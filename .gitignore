@@ -1,0 +1,5 @@
+.direnv/
+.zig-cache/
+zig-out/
+err.txt
+out.txt
