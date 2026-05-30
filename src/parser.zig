@@ -1,0 +1,468 @@
+//! Recursive descent parser using Pratt-style precedence climbing.
+//!
+//! Parses a stream of tokens into an AST. The AST lives in an arena allocator.
+//! No intermediate representations — direct AST construction.
+
+const std = @import("std");
+const token = @import("token.zig");
+const TokenType = token.TokenType;
+const Token = token.Token;
+const ast = @import("ast.zig");
+const Node = ast.Node;
+const NodeTag = ast.NodeTag;
+
+const Precedence = enum(u8) {
+    none,
+    assignment, // = (in let)
+    pipe, // |>
+    or_, // ||
+    and_, // &&
+    eq, // == !=
+    cmp, // < > <= >=
+    update, // //
+    not, // !
+    sum, // + -
+    prod, // * /
+    concat, // ++
+    unary, // unary -
+    apply, // function application
+    primary,
+};
+
+const ParseFn = *const fn (p: *Parser) anyerror!*Node;
+const InfixFn = *const fn (p: *Parser, left: *Node) anyerror!*Node;
+
+const Rule = struct {
+    prefix: ?ParseFn,
+    infix: ?InfixFn,
+    prec: Precedence,
+};
+
+pub const Parser = struct {
+    allocator: std.mem.Allocator,
+    arena: *ast.AstArena,
+    scanner: @import("scanner.zig").Scanner,
+    source: []const u8,
+    current: Token,
+    previous: Token,
+    had_error: bool,
+
+    pub fn init(allocator: std.mem.Allocator, arena: *ast.AstArena, source: []const u8) Parser {
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .scanner = @import("scanner.zig").Scanner.init(source),
+            .source = source,
+            .current = undefined,
+            .previous = undefined,
+            .had_error = false,
+        };
+    }
+
+    pub fn parse(self: *Parser) !*Node {
+        self.advance();
+        const node = try self.expression();
+        if (!self.check(.eof)) {
+            self.reportError("Unexpected token after expression.");
+        }
+        return node;
+    }
+
+    pub fn parseFile(self: *Parser) !*Node {
+        return self.parse();
+    }
+
+    // ---- token stream ----
+
+    fn advance(self: *Parser) void {
+        self.previous = self.current;
+        while (true) {
+            self.current = self.scanner.next();
+            if (self.current.type == .error_token) {
+                self.reportError("Invalid token.");
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn check(self: *const Parser, tt: TokenType) bool {
+        return self.current.type == tt;
+    }
+
+    fn match(self: *Parser, tt: TokenType) bool {
+        if (!self.check(tt)) return false;
+        self.advance();
+        return true;
+    }
+
+    fn expect(self: *Parser, tt: TokenType, msg: []const u8) !void {
+        if (!self.match(tt)) {
+            self.reportError(msg);
+            // Recovery: skip until we find the expected token or safe token.
+            return error.ParseError;
+        }
+    }
+
+    fn reportError(self: *Parser, msg: []const u8) void {
+        if (self.had_error) return;
+        self.had_error = true;
+        const tok = &self.current;
+        std.debug.print("[line {d}] parse error", .{tok.line});
+        if (tok.type != .eof) {
+            const token_span = self.source[tok.offset .. tok.offset + tok.len];
+            std.debug.print(" at '{s}'", .{token_span});
+        }
+        std.debug.print(": {s}\n", .{msg});
+    }
+
+    fn span(self: *const Parser, tok: Token) []const u8 {
+        return self.source[tok.offset .. tok.offset + tok.len];
+    }
+
+    // ---- precedence ----
+
+    fn rule(tt: TokenType) Rule {
+        switch (tt) {
+            .left_paren => return .{ .prefix = grouping, .infix = null, .prec = .none },
+            .left_brace => return .{ .prefix = attrSet, .infix = null, .prec = .none },
+            .left_bracket => return .{ .prefix = list, .infix = null, .prec = .none },
+            .identifier => return .{ .prefix = variable, .infix = null, .prec = .none },
+            .integer => return .{ .prefix = integer, .infix = null, .prec = .none },
+            .float_val => return .{ .prefix = floatLit, .infix = null, .prec = .none },
+            .string => return .{ .prefix = stringLit, .infix = null, .prec = .none },
+            .path => return .{ .prefix = pathLit, .infix = null, .prec = .none },
+            .kw_true => return .{ .prefix = literal, .infix = null, .prec = .none },
+            .kw_false => return .{ .prefix = literal, .infix = null, .prec = .none },
+            .kw_null => return .{ .prefix = literal, .infix = null, .prec = .none },
+            .kw_if => return .{ .prefix = ifElse, .infix = null, .prec = .none },
+            .kw_assert => return .{ .prefix = assert_, .infix = null, .prec = .none },
+            .kw_with => return .{ .prefix = with_, .infix = null, .prec = .none },
+            .kw_let => return .{ .prefix = letIn, .infix = null, .prec = .none },
+            .bang => return .{ .prefix = unary, .infix = null, .prec = .none },
+            .minus => return .{ .prefix = unary, .infix = binary, .prec = .sum },
+            .plus => return .{ .prefix = null, .infix = binary, .prec = .sum },
+            .slash => return .{ .prefix = null, .infix = binary, .prec = .prod },
+            .star => return .{ .prefix = null, .infix = binary, .prec = .prod },
+            .equal_equal => return .{ .prefix = null, .infix = binary, .prec = .eq },
+            .bang_equal => return .{ .prefix = null, .infix = binary, .prec = .eq },
+            .less => return .{ .prefix = null, .infix = binary, .prec = .cmp },
+            .less_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
+            .greater => return .{ .prefix = null, .infix = binary, .prec = .cmp },
+            .greater_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
+            .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
+            .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
+            .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
+            else => return .{ .prefix = null, .infix = null, .prec = .none },
+        }
+    }
+
+    fn expression(self: *Parser) anyerror!*Node {
+        return self.parsePrecedence(.assignment);
+    }
+
+    fn parsePrecedence(self: *Parser, min_prec: Precedence) anyerror!*Node {
+        self.advance();
+        const prefix_fn = rule(self.previous.type).prefix orelse {
+            self.reportError("Expected expression.");
+            return error.ParseError;
+        };
+        var left = try prefix_fn(self);
+
+        while (true) {
+            // Check for function application (juxtaposition)
+            if (canStartExpr(self.current.type) and @intFromEnum(min_prec) <= @intFromEnum(Precedence.apply)) {
+                const prev = self.previous;
+                _ = prev;
+                // Don't advance — parse the argument
+                const arg = try self.parsePrecedence(@enumFromInt(@intFromEnum(Precedence.apply) + 1));
+                left = try self.makeApply(left, arg);
+                continue;
+            }
+
+            const r = rule(self.current.type);
+            if (r.infix == null) break;
+            if (@intFromEnum(min_prec) > @intFromEnum(r.prec)) break;
+
+            self.advance();
+            left = try r.infix.?(self, left);
+        }
+
+        return left;
+    }
+
+    fn canStartExpr(tt: TokenType) bool {
+        return switch (tt) {
+            .identifier,
+            .integer,
+            .float_val,
+            .string,
+            .path,
+            .left_paren,
+            .left_brace,
+            .left_bracket,
+            .kw_true,
+            .kw_false,
+            .kw_null,
+            .kw_if,
+            .kw_assert,
+            .kw_with,
+            .kw_let,
+            .bang,
+            .minus,
+            => true,
+            else => false,
+        };
+    }
+
+    // ---- prefix parsers ----
+
+    fn grouping(self: *Parser) !*Node {
+        const expr = try self.expression();
+        _ = try self.expect(.right_paren, "Expected ')' after expression.");
+        return self.arena.createNode(.parens, .{ .parens = expr });
+    }
+
+    fn integer(self: *Parser) !*Node {
+        return self.arena.createNode(.integer, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn floatLit(self: *Parser) !*Node {
+        return self.arena.createNode(.float_val, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn stringLit(self: *Parser) !*Node {
+        return self.arena.createNode(.string, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn pathLit(self: *Parser) !*Node {
+        return self.arena.createNode(.path, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn variable(self: *Parser) !*Node {
+        return self.arena.createNode(.identifier, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn literal(self: *Parser) !*Node {
+        const tag: NodeTag = switch (self.previous.type) {
+            .kw_true => .bool_true,
+            .kw_false => .bool_false,
+            .kw_null => .null,
+            else => unreachable,
+        };
+        return self.arena.createNode(tag, .{ .atom = .{ .offset = 0, .len = 0 } });
+    }
+
+    fn unary(self: *Parser) !*Node {
+        const is_not = self.previous.type == .bang;
+        const op: ast.UnaryOp = if (is_not) .not else .negate;
+        const operand = try self.parsePrecedence(.unary);
+        return self.arena.createNode(.unary_op, .{ .unary = .{ .op = op, .expr = operand } });
+    }
+
+    fn attrSet(self: *Parser) !*Node {
+        var recursive = false;
+        if (self.match(.kw_rec)) {
+            recursive = true;
+        }
+
+        const arena_allocator = self.arena.allocator();
+        var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
+
+        while (!self.check(.right_brace) and !self.check(.eof)) {
+            const name_tok = self.current;
+            _ = try self.expect(.identifier, "Expected attribute name.");
+            _ = try self.expect(.equal, "Expected '=' after attribute name.");
+            // allow missing semicolons by checking what comes next
+            if (!self.check(.semicolon) and !self.check(.right_brace)) {
+                _ = self.match(.semicolon); // optional
+            }
+
+            const expr = try self.expression();
+
+            try entries.append(arena_allocator, .{
+                .name_offset = name_tok.offset,
+                .name_len = name_tok.len,
+                .expr = expr,
+            });
+
+            if (!self.match(.semicolon)) break;
+        }
+
+        _ = try self.expect(.right_brace, "Expected '}' after attribute set.");
+
+        return self.arena.createNode(.attr_set, .{
+            .attr_set = .{
+                .entries = try entries.toOwnedSlice(arena_allocator),
+                .recursive = recursive,
+            },
+        });
+    }
+
+    fn list(self: *Parser) !*Node {
+        const arena_allocator = self.arena.allocator();
+        var items: std.ArrayListUnmanaged(*Node) = .empty;
+
+        while (!self.check(.right_bracket) and !self.check(.eof)) {
+            const item = try self.expression();
+            try items.append(arena_allocator, item);
+
+            if (!self.match(.comma)) break;
+            // Allow trailing comma before ]
+        }
+
+        _ = try self.expect(.right_bracket, "Expected ']' after list.");
+
+        return self.arena.createNode(.list, .{
+            .list = .{ .items = try items.toOwnedSlice(arena_allocator) },
+        });
+    }
+
+    fn ifElse(self: *Parser) !*Node {
+        const cond = try self.expression();
+        _ = try self.expect(.kw_then, "Expected 'then' after if condition.");
+        const then_branch = try self.expression();
+        _ = try self.expect(.kw_else, "Expected 'else' after then branch.");
+        const else_branch = try self.expression();
+
+        return self.arena.createNode(.if_else, .{
+            .if_else = .{
+                .cond = cond,
+                .then_branch = then_branch,
+                .else_branch = else_branch,
+            },
+        });
+    }
+
+    fn assert_(self: *Parser) !*Node {
+        const cond = try self.expression();
+        _ = try self.expect(.semicolon, "Expected ';' after assert condition.");
+        const body = try self.expression();
+
+        return self.arena.createNode(.assert, .{
+            .assert = .{ .cond = cond, .body = body },
+        });
+    }
+
+    fn with_(self: *Parser) !*Node {
+        const with_expr = try self.expression();
+        _ = try self.expect(.semicolon, "Expected ';' after with expression.");
+        const body = try self.expression();
+
+        return self.arena.createNode(.with_expr, .{
+            .with_expr = .{ .attr_set = with_expr, .body = body },
+        });
+    }
+
+    fn letIn(self: *Parser) !*Node {
+        const arena_allocator = self.arena.allocator();
+        var bindings: std.ArrayListUnmanaged(Node.Binding) = .empty;
+
+        while (!self.check(.kw_in) and !self.check(.eof)) {
+            const name_tok = self.current;
+            _ = try self.expect(.identifier, "Expected variable name in let binding.");
+            _ = try self.expect(.equal, "Expected '=' after variable name.");
+            const expr = try self.expression();
+            _ = try self.expect(.semicolon, "Expected ';' after let binding.");
+
+            try bindings.append(arena_allocator, .{
+                .name_offset = name_tok.offset,
+                .name_len = name_tok.len,
+                .expr = expr,
+            });
+        }
+
+        _ = try self.expect(.kw_in, "Expected 'in' after let bindings.");
+        const body = try self.expression();
+
+        return self.arena.createNode(.let_in, .{
+            .let_in = .{ .bindings = try bindings.toOwnedSlice(arena_allocator), .body = body },
+        });
+    }
+
+    // ---- infix parsers ----
+
+    fn binary(self: *Parser, left: *Node) !*Node {
+        const op: ast.BinaryOp = switch (self.previous.type) {
+            .plus => .add,
+            .minus => .sub,
+            .star => .mul,
+            .slash => .div,
+            .equal_equal => .eq,
+            .bang_equal => .neq,
+            .less => .lt,
+            .less_equal => .lte,
+            .greater => .gt,
+            .greater_equal => .gte,
+            .double_slash => .update,
+            .arrow => .impl,
+            else => unreachable,
+        };
+
+        const r = rule(self.previous.type);
+        const right = try self.parsePrecedence(@enumFromInt(@intFromEnum(r.prec) + 1));
+
+        return self.makeBinary(op, left, right);
+    }
+
+    fn dotAccess(self: *Parser, left: *Node) !*Node {
+        // `expr.attr` or `expr."string"` or `expr.${...}`
+        const arena_allocator = self.arena.allocator();
+        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+
+        while (true) {
+            if (self.match(.identifier)) {
+                try segments.append(arena_allocator, .{
+                    .offset = self.previous.offset,
+                    .len = self.previous.len,
+                });
+            } else if (self.match(.string)) {
+                // "string" inside dot access: a."foo"
+                try segments.append(arena_allocator, .{
+                    .offset = self.previous.offset,
+                    .len = self.previous.len,
+                });
+            } else {
+                break;
+            }
+
+            if (!self.match(.dot)) break;
+        }
+
+        return self.arena.createNode(.attr_path, .{
+            .attr_path = .{
+                .root = left,
+                .segments = try segments.toOwnedSlice(arena_allocator),
+            },
+        });
+    }
+
+    // ---- helpers ----
+
+    fn makeBinary(self: *Parser, op: ast.BinaryOp, left: *Node, right: *Node) !*Node {
+        return self.arena.createNode(.binary_op, .{
+            .binary = .{ .op = op, .left = left, .right = right },
+        });
+    }
+
+    fn makeApply(self: *Parser, func: *Node, arg: *Node) !*Node {
+        return self.arena.createNode(.apply, .{
+            .apply = .{ .func = func, .arg = arg },
+        });
+    }
+};
