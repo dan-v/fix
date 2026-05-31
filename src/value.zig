@@ -21,6 +21,7 @@ pub const ValueType = enum(u8) {
     closure = 9, // payload is ObjectId
     thunk = 10, // payload is ObjectId
     cell = 11, // payload is ObjectId
+    builtin = 12, // payload is builtin id
     // reserved 13..255 for future extensions
 };
 
@@ -106,6 +107,13 @@ pub const Value = extern struct {
         };
     }
 
+    pub fn builtin(id: u16) Value {
+        return .{
+            .discriminant = .builtin,
+            .payload = id,
+        };
+    }
+
     // ---- accessors ----
 
     pub fn asInt(self: Value) i64 {
@@ -123,6 +131,10 @@ pub const Value = extern struct {
     }
 
     pub fn asObjectId(self: Value) ObjectId {
+        return @intCast(self.payload);
+    }
+
+    pub fn asBuiltinId(self: Value) u16 {
         return @intCast(self.payload);
     }
 
@@ -156,7 +168,7 @@ pub const Value = extern struct {
             .int => self.asInt() == other.asInt(),
             .float => self.asFloat() == other.asFloat(),
             .string, .path => self.asInternId() == other.asInternId(),
-            .list, .attrs, .closure, .thunk, .cell => self.payload == other.payload,
+            .list, .attrs, .closure, .thunk, .cell, .builtin => self.payload == other.payload,
         };
     }
 
@@ -170,7 +182,7 @@ pub const Value = extern struct {
             .string, .path => @as(u64, self.asInternId()) *% 31,
             .list => self.payload *% 31,
             .attrs => self.payload *% 31,
-            .closure, .thunk, .cell => self.payload,
+            .closure, .thunk, .cell, .builtin => self.payload,
         };
     }
 
@@ -191,6 +203,7 @@ pub const Value = extern struct {
             .closure => try writer.writeAll("<closure>"),
             .thunk => try writer.writeAll("<thunk>"),
             .cell => try writer.writeAll("<cell>"),
+            .builtin => try writer.writeAll("<builtin>"),
         }
     }
 };

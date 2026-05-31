@@ -402,5 +402,26 @@ test "end-to-end: single argument lambdas" {
     try std.testing.expectEqual(@as(i64, 42), captured.asInt());
 }
 
+test "end-to-end: builtins.toString" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const int_string = try ev.evaluate("builtins.toString 42");
+    try std.testing.expectEqualStrings("42", ev.intern.get(int_string.asInternId()));
+
+    const bool_string = try ev.evaluate("builtins.toString true");
+    try std.testing.expectEqualStrings("true", ev.intern.get(bool_string.asInternId()));
+
+    const string_passthrough = try ev.evaluate("builtins.toString \"x\"");
+    try std.testing.expectEqualStrings("x", ev.intern.get(string_passthrough.asInternId()));
+
+    const shadowed = try ev.evaluate("let builtins = { toString = x: \"shadow\"; }; in builtins.toString 1");
+    try std.testing.expectEqualStrings("shadow", ev.intern.get(shadowed.asInternId()));
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toString {}"));
+}
+
 const std = @import("std");
 const ValueType = value.ValueType;

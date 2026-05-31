@@ -209,6 +209,8 @@ pub const Compiler = struct {
             try self.emitOpByte(.get_local, @intCast(slot));
         } else if (try self.resolveCapture(span)) |slot| {
             try self.emitOpByte(.get_upvalue, slot);
+        } else if (std.mem.eql(u8, span, "builtins")) {
+            try self.emitOp(.push_builtins);
         } else {
             return error.UndefinedVariable;
         }

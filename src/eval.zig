@@ -111,6 +111,7 @@ pub const Evaluator = struct {
             .closure => try writer.writeAll("<closure>"),
             .thunk => try writer.writeAll("<thunk>"),
             .cell => try writer.writeAll("<cell>"),
+            .builtin => try writer.writeAll("<builtin>"),
         }
     }
 

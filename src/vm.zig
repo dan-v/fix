@@ -25,7 +25,12 @@ const Thunk = @import("thunk.zig").Thunk;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
+const AttrEntry = heap_mod.AttrEntry;
 const Closure = heap_mod.Closure;
+
+const BuiltinId = enum(u16) {
+    toString = 0,
+};
 
 /// A single call frame.
 pub const Frame = struct {
@@ -379,6 +384,7 @@ pub const VM = struct {
                     const left = self.pop();
                     try self.push(try self.mergeAttrs(left, right));
                 },
+                .push_builtins => try self.push(try self.makeBuiltins()),
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
@@ -471,6 +477,7 @@ pub const VM = struct {
             .list => try self.listsEqual(va.asObjectId(), vb.asObjectId()),
             .attrs => try self.attrsEqual(va.asObjectId(), vb.asObjectId()),
             .closure => false,
+            .builtin => va.asBuiltinId() == vb.asBuiltinId(),
             .thunk, .cell => unreachable,
         };
     }
@@ -653,8 +660,50 @@ pub const VM = struct {
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             try self.push(arg); // arg is first local
             try self.pushFrame(ch, 1, closure_id);
+        } else if (callee.discriminant == .builtin) {
+            try self.push(try self.callBuiltin(callee, arg));
         } else {
             return error.NotCallable;
+        }
+    }
+
+    fn makeBuiltins(self: *VM) !Value {
+        const to_string_name = try self.intern.intern("toString");
+        const entries = [_]AttrEntry{
+            .{
+                .name = to_string_name,
+                .value = Value.builtin(@intFromEnum(BuiltinId.toString)),
+            },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
+    }
+
+    fn callBuiltin(self: *VM, callee: Value, arg: Value) !Value {
+        return switch (callee.asBuiltinId()) {
+            @intFromEnum(BuiltinId.toString) => self.builtinToString(arg),
+            else => error.InvalidBuiltin,
+        };
+    }
+
+    fn builtinToString(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        switch (value.discriminant) {
+            .string => return value,
+            .path => return Value.string(value.asInternId()),
+            .int => {
+                const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
+                defer self.allocator.free(s);
+                return Value.string(try self.intern.intern(s));
+            },
+            .float => {
+                const s = try std.fmt.allocPrint(self.allocator, "{d}", .{value.asFloat()});
+                defer self.allocator.free(s);
+                return Value.string(try self.intern.intern(s));
+            },
+            .bool_false => return Value.string(try self.intern.intern("false")),
+            .bool_true => return Value.string(try self.intern.intern("true")),
+            .null => return Value.string(try self.intern.intern("null")),
+            else => return error.TypeError,
         }
     }
 
