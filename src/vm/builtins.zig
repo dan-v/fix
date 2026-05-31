@@ -473,8 +473,11 @@ fn builtinSplitVersion(self: anytype, arg: Value) !Value {
 }
 
 fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
-    const pattern_text = try stringArg(self, regex_arg);
-    const text = try stringArg(self, text_arg);
+    const pattern_value = try self.forceValue(regex_arg);
+    const text_value = try self.forceValue(text_arg);
+    if (pattern_value.discriminant != .string or text_value.discriminant != .string) return error.TypeError;
+    const pattern_text = self.intern.get(pattern_value.asInternId());
+    const text = self.intern.get(text_value.asInternId());
 
     var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
     defer pattern.deinit();
@@ -485,8 +488,11 @@ fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
 }
 
 fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
-    const pattern_text = try stringArg(self, regex_arg);
-    const text = try stringArg(self, text_arg);
+    const pattern_value = try self.forceValue(regex_arg);
+    const text_value = try self.forceValue(text_arg);
+    if (pattern_value.discriminant != .string or text_value.discriminant != .string) return error.TypeError;
+    const pattern_text = self.intern.get(pattern_value.asInternId());
+    const text = self.intern.get(text_value.asInternId());
 
     var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
     defer pattern.deinit();
