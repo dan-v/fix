@@ -1146,6 +1146,20 @@ test "evaluate fetchTarball builtin through fetch cache" {
     try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
 }
 
+test "evaluate flake ref builtins" {
+    const github = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"github:NixOS/nixpkgs/nixos-unstable\")");
+    defer std.testing.allocator.free(github);
+    try std.testing.expectEqualStrings("\"{\\\"owner\\\":\\\"NixOS\\\",\\\"ref\\\":\\\"nixos-unstable\\\",\\\"repo\\\":\\\"nixpkgs\\\",\\\"type\\\":\\\"github\\\"}\"", github);
+
+    const path = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"path:/tmp/source?rev=abc&narHash=sha256-test\")");
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("\"{\\\"narHash\\\":\\\"sha256-test\\\",\\\"path\\\":\\\"/tmp/source\\\",\\\"rev\\\":\\\"abc\\\",\\\"type\\\":\\\"path\\\"}\"", path);
+
+    const stringified = try renderForTest("builtins.flakeRefToString { type = \"github\"; owner = \"NixOS\"; repo = \"nixpkgs\"; ref = \"nixos-unstable\"; }");
+    defer std.testing.allocator.free(stringified);
+    try std.testing.expectEqualStrings("\"github:NixOS/nixpkgs/nixos-unstable\"", stringified);
+}
+
 test "evaluate findFile builtin through explicit search path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

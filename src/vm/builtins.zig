@@ -128,12 +128,12 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .fetchGit => builtinFetchGit(self, args[0]),
         .fetchurl => builtinFetchurl(self, args[0]),
         .fetchTarball => builtinFetchTarball(self, args[0]),
+        .parseFlakeRef => builtinParseFlakeRef(self, args[0]),
+        .flakeRefToString => builtinFlakeRefToString(self, args[0]),
         .toXML,
         .fetchMercurial,
         .fetchTree,
         .getFlake,
-        .parseFlakeRef,
-        .flakeRefToString,
         .break_,
         .scopedImport,
         => unsupportedBuiltin(id),
@@ -1343,6 +1343,105 @@ fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     return Value.string(try self.intern.intern(path));
 }
 
+fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
+    const ref = try stringArg(self, arg);
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+
+    if (std.mem.startsWith(u8, ref, "github:")) {
+        try appendStringAttr(self, &entries, "type", "github");
+        var parts = std.mem.splitScalar(u8, ref["github:".len..], '/');
+        const owner = parts.next() orelse return error.InvalidFlakeRef;
+        const repo = parts.next() orelse return error.InvalidFlakeRef;
+        try appendStringAttr(self, &entries, "owner", owner);
+        try appendStringAttr(self, &entries, "repo", repo);
+        if (parts.next()) |branch| {
+            if (branch.len != 0) try appendStringAttr(self, &entries, "ref", branch);
+        }
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    if (std.mem.startsWith(u8, ref, "path:")) {
+        try appendStringAttr(self, &entries, "type", "path");
+        const rest = ref["path:".len..];
+        const query_start = std.mem.indexOfScalar(u8, rest, '?');
+        const path = if (query_start) |i| rest[0..i] else rest;
+        try appendStringAttr(self, &entries, "path", path);
+        if (query_start) |i| try appendFlakeQueryAttrs(self, &entries, rest[i + 1 ..]);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    return error.InvalidFlakeRef;
+}
+
+fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
+    const attrs = try self.forceValue(arg);
+    if (attrs.discriminant != .attrs) return error.TypeError;
+
+    const type_value = try requiredStringAttr(self, attrs.asObjectId(), "type");
+    defer self.allocator.free(type_value);
+    if (std.mem.eql(u8, type_value, "github")) {
+        const owner = try requiredStringAttr(self, attrs.asObjectId(), "owner");
+        defer self.allocator.free(owner);
+        const repo = try requiredStringAttr(self, attrs.asObjectId(), "repo");
+        defer self.allocator.free(repo);
+        const ref = try optionalStringAttr(self, attrs.asObjectId(), "ref");
+        defer if (ref) |owned| self.allocator.free(owned);
+        const text = if (ref) |branch|
+            try std.fmt.allocPrint(self.allocator, "github:{s}/{s}/{s}", .{ owner, repo, branch })
+        else
+            try std.fmt.allocPrint(self.allocator, "github:{s}/{s}", .{ owner, repo });
+        defer self.allocator.free(text);
+        return Value.string(try self.intern.intern(text));
+    }
+
+    if (std.mem.eql(u8, type_value, "path")) {
+        const path = try requiredStringAttr(self, attrs.asObjectId(), "path");
+        defer self.allocator.free(path);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "path:");
+        try out.appendSlice(self.allocator, path);
+        var first_query = true;
+        try appendFlakeQueryString(self, attrs.asObjectId(), "ref", &out, &first_query);
+        try appendFlakeQueryString(self, attrs.asObjectId(), "rev", &out, &first_query);
+        try appendFlakeQueryString(self, attrs.asObjectId(), "narHash", &out, &first_query);
+        return Value.string(try self.intern.intern(out.items));
+    }
+
+    return error.InvalidFlakeRef;
+}
+
+fn appendFlakeQueryAttrs(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), query: []const u8) !void {
+    var parts = std.mem.splitScalar(u8, query, '&');
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
+        const key = part[0..eq];
+        const value = part[eq + 1 ..];
+        if (std.mem.eql(u8, key, "ref") or std.mem.eql(u8, key, "rev") or std.mem.eql(u8, key, "narHash")) {
+            try appendStringAttr(self, entries, key, value);
+        }
+    }
+}
+
+fn appendFlakeQueryString(self: anytype, attrs_id: ObjectId, name: []const u8, out: *std.ArrayListUnmanaged(u8), first: *bool) !void {
+    const value = try optionalStringAttr(self, attrs_id, name) orelse return;
+    defer self.allocator.free(value);
+    try out.append(self.allocator, if (first.*) '?' else '&');
+    first.* = false;
+    try out.appendSlice(self.allocator, name);
+    try out.append(self.allocator, '=');
+    try out.appendSlice(self.allocator, value);
+}
+
+fn appendStringAttr(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: []const u8, value: []const u8) !void {
+    try entries.append(self.allocator, .{
+        .name = try self.intern.intern(name),
+        .value = Value.string(try self.intern.intern(value)),
+    });
+}
+
 fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {
     const basename = path_ops.baseName(url);
     if (basename.len != 0) return self.allocator.dupe(u8, basename);
@@ -1367,6 +1466,10 @@ fn optionalStringAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?[]u
     const forced = try self.forceValue(value);
     if (forced.discriminant != .string) return error.TypeError;
     return try self.allocator.dupe(u8, self.intern.get(forced.asInternId()));
+}
+
+fn requiredStringAttr(self: anytype, attrs_id: ObjectId, name: []const u8) ![]u8 {
+    return try optionalStringAttr(self, attrs_id, name) orelse error.MissingAttribute;
 }
 
 fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool {
