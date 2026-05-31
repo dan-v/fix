@@ -36,7 +36,7 @@ pub const Scanner = struct {
         if (isDigit(c)) return self.lexNumber(start);
         if (c == '"') return self.lexString(start, .double_quoted);
         if (c == '\'' and self.peek() == '\'') return self.lexString(start, .indented);
-        if (c == '.' and self.peek() == '/') return self.lexPath(start);
+        if (c == '.' and (self.peek() == '/' or (self.peek() == '.' and self.peekAhead(1) == '/'))) return self.lexPath(start);
 
         // Single-character tokens.
         switch (c) {
@@ -55,6 +55,10 @@ pub const Scanner = struct {
             '@' => return self.makeToken(.at, start, 1),
             ';' => return self.makeToken(.semicolon, start, 1),
             '?' => return self.makeToken(.question_mark, start, 1),
+            '$' => {
+                if (self.match('{')) return self.makeToken(.dollar_curly, start, 2);
+                return self.makeToken(.error_token, start, 1);
+            },
             '+' => {
                 if (self.match('+')) return self.makeToken(.double_plus, start, 2);
                 return self.makeToken(.plus, start, 1);
@@ -289,8 +293,10 @@ test "scanner recognizes lambda colon" {
 }
 
 test "scanner recognizes simple path literals" {
-    var scanner = Scanner.init("./foo /nix/store/abc");
+    var scanner = Scanner.init("./foo ../bar ../../lib /nix/store/abc");
 
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
@@ -307,6 +313,17 @@ test "scanner recognizes nested strings in interpolation" {
     var scanner = Scanner.init("\"a${{ x = \"}\"; }.x}b\"");
 
     try std.testing.expectEqual(TokenType.string, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes dynamic attribute syntax" {
+    var scanner = Scanner.init("attrs.${name}");
+
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.dot, scanner.next().type);
+    try std.testing.expectEqual(TokenType.dollar_curly, scanner.next().type);
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.right_brace, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }
 

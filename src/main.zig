@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
 

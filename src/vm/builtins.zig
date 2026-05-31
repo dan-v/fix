@@ -109,7 +109,41 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .compareVersions => builtinCompareVersions(self, args[0], args[1]),
         .splitVersion => builtinSplitVersion(self, args[0]),
         .parseDrvName => builtinParseDrvName(self, args[0]),
+        .getEnv => builtinGetEnv(self, args[0]),
+        .fromTOML,
+        .toXML,
+        .match,
+        .split,
+        .fetchurl,
+        .fetchTarball,
+        .fetchGit,
+        .fetchMercurial,
+        .fetchTree,
+        .getFlake,
+        .parseFlakeRef,
+        .flakeRefToString,
+        .break_,
+        .filterSource,
+        .scopedImport,
+        => unsupportedBuiltin(id),
+        .traceVerbose => builtinTraceVerbose(self, args[0], args[1]),
+        .addErrorContext => self.forceValue(args[1]),
+        .unsafeDiscardStringContext,
+        .unsafeDiscardOutputDependency,
+        .addDrvOutputDependencies,
+        => self.forceValue(args[0]),
+        .appendContext => self.forceValue(args[0]),
+        .getContext => Value.attrs(try self.heap.addAttrs(&.{})),
+        .hasContext => Value.boolVal(false),
+        .toPath => builtinToPath(self, args[0]),
+        .toFile => unsupportedBuiltin(id),
+        .placeholder => builtinPlaceholder(self, args[0]),
     };
+}
+
+fn unsupportedBuiltin(id: BuiltinId) !Value {
+    _ = id;
+    return error.UnsupportedBuiltin;
 }
 
 fn makeBuiltinClosure(self: anytype, builtin_id: u16, args: []const Value) !Value {
@@ -957,6 +991,7 @@ fn builtinTryEval(self: anytype, arg: Value) !Value {
         error.NixThrow,
         error.NixAbort,
         error.AssertionFailed,
+        error.FileNotFound,
         => return tryEvalResult(self, false, Value.boolVal(false)),
         else => return err,
     };
@@ -966,6 +1001,34 @@ fn builtinTryEval(self: anytype, arg: Value) !Value {
 fn builtinTrace(self: anytype, message_arg: Value, value_arg: Value) !Value {
     _ = try self.forceValue(message_arg);
     return self.forceValue(value_arg);
+}
+
+fn builtinTraceVerbose(self: anytype, message_arg: Value, value_arg: Value) !Value {
+    _ = try self.forceValue(message_arg);
+    return self.forceValue(value_arg);
+}
+
+fn builtinGetEnv(self: anytype, name_arg: Value) !Value {
+    const name = try stringArg(self, name_arg);
+    const host = self.import_host orelse return Value.string(try self.intern.intern(""));
+    const value = try host.get_env(host.context, name);
+    return Value.string(try self.intern.intern(value));
+}
+
+fn builtinToPath(self: anytype, arg: Value) !Value {
+    const value = try self.forceValue(arg);
+    return switch (value.discriminant) {
+        .path => value,
+        .string => Value.path(value.asInternId()),
+        else => error.TypeError,
+    };
+}
+
+fn builtinPlaceholder(self: anytype, arg: Value) !Value {
+    const output = try stringArg(self, arg);
+    const text = try std.fmt.allocPrint(self.allocator, "/nix/store/placeholder-{s}", .{output});
+    defer self.allocator.free(text);
+    return Value.string(try self.intern.intern(text));
 }
 
 fn tryEvalResult(self: anytype, success: bool, value: Value) !Value {

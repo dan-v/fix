@@ -30,8 +30,10 @@ pub const NodeTag = enum(u8) {
     with_expr,
     attr_set,
     attr_path, // foo.bar.baz
+    attr_dynamic, // foo.${expr}
     attr_or, // foo.bar or default
     has_attr, // foo ? bar.baz
+    has_attr_dynamic, // foo ? ${expr}
     list,
     parens, // parenthesized subexpression
 };
@@ -80,8 +82,10 @@ pub const Node = struct {
         with_expr: WithExpr,
         attr_set: AttrSet,
         attr_path: AttrPath,
+        attr_dynamic: AttrDynamic,
         attr_or: AttrOr,
         has_attr: HasAttr,
+        has_attr_dynamic: AttrDynamic,
         list: List,
         parens: *Node,
     };
@@ -155,6 +159,7 @@ pub const Node = struct {
 
     pub const AttrSetEntry = struct {
         path: []Atom,
+        dynamic_name: ?*Node = null,
         expr: *Node,
     };
 
@@ -168,6 +173,11 @@ pub const Node = struct {
         /// Attribute names (as source offsets).
         /// e.g., `a.b.c` → [a, b, c]
         segments: []Atom,
+    };
+
+    pub const AttrDynamic = struct {
+        root: *Node,
+        name: *Node,
     };
 
     pub const AttrOr = struct {

@@ -124,8 +124,10 @@ pub const Compiler = struct {
             .with_expr => try self.compileWith(node),
             .attr_set => try self.compileAttrSet(node),
             .attr_path => try self.compileAttrPath(node),
+            .attr_dynamic => try self.compileAttrDynamic(node),
             .attr_or => try self.compileAttrOr(node),
             .has_attr => try self.compileHasAttr(node),
+            .has_attr_dynamic => try self.compileHasAttrDynamic(node),
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
         }
@@ -678,10 +680,63 @@ pub const Compiler = struct {
 
     fn compileAttrSet(self: *Compiler, node: *const Node) !void {
         const aset = node.data.attr_set;
+        if (self.hasDynamicAttrEntries(aset.entries)) {
+            return self.compileMixedAttrSet(aset.entries, aset.recursive);
+        }
+
         const entries = try self.attrEntryViews(aset.entries);
         defer self.allocator.free(entries);
 
         try self.compileAttrEntries(entries, aset.recursive);
+    }
+
+    fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
+        if (recursive) return error.UnsupportedDynamicAttribute;
+
+        const static_count = self.staticAttrEntryCount(entries);
+        if (static_count > 0) {
+            const static_entries = try self.allocator.alloc(Node.AttrSetEntry, static_count);
+            defer self.allocator.free(static_entries);
+
+            var i: usize = 0;
+            for (entries) |entry| {
+                if (entry.dynamic_name == null) {
+                    static_entries[i] = entry;
+                    i += 1;
+                }
+            }
+
+            const views = try self.attrEntryViews(static_entries);
+            defer self.allocator.free(views);
+            try self.compileAttrEntries(views, false);
+        } else {
+            try self.emitOpU16(.build_attrs, 0);
+        }
+
+        for (entries) |entry| {
+            const name = entry.dynamic_name orelse continue;
+            try self.compileNode(name);
+            try self.compileThunk(entry.expr);
+            try self.emitOpU16(.build_attrs, 1);
+            try self.emitOp(.merge_attrs);
+        }
+    }
+
+    fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
+        _ = self;
+        for (entries) |entry| {
+            if (entry.dynamic_name != null) return true;
+        }
+        return false;
+    }
+
+    fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSetEntry) usize {
+        _ = self;
+        var count: usize = 0;
+        for (entries) |entry| {
+            if (entry.dynamic_name == null) count += 1;
+        }
+        return count;
     }
 
     fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
@@ -817,6 +872,7 @@ pub const Compiler = struct {
     fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {
         const views = try self.allocator.alloc(AttrEntryView, entries.len);
         for (entries, views) |entry, *view| {
+            std.debug.assert(entry.dynamic_name == null);
             view.* = .{ .path = entry.path, .expr = entry.expr };
         }
         return views;
@@ -926,10 +982,25 @@ pub const Compiler = struct {
         }
     }
 
+    fn compileAttrDynamic(self: *Compiler, node: *const Node) !void {
+        const dynamic = node.data.attr_dynamic;
+        try self.compileNode(dynamic.root);
+        try self.compileNode(dynamic.name);
+        try self.emitOp(.get_attr_dynamic);
+    }
+
     fn compileAttrOr(self: *Compiler, node: *const Node) !void {
         const attr_or = node.data.attr_or;
-        const apath = attr_or.attr_path.data.attr_path;
+        if (attr_or.attr_path.tag == .attr_dynamic) {
+            const dynamic = attr_or.attr_path.data.attr_dynamic;
+            try self.compileNode(dynamic.root);
+            try self.compileNode(dynamic.name);
+            try self.compileThunk(attr_or.default);
+            try self.emitOp(.get_attr_dynamic_or);
+            return;
+        }
 
+        const apath = attr_or.attr_path.data.attr_path;
         try self.compileNode(apath.root);
         try self.compileThunk(attr_or.default);
         try self.emitOp(.get_attr_path_or);
@@ -951,6 +1022,13 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name_span);
             try self.builder.writeU16(self.allocator, @intCast(name_id));
         }
+    }
+
+    fn compileHasAttrDynamic(self: *Compiler, node: *const Node) !void {
+        const dynamic = node.data.has_attr_dynamic;
+        try self.compileNode(dynamic.root);
+        try self.compileNode(dynamic.name);
+        try self.emitOp(.has_attr_dynamic);
     }
 
     fn compileList(self: *Compiler, node: *const Node) !void {
@@ -1156,6 +1234,7 @@ fn offsetNode(node: *Node, offset: u32) void {
                 for (entry.path) |*segment| {
                     segment.offset += offset;
                 }
+                if (entry.dynamic_name) |dynamic_name| offsetNode(dynamic_name, offset);
                 offsetNode(entry.expr, offset);
             }
         },
@@ -1164,6 +1243,10 @@ fn offsetNode(node: *Node, offset: u32) void {
             for (node.data.attr_path.segments) |*segment| {
                 segment.offset += offset;
             }
+        },
+        .attr_dynamic => {
+            offsetNode(node.data.attr_dynamic.root, offset);
+            offsetNode(node.data.attr_dynamic.name, offset);
         },
         .attr_or => {
             offsetNode(node.data.attr_or.attr_path, offset);
@@ -1174,6 +1257,10 @@ fn offsetNode(node: *Node, offset: u32) void {
             for (node.data.has_attr.segments) |*segment| {
                 segment.offset += offset;
             }
+        },
+        .has_attr_dynamic => {
+            offsetNode(node.data.has_attr_dynamic.root, offset);
+            offsetNode(node.data.has_attr_dynamic.name, offset);
         },
         .list => {
             for (node.data.list.items) |item| {

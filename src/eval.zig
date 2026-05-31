@@ -34,6 +34,7 @@ pub const Evaluator = struct {
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
     base_path: ?[:0]u8,
+    env_map: ?*const std.process.Environ.Map,
     worker_count: u8,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
 
@@ -60,6 +61,7 @@ pub const Evaluator = struct {
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
             .base_path = null,
+            .env_map = null,
             .worker_count = worker_count,
             .diagnostics = .empty,
         };
@@ -95,6 +97,10 @@ pub const Evaluator = struct {
 
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
+    }
+
+    pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
+        self.env_map = env_map;
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -198,7 +204,7 @@ pub const Evaluator = struct {
             &self.heap,
             &self.files,
             &self.scheduler,
-            .{ .context = self, .import_value = importValue, .find_file = findFile },
+            .{ .context = self, .import_value = importValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             0,
         );
@@ -215,6 +221,12 @@ pub const Evaluator = struct {
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.findFileInDefaultSearchPath(name);
+    }
+
+    fn getEnv(context: *anyopaque, name: []const u8) anyerror![]const u8 {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const env_map = self.env_map orelse return "";
+        return env_map.get(name) orelse "";
     }
 
     fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {

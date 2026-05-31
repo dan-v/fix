@@ -105,6 +105,12 @@ pub const OpCode = enum(u8) {
     /// Select an attribute from attrset on stack top.
     /// Operand: 2-byte InternId of the attribute name.
     get_attr,
+    /// Select an attribute by a runtime string name.
+    /// Stack layout before: [attrs, name].
+    get_attr_dynamic,
+    /// Select a runtime string attribute with a lazy default.
+    /// Stack layout before: [attrs, name, default_thunk].
+    get_attr_dynamic_or,
     /// Select an attribute path with a lazy default if any segment is missing.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].
@@ -113,6 +119,9 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs].
     has_attr_path,
+    /// Test whether a runtime string attribute exists.
+    /// Stack layout before: [attrs, name].
+    has_attr_dynamic,
     /// Validate an attrset function argument.
     /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
     /// Stack layout before: [attrs].

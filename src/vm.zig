@@ -48,6 +48,7 @@ pub const ImportHost = struct {
     context: *anyopaque,
     import_value: *const fn (*anyopaque, []const u8) anyerror!Value,
     find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
+    get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
@@ -439,6 +440,26 @@ pub const VM = struct {
                     const result = try self.getAttrValue(attrs_val, @intCast(name_id));
                     try self.push(result);
                 },
+                .get_attr_dynamic => {
+                    const name_val = try self.forceValue(self.pop());
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrValue(attrs_val, name_val.asInternId());
+                    try self.push(result);
+                },
+                .get_attr_dynamic_or => {
+                    const default_val = self.pop();
+                    const name_val = try self.forceValue(self.pop());
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    const attrs_val = self.pop();
+                    const attrs = try self.forceValue(attrs_val);
+                    if (attrs.discriminant != .attrs) return error.TypeError;
+                    const result = self.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
+                        error.MissingAttribute => try self.forceValue(default_val),
+                        else => return err,
+                    };
+                    try self.push(try self.forceValue(result));
+                },
                 .get_attr_path_or => {
                     const segment_count = code[frame.ip];
                     frame.ip += 1;
@@ -456,6 +477,22 @@ pub const VM = struct {
                     frame.ip += @as(usize, segment_count) * 2;
                     const attrs_val = self.pop();
                     try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip])));
+                },
+                .has_attr_dynamic => {
+                    const name_val = try self.forceValue(self.pop());
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    const attrs_val = try self.forceValue(self.pop());
+                    if (attrs_val.discriminant != .attrs) {
+                        try self.push(Value.boolVal(false));
+                    } else {
+                        const present = if (self.heap.getAttrValue(attrs_val.asObjectId(), name_val.asInternId())) |_|
+                            true
+                        else |err| switch (err) {
+                            error.MissingAttribute => false,
+                            else => return err,
+                        };
+                        try self.push(Value.boolVal(present));
+                    }
                 },
                 .validate_attrs => {
                     const allow_extra = code[frame.ip] != 0;

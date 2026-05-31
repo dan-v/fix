@@ -167,6 +167,44 @@ test "end-to-end: ambient builtins" {
 
     const version = try ev.evaluate("nixVersion");
     try std.testing.expectEqual(value.ValueType.string, version.discriminant);
+
+    const missing_env = try ev.evaluate("builtins.getEnv \"FIX_TEST_UNSET\"");
+    try std.testing.expectEqualStrings("", ev.intern.get(missing_env.asInternId()));
+
+    const context = try ev.evaluate("builtins.hasContext \"x\"");
+    try std.testing.expect(!context.asBool());
+}
+
+test "end-to-end: inherit quoted attribute from source" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("let x = { \"or\" = 1; }; in { inherit (x) \"or\"; }.\"or\"");
+    try std.testing.expectEqual(@as(i64, 1), result.asInt());
+}
+
+test "end-to-end: dynamic attribute selection" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("let digits = { \"10\" = \"A\"; }; d = 10; in digits.${builtins.toString d}");
+    try std.testing.expectEqualStrings("A", ev.intern.get(result.asInternId()));
+
+    const declared = try ev.evaluate("let key = \"x\"; in ({ ${key} = 4; }).x");
+    try std.testing.expectEqual(@as(i64, 4), declared.asInt());
+
+    const defaulted = try ev.evaluate("let key = \"missing\"; attrs = {}; in attrs.${key} or 9");
+    try std.testing.expectEqual(@as(i64, 9), defaulted.asInt());
+
+    const defaulted_arg = try ev.evaluate("let v = x: x; final = {}; in v final.gcc.arch or \"default\"");
+    try std.testing.expectEqualStrings("default", ev.intern.get(defaulted_arg.asInternId()));
+
+    const has_dynamic = try ev.evaluate("let key = \"x\"; in { x = 1; } ? ${key}");
+    try std.testing.expect(has_dynamic.asBool());
 }
 
 test "end-to-end: let binding" {

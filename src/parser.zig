@@ -34,6 +34,11 @@ const Precedence = enum(u8) {
 const ParseFn = *const fn (p: *Parser) anyerror!*Node;
 const InfixFn = *const fn (p: *Parser, left: *Node) anyerror!*Node;
 
+const AttrDeclaration = struct {
+    path: []Node.Atom,
+    dynamic_name: ?*Node = null,
+};
+
 const Rule = struct {
     prefix: ?ParseFn,
     infix: ?InfixFn,
@@ -471,7 +476,7 @@ pub const Parser = struct {
                 continue;
             }
 
-            const path = self.attrDeclarationPath(arena_allocator) catch {
+            const declaration = self.attrDeclaration(arena_allocator) catch {
                 self.synchronizeAttrSetEntry();
                 continue;
             };
@@ -490,7 +495,8 @@ pub const Parser = struct {
             };
 
             try entries.append(arena_allocator, .{
-                .path = path,
+                .path = declaration.path,
+                .dynamic_name = declaration.dynamic_name,
                 .expr = expr,
             });
 
@@ -528,7 +534,8 @@ pub const Parser = struct {
         var count: usize = 0;
         while (!self.check(.semicolon) and !self.check(.right_brace) and !self.check(.eof)) {
             const name_tok = self.current;
-            if (!self.matchLetBindingName()) {
+            const matched_name = if (source != null) self.matchAttrName() else self.matchLetBindingName();
+            if (!matched_name) {
                 self.reportError("Expected inherited variable name.");
                 return error.ParseError;
             }
@@ -565,6 +572,16 @@ pub const Parser = struct {
                 .segments = segments,
             },
         });
+    }
+
+    fn attrDeclaration(self: *Parser, allocator: std.mem.Allocator) !AttrDeclaration {
+        if (self.match(.dollar_curly)) {
+            const name = try self.expression();
+            _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+            return .{ .path = try self.arena.allocSlice(Node.Atom, 0), .dynamic_name = name };
+        }
+
+        return .{ .path = try self.attrDeclarationPath(allocator) };
     }
 
     fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
@@ -776,6 +793,7 @@ pub const Parser = struct {
     fn dotAccess(self: *Parser, left: *Node) !*Node {
         // `expr.attr` or `expr."string"` or `expr.${...}`
         const arena_allocator = self.arena.allocator();
+        var current = left;
         var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
 
         while (true) {
@@ -784,6 +802,25 @@ pub const Parser = struct {
                     .offset = self.previous.offset,
                     .len = self.previous.len,
                 });
+            } else if (self.match(.dollar_curly)) {
+                if (segments.items.len > 0) {
+                    current = try self.arena.createNode(.attr_path, .{
+                        .attr_path = .{
+                            .root = current,
+                            .segments = try segments.toOwnedSlice(arena_allocator),
+                        },
+                    });
+                    segments = .empty;
+                }
+
+                const name = try self.expression();
+                _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+                current = try self.arena.createNode(.attr_dynamic, .{
+                    .attr_dynamic = .{
+                        .root = current,
+                        .name = name,
+                    },
+                });
             } else {
                 break;
             }
@@ -791,16 +828,29 @@ pub const Parser = struct {
             if (!self.match(.dot)) break;
         }
 
+        if (segments.items.len == 0) return current;
         return self.arena.createNode(.attr_path, .{
             .attr_path = .{
-                .root = left,
+                .root = current,
                 .segments = try segments.toOwnedSlice(arena_allocator),
             },
         });
     }
 
     fn attrOr(self: *Parser, left: *Node) !*Node {
-        if (left.tag != .attr_path) {
+        if (left.tag == .apply and
+            (left.data.apply.arg.tag == .attr_path or left.data.apply.arg.tag == .attr_dynamic))
+        {
+            const default = try self.expression();
+            const defaulted_arg = try self.arena.createNode(.attr_or, .{
+                .attr_or = .{ .attr_path = left.data.apply.arg, .default = default },
+            });
+            return self.arena.createNode(.apply, .{
+                .apply = .{ .func = left.data.apply.func, .arg = defaulted_arg },
+            });
+        }
+
+        if (left.tag != .attr_path and left.tag != .attr_dynamic) {
             self.reportError("'or' default requires an attribute path.");
             return error.ParseError;
         }
@@ -811,6 +861,17 @@ pub const Parser = struct {
     }
 
     fn hasAttr(self: *Parser, left: *Node) !*Node {
+        if (self.match(.dollar_curly)) {
+            const name = try self.expression();
+            _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+            return self.arena.createNode(.has_attr_dynamic, .{
+                .has_attr_dynamic = .{
+                    .root = left,
+                    .name = name,
+                },
+            });
+        }
+
         const arena_allocator = self.arena.allocator();
         var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
 
