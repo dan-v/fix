@@ -23,6 +23,21 @@ pub const FetchCache = struct {
         submodules: bool = false,
     };
 
+    pub const UrlSpec = struct {
+        url: []const u8,
+        name: []const u8,
+    };
+
+    pub const UrlResult = struct {
+        path: []u8,
+        hash: []u8,
+
+        pub fn deinit(self: UrlResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+            allocator.free(self.hash);
+        }
+    };
+
     pub const GitResult = struct {
         out_path: []u8,
         rev: []u8,
@@ -62,6 +77,41 @@ pub const FetchCache = struct {
             return self.localGit(files, path, spec);
         }
         return self.remoteGit(files, spec);
+    }
+
+    pub fn fetchUrl(self: *FetchCache, files: *FileCache, spec: UrlSpec) !UrlResult {
+        const io = self.io orelse return error.FetchIoUnavailable;
+        const body = try self.fetchUrlBytes(files, spec.url);
+        defer self.allocator.free(body);
+
+        const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
+        errdefer self.allocator.free(hash);
+        const path = try self.urlCachePath(io, spec.name, hash);
+        errdefer self.allocator.free(path);
+
+        if (!try hostPathExists(io, path)) {
+            if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+        }
+
+        return .{ .path = path, .hash = hash };
+    }
+
+    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8) ![]u8 {
+        if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
+
+        const io = self.io orelse return error.FetchIoUnavailable;
+        var client = std.http.Client{ .allocator = self.allocator, .io = io };
+        defer client.deinit();
+
+        var body = std.Io.Writer.Allocating.init(self.allocator);
+        defer body.deinit();
+        const result = try client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &body.writer,
+        });
+        if (result.status.class() != .success) return error.FetchHttpStatus;
+        return body.toOwnedSlice();
     }
 
     fn localGit(self: *FetchCache, files: *FileCache, path: []const u8, spec: GitSpec) !GitResult {
@@ -154,6 +204,14 @@ pub const FetchCache = struct {
         const cwd = try std.process.currentPathAlloc(io, self.allocator);
         defer self.allocator.free(cwd);
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "git", digest[0..32] });
+    }
+
+    fn urlCachePath(self: *FetchCache, io: std.Io, name: []const u8, hash: []const u8) ![]u8 {
+        const cwd = try std.process.currentPathAlloc(io, self.allocator);
+        defer self.allocator.free(cwd);
+        const clean_name = try cleanStoreName(self.allocator, name);
+        defer self.allocator.free(clean_name);
+        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "url", hash[0..32], clean_name });
     }
 
     fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {
@@ -251,6 +309,23 @@ pub const FetchCache = struct {
         return error.FetchCommandFailed;
     }
 };
+
+fn cleanStoreName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const clean_name = try allocator.alloc(u8, name.len);
+    errdefer allocator.free(clean_name);
+    for (name, clean_name) |c, *out| {
+        out.* = if (c == '/' or c == 0 or std.ascii.isWhitespace(c)) '-' else c;
+    }
+    return clean_name;
+}
+
+fn hostPathExists(io: std.Io, path: []const u8) !bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
 
 fn localFetchPath(url: []const u8) ?[]const u8 {
     if (std.fs.path.isAbsolute(url)) return url;

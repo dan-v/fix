@@ -126,8 +126,8 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .fromTOML => builtinFromTOML(self, args[0]),
         .filterSource => builtinFilterSource(self, args[0], args[1]),
         .fetchGit => builtinFetchGit(self, args[0]),
+        .fetchurl => builtinFetchurl(self, args[0]),
         .toXML,
-        .fetchurl,
         .fetchTarball,
         .fetchMercurial,
         .fetchTree,
@@ -1291,6 +1291,53 @@ fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
         .ref = ref,
         .submodules = submodules,
     };
+}
+
+const FetchUrlSpec = struct {
+    url: []u8,
+    name: []u8,
+
+    fn deinit(self: FetchUrlSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.name);
+    }
+
+    fn borrowed(self: FetchUrlSpec) fetch_cache.FetchCache.UrlSpec {
+        return .{ .url = self.url, .name = self.name };
+    }
+};
+
+fn builtinFetchurl(self: anytype, arg: Value) !Value {
+    const spec = try fetchUrlSpec(self, arg);
+    defer spec.deinit(self.allocator);
+
+    const result = try self.fetchers.fetchUrl(self.files, spec.borrowed());
+    defer result.deinit(self.fetchers.allocator);
+    return Value.string(try self.intern.intern(result.path));
+}
+
+fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
+    const value = try self.forceValue(arg);
+    if (value.discriminant != .attrs) {
+        const url = try self.allocator.dupe(u8, try pathArg(self, value));
+        errdefer self.allocator.free(url);
+        return .{
+            .url = url,
+            .name = try defaultFetchName(self, url),
+        };
+    }
+
+    const attrs_id = value.asObjectId();
+    const url = try dupPathAttr(self, attrs_id, "url");
+    errdefer self.allocator.free(url);
+    const name = try optionalStringAttr(self, attrs_id, "name") orelse try defaultFetchName(self, url);
+    return .{ .url = url, .name = name };
+}
+
+fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {
+    const basename = path_ops.baseName(url);
+    if (basename.len != 0) return self.allocator.dupe(u8, basename);
+    return self.allocator.dupe(u8, "source");
 }
 
 fn dupPathAttr(self: anytype, attrs_id: ObjectId, name: []const u8) ![]u8 {

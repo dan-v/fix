@@ -1085,6 +1085,33 @@ test "evaluate fetchGit builtin for local repository" {
     try std.testing.expectEqual(@as(i64, 7), short_rev_len.asInt());
 }
 
+test "evaluate fetchurl builtin through fetch cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "payload.txt",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; }})", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
 test "evaluate findFile builtin through explicit search path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
