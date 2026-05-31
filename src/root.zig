@@ -570,6 +570,18 @@ test "end-to-end: builtins.toFile returns store-like string" {
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toFile \"x\" 1"));
 }
 
+test "end-to-end: derivation coerces string-like attrs" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const drv = try ev.evaluate(
+        "derivation { name = \"x\"; builder = { outPath = \"/nix/store/builder\"; }; system = \"x\"; src = { outPath = \"/nix/store/src\"; }; PATH = [ { outPath = \"/nix/store/bin\"; } ]; }",
+    );
+    try std.testing.expectEqual(value.ValueType.attrs, drv.discriminant);
+}
+
 test "end-to-end: with expressions" {
     const alloc = std.testing.allocator;
 

@@ -1237,7 +1237,7 @@ fn normalizedDerivationAttrs(self: anytype, attrs_id: ObjectId, outputs: []const
 fn coerceDerivationValue(self: anytype, value: Value) !Value {
     const forced = try self.forceValue(value);
     return switch (forced.discriminant) {
-        .string, .path, .int, .bool_true, .bool_false => coerceDerivationString(self, forced),
+        .string, .path, .int, .bool_true, .bool_false, .attrs => coerceDerivationString(self, forced),
         .list => coerceDerivationStringList(self, forced),
         else => error.TypeError,
     };
@@ -1255,6 +1255,7 @@ fn coerceDerivationString(self: anytype, value: Value) !Value {
         },
         .bool_true => Value.string(try self.intern.intern("1")),
         .bool_false => Value.string(try self.intern.intern("")),
+        .attrs => Value.string(try coerceAttrsToStringId(self, forced)),
         else => error.TypeError,
     };
 }
