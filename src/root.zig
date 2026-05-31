@@ -128,6 +128,18 @@ test "end-to-end: attribute access" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: unused attribute values are lazy" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("({ a = 42; b = 1 / 0; }).a");
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+
+    try std.testing.expectError(error.DivisionByZero, ev.evaluate("({ a = 1 / 0; }).a"));
+}
+
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 
@@ -135,6 +147,7 @@ test "end-to-end: duplicate attributes are rejected" {
     defer ev.deinit();
 
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1 / 0; a = 2; }"));
 }
 
 test "end-to-end: quoted attribute access" {

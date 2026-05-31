@@ -673,7 +673,7 @@ pub const VM = struct {
 
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
         if (attrs_val.discriminant != .attrs) return error.TypeError;
-        return self.heap.getAttrValue(attrs_val.asObjectId(), name_id);
+        return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
     }
 
     fn getAttrOrValue(self: *VM, attrs_val: Value, name_id: InternId, default_val: Value) Value {

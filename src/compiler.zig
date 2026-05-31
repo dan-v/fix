@@ -359,8 +359,8 @@ pub const Compiler = struct {
             const name_val = @import("value.zig").Value.string(name_id);
             try self.builder.emitConstant(self.allocator, name_val);
 
-            // Compile value.
-            try self.compileNode(entry.expr);
+            // Attribute values are lazy; selection forces the stored thunk.
+            try self.compileThunk(entry.expr);
         }
 
         try self.emitOpU16(.build_attrs, @intCast(count));
