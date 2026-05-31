@@ -99,12 +99,7 @@ pub const Evaluator = struct {
 
         compiler.compile(ast_node) catch |err| {
             try self.copyDiagnostics(compiler.diagnostics.items);
-            if (err == error.DuplicateAttribute or
-                err == error.DuplicateBinding or
-                err == error.UndefinedVariable)
-            {
-                return err;
-            }
+            if (preserveCompileError(err)) return err;
             return error.CompileError;
         };
 
@@ -135,6 +130,16 @@ pub const Evaluator = struct {
         const value = try builtins.buildAttrSet(&self.intern, &self.heap);
         self.builtins_value = value;
         return value;
+    }
+
+    fn preserveCompileError(err: anyerror) bool {
+        return switch (err) {
+            error.DuplicateAttribute,
+            error.DuplicateBinding,
+            error.UndefinedVariable,
+            => true,
+            else => false,
+        };
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
