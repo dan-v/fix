@@ -1397,13 +1397,91 @@ pub const VM = struct {
             };
         }
 
+        const normalized_attrs = try self.normalizedDerivationAttrs(attrs.asObjectId(), outputs);
+        defer self.allocator.free(normalized_attrs);
+
         return derivation.buildValue(self.allocator, self.intern, self.heap, .{
             .name = name,
             .drv_path = try derivation.drvPath(self.allocator, self.intern, name),
             .default_output = output_names[0],
             .outputs = outputs,
-            .original_attrs = try self.heap.getAttrs(attrs.asObjectId()),
+            .original_attrs = normalized_attrs,
         });
+    }
+
+    fn normalizedDerivationAttrs(self: *VM, attrs_id: ObjectId, outputs: []const derivation.Output) ![]heap_mod.AttrEntry {
+        const original = try self.heap.getAttrs(attrs_id);
+        const normalized = try self.allocator.alloc(heap_mod.AttrEntry, original.len);
+        errdefer self.allocator.free(normalized);
+
+        const structured_attrs_id = try self.intern.intern("__structuredAttrs");
+        const pass_as_file_id = try self.intern.intern("passAsFile");
+        const args_id = try self.intern.intern("args");
+        const builder_id = try self.intern.intern("builder");
+        const system_id = try self.intern.intern("system");
+
+        for (original, normalized) |entry, *out| {
+            if (derivation.isSyntheticName(self.intern, self.intern.get(entry.name), outputs)) {
+                out.* = entry;
+                continue;
+            }
+
+            if (entry.name == structured_attrs_id) {
+                const value = try self.forceValue(entry.value);
+                if (!value.isBool()) return error.TypeError;
+                out.* = .{ .name = entry.name, .value = value };
+                continue;
+            }
+
+            if (entry.name == pass_as_file_id or entry.name == args_id) {
+                out.* = .{ .name = entry.name, .value = try self.coerceDerivationStringList(entry.value) };
+                continue;
+            }
+
+            if (entry.name == builder_id or entry.name == system_id) {
+                out.* = .{ .name = entry.name, .value = try self.coerceDerivationString(entry.value) };
+                continue;
+            }
+
+            out.* = .{ .name = entry.name, .value = try self.coerceDerivationValue(entry.value) };
+        }
+
+        return normalized;
+    }
+
+    fn coerceDerivationValue(self: *VM, value: Value) !Value {
+        const forced = try self.forceValue(value);
+        return switch (forced.discriminant) {
+            .string, .path, .int, .bool_true, .bool_false => self.coerceDerivationString(forced),
+            .list => self.coerceDerivationStringList(forced),
+            else => error.TypeError,
+        };
+    }
+
+    fn coerceDerivationString(self: *VM, value: Value) !Value {
+        const forced = try self.forceValue(value);
+        return switch (forced.discriminant) {
+            .string => forced,
+            .path => Value.string(forced.asInternId()),
+            .int => blk: {
+                const text = try std.fmt.allocPrint(self.allocator, "{}", .{forced.asInt()});
+                defer self.allocator.free(text);
+                break :blk Value.string(try self.intern.intern(text));
+            },
+            .bool_true => Value.string(try self.intern.intern("1")),
+            .bool_false => Value.string(try self.intern.intern("")),
+            else => error.TypeError,
+        };
+    }
+
+    fn coerceDerivationStringList(self: *VM, value: Value) !Value {
+        const list = try self.forceValue(value);
+        if (list.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(list.asObjectId());
+        const coerced = try self.allocator.alloc(Value, items.len);
+        defer self.allocator.free(coerced);
+        for (items, coerced) |item, *out| out.* = try self.coerceDerivationString(item);
+        return Value.list(try self.heap.addList(coerced));
     }
 
     fn derivationOutputNames(self: *VM, attrs_id: ObjectId) ![]InternId {

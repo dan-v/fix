@@ -1109,6 +1109,14 @@ test "evaluate minimal derivation builtins" {
     const all_len = try renderForTest("builtins.length (builtins.derivation { name = \"pkg\"; outputs = [ \"out\" \"dev\" ]; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).all");
     defer std.testing.allocator.free(all_len);
     try std.testing.expectEqualStrings("2", all_len);
+
+    const coerced_int = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; version = 1; }).version");
+    defer std.testing.allocator.free(coerced_int);
+    try std.testing.expectEqualStrings("\"1\"", coerced_int);
+
+    const coerced_args = try renderForTest("builtins.head (builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ 1 ./foo ]; }).args");
+    defer std.testing.allocator.free(coerced_args);
+    try std.testing.expectEqualStrings("\"1\"", coerced_args);
 }
 
 test "evaluate foldl' builtin" {
