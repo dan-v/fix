@@ -14,6 +14,8 @@ pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
 pub const InternId = types.InternId;
 
+const OBJECTS_PER_PAGE: u32 = 256;
+
 pub const AttrEntry = struct {
     name: InternId,
     value: Value,
@@ -49,36 +51,46 @@ pub const Object = union(enum) {
 
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
-    objects: std.ArrayListUnmanaged(Object),
+    object_pages: std.ArrayListUnmanaged([]Object),
+    object_count: u32,
     values: std.ArrayListUnmanaged(Value),
     attrs: std.ArrayListUnmanaged(AttrEntry),
 
     pub fn init(allocator: std.mem.Allocator) ObjectHeap {
         return .{
             .allocator = allocator,
-            .objects = .empty,
+            .object_pages = .empty,
+            .object_count = 0,
             .values = .empty,
             .attrs = .empty,
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        for (self.object_pages.items) |page| {
+            self.allocator.free(page);
+        }
+        self.object_pages.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
-        self.objects.deinit(self.allocator);
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
-        try self.objects.append(self.allocator, object);
-        return @intCast(self.objects.items.len - 1);
+        const id = self.object_count;
+        try self.ensureObjectPage(id);
+        self.objectSlot(id).* = object;
+        self.object_count += 1;
+        return id;
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
-        return &self.objects.items[id];
+        std.debug.assert(id < self.object_count);
+        return self.objectSlot(id);
     }
 
     pub fn getConst(self: *const ObjectHeap, id: ObjectId) *const Object {
-        return &self.objects.items[id];
+        std.debug.assert(id < self.object_count);
+        return self.objectSlotConst(id);
     }
 
     pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
@@ -200,6 +212,27 @@ pub const ObjectHeap = struct {
         const end = start + range.len;
         return self.attrs.items[start..end];
     }
+
+    fn ensureObjectPage(self: *ObjectHeap, id: ObjectId) !void {
+        const page_index: usize = @intCast(id / OBJECTS_PER_PAGE);
+        if (page_index < self.object_pages.items.len) return;
+
+        std.debug.assert(page_index == self.object_pages.items.len);
+        const page = try self.allocator.alloc(Object, OBJECTS_PER_PAGE);
+        try self.object_pages.append(self.allocator, page);
+    }
+
+    fn objectSlot(self: *ObjectHeap, id: ObjectId) *Object {
+        const page_index: usize = @intCast(id / OBJECTS_PER_PAGE);
+        const slot: usize = @intCast(id % OBJECTS_PER_PAGE);
+        return &self.object_pages.items[page_index][slot];
+    }
+
+    fn objectSlotConst(self: *const ObjectHeap, id: ObjectId) *const Object {
+        const page_index: usize = @intCast(id / OBJECTS_PER_PAGE);
+        const slot: usize = @intCast(id % OBJECTS_PER_PAGE);
+        return &self.object_pages.items[page_index][slot];
+    }
 };
 
 test "object heap stores list and attrs payloads behind object ids" {
@@ -248,6 +281,24 @@ test "object heap preserves earlier ranges as side arenas grow" {
     try std.testing.expectEqual(@as(usize, 2), first.len);
     try std.testing.expectEqual(@as(i64, 1), first[0].asInt());
     try std.testing.expectEqual(@as(i64, 2), first[1].asInt());
+}
+
+test "object heap keeps object addresses stable across page growth" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const first_id = try heap.addCell(.{ .value = Value.int(1) });
+    const first_ptr = heap.get(first_id);
+    const first_addr = @intFromPtr(first_ptr);
+
+    var i: usize = 0;
+    while (i < OBJECTS_PER_PAGE * 3) : (i += 1) {
+        _ = try heap.addCell(.{ .value = Value.int(@intCast(i)) });
+    }
+
+    try std.testing.expectEqual(first_addr, @intFromPtr(heap.get(first_id)));
+    try heap.setCellValue(first_id, Value.int(99));
+    try std.testing.expectEqual(@as(i64, 99), (try heap.getCellValue(first_id)).asInt());
 }
 
 test "object heap stores closures and mutable runtime cells" {
