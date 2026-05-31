@@ -309,6 +309,12 @@ pub const Parser = struct {
         var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
+            if (self.match(.kw_inherit)) {
+                try self.inheritAttrs(arena_allocator, &entries);
+                _ = try self.expect(.semicolon, "Expected ';' after inherit.");
+                continue;
+            }
+
             const path = try self.attrDeclarationPath(arena_allocator);
             _ = try self.expect(.equal, "Expected '=' after attribute name.");
             // allow missing semicolons by checking what comes next
@@ -334,6 +340,29 @@ pub const Parser = struct {
                 .recursive = recursive,
             },
         });
+    }
+
+    fn inheritAttrs(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        entries: *std.ArrayListUnmanaged(Node.AttrSetEntry),
+    ) !void {
+        while (!self.check(.semicolon) and !self.check(.right_brace) and !self.check(.eof)) {
+            const name_tok = self.current;
+            _ = try self.expect(.identifier, "Expected inherited variable name.");
+
+            const path = try allocator.alloc(Node.Atom, 1);
+            path[0] = .{
+                .offset = name_tok.offset,
+                .len = name_tok.len,
+            };
+            const expr = try self.arena.createNode(.identifier, .{ .atom = path[0] });
+
+            try entries.append(allocator, .{
+                .path = path,
+                .expr = expr,
+            });
+        }
     }
 
     fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
@@ -582,6 +611,33 @@ test "parser recognizes nested attr declarations" {
         .len = entries[1].path[1].len,
         .line = 1,
     }));
+}
+
+test "parser desugars simple inherit in attrsets" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit a b; }");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    const entries = node.data.attr_set.entries;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 1), entries[0].path.len);
+    try std.testing.expectEqualStrings("a", parser.span(.{
+        .type = .identifier,
+        .offset = entries[0].path[0].offset,
+        .len = entries[0].path[0].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.identifier, entries[0].expr.tag);
+    try std.testing.expectEqualStrings("b", parser.span(.{
+        .type = .identifier,
+        .offset = entries[1].path[0].offset,
+        .len = entries[1].path[0].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.tag);
 }
 
 test "parser recognizes attr path or default" {

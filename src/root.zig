@@ -175,6 +175,22 @@ test "end-to-end: attribute set" {
     try std.testing.expectEqual(value.ValueType.attrs, result.discriminant);
 }
 
+test "end-to-end: simple inherit in attrsets" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const inherited = try ev.evaluate("let x = 1; y = 2; in ({ inherit x y; }).y");
+    try std.testing.expectEqual(@as(i64, 2), inherited.asInt());
+
+    const recursive = try ev.evaluate("let a = { inherit a; }; in a");
+    try std.testing.expectEqual(value.ValueType.attrs, recursive.discriminant);
+
+    const nested = try ev.evaluate("(let a = { inherit a; }; in a).a.a");
+    try std.testing.expectEqual(value.ValueType.attrs, nested.discriminant);
+}
+
 test "end-to-end: list elements are lazy" {
     const alloc = std.testing.allocator;
 
