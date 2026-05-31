@@ -564,6 +564,20 @@ test "evaluate all and any builtins" {
     try std.testing.expectEqualStrings("false", any_false);
 }
 
+test "evaluate filter builtin" {
+    const filtered = try renderForTest("builtins.filter (x: x < 3) [ 1 4 2 ]");
+    defer std.testing.allocator.free(filtered);
+    try std.testing.expectEqualStrings("[ 1 2 ]", filtered);
+
+    const length_lazy = try renderForTest("builtins.length (builtins.filter (x: true) [ (1 / 0) ])");
+    defer std.testing.allocator.free(length_lazy);
+    try std.testing.expectEqualStrings("1", length_lazy);
+
+    const reject_lazy = try renderForTest("builtins.filter (x: false) [ (1 / 0) ]");
+    defer std.testing.allocator.free(reject_lazy);
+    try std.testing.expectEqualStrings("[ ]", reject_lazy);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

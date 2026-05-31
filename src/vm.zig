@@ -787,6 +787,7 @@ pub const VM = struct {
             .seq => self.builtinSeq(args[0], args[1]),
             .all => self.builtinAll(args[0], args[1]),
             .any => self.builtinAny(args[0], args[1]),
+            .filter => self.builtinFilter(args[0], args[1]),
         };
     }
 
@@ -1007,6 +1008,23 @@ pub const VM = struct {
             if (result.discriminant == .bool_true) return Value.boolVal(true);
         }
         return Value.boolVal(false);
+    }
+
+    fn builtinFilter(self: *VM, pred_arg: Value, list_arg: Value) !Value {
+        const pred = try self.forceValue(pred_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        var out: std.ArrayListUnmanaged(Value) = .empty;
+        defer out.deinit(self.allocator);
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const result = try self.forceValue(try self.callValue(pred, item));
+            if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+            if (result.discriminant == .bool_true) try out.append(self.allocator, item);
+        }
+
+        return Value.list(try self.heap.addList(out.items));
     }
 
     fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {

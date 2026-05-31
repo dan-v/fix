@@ -34,6 +34,7 @@ pub const BuiltinId = enum(u16) {
     seq = 24,
     all = 25,
     any = 26,
+    filter = 27,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -66,6 +67,7 @@ pub fn arity(id: BuiltinId) u8 {
         .seq,
         .all,
         .any,
+        .filter,
         => 2,
     };
 }
@@ -179,6 +181,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("any"),
             .value = Value.builtin(@intFromEnum(BuiltinId.any)),
+        },
+        .{
+            .name = try intern.intern("filter"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.filter)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

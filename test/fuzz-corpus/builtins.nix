@@ -42,3 +42,6 @@ builtins.all (x: x < 3) [ 1 2 ]
 builtins.all (x: x < 3) [ 1 4 (1 / 0) ]
 builtins.any (x: x == 2) [ 1 2 (1 / 0) ]
 builtins.any (x: x == 2) [ 1 3 ]
+builtins.filter (x: x < 3) [ 1 4 2 ]
+builtins.length (builtins.filter (x: true) [ (1 / 0) ])
+builtins.filter (x: false) [ (1 / 0) ]
