@@ -1,0 +1,114 @@
+//! Evaluator-owned filesystem cache.
+//!
+//! The VM talks to this cache, not directly to the host filesystem. Cold reads
+//! are isolated behind `readFile`/`pathExists`; a later async backend can make
+//! those calls suspend/reschedule evaluator work without changing builtin
+//! semantics or VM call sites.
+
+const std = @import("std");
+
+pub const FileCache = struct {
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    entries: std.StringHashMapUnmanaged(Entry),
+
+    const max_read_bytes = 128 * 1024 * 1024;
+
+    const Entry = struct {
+        path: []u8,
+        exists_known: bool = false,
+        exists: bool = false,
+        contents: ?[]u8 = null,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) FileCache {
+        return .{
+            .allocator = allocator,
+            .io = null,
+            .entries = .empty,
+        };
+    }
+
+    pub fn deinit(self: *FileCache) void {
+        var iter = self.entries.iterator();
+        while (iter.next()) |kv| {
+            self.allocator.free(kv.value_ptr.path);
+            if (kv.value_ptr.contents) |contents| self.allocator.free(contents);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn setIo(self: *FileCache, io: std.Io) void {
+        self.io = io;
+    }
+
+    pub fn pathExists(self: *FileCache, path: []const u8) !bool {
+        var entry = try self.entryFor(path);
+        if (entry.exists_known) return entry.exists;
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        std.Io.Dir.accessAbsolute(io, entry.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                entry.exists_known = true;
+                entry.exists = false;
+                return false;
+            },
+            else => return err,
+        };
+
+        entry.exists_known = true;
+        entry.exists = true;
+        return true;
+    }
+
+    pub fn readFile(self: *FileCache, path: []const u8) ![]const u8 {
+        var entry = try self.entryFor(path);
+        if (entry.contents) |contents| return contents;
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        const contents = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            entry.path,
+            self.allocator,
+            .limited(max_read_bytes),
+        );
+        errdefer self.allocator.free(contents);
+
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.contents = contents;
+        return contents;
+    }
+
+    fn entryFor(self: *FileCache, path: []const u8) !*Entry {
+        if (self.entries.getPtr(path)) |entry| return entry;
+
+        const canonical = try self.canonicalPath(path);
+        errdefer self.allocator.free(canonical);
+
+        const gop = try self.entries.getOrPut(self.allocator, canonical);
+        if (gop.found_existing) {
+            self.allocator.free(canonical);
+            return gop.value_ptr;
+        }
+
+        gop.key_ptr.* = canonical;
+        gop.value_ptr.* = .{ .path = canonical };
+        return gop.value_ptr;
+    }
+
+    fn canonicalPath(self: *FileCache, path: []const u8) ![]u8 {
+        if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
+        if (!needsNormalize(path)) return self.allocator.dupe(u8, path);
+        return std.fs.path.resolve(self.allocator, &.{path});
+    }
+
+    fn needsNormalize(path: []const u8) bool {
+        var parts = std.mem.splitScalar(u8, path, '/');
+        while (parts.next()) |part| {
+            if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return true;
+        }
+        return false;
+    }
+};
+

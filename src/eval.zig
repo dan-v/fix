@@ -11,6 +11,7 @@ const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
+const FileCache = @import("file_cache.zig").FileCache;
 const Value = @import("value.zig").Value;
 const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
@@ -25,6 +26,7 @@ pub const Evaluator = struct {
     registry: ChunkRegistry,
     scheduler: Scheduler,
     heap: ObjectHeap,
+    files: FileCache,
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
     base_path: ?[:0]u8,
@@ -40,6 +42,7 @@ pub const Evaluator = struct {
             .registry = try ChunkRegistry.init(allocator),
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
+            .files = FileCache.init(allocator),
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
             .base_path = null,
@@ -51,6 +54,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         if (self.base_path) |path| self.allocator.free(path);
         self.diagnostics.deinit(self.allocator);
+        self.files.deinit();
         self.heap.deinit();
         self.runtime_arena.deinit();
         self.scheduler.deinit();
@@ -63,8 +67,13 @@ pub const Evaluator = struct {
     }
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
+        self.files.setIo(io);
         if (self.base_path) |path| self.allocator.free(path);
         self.base_path = try std.process.currentPathAlloc(io, self.allocator);
+    }
+
+    pub fn setFileIo(self: *Evaluator, io: std.Io) void {
+        self.files.setIo(io);
     }
 
     fn clearDiagnostics(self: *Evaluator) void {
@@ -125,6 +134,7 @@ pub const Evaluator = struct {
             &self.registry,
             &self.intern,
             &self.heap,
+            &self.files,
             &self.scheduler,
             try self.ensureBuiltins(),
             0,
@@ -558,6 +568,41 @@ test "evaluate deepSeq builtin" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("builtins.deepSeq [ (1 / 0) ] 2"));
+}
+
+test "evaluate pathExists and readFile builtins through file cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.txt", .data = "abc\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "input.txt",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const exists_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.pathExists \"{s}\"", .{file_path});
+    defer std.testing.allocator.free(exists_source);
+    const read_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile \"{s}\"", .{file_path});
+    defer std.testing.allocator.free(read_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const exists = try ev.evaluate(exists_source);
+    try std.testing.expect(exists.asBool());
+
+    const contents = try ev.evaluate(read_source);
+    try std.testing.expectEqualStrings("abc\n", ev.intern.get(contents.asInternId()));
+
+    const reread = try ev.evaluate(read_source);
+    try std.testing.expectEqual(contents.asInternId(), reread.asInternId());
 }
 
 test "evaluate all and any builtins" {

@@ -26,6 +26,7 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const Closure = heap_mod.Closure;
+const FileCache = @import("file_cache.zig").FileCache;
 const builtins_mod = @import("builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 
@@ -52,6 +53,8 @@ pub const VM = struct {
     intern: *InternTable,
     /// Runtime object heap.
     heap: *ObjectHeap,
+    /// Evaluator-owned filesystem cache.
+    files: *FileCache,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
     /// Cached evaluator-owned builtins attrset.
@@ -71,6 +74,7 @@ pub const VM = struct {
         registry: *const ChunkRegistry,
         intern: *InternTable,
         heap: *ObjectHeap,
+        files: *FileCache,
         scheduler: *Scheduler,
         builtins: Value,
         worker_id: u8,
@@ -80,6 +84,7 @@ pub const VM = struct {
             .registry = registry,
             .intern = intern,
             .heap = heap,
+            .files = files,
             .scheduler = scheduler,
             .builtins = builtins,
             .worker_id = worker_id,
@@ -778,6 +783,8 @@ pub const VM = struct {
             .typeOf => self.builtinTypeOf(args[0]),
             .concatLists => self.builtinConcatLists(args[0]),
             .listToAttrs => self.builtinListToAttrs(args[0]),
+            .pathExists => self.builtinPathExists(args[0]),
+            .readFile => self.builtinReadFile(args[0]),
             .hasAttr => self.builtinHasAttr(args[0], args[1]),
             .getAttr => self.builtinGetAttr(args[0], args[1]),
             .elemAt => self.builtinElemAt(args[0], args[1]),
@@ -893,6 +900,23 @@ pub const VM = struct {
         }
 
         return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    fn builtinPathExists(self: *VM, arg: Value) !Value {
+        return Value.boolVal(try self.files.pathExists(try self.pathArg(arg)));
+    }
+
+    fn builtinReadFile(self: *VM, arg: Value) !Value {
+        const contents = try self.files.readFile(try self.pathArg(arg));
+        return Value.string(try self.intern.intern(contents));
+    }
+
+    fn pathArg(self: *VM, arg: Value) ![]const u8 {
+        const value = try self.forceValue(arg);
+        return switch (value.discriminant) {
+            .path, .string => self.intern.get(value.asInternId()),
+            else => error.TypeError,
+        };
     }
 
     fn attrEntryNameIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize {

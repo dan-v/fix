@@ -37,6 +37,8 @@ pub const BuiltinId = enum(u16) {
     filter = 27,
     foldlStrict = 28,
     deepSeq = 29,
+    pathExists = 30,
+    readFile = 31,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -59,6 +61,8 @@ pub fn arity(id: BuiltinId) u8 {
         .typeOf,
         .concatLists,
         .listToAttrs,
+        .pathExists,
+        .readFile,
         => 1,
         .hasAttr,
         .getAttr,
@@ -197,6 +201,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("deepSeq"),
             .value = Value.builtin(@intFromEnum(BuiltinId.deepSeq)),
+        },
+        .{
+            .name = try intern.intern("pathExists"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.pathExists)),
+        },
+        .{
+            .name = try intern.intern("readFile"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.readFile)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

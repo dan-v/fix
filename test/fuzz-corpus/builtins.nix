@@ -40,6 +40,8 @@ builtins.seq [ (1 / 0) ] 2
 let x = builtins.seq (1 / 0) 2; in 3
 builtins.deepSeq { a = 1; b = [ 2 ]; } 3
 let x = builtins.deepSeq [ (1 / 0) ] 2; in 3
+builtins.pathExists ./test/fuzz-corpus/builtins.nix
+builtins.isString (builtins.readFile ./test/fuzz-corpus/basics.nix)
 builtins.all (x: x < 3) [ 1 2 ]
 builtins.all (x: x < 3) [ 1 4 (1 / 0) ]
 builtins.any (x: x == 2) [ 1 2 (1 / 0) ]

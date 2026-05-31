@@ -16,6 +16,7 @@ pub const env = @import("env.zig");
 pub const intern = @import("intern.zig");
 pub const thunk = @import("thunk.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const file_cache = @import("file_cache.zig");
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
 pub const builtins = @import("builtins.zig");
