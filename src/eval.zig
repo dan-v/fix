@@ -1,18 +1,13 @@
 //! Evaluator — the top-level orchestration layer.
 //!
-//! Manages the shared state (chunk registry, intern table, memo cache,
-//! scheduler) and runs the worker threads that execute bytecode.
-//!
-//! This is where aggressive normalization happens: before evaluating a chunk,
-//! we check the memo cache. If the chunk+environment pair has been evaluated
-//! before, we return the cached result immediately.
+//! Manages the shared state (chunk registry, intern table, scheduler) and runs
+//! the worker threads that execute bytecode.
 
 const std = @import("std");
 const types = @import("types.zig");
 const InternTable = @import("intern.zig").InternTable;
 const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
 const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
-const MemoCache = @import("cache.zig").MemoCache;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
@@ -22,21 +17,18 @@ pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
     registry: ChunkRegistry,
-    cache: MemoCache,
     scheduler: Scheduler,
     heap: ObjectHeap,
     runtime_arena: std.heap.ArenaAllocator,
     worker_count: u8,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
-        const cache = try MemoCache.init(allocator, types.CACHE_INITIAL_CAP);
         const scheduler = try Scheduler.init(allocator, worker_count);
 
         return .{
             .allocator = allocator,
             .intern = try InternTable.init(allocator),
             .registry = try ChunkRegistry.init(allocator),
-            .cache = cache,
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
@@ -49,7 +41,6 @@ pub const Evaluator = struct {
         self.runtime_arena.deinit();
         self.scheduler.deinit();
         self.registry.deinit();
-        self.cache.deinit();
         self.intern.deinit();
     }
 
@@ -96,7 +87,6 @@ pub const Evaluator = struct {
         var vm = try VM.init(
             self.runtime_arena.allocator(),
             &self.registry,
-            &self.cache,
             &self.heap,
             &self.scheduler,
             0,

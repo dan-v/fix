@@ -8,7 +8,6 @@
 //!   - Direct-threaded dispatch via switch statement
 //!   - Value stack (growable, contiguous memory)
 //!   - Frame stack (call frames with return info)
-//!   - Integration with MemoCache for aggressive normalization
 //!   - Atomic thunk integration for lazy evaluation
 
 const std = @import("std");
@@ -21,7 +20,6 @@ const OpCode = @import("opcode.zig").OpCode;
 const chunk = @import("chunk.zig");
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
-const MemoCache = @import("cache.zig").MemoCache;
 const Thunk = @import("thunk.zig").Thunk;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
@@ -47,8 +45,6 @@ pub const VM = struct {
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs).
     registry: *const ChunkRegistry,
-    /// Global memoization cache (shared).
-    cache: *MemoCache,
     /// Runtime object heap.
     heap: *ObjectHeap,
     /// Global scheduler (for spawning work).
@@ -66,7 +62,6 @@ pub const VM = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *const ChunkRegistry,
-        cache: *MemoCache,
         heap: *ObjectHeap,
         scheduler: *Scheduler,
         worker_id: u8,
@@ -74,7 +69,6 @@ pub const VM = struct {
         return .{
             .allocator = allocator,
             .registry = registry,
-            .cache = cache,
             .heap = heap,
             .scheduler = scheduler,
             .worker_id = worker_id,

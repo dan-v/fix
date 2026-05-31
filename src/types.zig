@@ -18,9 +18,6 @@ pub const CHUNK_CONSTANTS_CAP: usize = 128;
 /// Initial capacity for bytecode in a chunk.
 pub const CHUNK_CODE_CAP: usize = 256;
 
-/// How many entries a newborn memo table can hold before growing.
-pub const CACHE_INITIAL_CAP: usize = 4096;
-
 /// A small identifier for interned strings.
 pub const InternId = u32;
 pub const INTERN_ID_NONE: InternId = std.math.maxInt(InternId);
@@ -38,9 +35,6 @@ pub const ConstIdx = u16;
 /// An index into the evaluator object heap.
 pub const ObjectId = u32;
 pub const OBJECT_ID_NONE: ObjectId = std.math.maxInt(ObjectId);
-
-/// A fingerprint for memoization (hash of expression + environment).
-pub const MemoHash = u64;
 
 /// The result of attempting to force a thunk.
 pub const ForceResult = enum(u8) {
