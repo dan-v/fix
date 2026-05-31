@@ -17,7 +17,6 @@ pub const Output = struct {
 };
 
 pub const Spec = struct {
-    name: []const u8,
     drv_path: InternId,
     default_output: InternId,
     outputs: []const Output,

@@ -1168,7 +1168,7 @@ fn builtinDerivation(self: anytype, arg: Value) !Value {
     const name_id = try self.intern.intern("name");
     const name_value = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
     if (name_value.discriminant != .string) return error.TypeError;
-    const name = self.intern.get(name_value.asInternId());
+    const drv_name_id = name_value.asInternId();
 
     const output_names = try derivationOutputNames(self, attrs.asObjectId());
     defer self.allocator.free(output_names);
@@ -1178,7 +1178,7 @@ fn builtinDerivation(self: anytype, arg: Value) !Value {
     for (output_names, outputs) |output_name, *output| {
         output.* = .{
             .name = output_name,
-            .out_path = try derivation.storePath(self.allocator, self.intern, name, self.intern.get(output_name)),
+            .out_path = try derivation.storePath(self.allocator, self.intern, self.intern.get(drv_name_id), self.intern.get(output_name)),
         };
     }
 
@@ -1186,8 +1186,7 @@ fn builtinDerivation(self: anytype, arg: Value) !Value {
     defer self.allocator.free(normalized_attrs);
 
     return derivation.buildValue(self.allocator, self.intern, self.heap, .{
-        .name = name,
-        .drv_path = try derivation.drvPath(self.allocator, self.intern, name),
+        .drv_path = try derivation.drvPath(self.allocator, self.intern, self.intern.get(drv_name_id)),
         .default_output = output_names[0],
         .outputs = outputs,
         .original_attrs = normalized_attrs,
