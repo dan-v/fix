@@ -431,6 +431,7 @@ pub const Parser = struct {
 
                 if (self.match(.right_brace)) break;
                 _ = try self.expect(.comma, "Expected ',' or '}' in function argument set.");
+                if (self.match(.right_brace)) break;
             }
         }
 
