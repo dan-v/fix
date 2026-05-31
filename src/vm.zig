@@ -777,6 +777,9 @@ pub const VM = struct {
             try self.push(try self.applyBuiltin(callee.asBuiltinId(), &.{arg}));
         } else if (callee.discriminant == .builtin_closure) {
             try self.push(try self.applyBuiltinClosure(callee, arg));
+        } else if (callee.discriminant == .attrs) {
+            const callable = try self.callAttrFunctor(callee);
+            try self.doCall(callable, arg);
         } else {
             return error.NotCallable;
         }
@@ -798,7 +801,20 @@ pub const VM = struct {
         if (callee.discriminant == .builtin_closure) {
             return self.applyBuiltinClosure(callee, arg);
         }
+        if (callee.discriminant == .attrs) {
+            const callable = try self.callAttrFunctor(callee);
+            return self.callValue(callable, arg);
+        }
         return error.NotCallable;
+    }
+
+    fn callAttrFunctor(self: *VM, callee: Value) !Value {
+        const functor_id = try self.intern.intern("__functor");
+        const functor = self.heap.getAttrValue(callee.asObjectId(), functor_id) catch |err| switch (err) {
+            error.MissingAttribute => return error.NotCallable,
+            else => return err,
+        };
+        return self.callValue(try self.forceValue(functor), callee);
     }
 
     fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {

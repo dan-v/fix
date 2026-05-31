@@ -698,6 +698,12 @@ test "end-to-end: single argument lambdas" {
 
     const captured = try ev.evaluate("let y = 1; in (x: x + y) 41");
     try std.testing.expectEqual(@as(i64, 42), captured.asInt());
+
+    const functor = try ev.evaluate("let f = { base = 40; __functor = self: x: self.base + x; }; in f 2");
+    try std.testing.expectEqual(@as(i64, 42), functor.asInt());
+
+    const returned_functor = try ev.evaluate("let f = { __functor = self: x: x; }; g = { __functor = self: x: f; }; in g 0 42");
+    try std.testing.expectEqual(@as(i64, 42), returned_functor.asInt());
 }
 
 test "end-to-end: builtins.toString" {
