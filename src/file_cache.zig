@@ -14,11 +14,33 @@ pub const FileCache = struct {
 
     const max_read_bytes = 128 * 1024 * 1024;
 
+    pub const FileKind = enum {
+        regular,
+        directory,
+        symlink,
+        unknown,
+
+        pub fn nixTypeName(self: FileKind) []const u8 {
+            return switch (self) {
+                .regular => "regular",
+                .directory => "directory",
+                .symlink => "symlink",
+                .unknown => "unknown",
+            };
+        }
+    };
+
+    pub const DirEntry = struct {
+        name: []u8,
+        kind: FileKind,
+    };
+
     const Entry = struct {
         path: []u8,
         exists_known: bool = false,
         exists: bool = false,
         contents: ?[]u8 = null,
+        dir_entries: ?[]DirEntry = null,
     };
 
     pub fn init(allocator: std.mem.Allocator) FileCache {
@@ -34,6 +56,7 @@ pub const FileCache = struct {
         while (iter.next()) |kv| {
             self.allocator.free(kv.value_ptr.path);
             if (kv.value_ptr.contents) |contents| self.allocator.free(contents);
+            if (kv.value_ptr.dir_entries) |entries| self.freeDirEntries(entries);
         }
         self.entries.deinit(self.allocator);
     }
@@ -80,6 +103,38 @@ pub const FileCache = struct {
         return contents;
     }
 
+    pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
+        var entry = try self.entryFor(path);
+        if (entry.dir_entries) |entries| return entries;
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        var dir = try std.Io.Dir.cwd().openDir(io, entry.path, .{ .iterate = true });
+        defer dir.close(io);
+
+        var owned_entries: std.ArrayListUnmanaged(DirEntry) = .empty;
+        errdefer {
+            self.freeDirEntries(owned_entries.items);
+            owned_entries.deinit(self.allocator);
+        }
+
+        var iter = dir.iterate();
+        while (try iter.next(io)) |dir_entry| {
+            const name = try self.allocator.dupe(u8, dir_entry.name);
+            owned_entries.append(self.allocator, .{
+                .name = name,
+                .kind = fileKindFromStd(dir_entry.kind),
+            }) catch |err| {
+                self.allocator.free(name);
+                return err;
+            };
+        }
+
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.dir_entries = try owned_entries.toOwnedSlice(self.allocator);
+        return entry.dir_entries.?;
+    }
+
     fn entryFor(self: *FileCache, path: []const u8) !*Entry {
         if (self.entries.getPtr(path)) |entry| return entry;
 
@@ -110,5 +165,18 @@ pub const FileCache = struct {
         }
         return false;
     }
-};
 
+    fn freeDirEntries(self: *FileCache, entries: []DirEntry) void {
+        for (entries) |dir_entry| self.allocator.free(dir_entry.name);
+        self.allocator.free(entries);
+    }
+
+    fn fileKindFromStd(kind: std.Io.File.Kind) FileKind {
+        return switch (kind) {
+            .file => .regular,
+            .directory => .directory,
+            .sym_link => .symlink,
+            else => .unknown,
+        };
+    }
+};

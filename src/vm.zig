@@ -794,6 +794,7 @@ pub const VM = struct {
             .pathExists => self.builtinPathExists(args[0]),
             .readFile => self.builtinReadFile(args[0]),
             .import => self.builtinImport(args[0]),
+            .readDir => self.builtinReadDir(args[0]),
             .hasAttr => self.builtinHasAttr(args[0], args[1]),
             .getAttr => self.builtinGetAttr(args[0], args[1]),
             .elemAt => self.builtinElemAt(args[0], args[1]),
@@ -923,6 +924,22 @@ pub const VM = struct {
     fn builtinImport(self: *VM, arg: Value) !Value {
         const host = self.import_host orelse return error.ImportUnavailable;
         return host.import_value(host.context, try self.pathArg(arg));
+    }
+
+    fn builtinReadDir(self: *VM, arg: Value) !Value {
+        const dir_entries = try self.files.readDir(try self.pathArg(arg));
+        var attrs: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer attrs.deinit(self.allocator);
+        try attrs.ensureTotalCapacity(self.allocator, dir_entries.len);
+
+        for (dir_entries) |dir_entry| {
+            attrs.appendAssumeCapacity(.{
+                .name = try self.intern.intern(dir_entry.name),
+                .value = Value.string(try self.intern.intern(dir_entry.kind.nixTypeName())),
+            });
+        }
+
+        return Value.attrs(try self.heap.addAttrs(attrs.items));
     }
 
     fn pathArg(self: *VM, arg: Value) ![]const u8 {

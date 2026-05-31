@@ -695,6 +695,38 @@ test "read source files through evaluator file cache" {
     try std.testing.expectEqual(@intFromPtr(source.ptr), @intFromPtr(cached_source.ptr));
 }
 
+test "evaluate readDir builtin through file cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "file.txt", .data = "x" });
+    try tmp.dir.createDir(std.testing.io, "sub", .default_dir);
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(dir_path);
+
+    const file_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.getAttr \"file.txt\" (builtins.readDir {s})", .{dir_path});
+    defer std.testing.allocator.free(file_source);
+    const dir_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.readDir {s}).sub", .{dir_path});
+    defer std.testing.allocator.free(dir_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const file_kind = try ev.evaluate(file_source);
+    try std.testing.expectEqualStrings("regular", ev.intern.get(file_kind.asInternId()));
+
+    const dir_kind = try ev.evaluate(dir_source);
+    try std.testing.expectEqualStrings("directory", ev.intern.get(dir_kind.asInternId()));
+}
+
 test "evaluate import through evaluator file cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

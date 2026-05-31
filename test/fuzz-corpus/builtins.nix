@@ -45,6 +45,7 @@ builtins.isString (builtins.readFile ./test/fuzz-corpus/basics.nix)
 (import ./test/fuzz-corpus/imported.nix).value
 (builtins.import ./test/fuzz-corpus/imported.nix).value
 (import ./test/fuzz-corpus/import-dir).value
+builtins.getAttr "default.nix" (builtins.readDir ./test/fuzz-corpus/import-dir)
 builtins.all (x: x < 3) [ 1 2 ]
 builtins.all (x: x < 3) [ 1 4 (1 / 0) ]
 builtins.any (x: x == 2) [ 1 2 (1 / 0) ]

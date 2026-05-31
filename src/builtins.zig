@@ -40,6 +40,7 @@ pub const BuiltinId = enum(u16) {
     pathExists = 30,
     readFile = 31,
     import = 32,
+    readDir = 33,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -65,6 +66,7 @@ pub fn arity(id: BuiltinId) u8 {
         .pathExists,
         .readFile,
         .import,
+        .readDir,
         => 1,
         .hasAttr,
         .getAttr,
@@ -215,6 +217,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("import"),
             .value = Value.builtin(@intFromEnum(BuiltinId.import)),
+        },
+        .{
+            .name = try intern.intern("readDir"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.readDir)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));
