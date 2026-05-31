@@ -22,6 +22,13 @@ fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
     return null;
 }
 
+fn firstReplacementIdAt(self: anytype, input: []const u8, needles: []const InternId) ?usize {
+    for (needles, 0..) |needle_id, i| {
+        if (std.mem.startsWith(u8, input, self.intern.get(needle_id))) return i;
+    }
+    return null;
+}
+
 pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value {
     const id: BuiltinId = @enumFromInt(builtin_id);
     const arity = builtins_mod.arity(id);
@@ -317,8 +324,11 @@ fn builtinZipAttrsValue(self: anytype, func_arg: Value, name_arg: Value, values_
 }
 
 fn builtinHashString(self: anytype, algorithm_arg: Value, string_arg: Value) !Value {
-    const algorithm = try stringArg(self, algorithm_arg);
-    const string = try stringArg(self, string_arg);
+    const algorithm_value = try self.forceValue(algorithm_arg);
+    const string_value = try self.forceValue(string_arg);
+    if (algorithm_value.discriminant != .string or string_value.discriminant != .string) return error.TypeError;
+    const algorithm = self.intern.get(algorithm_value.asInternId());
+    const string = self.intern.get(string_value.asInternId());
     const digest = try nix_hash.hashBytes(self.allocator, algorithm, string);
     defer self.allocator.free(digest);
     return Value.string(try self.intern.intern(digest));
@@ -454,8 +464,11 @@ fn attrsFromJson(self: anytype, object: anytype) !Value {
 }
 
 fn builtinCompareVersions(self: anytype, left_arg: Value, right_arg: Value) !Value {
-    const left = try stringArg(self, left_arg);
-    const right = try stringArg(self, right_arg);
+    const left_value = try self.forceValue(left_arg);
+    const right_value = try self.forceValue(right_arg);
+    if (left_value.discriminant != .string or right_value.discriminant != .string) return error.TypeError;
+    const left = self.intern.get(left_value.asInternId());
+    const right = self.intern.get(right_value.asInternId());
     return Value.int(try version.compareVersions(self.allocator, left, right));
 }
 
@@ -988,16 +1001,27 @@ fn builtinStringLength(self: anytype, arg: Value) !Value {
 }
 
 fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Value {
-    const sep = try stringArg(self, sep_arg);
+    const sep_value = try self.forceValue(sep_arg);
     const list = try self.forceValue(list_arg);
-    if (list.discriminant != .list) return error.TypeError;
+    if (sep_value.discriminant != .string or list.discriminant != .list) return error.TypeError;
+
+    const items = try self.heap.getList(list.asObjectId());
+    const item_ids = try self.allocator.alloc(InternId, items.len);
+    defer self.allocator.free(item_ids);
+    for (items, item_ids) |item, *id| {
+        const value = try self.forceValue(item);
+        if (value.discriminant != .string) return error.TypeError;
+        id.* = value.asInternId();
+    }
+
+    const sep = self.intern.get(sep_value.asInternId());
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
-    for (try self.heap.getList(list.asObjectId()), 0..) |item, i| {
+    for (item_ids, 0..) |item_id, i| {
         if (i > 0) try out.appendSlice(self.allocator, sep);
-        try out.appendSlice(self.allocator, try stringArg(self, item));
+        try out.appendSlice(self.allocator, self.intern.get(item_id));
     }
 
     return Value.string(try self.intern.intern(out.items));
@@ -1019,22 +1043,23 @@ fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg:
 }
 
 fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
-    const from = try stringListArg(self, from_arg);
-    defer self.allocator.free(from);
-    const to = try stringListArg(self, to_arg);
-    defer self.allocator.free(to);
-    if (from.len != to.len) return error.TypeError;
+    const from_ids = try stringListInternIdsArg(self, from_arg);
+    defer self.allocator.free(from_ids);
+    const to_ids = try stringListInternIdsArg(self, to_arg);
+    defer self.allocator.free(to_ids);
+    const input_value = try self.forceValue(string_arg);
+    if (from_ids.len != to_ids.len or input_value.discriminant != .string) return error.TypeError;
 
-    const input = try stringArg(self, string_arg);
+    const input = self.intern.get(input_value.asInternId());
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
 
     var index: usize = 0;
     while (index < input.len) {
-        if (firstReplacementAt(input[index..], from)) |replacement_index| {
-            const needle = from[replacement_index];
+        if (firstReplacementIdAt(self, input[index..], from_ids)) |replacement_index| {
+            const needle = self.intern.get(from_ids[replacement_index]);
             if (needle.len == 0) return error.TypeError;
-            try out.appendSlice(self.allocator, to[replacement_index]);
+            try out.appendSlice(self.allocator, self.intern.get(to_ids[replacement_index]));
             index += needle.len;
         } else {
             try out.append(self.allocator, input[index]);
@@ -1492,6 +1517,21 @@ fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
     errdefer self.allocator.free(strings);
     for (items, strings) |item, *string| string.* = try stringArg(self, item);
     return strings;
+}
+
+fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
+    const list = try self.forceValue(arg);
+    if (list.discriminant != .list) return error.TypeError;
+
+    const items = try self.heap.getList(list.asObjectId());
+    const ids = try self.allocator.alloc(InternId, items.len);
+    errdefer self.allocator.free(ids);
+    for (items, ids) |item, *id| {
+        const value = try self.forceValue(item);
+        if (value.discriminant != .string) return error.TypeError;
+        id.* = value.asInternId();
+    }
+    return ids;
 }
 
 fn builtinToString(self: anytype, arg: Value) !Value {
