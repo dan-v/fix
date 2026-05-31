@@ -89,17 +89,26 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
-    const diff_fuzz_exe = b.addExecutable(.{
-        .name = "diff-fuzz",
+    const integration_diff_exe = b.addExecutable(.{
+        .name = "integration-diff",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/diff_fuzz.zig"),
+            .root_source_file = b.path("test/integration_diff.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
 
-    const diff_fuzz_step = b.step("diff-fuzz", "Run differential fuzzing against nix-instantiate");
-    const diff_fuzz_cmd = b.addRunArtifact(diff_fuzz_exe);
+    const integration_step = b.step("integration-test", "Run differential integration tests against nix-instantiate");
+    const integration_cmd = b.addRunArtifact(integration_diff_exe);
+    integration_cmd.step.dependOn(b.getInstallStep());
+    integration_cmd.addArgs(&.{ "--iterations", "250", "--seed-count", "2" });
+    if (b.args) |args| {
+        integration_cmd.addArgs(args);
+    }
+    integration_step.dependOn(&integration_cmd.step);
+
+    const diff_fuzz_step = b.step("diff-fuzz", "Run longer differential fuzzing against nix-instantiate");
+    const diff_fuzz_cmd = b.addRunArtifact(integration_diff_exe);
     diff_fuzz_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         diff_fuzz_cmd.addArgs(args);
@@ -158,6 +167,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    const check_step = b.step("check", "Run unit and integration tests");
+    check_step.dependOn(test_step);
+    check_step.dependOn(integration_step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

@@ -1,4 +1,4 @@
-//! Differential fuzzer for fix.
+//! Differential integration runner for fix.
 //!
 //! The generator deliberately avoids owning a second Nix grammar. It mutates a
 //! corpus of real expressions, then asks real Nix and fix what each candidate
@@ -8,9 +8,10 @@ const std = @import("std");
 
 const Config = struct {
     iterations: usize = 100,
-    seed: u64 = 0x8b5f_19d3_7442_0c11,
-    corpus_dir: []const u8 = "tools/fuzz-corpus",
-    failure_dir: []const u8 = "zig-out/fuzz-failures",
+    seed: ?u64 = null,
+    seed_count: usize = 1,
+    corpus_dir: []const u8 = "test/fuzz-corpus",
+    failure_dir: []const u8 = "zig-out/integration-failures",
     fix_bin: []const u8 = "zig-out/bin/fix",
     nix_bin: []const u8 = "nix-instantiate",
     max_mutations: u8 = 5,
@@ -70,46 +71,55 @@ pub fn main(init: std.process.Init) !void {
     try loadCorpus(allocator, init.io, config.corpus_dir, &corpus);
     if (corpus.items.len == 0) try loadDefaultCorpus(allocator, &corpus);
 
-    var prng = std.Random.DefaultPrng.init(config.seed);
-    const random = prng.random();
+    const base_seed = config.seed orelse randomSeed(init.io);
 
     std.debug.print(
-        "diff-fuzz: iterations={} seed={} corpus={}\n",
-        .{ config.iterations, config.seed, corpus.items.len },
+        "integration-diff: iterations={} seed={} seed_count={} corpus={}\n",
+        .{ config.iterations, base_seed, config.seed_count, corpus.items.len },
     );
+    if (config.seed == null) {
+        std.debug.print("integration-diff: reproduce with --seed {}\n", .{base_seed});
+    }
 
-    var i: usize = 0;
-    while (i < config.iterations) : (i += 1) {
-        const expr = try mutateExpression(allocator, random, corpus.items, config.max_mutations);
-        defer allocator.free(expr);
+    var seed_index: usize = 0;
+    while (seed_index < config.seed_count) : (seed_index += 1) {
+        const seed = base_seed +% @as(u64, @intCast(seed_index));
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
 
-        var classification = classify(allocator, init.io, &config, expr) catch |err| {
-            std.debug.print("diff-fuzz: command failed at iteration {}: {s}\n", .{ i, @errorName(err) });
-            return err;
-        };
-        defer classification.deinit(allocator);
+        var i: usize = 0;
+        while (i < config.iterations) : (i += 1) {
+            const expr = try mutateExpression(allocator, random, corpus.items, config.max_mutations);
+            defer allocator.free(expr);
 
-        if (classification.interesting()) {
-            const shrunk = if (config.shrink)
-                try shrinkInteresting(allocator, init.io, &config, expr, classification.outcome)
-            else
-                try allocator.dupe(u8, expr);
-            defer allocator.free(shrunk);
+            var classification = classify(allocator, init.io, &config, expr) catch |err| {
+                std.debug.print("integration-diff: command failed at seed {} iteration {}: {s}\n", .{ seed, i, @errorName(err) });
+                return err;
+            };
+            defer classification.deinit(allocator);
 
-            var shrunk_classification = try classify(allocator, init.io, &config, shrunk);
-            defer shrunk_classification.deinit(allocator);
+            if (classification.interesting()) {
+                const shrunk = if (config.shrink)
+                    try shrinkInteresting(allocator, init.io, &config, expr, classification.outcome)
+                else
+                    try allocator.dupe(u8, expr);
+                defer allocator.free(shrunk);
 
-            try saveFailure(allocator, init.io, &config, i, shrunk, shrunk_classification);
-            std.debug.print(
-                "diff-fuzz: found {s} at iteration {}; saved under {s}\n",
-                .{ @tagName(shrunk_classification.outcome), i, config.failure_dir },
-            );
-            std.debug.print("expression:\n{s}\n", .{shrunk});
-            return error.DifferentialMismatch;
+                var shrunk_classification = try classify(allocator, init.io, &config, shrunk);
+                defer shrunk_classification.deinit(allocator);
+
+                try saveFailure(allocator, init.io, &config, seed, i, shrunk, shrunk_classification);
+                std.debug.print(
+                    "integration-diff: found {s} at seed {} iteration {}; saved under {s}\n",
+                    .{ @tagName(shrunk_classification.outcome), seed, i, config.failure_dir },
+                );
+                std.debug.print("expression:\n{s}\n", .{shrunk});
+                return error.DifferentialMismatch;
+            }
         }
     }
 
-    std.debug.print("diff-fuzz: no mismatches found\n", .{});
+    std.debug.print("integration-diff: no mismatches found\n", .{});
 }
 
 fn parseArgs(allocator: std.mem.Allocator, config: *Config, init: std.process.Init) !void {
@@ -123,6 +133,8 @@ fn parseArgs(allocator: std.mem.Allocator, config: *Config, init: std.process.In
             config.iterations = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             config.seed = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 0);
+        } else if (std.mem.eql(u8, arg, "--seed-count")) {
+            config.seed_count = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
         } else if (std.mem.eql(u8, arg, "--corpus")) {
             config.corpus_dir = args.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--failures")) {
@@ -148,11 +160,12 @@ fn parseArgs(allocator: std.mem.Allocator, config: *Config, init: std.process.In
 
 fn usage() void {
     std.debug.print(
-        \\usage: zig build diff-fuzz -- [options]
+        \\usage: zig build integration-test -- [options]
         \\
         \\options:
         \\  --iterations N      number of generated expressions (default: 100)
-        \\  --seed N            deterministic RNG seed
+        \\  --seed N            deterministic base RNG seed; random when omitted
+        \\  --seed-count N      number of consecutive seeds to run (default: 1)
         \\  --corpus PATH       directory of .nix seed files
         \\  --failures PATH     directory for reproducers
         \\  --fix-bin PATH      fix executable (default: zig-out/bin/fix)
@@ -161,6 +174,12 @@ fn usage() void {
         \\  --no-shrink         save the original failing candidate
         \\
     , .{});
+}
+
+fn randomSeed(io: std.Io) u64 {
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    return @bitCast(bytes);
 }
 
 fn loadCorpus(
@@ -480,14 +499,16 @@ fn saveFailure(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
+    seed: u64,
     iteration: usize,
     expr: []const u8,
     classification: Classification,
 ) !void {
     try std.Io.Dir.cwd().createDirPath(io, config.failure_dir);
 
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/case-{d}-{s}", .{
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/case-{d}-{d}-{s}", .{
         config.failure_dir,
+        seed,
         iteration,
         @tagName(classification.outcome),
     });
@@ -499,6 +520,7 @@ fn saveFailure(
 
     const report = try std.fmt.allocPrint(allocator,
         \\outcome: {s}
+        \\seed: {d}
         \\iteration: {d}
         \\
         \\expression:
@@ -518,6 +540,7 @@ fn saveFailure(
         \\
     , .{
         @tagName(classification.outcome),
+        seed,
         iteration,
         expr,
         classification.nix.ok,
