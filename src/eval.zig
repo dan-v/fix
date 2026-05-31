@@ -96,4 +96,37 @@ pub const Evaluator = struct {
 
         return vm.eval(chunk_id);
     }
+
+    pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        switch (value.discriminant) {
+            .null => try writer.writeAll("null"),
+            .bool_false => try writer.writeAll("false"),
+            .bool_true => try writer.writeAll("true"),
+            .int => try writer.print("{}", .{value.asInt()}),
+            .float => try writer.print("{d}", .{value.asFloat()}),
+            .string => try self.writeQuotedString(writer, self.intern.get(value.asInternId())),
+            .path => try writer.print("<path:{s}>", .{self.intern.get(value.asInternId())}),
+            .list => try writer.writeAll("[...]"),
+            .attrs => try writer.writeAll("{...}"),
+            .closure => try writer.writeAll("<closure>"),
+            .thunk => try writer.writeAll("<thunk>"),
+            .cell => try writer.writeAll("<cell>"),
+        }
+    }
+
+    fn writeQuotedString(self: *Evaluator, writer: *std.Io.Writer, s: []const u8) !void {
+        _ = self;
+        try writer.writeByte('"');
+        for (s) |c| {
+            switch (c) {
+                '\\' => try writer.writeAll("\\\\"),
+                '"' => try writer.writeAll("\\\""),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeByte('"');
+    }
 };

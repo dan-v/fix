@@ -48,7 +48,8 @@ pub fn main(init: std.process.Init) !void {
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    try stdout.interface.print("{f}\n", .{result});
+    try ev.writeValue(&stdout.interface, result);
+    try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
 }
 
