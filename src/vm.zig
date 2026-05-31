@@ -480,6 +480,7 @@ pub const VM = struct {
                     const result = self.pop();
                     const finished_frame = self.popFrame();
                     if (self.frames.items.len == stop_depth) {
+                        self.sp = finished_frame.frame_base;
                         return result;
                     }
                     self.sp = finished_frame.frame_base;
@@ -724,6 +725,25 @@ pub const VM = struct {
         }
     }
 
+    fn callValue(self: *VM, callee: Value, arg: Value) !Value {
+        if (callee.discriminant == .closure) {
+            const closure_id = callee.asObjectId();
+            const closure = try self.getClosureById(closure_id);
+            const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+            const stop_depth = self.frames.items.len;
+            try self.push(arg);
+            try self.pushFrame(ch, 1, closure_id);
+            return self.runUntil(stop_depth);
+        }
+        if (callee.discriminant == .builtin) {
+            return self.applyBuiltin(callee.asBuiltinId(), &.{arg});
+        }
+        if (callee.discriminant == .builtin_closure) {
+            return self.applyBuiltinClosure(callee, arg);
+        }
+        return error.NotCallable;
+    }
+
     fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
         const closure = try self.heap.getBuiltinClosure(callee.asObjectId());
         var args: [8]Value = undefined;
@@ -765,6 +785,8 @@ pub const VM = struct {
             .intersectAttrs => self.builtinIntersectAttrs(args[0], args[1]),
             .elem => self.builtinElem(args[0], args[1]),
             .seq => self.builtinSeq(args[0], args[1]),
+            .all => self.builtinAll(args[0], args[1]),
+            .any => self.builtinAny(args[0], args[1]),
         };
     }
 
@@ -959,6 +981,32 @@ pub const VM = struct {
     fn builtinSeq(self: *VM, first: Value, second: Value) !Value {
         _ = try self.forceValue(first);
         return self.forceValue(second);
+    }
+
+    fn builtinAll(self: *VM, pred_arg: Value, list_arg: Value) !Value {
+        const pred = try self.forceValue(pred_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const result = try self.forceValue(try self.callValue(pred, item));
+            if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+            if (result.discriminant == .bool_false) return Value.boolVal(false);
+        }
+        return Value.boolVal(true);
+    }
+
+    fn builtinAny(self: *VM, pred_arg: Value, list_arg: Value) !Value {
+        const pred = try self.forceValue(pred_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const result = try self.forceValue(try self.callValue(pred, item));
+            if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+            if (result.discriminant == .bool_true) return Value.boolVal(true);
+        }
+        return Value.boolVal(false);
     }
 
     fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {

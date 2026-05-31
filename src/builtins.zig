@@ -32,6 +32,8 @@ pub const BuiltinId = enum(u16) {
     intersectAttrs = 22,
     elem = 23,
     seq = 24,
+    all = 25,
+    any = 26,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -62,6 +64,8 @@ pub fn arity(id: BuiltinId) u8 {
         .intersectAttrs,
         .elem,
         .seq,
+        .all,
+        .any,
         => 2,
     };
 }
@@ -167,6 +171,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("seq"),
             .value = Value.builtin(@intFromEnum(BuiltinId.seq)),
+        },
+        .{
+            .name = try intern.intern("all"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.all)),
+        },
+        .{
+            .name = try intern.intern("any"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.any)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

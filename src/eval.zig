@@ -546,6 +546,24 @@ test "evaluate seq builtin" {
     try std.testing.expectEqualStrings("3", unused);
 }
 
+test "evaluate all and any builtins" {
+    const all_true = try renderForTest("builtins.all (x: x < 3) [ 1 2 ]");
+    defer std.testing.allocator.free(all_true);
+    try std.testing.expectEqualStrings("true", all_true);
+
+    const all_short_circuit = try renderForTest("builtins.all (x: x < 3) [ 1 4 (1 / 0) ]");
+    defer std.testing.allocator.free(all_short_circuit);
+    try std.testing.expectEqualStrings("false", all_short_circuit);
+
+    const any_short_circuit = try renderForTest("builtins.any (x: x == 2) [ 1 2 (1 / 0) ]");
+    defer std.testing.allocator.free(any_short_circuit);
+    try std.testing.expectEqualStrings("true", any_short_circuit);
+
+    const any_false = try renderForTest("builtins.any (x: x == 2) [ 1 3 ]");
+    defer std.testing.allocator.free(any_false);
+    try std.testing.expectEqualStrings("false", any_false);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
