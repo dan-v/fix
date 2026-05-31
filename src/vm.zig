@@ -548,6 +548,17 @@ pub const VM = struct {
     }
 
     pub fn valuesEqual(self: *VM, a: Value, b: Value) anyerror!bool {
+        var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
+        defer seen.deinit(self.allocator);
+        return self.valuesEqualSeen(a, b, &seen);
+    }
+
+    const EqualityPair = struct {
+        left: Value,
+        right: Value,
+    };
+
+    fn valuesEqualSeen(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
         const va = try self.forceValue(a);
         const vb = try self.forceValue(b);
 
@@ -561,8 +572,8 @@ pub const VM = struct {
             .int => va.asInt() == vb.asInt(),
             .float => va.asFloat() == vb.asFloat(),
             .string, .path => va.asInternId() == vb.asInternId(),
-            .list => try self.listsEqual(va.asObjectId(), vb.asObjectId()),
-            .attrs => try self.attrsEqual(va.asObjectId(), vb.asObjectId()),
+            .list => try self.listsEqual(va, vb, seen),
+            .attrs => try self.attrsEqual(va, vb, seen),
             .closure => va.asObjectId() == vb.asObjectId(),
             .builtin => va.asBuiltinId() == vb.asBuiltinId(),
             .builtin_closure => va.asObjectId() == vb.asObjectId(),
@@ -572,27 +583,45 @@ pub const VM = struct {
 
     const CompareResult = enum { lt, eq, gt };
 
-    fn listsEqual(self: *VM, a_id: ObjectId, b_id: ObjectId) anyerror!bool {
-        const a_items = try self.heap.getList(a_id);
-        const b_items = try self.heap.getList(b_id);
+    fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+        if (a.asObjectId() == b.asObjectId()) return true;
+        if (try self.equalityPairSeen(a, b, seen)) return true;
+
+        const a_items = try self.heap.getList(a.asObjectId());
+        const b_items = try self.heap.getList(b.asObjectId());
         if (a_items.len != b_items.len) return false;
 
         for (a_items, b_items) |a_item, b_item| {
-            if (!try self.valuesEqual(a_item, b_item)) return false;
+            if (!try self.valuesEqualSeen(a_item, b_item, seen)) return false;
         }
         return true;
     }
 
-    fn attrsEqual(self: *VM, a_id: ObjectId, b_id: ObjectId) anyerror!bool {
-        const a_entries = try self.heap.getAttrs(a_id);
-        const b_entries = try self.heap.getAttrs(b_id);
+    fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+        if (a.asObjectId() == b.asObjectId()) return true;
+        if (try self.equalityPairSeen(a, b, seen)) return true;
+
+        const a_entries = try self.heap.getAttrs(a.asObjectId());
+        const b_entries = try self.heap.getAttrs(b.asObjectId());
         if (a_entries.len != b_entries.len) return false;
 
         for (a_entries, b_entries) |a_entry, b_entry| {
             if (a_entry.name != b_entry.name) return false;
-            if (!try self.valuesEqual(a_entry.value, b_entry.value)) return false;
+            if (!try self.valuesEqualSeen(a_entry.value, b_entry.value, seen)) return false;
         }
         return true;
+    }
+
+    fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) !bool {
+        for (seen.items) |pair| {
+            if ((pair.left.memoEq(left, self.intern) and pair.right.memoEq(right, self.intern)) or
+                (pair.left.memoEq(right, self.intern) and pair.right.memoEq(left, self.intern)))
+            {
+                return true;
+            }
+        }
+        try seen.append(self.allocator, .{ .left = left, .right = right });
+        return false;
     }
 
     pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {

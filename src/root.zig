@@ -226,6 +226,9 @@ test "end-to-end: dynamic attribute selection" {
 
     const has_dynamic = try ev.evaluate("let key = \"x\"; in { x = 1; } ? ${key}");
     try std.testing.expect(has_dynamic.asBool());
+
+    const quoted_interpolation = try ev.evaluate("let key = \"x\"; in { x = 1; }.\"${key}\"");
+    try std.testing.expectEqual(@as(i64, 1), quoted_interpolation.asInt());
 }
 
 test "end-to-end: let binding" {
@@ -750,6 +753,9 @@ test "end-to-end: lists and attrs compare structurally" {
 
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("[ 1 (1 / 0) ] == [ 1 2 ]"));
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("{ a = 1 / 0; } == { a = 1; }"));
+
+    const recursive = try ev.evaluate("let x = rec { a = [ x ]; }; in x == x");
+    try std.testing.expect(recursive.asBool());
 }
 
 test "end-to-end: single argument lambdas" {

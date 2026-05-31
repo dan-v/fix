@@ -164,9 +164,13 @@ pub const Compiler = struct {
     }
 
     fn compileString(self: *Compiler, node: *const Node) !void {
+        try self.compileStringAtom(node.data.atom);
+    }
+
+    fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
         const literal = string_syntax.Span{
-            .start = node.data.atom.offset,
-            .end = node.data.atom.offset + node.data.atom.len,
+            .start = atom.offset,
+            .end = atom.offset + atom.len,
         };
         const parsed = try string_syntax.parseLiteral(self.allocator, self.source, literal);
         defer parsed.deinit();
@@ -976,9 +980,14 @@ pub const Compiler = struct {
         try self.compileNode(apath.root);
 
         for (apath.segments) |seg| {
-            const name_span = self.attrSegmentSpan(seg);
-            const name_id = try self.intern.intern(name_span);
-            try self.emitOpU16(.get_attr, @intCast(name_id));
+            if (self.attrSegmentHasInterpolation(seg)) {
+                try self.compileStringAtom(seg);
+                try self.emitOp(.get_attr_dynamic);
+            } else {
+                const name_span = self.attrSegmentSpan(seg);
+                const name_id = try self.intern.intern(name_span);
+                try self.emitOpU16(.get_attr, @intCast(name_id));
+            }
         }
     }
 
@@ -1094,6 +1103,11 @@ pub const Compiler = struct {
             return span[1 .. span.len - 1];
         }
         return span;
+    }
+
+    fn attrSegmentHasInterpolation(self: *const Compiler, atom: Node.Atom) bool {
+        const span = self.source[atom.offset .. atom.offset + atom.len];
+        return span.len >= 2 and span[0] == '"' and std.mem.indexOf(u8, span, "${") != null;
     }
 
     // ---- scope management ----
