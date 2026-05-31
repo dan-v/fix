@@ -54,6 +54,21 @@ test "end-to-end: float arithmetic" {
     try std.testing.expect(mixed_neq.asBool());
 }
 
+test "end-to-end: string concatenation" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const literal = try ev.evaluate("\"ab\" + \"cd\"");
+    try std.testing.expectEqualStrings("abcd", ev.intern.get(literal.asInternId()));
+
+    const bound = try ev.evaluate("let a = \"ab\"; in a + \"cd\"");
+    try std.testing.expectEqualStrings("abcd", ev.intern.get(bound.asInternId()));
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("\"ab\" + 1"));
+}
+
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 

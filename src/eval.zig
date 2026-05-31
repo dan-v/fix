@@ -87,6 +87,7 @@ pub const Evaluator = struct {
         var vm = try VM.init(
             self.runtime_arena.allocator(),
             &self.registry,
+            &self.intern,
             &self.heap,
             &self.scheduler,
             0,

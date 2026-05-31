@@ -20,6 +20,7 @@ const OpCode = @import("opcode.zig").OpCode;
 const chunk = @import("chunk.zig");
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
+const InternTable = @import("intern.zig").InternTable;
 const Thunk = @import("thunk.zig").Thunk;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
@@ -45,6 +46,8 @@ pub const VM = struct {
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs).
     registry: *const ChunkRegistry,
+    /// Global intern table (shared).
+    intern: *InternTable,
     /// Runtime object heap.
     heap: *ObjectHeap,
     /// Global scheduler (for spawning work).
@@ -62,6 +65,7 @@ pub const VM = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *const ChunkRegistry,
+        intern: *InternTable,
         heap: *ObjectHeap,
         scheduler: *Scheduler,
         worker_id: u8,
@@ -69,6 +73,7 @@ pub const VM = struct {
         return .{
             .allocator = allocator,
             .registry = registry,
+            .intern = intern,
             .heap = heap,
             .scheduler = scheduler,
             .worker_id = worker_id,
@@ -233,6 +238,8 @@ pub const VM = struct {
                     const a = self.pop();
                     if (a.discriminant == .int and b.discriminant == .int) {
                         try self.push(Value.int(a.asInt() + b.asInt()));
+                    } else if (a.discriminant == .string and b.discriminant == .string) {
+                        try self.push(try self.concatStrings(a, b));
                     } else {
                         return error.TypeError;
                     }
@@ -589,6 +596,19 @@ pub const VM = struct {
         const id = try self.heap.addList(self.stack.items[start..self.sp]);
         self.sp = start;
         try self.push(Value.list(id));
+    }
+
+    fn concatStrings(self: *VM, a: Value, b: Value) !Value {
+        const s_a = self.intern.get(a.asInternId());
+        const s_b = self.intern.get(b.asInternId());
+
+        const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
+        defer self.allocator.free(buf);
+
+        @memcpy(buf[0..s_a.len], s_a);
+        @memcpy(buf[s_a.len..], s_b);
+
+        return Value.string(try self.intern.intern(buf));
     }
 
     // ---- closures ----
