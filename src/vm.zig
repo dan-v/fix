@@ -23,7 +23,6 @@ const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const MemoCache = @import("cache.zig").MemoCache;
 const Thunk = @import("thunk.zig").Thunk;
-const InternTable = @import("intern.zig").InternTable;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
@@ -48,8 +47,6 @@ pub const VM = struct {
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs).
     registry: *const ChunkRegistry,
-    /// Global intern table (shared).
-    intern: *InternTable,
     /// Global memoization cache (shared).
     cache: *MemoCache,
     /// Runtime object heap.
@@ -69,7 +66,6 @@ pub const VM = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *const ChunkRegistry,
-        intern: *InternTable,
         cache: *MemoCache,
         heap: *ObjectHeap,
         scheduler: *Scheduler,
@@ -78,7 +74,6 @@ pub const VM = struct {
         return .{
             .allocator = allocator,
             .registry = registry,
-            .intern = intern,
             .cache = cache,
             .heap = heap,
             .scheduler = scheduler,
@@ -362,11 +357,6 @@ pub const VM = struct {
                         frame.ip += @as(usize, offset);
                     }
                 },
-                .jump_back => {
-                    const offset: u16 = readU16(code, frame.ip);
-                    frame.ip = frame.ip + 2 - @as(usize, offset);
-                },
-
                 // ---- data structures ----
                 .build_attrs => {
                     const count: u16 = readU16(code, frame.ip);
@@ -378,19 +368,6 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.buildList(count);
                 },
-                .concat_string => {
-                    const b = self.pop();
-                    const a = self.pop();
-                    const result = try self.concatStrings(a, b);
-                    try self.push(result);
-                },
-                .interpolate => {
-                    const count: u16 = readU16(code, frame.ip);
-                    frame.ip += 2;
-                    _ = count;
-                    return error.UnsupportedInterpolation;
-                },
-
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
@@ -406,12 +383,6 @@ pub const VM = struct {
                     const callee = self.pop();
                     try self.doCall(callee, arg);
                 },
-                .tail_call => {
-                    const arg = self.pop();
-                    const callee = self.pop();
-                    try self.doTailCall(callee, arg);
-                },
-
                 // ---- thunks ----
                 .make_thunk => {
                     const closure = self.pop();
@@ -430,18 +401,6 @@ pub const VM = struct {
                     const result = try self.getAttrValue(attrs_val, @intCast(name_id));
                     try self.push(result);
                 },
-                .get_attr_or => {
-                    const name_id: u16 = readU16(code, frame.ip);
-                    frame.ip += 2;
-                    const default_val = self.pop();
-                    const attrs_val = self.pop();
-                    const result = try self.getAttrOrValue(attrs_val, @intCast(name_id), default_val);
-                    try self.push(result);
-                },
-
-                // ---- environment ----
-                .push_env, .pop_env => return error.UnsupportedWith,
-
                 // ---- termination ----
                 .ret => {
                     const result = self.pop();
@@ -633,21 +592,6 @@ pub const VM = struct {
         try self.push(Value.list(id));
     }
 
-    fn concatStrings(self: *VM, a: Value, b: Value) !Value {
-        const id_a = a.asInternId();
-        const id_b = b.asInternId();
-        const s_a = self.intern.get(id_a);
-        const s_b = self.intern.get(id_b);
-
-        const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
-        @memcpy(buf[0..s_a.len], s_a);
-        @memcpy(buf[s_a.len..], s_b);
-        defer self.allocator.free(buf);
-
-        const new_id = try self.intern.intern(buf);
-        return Value.string(new_id);
-    }
-
     // ---- closures ----
 
     fn getClosureById(self: *VM, closure_id: ObjectId) !Closure {
@@ -675,36 +619,9 @@ pub const VM = struct {
         }
     }
 
-    fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
-        if (callee.discriminant == .closure) {
-            const closure_id = callee.asObjectId();
-            const closure = try self.getClosureById(closure_id);
-            const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-
-            var frame = self.currentFrame();
-            frame.chunk_ptr = ch;
-            frame.ip = 0;
-            frame.closure_id = closure_id;
-            self.sp = frame.frame_base;
-            try self.push(arg);
-            frame.local_count = 1;
-        } else {
-            try self.push(callee);
-            try self.push(arg);
-            try self.doCall(self.stack.items[self.sp - 2], self.stack.items[self.sp - 1]);
-        }
-    }
-
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
         if (attrs_val.discriminant != .attrs) return error.TypeError;
         return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
-    }
-
-    fn getAttrOrValue(self: *VM, attrs_val: Value, name_id: InternId, default_val: Value) !Value {
-        return self.getAttrValue(attrs_val, name_id) catch |err| switch (err) {
-            error.MissingAttribute => default_val,
-            else => err,
-        };
     }
 };
 

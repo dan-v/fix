@@ -62,8 +62,6 @@ pub const OpCode = enum(u8) {
     jump,
     /// Jump forward if top of stack is truthy (operand: 2-byte signed offset).
     jump_if_false,
-    /// Jump backward (operand: 2-byte signed offset, interpreted as negative).
-    jump_back,
 
     // ---- data ----
     /// Build an attribute set from pairs on the stack.
@@ -73,11 +71,6 @@ pub const OpCode = enum(u8) {
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     build_list,
-    /// Concatenate the top two strings and push result.
-    concat_string,
-    /// Interpolate: replace placeholders in a template string.
-    /// Operand: 2-byte count of substitutions.
-    interpolate,
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.
@@ -90,8 +83,6 @@ pub const OpCode = enum(u8) {
     /// The stack layout before: [closure, arg].
     /// After: [result].
     call,
-    /// Tail call: replace current frame with a call to the closure below top.
-    tail_call,
 
     // ---- thunks ----
     /// Wrap the top-of-stack zero-argument closure into a lazy thunk.
@@ -103,15 +94,6 @@ pub const OpCode = enum(u8) {
     /// Select an attribute from attrset on stack top.
     /// Operand: 2-byte InternId of the attribute name.
     get_attr,
-    /// Like get_attr, but if missing, return the default value below the attrset.
-    get_attr_or,
-
-    // ---- environment ----
-    /// Push a with-scope environment entry.
-    push_env,
-    /// Pop one environment entry.
-    pop_env,
-
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,
