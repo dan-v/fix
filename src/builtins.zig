@@ -51,6 +51,10 @@ pub const BuiltinId = enum(u16) {
     concatStringsSep = 41,
     substring = 42,
     replaceStrings = 43,
+    throw = 44,
+    abort = 45,
+    tryEval = 46,
+    trace = 47,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -79,6 +83,9 @@ pub fn arity(id: BuiltinId) u8 {
         .readDir,
         .readFileType,
         .stringLength,
+        .throw,
+        .abort,
+        .tryEval,
         => 1,
         .hasAttr,
         .getAttr,
@@ -97,6 +104,7 @@ pub fn arity(id: BuiltinId) u8 {
         .mapAttrs,
         .genList,
         .concatStringsSep,
+        .trace,
         => 2,
         .foldlStrict,
         .substring,
@@ -282,6 +290,22 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("replaceStrings"),
             .value = Value.builtin(@intFromEnum(BuiltinId.replaceStrings)),
+        },
+        .{
+            .name = try intern.intern("throw"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.throw)),
+        },
+        .{
+            .name = try intern.intern("abort"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.abort)),
+        },
+        .{
+            .name = try intern.intern("tryEval"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.tryEval)),
+        },
+        .{
+            .name = try intern.intern("trace"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.trace)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

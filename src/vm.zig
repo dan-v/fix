@@ -839,6 +839,10 @@ pub const VM = struct {
             .substring => self.builtinSubstring(args[0], args[1], args[2]),
             .replaceStrings => self.builtinReplaceStrings(args[0], args[1], args[2]),
             .deepSeq => self.builtinDeepSeq(args[0], args[1]),
+            .throw => self.builtinThrow(args[0]),
+            .abort => self.builtinAbort(args[0]),
+            .tryEval => self.builtinTryEval(args[0]),
+            .trace => self.builtinTrace(args[0], args[1]),
         };
     }
 
@@ -1327,6 +1331,46 @@ pub const VM = struct {
         }
 
         return Value.string(try self.intern.intern(out.items));
+    }
+
+    fn builtinThrow(self: *VM, message_arg: Value) !Value {
+        _ = try self.stringArg(message_arg);
+        return error.NixThrow;
+    }
+
+    fn builtinAbort(self: *VM, message_arg: Value) !Value {
+        _ = try self.stringArg(message_arg);
+        return error.NixAbort;
+    }
+
+    fn builtinTryEval(self: *VM, arg: Value) !Value {
+        const value = self.forceValue(arg) catch |err| switch (err) {
+            error.NixThrow,
+            error.NixAbort,
+            error.AssertionFailed,
+            => return self.tryEvalResult(false, Value.boolVal(false)),
+            else => return err,
+        };
+        return self.tryEvalResult(true, value);
+    }
+
+    fn builtinTrace(self: *VM, message_arg: Value, value_arg: Value) !Value {
+        _ = try self.forceValue(message_arg);
+        return self.forceValue(value_arg);
+    }
+
+    fn tryEvalResult(self: *VM, success: bool, value: Value) !Value {
+        const entries = [_]heap_mod.AttrEntry{
+            .{
+                .name = try self.intern.intern("success"),
+                .value = Value.boolVal(success),
+            },
+            .{
+                .name = try self.intern.intern("value"),
+                .value = value,
+            },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {

@@ -1073,6 +1073,26 @@ test "evaluate string builtins" {
     try std.testing.expectEqualStrings("\"XcY\"", replaced);
 }
 
+test "evaluate control and error builtins" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.NixThrow, ev.evaluate("builtins.throw \"nope\""));
+    try std.testing.expectError(error.NixAbort, ev.evaluate("builtins.abort \"nope\""));
+
+    const try_success = try renderForTest("(builtins.tryEval (1 + 2)).success");
+    defer std.testing.allocator.free(try_success);
+    try std.testing.expectEqualStrings("true", try_success);
+
+    const try_value = try renderForTest("(builtins.tryEval (builtins.throw \"nope\")).value");
+    defer std.testing.allocator.free(try_value);
+    try std.testing.expectEqualStrings("false", try_value);
+
+    const traced = try renderForTest("builtins.trace \"message\" 42");
+    defer std.testing.allocator.free(traced);
+    try std.testing.expectEqualStrings("42", traced);
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);
