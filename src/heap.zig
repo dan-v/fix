@@ -68,6 +68,48 @@ pub const ObjectHeap = struct {
         return &self.objects.items[id];
     }
 
+    pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
+        return switch (self.getConst(id).*) {
+            .list => |items| items,
+            else => error.InvalidObjectType,
+        };
+    }
+
+    pub fn getAttrs(self: *const ObjectHeap, id: ObjectId) ![]const AttrEntry {
+        return switch (self.getConst(id).*) {
+            .attrs => |entries| entries,
+            else => error.InvalidObjectType,
+        };
+    }
+
+    pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
+        return switch (self.getConst(id).*) {
+            .closure => |closure| closure,
+            else => error.InvalidObjectType,
+        };
+    }
+
+    pub fn getThunk(self: *ObjectHeap, id: ObjectId) !*Thunk {
+        return switch (self.get(id).*) {
+            .thunk => |*thunk| thunk,
+            else => error.InvalidObjectType,
+        };
+    }
+
+    pub fn getCellValue(self: *const ObjectHeap, id: ObjectId) !Value {
+        return switch (self.getConst(id).*) {
+            .cell => |cell| cell.value,
+            else => error.InvalidObjectType,
+        };
+    }
+
+    pub fn setCellValue(self: *ObjectHeap, id: ObjectId, value: Value) !void {
+        switch (self.get(id).*) {
+            .cell => |*cell| cell.value = value,
+            else => return error.InvalidObjectType,
+        }
+    }
+
     pub fn addList(self: *ObjectHeap, items: []Value) !ObjectId {
         return self.add(.{ .list = items });
     }

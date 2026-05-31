@@ -220,11 +220,7 @@ pub const VM = struct {
                     const val = self.pop();
                     const cell_val = self.stack.items[frame.frame_base + slot];
                     if (cell_val.discriminant != .cell) return error.TypeError;
-                    const object = self.heap.get(cell_val.asObjectId());
-                    switch (object.*) {
-                        .cell => |*cell| cell.value = val,
-                        else => return error.TypeError,
-                    }
+                    try self.heap.setCellValue(cell_val.asObjectId(), val);
                 },
 
                 .get_upvalue => {
@@ -547,15 +543,9 @@ pub const VM = struct {
             .thunk => try self.forceThunkFallible(value),
             .cell => {
                 const cell_id = value.asObjectId();
-                const raw = switch (self.heap.getConst(cell_id).*) {
-                    .cell => |cell| cell.value,
-                    else => return error.TypeError,
-                };
+                const raw = try self.heap.getCellValue(cell_id);
                 const forced = try self.forceValue(raw);
-                switch (self.heap.get(cell_id).*) {
-                    .cell => |*cell| cell.value = forced,
-                    else => return error.TypeError,
-                }
+                try self.heap.setCellValue(cell_id, forced);
                 return forced;
             },
             else => value,
@@ -565,20 +555,16 @@ pub const VM = struct {
     fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
         const thunk_id = thunk_val.asObjectId();
         var closure: Value = undefined;
-        switch (self.heap.get(thunk_id).*) {
-            .thunk => |*t| switch (t.tryClaim()) {
-                .already_resolved => return t.result,
-                .claimed => closure = t.closure,
-                .busy => return error.RecursiveThunk,
-            },
-            else => return error.TypeError,
+        const claimed = try self.heap.getThunk(thunk_id);
+        switch (claimed.tryClaim()) {
+            .already_resolved => return claimed.result,
+            .claimed => closure = claimed.closure,
+            .busy => return error.RecursiveThunk,
         }
 
         const result = try self.evalThunkClosure(closure);
-        switch (self.heap.get(thunk_id).*) {
-            .thunk => |*t| t.resolve(result),
-            else => return error.TypeError,
-        }
+        const resolved = try self.heap.getThunk(thunk_id);
+        resolved.resolve(result);
         return result;
     }
 
@@ -650,10 +636,7 @@ pub const VM = struct {
     // ---- closures ----
 
     fn getClosureById(self: *VM, closure_id: ObjectId) !Closure {
-        return switch (self.heap.getConst(closure_id).*) {
-            .closure => |closure| closure,
-            else => error.TypeError,
-        };
+        return self.heap.getClosure(closure_id);
     }
 
     fn makeClosure(self: *VM, chunk_id: u16, upvalue_count: u8) !void {
@@ -708,10 +691,7 @@ pub const VM = struct {
 
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
         if (attrs_val.discriminant != .attrs) return error.TypeError;
-        const entries = switch (self.heap.getConst(attrs_val.asObjectId()).*) {
-            .attrs => |entries| entries,
-            else => return error.TypeError,
-        };
+        const entries = try self.heap.getAttrs(attrs_val.asObjectId());
 
         for (entries) |entry| {
             if (entry.name == name_id) {
