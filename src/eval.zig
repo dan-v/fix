@@ -12,6 +12,7 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
+const FetchCache = @import("fetch_cache.zig").FetchCache;
 const Value = @import("value.zig").Value;
 const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
@@ -28,6 +29,7 @@ pub const Evaluator = struct {
     scheduler: Scheduler,
     heap: ObjectHeap,
     files: FileCache,
+    fetchers: FetchCache,
     imports: std.StringHashMapUnmanaged(Value),
     imports_in_progress: std.StringHashMapUnmanaged(void),
     search_paths: []SearchPathEntry,
@@ -55,6 +57,7 @@ pub const Evaluator = struct {
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
             .files = FileCache.init(allocator),
+            .fetchers = FetchCache.init(allocator),
             .imports = .empty,
             .imports_in_progress = .empty,
             .search_paths = &.{},
@@ -77,6 +80,7 @@ pub const Evaluator = struct {
         while (progress_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
         self.imports_in_progress.deinit(self.allocator);
         self.freeSearchPaths();
+        self.fetchers.deinit();
         self.files.deinit();
         self.heap.deinit();
         self.runtime_arena.deinit();
@@ -91,12 +95,14 @@ pub const Evaluator = struct {
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
         self.files.setIo(io);
+        self.fetchers.setIo(io);
         if (self.base_path) |path| self.allocator.free(path);
         self.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
 
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
+        self.fetchers.setIo(io);
     }
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
@@ -203,6 +209,7 @@ pub const Evaluator = struct {
             &self.intern,
             &self.heap,
             &self.files,
+            &self.fetchers,
             &self.scheduler,
             .{ .context = self, .import_value = importValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
@@ -1056,6 +1063,26 @@ test "evaluate filterSource builtin through file cache" {
     );
     defer std.testing.allocator.free(called_source);
     try std.testing.expectError(error.NixThrow, ev.evaluate(called_source));
+}
+
+test "evaluate fetchGit builtin for local repository" {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+
+    const out_path_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.fetchGit {{ url = \"{s}\"; }}).outPath", .{cwd});
+    defer std.testing.allocator.free(out_path_source);
+    const short_rev_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.stringLength (builtins.fetchGit {{ url = \"{s}\"; }}).shortRev", .{cwd});
+    defer std.testing.allocator.free(short_rev_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const out_path = try ev.evaluate(out_path_source);
+    try std.testing.expectEqualStrings(cwd, ev.intern.get(out_path.asInternId()));
+
+    const short_rev_len = try ev.evaluate(short_rev_source);
+    try std.testing.expectEqual(@as(i64, 7), short_rev_len.asInt());
 }
 
 test "evaluate findFile builtin through explicit search path" {

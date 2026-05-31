@@ -7,6 +7,7 @@ const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("../heap.zig");
 const file_cache = @import("../file_cache.zig");
+const fetch_cache = @import("../fetch_cache.zig");
 const builtins_mod = @import("../builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("../derivation.zig");
@@ -124,10 +125,10 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .split => builtinSplit(self, args[0], args[1]),
         .fromTOML => builtinFromTOML(self, args[0]),
         .filterSource => builtinFilterSource(self, args[0], args[1]),
+        .fetchGit => builtinFetchGit(self, args[0]),
         .toXML,
         .fetchurl,
         .fetchTarball,
-        .fetchGit,
         .fetchMercurial,
         .fetchTree,
         .getFlake,
@@ -1211,6 +1212,116 @@ fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
     }
 
     return Value.string(try storeLikePath(self, path_ops.baseName(root), fingerprint.items));
+}
+
+const FetchGitSpec = struct {
+    url: []u8,
+    name: []u8,
+    rev: ?[]u8,
+    ref: ?[]u8,
+    submodules: bool,
+
+    fn deinit(self: FetchGitSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.name);
+        if (self.rev) |rev| allocator.free(rev);
+        if (self.ref) |ref| allocator.free(ref);
+    }
+
+    fn borrowed(self: FetchGitSpec) fetch_cache.FetchCache.GitSpec {
+        return .{
+            .url = self.url,
+            .name = self.name,
+            .rev = self.rev,
+            .ref = self.ref,
+            .submodules = self.submodules,
+        };
+    }
+};
+
+fn builtinFetchGit(self: anytype, arg: Value) !Value {
+    const spec = try fetchGitSpec(self, arg);
+    defer spec.deinit(self.allocator);
+
+    const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
+    defer result.deinit(self.fetchers.allocator);
+
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(result.last_modified) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(result.last_modified_date)) },
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
+        .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
+        .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) },
+        .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
+        .{ .name = try self.intern.intern("submodules"), .value = Value.boolVal(result.submodules) },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
+fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
+    const value = try self.forceValue(arg);
+    if (value.discriminant != .attrs) {
+        const url = try self.allocator.dupe(u8, try pathArg(self, value));
+        errdefer self.allocator.free(url);
+        return .{
+            .url = url,
+            .name = try self.allocator.dupe(u8, "source"),
+            .rev = null,
+            .ref = null,
+            .submodules = false,
+        };
+    }
+
+    const attrs_id = value.asObjectId();
+    const url = try dupPathAttr(self, attrs_id, "url");
+    errdefer self.allocator.free(url);
+    const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
+    errdefer self.allocator.free(name);
+    const rev = try optionalStringAttr(self, attrs_id, "rev");
+    errdefer if (rev) |owned| self.allocator.free(owned);
+    const ref = try optionalStringAttr(self, attrs_id, "ref");
+    errdefer if (ref) |owned| self.allocator.free(owned);
+    const submodules = try optionalBoolAttr(self, attrs_id, "submodules") orelse false;
+
+    return .{
+        .url = url,
+        .name = name,
+        .rev = rev,
+        .ref = ref,
+        .submodules = submodules,
+    };
+}
+
+fn dupPathAttr(self: anytype, attrs_id: ObjectId, name: []const u8) ![]u8 {
+    const name_id = try self.intern.intern(name);
+    const value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
+    return switch (value.discriminant) {
+        .path, .string => self.allocator.dupe(u8, self.intern.get(value.asInternId())),
+        else => error.TypeError,
+    };
+}
+
+fn optionalStringAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?[]u8 {
+    const name_id = try self.intern.intern(name);
+    const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
+        error.MissingAttribute => return null,
+        else => return err,
+    };
+    const forced = try self.forceValue(value);
+    if (forced.discriminant != .string) return error.TypeError;
+    return try self.allocator.dupe(u8, self.intern.get(forced.asInternId()));
+}
+
+fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool {
+    const name_id = try self.intern.intern(name);
+    const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
+        error.MissingAttribute => return null,
+        else => return err,
+    };
+    const forced = try self.forceValue(value);
+    if (forced.discriminant != .bool_true and forced.discriminant != .bool_false) return error.TypeError;
+    return forced.discriminant == .bool_true;
 }
 
 fn appendFilteredTreeFingerprint(

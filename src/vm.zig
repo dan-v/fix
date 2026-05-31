@@ -27,6 +27,7 @@ const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const Closure = heap_mod.Closure;
 const FileCache = @import("file_cache.zig").FileCache;
+const FetchCache = @import("fetch_cache.zig").FetchCache;
 const numeric = @import("runtime/numeric.zig");
 const vm_builtins = @import("vm/builtins.zig");
 
@@ -62,6 +63,8 @@ pub const VM = struct {
     heap: *ObjectHeap,
     /// Evaluator-owned filesystem cache.
     files: *FileCache,
+    /// Evaluator-owned network/source fetch cache.
+    fetchers: *FetchCache,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
     import_host: ?ImportHost,
@@ -83,6 +86,7 @@ pub const VM = struct {
         intern: *InternTable,
         heap: *ObjectHeap,
         files: *FileCache,
+        fetchers: *FetchCache,
         scheduler: *Scheduler,
         import_host: ?ImportHost,
         builtins: Value,
@@ -100,6 +104,7 @@ pub const VM = struct {
             .intern = intern,
             .heap = heap,
             .files = files,
+            .fetchers = fetchers,
             .scheduler = scheduler,
             .import_host = import_host,
             .builtins = builtins,
