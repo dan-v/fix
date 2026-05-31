@@ -19,7 +19,7 @@ pub const ValueType = enum(u8) {
     list = 7, // payload is ObjectId
     attrs = 8, // payload is ObjectId
     closure = 9, // payload is ObjectId
-    builtin = 10, // payload is *Builtin (builtins.zig)
+    builtin = 10, // payload is builtin registry index
     thunk = 11, // payload is ObjectId
     cell = 12, // payload is ObjectId
     // reserved 13..255 for future extensions
@@ -93,10 +93,10 @@ pub const Value = extern struct {
         };
     }
 
-    pub fn builtin(ptr: *anyopaque) Value {
+    pub fn builtin(id: u16) Value {
         return .{
             .discriminant = .builtin,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
@@ -132,10 +132,6 @@ pub const Value = extern struct {
 
     pub fn asObjectId(self: Value) ObjectId {
         return @intCast(self.payload);
-    }
-
-    pub fn asPtr(self: Value, comptime T: type) *T {
-        return @ptrFromInt(@as(usize, @intCast(self.payload)));
     }
 
     pub fn isThunk(self: Value) bool {
