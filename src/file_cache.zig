@@ -39,6 +39,7 @@ pub const FileCache = struct {
         path: []u8,
         exists_known: bool = false,
         exists: bool = false,
+        kind: ?FileKind = null,
         contents: ?[]u8 = null,
         dir_entries: ?[]DirEntry = null,
     };
@@ -100,7 +101,28 @@ pub const FileCache = struct {
         entry.exists_known = true;
         entry.exists = true;
         entry.contents = contents;
+        entry.kind = .regular;
         return contents;
+    }
+
+    pub fn fileType(self: *FileCache, path: []const u8) !FileKind {
+        var entry = try self.entryFor(path);
+        if (entry.kind) |kind| return kind;
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        const stat = std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => {
+                entry.exists_known = true;
+                entry.exists = false;
+                return err;
+            },
+            else => return err,
+        };
+        const kind = fileKindFromStd(stat.kind);
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.kind = kind;
+        return kind;
     }
 
     pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
@@ -131,6 +153,7 @@ pub const FileCache = struct {
 
         entry.exists_known = true;
         entry.exists = true;
+        entry.kind = .directory;
         entry.dir_entries = try owned_entries.toOwnedSlice(self.allocator);
         return entry.dir_entries.?;
     }

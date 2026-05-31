@@ -795,6 +795,7 @@ pub const VM = struct {
             .readFile => self.builtinReadFile(args[0]),
             .import => self.builtinImport(args[0]),
             .readDir => self.builtinReadDir(args[0]),
+            .readFileType => self.builtinReadFileType(args[0]),
             .hasAttr => self.builtinHasAttr(args[0], args[1]),
             .getAttr => self.builtinGetAttr(args[0], args[1]),
             .elemAt => self.builtinElemAt(args[0], args[1]),
@@ -919,6 +920,11 @@ pub const VM = struct {
     fn builtinReadFile(self: *VM, arg: Value) !Value {
         const contents = try self.files.readFile(try self.pathArg(arg));
         return Value.string(try self.intern.intern(contents));
+    }
+
+    fn builtinReadFileType(self: *VM, arg: Value) !Value {
+        const kind = try self.files.fileType(try self.pathArg(arg));
+        return Value.string(try self.intern.intern(kind.nixTypeName()));
     }
 
     fn builtinImport(self: *VM, arg: Value) !Value {
