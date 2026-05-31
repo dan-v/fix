@@ -443,9 +443,8 @@ pub const VM = struct {
                     try self.push(result);
                 },
 
-                // ---- environment (placeholders) ----
-                .push_env => {},
-                .pop_env => {},
+                // ---- environment ----
+                .push_env, .pop_env => return error.UnsupportedWith,
 
                 // ---- termination ----
                 .ret => {
