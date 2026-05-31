@@ -230,6 +230,10 @@ pub const Evaluator = struct {
     }
 
     fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {
+        if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
+            return Value.path(try self.intern.intern("/__corepkgs__/fetchurl.nix"));
+        }
+
         for (self.search_paths) |entry| {
             if (try self.searchPathCandidate(entry.path, entry.prefix, name)) |candidate| {
                 defer self.allocator.free(candidate);
@@ -262,14 +266,43 @@ pub const Evaluator = struct {
         const progress_key = try self.beginImport(stable_path);
         defer self.endImport(progress_key);
 
-        const source = self.files.readFile(stable_path) catch |err| switch (err) {
-            error.IsDir => return self.importDirectory(stable_path),
-            else => return err,
-        };
+        const source = if (corepkgsSource(stable_path)) |core_source|
+            core_source
+        else
+            self.files.readFile(stable_path) catch |err| switch (err) {
+                error.IsDir => return self.importDirectory(stable_path),
+                else => return err,
+            };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
         const value = try self.evaluateSource(source, source_base);
         try self.cacheImportValue(stable_path, value);
         return value;
+    }
+
+    fn corepkgsSource(path: []const u8) ?[]const u8 {
+        if (!std.mem.eql(u8, path, "/__corepkgs__/fetchurl.nix")) return null;
+        return
+            \\{
+            \\  name ? baseNameOf url,
+            \\  url,
+            \\  hash ? "",
+            \\  sha256 ? hash,
+            \\  executable ? false,
+            \\  ...
+            \\}:
+            \\derivation {
+            \\  inherit name url executable;
+            \\  urls = [ url ];
+            \\  builder = "builtin:fetchurl";
+            \\  system = "builtin";
+            \\  outputHash = sha256;
+            \\  outputHashAlgo = "sha256";
+            \\  outputHashMode = "flat";
+            \\  preferLocalBuild = true;
+            \\  impureEnvVars = [ ];
+            \\  unpack = false;
+            \\}
+        ;
     }
 
     fn importDirectory(self: *Evaluator, path: []const u8) anyerror!Value {

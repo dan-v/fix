@@ -595,6 +595,18 @@ test "end-to-end: derivation coerces string-like attrs" {
     try std.testing.expectEqual(value.ValueType.attrs, drv.discriminant);
 }
 
+test "end-to-end: core fetchurl import" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const fetched = try ev.evaluate(
+        "import <nix/fetchurl.nix> { name = \"seed\"; url = \"https://example.com/seed\"; sha256 = \"sha256-000\"; }",
+    );
+    try std.testing.expectEqual(value.ValueType.attrs, fetched.discriminant);
+}
+
 test "end-to-end: with expressions" {
     const alloc = std.testing.allocator;
 
