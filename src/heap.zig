@@ -15,6 +15,8 @@ pub const ChunkId = types.ChunkId;
 pub const InternId = types.InternId;
 
 const OBJECTS_PER_PAGE: u32 = 256;
+const VALUES_PER_PAGE: u32 = 1024;
+const ATTRS_PER_PAGE: u32 = 512;
 
 pub const AttrEntry = struct {
     name: InternId,
@@ -22,11 +24,13 @@ pub const AttrEntry = struct {
 };
 
 const ValueRange = struct {
+    page: u32,
     start: u32,
     len: u32,
 };
 
 const AttrRange = struct {
+    page: u32,
     start: u32,
     len: u32,
 };
@@ -53,26 +57,38 @@ pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     object_pages: std.ArrayListUnmanaged([]Object),
     object_count: u32,
-    values: std.ArrayListUnmanaged(Value),
-    attrs: std.ArrayListUnmanaged(AttrEntry),
+    value_pages: std.ArrayListUnmanaged([]Value),
+    value_page_used: std.ArrayListUnmanaged(u32),
+    attr_pages: std.ArrayListUnmanaged([]AttrEntry),
+    attr_page_used: std.ArrayListUnmanaged(u32),
 
     pub fn init(allocator: std.mem.Allocator) ObjectHeap {
         return .{
             .allocator = allocator,
             .object_pages = .empty,
             .object_count = 0,
-            .values = .empty,
-            .attrs = .empty,
+            .value_pages = .empty,
+            .value_page_used = .empty,
+            .attr_pages = .empty,
+            .attr_page_used = .empty,
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        for (self.attr_pages.items) |page| {
+            self.allocator.free(page);
+        }
+        self.attr_pages.deinit(self.allocator);
+        self.attr_page_used.deinit(self.allocator);
+        for (self.value_pages.items) |page| {
+            self.allocator.free(page);
+        }
+        self.value_pages.deinit(self.allocator);
+        self.value_page_used.deinit(self.allocator);
         for (self.object_pages.items) |page| {
             self.allocator.free(page);
         }
         self.object_pages.deinit(self.allocator);
-        self.attrs.deinit(self.allocator);
-        self.values.deinit(self.allocator);
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
@@ -159,42 +175,40 @@ pub const ObjectHeap = struct {
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
         const range = try self.appendValues(items);
+        errdefer self.rollbackValues(range);
         return self.add(.{ .list = range });
     }
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrs(entries);
         self.sortAttrs(range);
-        errdefer self.attrs.shrinkRetainingCapacity(range.start);
+        errdefer self.rollbackAttrs(range);
         try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
         std.debug.assert(pairs.len % 2 == 0);
-        const start = self.attrs.items.len;
-        try self.attrs.ensureUnusedCapacity(self.allocator, pairs.len / 2);
+        const range = try self.reserveAttrs(pairs.len / 2);
+        const entries = self.attrSliceMut(range);
 
         var i: usize = 0;
         while (i < pairs.len) : (i += 2) {
-            self.attrs.appendAssumeCapacity(.{
+            entries[i / 2] = .{
                 .name = pairs[i].asInternId(),
                 .value = pairs[i + 1],
-            });
+            };
         }
 
-        const range: AttrRange = .{
-            .start = @intCast(start),
-            .len = @intCast(pairs.len / 2),
-        };
         self.sortAttrs(range);
-        errdefer self.attrs.shrinkRetainingCapacity(start);
+        errdefer self.rollbackAttrs(range);
         try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
         const range = try self.appendValues(upvalues);
+        errdefer self.rollbackValues(range);
         return self.add(.{ .closure = .{
             .chunk_id = chunk_id,
             .upvalues = range,
@@ -210,39 +224,43 @@ pub const ObjectHeap = struct {
     }
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {
-        const start = self.values.items.len;
-        try self.values.appendSlice(self.allocator, items);
-        return .{
-            .start = @intCast(start),
-            .len = @intCast(items.len),
-        };
+        const range = try self.reserveValues(items.len);
+        @memcpy(self.valueSliceMut(range), items);
+        return range;
     }
 
     fn appendAttrs(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
-        const start = self.attrs.items.len;
-        try self.attrs.appendSlice(self.allocator, entries);
-        return .{
-            .start = @intCast(start),
-            .len = @intCast(entries.len),
-        };
+        const range = try self.reserveAttrs(entries.len);
+        @memcpy(self.attrSliceMut(range), entries);
+        return range;
     }
 
     fn valueSlice(self: *const ObjectHeap, range: ValueRange) []const Value {
+        if (range.len == 0) return &.{};
         const start: usize = range.start;
         const end = start + range.len;
-        return self.values.items[start..end];
+        return self.value_pages.items[@intCast(range.page)][start..end];
+    }
+
+    fn valueSliceMut(self: *ObjectHeap, range: ValueRange) []Value {
+        if (range.len == 0) return &.{};
+        const start: usize = range.start;
+        const end = start + range.len;
+        return self.value_pages.items[@intCast(range.page)][start..end];
     }
 
     fn attrSlice(self: *const ObjectHeap, range: AttrRange) []const AttrEntry {
+        if (range.len == 0) return &.{};
         const start: usize = range.start;
         const end = start + range.len;
-        return self.attrs.items[start..end];
+        return self.attr_pages.items[@intCast(range.page)][start..end];
     }
 
     fn attrSliceMut(self: *ObjectHeap, range: AttrRange) []AttrEntry {
+        if (range.len == 0) return &.{};
         const start: usize = range.start;
         const end = start + range.len;
-        return self.attrs.items[start..end];
+        return self.attr_pages.items[@intCast(range.page)][start..end];
     }
 
     fn sortAttrs(self: *ObjectHeap, range: AttrRange) void {
@@ -267,6 +285,72 @@ pub const ObjectHeap = struct {
         std.debug.assert(page_index == self.object_pages.items.len);
         const page = try self.allocator.alloc(Object, OBJECTS_PER_PAGE);
         try self.object_pages.append(self.allocator, page);
+    }
+
+    fn reserveValues(self: *ObjectHeap, len: usize) !ValueRange {
+        if (len == 0) return .{ .page = 0, .start = 0, .len = 0 };
+        const page_index = try self.ensureValuePage(len);
+        const start = self.value_page_used.items[page_index];
+        self.value_page_used.items[page_index] += @intCast(len);
+        return .{
+            .page = @intCast(page_index),
+            .start = start,
+            .len = @intCast(len),
+        };
+    }
+
+    fn reserveAttrs(self: *ObjectHeap, len: usize) !AttrRange {
+        if (len == 0) return .{ .page = 0, .start = 0, .len = 0 };
+        const page_index = try self.ensureAttrPage(len);
+        const start = self.attr_page_used.items[page_index];
+        self.attr_page_used.items[page_index] += @intCast(len);
+        return .{
+            .page = @intCast(page_index),
+            .start = start,
+            .len = @intCast(len),
+        };
+    }
+
+    fn rollbackAttrs(self: *ObjectHeap, range: AttrRange) void {
+        if (range.len == 0) return;
+        self.attr_page_used.items[@intCast(range.page)] = range.start;
+    }
+
+    fn rollbackValues(self: *ObjectHeap, range: ValueRange) void {
+        if (range.len == 0) return;
+        self.value_page_used.items[@intCast(range.page)] = range.start;
+    }
+
+    fn ensureValuePage(self: *ObjectHeap, len: usize) !usize {
+        if (self.value_pages.items.len > 0) {
+            const last = self.value_pages.items.len - 1;
+            const used = self.value_page_used.items[last];
+            if (used + len <= self.value_pages.items[last].len) return last;
+        }
+
+        const cap = @max(@as(usize, VALUES_PER_PAGE), len);
+        const page = try self.allocator.alloc(Value, cap);
+        errdefer self.allocator.free(page);
+        try self.value_pages.append(self.allocator, page);
+        errdefer _ = self.value_pages.pop();
+        try self.value_page_used.append(self.allocator, 0);
+        return self.value_pages.items.len - 1;
+    }
+
+    fn ensureAttrPage(self: *ObjectHeap, len: usize) !usize {
+        if (self.attr_pages.items.len > 0) {
+            const last = self.attr_pages.items.len - 1;
+            const used = self.attr_page_used.items[last];
+            if (used + len <= self.attr_pages.items[last].len) return last;
+        }
+
+        const cap = @max(@as(usize, ATTRS_PER_PAGE), len);
+        const page = try self.allocator.alloc(AttrEntry, cap);
+        errdefer self.allocator.free(page);
+        try self.attr_pages.append(self.allocator, page);
+        errdefer _ = self.attr_pages.pop();
+        try self.attr_page_used.append(self.allocator, 0);
+        return self.attr_pages.items.len - 1;
     }
 
     fn objectSlot(self: *ObjectHeap, id: ObjectId) *Object {
@@ -344,7 +428,9 @@ test "object heap rejects duplicate attrs and rolls back side entries" {
         .{ .name = 10, .value = Value.int(3) },
     }));
 
-    try std.testing.expectEqual(@as(usize, 0), heap.attrs.items.len);
+    if (heap.attr_page_used.items.len > 0) {
+        try std.testing.expectEqual(@as(u32, 0), heap.attr_page_used.items[0]);
+    }
 
     const attrs_id = try heap.addAttrs(&.{
         .{ .name = 10, .value = Value.int(1) },
@@ -358,9 +444,10 @@ test "object heap preserves earlier ranges as side arenas grow" {
     defer heap.deinit();
 
     const first_id = try heap.addList(&.{ Value.int(1), Value.int(2) });
+    const first_ptr = (try heap.getList(first_id)).ptr;
 
     var i: usize = 0;
-    while (i < 256) : (i += 1) {
+    while (i < VALUES_PER_PAGE * 3) : (i += 1) {
         _ = try heap.addList(&.{
             Value.int(@intCast(i)),
             Value.int(@intCast(i + 1)),
@@ -369,9 +456,29 @@ test "object heap preserves earlier ranges as side arenas grow" {
     }
 
     const first = try heap.getList(first_id);
+    try std.testing.expectEqual(first_ptr, first.ptr);
     try std.testing.expectEqual(@as(usize, 2), first.len);
     try std.testing.expectEqual(@as(i64, 1), first[0].asInt());
     try std.testing.expectEqual(@as(i64, 2), first[1].asInt());
+
+    const attrs_id = try heap.addAttrs(&.{
+        .{ .name = 1, .value = Value.int(1) },
+        .{ .name = 2, .value = Value.int(2) },
+    });
+    const attrs_ptr = (try heap.getAttrs(attrs_id)).ptr;
+
+    i = 0;
+    while (i < ATTRS_PER_PAGE * 3) : (i += 1) {
+        _ = try heap.addAttrs(&.{
+            .{ .name = @intCast(i * 3 + 10), .value = Value.int(@intCast(i)) },
+            .{ .name = @intCast(i * 3 + 11), .value = Value.int(@intCast(i + 1)) },
+            .{ .name = @intCast(i * 3 + 12), .value = Value.int(@intCast(i + 2)) },
+        });
+    }
+
+    const first_attrs = try heap.getAttrs(attrs_id);
+    try std.testing.expectEqual(attrs_ptr, first_attrs.ptr);
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 2)).asInt());
 }
 
 test "object heap keeps object addresses stable across page growth" {
