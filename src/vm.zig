@@ -415,8 +415,7 @@ pub const VM = struct {
                     const idx: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
                     _ = idx;
-                    _ = self.pop();
-                    try self.push(Value.null_val);
+                    return error.UnsupportedBuiltin;
                 },
                 .tail_call => {
                     const arg = self.pop();
@@ -646,9 +645,7 @@ pub const VM = struct {
             try self.push(arg); // arg is first local
             try self.pushFrame(ch, 1, closure_id);
         } else if (callee.discriminant == .builtin) {
-            try self.push(arg);
-            try self.push(callee);
-            return;
+            return error.UnsupportedBuiltin;
         } else {
             return error.NotCallable;
         }
