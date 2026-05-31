@@ -83,7 +83,7 @@ pub const Evaluator = struct {
         try builder.writeOp(self.allocator, .ret);
         try builder.writeOp(self.allocator, .halt);
 
-        const chunk = try builder.finish(self.allocator);
+        const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registry.register(chunk);
 
         // 3. Evaluate via a VM.

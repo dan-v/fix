@@ -106,6 +106,10 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].
     get_attr_path_or,
+    /// Look up a variable name through active with-scopes.
+    /// Operand: 2-byte InternId, 1-byte scope count.
+    /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.
+    lookup_with,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,

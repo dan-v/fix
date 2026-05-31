@@ -34,10 +34,17 @@ const Capture = struct {
     index: u16,
 };
 
+const WithScope = struct {
+    kind: Capture.Kind,
+    index: u16,
+};
+
 const AttrEntryView = struct {
     path: []const Node.Atom,
     expr: *const Node,
 };
+
+const with_capture_name = "\x00with";
 
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
@@ -47,6 +54,7 @@ pub const Compiler = struct {
     intern: *@import("intern.zig").InternTable,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
+    with_scopes: std.ArrayListUnmanaged(WithScope),
     parent: ?*Compiler,
     scope_depth: u8,
     slot_count: u16,
@@ -66,6 +74,7 @@ pub const Compiler = struct {
             .intern = intern,
             .locals = .empty,
             .captures = .empty,
+            .with_scopes = .empty,
             .parent = null,
             .scope_depth = 0,
             .slot_count = 0,
@@ -73,6 +82,7 @@ pub const Compiler = struct {
     }
 
     pub fn deinit(self: *Compiler) void {
+        self.with_scopes.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
     }
@@ -98,12 +108,12 @@ pub const Compiler = struct {
             .let_in => try self.compileLetIn(node),
             .if_else => try self.compileIfElse(node),
             .assert => try self.compileAssert(node),
+            .with_expr => try self.compileWith(node),
             .attr_set => try self.compileAttrSet(node),
             .attr_path => try self.compileAttrPath(node),
             .attr_or => try self.compileAttrOr(node),
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
-            else => return error.UnsupportedNode,
         }
     }
 
@@ -212,6 +222,8 @@ pub const Compiler = struct {
             try self.emitOpByte(.get_upvalue, slot);
         } else if (std.mem.eql(u8, span, "builtins")) {
             try self.emitOp(.push_builtins);
+        } else if (try self.emitWithLookup(span)) {
+            return;
         } else {
             return error.UndefinedVariable;
         }
@@ -333,7 +345,7 @@ pub const Compiler = struct {
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
-        const child_chunk = try child_builder.finish(self.allocator);
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
@@ -383,7 +395,7 @@ pub const Compiler = struct {
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
-        const child_chunk = try child_builder.finish(self.allocator);
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
@@ -442,6 +454,22 @@ pub const Compiler = struct {
         try self.emitOp(.fail_assertion);
 
         self.patchJump(end_jump, self.builder.code.items.len);
+    }
+
+    fn compileWith(self: *Compiler, node: *const Node) !void {
+        const with_node = node.data.with_expr;
+
+        self.beginScope();
+
+        const scope_slot = self.declareLocal("", try self.intern.intern(""));
+        try self.compileThunk(with_node.attr_set);
+        try self.emitOpByte(.set_local, @intCast(scope_slot));
+        try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
+
+        try self.compileNode(with_node.body);
+
+        _ = self.with_scopes.pop();
+        self.endScope();
     }
 
     fn compileAttrSet(self: *Compiler, node: *const Node) !void {
@@ -558,7 +586,7 @@ pub const Compiler = struct {
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
-        const child_chunk = try child_builder.finish(self.allocator);
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
@@ -667,6 +695,45 @@ pub const Compiler = struct {
             try self.compileThunk(item);
         }
         try self.emitOpU16(.build_list, @intCast(list.items.len));
+    }
+
+    fn emitWithLookup(self: *Compiler, name: []const u8) !bool {
+        var scopes: std.ArrayListUnmanaged(WithScope) = .empty;
+        defer scopes.deinit(self.allocator);
+
+        try self.collectWithScopes(&scopes);
+        if (scopes.items.len == 0) return false;
+        if (scopes.items.len > std.math.maxInt(u8)) return error.TooManyWithScopes;
+
+        for (scopes.items) |scope| {
+            switch (scope.kind) {
+                .local => try self.emitOpByte(.capture_local, @intCast(scope.index)),
+                .upvalue => try self.emitOpByte(.capture_upvalue, @intCast(scope.index)),
+            }
+        }
+
+        const name_id = try self.intern.intern(name);
+        try self.emitOpU16(.lookup_with, @intCast(name_id));
+        try self.builder.writeByte(self.allocator, @intCast(scopes.items.len));
+        return true;
+    }
+
+    fn collectWithScopes(self: *Compiler, scopes: *std.ArrayListUnmanaged(WithScope)) !void {
+        var i: usize = self.with_scopes.items.len;
+        while (i > 0) {
+            i -= 1;
+            try scopes.append(self.allocator, self.with_scopes.items[i]);
+        }
+
+        const parent = self.parent orelse return;
+        var parent_scopes: std.ArrayListUnmanaged(WithScope) = .empty;
+        defer parent_scopes.deinit(self.allocator);
+
+        try parent.collectWithScopes(&parent_scopes);
+        for (parent_scopes.items) |scope| {
+            const capture_slot = try self.addCapture(with_capture_name, scope.kind, scope.index);
+            try scopes.append(self.allocator, .{ .kind = .upvalue, .index = capture_slot });
+        }
     }
 
     // ---- patch helpers ----

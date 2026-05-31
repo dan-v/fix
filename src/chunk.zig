@@ -15,6 +15,8 @@ pub const Chunk = struct {
     code: []u8,
     /// Constant pool.
     constants: []Value,
+    /// Number of stack slots reserved for locals in each frame.
+    local_count: u16,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
@@ -69,12 +71,13 @@ pub const ChunkBuilder = struct {
     }
 
     /// Finalize into an immutable Chunk.
-    pub fn finish(self: *ChunkBuilder, allocator: std.mem.Allocator) !Chunk {
+    pub fn finish(self: *ChunkBuilder, allocator: std.mem.Allocator, local_count: u16) !Chunk {
         const code = try allocator.dupe(u8, self.code.items);
         const constants = try allocator.dupe(Value, self.constants.items);
         return Chunk{
             .code = code,
             .constants = constants,
+            .local_count = local_count,
         };
     }
 };

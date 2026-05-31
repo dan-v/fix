@@ -111,13 +111,20 @@ pub const VM = struct {
 
     // ---- frame management ----
 
-    fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_id: ?ObjectId) !void {
+    fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) !void {
         if (self.frames.items.len >= types.MAX_FRAMES) return error.FrameOverflow;
+        if (arg_count > ch.local_count) return error.InvalidCallFrame;
+        const frame_base = self.sp - arg_count;
+        const reserved = @as(u32, ch.local_count) - arg_count;
+        var i: u32 = 0;
+        while (i < reserved) : (i += 1) {
+            try self.push(Value.null_val);
+        }
         try self.frames.append(self.allocator, .{
             .chunk_ptr = ch,
             .ip = 0,
-            .frame_base = self.sp - local_count,
-            .local_count = local_count,
+            .frame_base = frame_base,
+            .local_count = ch.local_count,
             .closure_id = closure_id,
         });
     }
@@ -215,7 +222,7 @@ pub const VM = struct {
                 .set_local => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
-                    const val = self.stack.items[self.sp - 1];
+                    const val = self.pop();
                     self.setStack(frame.frame_base + slot, val);
                 },
 
@@ -433,6 +440,13 @@ pub const VM = struct {
                     const attrs_val = self.pop();
                     const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip]);
                     try self.push(result);
+                },
+                .lookup_with => {
+                    const name_id: InternId = @intCast(readU16(code, frame.ip));
+                    frame.ip += 2;
+                    const scope_count = code[frame.ip];
+                    frame.ip += 1;
+                    try self.lookupWith(name_id, scope_count);
                 },
                 // ---- termination ----
                 .ret => {
@@ -741,6 +755,29 @@ pub const VM = struct {
             current = try self.forceValue(current);
         }
         return current;
+    }
+
+    fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
+        const start = self.sp - scope_count;
+        const scopes = self.stack.items[start..self.sp];
+
+        for (scopes) |scope| {
+            const attrs_val = try self.forceValue(scope);
+            if (attrs_val.discriminant != .attrs) return error.TypeError;
+
+            const attr_val = self.heap.getAttrValue(attrs_val.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => continue,
+                else => return err,
+            };
+
+            const result = try self.forceValue(attr_val);
+            self.sp = start;
+            try self.push(result);
+            return;
+        }
+
+        self.sp = start;
+        return error.UndefinedVariable;
     }
 };
 
