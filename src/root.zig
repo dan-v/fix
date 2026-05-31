@@ -209,6 +209,28 @@ test "end-to-end: inherit from source expression" {
     try std.testing.expectEqual(value.ValueType.attrs, lazy.discriminant);
 }
 
+test "end-to-end: or is contextual in attr names" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const direct = try ev.evaluate("({ or = 2; }).or");
+    try std.testing.expectEqual(@as(i64, 2), direct.asInt());
+
+    const nested = try ev.evaluate("({ x.or = 3; }).x.or");
+    try std.testing.expectEqual(@as(i64, 3), nested.asInt());
+
+    const inherited = try ev.evaluate("let or = 4; in ({ inherit or; }).or");
+    try std.testing.expectEqual(@as(i64, 4), inherited.asInt());
+
+    const inherited_from = try ev.evaluate("({ inherit ({ or = 5; }) or; }).or");
+    try std.testing.expectEqual(@as(i64, 5), inherited_from.asInt());
+
+    const attr_or = try ev.evaluate("({ x.or = 6; }).x.or or 9");
+    try std.testing.expectEqual(@as(i64, 6), attr_or.asInt());
+}
+
 test "end-to-end: list elements are lazy" {
     const alloc = std.testing.allocator;
 

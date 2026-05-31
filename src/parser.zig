@@ -356,7 +356,10 @@ pub const Parser = struct {
         var count: usize = 0;
         while (!self.check(.semicolon) and !self.check(.right_brace) and !self.check(.eof)) {
             const name_tok = self.current;
-            _ = try self.expect(.identifier, "Expected inherited variable name.");
+            if (!self.matchLetBindingName()) {
+                self.reportError("Expected inherited variable name.");
+                return error.ParseError;
+            }
 
             const path = try allocator.alloc(Node.Atom, 1);
             path[0] = .{
@@ -396,7 +399,7 @@ pub const Parser = struct {
         var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
 
         while (true) {
-            if (self.match(.identifier) or self.match(.string)) {
+            if (self.matchAttrName()) {
                 try segments.append(allocator, .{
                     .offset = self.previous.offset,
                     .len = self.previous.len,
@@ -472,7 +475,10 @@ pub const Parser = struct {
 
         while (!self.check(.kw_in) and !self.check(.eof)) {
             const name_tok = self.current;
-            _ = try self.expect(.identifier, "Expected variable name in let binding.");
+            if (!self.matchLetBindingName()) {
+                self.reportError("Expected variable name in let binding.");
+                return error.ParseError;
+            }
             _ = try self.expect(.equal, "Expected '=' after variable name.");
             const expr = try self.expression();
             _ = try self.expect(.semicolon, "Expected ';' after let binding.");
@@ -526,13 +532,7 @@ pub const Parser = struct {
         var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
 
         while (true) {
-            if (self.match(.identifier)) {
-                try segments.append(arena_allocator, .{
-                    .offset = self.previous.offset,
-                    .len = self.previous.len,
-                });
-            } else if (self.match(.string)) {
-                // "string" inside dot access: a."foo"
+            if (self.matchAttrName()) {
                 try segments.append(arena_allocator, .{
                     .offset = self.previous.offset,
                     .len = self.previous.len,
@@ -575,6 +575,14 @@ pub const Parser = struct {
         return self.arena.createNode(.apply, .{
             .apply = .{ .func = func, .arg = arg },
         });
+    }
+
+    fn matchAttrName(self: *Parser) bool {
+        return self.match(.identifier) or self.match(.string) or self.match(.kw_or);
+    }
+
+    fn matchLetBindingName(self: *Parser) bool {
+        return self.match(.identifier) or self.match(.kw_or);
     }
 };
 
@@ -644,7 +652,7 @@ test "parser desugars simple inherit in attrsets" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
-    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit a b; }");
+    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit a or; }");
     const node = try parser.parse();
 
     try std.testing.expectEqual(NodeTag.attr_set, node.tag);
@@ -658,8 +666,8 @@ test "parser desugars simple inherit in attrsets" {
         .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.identifier, entries[0].expr.tag);
-    try std.testing.expectEqualStrings("b", parser.span(.{
-        .type = .identifier,
+    try std.testing.expectEqualStrings("or", parser.span(.{
+        .type = .kw_or,
         .offset = entries[1].path[0].offset,
         .len = entries[1].path[0].len,
         .line = 1,
@@ -671,7 +679,7 @@ test "parser desugars inherit from source expression" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
-    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit (src) a b; }");
+    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit (src) a or; }");
     const node = try parser.parse();
 
     try std.testing.expectEqual(NodeTag.attr_set, node.tag);
@@ -688,6 +696,30 @@ test "parser desugars inherit from source expression" {
     }));
     try std.testing.expectEqual(NodeTag.attr_path, entries[1].expr.tag);
     try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.data.attr_path.root.tag);
+}
+
+test "parser recognizes contextual or attr names" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ or = 2; x.or = 3; }");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    const entries = node.data.attr_set.entries;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("or", parser.span(.{
+        .type = .kw_or,
+        .offset = entries[0].path[0].offset,
+        .len = entries[0].path[0].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqualStrings("or", parser.span(.{
+        .type = .kw_or,
+        .offset = entries[1].path[1].offset,
+        .len = entries[1].path[1].len,
+        .line = 1,
+    }));
 }
 
 test "parser recognizes attr path or default" {
