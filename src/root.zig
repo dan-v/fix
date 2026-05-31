@@ -91,6 +91,19 @@ test "end-to-end: string concatenation" {
     try std.testing.expectError(error.TypeError, ev.evaluate("\"ab\" + 1"));
 }
 
+test "end-to-end: string concatenation coerces string-like attrs" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const out_path = try ev.evaluate("{ outPath = \"/nix/store/source\"; } + \"/subdir\"");
+    try std.testing.expectEqualStrings("/nix/store/source/subdir", ev.intern.get(out_path.asInternId()));
+
+    const custom = try ev.evaluate("{ __toString = self: self.value; value = \"left\"; } + \"-right\"");
+    try std.testing.expectEqualStrings("left-right", ev.intern.get(custom.asInternId()));
+}
+
 test "end-to-end: path concatenation follows Nix left-path semantics" {
     const alloc = std.testing.allocator;
 

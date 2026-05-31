@@ -268,14 +268,17 @@ pub const VM = struct {
 
                 // ---- integer arithmetic ----
                 .add_int => {
-                    const b = self.pop();
-                    const a = self.pop();
-                    if (a.discriminant == .string and b.discriminant == .string) {
-                        try self.push(try self.concatStrings(a, b));
-                    } else if (a.discriminant == .path and (b.discriminant == .string or b.discriminant == .path)) {
-                        try self.push(try self.concatPath(a, b));
-                    } else {
+                    const b = try self.forceValue(self.pop());
+                    const a = try self.forceValue(self.pop());
+                    if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
                         try self.push(try numeric.add(a, b));
+                    } else if (a.discriminant == .path) {
+                        const b_id = try self.stringLikeInternId(b);
+                        try self.push(try self.concatInternedPath(a.asInternId(), b_id));
+                    } else {
+                        const a_id = try self.stringLikeInternId(a);
+                        const b_id = try self.stringLikeInternId(b);
+                        try self.push(Value.string(try self.concatInternedString(a_id, b_id)));
                     }
                 },
                 .sub_int => {
@@ -726,29 +729,53 @@ pub const VM = struct {
     }
 
     fn concatStrings(self: *VM, a: Value, b: Value) !Value {
-        const s_a = self.intern.get(a.asInternId());
-        const s_b = self.intern.get(b.asInternId());
-
-        const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
-        defer self.allocator.free(buf);
-
-        @memcpy(buf[0..s_a.len], s_a);
-        @memcpy(buf[s_a.len..], s_b);
-
-        return Value.string(try self.intern.intern(buf));
+        return Value.string(try self.concatInternedString(a.asInternId(), b.asInternId()));
     }
 
     fn concatPath(self: *VM, a: Value, b: Value) !Value {
-        const s_a = self.intern.get(a.asInternId());
-        const s_b = self.intern.get(b.asInternId());
+        return Value.path(try self.concatInternedString(a.asInternId(), b.asInternId()));
+    }
 
+    fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
+        const s_a = self.intern.get(a);
+        const s_b = self.intern.get(b);
         const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
         defer self.allocator.free(buf);
 
         @memcpy(buf[0..s_a.len], s_a);
         @memcpy(buf[s_a.len..], s_b);
 
-        return Value.path(try self.intern.intern(buf));
+        return self.intern.intern(buf);
+    }
+
+    fn concatInternedPath(self: *VM, a: InternId, b: InternId) !Value {
+        return Value.path(try self.concatInternedString(a, b));
+    }
+
+    fn stringLikeInternId(self: *VM, value: Value) !InternId {
+        const forced = try self.forceValue(value);
+        return switch (forced.discriminant) {
+            .string, .path => forced.asInternId(),
+            .attrs => try self.attrsStringLikeInternId(forced),
+            else => error.TypeError,
+        };
+    }
+
+    fn attrsStringLikeInternId(self: *VM, attrs: Value) !InternId {
+        const to_string_id = try self.intern.intern("__toString");
+        if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
+            return self.stringLikeInternId(try self.callValue(try self.forceValue(to_string), attrs));
+        } else |err| switch (err) {
+            error.MissingAttribute => {},
+            else => return err,
+        }
+
+        const out_path_id = try self.intern.intern("outPath");
+        const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
+            error.MissingAttribute => return error.TypeError,
+            else => return err,
+        };
+        return self.stringLikeInternId(out_path);
     }
 
     // ---- closures ----
