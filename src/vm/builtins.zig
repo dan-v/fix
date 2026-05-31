@@ -6,6 +6,7 @@ const Value = @import("../value.zig").Value;
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("../heap.zig");
+const file_cache = @import("../file_cache.zig");
 const builtins_mod = @import("../builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("../derivation.zig");
@@ -122,6 +123,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .match => builtinMatch(self, args[0], args[1]),
         .split => builtinSplit(self, args[0], args[1]),
         .fromTOML => builtinFromTOML(self, args[0]),
+        .filterSource => builtinFilterSource(self, args[0], args[1]),
         .toXML,
         .fetchurl,
         .fetchTarball,
@@ -132,7 +134,6 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .parseFlakeRef,
         .flakeRefToString,
         .break_,
-        .filterSource,
         .scopedImport,
         => unsupportedBuiltin(id),
         .traceVerbose => builtinTraceVerbose(self, args[0], args[1]),
@@ -1186,7 +1187,74 @@ fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
 
     const name = self.intern.get(name_value.asInternId());
     const contents = self.intern.get(contents_value.asInternId());
-    const digest = try nix_hash.hashBytes(self.allocator, "sha256", contents);
+    const path_id = try storeLikePath(self, name, contents);
+    return Value.string(path_id);
+}
+
+fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
+    const pred = try self.forceValue(pred_arg);
+    const root_arg = try pathArg(self, path_arg);
+    const root = try self.allocator.dupe(u8, root_arg);
+    defer self.allocator.free(root);
+
+    var fingerprint: std.ArrayListUnmanaged(u8) = .empty;
+    defer fingerprint.deinit(self.allocator);
+    try fingerprint.appendSlice(self.allocator, "filterSource\n");
+    try fingerprint.appendSlice(self.allocator, root);
+    try fingerprint.append(self.allocator, '\n');
+
+    const root_kind = try self.files.fileType(root);
+    try fingerprint.appendSlice(self.allocator, root_kind.nixTypeName());
+    try fingerprint.append(self.allocator, '\n');
+    if (root_kind == .directory) {
+        try appendFilteredTreeFingerprint(self, pred, root, &fingerprint);
+    }
+
+    return Value.string(try storeLikePath(self, path_ops.baseName(root), fingerprint.items));
+}
+
+fn appendFilteredTreeFingerprint(
+    self: anytype,
+    pred: Value,
+    dir_path: []const u8,
+    fingerprint: *std.ArrayListUnmanaged(u8),
+) !void {
+    const entries = try self.files.readDir(dir_path);
+    const sorted = try self.allocator.dupe(file_cache.FileCache.DirEntry, entries);
+    defer self.allocator.free(sorted);
+    std.mem.sort(file_cache.FileCache.DirEntry, sorted, {}, dirEntryNameLessThan);
+
+    for (sorted) |entry| {
+        const child_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
+        defer self.allocator.free(child_path);
+
+        if (!try filterSourceAccepts(self, pred, child_path, entry.kind)) continue;
+        try fingerprint.appendSlice(self.allocator, child_path);
+        try fingerprint.append(self.allocator, 0);
+        try fingerprint.appendSlice(self.allocator, entry.kind.nixTypeName());
+        try fingerprint.append(self.allocator, '\n');
+
+        if (entry.kind == .directory) {
+            try appendFilteredTreeFingerprint(self, pred, child_path, fingerprint);
+        }
+    }
+}
+
+fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
+    const path_value = Value.string(try self.intern.intern(path));
+    const kind_value = Value.string(try self.intern.intern(kind.nixTypeName()));
+    const partial = try self.callValue(pred, path_value);
+    const result = try self.forceValue(try self.callValue(partial, kind_value));
+    if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+    return result.discriminant == .bool_true;
+}
+
+fn dirEntryNameLessThan(_: void, left: file_cache.FileCache.DirEntry, right: file_cache.FileCache.DirEntry) bool {
+    return std.mem.lessThan(u8, left.name, right.name);
+}
+
+fn storeLikePath(self: anytype, name: []const u8, fingerprint: []const u8) !InternId {
+    const digest = try nix_hash.hashBytes(self.allocator, "sha256", fingerprint);
     defer self.allocator.free(digest);
 
     const clean_name = try self.allocator.alloc(u8, name.len);
@@ -1198,7 +1266,7 @@ fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
     const hash_len = @min(@as(usize, 32), digest.len);
     const path = try std.fmt.allocPrint(self.allocator, "/nix/store/{s}-{s}", .{ digest[0..hash_len], clean_name });
     defer self.allocator.free(path);
-    return Value.string(try self.intern.intern(path));
+    return self.intern.intern(path);
 }
 
 fn builtinPlaceholder(self: anytype, arg: Value) !Value {

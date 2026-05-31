@@ -1002,6 +1002,62 @@ test "evaluate readFileType builtin through file cache" {
     try std.testing.expectEqualStrings("directory", ev.intern.get(dir_kind.asInternId()));
 }
 
+test "evaluate filterSource builtin through file cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keep.txt", .data = "x" });
+    try tmp.dir.createDir(std.testing.io, "keepdir", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keepdir/nested.txt", .data = "x" });
+    try tmp.dir.createDir(std.testing.io, "skip", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "skip/boom.txt", .data = "x" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(dir_path);
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\builtins.filterSource
+        \\  (path: type:
+        \\    if builtins.baseNameOf path == "boom.txt"
+        \\    then builtins.throw "descended into rejected directory"
+        \\    else builtins.baseNameOf path != "skip")
+        \\  {s}
+    ,
+        .{dir_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const filtered = try ev.evaluate(source);
+    try std.testing.expectEqual(.string, filtered.discriminant);
+    try std.testing.expect(std.mem.startsWith(u8, ev.intern.get(filtered.asInternId()), "/nix/store/"));
+    try std.testing.expect(std.mem.endsWith(u8, ev.intern.get(filtered.asInternId()), &tmp.sub_path));
+
+    const called_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\builtins.filterSource
+        \\  (path: type:
+        \\    if builtins.baseNameOf path == "keep.txt"
+        \\    then builtins.throw "predicate called"
+        \\    else true)
+        \\  {s}
+    ,
+        .{dir_path},
+    );
+    defer std.testing.allocator.free(called_source);
+    try std.testing.expectError(error.NixThrow, ev.evaluate(called_source));
+}
+
 test "evaluate findFile builtin through explicit search path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
