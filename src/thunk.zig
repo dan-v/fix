@@ -69,6 +69,12 @@ pub const Thunk = struct {
         self.state.store(@intFromEnum(ThunkState.resolved), .release);
     }
 
+    /// Mark a failed evaluation attempt as retryable.
+    pub fn reset(self: *Thunk) void {
+        self.result = Value.null_val;
+        self.state.store(@intFromEnum(ThunkState.unresolved), .release);
+    }
+
     /// Spin until the thunk is resolved, then return the value.
     pub fn waitAndGet(self: *Thunk) Value {
         while (true) {
@@ -102,3 +108,16 @@ pub const Thunk = struct {
         allocator.destroy(self);
     }
 };
+
+test "thunk reset makes failed claims retryable" {
+    var thunk = Thunk.init(Value.null_val);
+
+    try std.testing.expectEqual(ForceResult.claimed, thunk.tryClaim());
+    try std.testing.expectEqual(ForceResult.busy, thunk.tryClaim());
+
+    thunk.reset();
+    try std.testing.expectEqual(ForceResult.claimed, thunk.tryClaim());
+
+    thunk.resolve(Value.int(42));
+    try std.testing.expectEqual(ForceResult.already_resolved, thunk.tryClaim());
+}

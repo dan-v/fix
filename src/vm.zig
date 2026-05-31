@@ -561,7 +561,11 @@ pub const VM = struct {
             .busy => return error.RecursiveThunk,
         }
 
-        const result = try self.evalThunkClosure(closure);
+        const result = self.evalThunkClosure(closure) catch |err| {
+            const failed = try self.heap.getThunk(thunk_id);
+            failed.reset();
+            return err;
+        };
         const resolved = try self.heap.getThunk(thunk_id);
         resolved.resolve(result);
         return result;
