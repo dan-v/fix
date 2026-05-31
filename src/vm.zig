@@ -310,33 +310,33 @@ pub const VM = struct {
                 .eq => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.boolVal(self.valuesEqual(a, b)));
+                    try self.push(Value.boolVal(try self.valuesEqual(a, b)));
                 },
                 .neq => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.boolVal(!self.valuesEqual(a, b)));
+                    try self.push(Value.boolVal(!try self.valuesEqual(a, b)));
                 },
                 .lt => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.boolVal(self.compareValues(a, b) == .lt));
+                    try self.push(Value.boolVal(try self.compareValues(a, b) == .lt));
                 },
                 .lte => {
                     const b = self.pop();
                     const a = self.pop();
-                    const r = self.compareValues(a, b);
+                    const r = try self.compareValues(a, b);
                     try self.push(Value.boolVal(r == .lt or r == .eq));
                 },
                 .gt => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.boolVal(self.compareValues(a, b) == .gt));
+                    try self.push(Value.boolVal(try self.compareValues(a, b) == .gt));
                 },
                 .gte => {
                     const b = self.pop();
                     const a = self.pop();
-                    const r = self.compareValues(a, b);
+                    const r = try self.compareValues(a, b);
                     try self.push(Value.boolVal(r == .gt or r == .eq));
                 },
 
@@ -439,7 +439,7 @@ pub const VM = struct {
                     frame.ip += 2;
                     const default_val = self.pop();
                     const attrs_val = self.pop();
-                    const result = self.getAttrOrValue(attrs_val, @intCast(name_id), default_val);
+                    const result = try self.getAttrOrValue(attrs_val, @intCast(name_id), default_val);
                     try self.push(result);
                 },
 
@@ -476,9 +476,9 @@ pub const VM = struct {
         };
     }
 
-    fn valuesEqual(self: *VM, a: Value, b: Value) bool {
-        const va = self.forceValue(a) catch Value.null_val;
-        const vb = self.forceValue(b) catch Value.null_val;
+    fn valuesEqual(self: *VM, a: Value, b: Value) !bool {
+        const va = try self.forceValue(a);
+        const vb = try self.forceValue(b);
 
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
@@ -494,9 +494,9 @@ pub const VM = struct {
 
     const CompareResult = enum { lt, eq, gt };
 
-    fn compareValues(self: *VM, a: Value, b: Value) CompareResult {
-        const va = self.forceValue(a) catch Value.null_val;
-        const vb = self.forceValue(b) catch Value.null_val;
+    fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
+        const va = try self.forceValue(a);
+        const vb = try self.forceValue(b);
 
         switch (va.discriminant) {
             .int => {
@@ -518,7 +518,7 @@ pub const VM = struct {
                 const ib = vb.asInternId();
                 return if (ia < ib) .lt else if (ia > ib) .gt else .eq;
             },
-            else => return .eq,
+            else => return error.TypeError,
         }
     }
 
@@ -668,8 +668,11 @@ pub const VM = struct {
         return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
     }
 
-    fn getAttrOrValue(self: *VM, attrs_val: Value, name_id: InternId, default_val: Value) Value {
-        return self.getAttrValue(attrs_val, name_id) catch default_val;
+    fn getAttrOrValue(self: *VM, attrs_val: Value, name_id: InternId, default_val: Value) !Value {
+        return self.getAttrValue(attrs_val, name_id) catch |err| switch (err) {
+            error.MissingAttribute => default_val,
+            else => err,
+        };
     }
 };
 
