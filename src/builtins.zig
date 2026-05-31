@@ -57,6 +57,8 @@ pub const BuiltinId = enum(u16) {
     trace = 47,
     derivation = 48,
     derivationStrict = 49,
+    storePath = 50,
+    path = 51,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -90,6 +92,8 @@ pub fn arity(id: BuiltinId) u8 {
         .tryEval,
         .derivation,
         .derivationStrict,
+        .storePath,
+        .path,
         => 1,
         .hasAttr,
         .getAttr,
@@ -318,6 +322,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("derivationStrict"),
             .value = Value.builtin(@intFromEnum(BuiltinId.derivationStrict)),
+        },
+        .{
+            .name = try intern.intern("storePath"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.storePath)),
+        },
+        .{
+            .name = try intern.intern("path"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.path)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

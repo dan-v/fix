@@ -846,6 +846,8 @@ pub const VM = struct {
             .trace => self.builtinTrace(args[0], args[1]),
             .derivation => self.builtinDerivation(args[0]),
             .derivationStrict => self.builtinDerivation(args[0]),
+            .storePath => self.builtinStorePath(args[0]),
+            .path => self.builtinPath(args[0]),
         };
     }
 
@@ -1509,6 +1511,37 @@ pub const VM = struct {
             if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;
         }
         return names;
+    }
+
+    fn builtinStorePath(self: *VM, arg: Value) !Value {
+        const path = try self.pathArg(arg);
+        if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
+        return Value.path(try self.intern.intern(path));
+    }
+
+    fn builtinPath(self: *VM, arg: Value) !Value {
+        const attrs = try self.forceValue(arg);
+        if (attrs.discriminant != .attrs) return error.TypeError;
+
+        const path_id = try self.intern.intern("path");
+        const path_value = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), path_id));
+        const path = switch (path_value.discriminant) {
+            .path, .string => self.intern.get(path_value.asInternId()),
+            else => return error.TypeError,
+        };
+        if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
+
+        const name_id = try self.intern.intern("name");
+        const name_value = self.heap.getAttrValue(attrs.asObjectId(), name_id) catch |err| switch (err) {
+            error.MissingAttribute => Value.null_val,
+            else => return err,
+        };
+        if (name_value.discriminant != .null) {
+            const name = try self.forceValue(name_value);
+            if (name.discriminant != .string) return error.TypeError;
+        }
+
+        return Value.path(try self.intern.intern(path));
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {

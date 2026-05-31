@@ -1119,6 +1119,25 @@ test "evaluate minimal derivation builtins" {
     try std.testing.expectEqualStrings("\"1\"", coerced_args);
 }
 
+test "evaluate path construction builtins" {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+
+    const store_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isPath (builtins.storePath \"{s}\")", .{cwd});
+    defer std.testing.allocator.free(store_source);
+    const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isPath (builtins.path {{ path = \"{s}\"; name = \"cwd\"; }})", .{cwd});
+    defer std.testing.allocator.free(path_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const store_path = try ev.evaluate(store_source);
+    try std.testing.expect(store_path.asBool());
+
+    const path = try ev.evaluate(path_source);
+    try std.testing.expect(path.asBool());
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);
