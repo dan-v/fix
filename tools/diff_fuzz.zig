@@ -290,7 +290,7 @@ fn classify(
     config: *const Config,
     expr: []const u8,
 ) !Classification {
-    const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--strict", "--expr", expr });
+    const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--expr", expr });
     errdefer nix.deinit(allocator);
 
     const fix = try runCommand(allocator, io, &.{ config.fix_bin, expr });

@@ -235,6 +235,42 @@ pub const Parser = struct {
         };
     }
 
+    fn isDisallowedListItemStart(tt: TokenType) bool {
+        return switch (tt) {
+            .kw_if,
+            .kw_assert,
+            .kw_with,
+            .kw_let,
+            .bang,
+            .minus,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isDisallowedListItemContinuation(tt: TokenType) bool {
+        return switch (tt) {
+            .colon,
+            .plus,
+            .minus,
+            .slash,
+            .star,
+            .equal_equal,
+            .bang_equal,
+            .less,
+            .less_equal,
+            .greater,
+            .greater_equal,
+            .amp_amp,
+            .pipe_pipe,
+            .double_slash,
+            .double_plus,
+            .arrow,
+            => true,
+            else => false,
+        };
+    }
+
     // ---- prefix parsers ----
 
     fn grouping(self: *Parser) !*Node {
@@ -451,7 +487,7 @@ pub const Parser = struct {
         var items: std.ArrayListUnmanaged(*Node) = .empty;
 
         while (!self.check(.right_bracket) and !self.check(.eof)) {
-            const item = try self.parsePrecedenceWithApply(.assignment, false);
+            const item = try self.listItem();
             try items.append(arena_allocator, item);
 
             _ = self.match(.comma);
@@ -462,6 +498,31 @@ pub const Parser = struct {
         return self.arena.createNode(.list, .{
             .list = .{ .items = try items.toOwnedSlice(arena_allocator) },
         });
+    }
+
+    fn listItem(self: *Parser) !*Node {
+        if (isDisallowedListItemStart(self.current.type)) {
+            self.reportError("Expected list item.");
+            return error.ParseError;
+        }
+
+        var item = try self.parsePrecedenceWithApply(.primary, false);
+        if (item.tag == .lambda) {
+            self.reportError("Expected list separator or ']'.");
+            return error.ParseError;
+        }
+
+        if (self.check(.kw_or)) {
+            self.advance();
+            item = try self.attrOr(item);
+        }
+
+        if (isDisallowedListItemContinuation(self.current.type)) {
+            self.reportError("Expected list separator or ']'.");
+            return error.ParseError;
+        }
+
+        return item;
     }
 
     fn ifElse(self: *Parser) !*Node {
@@ -843,6 +904,52 @@ test "parser recognizes attr path or default" {
     try std.testing.expectEqual(NodeTag.attr_or, node.tag);
     try std.testing.expectEqual(NodeTag.attr_path, node.data.attr_or.attr_path.tag);
     try std.testing.expectEqual(NodeTag.integer, node.data.attr_or.default.tag);
+}
+
+test "parser rejects unparenthesized expression forms in lists" {
+    const cases = [_][]const u8{
+        "[ with { x = 1; }; x ]",
+        "[ let x = 1; in x ]",
+        "[ if true then 1 else 2 ]",
+        "[ assert true; 1 ]",
+        "[ ! true ]",
+        "[ -1 ]",
+        "[ x: x ]",
+        "[ 1 + 2 ]",
+    };
+
+    for (cases) |source| {
+        var arena = ast.AstArena.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var parser = Parser.init(std.testing.allocator, &arena, source);
+        defer parser.deinit();
+
+        try std.testing.expectError(error.ParseError, parser.parse());
+    }
+}
+
+test "parser accepts parenthesized expression forms in lists" {
+    const cases = [_][]const u8{
+        "[ (with { x = 1; }; x) ]",
+        "[ (let x = 1; in x) ]",
+        "[ (if true then 1 else 2) ]",
+        "[ (assert true; 1) ]",
+        "[ (! true) ]",
+        "[ (-1) ]",
+        "[ (x: x) ]",
+        "[ (1 + 2) ]",
+    };
+
+    for (cases) |source| {
+        var arena = ast.AstArena.init(std.testing.allocator);
+        defer arena.deinit();
+
+        var parser = Parser.init(std.testing.allocator, &arena, source);
+        defer parser.deinit();
+
+        _ = try parser.parse();
+    }
 }
 
 test "parser records diagnostics without printing" {
