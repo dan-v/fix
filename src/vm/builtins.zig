@@ -1205,91 +1205,12 @@ fn builtinDerivation(self: anytype, arg: Value) !Value {
         };
     }
 
-    const normalized_attrs = try normalizedDerivationAttrs(self, attrs.asObjectId(), outputs);
-    defer self.allocator.free(normalized_attrs);
-
     return derivation.buildValue(self.allocator, self.intern, self.heap, .{
         .drv_path = try derivation.drvPath(self.allocator, self.intern, self.intern.get(drv_name_id)),
         .default_output = output_names[0],
         .outputs = outputs,
-        .original_attrs = normalized_attrs,
+        .original_attrs = try self.heap.getAttrs(attrs.asObjectId()),
     });
-}
-
-fn normalizedDerivationAttrs(self: anytype, attrs_id: ObjectId, outputs: []const derivation.Output) ![]heap_mod.AttrEntry {
-    const original = try self.heap.getAttrs(attrs_id);
-    const normalized = try self.allocator.alloc(heap_mod.AttrEntry, original.len);
-    errdefer self.allocator.free(normalized);
-
-    const structured_attrs_id = try self.intern.intern("__structuredAttrs");
-    const pass_as_file_id = try self.intern.intern("passAsFile");
-    const args_id = try self.intern.intern("args");
-    const builder_id = try self.intern.intern("builder");
-    const system_id = try self.intern.intern("system");
-
-    for (original, normalized) |entry, *out| {
-        if (derivation.isSyntheticName(self.intern, self.intern.get(entry.name), outputs)) {
-            out.* = entry;
-            continue;
-        }
-
-        if (entry.name == structured_attrs_id) {
-            const value = try self.forceValue(entry.value);
-            if (!value.isBool()) return error.TypeError;
-            out.* = .{ .name = entry.name, .value = value };
-            continue;
-        }
-
-        if (entry.name == pass_as_file_id or entry.name == args_id) {
-            out.* = .{ .name = entry.name, .value = try coerceDerivationStringList(self, entry.value) };
-            continue;
-        }
-
-        if (entry.name == builder_id or entry.name == system_id) {
-            out.* = .{ .name = entry.name, .value = try coerceDerivationString(self, entry.value) };
-            continue;
-        }
-
-        out.* = .{ .name = entry.name, .value = try coerceDerivationValue(self, entry.value) };
-    }
-
-    return normalized;
-}
-
-fn coerceDerivationValue(self: anytype, value: Value) !Value {
-    const forced = try self.forceValue(value);
-    return switch (forced.discriminant) {
-        .string, .path, .int, .bool_true, .bool_false, .attrs => coerceDerivationString(self, forced),
-        .list => coerceDerivationStringList(self, forced),
-        else => error.TypeError,
-    };
-}
-
-fn coerceDerivationString(self: anytype, value: Value) !Value {
-    const forced = try self.forceValue(value);
-    return switch (forced.discriminant) {
-        .string => forced,
-        .path => Value.string(forced.asInternId()),
-        .int => blk: {
-            const text = try std.fmt.allocPrint(self.allocator, "{}", .{forced.asInt()});
-            defer self.allocator.free(text);
-            break :blk Value.string(try self.intern.intern(text));
-        },
-        .bool_true => Value.string(try self.intern.intern("1")),
-        .bool_false => Value.string(try self.intern.intern("")),
-        .attrs => Value.string(try coerceAttrsToStringId(self, forced)),
-        else => error.TypeError,
-    };
-}
-
-fn coerceDerivationStringList(self: anytype, value: Value) !Value {
-    const list = try self.forceValue(value);
-    if (list.discriminant != .list) return error.TypeError;
-    const items = try self.heap.getList(list.asObjectId());
-    const coerced = try self.allocator.alloc(Value, items.len);
-    defer self.allocator.free(coerced);
-    for (items, coerced) |item, *out| out.* = try coerceDerivationString(self, item);
-    return Value.list(try self.heap.addList(coerced));
 }
 
 fn derivationOutputNames(self: anytype, attrs_id: ObjectId) ![]InternId {

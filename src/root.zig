@@ -583,7 +583,7 @@ test "end-to-end: builtins.toFile returns store-like string" {
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toFile \"x\" 1"));
 }
 
-test "end-to-end: derivation coerces string-like attrs" {
+test "end-to-end: derivation preserves original attrs" {
     const alloc = std.testing.allocator;
 
     var ev = try Evaluator.init(alloc, 0);
@@ -593,6 +593,9 @@ test "end-to-end: derivation coerces string-like attrs" {
         "derivation { name = \"x\"; builder = { outPath = \"/nix/store/builder\"; }; system = \"x\"; src = { outPath = \"/nix/store/src\"; }; PATH = [ { outPath = \"/nix/store/bin\"; } ]; }",
     );
     try std.testing.expectEqual(value.ValueType.attrs, drv.discriminant);
+
+    const user_hook = try ev.evaluate("(derivation { name = \"x\"; builder = \"b\"; system = \"s\"; userHook = null; }).userHook");
+    try std.testing.expectEqual(value.ValueType.null, user_hook.discriminant);
 }
 
 test "end-to-end: core fetchurl import" {
