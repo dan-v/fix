@@ -108,6 +108,7 @@ pub const VM = struct {
     // ---- frame management ----
 
     fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_id: ?ObjectId) !void {
+        if (self.frames.items.len >= types.MAX_FRAMES) return error.FrameOverflow;
         try self.frames.append(self.allocator, .{
             .chunk_ptr = ch,
             .ip = 0,
@@ -129,6 +130,7 @@ pub const VM = struct {
 
     fn push(self: *VM, val: Value) !void {
         if (self.sp >= self.stack.items.len) {
+            if (self.stack.items.len >= types.VM_STACK_CAP) return error.StackOverflow;
             try self.stack.append(self.allocator, val);
             self.sp = @intCast(self.stack.items.len);
         } else {
