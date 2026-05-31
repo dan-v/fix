@@ -1055,6 +1055,24 @@ test "evaluate map concatMap mapAttrs and genList builtins" {
     try std.testing.expectEqualStrings("[ 1 2 3 ]", generated);
 }
 
+test "evaluate string builtins" {
+    const length = try renderForTest("builtins.stringLength \"abcd\"");
+    defer std.testing.allocator.free(length);
+    try std.testing.expectEqualStrings("4", length);
+
+    const joined = try renderForTest("builtins.concatStringsSep \",\" [ \"a\" \"b\" \"c\" ]");
+    defer std.testing.allocator.free(joined);
+    try std.testing.expectEqualStrings("\"a,b,c\"", joined);
+
+    const substring = try renderForTest("builtins.substring 1 2 \"abcd\"");
+    defer std.testing.allocator.free(substring);
+    try std.testing.expectEqualStrings("\"bc\"", substring);
+
+    const replaced = try renderForTest("builtins.replaceStrings [ \"ab\" \"d\" ] [ \"X\" \"Y\" ] \"abcd\"");
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings("\"XcY\"", replaced);
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);

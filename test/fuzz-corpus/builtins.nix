@@ -59,6 +59,10 @@ builtins.map (x: x + 1) [ 1 2 ]
 builtins.concatMap (x: [ x ]) [ 1 2 ]
 (builtins.mapAttrs (name: value: value) { a = 1; }).a
 builtins.genList (x: x) 2
+builtins.stringLength "abcd"
+builtins.concatStringsSep "," [ "a" "b" ]
+builtins.substring 1 2 "abcd"
+builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
 builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]
 builtins.foldl' (a: b: a) 1 [ (1 / 0) ]
 builtins.foldl' (a: b: b) 0 [ 1 2 ]

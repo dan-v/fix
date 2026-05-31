@@ -47,6 +47,10 @@ pub const BuiltinId = enum(u16) {
     concatMap = 37,
     mapAttrs = 38,
     genList = 39,
+    stringLength = 40,
+    concatStringsSep = 41,
+    substring = 42,
+    replaceStrings = 43,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -74,6 +78,7 @@ pub fn arity(id: BuiltinId) u8 {
         .import,
         .readDir,
         .readFileType,
+        .stringLength,
         => 1,
         .hasAttr,
         .getAttr,
@@ -91,8 +96,12 @@ pub fn arity(id: BuiltinId) u8 {
         .concatMap,
         .mapAttrs,
         .genList,
+        .concatStringsSep,
         => 2,
-        .foldlStrict => 3,
+        .foldlStrict,
+        .substring,
+        .replaceStrings,
+        => 3,
     };
 }
 
@@ -257,6 +266,22 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("genList"),
             .value = Value.builtin(@intFromEnum(BuiltinId.genList)),
+        },
+        .{
+            .name = try intern.intern("stringLength"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.stringLength)),
+        },
+        .{
+            .name = try intern.intern("concatStringsSep"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.concatStringsSep)),
+        },
+        .{
+            .name = try intern.intern("substring"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.substring)),
+        },
+        .{
+            .name = try intern.intern("replaceStrings"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.replaceStrings)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

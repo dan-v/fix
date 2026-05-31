@@ -38,6 +38,13 @@ fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
     return name[prefix.len + 1 ..];
 }
 
+fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
+    for (needles, 0..) |needle, i| {
+        if (std.mem.startsWith(u8, input, needle)) return i;
+    }
+    return null;
+}
+
 /// A single call frame.
 pub const Frame = struct {
     /// The chunk being executed.
@@ -826,7 +833,11 @@ pub const VM = struct {
             .concatMap => self.builtinConcatMap(args[0], args[1]),
             .mapAttrs => self.builtinMapAttrs(args[0], args[1]),
             .genList => self.builtinGenList(args[0], args[1]),
+            .stringLength => self.builtinStringLength(args[0]),
+            .concatStringsSep => self.builtinConcatStringsSep(args[0], args[1]),
             .foldlStrict => self.builtinFoldlStrict(args[0], args[1], args[2]),
+            .substring => self.builtinSubstring(args[0], args[1], args[2]),
+            .replaceStrings => self.builtinReplaceStrings(args[0], args[1], args[2]),
             .deepSeq => self.builtinDeepSeq(args[0], args[1]),
         };
     }
@@ -1256,6 +1267,68 @@ pub const VM = struct {
         return Value.list(try self.heap.addList(out));
     }
 
+    fn builtinStringLength(self: *VM, arg: Value) !Value {
+        return Value.int(@intCast((try self.stringArg(arg)).len));
+    }
+
+    fn builtinConcatStringsSep(self: *VM, sep_arg: Value, list_arg: Value) !Value {
+        const sep = try self.stringArg(sep_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+
+        for (try self.heap.getList(list.asObjectId()), 0..) |item, i| {
+            if (i > 0) try out.appendSlice(self.allocator, sep);
+            try out.appendSlice(self.allocator, try self.stringArg(item));
+        }
+
+        return Value.string(try self.intern.intern(out.items));
+    }
+
+    fn builtinSubstring(self: *VM, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
+        const start_value = try self.forceValue(start_arg);
+        const len_value = try self.forceValue(len_arg);
+        if (start_value.discriminant != .int or len_value.discriminant != .int) return error.TypeError;
+        if (start_value.asInt() < 0 or len_value.asInt() < 0) return error.TypeError;
+
+        const string = try self.stringArg(string_arg);
+        const start: usize = @intCast(start_value.asInt());
+        if (start >= string.len) return Value.string(try self.intern.intern(""));
+        const requested_len: usize = @intCast(len_value.asInt());
+        const available = string.len - start;
+        const end = start + @min(available, requested_len);
+        return Value.string(try self.intern.intern(string[start..end]));
+    }
+
+    fn builtinReplaceStrings(self: *VM, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
+        const from = try self.stringListArg(from_arg);
+        defer self.allocator.free(from);
+        const to = try self.stringListArg(to_arg);
+        defer self.allocator.free(to);
+        if (from.len != to.len) return error.TypeError;
+
+        const input = try self.stringArg(string_arg);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+
+        var index: usize = 0;
+        while (index < input.len) {
+            if (firstReplacementAt(input[index..], from)) |replacement_index| {
+                const needle = from[replacement_index];
+                if (needle.len == 0) return error.TypeError;
+                try out.appendSlice(self.allocator, to[replacement_index]);
+                index += needle.len;
+            } else {
+                try out.append(self.allocator, input[index]);
+                index += 1;
+            }
+        }
+
+        return Value.string(try self.intern.intern(out.items));
+    }
+
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
         const op = try self.forceValue(op_arg);
         var acc = try self.forceValue(nul_arg);
@@ -1316,6 +1389,23 @@ pub const VM = struct {
             if (value.asInternId() == needle) return true;
         }
         return false;
+    }
+
+    fn stringArg(self: *VM, arg: Value) ![]const u8 {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .string) return error.TypeError;
+        return self.intern.get(value.asInternId());
+    }
+
+    fn stringListArg(self: *VM, arg: Value) ![][]const u8 {
+        const list = try self.forceValue(arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const items = try self.heap.getList(list.asObjectId());
+        const strings = try self.allocator.alloc([]const u8, items.len);
+        errdefer self.allocator.free(strings);
+        for (items, strings) |item, *string| string.* = try self.stringArg(item);
+        return strings;
     }
 
     fn attrEntryNameLessThan(self: *VM, a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
