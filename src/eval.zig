@@ -653,6 +653,74 @@ test "evaluate curried binary builtins" {
     try std.testing.expectEqualStrings("true", partial_is_function);
 }
 
+test "evaluate primitive arithmetic and bit builtins" {
+    const add = try renderForTest("builtins.add 1 2.5");
+    defer std.testing.allocator.free(add);
+    try std.testing.expectEqualStrings("3.5", add);
+
+    const div = try renderForTest("builtins.div (-7) 2");
+    defer std.testing.allocator.free(div);
+    try std.testing.expectEqualStrings("-3", div);
+
+    const less_than = try renderForTest("builtins.lessThan \"a\" \"b\"");
+    defer std.testing.allocator.free(less_than);
+    try std.testing.expectEqualStrings("true", less_than);
+
+    const bit_and = try renderForTest("builtins.bitAnd 6 3");
+    defer std.testing.allocator.free(bit_and);
+    try std.testing.expectEqualStrings("2", bit_and);
+
+    const bit_or = try renderForTest("builtins.bitOr 4 1");
+    defer std.testing.allocator.free(bit_or);
+    try std.testing.expectEqualStrings("5", bit_or);
+
+    const bit_xor = try renderForTest("builtins.bitXor 6 3");
+    defer std.testing.allocator.free(bit_xor);
+    try std.testing.expectEqualStrings("5", bit_xor);
+
+    const floor = try renderForTest("builtins.floor (-1.2)");
+    defer std.testing.allocator.free(floor);
+    try std.testing.expectEqualStrings("-2", floor);
+
+    const ceil = try renderForTest("builtins.ceil (-1.8)");
+    defer std.testing.allocator.free(ceil);
+    try std.testing.expectEqualStrings("-1", ceil);
+}
+
+test "evaluate primitive path and metadata builtins" {
+    const base = try renderForTest("builtins.baseNameOf /foo/bar");
+    defer std.testing.allocator.free(base);
+    try std.testing.expectEqualStrings("\"bar\"", base);
+
+    const string_dir = try renderForTest("builtins.dirOf \"foo/bar\"");
+    defer std.testing.allocator.free(string_dir);
+    try std.testing.expectEqualStrings("\"foo\"", string_dir);
+
+    const path_dir = try renderForTest("builtins.dirOf /foo/bar");
+    defer std.testing.allocator.free(path_dir);
+    try std.testing.expectEqualStrings("/foo", path_dir);
+
+    const true_value = try renderForTest("builtins.true");
+    defer std.testing.allocator.free(true_value);
+    try std.testing.expectEqualStrings("true", true_value);
+
+    const false_value = try renderForTest("builtins.false");
+    defer std.testing.allocator.free(false_value);
+    try std.testing.expectEqualStrings("false", false_value);
+
+    const null_value = try renderForTest("builtins.null");
+    defer std.testing.allocator.free(null_value);
+    try std.testing.expectEqualStrings("null", null_value);
+
+    const lang_version = try renderForTest("builtins.langVersion");
+    defer std.testing.allocator.free(lang_version);
+    try std.testing.expectEqualStrings("6", lang_version);
+
+    const store_dir = try renderForTest("builtins.storeDir");
+    defer std.testing.allocator.free(store_dir);
+    try std.testing.expectEqualStrings("\"/nix/store\"", store_dir);
+}
+
 test "evaluate builtins.typeOf" {
     const int_type = try renderForTest("builtins.typeOf 1");
     defer std.testing.allocator.free(int_type);

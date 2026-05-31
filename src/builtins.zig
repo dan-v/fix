@@ -1,5 +1,6 @@
 //! Evaluator-owned builtin values.
 
+const builtin = @import("builtin");
 const InternTable = @import("intern.zig").InternTable;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
@@ -65,6 +66,18 @@ pub const BuiltinId = enum(u16) {
     genericClosure = 55,
     functionArgs = 56,
     unsafeGetAttrPos = 57,
+    add = 58,
+    sub = 59,
+    mul = 60,
+    div = 61,
+    lessThan = 62,
+    bitAnd = 63,
+    bitOr = 64,
+    bitXor = 65,
+    floor = 66,
+    ceil = 67,
+    baseNameOf = 68,
+    dirOf = 69,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -102,6 +115,10 @@ pub fn arity(id: BuiltinId) u8 {
         .path,
         .genericClosure,
         .functionArgs,
+        .floor,
+        .ceil,
+        .baseNameOf,
+        .dirOf,
         => 1,
         .hasAttr,
         .getAttr,
@@ -125,6 +142,14 @@ pub fn arity(id: BuiltinId) u8 {
         .partition,
         .groupBy,
         .unsafeGetAttrPos,
+        .add,
+        .sub,
+        .mul,
+        .div,
+        .lessThan,
+        .bitAnd,
+        .bitOr,
+        .bitXor,
         => 2,
         .foldlStrict,
         .substring,
@@ -367,6 +392,101 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
             .name = try intern.intern("unsafeGetAttrPos"),
             .value = Value.builtin(@intFromEnum(BuiltinId.unsafeGetAttrPos)),
         },
+        .{
+            .name = try intern.intern("add"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.add)),
+        },
+        .{
+            .name = try intern.intern("sub"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.sub)),
+        },
+        .{
+            .name = try intern.intern("mul"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.mul)),
+        },
+        .{
+            .name = try intern.intern("div"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.div)),
+        },
+        .{
+            .name = try intern.intern("lessThan"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.lessThan)),
+        },
+        .{
+            .name = try intern.intern("bitAnd"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.bitAnd)),
+        },
+        .{
+            .name = try intern.intern("bitOr"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.bitOr)),
+        },
+        .{
+            .name = try intern.intern("bitXor"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.bitXor)),
+        },
+        .{
+            .name = try intern.intern("floor"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.floor)),
+        },
+        .{
+            .name = try intern.intern("ceil"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.ceil)),
+        },
+        .{
+            .name = try intern.intern("baseNameOf"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.baseNameOf)),
+        },
+        .{
+            .name = try intern.intern("dirOf"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.dirOf)),
+        },
+        .{
+            .name = try intern.intern("true"),
+            .value = Value.boolVal(true),
+        },
+        .{
+            .name = try intern.intern("false"),
+            .value = Value.boolVal(false),
+        },
+        .{
+            .name = try intern.intern("null"),
+            .value = Value.null_val,
+        },
+        .{
+            .name = try intern.intern("langVersion"),
+            .value = Value.int(6),
+        },
+        .{
+            .name = try intern.intern("storeDir"),
+            .value = Value.string(try intern.intern("/nix/store")),
+        },
+        .{
+            .name = try intern.intern("currentSystem"),
+            .value = Value.string(try intern.intern(hostSystemName())),
+        },
     };
     return Value.attrs(try heap.addAttrs(&entries));
+}
+
+fn hostSystemName() []const u8 {
+    return switch (builtin.target.os.tag) {
+        .linux => switch (builtin.target.cpu.arch) {
+            .x86_64 => "x86_64-linux",
+            .aarch64 => "aarch64-linux",
+            .arm => "armv7l-linux",
+            .riscv64 => "riscv64-linux",
+            else => "unknown-linux",
+        },
+        .macos => switch (builtin.target.cpu.arch) {
+            .x86_64 => "x86_64-darwin",
+            .aarch64 => "aarch64-darwin",
+            else => "unknown-darwin",
+        },
+        .freebsd => switch (builtin.target.cpu.arch) {
+            .x86_64 => "x86_64-freebsd",
+            .aarch64 => "aarch64-freebsd",
+            else => "unknown-freebsd",
+        },
+        else => "unknown",
+    };
 }

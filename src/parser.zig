@@ -850,7 +850,12 @@ pub const Parser = struct {
     }
 
     fn matchAttrName(self: *Parser) bool {
-        return self.match(.identifier) or self.match(.string) or self.match(.kw_or);
+        return self.match(.identifier) or
+            self.match(.string) or
+            self.match(.kw_or) or
+            self.match(.kw_true) or
+            self.match(.kw_false) or
+            self.match(.kw_null);
     }
 
     fn matchLetBindingName(self: *Parser) bool {

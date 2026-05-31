@@ -30,6 +30,8 @@ const FileCache = @import("file_cache.zig").FileCache;
 const builtins_mod = @import("builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("derivation.zig");
+const numeric = @import("runtime/numeric.zig");
+const path_ops = @import("runtime/paths.zig");
 
 fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
     if (prefix.len == 0) return name;
@@ -279,85 +281,56 @@ pub const VM = struct {
                 .add_int => {
                     const b = self.pop();
                     const a = self.pop();
-                    if (a.discriminant == .int and b.discriminant == .int) {
-                        try self.push(Value.int(a.asInt() + b.asInt()));
-                    } else if (isNumeric(a) and isNumeric(b)) {
-                        try self.push(Value.float(try coerceToFloat(a) + try coerceToFloat(b)));
-                    } else if (a.discriminant == .string and b.discriminant == .string) {
+                    if (a.discriminant == .string and b.discriminant == .string) {
                         try self.push(try self.concatStrings(a, b));
                     } else {
-                        return error.TypeError;
+                        try self.push(try numeric.add(a, b));
                     }
                 },
                 .sub_int => {
                     const b = self.pop();
                     const a = self.pop();
-                    if (a.discriminant == .int and b.discriminant == .int) {
-                        try self.push(Value.int(a.asInt() - b.asInt()));
-                    } else if (isNumeric(a) and isNumeric(b)) {
-                        try self.push(Value.float(try coerceToFloat(a) - try coerceToFloat(b)));
-                    } else {
-                        return error.TypeError;
-                    }
+                    try self.push(try numeric.sub(a, b));
                 },
                 .mul_int => {
                     const b = self.pop();
                     const a = self.pop();
-                    if (a.discriminant == .int and b.discriminant == .int) {
-                        try self.push(Value.int(a.asInt() * b.asInt()));
-                    } else if (isNumeric(a) and isNumeric(b)) {
-                        try self.push(Value.float(try coerceToFloat(a) * try coerceToFloat(b)));
-                    } else {
-                        return error.TypeError;
-                    }
+                    try self.push(try numeric.mul(a, b));
                 },
                 .div_int => {
                     const b = self.pop();
                     const a = self.pop();
-                    if (a.discriminant == .int and b.discriminant == .int) {
-                        if (b.asInt() == 0) return error.DivisionByZero;
-                        try self.push(Value.int(@divTrunc(a.asInt(), b.asInt())));
-                    } else if (isNumeric(a) and isNumeric(b)) {
-                        try self.push(Value.float(try coerceToFloat(a) / try coerceToFloat(b)));
-                    } else {
-                        return error.TypeError;
-                    }
+                    try self.push(try numeric.div(a, b));
                 },
                 .negate_int => {
                     const a = self.pop();
-                    if (a.discriminant == .int) {
-                        try self.push(Value.int(-a.asInt()));
-                    } else if (a.discriminant == .float) {
-                        try self.push(Value.float(-a.asFloat()));
-                    } else {
-                        return error.TypeError;
-                    }
+                    try self.push(try numeric.negate(a));
                 },
 
                 // ---- float arithmetic ----
                 .add_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(try coerceToFloat(a) + try coerceToFloat(b)));
+                    try self.push(Value.float(try numeric.toFloat(a) + try numeric.toFloat(b)));
                 },
                 .sub_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(try coerceToFloat(a) - try coerceToFloat(b)));
+                    try self.push(Value.float(try numeric.toFloat(a) - try numeric.toFloat(b)));
                 },
                 .mul_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(try coerceToFloat(a) * try coerceToFloat(b)));
+                    try self.push(Value.float(try numeric.toFloat(a) * try numeric.toFloat(b)));
                 },
                 .div_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(try coerceToFloat(a) / try coerceToFloat(b)));
+                    try self.push(Value.float(try numeric.toFloat(a) / try numeric.toFloat(b)));
                 },
                 .negate_float => {
                     const a = self.pop();
-                    try self.push(Value.float(-try coerceToFloat(a)));
+                    try self.push(Value.float(-try numeric.toFloat(a)));
                 },
 
                 // ---- comparison ----
@@ -548,8 +521,8 @@ pub const VM = struct {
         const va = try self.forceValue(a);
         const vb = try self.forceValue(b);
 
-        if (isNumeric(va) and isNumeric(vb)) {
-            return try coerceToFloat(va) == try coerceToFloat(vb);
+        if (numeric.isNumeric(va) and numeric.isNumeric(vb)) {
+            return try numeric.toFloat(va) == try numeric.toFloat(vb);
         }
 
         if (va.discriminant != vb.discriminant) return false;
@@ -613,7 +586,7 @@ pub const VM = struct {
             },
             .float => {
                 const af = va.asFloat();
-                const bf = try coerceToFloat(vb);
+                const bf = try numeric.toFloat(vb);
                 if (af < bf) return .lt;
                 if (af > bf) return .gt;
                 return .eq;
@@ -854,6 +827,18 @@ pub const VM = struct {
             .genericClosure => self.builtinGenericClosure(args[0]),
             .functionArgs => self.builtinFunctionArgs(args[0]),
             .unsafeGetAttrPos => self.builtinUnsafeGetAttrPos(args[0], args[1]),
+            .add => self.builtinAdd(args[0], args[1]),
+            .sub => self.builtinSub(args[0], args[1]),
+            .mul => self.builtinMul(args[0], args[1]),
+            .div => self.builtinDiv(args[0], args[1]),
+            .lessThan => self.builtinLessThan(args[0], args[1]),
+            .bitAnd => self.builtinBitAnd(args[0], args[1]),
+            .bitOr => self.builtinBitOr(args[0], args[1]),
+            .bitXor => self.builtinBitXor(args[0], args[1]),
+            .floor => self.builtinFloor(args[0]),
+            .ceil => self.builtinCeil(args[0]),
+            .baseNameOf => self.builtinBaseNameOf(args[0]),
+            .dirOf => self.builtinDirOf(args[0]),
         };
     }
 
@@ -891,6 +876,69 @@ pub const VM = struct {
             .thunk, .cell => unreachable,
         };
         return Value.string(try self.intern.intern(name));
+    }
+
+    fn builtinAdd(self: *VM, left: Value, right: Value) !Value {
+        return numeric.add(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinSub(self: *VM, left: Value, right: Value) !Value {
+        return numeric.sub(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinMul(self: *VM, left: Value, right: Value) !Value {
+        return numeric.mul(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinDiv(self: *VM, left: Value, right: Value) !Value {
+        return numeric.div(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinLessThan(self: *VM, left: Value, right: Value) !Value {
+        return Value.boolVal(try self.compareValues(left, right) == .lt);
+    }
+
+    fn builtinBitAnd(self: *VM, left: Value, right: Value) !Value {
+        return numeric.bitAnd(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinBitOr(self: *VM, left: Value, right: Value) !Value {
+        return numeric.bitOr(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinBitXor(self: *VM, left: Value, right: Value) !Value {
+        return numeric.bitXor(try self.forceValue(left), try self.forceValue(right));
+    }
+
+    fn builtinFloor(self: *VM, arg: Value) !Value {
+        return numeric.floor(try self.forceValue(arg));
+    }
+
+    fn builtinCeil(self: *VM, arg: Value) !Value {
+        return numeric.ceil(try self.forceValue(arg));
+    }
+
+    fn builtinBaseNameOf(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        const path = switch (value.discriminant) {
+            .path, .string => self.intern.get(value.asInternId()),
+            else => return error.TypeError,
+        };
+        return Value.string(try self.intern.intern(path_ops.baseName(path)));
+    }
+
+    fn builtinDirOf(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        const path = switch (value.discriminant) {
+            .path, .string => self.intern.get(value.asInternId()),
+            else => return error.TypeError,
+        };
+        const dir = try self.intern.intern(path_ops.dirOf(path));
+        return switch (value.discriminant) {
+            .path => Value.path(dir),
+            .string => Value.string(dir),
+            else => unreachable,
+        };
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {
@@ -1903,16 +1951,4 @@ pub const VM = struct {
 
 fn readU16(code: []const u8, ip: usize) u16 {
     return @as(u16, code[ip]) | (@as(u16, code[ip + 1]) << 8);
-}
-
-fn coerceToFloat(val: Value) !f64 {
-    return switch (val.discriminant) {
-        .int => @floatFromInt(val.asInt()),
-        .float => val.asFloat(),
-        else => error.TypeError,
-    };
-}
-
-fn isNumeric(val: Value) bool {
-    return val.discriminant == .int or val.discriminant == .float;
 }

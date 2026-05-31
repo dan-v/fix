@@ -25,6 +25,23 @@ builtins.isFunction (builtins.elemAt [ 1 ])
 builtins.typeOf 1
 builtins.typeOf { }
 builtins.typeOf (x: x)
+builtins.add 1 2.5
+builtins.sub 5 2
+builtins.mul 3 4
+builtins.div (-7) 2
+builtins.lessThan "a" "b"
+builtins.bitAnd 6 3
+builtins.bitOr 4 1
+builtins.bitXor 6 3
+builtins.floor (-1.2)
+builtins.ceil (-1.8)
+builtins.baseNameOf /foo/bar
+builtins.dirOf /foo/bar
+builtins.true
+builtins.false
+builtins.null
+builtins.langVersion
+builtins.storeDir
 builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]
 (builtins.listToAttrs [ { name = "a"; value = 1; } { name = "a"; value = 2; } ]).a
 (builtins.listToAttrs [ { name = "a"; value = 1 / 0; } ]) ? a
