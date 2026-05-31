@@ -556,6 +556,20 @@ test "end-to-end: dynamic null attributes are omitted" {
     try std.testing.expectError(error.TypeError, ev.evaluate("{ ${true} = 1; }"));
 }
 
+test "end-to-end: builtins.toFile returns store-like string" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const file_value = try ev.evaluate("builtins.toFile \"x y\" \"hello\"");
+    const text = ev.intern.get(file_value.asInternId());
+    try std.testing.expect(std.mem.startsWith(u8, text, "/nix/store/"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "-x-y"));
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toFile \"x\" 1"));
+}
+
 test "end-to-end: with expressions" {
     const alloc = std.testing.allocator;
 

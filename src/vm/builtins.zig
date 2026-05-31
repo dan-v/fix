@@ -144,7 +144,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .getContext => Value.attrs(try self.heap.addAttrs(&.{})),
         .hasContext => Value.boolVal(false),
         .toPath => builtinToPath(self, args[0]),
-        .toFile => unsupportedBuiltin(id),
+        .toFile => builtinToFile(self, args[0], args[1]),
         .placeholder => builtinPlaceholder(self, args[0]),
     };
 }
@@ -1116,6 +1116,28 @@ fn builtinToPath(self: anytype, arg: Value) !Value {
         .string => Value.path(value.asInternId()),
         else => error.TypeError,
     };
+}
+
+fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
+    const name_value = try self.forceValue(name_arg);
+    const contents_value = try self.forceValue(contents_arg);
+    if (name_value.discriminant != .string or contents_value.discriminant != .string) return error.TypeError;
+
+    const name = self.intern.get(name_value.asInternId());
+    const contents = self.intern.get(contents_value.asInternId());
+    const digest = try nix_hash.hashBytes(self.allocator, "sha256", contents);
+    defer self.allocator.free(digest);
+
+    const clean_name = try self.allocator.alloc(u8, name.len);
+    defer self.allocator.free(clean_name);
+    for (name, clean_name) |c, *out| {
+        out.* = if (c == '/' or c == 0 or std.ascii.isWhitespace(c)) '-' else c;
+    }
+
+    const hash_len = @min(@as(usize, 32), digest.len);
+    const path = try std.fmt.allocPrint(self.allocator, "/nix/store/{s}-{s}", .{ digest[0..hash_len], clean_name });
+    defer self.allocator.free(path);
+    return Value.string(try self.intern.intern(path));
 }
 
 fn builtinPlaceholder(self: anytype, arg: Value) !Value {
