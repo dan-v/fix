@@ -357,6 +357,8 @@ pub const Compiler = struct {
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
         const let_in = node.data.let_in;
+        try self.rejectDuplicateLetBindings(let_in.bindings);
+
         self.beginScope();
 
         for (let_in.bindings) |binding| {
@@ -382,6 +384,16 @@ pub const Compiler = struct {
         try self.compileNode(let_in.body);
 
         self.endScope();
+    }
+
+    fn rejectDuplicateLetBindings(self: *const Compiler, bindings: []const Node.Binding) !void {
+        for (bindings, 0..) |binding, i| {
+            const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
+            for (bindings[0..i]) |previous| {
+                const previous_name = self.source[previous.name_offset .. previous.name_offset + previous.name_len];
+                if (std.mem.eql(u8, name, previous_name)) return error.DuplicateBinding;
+            }
+        }
     }
 
     fn compileThunk(self: *Compiler, expr: *const Node) !void {

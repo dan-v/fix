@@ -101,6 +101,18 @@ test "end-to-end: let binding" {
     try std.testing.expectEqual(@as(i64, 3), left_operand.asInt());
 }
 
+test "end-to-end: duplicate let bindings are rejected" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; x = 2; in x"));
+    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; inherit x; in x"));
+    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let inherit ({ x = 1; }) x; x = 2; in x"));
+    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let or = 1; inherit ({ or = 2; }) or; in ({ inherit or; }).or"));
+}
+
 test "end-to-end: let forward references" {
     const alloc = std.testing.allocator;
 

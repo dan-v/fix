@@ -97,7 +97,7 @@ pub const Evaluator = struct {
         defer compiler.deinit();
 
         compiler.compile(ast_node) catch |err| {
-            if (err == error.DuplicateAttribute) return err;
+            if (err == error.DuplicateAttribute or err == error.DuplicateBinding) return err;
             return error.CompileError;
         };
 
