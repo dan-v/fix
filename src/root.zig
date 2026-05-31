@@ -49,6 +49,15 @@ test "end-to-end: float arithmetic" {
     const nested = try ev.evaluate("(1.5 + 2) * 2");
     try std.testing.expectEqual(@as(f64, 7.0), nested.asFloat());
 
+    const runtime_add = try ev.evaluate("let x = 1.5; in x + 2");
+    try std.testing.expectEqual(@as(f64, 3.5), runtime_add.asFloat());
+
+    const runtime_div_left = try ev.evaluate("let x = 5.0; in x / 2");
+    try std.testing.expectEqual(@as(f64, 2.5), runtime_div_left.asFloat());
+
+    const runtime_div_right = try ev.evaluate("let x = 5; in x / 2.0");
+    try std.testing.expectEqual(@as(f64, 2.5), runtime_div_right.asFloat());
+
     const mixed_eq = try ev.evaluate("1 == 1.0");
     try std.testing.expect(mixed_eq.asBool());
 

@@ -16,7 +16,7 @@ in
 
     nativeBuildInputs = [zig.hook pkg-config];
 
-    zigBuildFlags = (lib.optional (release != null) "--release=${release}") ++ (lib.optional (cpu != null) "--cpu=${cpu}");
+    zigBuildFlags = (lib.optional (release != null) "--release=${release}") ++ (lib.optional (cpu != null) "-Dcpu=${cpu}");
 
     dontSetZigCheck = true;
     dontSetZigDefaultFlags = true;

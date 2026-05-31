@@ -250,6 +250,8 @@ pub const VM = struct {
                     const a = self.pop();
                     if (a.discriminant == .int and b.discriminant == .int) {
                         try self.push(Value.int(a.asInt() + b.asInt()));
+                    } else if (isNumeric(a) and isNumeric(b)) {
+                        try self.push(Value.float(try coerceToFloat(a) + try coerceToFloat(b)));
                     } else if (a.discriminant == .string and b.discriminant == .string) {
                         try self.push(try self.concatStrings(a, b));
                     } else {
@@ -261,6 +263,8 @@ pub const VM = struct {
                     const a = self.pop();
                     if (a.discriminant == .int and b.discriminant == .int) {
                         try self.push(Value.int(a.asInt() - b.asInt()));
+                    } else if (isNumeric(a) and isNumeric(b)) {
+                        try self.push(Value.float(try coerceToFloat(a) - try coerceToFloat(b)));
                     } else {
                         return error.TypeError;
                     }
@@ -270,6 +274,8 @@ pub const VM = struct {
                     const a = self.pop();
                     if (a.discriminant == .int and b.discriminant == .int) {
                         try self.push(Value.int(a.asInt() * b.asInt()));
+                    } else if (isNumeric(a) and isNumeric(b)) {
+                        try self.push(Value.float(try coerceToFloat(a) * try coerceToFloat(b)));
                     } else {
                         return error.TypeError;
                     }
@@ -280,6 +286,8 @@ pub const VM = struct {
                     if (a.discriminant == .int and b.discriminant == .int) {
                         if (b.asInt() == 0) return error.DivisionByZero;
                         try self.push(Value.int(@divTrunc(a.asInt(), b.asInt())));
+                    } else if (isNumeric(a) and isNumeric(b)) {
+                        try self.push(Value.float(try coerceToFloat(a) / try coerceToFloat(b)));
                     } else {
                         return error.TypeError;
                     }
