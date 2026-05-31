@@ -99,7 +99,12 @@ pub const Evaluator = struct {
 
         compiler.compile(ast_node) catch |err| {
             try self.copyDiagnostics(compiler.diagnostics.items);
-            if (err == error.DuplicateAttribute or err == error.DuplicateBinding) return err;
+            if (err == error.DuplicateAttribute or
+                err == error.DuplicateBinding or
+                err == error.UndefinedVariable)
+            {
+                return err;
+            }
             return error.CompileError;
         };
 
@@ -373,4 +378,18 @@ test "evaluate exposes duplicate attribute diagnostics" {
     try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
     try std.testing.expectEqualStrings("first attribute defined here", diagnostics[1].message);
     try std.testing.expectEqual(@as(u32, 2), diagnostics[1].offset);
+}
+
+test "evaluate exposes undefined variable diagnostics" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.UndefinedVariable, ev.evaluate("let y = x; in y"));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
+    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("undefined variable", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 8), diagnostics[0].offset);
+    try std.testing.expectEqual(@as(u32, 9), diagnostics[0].column);
 }

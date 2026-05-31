@@ -233,6 +233,7 @@ pub const Compiler = struct {
         } else if (try self.emitWithLookup(span)) {
             return;
         } else {
+            try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "undefined variable");
             return error.UndefinedVariable;
         }
     }
@@ -349,7 +350,10 @@ pub const Compiler = struct {
 
         const param_id = try self.intern.intern(param_name);
         _ = child.declareLocal(param_name, param_id);
-        try child.compileNode(lambda.body);
+        child.compileNode(lambda.body) catch |err| {
+            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            return err;
+        };
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
@@ -440,7 +444,10 @@ pub const Compiler = struct {
         child.parent = self;
         defer child.deinit();
 
-        try child.compileNode(expr);
+        child.compileNode(expr) catch |err| {
+            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            return err;
+        };
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 

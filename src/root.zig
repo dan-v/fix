@@ -114,6 +114,23 @@ test "end-to-end: duplicate let bindings are rejected" {
     try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let or = 1; inherit ({ or = 2; }) or; in ({ inherit or; }).or"));
 }
 
+test "end-to-end: undefined variables are rejected with source diagnostics" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.UndefinedVariable, ev.evaluate("x"));
+    try std.testing.expectEqual(@as(usize, 1), ev.getDiagnostics().len);
+    try std.testing.expectEqualStrings("undefined variable", ev.getDiagnostics()[0].message);
+    try std.testing.expectEqual(@as(u32, 0), ev.getDiagnostics()[0].offset);
+
+    try std.testing.expectError(error.UndefinedVariable, ev.evaluate("{ inherit x; }"));
+    try std.testing.expectEqual(@as(usize, 1), ev.getDiagnostics().len);
+    try std.testing.expectEqualStrings("undefined variable", ev.getDiagnostics()[0].message);
+    try std.testing.expectEqual(@as(u32, 10), ev.getDiagnostics()[0].offset);
+}
+
 test "end-to-end: let forward references" {
     const alloc = std.testing.allocator;
 
