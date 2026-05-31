@@ -278,7 +278,7 @@ pub const Compiler = struct {
         try self.compileNode(apath.root);
 
         for (apath.segments) |seg| {
-            const name_span = self.source[seg.offset .. seg.offset + seg.len];
+            const name_span = self.attrSegmentSpan(seg);
             const name_id = try self.intern.intern(name_span);
             try self.emitOpU16(.get_attr, @intCast(name_id));
         }
@@ -300,6 +300,14 @@ pub const Compiler = struct {
         const relative: u16 = @intCast(target_offset - next_instruction);
         self.builder.code.items[operand_offset] = @truncate(relative);
         self.builder.code.items[operand_offset + 1] = @truncate(relative >> 8);
+    }
+
+    fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
+        const span = self.source[atom.offset .. atom.offset + atom.len];
+        if (span.len >= 2 and span[0] == '"' and span[span.len - 1] == '"') {
+            return span[1 .. span.len - 1];
+        }
+        return span;
     }
 
     // ---- scope management ----

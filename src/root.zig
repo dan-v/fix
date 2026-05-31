@@ -63,6 +63,16 @@ test "end-to-end: attribute access" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: quoted attribute access" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("({ foo = 42; }).\"foo\"");
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
 test "end-to-end: if else false branch" {
     const alloc = std.testing.allocator;
 
