@@ -6,6 +6,7 @@ pub const types = @import("types.zig");
 pub const value = @import("value.zig");
 pub const token = @import("token.zig");
 pub const scanner = @import("scanner.zig");
+pub const string_syntax = @import("string_syntax.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
 pub const opcode = @import("opcode.zig");
@@ -110,6 +111,46 @@ test "end-to-end: string interpolation" {
     try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
 
     try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
+}
+
+test "end-to-end: nested interpolation in strings" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const literal_brace = try ev.evaluate("\"a${{ x = \"}\"; }.x}b\"");
+    try std.testing.expectEqualStrings("a}b", ev.intern.get(literal_brace.asInternId()));
+
+    const nested_attr = try ev.evaluate("\"a${{ x = { y = \"b\"; }; }.x.y}c\"");
+    try std.testing.expectEqualStrings("abc", ev.intern.get(nested_attr.asInternId()));
+}
+
+test "end-to-end: indented strings" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const plain = try ev.evaluate(
+        \\''
+        \\  a
+        \\  b
+        \\''
+    );
+    try std.testing.expectEqualStrings("a\nb\n", ev.intern.get(plain.asInternId()));
+
+    const interpolated = try ev.evaluate(
+        \\let x = "b"; in ''
+        \\  a
+        \\  ${x}
+        \\  c
+        \\''
+    );
+    try std.testing.expectEqualStrings("a\nb\nc\n", ev.intern.get(interpolated.asInternId()));
+
+    const escaped = try ev.evaluate("'' ''${ ''' ''\\n ''");
+    try std.testing.expectEqualStrings("${ '' \n", ev.intern.get(escaped.asInternId()));
 }
 
 test "end-to-end: let binding" {

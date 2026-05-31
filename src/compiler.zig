@@ -16,6 +16,7 @@ const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("types.zig");
 const diagnostic = @import("diagnostic.zig");
 const builtins = @import("builtins.zig");
+const string_syntax = @import("string_syntax.zig");
 const Diagnostic = diagnostic.Diagnostic;
 
 const InternId = types.InternId;
@@ -161,42 +162,25 @@ pub const Compiler = struct {
     }
 
     fn compileString(self: *Compiler, node: *const Node) !void {
-        const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-        // Strip quotes "..." → ...
-        var content = span;
-        var content_offset = node.data.atom.offset;
-        if (content.len >= 2 and content[0] == '"' and content[content.len - 1] == '"') {
-            content = content[1 .. content.len - 1];
-            content_offset += 1;
-        }
-        if (std.mem.indexOf(u8, content, "${") != null) {
-            try self.compileInterpolatedString(content, content_offset);
-            return;
-        }
-        const decoded = try self.decodeStringPart(content);
-        defer if (decoded.owned) self.allocator.free(decoded.text);
-        const id = try self.intern.intern(decoded.text);
-        const v = @import("value.zig").Value.string(id);
-        try self.builder.emitConstant(self.allocator, v);
-    }
+        const literal = string_syntax.Span{
+            .start = node.data.atom.offset,
+            .end = node.data.atom.offset + node.data.atom.len,
+        };
+        const parsed = try string_syntax.parseLiteral(self.allocator, self.source, literal);
+        defer parsed.deinit();
 
-    fn compileInterpolatedString(self: *Compiler, content: []const u8, content_offset: u32) !void {
-        var cursor: usize = 0;
         var have_value = false;
-
-        while (std.mem.indexOfPos(u8, content, cursor, "${")) |start| {
-            try self.emitStringPart(content[cursor..start], &have_value);
-
-            const expr_start = start + 2;
-            const expr_end = std.mem.indexOfScalarPos(u8, content, expr_start, '}') orelse return error.ParseError;
-            try self.compileInterpolatedExpr(content[expr_start..expr_end], content_offset + @as(u32, @intCast(expr_start)));
-            if (have_value) try self.emitOp(.add_int);
-            have_value = true;
-
-            cursor = expr_end + 1;
+        for (parsed.parts) |part| {
+            switch (part) {
+                .text => |text| try self.emitStringPart(text.bytes, &have_value),
+                .interpolation => |span| {
+                    try self.compileInterpolatedExpr(self.source[span.start..span.end], span.start);
+                    if (have_value) try self.emitOp(.add_int);
+                    have_value = true;
+                },
+            }
         }
 
-        try self.emitStringPart(content[cursor..], &have_value);
         if (!have_value) {
             const id = try self.intern.intern("");
             try self.builder.emitConstant(self.allocator, @import("value.zig").Value.string(id));
@@ -206,47 +190,10 @@ pub const Compiler = struct {
     fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
         if (part.len == 0) return;
 
-        const decoded = try self.decodeStringPart(part);
-        defer if (decoded.owned) self.allocator.free(decoded.text);
-        const id = try self.intern.intern(decoded.text);
+        const id = try self.intern.intern(part);
         try self.builder.emitConstant(self.allocator, @import("value.zig").Value.string(id));
         if (have_value.*) try self.emitOp(.add_int);
         have_value.* = true;
-    }
-
-    const DecodedString = struct {
-        text: []const u8,
-        owned: bool,
-    };
-
-    fn decodeStringPart(self: *Compiler, part: []const u8) !DecodedString {
-        if (std.mem.indexOfScalar(u8, part, '\\') == null) {
-            return .{ .text = part, .owned = false };
-        }
-
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-
-        var i: usize = 0;
-        while (i < part.len) : (i += 1) {
-            const c = part[i];
-            if (c != '\\' or i + 1 >= part.len) {
-                try out.append(self.allocator, c);
-                continue;
-            }
-
-            i += 1;
-            try out.append(self.allocator, switch (part[i]) {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '"' => '"',
-                '\\' => '\\',
-                else => part[i],
-            });
-        }
-
-        return .{ .text = try out.toOwnedSlice(self.allocator), .owned = true };
     }
 
     fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_offset: u32) !void {

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const token = @import("token.zig");
+const string_syntax = @import("string_syntax.zig");
 const TokenType = token.TokenType;
 const Token = token.Token;
 
@@ -33,7 +34,8 @@ pub const Scanner = struct {
         // Fast path: ASCII alpha starts an identifier/keyword.
         if (isAlpha(c)) return self.lexIdentOrKeyword(start);
         if (isDigit(c)) return self.lexNumber(start);
-        if (c == '"') return self.lexString(start);
+        if (c == '"') return self.lexString(start, .double_quoted);
+        if (c == '\'' and self.peek() == '\'') return self.lexString(start, .indented);
         if (c == '.' and self.peek() == '/') return self.lexPath(start);
 
         // Single-character tokens.
@@ -187,38 +189,20 @@ pub const Scanner = struct {
         return self.makeToken(.integer, start, self.pos - start);
     }
 
-    fn lexString(self: *Scanner, start: u32) Token {
-        // start points to the opening '"'
-        var interpolation_depth: u32 = 0;
-        while (self.pos < self.source.len) {
-            const c = self.source[self.pos];
-            if (interpolation_depth == 0 and c == '"') {
-                self.pos += 1; // consume closing quote
-                return self.makeToken(.string, start, self.pos - start);
-            }
-            if (c == '$' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
-                interpolation_depth += 1;
-                self.pos += 2;
-                continue;
-            }
-            if (interpolation_depth > 0 and c == '{') {
-                interpolation_depth += 1;
-                self.pos += 1;
-                continue;
-            }
-            if (interpolation_depth > 0 and c == '}') {
-                interpolation_depth -= 1;
-                self.pos += 1;
-                continue;
-            }
-            if (c == '\\') {
-                self.pos += 2; // skip escape (simplified)
-                continue;
-            }
-            if (c == '\n') self.line += 1;
-            self.pos += 1;
+    fn lexString(self: *Scanner, start: u32, kind: string_syntax.LiteralKind) Token {
+        const end = string_syntax.scanLiteral(self.source, start, kind) orelse {
+            self.pos = @intCast(self.source.len);
+            return self.makeToken(.error_token, start, self.pos - start);
+        };
+        self.countNewlines(self.source[start..end]);
+        self.pos = @intCast(end);
+        return self.makeToken(.string, start, self.pos - start);
+    }
+
+    fn countNewlines(self: *Scanner, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (byte == '\n') self.line += 1;
         }
-        return self.makeToken(.error_token, start, self.pos - start);
     }
 
     fn lexPath(self: *Scanner, start: u32) Token {
@@ -309,6 +293,20 @@ test "scanner recognizes simple path literals" {
 
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes indented string literals" {
+    var scanner = Scanner.init("''\n  ${\"x\"}\n''");
+
+    try std.testing.expectEqual(TokenType.string, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes nested strings in interpolation" {
+    var scanner = Scanner.init("\"a${{ x = \"}\"; }.x}b\"");
+
+    try std.testing.expectEqual(TokenType.string, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }
 
