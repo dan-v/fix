@@ -284,26 +284,26 @@ pub const VM = struct {
                 .add_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(coerceToFloat(a) + coerceToFloat(b)));
+                    try self.push(Value.float(try coerceToFloat(a) + try coerceToFloat(b)));
                 },
                 .sub_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(coerceToFloat(a) - coerceToFloat(b)));
+                    try self.push(Value.float(try coerceToFloat(a) - try coerceToFloat(b)));
                 },
                 .mul_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(coerceToFloat(a) * coerceToFloat(b)));
+                    try self.push(Value.float(try coerceToFloat(a) * try coerceToFloat(b)));
                 },
                 .div_float => {
                     const b = self.pop();
                     const a = self.pop();
-                    try self.push(Value.float(coerceToFloat(a) / coerceToFloat(b)));
+                    try self.push(Value.float(try coerceToFloat(a) / try coerceToFloat(b)));
                 },
                 .negate_float => {
                     const a = self.pop();
-                    try self.push(Value.float(-coerceToFloat(a)));
+                    try self.push(Value.float(-try coerceToFloat(a)));
                 },
 
                 // ---- comparison ----
@@ -497,19 +497,24 @@ pub const VM = struct {
         switch (va.discriminant) {
             .int => {
                 const ai = va.asInt();
-                const bi = if (vb.discriminant == .int) vb.asInt() else @as(i64, @intFromFloat(vb.asFloat()));
+                const bi = switch (vb.discriminant) {
+                    .int => vb.asInt(),
+                    .float => @as(i64, @intFromFloat(vb.asFloat())),
+                    else => return error.TypeError,
+                };
                 if (ai < bi) return .lt;
                 if (ai > bi) return .gt;
                 return .eq;
             },
             .float => {
                 const af = va.asFloat();
-                const bf = coerceToFloat(vb);
+                const bf = try coerceToFloat(vb);
                 if (af < bf) return .lt;
                 if (af > bf) return .gt;
                 return .eq;
             },
             .string, .path => {
+                if (vb.discriminant != va.discriminant) return error.TypeError;
                 const ia = va.asInternId();
                 const ib = vb.asInternId();
                 return if (ia < ib) .lt else if (ia > ib) .gt else .eq;
@@ -676,10 +681,10 @@ fn readU16(code: []const u8, ip: usize) u16 {
     return @as(u16, code[ip]) | (@as(u16, code[ip + 1]) << 8);
 }
 
-fn coerceToFloat(val: Value) f64 {
+fn coerceToFloat(val: Value) !f64 {
     return switch (val.discriminant) {
         .int => @floatFromInt(val.asInt()),
         .float => val.asFloat(),
-        else => 0.0,
+        else => error.TypeError,
     };
 }

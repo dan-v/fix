@@ -210,6 +210,17 @@ test "end-to-end: boolean contexts require booleans" {
     try std.testing.expectError(error.TypeError, ev.evaluate("0 || false"));
 }
 
+test "end-to-end: comparisons reject incompatible types" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("1 < true"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("\"a\" < 1"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("true < false"));
+}
+
 test "end-to-end: single argument lambdas" {
     const alloc = std.testing.allocator;
 
