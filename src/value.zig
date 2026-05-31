@@ -19,9 +19,8 @@ pub const ValueType = enum(u8) {
     list = 7, // payload is ObjectId
     attrs = 8, // payload is ObjectId
     closure = 9, // payload is ObjectId
-    builtin = 10, // payload is builtin registry index
-    thunk = 11, // payload is ObjectId
-    cell = 12, // payload is ObjectId
+    thunk = 10, // payload is ObjectId
+    cell = 11, // payload is ObjectId
     // reserved 13..255 for future extensions
 };
 
@@ -93,13 +92,6 @@ pub const Value = extern struct {
         };
     }
 
-    pub fn builtin(id: u16) Value {
-        return .{
-            .discriminant = .builtin,
-            .payload = id,
-        };
-    }
-
     pub fn thunk(id: ObjectId) Value {
         return .{
             .discriminant = .thunk,
@@ -164,7 +156,7 @@ pub const Value = extern struct {
             .int => self.asInt() == other.asInt(),
             .float => self.asFloat() == other.asFloat(),
             .string, .path => self.asInternId() == other.asInternId(),
-            .list, .attrs, .closure, .builtin, .thunk, .cell => self.payload == other.payload,
+            .list, .attrs, .closure, .thunk, .cell => self.payload == other.payload,
         };
     }
 
@@ -178,7 +170,7 @@ pub const Value = extern struct {
             .string, .path => @as(u64, self.asInternId()) *% 31,
             .list => self.payload *% 31,
             .attrs => self.payload *% 31,
-            .closure, .builtin, .thunk, .cell => self.payload,
+            .closure, .thunk, .cell => self.payload,
         };
     }
 
@@ -197,7 +189,6 @@ pub const Value = extern struct {
             .list => try writer.writeAll("[...]"),
             .attrs => try writer.writeAll("{...}"),
             .closure => try writer.writeAll("<closure>"),
-            .builtin => try writer.writeAll("<builtin>"),
             .thunk => try writer.writeAll("<thunk>"),
             .cell => try writer.writeAll("<cell>"),
         }

@@ -404,12 +404,6 @@ pub const VM = struct {
                     const callee = self.pop();
                     try self.doCall(callee, arg);
                 },
-                .call_builtin => {
-                    const idx: u16 = readU16(code, frame.ip);
-                    frame.ip += 2;
-                    _ = idx;
-                    return error.UnsupportedBuiltin;
-                },
                 .tail_call => {
                     const arg = self.pop();
                     const callee = self.pop();
@@ -487,7 +481,7 @@ pub const VM = struct {
             .float => va.asFloat() == vb.asFloat(),
             .string, .path => va.asInternId() == vb.asInternId(),
             .list, .attrs => va.asObjectId() == vb.asObjectId(),
-            .closure, .builtin => false,
+            .closure => false,
             .thunk, .cell => unreachable,
         };
     }
@@ -636,8 +630,6 @@ pub const VM = struct {
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             try self.push(arg); // arg is first local
             try self.pushFrame(ch, 1, closure_id);
-        } else if (callee.discriminant == .builtin) {
-            return error.UnsupportedBuiltin;
         } else {
             return error.NotCallable;
         }

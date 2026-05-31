@@ -90,9 +90,6 @@ pub const OpCode = enum(u8) {
     /// The stack layout before: [closure, arg].
     /// After: [result].
     call,
-    /// Call a builtin.
-    /// Operand: 2-byte builtin index.
-    call_builtin,
     /// Tail call: replace current frame with a call to the closure below top.
     tail_call,
 
