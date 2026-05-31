@@ -1,0 +1,8 @@
+[ 1 2 3 ]
+[ (1 + 2) (let x = 3; in x) ]
+[ 1 ] ++ [ 2 3 ]
+[ (with { x = 1; }; x) ]
+[ (if true then 1 else 2) ]
+[ (assert true; 1) ]
+[ (x: x) ]
+[ (1 / 0) ] ++ []
