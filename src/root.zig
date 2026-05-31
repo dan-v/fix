@@ -198,6 +198,18 @@ test "end-to-end: boolean operators short-circuit" {
     try std.testing.expect(short_or.asBool());
 }
 
+test "end-to-end: boolean contexts require booleans" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("if 1 then 2 else 3"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("!1"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("1 && true"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("0 || false"));
+}
+
 test "end-to-end: single argument lambdas" {
     const alloc = std.testing.allocator;
 

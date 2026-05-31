@@ -343,7 +343,7 @@ pub const VM = struct {
                 // ---- logical ----
                 .not => {
                     const a = self.pop();
-                    try self.push(Value.boolVal(!isTruthy(a)));
+                    try self.push(Value.boolVal(!try self.expectBool(a)));
                 },
 
                 // ---- control flow ----
@@ -356,7 +356,7 @@ pub const VM = struct {
                     const offset: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
                     const cond = self.stack.items[self.sp - 1];
-                    if (!isTruthy(cond)) {
+                    if (!try self.expectBool(cond)) {
                         frame.ip += @as(usize, offset);
                     }
                 },
@@ -463,10 +463,12 @@ pub const VM = struct {
 
     // ---- helpers ----
 
-    fn isTruthy(val: Value) bool {
-        return switch (val.discriminant) {
-            .null, .bool_false => false,
-            else => true,
+    fn expectBool(self: *VM, val: Value) !bool {
+        const forced = try self.forceValue(val);
+        return switch (forced.discriminant) {
+            .bool_false => false,
+            .bool_true => true,
+            else => error.TypeError,
         };
     }
 
