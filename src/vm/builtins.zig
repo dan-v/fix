@@ -997,7 +997,7 @@ fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
 }
 
 fn builtinStringLength(self: anytype, arg: Value) !Value {
-    return Value.int(@intCast((try stringArg(self, arg)).len));
+    return Value.int(@intCast(self.intern.get(try coerceStringContextId(self, arg)).len));
 }
 
 fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Value {
@@ -1056,7 +1056,7 @@ fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg:
     if (start_value.discriminant != .int or len_value.discriminant != .int) return error.TypeError;
     if (start_value.asInt() < 0 or len_value.asInt() < 0) return error.TypeError;
 
-    const string = try stringArg(self, string_arg);
+    const string = self.intern.get(try coerceStringContextId(self, string_arg));
     const start: usize = @intCast(start_value.asInt());
     if (start >= string.len) return Value.string(try self.intern.intern(""));
     const requested_len: usize = @intCast(len_value.asInt());

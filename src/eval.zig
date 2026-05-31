@@ -1198,6 +1198,12 @@ test "evaluate string builtins" {
     defer std.testing.allocator.free(length);
     try std.testing.expectEqualStrings("4", length);
 
+    const out_path_length = try renderForTest("builtins.stringLength { outPath = \"/x\"; }");
+    defer std.testing.allocator.free(out_path_length);
+    try std.testing.expectEqualStrings("2", out_path_length);
+
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.stringLength 1"));
+
     const joined = try renderForTest("builtins.concatStringsSep \",\" [ \"a\" \"b\" \"c\" ]");
     defer std.testing.allocator.free(joined);
     try std.testing.expectEqualStrings("\"a,b,c\"", joined);
@@ -1211,6 +1217,10 @@ test "evaluate string builtins" {
     const substring = try renderForTest("builtins.substring 1 2 \"abcd\"");
     defer std.testing.allocator.free(substring);
     try std.testing.expectEqualStrings("\"bc\"", substring);
+
+    const out_path_substring = try renderForTest("builtins.substring 0 1 { outPath = \"/x\"; }");
+    defer std.testing.allocator.free(out_path_substring);
+    try std.testing.expectEqualStrings("\"/\"", out_path_substring);
 
     const replaced = try renderForTest("builtins.replaceStrings [ \"ab\" \"d\" ] [ \"X\" \"Y\" ] \"abcd\"");
     defer std.testing.allocator.free(replaced);
