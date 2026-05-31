@@ -775,8 +775,16 @@ pub const Compiler = struct {
             }
 
             if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
-                try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
-                return error.DuplicateAttribute;
+                if (leaf.?.expr.tag != .attr_set) {
+                    try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
+                    return error.DuplicateAttribute;
+                }
+                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
+                defer self.allocator.free(tails);
+                try self.emitAttrName(entry.path[0]);
+                try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
+                count += 1;
+                continue;
             }
             try self.emitAttrName(entry.path[0]);
             try self.compileThunk(leaf.?.expr);
@@ -823,8 +831,16 @@ pub const Compiler = struct {
             }
 
             if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
-                try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
-                return error.DuplicateAttribute;
+                if (leaf.?.expr.tag != .attr_set) {
+                    try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
+                    return error.DuplicateAttribute;
+                }
+                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
+                defer self.allocator.free(tails);
+                try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
+                try self.emitOpByte(.set_cell_local, @intCast(slot));
+                count += 1;
+                continue;
             }
             const previous_skip = self.skip_local_slot;
             if (leaf.?.inherit_outer) self.skip_local_slot = slot;
@@ -846,6 +862,20 @@ pub const Compiler = struct {
 
         try self.emitOpU16(.build_attrs, count);
         self.endScope();
+    }
+
+    fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {
+        std.debug.assert(leaf.expr.tag == .attr_set);
+        const attr_set = leaf.expr.data.attr_set;
+        const leaf_entries = try self.attrEntryViews(attr_set.entries);
+        defer self.allocator.free(leaf_entries);
+
+        const merged = try self.allocator.alloc(AttrEntryView, leaf_entries.len + tails.len);
+        defer self.allocator.free(merged);
+        @memcpy(merged[0..leaf_entries.len], leaf_entries);
+        @memcpy(merged[leaf_entries.len..], tails);
+
+        try self.compileAttrEntriesThunk(merged, attr_set.recursive);
     }
 
     fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {

@@ -508,6 +508,15 @@ test "end-to-end: nested attribute declarations" {
     const rec_nested = try ev.evaluate("(rec { a.b = x + 1; x = 3; }).a.b");
     try std.testing.expectEqual(@as(i64, 4), rec_nested.asInt());
 
+    const extended_attr = try ev.evaluate("({ a = { b = 1; }; a.c = 2; }).a.c");
+    try std.testing.expectEqual(@as(i64, 2), extended_attr.asInt());
+
+    const plain_scope = try ev.evaluate("let y = 2; in ({ a = { x = y; }; a.y = 1; }).a.x");
+    try std.testing.expectEqual(@as(i64, 2), plain_scope.asInt());
+
+    const rec_scope = try ev.evaluate("({ a = rec { x = y; }; a.y = 1; }).a.x");
+    try std.testing.expectEqual(@as(i64, 1), rec_scope.asInt());
+
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a.b = 2; }"));
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
 }
