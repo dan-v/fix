@@ -27,6 +27,7 @@ pub const Evaluator = struct {
     scheduler: Scheduler,
     heap: ObjectHeap,
     files: FileCache,
+    imports: std.StringHashMapUnmanaged(Value),
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
     base_path: ?[:0]u8,
@@ -43,6 +44,7 @@ pub const Evaluator = struct {
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
             .files = FileCache.init(allocator),
+            .imports = .empty,
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
             .base_path = null,
@@ -54,6 +56,9 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         if (self.base_path) |path| self.allocator.free(path);
         self.diagnostics.deinit(self.allocator);
+        var imports_iter = self.imports.iterator();
+        while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        self.imports.deinit(self.allocator);
         self.files.deinit();
         self.heap.deinit();
         self.runtime_arena.deinit();
@@ -162,10 +167,16 @@ pub const Evaluator = struct {
     fn importPath(self: *Evaluator, path: []const u8) !Value {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
+        if (self.imports.get(resolved.text)) |value| return value;
 
         const source = try self.files.readFile(resolved.text);
         const source_base = std.fs.path.dirname(resolved.text) orelse "/";
-        return self.evaluateSource(source, source_base);
+        const value = try self.evaluateSource(source, source_base);
+
+        const key = try self.allocator.dupe(u8, resolved.text);
+        errdefer self.allocator.free(key);
+        try self.imports.put(self.allocator, key, value);
+        return value;
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
@@ -679,7 +690,7 @@ test "evaluate import through evaluator file cache" {
     });
     defer std.testing.allocator.free(file_path);
 
-    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{file_path});
+    const source = try std.fmt.allocPrint(std.testing.allocator, "let a = import {s}; b = import {s}; in a.value + b.value", .{ file_path, file_path });
     defer std.testing.allocator.free(source);
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
@@ -687,7 +698,8 @@ test "evaluate import through evaluator file cache" {
     ev.setFileIo(std.testing.io);
 
     const imported = try ev.evaluate(source);
-    try std.testing.expectEqual(@as(i64, 42), imported.asInt());
+    try std.testing.expectEqual(@as(i64, 84), imported.asInt());
+    try std.testing.expectEqual(@as(u32, 1), ev.imports.count());
 }
 
 test "evaluate all and any builtins" {
