@@ -47,6 +47,12 @@ test "end-to-end: float arithmetic" {
 
     const nested = try ev.evaluate("(1.5 + 2) * 2");
     try std.testing.expectEqual(@as(f64, 7.0), nested.asFloat());
+
+    const mixed_eq = try ev.evaluate("1 == 1.0");
+    try std.testing.expect(mixed_eq.asBool());
+
+    const mixed_neq = try ev.evaluate("1 != 1.5");
+    try std.testing.expect(mixed_neq.asBool());
 }
 
 test "end-to-end: let binding" {

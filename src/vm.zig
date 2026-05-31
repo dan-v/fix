@@ -478,6 +478,10 @@ pub const VM = struct {
         const va = try self.forceValue(a);
         const vb = try self.forceValue(b);
 
+        if (isNumeric(va) and isNumeric(vb)) {
+            return try coerceToFloat(va) == try coerceToFloat(vb);
+        }
+
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
             .null, .bool_false, .bool_true => true,
@@ -716,4 +720,8 @@ fn coerceToFloat(val: Value) !f64 {
         .float => val.asFloat(),
         else => error.TypeError,
     };
+}
+
+fn isNumeric(val: Value) bool {
+    return val.discriminant == .int or val.discriminant == .float;
 }
