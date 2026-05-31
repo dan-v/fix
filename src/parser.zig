@@ -139,6 +139,7 @@ pub const Parser = struct {
             .kw_assert => return .{ .prefix = assert_, .infix = null, .prec = .none },
             .kw_with => return .{ .prefix = with_, .infix = null, .prec = .none },
             .kw_let => return .{ .prefix = letIn, .infix = null, .prec = .none },
+            .kw_rec => return .{ .prefix = recAttrSet, .infix = null, .prec = .none },
             .bang => return .{ .prefix = unary, .infix = null, .prec = .none },
             .minus => return .{ .prefix = unary, .infix = binary, .prec = .sum },
             .plus => return .{ .prefix = null, .infix = binary, .prec = .sum },
@@ -214,6 +215,7 @@ pub const Parser = struct {
             .kw_assert,
             .kw_with,
             .kw_let,
+            .kw_rec,
             .bang,
             .minus,
             => true,
@@ -292,11 +294,15 @@ pub const Parser = struct {
     }
 
     fn attrSet(self: *Parser) !*Node {
-        var recursive = false;
-        if (self.match(.kw_rec)) {
-            recursive = true;
-        }
+        return self.attrSetAfterLeftBrace(false);
+    }
 
+    fn recAttrSet(self: *Parser) !*Node {
+        _ = try self.expect(.left_brace, "Expected '{' after rec.");
+        return self.attrSetAfterLeftBrace(true);
+    }
+
+    fn attrSetAfterLeftBrace(self: *Parser, recursive: bool) !*Node {
         const arena_allocator = self.arena.allocator();
         var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
 

@@ -171,6 +171,21 @@ test "end-to-end: unused attribute values are lazy" {
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("({ a = 1 / 0; }).a"));
 }
 
+test "end-to-end: recursive attribute sets" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const forward = try ev.evaluate("(rec { a = b + 1; b = 3; }).a");
+    try std.testing.expectEqual(@as(i64, 4), forward.asInt());
+
+    const guarded = try ev.evaluate("(rec { a = if true then 1 else b; b = a + 1; }).b");
+    try std.testing.expectEqual(@as(i64, 2), guarded.asInt());
+
+    try std.testing.expectError(error.RecursiveThunk, ev.evaluate("(rec { a = a; }).a"));
+}
+
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 

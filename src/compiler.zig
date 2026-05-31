@@ -350,6 +350,8 @@ pub const Compiler = struct {
 
     fn compileAttrSet(self: *Compiler, node: *const Node) !void {
         const aset = node.data.attr_set;
+        if (aset.recursive) return self.compileRecursiveAttrSet(aset);
+
         const count = aset.entries.len;
 
         for (aset.entries) |entry| {
@@ -364,6 +366,39 @@ pub const Compiler = struct {
         }
 
         try self.emitOpU16(.build_attrs, @intCast(count));
+    }
+
+    fn compileRecursiveAttrSet(self: *Compiler, aset: Node.AttrSet) !void {
+        self.beginScope();
+
+        for (aset.entries) |entry| {
+            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
+            const name_id = try self.intern.intern(name_span);
+            try self.emitOp(.push_null);
+            try self.emitOp(.make_cell);
+            const slot = self.declareLocal(name_span, name_id);
+            try self.emitOpByte(.set_local, @intCast(slot));
+        }
+
+        for (aset.entries) |entry| {
+            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
+            const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
+            try self.compileThunk(entry.expr);
+            try self.emitOpByte(.set_cell_local, @intCast(slot));
+        }
+
+        for (aset.entries) |entry| {
+            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
+            const name_id = try self.intern.intern(name_span);
+            const name_val = @import("value.zig").Value.string(name_id);
+            try self.builder.emitConstant(self.allocator, name_val);
+
+            const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
+            try self.emitOpByte(.capture_local, @intCast(slot));
+        }
+
+        try self.emitOpU16(.build_attrs, @intCast(aset.entries.len));
+        self.endScope();
     }
 
     fn compileAttrPath(self: *Compiler, node: *const Node) !void {
