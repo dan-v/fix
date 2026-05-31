@@ -423,5 +423,27 @@ test "end-to-end: builtins.toString" {
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toString {}"));
 }
 
+test "end-to-end: assert and implication" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const passed = try ev.evaluate("assert 1 < 2; 42");
+    try std.testing.expectEqual(@as(i64, 42), passed.asInt());
+
+    try std.testing.expectError(error.AssertionFailed, ev.evaluate("assert false; 42"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("assert 1; 42"));
+
+    const vacuous = try ev.evaluate("false -> (1 / 0)");
+    try std.testing.expect(vacuous.asBool());
+
+    const true_case = try ev.evaluate("true -> 1 < 2");
+    try std.testing.expect(true_case.asBool());
+
+    const false_case = try ev.evaluate("true -> false");
+    try std.testing.expect(!false_case.asBool());
+}
+
 const std = @import("std");
 const ValueType = value.ValueType;

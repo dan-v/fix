@@ -368,6 +368,7 @@ pub const VM = struct {
                         frame.ip += @as(usize, offset);
                     }
                 },
+                .fail_assertion => return error.AssertionFailed,
                 // ---- data structures ----
                 .build_attrs => {
                     const count: u16 = readU16(code, frame.ip);

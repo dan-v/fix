@@ -97,6 +97,7 @@ pub const Compiler = struct {
             .lambda => try self.compileLambda(node),
             .let_in => try self.compileLetIn(node),
             .if_else => try self.compileIfElse(node),
+            .assert => try self.compileAssert(node),
             .attr_set => try self.compileAttrSet(node),
             .attr_path => try self.compileAttrPath(node),
             .attr_or => try self.compileAttrOr(node),
@@ -223,6 +224,7 @@ pub const Compiler = struct {
         switch (bin.op) {
             .and_ => return self.compileAnd(bin.left, bin.right),
             .or_ => return self.compileOr(bin.left, bin.right),
+            .impl => return self.compileImpl(bin.left, bin.right),
             else => {},
         }
 
@@ -242,7 +244,7 @@ pub const Compiler = struct {
             .gte => try self.emitOp(.gte),
             .and_, .or_ => unreachable,
             .update => try self.emitOp(.merge_attrs),
-            .impl => return error.UnsupportedBinaryOp,
+            .impl => unreachable,
             .concat => return error.UnsupportedBinaryOp,
         }
     }
@@ -271,6 +273,24 @@ pub const Compiler = struct {
         try self.emitOp(.pop);
 
         try self.compileNode(right);
+        self.patchJump(end_jump, self.builder.code.items.len);
+    }
+
+    fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
+        try self.compileNode(left);
+
+        const false_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOp(.pop);
+
+        try self.compileNode(right);
+        const end_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump, 0);
+
+        self.patchJump(false_jump, self.builder.code.items.len);
+        try self.emitOp(.pop);
+        try self.emitOp(.push_true);
+
         self.patchJump(end_jump, self.builder.code.items.len);
     }
 
@@ -402,6 +422,26 @@ pub const Compiler = struct {
 
         // Patch jump (skip else)
         self.patchJump(jump_over_pos, self.builder.code.items.len);
+    }
+
+    fn compileAssert(self: *Compiler, node: *const Node) !void {
+        const assert_node = node.data.assert;
+
+        try self.compileNode(assert_node.cond);
+
+        const fail_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOp(.pop);
+
+        try self.compileNode(assert_node.body);
+        const end_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump, 0);
+
+        self.patchJump(fail_jump, self.builder.code.items.len);
+        try self.emitOp(.pop);
+        try self.emitOp(.fail_assertion);
+
+        self.patchJump(end_jump, self.builder.code.items.len);
     }
 
     fn compileAttrSet(self: *Compiler, node: *const Node) !void {

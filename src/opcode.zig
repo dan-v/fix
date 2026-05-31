@@ -62,6 +62,8 @@ pub const OpCode = enum(u8) {
     jump,
     /// Jump forward if top of stack is truthy (operand: 2-byte signed offset).
     jump_if_false,
+    /// Raise an assertion failure.
+    fail_assertion,
 
     // ---- data ----
     /// Build an attribute set from pairs on the stack.
