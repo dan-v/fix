@@ -1037,6 +1037,24 @@ test "evaluate filter builtin" {
     try std.testing.expectEqualStrings("[ ]", reject_lazy);
 }
 
+test "evaluate map concatMap mapAttrs and genList builtins" {
+    const mapped = try renderForTest("builtins.map (x: x + 1) [ 1 2 3 ]");
+    defer std.testing.allocator.free(mapped);
+    try std.testing.expectEqualStrings("[ 2 3 4 ]", mapped);
+
+    const concat_mapped = try renderForTest("builtins.elemAt (builtins.concatMap (x: [ x (x + 10) ]) [ 1 2 ]) 1");
+    defer std.testing.allocator.free(concat_mapped);
+    try std.testing.expectEqualStrings("11", concat_mapped);
+
+    const mapped_attrs = try renderForTest("(builtins.mapAttrs (name: value: value + 1) { a = 1; b = 2; }).b");
+    defer std.testing.allocator.free(mapped_attrs);
+    try std.testing.expectEqualStrings("3", mapped_attrs);
+
+    const generated = try renderForTest("builtins.genList (x: x + 1) 3");
+    defer std.testing.allocator.free(generated);
+    try std.testing.expectEqualStrings("[ 1 2 3 ]", generated);
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);

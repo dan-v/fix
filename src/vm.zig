@@ -822,6 +822,10 @@ pub const VM = struct {
             .all => self.builtinAll(args[0], args[1]),
             .any => self.builtinAny(args[0], args[1]),
             .filter => self.builtinFilter(args[0], args[1]),
+            .map => self.builtinMap(args[0], args[1]),
+            .concatMap => self.builtinConcatMap(args[0], args[1]),
+            .mapAttrs => self.builtinMapAttrs(args[0], args[1]),
+            .genList => self.builtinGenList(args[0], args[1]),
             .foldlStrict => self.builtinFoldlStrict(args[0], args[1], args[2]),
             .deepSeq => self.builtinDeepSeq(args[0], args[1]),
         };
@@ -1185,6 +1189,71 @@ pub const VM = struct {
         }
 
         return Value.list(try self.heap.addList(out.items));
+    }
+
+    fn builtinMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
+        const func = try self.forceValue(fn_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const items = try self.heap.getList(list.asObjectId());
+        const out = try self.allocator.alloc(Value, items.len);
+        defer self.allocator.free(out);
+
+        for (items, out) |item, *mapped| {
+            mapped.* = try self.callValue(func, item);
+        }
+        return Value.list(try self.heap.addList(out));
+    }
+
+    fn builtinConcatMap(self: *VM, fn_arg: Value, list_arg: Value) !Value {
+        const func = try self.forceValue(fn_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        var out: std.ArrayListUnmanaged(Value) = .empty;
+        defer out.deinit(self.allocator);
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const mapped = try self.forceValue(try self.callValue(func, item));
+            if (mapped.discriminant != .list) return error.TypeError;
+            try out.appendSlice(self.allocator, try self.heap.getList(mapped.asObjectId()));
+        }
+        return Value.list(try self.heap.addList(out.items));
+    }
+
+    fn builtinMapAttrs(self: *VM, fn_arg: Value, attrs_arg: Value) !Value {
+        const func = try self.forceValue(fn_arg);
+        const attrs = try self.forceValue(attrs_arg);
+        if (attrs.discriminant != .attrs) return error.TypeError;
+
+        const attr_entries = try self.heap.getAttrs(attrs.asObjectId());
+        const out = try self.allocator.alloc(heap_mod.AttrEntry, attr_entries.len);
+        defer self.allocator.free(out);
+
+        for (attr_entries, out) |entry, *mapped| {
+            const partial = try self.callValue(func, Value.string(entry.name));
+            mapped.* = .{
+                .name = entry.name,
+                .value = try self.callValue(partial, entry.value),
+            };
+        }
+        return Value.attrs(try self.heap.addAttrs(out));
+    }
+
+    fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {
+        const func = try self.forceValue(fn_arg);
+        const count = try self.forceValue(count_arg);
+        if (count.discriminant != .int or count.asInt() < 0) return error.TypeError;
+
+        const len: usize = @intCast(count.asInt());
+        const out = try self.allocator.alloc(Value, len);
+        defer self.allocator.free(out);
+
+        for (out, 0..) |*value, i| {
+            value.* = try self.callValue(func, Value.int(@intCast(i)));
+        }
+        return Value.list(try self.heap.addList(out));
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
