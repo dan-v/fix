@@ -34,6 +34,7 @@ pub const Scanner = struct {
         if (isAlpha(c)) return self.lexIdentOrKeyword(start);
         if (isDigit(c)) return self.lexNumber(start);
         if (c == '"') return self.lexString(start);
+        if (c == '.' and self.peek() == '/') return self.lexPath(start);
 
         // Single-character tokens.
         switch (c) {
@@ -75,6 +76,7 @@ pub const Scanner = struct {
             },
             '/' => {
                 if (self.match('/')) return self.makeToken(.double_slash, start, 2);
+                if (isPathContinue(self.peek()) and !isDigit(self.peek())) return self.lexPath(start);
                 return self.makeToken(.slash, start, 1);
             },
             '&' => {
@@ -214,12 +216,23 @@ pub const Scanner = struct {
         return self.makeToken(.error_token, start, self.pos - start);
     }
 
+    fn lexPath(self: *Scanner, start: u32) Token {
+        while (self.pos < self.source.len and isPathContinue(self.source[self.pos])) {
+            self.pos += 1;
+        }
+        return self.makeToken(.path, start, self.pos - start);
+    }
+
     fn isAlpha(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
     }
 
     fn isDigit(c: u8) bool {
         return c >= '0' and c <= '9';
+    }
+
+    fn isPathContinue(c: u8) bool {
+        return isAlpha(c) or isDigit(c) or c == '/' or c == '.' or c == '-' or c == '_' or c == '+';
     }
 
     fn keywordType(s: []const u8) TokenType {
@@ -263,5 +276,13 @@ test "scanner recognizes lambda colon" {
     try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
     try std.testing.expectEqual(TokenType.colon, scanner.next().type);
     try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes simple path literals" {
+    var scanner = Scanner.init("./foo /nix/store/abc");
+
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }

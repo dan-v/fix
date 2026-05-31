@@ -6,3 +6,4 @@ let x = 5.0; in x / 2
 if true then 1 else 2
 assert true; 42
 false -> (1 / 0)
+./foo

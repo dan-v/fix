@@ -54,6 +54,7 @@ pub const Compiler = struct {
     registry: *ChunkRegistry,
     source: []const u8,
     intern: *@import("intern.zig").InternTable,
+    base_path: ?[]const u8,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
@@ -76,6 +77,7 @@ pub const Compiler = struct {
             .registry = registry,
             .source = source,
             .intern = intern,
+            .base_path = null,
             .locals = .empty,
             .captures = .empty,
             .with_scopes = .empty,
@@ -112,6 +114,7 @@ pub const Compiler = struct {
             .unary_op => try self.compileUnary(node),
             .apply => try self.compileApply(node),
             .lambda => try self.compileLambda(node),
+            .lambda_attrs => try self.compileLambdaAttrs(node),
             .let_in => try self.compileLetIn(node),
             .if_else => try self.compileIfElse(node),
             .assert => try self.compileAssert(node),
@@ -119,6 +122,7 @@ pub const Compiler = struct {
             .attr_set => try self.compileAttrSet(node),
             .attr_path => try self.compileAttrPath(node),
             .attr_or => try self.compileAttrOr(node),
+            .has_attr => try self.compileHasAttr(node),
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
         }
@@ -167,7 +171,9 @@ pub const Compiler = struct {
             try self.compileInterpolatedString(content, content_offset);
             return;
         }
-        const id = try self.intern.intern(content);
+        const decoded = try self.decodeStringPart(content);
+        defer if (decoded.owned) self.allocator.free(decoded.text);
+        const id = try self.intern.intern(decoded.text);
         const v = @import("value.zig").Value.string(id);
         try self.builder.emitConstant(self.allocator, v);
     }
@@ -198,10 +204,47 @@ pub const Compiler = struct {
     fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
         if (part.len == 0) return;
 
-        const id = try self.intern.intern(part);
+        const decoded = try self.decodeStringPart(part);
+        defer if (decoded.owned) self.allocator.free(decoded.text);
+        const id = try self.intern.intern(decoded.text);
         try self.builder.emitConstant(self.allocator, @import("value.zig").Value.string(id));
         if (have_value.*) try self.emitOp(.add_int);
         have_value.* = true;
+    }
+
+    const DecodedString = struct {
+        text: []const u8,
+        owned: bool,
+    };
+
+    fn decodeStringPart(self: *Compiler, part: []const u8) !DecodedString {
+        if (std.mem.indexOfScalar(u8, part, '\\') == null) {
+            return .{ .text = part, .owned = false };
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < part.len) : (i += 1) {
+            const c = part[i];
+            if (c != '\\' or i + 1 >= part.len) {
+                try out.append(self.allocator, c);
+                continue;
+            }
+
+            i += 1;
+            try out.append(self.allocator, switch (part[i]) {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                else => part[i],
+            });
+        }
+
+        return .{ .text = try out.toOwnedSlice(self.allocator), .owned = true };
     }
 
     fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_offset: u32) !void {
@@ -217,9 +260,28 @@ pub const Compiler = struct {
 
     fn compilePath(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-        const id = try self.intern.intern(span);
+        const path = try self.resolvePathLiteral(span);
+        defer if (path.owned) self.allocator.free(path.text);
+        const id = try self.intern.intern(path.text);
         const v = @import("value.zig").Value.path(id);
         try self.builder.emitConstant(self.allocator, v);
+    }
+
+    const ResolvedPath = struct {
+        text: []const u8,
+        owned: bool,
+    };
+
+    fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
+        if (std.fs.path.isAbsolute(span)) {
+            return .{ .text = span, .owned = false };
+        }
+        const cwd = self.base_path orelse return .{ .text = span, .owned = false };
+
+        return .{
+            .text = try std.fs.path.resolve(self.allocator, &.{ cwd, span }),
+            .owned = true,
+        };
     }
 
     fn compileIdent(self: *Compiler, node: *const Node) !void {
@@ -346,6 +408,7 @@ pub const Compiler = struct {
             self.intern,
         );
         child.parent = self;
+        child.base_path = self.base_path;
         defer child.deinit();
 
         const param_id = try self.intern.intern(param_name);
@@ -362,6 +425,84 @@ pub const Compiler = struct {
         try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
         try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+    }
+
+    fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
+        const lambda = node.data.lambda_attrs;
+
+        var child_builder = try ChunkBuilder.init(self.allocator);
+        defer child_builder.deinit(self.allocator);
+
+        var child = Compiler.init(
+            self.allocator,
+            &child_builder,
+            self.registry,
+            self.source,
+            self.intern,
+        );
+        child.parent = self;
+        child.base_path = self.base_path;
+        defer child.deinit();
+
+        const arg_slot = child.declareLocal("\x00args", try self.intern.intern("\x00args"));
+        for (lambda.params) |param| {
+            const name = self.source[param.offset .. param.offset + param.len];
+            const name_id = try self.intern.intern(name);
+            try child.emitOp(.push_null);
+            try child.emitOp(.make_cell);
+            const slot = child.declareLocal(name, name_id);
+            try child.emitOpByte(.set_local, @intCast(slot));
+        }
+
+        for (lambda.params) |param| {
+            const name = self.source[param.offset .. param.offset + param.len];
+            const name_id = try self.intern.intern(name);
+            const slot = child.resolveLocal(name) orelse return error.UndefinedVariable;
+            try child.compileAttrParamThunk(arg_slot, name_id);
+            try child.emitOpByte(.set_cell_local, @intCast(slot));
+        }
+
+        child.compileNode(lambda.body) catch |err| {
+            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            return err;
+        };
+        try child.emitOp(.ret);
+        try child.emitOp(.halt);
+
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+        const child_id = try self.registry.register(child_chunk);
+        try self.emitCaptures(child.captures.items);
+        try self.emitOpU16(.closure, @intCast(child_id));
+        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+    }
+
+    fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId) !void {
+        var child_builder = try ChunkBuilder.init(self.allocator);
+        defer child_builder.deinit(self.allocator);
+
+        var child = Compiler.init(
+            self.allocator,
+            &child_builder,
+            self.registry,
+            self.source,
+            self.intern,
+        );
+        child.parent = self;
+        child.base_path = self.base_path;
+        defer child.deinit();
+
+        _ = try child.addCapture("\x00args", .local, arg_slot);
+        try child.emitOpByte(.get_upvalue, 0);
+        try child.emitOpU16(.get_attr, @intCast(name_id));
+        try child.emitOp(.ret);
+        try child.emitOp(.halt);
+
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+        const child_id = try self.registry.register(child_chunk);
+        try self.emitOpByte(.capture_local, @intCast(arg_slot));
+        try self.emitOpU16(.closure, @intCast(child_id));
+        try self.builder.writeByte(self.allocator, 1);
+        try self.emitOp(.make_thunk);
     }
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
@@ -442,6 +583,7 @@ pub const Compiler = struct {
             self.intern,
         );
         child.parent = self;
+        child.base_path = self.base_path;
         defer child.deinit();
 
         child.compileNode(expr) catch |err| {
@@ -648,6 +790,7 @@ pub const Compiler = struct {
             self.intern,
         );
         child.parent = self;
+        child.base_path = self.base_path;
         defer child.deinit();
 
         child.compileAttrEntries(entries, recursive) catch |err| {
@@ -786,6 +929,18 @@ pub const Compiler = struct {
         try self.emitOp(.get_attr_path_or);
         try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
         for (apath.segments) |seg| {
+            const name_span = self.attrSegmentSpan(seg);
+            const name_id = try self.intern.intern(name_span);
+            try self.builder.writeU16(self.allocator, @intCast(name_id));
+        }
+    }
+
+    fn compileHasAttr(self: *Compiler, node: *const Node) !void {
+        const has_attr = node.data.has_attr;
+        try self.compileNode(has_attr.root);
+        try self.emitOp(.has_attr_path);
+        try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
+        for (has_attr.segments) |seg| {
             const name_span = self.attrSegmentSpan(seg);
             const name_id = try self.intern.intern(name_span);
             try self.builder.writeU16(self.allocator, @intCast(name_id));
@@ -959,6 +1114,12 @@ fn offsetNode(node: *Node, offset: u32) void {
             node.data.lambda.param_offset += offset;
             offsetNode(node.data.lambda.body, offset);
         },
+        .lambda_attrs => {
+            for (node.data.lambda_attrs.params) |*param| {
+                param.offset += offset;
+            }
+            offsetNode(node.data.lambda_attrs.body, offset);
+        },
         .let_in => {
             for (node.data.let_in.bindings) |*binding| {
                 binding.name_offset += offset;
@@ -996,6 +1157,12 @@ fn offsetNode(node: *Node, offset: u32) void {
         .attr_or => {
             offsetNode(node.data.attr_or.attr_path, offset);
             offsetNode(node.data.attr_or.default, offset);
+        },
+        .has_attr => {
+            offsetNode(node.data.has_attr.root, offset);
+            for (node.data.has_attr.segments) |*segment| {
+                segment.offset += offset;
+            }
         },
         .list => {
             for (node.data.list.items) |item| {

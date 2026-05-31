@@ -449,6 +449,14 @@ pub const VM = struct {
                     const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip]);
                     try self.push(result);
                 },
+                .has_attr_path => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 2;
+                    const attrs_val = self.pop();
+                    try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip])));
+                },
                 .lookup_with => {
                     const name_id: InternId = @intCast(readU16(code, frame.ip));
                     frame.ip += 2;
@@ -563,9 +571,11 @@ pub const VM = struct {
             },
             .string, .path => {
                 if (vb.discriminant != va.discriminant) return error.TypeError;
-                const ia = va.asInternId();
-                const ib = vb.asInternId();
-                return if (ia < ib) .lt else if (ia > ib) .gt else .eq;
+                return switch (std.mem.order(u8, self.intern.get(va.asInternId()), self.intern.get(vb.asInternId()))) {
+                    .lt => .lt,
+                    .eq => .eq,
+                    .gt => .gt,
+                };
             },
             else => return error.TypeError,
         }
@@ -738,9 +748,8 @@ pub const VM = struct {
                 defer self.allocator.free(s);
                 return Value.string(try self.intern.intern(s));
             },
-            .bool_false => return Value.string(try self.intern.intern("false")),
-            .bool_true => return Value.string(try self.intern.intern("true")),
-            .null => return Value.string(try self.intern.intern("null")),
+            .bool_false, .null => return Value.string(try self.intern.intern("")),
+            .bool_true => return Value.string(try self.intern.intern("1")),
             else => return error.TypeError,
         }
     }
@@ -763,6 +772,22 @@ pub const VM = struct {
             current = try self.forceValue(current);
         }
         return current;
+    }
+
+    fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8) !bool {
+        var current = try self.forceValue(attrs_val);
+        var offset: usize = 0;
+        while (offset < encoded_names.len) : (offset += 2) {
+            if (current.discriminant != .attrs) return false;
+            const name_id: InternId = @intCast(readU16(encoded_names, offset));
+            const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => return false,
+                else => return err,
+            };
+            if (offset + 2 >= encoded_names.len) return true;
+            current = try self.forceValue(attr);
+        }
+        return false;
     }
 
     fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {

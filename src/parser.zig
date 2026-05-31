@@ -135,7 +135,7 @@ pub const Parser = struct {
     fn rule(tt: TokenType) Rule {
         switch (tt) {
             .left_paren => return .{ .prefix = grouping, .infix = null, .prec = .none },
-            .left_brace => return .{ .prefix = attrSet, .infix = null, .prec = .none },
+            .left_brace => return .{ .prefix = braceExpr, .infix = null, .prec = .none },
             .left_bracket => return .{ .prefix = list, .infix = null, .prec = .none },
             .identifier => return .{ .prefix = variable, .infix = null, .prec = .none },
             .integer => return .{ .prefix = integer, .infix = null, .prec = .none },
@@ -168,6 +168,7 @@ pub const Parser = struct {
             .double_plus => return .{ .prefix = null, .infix = binary, .prec = .concat },
             .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
+            .question_mark => return .{ .prefix = null, .infix = hasAttr, .prec = .cmp },
             else => return .{ .prefix = null, .infix = null, .prec = .none },
         }
     }
@@ -266,6 +267,7 @@ pub const Parser = struct {
             .double_slash,
             .double_plus,
             .arrow,
+            .question_mark,
             => true,
             else => false,
         };
@@ -341,13 +343,62 @@ pub const Parser = struct {
         return self.arena.createNode(.unary_op, .{ .unary = .{ .op = op, .expr = operand } });
     }
 
-    fn attrSet(self: *Parser) !*Node {
+    fn braceExpr(self: *Parser) !*Node {
+        if (self.looksLikeAttrLambdaPattern()) {
+            return self.attrLambdaPattern();
+        }
         return self.attrSetAfterLeftBrace(false);
     }
 
     fn recAttrSet(self: *Parser) !*Node {
         _ = try self.expect(.left_brace, "Expected '{' after rec.");
         return self.attrSetAfterLeftBrace(true);
+    }
+
+    fn looksLikeAttrLambdaPattern(self: *Parser) bool {
+        var probe = self.*;
+        probe.diagnostics = .empty;
+
+        if (probe.match(.right_brace)) return probe.check(.colon);
+
+        while (true) {
+            if (!probe.matchAttrPatternName()) return false;
+            if (probe.match(.right_brace)) return probe.check(.colon);
+            if (!probe.match(.comma)) return false;
+            if (probe.check(.right_brace)) return false;
+        }
+    }
+
+    fn attrLambdaPattern(self: *Parser) !*Node {
+        const arena_allocator = self.arena.allocator();
+        var params: std.ArrayListUnmanaged(Node.Atom) = .empty;
+
+        if (!self.match(.right_brace)) {
+            while (true) {
+                const name_tok = self.current;
+                if (!self.matchAttrPatternName()) {
+                    self.reportError("Expected function argument name.");
+                    return error.ParseError;
+                }
+                try params.append(arena_allocator, .{
+                    .offset = name_tok.offset,
+                    .len = name_tok.len,
+                });
+
+                if (self.match(.right_brace)) break;
+                _ = try self.expect(.comma, "Expected ',' or '}' in function argument set.");
+            }
+        }
+
+        _ = try self.expect(.colon, "Expected ':' after function argument set.");
+        const body = try self.expression();
+
+        return self.arena.createNode(.lambda_attrs, .{
+            .lambda_attrs = .{
+                .params = try params.toOwnedSlice(arena_allocator),
+                .body = body,
+            },
+        });
     }
 
     fn attrSetAfterLeftBrace(self: *Parser, recursive: bool) !*Node {
@@ -705,6 +756,31 @@ pub const Parser = struct {
         });
     }
 
+    fn hasAttr(self: *Parser, left: *Node) !*Node {
+        const arena_allocator = self.arena.allocator();
+        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+
+        while (true) {
+            if (!self.matchAttrName()) {
+                self.reportError("Expected attribute name after '?'.");
+                return error.ParseError;
+            }
+            try segments.append(arena_allocator, .{
+                .offset = self.previous.offset,
+                .len = self.previous.len,
+            });
+
+            if (!self.match(.dot)) break;
+        }
+
+        return self.arena.createNode(.has_attr, .{
+            .has_attr = .{
+                .root = left,
+                .segments = try segments.toOwnedSlice(arena_allocator),
+            },
+        });
+    }
+
     // ---- helpers ----
 
     fn makeBinary(self: *Parser, op: ast.BinaryOp, left: *Node, right: *Node) !*Node {
@@ -724,6 +800,10 @@ pub const Parser = struct {
     }
 
     fn matchLetBindingName(self: *Parser) bool {
+        return self.match(.identifier) or self.match(.kw_or);
+    }
+
+    fn matchAttrPatternName(self: *Parser) bool {
         return self.match(.identifier) or self.match(.kw_or);
     }
 };
@@ -757,6 +837,18 @@ test "parser recognizes identifier lambda" {
         .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda.body.tag);
+}
+
+test "parser recognizes attrset lambda" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ x, y }: x + y");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.lambda_attrs, node.tag);
+    try std.testing.expectEqual(@as(usize, 2), node.data.lambda_attrs.params.len);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda_attrs.body.tag);
 }
 
 test "parser recognizes nested attr declarations" {
@@ -904,6 +996,17 @@ test "parser recognizes attr path or default" {
     try std.testing.expectEqual(NodeTag.attr_or, node.tag);
     try std.testing.expectEqual(NodeTag.attr_path, node.data.attr_or.attr_path.tag);
     try std.testing.expectEqual(NodeTag.integer, node.data.attr_or.default.tag);
+}
+
+test "parser recognizes has-attr operator" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ a.b = 1; } ? a.b");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.has_attr, node.tag);
+    try std.testing.expectEqual(@as(usize, 2), node.data.has_attr.segments.len);
 }
 
 test "parser rejects unparenthesized expression forms in lists" {

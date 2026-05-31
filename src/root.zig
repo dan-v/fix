@@ -584,7 +584,10 @@ test "end-to-end: builtins.toString" {
     try std.testing.expectEqualStrings("42", ev.intern.get(int_string.asInternId()));
 
     const bool_string = try ev.evaluate("builtins.toString true");
-    try std.testing.expectEqualStrings("true", ev.intern.get(bool_string.asInternId()));
+    try std.testing.expectEqualStrings("1", ev.intern.get(bool_string.asInternId()));
+
+    const false_string = try ev.evaluate("builtins.toString false");
+    try std.testing.expectEqualStrings("", ev.intern.get(false_string.asInternId()));
 
     const string_passthrough = try ev.evaluate("builtins.toString \"x\"");
     try std.testing.expectEqualStrings("x", ev.intern.get(string_passthrough.asInternId()));

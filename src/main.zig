@@ -35,6 +35,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    try ev.setBasePathFromCurrentPath(init.io);
 
     const source = getSource(init.io, allocator, arg1, &args_iter) catch |err| {
         std.debug.print("Error reading source: {s}\n", .{@errorName(err)});

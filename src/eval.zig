@@ -27,6 +27,7 @@ pub const Evaluator = struct {
     heap: ObjectHeap,
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
+    base_path: ?[:0]u8,
     worker_count: u8,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
 
@@ -41,12 +42,14 @@ pub const Evaluator = struct {
             .heap = ObjectHeap.init(allocator),
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
+            .base_path = null,
             .worker_count = worker_count,
             .diagnostics = .empty,
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
+        if (self.base_path) |path| self.allocator.free(path);
         self.diagnostics.deinit(self.allocator);
         self.heap.deinit();
         self.runtime_arena.deinit();
@@ -57,6 +60,11 @@ pub const Evaluator = struct {
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
         return self.diagnostics.items;
+    }
+
+    pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
+        if (self.base_path) |path| self.allocator.free(path);
+        self.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
 
     fn clearDiagnostics(self: *Evaluator) void {
@@ -95,6 +103,7 @@ pub const Evaluator = struct {
             source,
             &self.intern,
         );
+        compiler.base_path = self.base_path;
         defer compiler.deinit();
 
         compiler.compile(ast_node) catch |err| {
@@ -190,7 +199,7 @@ const ValuePrinter = struct {
             .int => try self.writer.print("{}", .{value.asInt()}),
             .float => try self.writer.print("{d}", .{value.asFloat()}),
             .string => try self.ev.writeQuotedString(self.writer, self.ev.intern.get(value.asInternId())),
-            .path => try self.writer.print("<path:{s}>", .{self.ev.intern.get(value.asInternId())}),
+            .path => try self.writer.writeAll(self.ev.intern.get(value.asInternId())),
             .list => try self.writeList(value.asObjectId()),
             .attrs => try self.writeAttrs(value.asObjectId()),
             .closure => try self.writer.writeAll("<closure>"),
@@ -336,6 +345,52 @@ test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
+}
+
+test "evaluate matches Nix toString bool and null semantics" {
+    const true_output = try renderForTest("builtins.toString true");
+    defer std.testing.allocator.free(true_output);
+    try std.testing.expectEqualStrings("\"1\"", true_output);
+
+    const false_output = try renderForTest("builtins.toString false");
+    defer std.testing.allocator.free(false_output);
+    try std.testing.expectEqualStrings("\"\"", false_output);
+
+    const null_output = try renderForTest("builtins.toString null");
+    defer std.testing.allocator.free(null_output);
+    try std.testing.expectEqualStrings("\"\"", null_output);
+}
+
+test "evaluate decodes common string escapes" {
+    const output = try renderForTest("\"a\\nb\\t\\\"c\"");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("\"a\\nb\\t\\\"c\"", output);
+}
+
+test "evaluate compares strings lexically" {
+    const output = try renderForTest("let b = \"b\"; a = \"a\"; in b > a");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("true", output);
+}
+
+test "evaluate checks attribute paths without forcing final value" {
+    const present = try renderForTest("({ a.b = 1 / 0; } ? a.b)");
+    defer std.testing.allocator.free(present);
+    try std.testing.expectEqualStrings("true", present);
+
+    const missing = try renderForTest("({ a = {}; } ? a.b)");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqualStrings("false", missing);
+}
+
+test "evaluate simple attrset function parameters" {
+    const output = try renderForTest("({ x, y }: x + y) { x = 1; y = 2; }");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("3", output);
+
+    const lazy = try renderForTest("({ x }: 1) { x = 1 / 0; }");
+    defer std.testing.allocator.free(lazy);
+    try std.testing.expectEqualStrings("1", lazy);
 }
 
 test "evaluate exposes parse diagnostics without printing" {

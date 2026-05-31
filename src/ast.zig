@@ -22,6 +22,7 @@ pub const NodeTag = enum(u8) {
     binary_op,
     apply,
     lambda,
+    lambda_attrs,
     let_in,
     if_else,
     assert,
@@ -29,6 +30,7 @@ pub const NodeTag = enum(u8) {
     attr_set,
     attr_path, // foo.bar.baz
     attr_or, // foo.bar or default
+    has_attr, // foo ? bar.baz
     list,
     parens, // parenthesized subexpression
 };
@@ -70,6 +72,7 @@ pub const Node = struct {
         binary: Binary,
         apply: Apply,
         lambda: Lambda,
+        lambda_attrs: LambdaAttrs,
         let_in: LetIn,
         if_else: IfElse,
         assert: Assert,
@@ -77,6 +80,7 @@ pub const Node = struct {
         attr_set: AttrSet,
         attr_path: AttrPath,
         attr_or: AttrOr,
+        has_attr: HasAttr,
         list: List,
         parens: *Node,
     };
@@ -105,6 +109,11 @@ pub const Node = struct {
     pub const Lambda = struct {
         param_offset: u32,
         param_len: u32,
+        body: *Node,
+    };
+
+    pub const LambdaAttrs = struct {
+        params: []Atom,
         body: *Node,
     };
 
@@ -156,6 +165,11 @@ pub const Node = struct {
     pub const AttrOr = struct {
         attr_path: *Node,
         default: *Node,
+    };
+
+    pub const HasAttr = struct {
+        root: *Node,
+        segments: []Atom,
     };
 
     pub const List = struct {

@@ -106,6 +106,10 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].
     get_attr_path_or,
+    /// Test whether an attribute path exists without forcing the final value.
+    /// Operand: 1-byte segment count, then that many 2-byte InternIds.
+    /// Stack layout before: [attrs].
+    has_attr_path,
     /// Look up a variable name through active with-scopes.
     /// Operand: 2-byte InternId, 1-byte scope count.
     /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.
