@@ -750,6 +750,10 @@ test "evaluate primitive arithmetic and bit builtins" {
 }
 
 test "evaluate primitive path and metadata builtins" {
+    const interpolated_path = try renderForTest("builtins.toString (let name = \"root.zig\"; in ./src/${name})");
+    defer std.testing.allocator.free(interpolated_path);
+    try std.testing.expect(std.mem.endsWith(u8, interpolated_path, "/src/root.zig\""));
+
     const base = try renderForTest("builtins.baseNameOf /foo/bar");
     defer std.testing.allocator.free(base);
     try std.testing.expectEqualStrings("\"bar\"", base);

@@ -210,8 +210,21 @@ pub const Scanner = struct {
     }
 
     fn lexPath(self: *Scanner, start: u32) Token {
-        while (self.pos < self.source.len and isPathContinue(self.source[self.pos])) {
-            self.pos += 1;
+        while (self.pos < self.source.len) {
+            if (isPathContinue(self.source[self.pos])) {
+                self.pos += 1;
+                continue;
+            }
+            if (self.source[self.pos] == '$' and
+                self.pos + 1 < self.source.len and
+                self.source[self.pos + 1] == '{')
+            {
+                const end = string_syntax.findInterpolationEnd(self.source, self.pos + 2) orelse break;
+                self.countNewlines(self.source[self.pos .. end + 1]);
+                self.pos = @intCast(end + 1);
+                continue;
+            }
+            break;
         }
         return self.makeToken(.path, start, self.pos - start);
     }
@@ -297,6 +310,14 @@ test "scanner recognizes simple path literals" {
 
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes interpolated path literals" {
+    var scanner = Scanner.init("./${name}/patch ../${dir}/file");
+
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);

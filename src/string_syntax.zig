@@ -131,7 +131,7 @@ fn scanIndented(source: []const u8, start: usize) ?usize {
     return null;
 }
 
-fn findInterpolationEnd(source: []const u8, start: usize) ?usize {
+pub fn findInterpolationEnd(source: []const u8, start: usize) ?usize {
     var depth: usize = 1;
     var i = start;
     while (i < source.len) {

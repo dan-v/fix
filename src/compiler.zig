@@ -216,11 +216,47 @@ pub const Compiler = struct {
 
     fn compilePath(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+        if (std.mem.indexOf(u8, span, "${") != null) return self.compileInterpolatedPath(span, node.data.atom.offset);
+
         const path = try self.resolvePathLiteral(span);
         defer if (path.owned) self.allocator.free(path.text);
         const id = try self.intern.intern(path.text);
         const v = @import("value.zig").Value.path(id);
         try self.builder.emitConstant(self.allocator, v);
+    }
+
+    fn compileInterpolatedPath(self: *Compiler, span: []const u8, source_offset: u32) !void {
+        var cursor: usize = 0;
+        var have_value = false;
+
+        while (std.mem.indexOf(u8, span[cursor..], "${")) |relative_start| {
+            const interp_start = cursor + relative_start;
+            try self.emitPathPart(span[cursor..interp_start], &have_value);
+
+            const expr_start = interp_start + 2;
+            const expr_end = string_syntax.findInterpolationEnd(span, expr_start) orelse return error.InvalidPathLiteral;
+            try self.compileInterpolatedExpr(span[expr_start..expr_end], source_offset + @as(u32, @intCast(expr_start)));
+            if (have_value) try self.emitOp(.add_int);
+            have_value = true;
+            cursor = expr_end + 1;
+        }
+
+        try self.emitPathPart(span[cursor..], &have_value);
+        if (!have_value) return error.InvalidPathLiteral;
+    }
+
+    fn emitPathPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
+        if (part.len == 0) return;
+        if (!have_value.*) {
+            const path = try self.resolvePathLiteralPreserveTrailingSlash(part);
+            defer if (path.owned) self.allocator.free(path.text);
+            const id = try self.intern.intern(path.text);
+            try self.builder.emitConstant(self.allocator, @import("value.zig").Value.path(id));
+            have_value.* = true;
+            return;
+        }
+
+        try self.emitStringPart(part, have_value);
     }
 
     fn compileSearchPath(self: *Compiler, node: *const Node) !void {
@@ -245,6 +281,15 @@ pub const Compiler = struct {
             .text = try std.fs.path.resolve(self.allocator, &.{ cwd, span }),
             .owned = true,
         };
+    }
+
+    fn resolvePathLiteralPreserveTrailingSlash(self: *Compiler, span: []const u8) !ResolvedPath {
+        const resolved = try self.resolvePathLiteral(span);
+        if (!std.mem.endsWith(u8, span, "/") or std.mem.endsWith(u8, resolved.text, "/")) return resolved;
+
+        const text = try std.fmt.allocPrint(self.allocator, "{s}/", .{resolved.text});
+        if (resolved.owned) self.allocator.free(resolved.text);
+        return .{ .text = text, .owned = true };
     }
 
     fn compileIdent(self: *Compiler, node: *const Node) !void {
