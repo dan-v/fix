@@ -40,6 +40,7 @@ const Rule = struct {
 
 pub const Diagnostic = struct {
     line: u32,
+    column: u32,
     offset: u32,
     len: u32,
     token_type: TokenType,
@@ -124,11 +125,22 @@ pub const Parser = struct {
         const tok = self.current;
         self.diagnostics.append(self.allocator, .{
             .line = tok.line,
+            .column = self.columnForOffset(tok.offset),
             .offset = tok.offset,
             .len = tok.len,
             .token_type = tok.type,
             .message = msg,
         }) catch {};
+    }
+
+    fn columnForOffset(self: *const Parser, offset: u32) u32 {
+        var line_start: usize = 0;
+        var i: usize = 0;
+        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
+        while (i < target) : (i += 1) {
+            if (self.source[i] == '\n') line_start = i + 1;
+        }
+        return @intCast(target - line_start + 1);
     }
 
     fn span(self: *const Parser, tok: Token) []const u8 {
@@ -325,19 +337,33 @@ pub const Parser = struct {
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
             if (self.match(.kw_inherit)) {
-                try self.inheritAttrs(arena_allocator, &entries);
-                _ = try self.expect(.semicolon, "Expected ';' after inherit.");
+                self.inheritAttrs(arena_allocator, &entries) catch {
+                    self.synchronizeAttrSetEntry();
+                    continue;
+                };
+                if (self.expect(.semicolon, "Expected ';' after inherit.")) |_| {} else |_| {
+                    self.synchronizeAttrSetEntry();
+                }
                 continue;
             }
 
-            const path = try self.attrDeclarationPath(arena_allocator);
-            _ = try self.expect(.equal, "Expected '=' after attribute name.");
+            const path = self.attrDeclarationPath(arena_allocator) catch {
+                self.synchronizeAttrSetEntry();
+                continue;
+            };
+            if (self.expect(.equal, "Expected '=' after attribute name.")) |_| {} else |_| {
+                self.synchronizeAttrSetEntry();
+                continue;
+            }
             // allow missing semicolons by checking what comes next
             if (!self.check(.semicolon) and !self.check(.right_brace)) {
                 _ = self.match(.semicolon); // optional
             }
 
-            const expr = try self.expression();
+            const expr = self.expression() catch {
+                self.synchronizeAttrSetEntry();
+                continue;
+            };
 
             try entries.append(arena_allocator, .{
                 .path = path,
@@ -355,6 +381,13 @@ pub const Parser = struct {
                 .recursive = recursive,
             },
         });
+    }
+
+    fn synchronizeAttrSetEntry(self: *Parser) void {
+        while (!self.check(.semicolon) and !self.check(.right_brace) and !self.check(.eof)) {
+            self.advance();
+        }
+        _ = self.match(.semicolon);
     }
 
     fn inheritAttrs(
@@ -760,6 +793,21 @@ test "parser records diagnostics without printing" {
     try std.testing.expectEqual(@as(usize, 2), parser.diagnostics.items.len);
     try std.testing.expectEqualStrings("Invalid token.", parser.diagnostics.items[0].message);
     try std.testing.expectEqual(@as(u32, 0), parser.diagnostics.items[0].offset);
+    try std.testing.expectEqual(@as(u32, 1), parser.diagnostics.items[0].column);
     try std.testing.expectEqualStrings("Invalid token.", parser.diagnostics.items[1].message);
     try std.testing.expectEqual(@as(u32, 2), parser.diagnostics.items[1].offset);
+    try std.testing.expectEqual(@as(u32, 3), parser.diagnostics.items[1].column);
+}
+
+test "parser recovers across attrset entries" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ if = 1; good = 2; inherit = 3; alsoGood = 4; }");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 2), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings("Expected attribute name.", parser.diagnostics.items[0].message);
+    try std.testing.expectEqualStrings("Expected inherited variable name.", parser.diagnostics.items[1].message);
 }

@@ -335,6 +335,8 @@ test "evaluate exposes parse diagnostics without printing" {
     try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
     try std.testing.expectEqualStrings("Invalid token.", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 0), diagnostics[0].offset);
+    try std.testing.expectEqual(@as(u32, 1), diagnostics[0].column);
     try std.testing.expectEqualStrings("Invalid token.", diagnostics[1].message);
     try std.testing.expectEqual(@as(u32, 2), diagnostics[1].offset);
+    try std.testing.expectEqual(@as(u32, 3), diagnostics[1].column);
 }

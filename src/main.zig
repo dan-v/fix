@@ -83,14 +83,56 @@ fn getSource(
 
 fn printDiagnostics(source: []const u8, diagnostics: []const eval.Diagnostic) void {
     for (diagnostics) |diagnostic| {
-        std.debug.print("[line {d}] parse error", .{diagnostic.line});
+        std.debug.print("error: parse error at {d}:{d}: {s}\n", .{
+            diagnostic.line,
+            diagnostic.column,
+            diagnostic.message,
+        });
+
+        const line = lineSpan(source, diagnostic.offset);
+        std.debug.print("{d: >4} | {s}\n", .{ diagnostic.line, source[line.start..line.end] });
+        std.debug.print("     | ", .{});
+        writeSpaces(diagnostic.column - 1);
+        const caret_count = @max(@as(u32, 1), diagnostic.len);
+        var i: u32 = 0;
+        while (i < caret_count) : (i += 1) {
+            std.debug.print("^", .{});
+        }
+
         if (diagnostic.token_type != .eof) {
             const start: usize = @intCast(diagnostic.offset);
             const len: usize = @intCast(diagnostic.len);
             if (start <= source.len and len <= source.len - start) {
-                std.debug.print(" at '{s}'", .{source[start .. start + len]});
+                std.debug.print(" near `{s}`", .{source[start .. start + len]});
             }
         }
-        std.debug.print(": {s}\n", .{diagnostic.message});
+        std.debug.print("\n", .{});
+    }
+}
+
+const LineSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn lineSpan(source: []const u8, offset: u32) LineSpan {
+    const target: usize = @min(@as(usize, @intCast(offset)), source.len);
+    var start = target;
+    while (start > 0 and source[start - 1] != '\n') {
+        start -= 1;
+    }
+
+    var end = target;
+    while (end < source.len and source[end] != '\n') {
+        end += 1;
+    }
+
+    return .{ .start = start, .end = end };
+}
+
+fn writeSpaces(count: u32) void {
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        std.debug.print(" ", .{});
     }
 }
