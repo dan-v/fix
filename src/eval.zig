@@ -496,6 +496,28 @@ test "evaluate concatLists and listToAttrs builtins" {
     try std.testing.expectEqualStrings("true", lazy_value);
 }
 
+test "evaluate removeAttrs and intersectAttrs builtins" {
+    const removed = try renderForTest("(builtins.removeAttrs { a = 1; b = 2; } [ \"a\" ]).b");
+    defer std.testing.allocator.free(removed);
+    try std.testing.expectEqualStrings("2", removed);
+
+    const removed_missing = try renderForTest("(builtins.removeAttrs { a = 1; b = 2; } [ \"a\" ]) ? a");
+    defer std.testing.allocator.free(removed_missing);
+    try std.testing.expectEqualStrings("false", removed_missing);
+
+    const remove_lazy = try renderForTest("(builtins.removeAttrs { a = 1 / 0; b = 2; } [ \"b\" ]) ? a");
+    defer std.testing.allocator.free(remove_lazy);
+    try std.testing.expectEqualStrings("true", remove_lazy);
+
+    const intersect = try renderForTest("(builtins.intersectAttrs { a = 1; } { a = 2; b = 3; }).a");
+    defer std.testing.allocator.free(intersect);
+    try std.testing.expectEqualStrings("2", intersect);
+
+    const intersect_lazy = try renderForTest("(builtins.intersectAttrs { a = 1; } { a = 1 / 0; b = 2; }) ? a");
+    defer std.testing.allocator.free(intersect_lazy);
+    try std.testing.expectEqualStrings("true", intersect_lazy);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

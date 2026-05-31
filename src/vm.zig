@@ -746,6 +746,8 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.hasAttr),
             @intFromEnum(BuiltinId.getAttr),
             @intFromEnum(BuiltinId.elemAt),
+            @intFromEnum(BuiltinId.removeAttrs),
+            @intFromEnum(BuiltinId.intersectAttrs),
             => self.makeBuiltinClosure(callee.asBuiltinId(), arg),
             else => error.InvalidBuiltin,
         };
@@ -764,6 +766,8 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.hasAttr) => self.builtinHasAttr(partial.arg, arg),
             @intFromEnum(BuiltinId.getAttr) => self.builtinGetAttr(partial.arg, arg),
             @intFromEnum(BuiltinId.elemAt) => self.builtinElemAt(partial.arg, arg),
+            @intFromEnum(BuiltinId.removeAttrs) => self.builtinRemoveAttrs(partial.arg, arg),
+            @intFromEnum(BuiltinId.intersectAttrs) => self.builtinIntersectAttrs(partial.arg, arg),
             else => error.InvalidBuiltin,
         };
     }
@@ -939,6 +943,54 @@ pub const VM = struct {
         const i: usize = @intCast(index.asInt());
         if (i >= items.len) return error.IndexOutOfBounds;
         return self.forceValue(items[i]);
+    }
+
+    fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {
+        const attrs = try self.forceValue(attrs_arg);
+        const names = try self.forceValue(names_arg);
+        if (attrs.discriminant != .attrs or names.discriminant != .list) return error.TypeError;
+
+        var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        const attr_entries = try self.heap.getAttrs(attrs.asObjectId());
+        for (attr_entries) |entry| {
+            if (!try self.stringListContainsIntern(names.asObjectId(), entry.name)) {
+                try entries.append(self.allocator, entry);
+            }
+        }
+
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Value {
+        const left = try self.forceValue(left_arg);
+        const right = try self.forceValue(right_arg);
+        if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
+
+        var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        const right_entries = try self.heap.getAttrs(right.asObjectId());
+        for (right_entries) |entry| {
+            _ = self.heap.getAttrValue(left.asObjectId(), entry.name) catch |err| switch (err) {
+                error.MissingAttribute => continue,
+                else => return err,
+            };
+            try entries.append(self.allocator, entry);
+        }
+
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    fn stringListContainsIntern(self: *VM, list_id: ObjectId, needle: InternId) !bool {
+        const items = try self.heap.getList(list_id);
+        for (items) |item| {
+            const value = try self.forceValue(item);
+            if (value.discriminant != .string) return error.TypeError;
+            if (value.asInternId() == needle) return true;
+        }
+        return false;
     }
 
     fn attrEntryNameLessThan(self: *VM, a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
