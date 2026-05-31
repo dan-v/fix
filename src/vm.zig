@@ -94,6 +94,11 @@ pub const VM = struct {
         return self.run();
     }
 
+    pub fn forceListItem(self: *VM, list_val: Value, index: usize) !Value {
+        if (list_val.discriminant != .list) return error.TypeError;
+        return self.forceValue(try self.heap.getListItem(list_val.asObjectId(), index));
+    }
+
     // ---- frame management ----
 
     fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_id: ?ObjectId) !void {

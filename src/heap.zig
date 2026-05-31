@@ -116,6 +116,16 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn getListLen(self: *const ObjectHeap, id: ObjectId) !usize {
+        return (try self.getList(id)).len;
+    }
+
+    pub fn getListItem(self: *const ObjectHeap, id: ObjectId, index: usize) !Value {
+        const items = try self.getList(id);
+        if (index >= items.len) return error.IndexOutOfBounds;
+        return items[index];
+    }
+
     pub fn getAttrs(self: *const ObjectHeap, id: ObjectId) ![]const AttrEntry {
         return switch (self.getConst(id).*) {
             .attrs => |range| self.attrSlice(range),
@@ -387,8 +397,11 @@ test "object heap stores list and attrs payloads behind object ids" {
 
     const items = try heap.getList(list_id);
     try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqual(@as(usize, 3), try heap.getListLen(list_id));
     try std.testing.expectEqual(@as(i64, 1), items[0].asInt());
     try std.testing.expectEqual(@as(i64, 3), items[2].asInt());
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getListItem(list_id, 1)).asInt());
+    try std.testing.expectError(error.IndexOutOfBounds, heap.getListItem(list_id, 3));
 
     const entries = try heap.getAttrs(attrs_id);
     try std.testing.expectEqual(@as(usize, 2), entries.len);
