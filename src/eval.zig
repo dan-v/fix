@@ -614,6 +614,10 @@ test "evaluate attrset function defaults ellipsis and binding" {
     defer std.testing.allocator.free(bound_after);
     try std.testing.expectEqualStrings("4", bound_after);
 
+    const default_uses_bound_args = try renderForTest("({ a ? args.b or 1, ... }@args: a) { }");
+    defer std.testing.allocator.free(default_uses_bound_args);
+    try std.testing.expectEqualStrings("1", default_uses_bound_args);
+
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));

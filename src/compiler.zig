@@ -507,9 +507,9 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitOpByte(.capture_local, @intCast(arg_slot));
+        try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, 1);
+        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
