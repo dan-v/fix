@@ -167,16 +167,37 @@ pub const Evaluator = struct {
     fn importPath(self: *Evaluator, path: []const u8) !Value {
         const resolved = try self.resolveHostPath(path);
         defer if (resolved.owned) self.allocator.free(resolved.text);
-        if (self.imports.get(resolved.text)) |value| return value;
+        return self.importResolvedPath(resolved.text);
+    }
 
-        const source = try self.files.readFile(resolved.text);
-        const source_base = std.fs.path.dirname(resolved.text) orelse "/";
+    fn importResolvedPath(self: *Evaluator, path: []const u8) anyerror!Value {
+        if (self.imports.get(path)) |value| return value;
+
+        const source = self.files.readFile(path) catch |err| switch (err) {
+            error.IsDir => return self.importDirectory(path),
+            else => return err,
+        };
+        const source_base = std.fs.path.dirname(path) orelse "/";
         const value = try self.evaluateSource(source, source_base);
+        try self.cacheImportValue(path, value);
+        return value;
+    }
 
-        const key = try self.allocator.dupe(u8, resolved.text);
+    fn importDirectory(self: *Evaluator, path: []const u8) anyerror!Value {
+        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
+        defer self.allocator.free(default_path);
+
+        const value = try self.importResolvedPath(default_path);
+        try self.cacheImportValue(path, value);
+        return value;
+    }
+
+    fn cacheImportValue(self: *Evaluator, path: []const u8, value: Value) !void {
+        if (self.imports.contains(path)) return;
+
+        const key = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(key);
         try self.imports.put(self.allocator, key, value);
-        return value;
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
@@ -700,6 +721,34 @@ test "evaluate import through evaluator file cache" {
     const imported = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 84), imported.asInt());
     try std.testing.expectEqual(@as(u32, 1), ev.imports.count());
+}
+
+test "evaluate directory import through default nix" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "pkg", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pkg/default.nix", .data = "{ value = 9; }\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pkg",
+    });
+    defer std.testing.allocator.free(dir_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{dir_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const imported = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 9), imported.asInt());
 }
 
 test "evaluate all and any builtins" {
