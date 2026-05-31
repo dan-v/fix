@@ -1,5 +1,16 @@
+# direnv
 .direnv/
+
+# Zig build output
 .zig-cache/
 zig-out/
+
+# Nix build symlinks
+result
+result-*
+
+# Local command output
 err.txt
 out.txt
+*.log
+*.tmp
