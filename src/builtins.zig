@@ -30,6 +30,7 @@ pub const BuiltinId = enum(u16) {
     listToAttrs = 20,
     removeAttrs = 21,
     intersectAttrs = 22,
+    elem = 23,
 };
 
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
@@ -125,6 +126,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("intersectAttrs"),
             .value = Value.builtin(@intFromEnum(BuiltinId.intersectAttrs)),
+        },
+        .{
+            .name = try intern.intern("elem"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.elem)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

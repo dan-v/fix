@@ -748,6 +748,7 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.elemAt),
             @intFromEnum(BuiltinId.removeAttrs),
             @intFromEnum(BuiltinId.intersectAttrs),
+            @intFromEnum(BuiltinId.elem),
             => self.makeBuiltinClosure(callee.asBuiltinId(), arg),
             else => error.InvalidBuiltin,
         };
@@ -768,6 +769,7 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.elemAt) => self.builtinElemAt(partial.arg, arg),
             @intFromEnum(BuiltinId.removeAttrs) => self.builtinRemoveAttrs(partial.arg, arg),
             @intFromEnum(BuiltinId.intersectAttrs) => self.builtinIntersectAttrs(partial.arg, arg),
+            @intFromEnum(BuiltinId.elem) => self.builtinElem(partial.arg, arg),
             else => error.InvalidBuiltin,
         };
     }
@@ -943,6 +945,17 @@ pub const VM = struct {
         const i: usize = @intCast(index.asInt());
         if (i >= items.len) return error.IndexOutOfBounds;
         return self.forceValue(items[i]);
+    }
+
+    fn builtinElem(self: *VM, needle: Value, list_arg: Value) !Value {
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const items = try self.heap.getList(list.asObjectId());
+        for (items) |item| {
+            if (try self.valuesEqual(needle, item)) return Value.boolVal(true);
+        }
+        return Value.boolVal(false);
     }
 
     fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {

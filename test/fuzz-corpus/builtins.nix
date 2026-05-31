@@ -32,3 +32,6 @@ builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]
 (builtins.removeAttrs { a = 1 / 0; b = 2; } [ "b" ]) ? a
 (builtins.intersectAttrs { a = 1; } { a = 2; b = 3; }).a
 (builtins.intersectAttrs { a = 1; } { a = 1 / 0; b = 2; }) ? a
+builtins.elem 2 [ 1 2 3 ]
+builtins.elem 4 [ 1 2 3 ]
+builtins.elem 1 [ 1 (1 / 0) ]

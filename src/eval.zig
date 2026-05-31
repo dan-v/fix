@@ -518,6 +518,20 @@ test "evaluate removeAttrs and intersectAttrs builtins" {
     try std.testing.expectEqualStrings("true", intersect_lazy);
 }
 
+test "evaluate elem builtin" {
+    const present = try renderForTest("builtins.elem 2 [ 1 2 3 ]");
+    defer std.testing.allocator.free(present);
+    try std.testing.expectEqualStrings("true", present);
+
+    const missing = try renderForTest("builtins.elem 4 [ 1 2 3 ]");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectEqualStrings("false", missing);
+
+    const short_circuit = try renderForTest("builtins.elem 1 [ 1 (1 / 0) ]");
+    defer std.testing.allocator.free(short_circuit);
+    try std.testing.expectEqualStrings("true", short_circuit);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
