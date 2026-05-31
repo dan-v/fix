@@ -8,18 +8,15 @@
 //! before, we return the cached result immediately.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const types = @import("types.zig");
 const InternTable = @import("intern.zig").InternTable;
 const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
 const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
-const Chunk = @import("chunk.zig").Chunk;
 const MemoCache = @import("cache.zig").MemoCache;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
-const Thunk = @import("thunk.zig").Thunk;
+const ObjectHeap = @import("heap.zig").ObjectHeap;
 const Value = @import("value.zig").Value;
-const ChunkId = types.ChunkId;
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +24,7 @@ pub const Evaluator = struct {
     registry: ChunkRegistry,
     cache: MemoCache,
     scheduler: Scheduler,
+    heap: ObjectHeap,
     runtime_arena: std.heap.ArenaAllocator,
     worker_count: u8,
 
@@ -40,12 +38,14 @@ pub const Evaluator = struct {
             .registry = try ChunkRegistry.init(allocator),
             .cache = cache,
             .scheduler = scheduler,
+            .heap = ObjectHeap.init(allocator),
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .worker_count = worker_count,
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
+        self.heap.deinit();
         self.runtime_arena.deinit();
         self.scheduler.deinit();
         self.registry.deinit();
@@ -97,6 +97,7 @@ pub const Evaluator = struct {
             &self.registry,
             &self.intern,
             &self.cache,
+            &self.heap,
             &self.scheduler,
             0,
         );

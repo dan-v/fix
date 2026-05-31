@@ -6,7 +6,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const InternId = types.InternId;
-const ChunkId = types.ChunkId;
+const ObjectId = types.ObjectId;
 
 pub const ValueType = enum(u8) {
     null = 0,
@@ -16,12 +16,12 @@ pub const ValueType = enum(u8) {
     float = 4,
     string = 5, // payload is InternId
     path = 6, // payload is InternId
-    list = 7, // payload is *ListHeader
-    attrs = 8, // payload is *AttrsHeader
-    closure = 9, // payload is *Closure (closure.zig)
+    list = 7, // payload is ObjectId
+    attrs = 8, // payload is ObjectId
+    closure = 9, // payload is ObjectId
     builtin = 10, // payload is *Builtin (builtins.zig)
-    thunk = 11, // payload is *Thunk (thunk.zig)
-    cell = 12, // payload is *Cell (thunk.zig)
+    thunk = 11, // payload is ObjectId
+    cell = 12, // payload is ObjectId
     // reserved 13..255 for future extensions
 };
 
@@ -72,24 +72,24 @@ pub const Value = extern struct {
         };
     }
 
-    pub fn list(ptr: *anyopaque) Value {
+    pub fn list(id: ObjectId) Value {
         return .{
             .discriminant = .list,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
-    pub fn attrs(ptr: *anyopaque) Value {
+    pub fn attrs(id: ObjectId) Value {
         return .{
             .discriminant = .attrs,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
-    pub fn closure(ptr: *anyopaque) Value {
+    pub fn closure(id: ObjectId) Value {
         return .{
             .discriminant = .closure,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
@@ -100,17 +100,17 @@ pub const Value = extern struct {
         };
     }
 
-    pub fn thunkPtr(ptr: *anyopaque) Value {
+    pub fn thunk(id: ObjectId) Value {
         return .{
             .discriminant = .thunk,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
-    pub fn cell(ptr: *anyopaque) Value {
+    pub fn cell(id: ObjectId) Value {
         return .{
             .discriminant = .cell,
-            .payload = @intFromPtr(ptr),
+            .payload = id,
         };
     }
 
@@ -127,6 +127,10 @@ pub const Value = extern struct {
     }
 
     pub fn asInternId(self: Value) InternId {
+        return @intCast(self.payload);
+    }
+
+    pub fn asObjectId(self: Value) ObjectId {
         return @intCast(self.payload);
     }
 
@@ -164,16 +168,7 @@ pub const Value = extern struct {
             .int => self.asInt() == other.asInt(),
             .float => self.asFloat() == other.asFloat(),
             .string, .path => self.asInternId() == other.asInternId(),
-            .list => self.asPtr(u8) == other.asPtr(u8),
-            .attrs => self.asPtr(u8) == other.asPtr(u8),
-            .closure => false,
-            .builtin => self.asPtr(u8) == other.asPtr(u8),
-            .thunk => {
-                const t1: *const @import("thunk.zig").Thunk = @ptrCast(@alignCast(self.asPtr(u8)));
-                const t2: *const @import("thunk.zig").Thunk = @ptrCast(@alignCast(other.asPtr(u8)));
-                return t1.eq(t2);
-            },
-            .cell => self.asPtr(u8) == other.asPtr(u8),
+            .list, .attrs, .closure, .builtin, .thunk, .cell => self.payload == other.payload,
         };
     }
 
@@ -185,12 +180,9 @@ pub const Value = extern struct {
             .int => @bitCast(self.asInt()),
             .float => @bitCast(self.asFloat()),
             .string, .path => @as(u64, self.asInternId()) *% 31,
-            .list => @intFromPtr(self.asPtr(u8)) *% 31,
-            .attrs => @intFromPtr(self.asPtr(u8)) *% 31,
-            .closure => @intFromPtr(self.asPtr(u8)),
-            .builtin => @intFromPtr(self.asPtr(u8)),
-            .thunk => @intFromPtr(self.asPtr(u8)),
-            .cell => @intFromPtr(self.asPtr(u8)),
+            .list => self.payload *% 31,
+            .attrs => self.payload *% 31,
+            .closure, .builtin, .thunk, .cell => self.payload,
         };
     }
 

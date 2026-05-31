@@ -12,20 +12,23 @@
 //!   - Atomic thunk integration for lazy evaluation
 
 const std = @import("std");
-const builtin = @import("builtin");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
+const ObjectId = types.ObjectId;
 const OpCode = @import("opcode.zig").OpCode;
 const chunk = @import("chunk.zig");
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const MemoCache = @import("cache.zig").MemoCache;
 const Thunk = @import("thunk.zig").Thunk;
-const Cell = @import("thunk.zig").Cell;
 const InternTable = @import("intern.zig").InternTable;
 const Scheduler = @import("scheduler.zig").Scheduler;
+const heap_mod = @import("heap.zig");
+const ObjectHeap = heap_mod.ObjectHeap;
+const AttrEntry = heap_mod.AttrEntry;
+const Closure = heap_mod.Closure;
 
 /// A single call frame.
 pub const Frame = struct {
@@ -38,7 +41,7 @@ pub const Frame = struct {
     /// Number of locals in this frame (for cleanup).
     local_count: u32,
     /// Closure currently executing, used for captured upvalue loads.
-    closure_ptr: ?*u8,
+    closure_id: ?ObjectId,
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
@@ -50,6 +53,8 @@ pub const VM = struct {
     intern: *InternTable,
     /// Global memoization cache (shared).
     cache: *MemoCache,
+    /// Runtime object heap.
+    heap: *ObjectHeap,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
     /// This VM's worker index.
@@ -67,6 +72,7 @@ pub const VM = struct {
         registry: *const ChunkRegistry,
         intern: *InternTable,
         cache: *MemoCache,
+        heap: *ObjectHeap,
         scheduler: *Scheduler,
         worker_id: u8,
     ) !VM {
@@ -75,6 +81,7 @@ pub const VM = struct {
             .registry = registry,
             .intern = intern,
             .cache = cache,
+            .heap = heap,
             .scheduler = scheduler,
             .worker_id = worker_id,
             .stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP),
@@ -101,13 +108,13 @@ pub const VM = struct {
 
     // ---- frame management ----
 
-    fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_ptr: ?*u8) !void {
+    fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_id: ?ObjectId) !void {
         try self.frames.append(self.allocator, .{
             .chunk_ptr = ch,
             .ip = 0,
             .frame_base = self.sp - local_count,
             .local_count = local_count,
-            .closure_ptr = closure_ptr,
+            .closure_id = closure_id,
         });
     }
 
@@ -195,9 +202,9 @@ pub const VM = struct {
                 .capture_upvalue => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
-                    const closure_ptr = frame.closure_ptr orelse return error.MissingClosure;
-                    const upvalues = closureUpvalues(closure_ptr);
-                    try self.push(upvalues[slot]);
+                    const closure_id = frame.closure_id orelse return error.MissingClosure;
+                    const closure = try self.getClosureById(closure_id);
+                    try self.push(closure.upvalues[slot]);
                 },
 
                 .set_local => {
@@ -213,16 +220,19 @@ pub const VM = struct {
                     const val = self.pop();
                     const cell_val = self.stack.items[frame.frame_base + slot];
                     if (cell_val.discriminant != .cell) return error.TypeError;
-                    const cell = cell_val.asPtr(Cell);
-                    cell.value = val;
+                    const object = self.heap.get(cell_val.asObjectId());
+                    switch (object.*) {
+                        .cell => |*cell| cell.value = val,
+                        else => return error.TypeError,
+                    }
                 },
 
                 .get_upvalue => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
-                    const closure_ptr = frame.closure_ptr orelse return error.MissingClosure;
-                    const upvalues = closureUpvalues(closure_ptr);
-                    const val = try self.forceValue(upvalues[slot]);
+                    const closure_id = frame.closure_id orelse return error.MissingClosure;
+                    const closure = try self.getClosureById(closure_id);
+                    const val = try self.forceValue(closure.upvalues[slot]);
                     try self.push(val);
                 },
 
@@ -434,7 +444,7 @@ pub const VM = struct {
                     const name_id: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
                     const attrs_val = self.pop();
-                    const result = try getAttrValue(attrs_val, @intCast(name_id));
+                    const result = try self.getAttrValue(attrs_val, @intCast(name_id));
                     try self.push(result);
                 },
                 .get_attr_or => {
@@ -442,7 +452,7 @@ pub const VM = struct {
                     frame.ip += 2;
                     const default_val = self.pop();
                     const attrs_val = self.pop();
-                    const result = getAttrOrValue(attrs_val, @intCast(name_id), default_val);
+                    const result = self.getAttrOrValue(attrs_val, @intCast(name_id), default_val);
                     try self.push(result);
                 },
 
@@ -490,8 +500,7 @@ pub const VM = struct {
             .int => va.asInt() == vb.asInt(),
             .float => va.asFloat() == vb.asFloat(),
             .string, .path => va.asInternId() == vb.asInternId(),
-            .list => va.asPtr(u8) == vb.asPtr(u8),
-            .attrs => va.asPtr(u8) == vb.asPtr(u8),
+            .list, .attrs => va.asObjectId() == vb.asObjectId(),
             .closure, .builtin => false,
             .thunk, .cell => unreachable,
         };
@@ -537,9 +546,16 @@ pub const VM = struct {
         return switch (value.discriminant) {
             .thunk => try self.forceThunkFallible(value),
             .cell => {
-                const cell = value.asPtr(Cell);
-                const forced = try self.forceValue(cell.value);
-                cell.value = forced;
+                const cell_id = value.asObjectId();
+                const raw = switch (self.heap.getConst(cell_id).*) {
+                    .cell => |cell| cell.value,
+                    else => return error.TypeError,
+                };
+                const forced = try self.forceValue(raw);
+                switch (self.heap.get(cell_id).*) {
+                    .cell => |*cell| cell.value = forced,
+                    else => return error.TypeError,
+                }
                 return forced;
             },
             else => value,
@@ -547,91 +563,73 @@ pub const VM = struct {
     }
 
     fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
-        const t: *Thunk = thunk_val.asPtr(Thunk);
-        switch (t.tryClaim()) {
-            .already_resolved => return t.result,
-            .claimed => {
-                const result = try self.evalThunkClosure(t.closure);
-                t.resolve(result);
-                return result;
+        const thunk_id = thunk_val.asObjectId();
+        var closure: Value = undefined;
+        switch (self.heap.get(thunk_id).*) {
+            .thunk => |*t| switch (t.tryClaim()) {
+                .already_resolved => return t.result,
+                .claimed => closure = t.closure,
+                .busy => return error.RecursiveThunk,
             },
-            .busy => {
-                return error.RecursiveThunk;
-            },
+            else => return error.TypeError,
         }
+
+        const result = try self.evalThunkClosure(closure);
+        switch (self.heap.get(thunk_id).*) {
+            .thunk => |*t| t.resolve(result),
+            else => return error.TypeError,
+        }
+        return result;
     }
 
-    fn evalThunkClosure(self: *VM, closure: Value) anyerror!Value {
-        if (closure.discriminant != .closure) return error.NotCallable;
-        const id_ptr: *ChunkId = @ptrCast(@alignCast(closure.asPtr(u8)));
-        const ch = self.registry.get(id_ptr.*) orelse return error.InvalidChunk;
+    fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
+        if (closure_val.discriminant != .closure) return error.NotCallable;
+        const closure_id = closure_val.asObjectId();
+        const closure = try self.getClosureById(closure_id);
+        const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         const stop_depth = self.frames.items.len;
-        try self.pushFrame(ch, 0, closure.asPtr(u8));
+        try self.pushFrame(ch, 0, closure_id);
         return self.runUntil(stop_depth);
     }
 
     fn makeThunk(self: *VM, closure: Value) !Value {
-        const thunk = try self.allocator.create(Thunk);
-        thunk.* = Thunk.init(closure);
-        return Value.thunkPtr(thunk);
+        const id = try self.heap.addThunk(Thunk.init(closure));
+        return Value.thunk(id);
     }
 
     fn makeCell(self: *VM, val: Value) !Value {
-        const cell = try self.allocator.create(Cell);
-        cell.* = .{ .value = val };
-        return Value.cell(cell);
+        const id = try self.heap.addCell(.{ .value = val });
+        return Value.cell(id);
     }
 
     // ---- data structure builders ----
 
     fn buildAttrs(self: *VM, count: u16) !void {
-        const Attrs = extern struct {
-            count: u16,
-        };
-        const AttrEntry = extern struct {
-            name: InternId,
-            value: Value,
-        };
-
-        const total = count;
-        const entries_offset = std.mem.alignForward(usize, @sizeOf(Attrs), @alignOf(AttrEntry));
-        const size = entries_offset + total * @sizeOf(AttrEntry);
-        const ptr = self.allocator.alignedAlloc(u8, .fromByteUnits(@max(@alignOf(Attrs), @alignOf(AttrEntry))), size) catch return error.OutOfMemory;
-        const attrs: *Attrs = @ptrCast(@alignCast(ptr));
-        attrs.count = total;
-
-        const entries: [*]AttrEntry = @ptrCast(@alignCast(ptr.ptr + entries_offset));
+        const entries = try self.heap.allocator.alloc(AttrEntry, count);
         var i: u16 = 0;
-        while (i < total) : (i += 1) {
+        while (i < count) : (i += 1) {
             const val = self.pop();
             const name_val = self.pop();
-            entries[total - 1 - i] = .{
+            entries[count - 1 - i] = .{
                 .name = name_val.asInternId(),
                 .value = val,
             };
         }
 
-        try self.push(Value.attrs(ptr.ptr));
+        const id = try self.heap.addAttrs(entries);
+        try self.push(Value.attrs(id));
     }
 
     fn buildList(self: *VM, count: u16) !void {
-        const List = extern struct {
-            count: u32,
-        };
-        const items_offset = std.mem.alignForward(usize, @sizeOf(List), @alignOf(Value));
-        const size = items_offset + @as(usize, count) * @sizeOf(Value);
-        const ptr = self.allocator.alignedAlloc(u8, .fromByteUnits(@max(@alignOf(List), @alignOf(Value))), size) catch return error.OutOfMemory;
-        const list: *List = @ptrCast(@alignCast(ptr));
-        list.count = count;
-
-        const items: [*]Value = @ptrCast(@alignCast(ptr.ptr + items_offset));
+        const items = try self.heap.allocator.alloc(Value, count);
         var i: u16 = count;
         while (i > 0) {
             i -= 1;
             items[i] = self.pop();
         }
 
-        try self.push(Value.list(ptr.ptr));
+        const id = try self.heap.addList(items);
+        try self.push(Value.list(id));
     }
 
     fn concatStrings(self: *VM, a: Value, b: Value) !Value {
@@ -651,32 +649,34 @@ pub const VM = struct {
 
     // ---- closures ----
 
+    fn getClosureById(self: *VM, closure_id: ObjectId) !Closure {
+        return switch (self.heap.getConst(closure_id).*) {
+            .closure => |closure| closure,
+            else => error.TypeError,
+        };
+    }
+
     fn makeClosure(self: *VM, chunk_id: u16, upvalue_count: u8) !void {
-        const upvalues_offset = std.mem.alignForward(usize, @sizeOf(ChunkId), @alignOf(Value));
-        const closure_size = upvalues_offset + @as(usize, upvalue_count) * @sizeOf(Value);
-        const ptr = self.allocator.alignedAlloc(u8, .fromByteUnits(@max(@alignOf(ChunkId), @alignOf(Value))), closure_size) catch return error.OutOfMemory;
-
-        const chunk_id_ptr: *ChunkId = @ptrCast(@alignCast(ptr));
-        chunk_id_ptr.* = chunk_id;
-
-        const upvalues_ptr: [*]Value = @ptrCast(@alignCast(ptr.ptr + upvalues_offset));
+        const upvalues = try self.heap.allocator.alloc(Value, upvalue_count);
         var i: u8 = upvalue_count;
         while (i > 0) {
             i -= 1;
-            upvalues_ptr[i] = self.pop();
+            upvalues[i] = self.pop();
         }
 
-        try self.push(Value.closure(ptr.ptr));
+        const id = try self.heap.addClosure(chunk_id, upvalues);
+        try self.push(Value.closure(id));
     }
 
     // ---- calls ----
 
     fn doCall(self: *VM, callee: Value, arg: Value) !void {
         if (callee.discriminant == .closure) {
-            const id_ptr: *ChunkId = @ptrCast(@alignCast(callee.asPtr(u8)));
-            const ch = self.registry.get(id_ptr.*) orelse return error.InvalidChunk;
+            const closure_id = callee.asObjectId();
+            const closure = try self.getClosureById(closure_id);
+            const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             try self.push(arg); // arg is first local
-            try self.pushFrame(ch, 1, callee.asPtr(u8));
+            try self.pushFrame(ch, 1, closure_id);
         } else if (callee.discriminant == .builtin) {
             try self.push(arg);
             try self.push(callee);
@@ -688,13 +688,14 @@ pub const VM = struct {
 
     fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
         if (callee.discriminant == .closure) {
-            const id_ptr: *ChunkId = @ptrCast(@alignCast(callee.asPtr(u8)));
-            const ch = self.registry.get(id_ptr.*) orelse return error.InvalidChunk;
+            const closure_id = callee.asObjectId();
+            const closure = try self.getClosureById(closure_id);
+            const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
 
             var frame = self.currentFrame();
             frame.chunk_ptr = ch;
             frame.ip = 0;
-            frame.closure_ptr = callee.asPtr(u8);
+            frame.closure_id = closure_id;
             self.sp = frame.frame_base;
             try self.push(arg);
             frame.local_count = 1;
@@ -703,6 +704,25 @@ pub const VM = struct {
             try self.push(arg);
             try self.doCall(self.stack.items[self.sp - 2], self.stack.items[self.sp - 1]);
         }
+    }
+
+    fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
+        if (attrs_val.discriminant != .attrs) return error.TypeError;
+        const entries = switch (self.heap.getConst(attrs_val.asObjectId()).*) {
+            .attrs => |entries| entries,
+            else => return error.TypeError,
+        };
+
+        for (entries) |entry| {
+            if (entry.name == name_id) {
+                return entry.value;
+            }
+        }
+        return error.MissingAttribute;
+    }
+
+    fn getAttrOrValue(self: *VM, attrs_val: Value, name_id: InternId, default_val: Value) Value {
+        return self.getAttrValue(attrs_val, name_id) catch default_val;
     }
 };
 
@@ -718,31 +738,4 @@ fn coerceToFloat(val: Value) f64 {
         .float => val.asFloat(),
         else => 0.0,
     };
-}
-
-fn getAttrValue(attrs_val: Value, name_id: InternId) !Value {
-    if (attrs_val.discriminant != .attrs) return error.TypeError;
-    const Attrs = extern struct { count: u16 };
-    const AttrEntry = extern struct { name: InternId, value: Value };
-
-    const attrs: *Attrs = @ptrCast(@alignCast(attrs_val.asPtr(u8)));
-    const entries_offset = std.mem.alignForward(usize, @sizeOf(Attrs), @alignOf(AttrEntry));
-    const entries: [*]AttrEntry = @ptrCast(@alignCast(@as([*]u8, @ptrCast(attrs)) + entries_offset));
-
-    var i: u16 = 0;
-    while (i < attrs.count) : (i += 1) {
-        if (entries[i].name == name_id) {
-            return entries[i].value;
-        }
-    }
-    return error.MissingAttribute;
-}
-
-fn getAttrOrValue(attrs_val: Value, name_id: InternId, default_val: Value) Value {
-    return getAttrValue(attrs_val, name_id) catch default_val;
-}
-
-fn closureUpvalues(ptr: *u8) [*]Value {
-    const upvalues_offset = std.mem.alignForward(usize, @sizeOf(ChunkId), @alignOf(Value));
-    return @ptrCast(@alignCast(@as([*]u8, @ptrCast(ptr)) + upvalues_offset));
 }
