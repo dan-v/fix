@@ -14,6 +14,9 @@ const ObjectHeap = @import("heap.zig").ObjectHeap;
 const Value = @import("value.zig").Value;
 const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
+const parser_mod = @import("parser.zig");
+
+pub const Diagnostic = parser_mod.Diagnostic;
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -24,6 +27,7 @@ pub const Evaluator = struct {
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
     worker_count: u8,
+    diagnostics: std.ArrayListUnmanaged(Diagnostic),
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
         const scheduler = try Scheduler.init(allocator, worker_count);
@@ -37,10 +41,12 @@ pub const Evaluator = struct {
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
             .worker_count = worker_count,
+            .diagnostics = .empty,
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
+        self.diagnostics.deinit(self.allocator);
         self.heap.deinit();
         self.runtime_arena.deinit();
         self.scheduler.deinit();
@@ -48,15 +54,34 @@ pub const Evaluator = struct {
         self.intern.deinit();
     }
 
+    pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
+        return self.diagnostics.items;
+    }
+
+    fn clearDiagnostics(self: *Evaluator) void {
+        self.diagnostics.clearRetainingCapacity();
+    }
+
+    fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic) !void {
+        self.clearDiagnostics();
+        try self.diagnostics.appendSlice(self.allocator, diagnostics);
+    }
+
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+        self.clearDiagnostics();
+
         // 1. Parse into AST.
         var arena = @import("ast.zig").AstArena.init(self.allocator);
         defer arena.deinit();
 
-        var parser = @import("parser.zig").Parser.init(self.allocator, &arena, source);
-        const ast_node = parser.parse() catch return error.ParseError;
+        var parser = parser_mod.Parser.init(self.allocator, &arena, source);
+        defer parser.deinit();
+        const ast_node = parser.parse() catch {
+            try self.copyDiagnostics(parser.diagnostics.items);
+            return error.ParseError;
+        };
 
         // 2. Compile AST to bytecode.
         var builder = try ChunkBuilder.init(self.allocator);
@@ -299,4 +324,17 @@ test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
+}
+
+test "evaluate exposes parse diagnostics without printing" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.ParseError, ev.evaluate("@ @ 1"));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
+    try std.testing.expectEqualStrings("Invalid token.", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 0), diagnostics[0].offset);
+    try std.testing.expectEqualStrings("Invalid token.", diagnostics[1].message);
+    try std.testing.expectEqual(@as(u32, 2), diagnostics[1].offset);
 }

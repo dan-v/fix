@@ -42,7 +42,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (source.owned) allocator.free(source.text);
 
     const result = ev.evaluate(source.text) catch |err| {
-        std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
+        if (err == error.ParseError and ev.getDiagnostics().len > 0) {
+            printDiagnostics(source.text, ev.getDiagnostics());
+        } else {
+            std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
+        }
         std.process.exit(1);
     };
 
@@ -75,4 +79,18 @@ fn getSource(
         };
     }
     return .{ .text = first_arg, .owned = false };
+}
+
+fn printDiagnostics(source: []const u8, diagnostics: []const eval.Diagnostic) void {
+    for (diagnostics) |diagnostic| {
+        std.debug.print("[line {d}] parse error", .{diagnostic.line});
+        if (diagnostic.token_type != .eof) {
+            const start: usize = @intCast(diagnostic.offset);
+            const len: usize = @intCast(diagnostic.len);
+            if (start <= source.len and len <= source.len - start) {
+                std.debug.print(" at '{s}'", .{source[start .. start + len]});
+            }
+        }
+        std.debug.print(": {s}\n", .{diagnostic.message});
+    }
 }

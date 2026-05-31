@@ -202,6 +202,7 @@ pub const Compiler = struct {
         defer arena.deinit();
 
         var parser = @import("parser.zig").Parser.init(self.allocator, &arena, expr_source);
+        defer parser.deinit();
         const expr = try parser.parse();
         offsetNode(expr, source_offset);
         try self.compileNode(expr);

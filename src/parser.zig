@@ -38,6 +38,14 @@ const Rule = struct {
     prec: Precedence,
 };
 
+pub const Diagnostic = struct {
+    line: u32,
+    offset: u32,
+    len: u32,
+    token_type: TokenType,
+    message: []const u8,
+};
+
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     arena: *ast.AstArena,
@@ -46,6 +54,7 @@ pub const Parser = struct {
     current: Token,
     previous: Token,
     had_error: bool,
+    diagnostics: std.ArrayListUnmanaged(Diagnostic),
 
     pub fn init(allocator: std.mem.Allocator, arena: *ast.AstArena, source: []const u8) Parser {
         return .{
@@ -56,7 +65,12 @@ pub const Parser = struct {
             .current = undefined,
             .previous = undefined,
             .had_error = false,
+            .diagnostics = .empty,
         };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        self.diagnostics.deinit(self.allocator);
     }
 
     pub fn parse(self: *Parser) !*Node {
@@ -65,6 +79,7 @@ pub const Parser = struct {
         if (!self.check(.eof)) {
             self.reportError("Unexpected token after expression.");
         }
+        if (self.had_error) return error.ParseError;
         return node;
     }
 
@@ -105,9 +120,15 @@ pub const Parser = struct {
     }
 
     fn reportError(self: *Parser, msg: []const u8) void {
-        _ = msg;
-        if (self.had_error) return;
         self.had_error = true;
+        const tok = self.current;
+        self.diagnostics.append(self.allocator, .{
+            .line = tok.line,
+            .offset = tok.offset,
+            .len = tok.len,
+            .token_type = tok.type,
+            .message = msg,
+        }) catch {};
     }
 
     fn span(self: *const Parser, tok: Token) []const u8 {
@@ -726,4 +747,19 @@ test "parser recognizes attr path or default" {
     try std.testing.expectEqual(NodeTag.attr_or, node.tag);
     try std.testing.expectEqual(NodeTag.attr_path, node.data.attr_or.attr_path.tag);
     try std.testing.expectEqual(NodeTag.integer, node.data.attr_or.default.tag);
+}
+
+test "parser records diagnostics without printing" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "@ @ 1");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 2), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings("Invalid token.", parser.diagnostics.items[0].message);
+    try std.testing.expectEqual(@as(u32, 0), parser.diagnostics.items[0].offset);
+    try std.testing.expectEqualStrings("Invalid token.", parser.diagnostics.items[1].message);
+    try std.testing.expectEqual(@as(u32, 2), parser.diagnostics.items[1].offset);
 }
