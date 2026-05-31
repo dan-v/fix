@@ -35,6 +35,14 @@ test "end-to-end: simple arithmetic" {
 
     const result = try ev.evaluate("10 + 32");
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
+
+    const spaced_sub = try ev.evaluate("let n = 0; in n - 1");
+    try std.testing.expectEqual(@as(i64, -1), spaced_sub.asInt());
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("let f = x: x; in f -1"));
+
+    const recursive_sub = try ev.evaluate("let f = n: if n == -1 then true else f (n - 1); in f 0");
+    try std.testing.expect(recursive_sub.asBool());
 }
 
 test "end-to-end: float arithmetic" {

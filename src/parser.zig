@@ -237,7 +237,6 @@ pub const Parser = struct {
             .kw_let,
             .kw_rec,
             .bang,
-            .minus,
             => true,
             else => false,
         };
