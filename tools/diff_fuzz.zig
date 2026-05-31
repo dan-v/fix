@@ -290,7 +290,10 @@ fn classify(
     config: *const Config,
     expr: []const u8,
 ) !Classification {
-    const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--expr", expr });
+    const nix_expr = try std.mem.concat(allocator, u8, &.{ "(", expr, ")" });
+    defer allocator.free(nix_expr);
+
+    const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--expr", nix_expr });
     errdefer nix.deinit(allocator);
 
     const fix = try runCommand(allocator, io, &.{ config.fix_bin, expr });
