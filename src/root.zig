@@ -128,6 +128,15 @@ test "end-to-end: attribute access" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: duplicate attributes are rejected" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
+}
+
 test "end-to-end: quoted attribute access" {
     const alloc = std.testing.allocator;
 

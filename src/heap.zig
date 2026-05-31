@@ -165,6 +165,8 @@ pub const ObjectHeap = struct {
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrs(entries);
         self.sortAttrs(range);
+        errdefer self.attrs.shrinkRetainingCapacity(range.start);
+        try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
     }
 
@@ -186,6 +188,8 @@ pub const ObjectHeap = struct {
             .len = @intCast(pairs.len / 2),
         };
         self.sortAttrs(range);
+        errdefer self.attrs.shrinkRetainingCapacity(start);
+        try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
     }
 
@@ -243,6 +247,17 @@ pub const ObjectHeap = struct {
 
     fn sortAttrs(self: *ObjectHeap, range: AttrRange) void {
         std.mem.sort(AttrEntry, self.attrSliceMut(range), {}, attrEntryLessThan);
+    }
+
+    fn rejectDuplicateAttrs(self: *const ObjectHeap, range: AttrRange) !void {
+        const entries = self.attrSlice(range);
+        if (entries.len < 2) return;
+
+        for (entries[1..], 1..) |entry, i| {
+            if (entry.name == entries[i - 1].name) {
+                return error.DuplicateAttribute;
+            }
+        }
     }
 
     fn ensureObjectPage(self: *ObjectHeap, id: ObjectId) !void {
@@ -317,6 +332,25 @@ test "object heap sorts attrs for binary lookup" {
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
     try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 20)).asInt());
     try std.testing.expectEqual(@as(i64, 3), (try heap.getAttrValue(attrs_id, 30)).asInt());
+}
+
+test "object heap rejects duplicate attrs and rolls back side entries" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    try std.testing.expectError(error.DuplicateAttribute, heap.addAttrs(&.{
+        .{ .name = 10, .value = Value.int(1) },
+        .{ .name = 20, .value = Value.int(2) },
+        .{ .name = 10, .value = Value.int(3) },
+    }));
+
+    try std.testing.expectEqual(@as(usize, 0), heap.attrs.items.len);
+
+    const attrs_id = try heap.addAttrs(&.{
+        .{ .name = 10, .value = Value.int(1) },
+        .{ .name = 20, .value = Value.int(2) },
+    });
+    try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
 }
 
 test "object heap preserves earlier ranges as side arenas grow" {
