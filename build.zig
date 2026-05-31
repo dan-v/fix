@@ -89,6 +89,23 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    const diff_fuzz_exe = b.addExecutable(.{
+        .name = "diff-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/diff_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const diff_fuzz_step = b.step("diff-fuzz", "Run differential fuzzing against nix-instantiate");
+    const diff_fuzz_cmd = b.addRunArtifact(diff_fuzz_exe);
+    diff_fuzz_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        diff_fuzz_cmd.addArgs(args);
+    }
+    diff_fuzz_step.dependOn(&diff_fuzz_cmd.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
