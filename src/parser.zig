@@ -550,3 +550,46 @@ test "parser recognizes identifier lambda" {
     }));
     try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda.body.tag);
 }
+
+test "parser recognizes nested attr declarations" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ a.b = 1; a.\"c\" = 2; }");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    const entries = node.data.attr_set.entries;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(usize, 2), entries[0].path.len);
+    try std.testing.expectEqualStrings("a", parser.span(.{
+        .type = .identifier,
+        .offset = entries[0].path[0].offset,
+        .len = entries[0].path[0].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqualStrings("b", parser.span(.{
+        .type = .identifier,
+        .offset = entries[0].path[1].offset,
+        .len = entries[0].path[1].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqualStrings("\"c\"", parser.span(.{
+        .type = .string,
+        .offset = entries[1].path[1].offset,
+        .len = entries[1].path[1].len,
+        .line = 1,
+    }));
+}
+
+test "parser recognizes attr path or default" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "a.b or 2");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_or, node.tag);
+    try std.testing.expectEqual(NodeTag.attr_path, node.data.attr_or.attr_path.tag);
+    try std.testing.expectEqual(NodeTag.integer, node.data.attr_or.default.tag);
+}
