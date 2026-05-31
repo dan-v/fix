@@ -393,11 +393,33 @@ test "evaluate simple attrset function parameters" {
     try std.testing.expectEqualStrings("1", lazy);
 }
 
+test "evaluate attrset function defaults ellipsis and binding" {
+    const defaulted = try renderForTest("({ x ? 2 }: x) { }");
+    defer std.testing.allocator.free(defaulted);
+    try std.testing.expectEqualStrings("2", defaulted);
+
+    const extra = try renderForTest("({ x, ... }: x) { x = 1; y = 2; }");
+    defer std.testing.allocator.free(extra);
+    try std.testing.expectEqualStrings("1", extra);
+
+    const bound_before = try renderForTest("(args@{ x }: args.x) { x = 3; }");
+    defer std.testing.allocator.free(bound_before);
+    try std.testing.expectEqualStrings("3", bound_before);
+
+    const bound_after = try renderForTest("({ x }@args: args.x) { x = 4; }");
+    defer std.testing.allocator.free(bound_after);
+    try std.testing.expectEqualStrings("4", bound_after);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.ParseError, ev.evaluate("@ @ 1"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("$ $ 1"));
     const diagnostics = ev.getDiagnostics();
     try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
     try std.testing.expectEqualStrings("Invalid token.", diagnostics[0].message);

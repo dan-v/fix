@@ -46,7 +46,11 @@ pub const Scanner = struct {
             ']' => return self.makeToken(.right_bracket, start, 1),
             ',' => return self.makeToken(.comma, start, 1),
             ':' => return self.makeToken(.colon, start, 1),
-            '.' => return self.makeToken(.dot, start, 1),
+            '.' => {
+                if (self.match('.') and self.match('.')) return self.makeToken(.ellipsis, start, 3);
+                return self.makeToken(.dot, start, 1);
+            },
+            '@' => return self.makeToken(.at, start, 1),
             ';' => return self.makeToken(.semicolon, start, 1),
             '?' => return self.makeToken(.question_mark, start, 1),
             '+' => {

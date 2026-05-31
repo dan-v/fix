@@ -12,6 +12,7 @@ pub const TokenType = enum(u8) {
     comma,
     colon,
     dot,
+    at,
     minus,
     plus,
     semicolon,
@@ -32,6 +33,7 @@ pub const TokenType = enum(u8) {
     pipe_pipe, // ||
     double_plus, // ++
     double_slash, // // (update operator)
+    ellipsis, // ...
     arrow, // ->
 
     // ---- literals ----

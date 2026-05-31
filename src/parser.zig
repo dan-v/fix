@@ -311,6 +311,13 @@ pub const Parser = struct {
 
     fn variable(self: *Parser) !*Node {
         const name_tok = self.previous;
+        if (self.match(.at)) {
+            _ = try self.expect(.left_brace, "Expected '{' after function argument binding.");
+            return self.attrLambdaPattern(.{
+                .offset = name_tok.offset,
+                .len = name_tok.len,
+            });
+        }
         if (self.match(.colon)) {
             const body = try self.expression();
             return self.arena.createNode(.lambda, .{ .lambda = .{
@@ -345,7 +352,7 @@ pub const Parser = struct {
 
     fn braceExpr(self: *Parser) !*Node {
         if (self.looksLikeAttrLambdaPattern()) {
-            return self.attrLambdaPattern();
+            return self.attrLambdaPattern(null);
         }
         return self.attrSetAfterLeftBrace(false);
     }
@@ -359,30 +366,53 @@ pub const Parser = struct {
         var probe = self.*;
         probe.diagnostics = .empty;
 
-        if (probe.match(.right_brace)) return probe.check(.colon);
-
-        while (true) {
-            if (!probe.matchAttrPatternName()) return false;
-            if (probe.match(.right_brace)) return probe.check(.colon);
-            if (!probe.match(.comma)) return false;
-            if (probe.check(.right_brace)) return false;
+        var depth: usize = 1;
+        while (!probe.check(.eof)) {
+            switch (probe.current.type) {
+                .left_brace, .left_bracket, .left_paren => depth += 1,
+                .right_brace, .right_bracket, .right_paren => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        probe.advance();
+                        return probe.check(.colon) or probe.check(.at);
+                    }
+                },
+                else => {},
+            }
+            probe.advance();
         }
+
+        return false;
     }
 
-    fn attrLambdaPattern(self: *Parser) !*Node {
+    fn attrLambdaPattern(self: *Parser, bind_before: ?Node.Atom) !*Node {
         const arena_allocator = self.arena.allocator();
-        var params: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        var params: std.ArrayListUnmanaged(Node.LambdaAttrParam) = .empty;
+        var allow_extra = false;
 
         if (!self.match(.right_brace)) {
             while (true) {
+                if (self.match(.ellipsis)) {
+                    allow_extra = true;
+                    _ = try self.expect(.right_brace, "Expected '}' after '...'.");
+                    break;
+                }
+
                 const name_tok = self.current;
                 if (!self.matchAttrPatternName()) {
                     self.reportError("Expected function argument name.");
                     return error.ParseError;
                 }
+                const default = if (self.match(.question_mark))
+                    try self.expression()
+                else
+                    null;
                 try params.append(arena_allocator, .{
-                    .offset = name_tok.offset,
-                    .len = name_tok.len,
+                    .name = .{
+                        .offset = name_tok.offset,
+                        .len = name_tok.len,
+                    },
+                    .default = default,
                 });
 
                 if (self.match(.right_brace)) break;
@@ -390,12 +420,27 @@ pub const Parser = struct {
             }
         }
 
+        const bind_name = bind_before orelse bind_after: {
+            if (!self.match(.at)) break :bind_after null;
+            const bind_tok = self.current;
+            if (!self.matchAttrPatternName()) {
+                self.reportError("Expected function argument binding name.");
+                return error.ParseError;
+            }
+            break :bind_after Node.Atom{
+                .offset = bind_tok.offset,
+                .len = bind_tok.len,
+            };
+        };
+
         _ = try self.expect(.colon, "Expected ':' after function argument set.");
         const body = try self.expression();
 
         return self.arena.createNode(.lambda_attrs, .{
             .lambda_attrs = .{
+                .bind_name = bind_name,
                 .params = try params.toOwnedSlice(arena_allocator),
+                .allow_extra = allow_extra,
                 .body = body,
             },
         });
@@ -851,6 +896,20 @@ test "parser recognizes attrset lambda" {
     try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda_attrs.body.tag);
 }
 
+test "parser recognizes attrset lambda defaults ellipsis and binding" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "args@{ x ? 1, ... }: args.x");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.lambda_attrs, node.tag);
+    try std.testing.expect(node.data.lambda_attrs.bind_name != null);
+    try std.testing.expect(node.data.lambda_attrs.allow_extra);
+    try std.testing.expectEqual(@as(usize, 1), node.data.lambda_attrs.params.len);
+    try std.testing.expect(node.data.lambda_attrs.params[0].default != null);
+}
+
 test "parser recognizes nested attr declarations" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
@@ -1059,7 +1118,7 @@ test "parser records diagnostics without printing" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
-    var parser = Parser.init(std.testing.allocator, &arena, "@ @ 1");
+    var parser = Parser.init(std.testing.allocator, &arena, "$ $ 1");
     defer parser.deinit();
 
     try std.testing.expectError(error.ParseError, parser.parse());

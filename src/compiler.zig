@@ -445,8 +445,25 @@ pub const Compiler = struct {
         defer child.deinit();
 
         const arg_slot = child.declareLocal("\x00args", try self.intern.intern("\x00args"));
+        if (lambda.bind_name) |bind_name| {
+            const name = self.source[bind_name.offset .. bind_name.offset + bind_name.len];
+            const name_id = try self.intern.intern(name);
+            const slot = child.declareLocal(name, name_id);
+            try child.emitOpByte(.capture_local, @intCast(arg_slot));
+            try child.emitOpByte(.set_local, @intCast(slot));
+        }
+
+        try child.emitOpByte(.get_local, @intCast(arg_slot));
+        try child.emitOp(.validate_attrs);
+        try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
+        try child.builder.writeU16(child.allocator, @intCast(lambda.params.len));
         for (lambda.params) |param| {
-            const name = self.source[param.offset .. param.offset + param.len];
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
+            try child.builder.writeU16(child.allocator, @intCast(try self.intern.intern(name)));
+        }
+
+        for (lambda.params) |param| {
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
             const name_id = try self.intern.intern(name);
             try child.emitOp(.push_null);
             try child.emitOp(.make_cell);
@@ -455,10 +472,10 @@ pub const Compiler = struct {
         }
 
         for (lambda.params) |param| {
-            const name = self.source[param.offset .. param.offset + param.len];
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
             const name_id = try self.intern.intern(name);
             const slot = child.resolveLocal(name) orelse return error.UndefinedVariable;
-            try child.compileAttrParamThunk(arg_slot, name_id);
+            try child.compileAttrParamThunk(arg_slot, name_id, param.default);
             try child.emitOpByte(.set_cell_local, @intCast(slot));
         }
 
@@ -476,7 +493,7 @@ pub const Compiler = struct {
         try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
     }
 
-    fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId) !void {
+    fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
         var child_builder = try ChunkBuilder.init(self.allocator);
         defer child_builder.deinit(self.allocator);
 
@@ -493,7 +510,14 @@ pub const Compiler = struct {
 
         _ = try child.addCapture("\x00args", .local, arg_slot);
         try child.emitOpByte(.get_upvalue, 0);
-        try child.emitOpU16(.get_attr, @intCast(name_id));
+        if (default) |default_expr| {
+            try child.compileThunk(default_expr);
+            try child.emitOp(.get_attr_path_or);
+            try child.builder.writeByte(child.allocator, 1);
+            try child.builder.writeU16(child.allocator, @intCast(name_id));
+        } else {
+            try child.emitOpU16(.get_attr, @intCast(name_id));
+        }
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
@@ -1115,8 +1139,12 @@ fn offsetNode(node: *Node, offset: u32) void {
             offsetNode(node.data.lambda.body, offset);
         },
         .lambda_attrs => {
+            if (node.data.lambda_attrs.bind_name) |*bind_name| {
+                bind_name.offset += offset;
+            }
             for (node.data.lambda_attrs.params) |*param| {
-                param.offset += offset;
+                param.name.offset += offset;
+                if (param.default) |default| offsetNode(default, offset);
             }
             offsetNode(node.data.lambda_attrs.body, offset);
         },

@@ -110,6 +110,10 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs].
     has_attr_path,
+    /// Validate an attrset function argument.
+    /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
+    /// Stack layout before: [attrs].
+    validate_attrs,
     /// Look up a variable name through active with-scopes.
     /// Operand: 2-byte InternId, 1-byte scope count.
     /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.

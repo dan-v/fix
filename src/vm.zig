@@ -457,6 +457,16 @@ pub const VM = struct {
                     const attrs_val = self.pop();
                     try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip])));
                 },
+                .validate_attrs => {
+                    const allow_extra = code[frame.ip] != 0;
+                    frame.ip += 1;
+                    const expected_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, expected_count) * 2;
+                    const attrs_val = self.pop();
+                    try self.validateAttrs(attrs_val, allow_extra, code[names_start..frame.ip]);
+                },
                 .lookup_with => {
                     const name_id: InternId = @intCast(readU16(code, frame.ip));
                     frame.ip += 2;
@@ -788,6 +798,26 @@ pub const VM = struct {
             current = try self.forceValue(attr);
         }
         return false;
+    }
+
+    fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8) !void {
+        const value = try self.forceValue(attrs_val);
+        if (value.discriminant != .attrs) return error.TypeError;
+        if (allow_extra) return;
+
+        const entries = try self.heap.getAttrs(value.asObjectId());
+        for (entries) |entry| {
+            var found = false;
+            var offset: usize = 0;
+            while (offset < encoded_names.len) : (offset += 2) {
+                const name_id: InternId = @intCast(readU16(encoded_names, offset));
+                if (entry.name == name_id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.UnexpectedAttribute;
+        }
     }
 
     fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {

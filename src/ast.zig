@@ -113,8 +113,15 @@ pub const Node = struct {
     };
 
     pub const LambdaAttrs = struct {
-        params: []Atom,
+        bind_name: ?Atom,
+        params: []LambdaAttrParam,
+        allow_extra: bool,
         body: *Node,
+    };
+
+    pub const LambdaAttrParam = struct {
+        name: Atom,
+        default: ?*Node,
     };
 
     pub const LetIn = struct {
