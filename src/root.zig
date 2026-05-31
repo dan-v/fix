@@ -532,8 +532,13 @@ test "end-to-end: attr path or defaults" {
     const lazy_default = try ev.evaluate("({ a.b = 1; }).a.b or (1 / 0)");
     try std.testing.expectEqual(@as(i64, 1), lazy_default.asInt());
 
+    const non_attr_mid = try ev.evaluate("({ a = 1; }).a.b or 2");
+    try std.testing.expectEqual(@as(i64, 2), non_attr_mid.asInt());
+
+    const non_attr_root = try ev.evaluate("(1).a or 2");
+    try std.testing.expectEqual(@as(i64, 2), non_attr_root.asInt());
+
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("({}).a.b or (1 / 0)"));
-    try std.testing.expectError(error.TypeError, ev.evaluate("1.a or 2"));
 }
 
 test "end-to-end: dynamic null attributes are omitted" {
