@@ -75,6 +75,9 @@ test "end-to-end: string interpolation" {
     var ev = try Evaluator.init(alloc, 0);
     defer ev.deinit();
 
+    const literal = try ev.evaluate("\"a${\"b\"}c\"");
+    try std.testing.expectEqualStrings("abc", ev.intern.get(literal.asInternId()));
+
     const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
     try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
 

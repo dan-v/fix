@@ -179,11 +179,27 @@ pub const Scanner = struct {
 
     fn lexString(self: *Scanner, start: u32) Token {
         // start points to the opening '"'
+        var interpolation_depth: u32 = 0;
         while (self.pos < self.source.len) {
             const c = self.source[self.pos];
-            if (c == '"') {
+            if (interpolation_depth == 0 and c == '"') {
                 self.pos += 1; // consume closing quote
                 return self.makeToken(.string, start, self.pos - start);
+            }
+            if (c == '$' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == '{') {
+                interpolation_depth += 1;
+                self.pos += 2;
+                continue;
+            }
+            if (interpolation_depth > 0 and c == '{') {
+                interpolation_depth += 1;
+                self.pos += 1;
+                continue;
+            }
+            if (interpolation_depth > 0 and c == '}') {
+                interpolation_depth -= 1;
+                self.pos += 1;
+                continue;
             }
             if (c == '\\') {
                 self.pos += 2; // skip escape (simplified)
