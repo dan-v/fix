@@ -532,6 +532,20 @@ test "evaluate elem builtin" {
     try std.testing.expectEqualStrings("true", short_circuit);
 }
 
+test "evaluate seq builtin" {
+    const value = try renderForTest("builtins.seq 1 2");
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("2", value);
+
+    const list_whnf = try renderForTest("builtins.seq [ (1 / 0) ] 2");
+    defer std.testing.allocator.free(list_whnf);
+    try std.testing.expectEqualStrings("2", list_whnf);
+
+    const unused = try renderForTest("let x = builtins.seq (1 / 0) 2; in 3");
+    defer std.testing.allocator.free(unused);
+    try std.testing.expectEqualStrings("3", unused);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

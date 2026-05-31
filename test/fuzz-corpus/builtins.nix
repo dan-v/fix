@@ -35,3 +35,6 @@ builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]
 builtins.elem 2 [ 1 2 3 ]
 builtins.elem 4 [ 1 2 3 ]
 builtins.elem 1 [ 1 (1 / 0) ]
+builtins.seq 1 2
+builtins.seq [ (1 / 0) ] 2
+let x = builtins.seq (1 / 0) 2; in 3

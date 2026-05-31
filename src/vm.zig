@@ -749,6 +749,7 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.removeAttrs),
             @intFromEnum(BuiltinId.intersectAttrs),
             @intFromEnum(BuiltinId.elem),
+            @intFromEnum(BuiltinId.seq),
             => self.makeBuiltinClosure(callee.asBuiltinId(), arg),
             else => error.InvalidBuiltin,
         };
@@ -770,6 +771,7 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.removeAttrs) => self.builtinRemoveAttrs(partial.arg, arg),
             @intFromEnum(BuiltinId.intersectAttrs) => self.builtinIntersectAttrs(partial.arg, arg),
             @intFromEnum(BuiltinId.elem) => self.builtinElem(partial.arg, arg),
+            @intFromEnum(BuiltinId.seq) => self.builtinSeq(partial.arg, arg),
             else => error.InvalidBuiltin,
         };
     }
@@ -956,6 +958,11 @@ pub const VM = struct {
             if (try self.valuesEqual(needle, item)) return Value.boolVal(true);
         }
         return Value.boolVal(false);
+    }
+
+    fn builtinSeq(self: *VM, first: Value, second: Value) !Value {
+        _ = try self.forceValue(first);
+        return self.forceValue(second);
     }
 
     fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {
