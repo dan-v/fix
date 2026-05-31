@@ -127,8 +127,8 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .filterSource => builtinFilterSource(self, args[0], args[1]),
         .fetchGit => builtinFetchGit(self, args[0]),
         .fetchurl => builtinFetchurl(self, args[0]),
+        .fetchTarball => builtinFetchTarball(self, args[0]),
         .toXML,
-        .fetchTarball,
         .fetchMercurial,
         .fetchTree,
         .getFlake,
@@ -1332,6 +1332,15 @@ fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse try defaultFetchName(self, url);
     return .{ .url = url, .name = name };
+}
+
+fn builtinFetchTarball(self: anytype, arg: Value) !Value {
+    const spec = try fetchUrlSpec(self, arg);
+    defer spec.deinit(self.allocator);
+
+    const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+    defer self.fetchers.allocator.free(path);
+    return Value.string(try self.intern.intern(path));
 }
 
 fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {

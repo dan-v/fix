@@ -1112,6 +1112,40 @@ test "evaluate fetchurl builtin through fetch cache" {
     try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
 }
 
+test "evaluate fetchTarball builtin through fetch cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer std.testing.allocator.free(archive_path);
+
+    const tar = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" },
+    });
+    defer std.testing.allocator.free(tar.stdout);
+    defer std.testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; }}) + \"/file.txt\")", .{archive_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
 test "evaluate findFile builtin through explicit search path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

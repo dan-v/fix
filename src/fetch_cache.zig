@@ -28,6 +28,11 @@ pub const FetchCache = struct {
         name: []const u8,
     };
 
+    pub const TarballSpec = struct {
+        url: []const u8,
+        name: []const u8 = "source",
+    };
+
     pub const UrlResult = struct {
         path: []u8,
         hash: []u8,
@@ -97,6 +102,20 @@ pub const FetchCache = struct {
         return .{ .path = path, .hash = hash };
     }
 
+    pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec) ![]u8 {
+        const io = self.io orelse return error.FetchIoUnavailable;
+        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name });
+        defer archive.deinit(self.allocator);
+
+        const out_path = try self.tarballCachePath(io, spec.name, archive.hash);
+        errdefer self.allocator.free(out_path);
+        if (!try hostPathExists(io, out_path)) {
+            try std.Io.Dir.cwd().createDirPath(io, out_path);
+            try self.runCommandDiscard(&.{ "tar", "-xf", archive.path, "-C", out_path, "--strip-components=1" });
+        }
+        return out_path;
+    }
+
     fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8) ![]u8 {
         if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
 
@@ -130,19 +149,19 @@ pub const FetchCache = struct {
         if (!try files.pathExists(git_dir)) {
             try std.Io.Dir.cwd().createDirPath(io, path);
             if (spec.ref) |ref| {
-                try self.runGitDiscard(&.{ "git", "clone", "--filter=blob:none", "--branch", ref, "--single-branch", spec.url, path });
+                try self.runCommandDiscard(&.{ "git", "clone", "--filter=blob:none", "--branch", ref, "--single-branch", spec.url, path });
             } else {
-                try self.runGitDiscard(&.{ "git", "clone", "--filter=blob:none", spec.url, path });
+                try self.runCommandDiscard(&.{ "git", "clone", "--filter=blob:none", spec.url, path });
             }
         }
 
         if (spec.rev) |rev| {
-            try self.runGitDiscard(&.{ "git", "-C", path, "checkout", "--detach", rev });
+            try self.runCommandDiscard(&.{ "git", "-C", path, "checkout", "--detach", rev });
         } else if (spec.ref) |ref| {
-            try self.runGitDiscard(&.{ "git", "-C", path, "checkout", ref });
+            try self.runCommandDiscard(&.{ "git", "-C", path, "checkout", ref });
         }
         if (spec.submodules) {
-            try self.runGitDiscard(&.{ "git", "-C", path, "submodule", "update", "--init", "--recursive" });
+            try self.runCommandDiscard(&.{ "git", "-C", path, "submodule", "update", "--init", "--recursive" });
         }
 
         const rev = try self.gitOneLine(&.{ "git", "-C", path, "rev-parse", "HEAD" });
@@ -214,6 +233,14 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "url", hash[0..32], clean_name });
     }
 
+    fn tarballCachePath(self: *FetchCache, io: std.Io, name: []const u8, hash: []const u8) ![]u8 {
+        const cwd = try std.process.currentPathAlloc(io, self.allocator);
+        defer self.allocator.free(cwd);
+        const clean_name = try cleanStoreName(self.allocator, name);
+        defer self.allocator.free(clean_name);
+        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "tarball", hash[0..32], clean_name });
+    }
+
     fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {
         var key: std.ArrayListUnmanaged(u8) = .empty;
         defer key.deinit(self.allocator);
@@ -282,7 +309,7 @@ pub const FetchCache = struct {
         return std.fmt.parseInt(i64, text, 10) catch return error.InvalidGitOutput;
     }
 
-    fn runGitDiscard(self: *FetchCache, argv: []const []const u8) !void {
+    fn runCommandDiscard(self: *FetchCache, argv: []const []const u8) !void {
         const result = try self.runGit(argv, null);
         self.allocator.free(result.stdout);
         self.allocator.free(result.stderr);
