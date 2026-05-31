@@ -134,8 +134,7 @@ pub const Node = struct {
     };
 
     pub const AttrSetEntry = struct {
-        name_offset: u32,
-        name_len: u32,
+        path: []Atom,
         expr: *Node,
     };
 

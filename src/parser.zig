@@ -307,8 +307,7 @@ pub const Parser = struct {
         var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
 
         while (!self.check(.right_brace) and !self.check(.eof)) {
-            const name_tok = self.current;
-            _ = try self.expect(.identifier, "Expected attribute name.");
+            const path = try self.attrDeclarationPath(arena_allocator);
             _ = try self.expect(.equal, "Expected '=' after attribute name.");
             // allow missing semicolons by checking what comes next
             if (!self.check(.semicolon) and !self.check(.right_brace)) {
@@ -318,8 +317,7 @@ pub const Parser = struct {
             const expr = try self.expression();
 
             try entries.append(arena_allocator, .{
-                .name_offset = name_tok.offset,
-                .name_len = name_tok.len,
+                .path = path,
                 .expr = expr,
             });
 
@@ -334,6 +332,26 @@ pub const Parser = struct {
                 .recursive = recursive,
             },
         });
+    }
+
+    fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
+        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+
+        while (true) {
+            if (self.match(.identifier) or self.match(.string)) {
+                try segments.append(allocator, .{
+                    .offset = self.previous.offset,
+                    .len = self.previous.len,
+                });
+            } else {
+                self.reportError("Expected attribute name.");
+                return error.ParseError;
+            }
+
+            if (!self.match(.dot)) break;
+        }
+
+        return segments.toOwnedSlice(allocator);
     }
 
     fn list(self: *Parser) !*Node {

@@ -80,6 +80,7 @@ pub const Evaluator = struct {
         defer compiler.deinit();
 
         compiler.compile(ast_node) catch |err| {
+            if (err == error.DuplicateAttribute) return err;
             std.debug.print("Compile error: {}\n", .{err});
             return error.CompileError;
         };

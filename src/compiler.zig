@@ -34,6 +34,11 @@ const Capture = struct {
     index: u16,
 };
 
+const AttrEntryView = struct {
+    path: []const Node.Atom,
+    expr: *const Node,
+};
+
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
     builder: *ChunkBuilder,
@@ -350,29 +355,56 @@ pub const Compiler = struct {
 
     fn compileAttrSet(self: *Compiler, node: *const Node) !void {
         const aset = node.data.attr_set;
-        if (aset.recursive) return self.compileRecursiveAttrSet(aset);
+        const entries = try self.attrEntryViews(aset.entries);
+        defer self.allocator.free(entries);
 
-        const count = aset.entries.len;
-
-        for (aset.entries) |entry| {
-            // Push name as interned string value.
-            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
-            const name_id = try self.intern.intern(name_span);
-            const name_val = @import("value.zig").Value.string(name_id);
-            try self.builder.emitConstant(self.allocator, name_val);
-
-            // Attribute values are lazy; selection forces the stored thunk.
-            try self.compileThunk(entry.expr);
-        }
-
-        try self.emitOpU16(.build_attrs, @intCast(count));
+        try self.compileAttrEntries(entries, aset.recursive);
     }
 
-    fn compileRecursiveAttrSet(self: *Compiler, aset: Node.AttrSet) !void {
+    fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
+        if (recursive) {
+            try self.compileRecursiveAttrEntries(entries);
+        } else {
+            try self.compilePlainAttrEntries(entries);
+        }
+    }
+
+    fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
+        var count: u16 = 0;
+
+        for (entries, 0..) |entry, index| {
+            if (entry.path.len == 0) return error.InvalidAttributePath;
+            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
+
+            const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
+            if (leaf_count > 1) return error.DuplicateAttribute;
+            const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
+            if (leaf == null) {
+                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
+                defer self.allocator.free(tails);
+                try self.emitAttrName(entry.path[0]);
+                try self.compileAttrEntriesThunk(tails, false);
+                count += 1;
+                continue;
+            }
+
+            if (self.hasNestedForFirstSegment(entries, entry.path[0])) return error.DuplicateAttribute;
+            try self.emitAttrName(entry.path[0]);
+            try self.compileThunk(leaf.?.expr);
+            count += 1;
+        }
+
+        try self.emitOpU16(.build_attrs, count);
+    }
+
+    fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
         self.beginScope();
 
-        for (aset.entries) |entry| {
-            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
+        for (entries, 0..) |entry, index| {
+            if (entry.path.len == 0) return error.InvalidAttributePath;
+            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
+
+            const name_span = self.attrSegmentSpan(entry.path[0]);
             const name_id = try self.intern.intern(name_span);
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
@@ -380,25 +412,136 @@ pub const Compiler = struct {
             try self.emitOpByte(.set_local, @intCast(slot));
         }
 
-        for (aset.entries) |entry| {
-            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
+        var count: u16 = 0;
+        for (entries, 0..) |entry, index| {
+            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
+
+            const name_span = self.attrSegmentSpan(entry.path[0]);
             const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
-            try self.compileThunk(entry.expr);
+            const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
+            if (leaf_count > 1) return error.DuplicateAttribute;
+            const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
+            if (leaf == null) {
+                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
+                defer self.allocator.free(tails);
+                try self.compileAttrEntriesThunk(tails, false);
+                try self.emitOpByte(.set_cell_local, @intCast(slot));
+                count += 1;
+                continue;
+            }
+
+            if (self.hasNestedForFirstSegment(entries, entry.path[0])) return error.DuplicateAttribute;
+            try self.compileThunk(leaf.?.expr);
             try self.emitOpByte(.set_cell_local, @intCast(slot));
+            count += 1;
         }
 
-        for (aset.entries) |entry| {
-            const name_span = self.source[entry.name_offset .. entry.name_offset + entry.name_len];
-            const name_id = try self.intern.intern(name_span);
-            const name_val = @import("value.zig").Value.string(name_id);
-            try self.builder.emitConstant(self.allocator, name_val);
+        for (entries, 0..) |entry, index| {
+            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
+            try self.emitAttrName(entry.path[0]);
 
+            const name_span = self.attrSegmentSpan(entry.path[0]);
             const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
             try self.emitOpByte(.capture_local, @intCast(slot));
         }
 
-        try self.emitOpU16(.build_attrs, @intCast(aset.entries.len));
+        try self.emitOpU16(.build_attrs, count);
         self.endScope();
+    }
+
+    fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
+        var child_builder = try ChunkBuilder.init(self.allocator);
+        defer child_builder.deinit(self.allocator);
+
+        var child = Compiler.init(
+            self.allocator,
+            &child_builder,
+            self.registry,
+            self.source,
+            self.intern,
+        );
+        child.parent = self;
+        defer child.deinit();
+
+        try child.compileAttrEntries(entries, recursive);
+        try child.emitOp(.ret);
+        try child.emitOp(.halt);
+
+        const child_chunk = try child_builder.finish(self.allocator);
+        const child_id = try self.registry.register(child_chunk);
+        try self.emitCaptures(child.captures.items);
+        try self.emitOpU16(.closure, @intCast(child_id));
+        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitOp(.make_thunk);
+    }
+
+    fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {
+        const views = try self.allocator.alloc(AttrEntryView, entries.len);
+        for (entries, views) |entry, *view| {
+            view.* = .{ .path = entry.path, .expr = entry.expr };
+        }
+        return views;
+    }
+
+    fn tailEntriesForFirstSegment(self: *Compiler, entries: []const AttrEntryView, first: Node.Atom) ![]AttrEntryView {
+        var count: usize = 0;
+        for (entries) |entry| {
+            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) count += 1;
+        }
+
+        const tails = try self.allocator.alloc(AttrEntryView, count);
+        var i: usize = 0;
+        for (entries) |entry| {
+            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) {
+                tails[i] = .{ .path = entry.path[1..], .expr = entry.expr };
+                i += 1;
+            }
+        }
+        return tails;
+    }
+
+    fn firstSegmentSeen(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) bool {
+        for (entries) |entry| {
+            if (entry.path.len > 0 and self.attrSegmentsEqual(entry.path[0], first)) return true;
+        }
+        return false;
+    }
+
+    fn uniqueLeafForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) ?AttrEntryView {
+        var found: ?AttrEntryView = null;
+        for (entries) |entry| {
+            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) {
+                if (found != null) return null;
+                found = entry;
+            }
+        }
+        return found;
+    }
+
+    fn leafCountForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) usize {
+        var count: usize = 0;
+        for (entries) |entry| {
+            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) count += 1;
+        }
+        return count;
+    }
+
+    fn hasNestedForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) bool {
+        for (entries) |entry| {
+            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) return true;
+        }
+        return false;
+    }
+
+    fn attrSegmentsEqual(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
+        return std.mem.eql(u8, self.attrSegmentSpan(a), self.attrSegmentSpan(b));
+    }
+
+    fn emitAttrName(self: *Compiler, atom: Node.Atom) !void {
+        const name_span = self.attrSegmentSpan(atom);
+        const name_id = try self.intern.intern(name_span);
+        const name_val = @import("value.zig").Value.string(name_id);
+        try self.builder.emitConstant(self.allocator, name_val);
     }
 
     fn compileAttrPath(self: *Compiler, node: *const Node) !void {

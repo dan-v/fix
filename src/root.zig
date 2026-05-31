@@ -186,6 +186,28 @@ test "end-to-end: recursive attribute sets" {
     try std.testing.expectError(error.RecursiveThunk, ev.evaluate("(rec { a = a; }).a"));
 }
 
+test "end-to-end: nested attribute declarations" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const nested = try ev.evaluate("({ a.b = 1; a.c = 2; }).a.c");
+    try std.testing.expectEqual(@as(i64, 2), nested.asInt());
+
+    const quoted = try ev.evaluate("({ a.\"b\" = 3; }).a.b");
+    try std.testing.expectEqual(@as(i64, 3), quoted.asInt());
+
+    const lazy = try ev.evaluate("({ a.b = 1; a.c = 1 / 0; }).a.b");
+    try std.testing.expectEqual(@as(i64, 1), lazy.asInt());
+
+    const rec_nested = try ev.evaluate("(rec { a.b = x + 1; x = 3; }).a.b");
+    try std.testing.expectEqual(@as(i64, 4), rec_nested.asInt());
+
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a.b = 2; }"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
+}
+
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 
