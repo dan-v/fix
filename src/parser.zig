@@ -390,7 +390,10 @@ pub const Parser = struct {
     fn unary(self: *Parser) !*Node {
         const is_not = self.previous.type == .bang;
         const op: ast.UnaryOp = if (is_not) .not else .negate;
-        const operand = try self.parsePrecedence(.unary);
+        var operand = try self.parsePrecedence(.unary);
+        if (is_not and self.match(.question_mark)) {
+            operand = try self.hasAttr(operand);
+        }
         return self.arena.createNode(.unary_op, .{ .unary = .{ .op = op, .expr = operand } });
     }
 

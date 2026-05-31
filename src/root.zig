@@ -830,6 +830,19 @@ test "end-to-end: builtin type predicates" {
     try std.testing.expect((try ev.evaluate("builtins.isNull null")).asBool());
 }
 
+test "end-to-end: has-attr binds tighter than boolean not" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expect(!(try ev.evaluate("!{ a = 1; } ? a")).asBool());
+    try std.testing.expect((try ev.evaluate("!{ } ? a")).asBool());
+
+    const applied = try ev.evaluate("let f = x: x; in !f { a = 1; } ? a");
+    try std.testing.expect(!applied.asBool());
+}
+
 test "end-to-end: assert and implication" {
     const alloc = std.testing.allocator;
 
