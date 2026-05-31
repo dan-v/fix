@@ -415,6 +415,36 @@ test "evaluate attrset function defaults ellipsis and binding" {
     try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));
 }
 
+test "evaluate small unary builtins" {
+    const is_float = try renderForTest("builtins.isFloat 1.5");
+    defer std.testing.allocator.free(is_float);
+    try std.testing.expectEqualStrings("true", is_float);
+
+    const is_function = try renderForTest("builtins.isFunction (x: x)");
+    defer std.testing.allocator.free(is_function);
+    try std.testing.expectEqualStrings("true", is_function);
+
+    const is_path = try renderForTest("builtins.isPath ./foo");
+    defer std.testing.allocator.free(is_path);
+    try std.testing.expectEqualStrings("true", is_path);
+
+    const length = try renderForTest("builtins.length [ 1 (1 / 0) 3 ]");
+    defer std.testing.allocator.free(length);
+    try std.testing.expectEqualStrings("3", length);
+
+    const head = try renderForTest("builtins.head [ 4 5 ]");
+    defer std.testing.allocator.free(head);
+    try std.testing.expectEqualStrings("4", head);
+
+    const names = try renderForTest("builtins.attrNames { b = 2; a = 1; }");
+    defer std.testing.allocator.free(names);
+    try std.testing.expectEqualStrings("[ \"a\" \"b\" ]", names);
+
+    const values = try renderForTest("builtins.attrValues { b = 2; a = 1; }");
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualStrings("[ ... ... ]", values);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

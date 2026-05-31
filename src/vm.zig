@@ -729,6 +729,14 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.isInt) => self.builtinTypePredicate(arg, .int),
             @intFromEnum(BuiltinId.isBool) => self.builtinIsBool(arg),
             @intFromEnum(BuiltinId.isNull) => self.builtinTypePredicate(arg, .null),
+            @intFromEnum(BuiltinId.isFloat) => self.builtinTypePredicate(arg, .float),
+            @intFromEnum(BuiltinId.isFunction) => self.builtinIsFunction(arg),
+            @intFromEnum(BuiltinId.isPath) => self.builtinTypePredicate(arg, .path),
+            @intFromEnum(BuiltinId.length) => self.builtinLength(arg),
+            @intFromEnum(BuiltinId.head) => self.builtinHead(arg),
+            @intFromEnum(BuiltinId.tail) => self.builtinTail(arg),
+            @intFromEnum(BuiltinId.attrNames) => self.builtinAttrNames(arg),
+            @intFromEnum(BuiltinId.attrValues) => self.builtinAttrValues(arg),
             else => error.InvalidBuiltin,
         };
     }
@@ -741,6 +749,73 @@ pub const VM = struct {
     fn builtinIsBool(self: *VM, arg: Value) !Value {
         const value = try self.forceValue(arg);
         return Value.boolVal(value.isBool());
+    }
+
+    fn builtinIsFunction(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        return Value.boolVal(value.discriminant == .closure or value.discriminant == .builtin);
+    }
+
+    fn builtinLength(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .list) return error.TypeError;
+        return Value.int(@intCast(try self.heap.getListLen(value.asObjectId())));
+    }
+
+    fn builtinHead(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(value.asObjectId());
+        if (items.len == 0) return error.IndexOutOfBounds;
+        return self.forceValue(items[0]);
+    }
+
+    fn builtinTail(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(value.asObjectId());
+        if (items.len == 0) return error.IndexOutOfBounds;
+        return Value.list(try self.heap.addList(items[1..]));
+    }
+
+    fn builtinAttrNames(self: *VM, arg: Value) !Value {
+        const entries = try self.sortedAttrEntries(arg);
+        defer self.allocator.free(entries);
+
+        const values = try self.allocator.alloc(Value, entries.len);
+        defer self.allocator.free(values);
+
+        for (entries, values) |entry, *value| {
+            value.* = Value.string(entry.name);
+        }
+        return Value.list(try self.heap.addList(values));
+    }
+
+    fn builtinAttrValues(self: *VM, arg: Value) !Value {
+        const entries = try self.sortedAttrEntries(arg);
+        defer self.allocator.free(entries);
+
+        const values = try self.allocator.alloc(Value, entries.len);
+        defer self.allocator.free(values);
+
+        for (entries, values) |entry, *value| {
+            value.* = entry.value;
+        }
+        return Value.list(try self.heap.addList(values));
+    }
+
+    fn sortedAttrEntries(self: *VM, arg: Value) ![]heap_mod.AttrEntry {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .attrs) return error.TypeError;
+
+        const entries = try self.heap.getAttrs(value.asObjectId());
+        const sorted = try self.allocator.dupe(heap_mod.AttrEntry, entries);
+        std.mem.sort(heap_mod.AttrEntry, sorted, self, attrEntryNameLessThan);
+        return sorted;
+    }
+
+    fn attrEntryNameLessThan(self: *VM, a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
+        return std.mem.lessThan(u8, self.intern.get(a.name), self.intern.get(b.name));
     }
 
     fn builtinToString(self: *VM, arg: Value) !Value {

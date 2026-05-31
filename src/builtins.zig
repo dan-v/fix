@@ -14,6 +14,14 @@ pub const BuiltinId = enum(u16) {
     isInt = 4,
     isBool = 5,
     isNull = 6,
+    isFloat = 7,
+    isFunction = 8,
+    isPath = 9,
+    length = 10,
+    head = 11,
+    tail = 12,
+    attrNames = 13,
+    attrValues = 14,
 };
 
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
@@ -45,6 +53,38 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("isNull"),
             .value = Value.builtin(@intFromEnum(BuiltinId.isNull)),
+        },
+        .{
+            .name = try intern.intern("isFloat"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.isFloat)),
+        },
+        .{
+            .name = try intern.intern("isFunction"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.isFunction)),
+        },
+        .{
+            .name = try intern.intern("isPath"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.isPath)),
+        },
+        .{
+            .name = try intern.intern("length"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.length)),
+        },
+        .{
+            .name = try intern.intern("head"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.head)),
+        },
+        .{
+            .name = try intern.intern("tail"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.tail)),
+        },
+        .{
+            .name = try intern.intern("attrNames"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.attrNames)),
+        },
+        .{
+            .name = try intern.intern("attrValues"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.attrValues)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));
