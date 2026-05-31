@@ -189,6 +189,24 @@ test "end-to-end: simple inherit in attrsets" {
 
     const nested = try ev.evaluate("(let a = { inherit a; }; in a).a.a");
     try std.testing.expectEqual(value.ValueType.attrs, nested.discriminant);
+
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("rec { x = 1; inherit x; }"));
+}
+
+test "end-to-end: inherit from source expression" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const inherited = try ev.evaluate("let src = { x = 7; y = 8; }; in ({ inherit (src) x y; }).x");
+    try std.testing.expectEqual(@as(i64, 7), inherited.asInt());
+
+    const literal_source = try ev.evaluate("({ inherit ({ x = 1; }) x; }).x");
+    try std.testing.expectEqual(@as(i64, 1), literal_source.asInt());
+
+    const lazy = try ev.evaluate("let src = 1 / 0; in { inherit (src) x; }");
+    try std.testing.expectEqual(value.ValueType.attrs, lazy.discriminant);
 }
 
 test "end-to-end: list elements are lazy" {

@@ -347,6 +347,13 @@ pub const Parser = struct {
         allocator: std.mem.Allocator,
         entries: *std.ArrayListUnmanaged(Node.AttrSetEntry),
     ) !void {
+        const source: ?*Node = if (self.match(.left_paren)) source: {
+            const expr = try self.expression();
+            _ = try self.expect(.right_paren, "Expected ')' after inherit source.");
+            break :source expr;
+        } else null;
+
+        var count: usize = 0;
         while (!self.check(.semicolon) and !self.check(.right_brace) and !self.check(.eof)) {
             const name_tok = self.current;
             _ = try self.expect(.identifier, "Expected inherited variable name.");
@@ -356,13 +363,33 @@ pub const Parser = struct {
                 .offset = name_tok.offset,
                 .len = name_tok.len,
             };
-            const expr = try self.arena.createNode(.identifier, .{ .atom = path[0] });
+            const expr = if (source) |src|
+                try self.inheritSourceAttr(src, path[0])
+            else
+                try self.arena.createNode(.identifier, .{ .atom = path[0] });
 
             try entries.append(allocator, .{
                 .path = path,
                 .expr = expr,
             });
+            count += 1;
         }
+
+        if (count == 0) {
+            self.reportError("Expected inherited variable name.");
+            return error.ParseError;
+        }
+    }
+
+    fn inheritSourceAttr(self: *Parser, source: *Node, name: Node.Atom) !*Node {
+        const segments = try self.arena.allocSlice(Node.Atom, 1);
+        segments[0] = name;
+        return self.arena.createNode(.attr_path, .{
+            .attr_path = .{
+                .root = source,
+                .segments = segments,
+            },
+        });
     }
 
     fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
@@ -638,6 +665,29 @@ test "parser desugars simple inherit in attrsets" {
         .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.tag);
+}
+
+test "parser desugars inherit from source expression" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit (src) a b; }");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    const entries = node.data.attr_set.entries;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(NodeTag.attr_path, entries[0].expr.tag);
+    try std.testing.expectEqual(NodeTag.identifier, entries[0].expr.data.attr_path.root.tag);
+    try std.testing.expectEqual(@as(usize, 1), entries[0].expr.data.attr_path.segments.len);
+    try std.testing.expectEqualStrings("a", parser.span(.{
+        .type = .identifier,
+        .offset = entries[0].expr.data.attr_path.segments[0].offset,
+        .len = entries[0].expr.data.attr_path.segments[0].len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.attr_path, entries[1].expr.tag);
+    try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.data.attr_path.root.tag);
 }
 
 test "parser recognizes attr path or default" {
