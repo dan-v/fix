@@ -15,8 +15,9 @@ const Value = @import("value.zig").Value;
 const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
+const diagnostic = @import("diagnostic.zig");
 
-pub const Diagnostic = parser_mod.Diagnostic;
+pub const Diagnostic = diagnostic.Diagnostic;
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,

@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const eval = @import("eval.zig");
+const diagnostic = @import("diagnostic.zig");
 const Evaluator = eval.Evaluator;
 
 pub fn main(init: std.process.Init) !void {
@@ -43,7 +44,10 @@ pub fn main(init: std.process.Init) !void {
 
     const result = ev.evaluate(source.text) catch |err| {
         if (ev.getDiagnostics().len > 0) {
-            printDiagnostics(source.text, ev.getDiagnostics());
+            var stderr_buffer: [1024]u8 = undefined;
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
+            try diagnostic.writeAll(&stderr.interface, source.text, ev.getDiagnostics());
+            try stderr.interface.flush();
         } else {
             std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
         }
@@ -79,74 +83,4 @@ fn getSource(
         };
     }
     return .{ .text = first_arg, .owned = false };
-}
-
-fn printDiagnostics(source: []const u8, diagnostics: []const eval.Diagnostic) void {
-    for (diagnostics) |diagnostic| {
-        switch (diagnostic.severity) {
-            .err => switch (diagnostic.kind) {
-                .parse => std.debug.print("error: parse error at {d}:{d}: {s}\n", .{
-                    diagnostic.line,
-                    diagnostic.column,
-                    diagnostic.message,
-                }),
-                .compile => std.debug.print("error: {s} at {d}:{d}\n", .{
-                    diagnostic.message,
-                    diagnostic.line,
-                    diagnostic.column,
-                }),
-            },
-            .note => std.debug.print("note: {s} at {d}:{d}\n", .{
-                diagnostic.message,
-                diagnostic.line,
-                diagnostic.column,
-            }),
-        }
-
-        const line = lineSpan(source, diagnostic.offset);
-        std.debug.print("{d: >4} | {s}\n", .{ diagnostic.line, source[line.start..line.end] });
-        std.debug.print("     | ", .{});
-        writeSpaces(diagnostic.column - 1);
-        const caret_count = @max(@as(u32, 1), diagnostic.len);
-        var i: u32 = 0;
-        while (i < caret_count) : (i += 1) {
-            std.debug.print("^", .{});
-        }
-
-        if (diagnostic.token_type == null or diagnostic.token_type.? != .eof) {
-            const start: usize = @intCast(diagnostic.offset);
-            const len: usize = @intCast(diagnostic.len);
-            if (start <= source.len and len <= source.len - start) {
-                std.debug.print(" near `{s}`", .{source[start .. start + len]});
-            }
-        }
-        std.debug.print("\n", .{});
-    }
-}
-
-const LineSpan = struct {
-    start: usize,
-    end: usize,
-};
-
-fn lineSpan(source: []const u8, offset: u32) LineSpan {
-    const target: usize = @min(@as(usize, @intCast(offset)), source.len);
-    var start = target;
-    while (start > 0 and source[start - 1] != '\n') {
-        start -= 1;
-    }
-
-    var end = target;
-    while (end < source.len and source[end] != '\n') {
-        end += 1;
-    }
-
-    return .{ .start = start, .end = end };
-}
-
-fn writeSpaces(count: u32) void {
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        std.debug.print(" ", .{});
-    }
 }

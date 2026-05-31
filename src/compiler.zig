@@ -14,7 +14,8 @@ const chunk = @import("chunk.zig");
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("types.zig");
-const Diagnostic = @import("parser.zig").Diagnostic;
+const diagnostic = @import("diagnostic.zig");
+const Diagnostic = diagnostic.Diagnostic;
 
 const InternId = types.InternId;
 
@@ -416,33 +417,13 @@ pub const Compiler = struct {
         try self.diagnostics.append(self.allocator, .{
             .severity = severity,
             .kind = .compile,
-            .line = self.lineForOffset(offset),
-            .column = self.columnForOffset(offset),
+            .line = diagnostic.lineForOffset(self.source, offset),
+            .column = diagnostic.columnForOffset(self.source, offset),
             .offset = offset,
             .len = len,
             .token_type = null,
             .message = message,
         });
-    }
-
-    fn lineForOffset(self: *const Compiler, offset: u32) u32 {
-        var line: u32 = 1;
-        var i: usize = 0;
-        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
-        while (i < target) : (i += 1) {
-            if (self.source[i] == '\n') line += 1;
-        }
-        return line;
-    }
-
-    fn columnForOffset(self: *const Compiler, offset: u32) u32 {
-        var line_start: usize = 0;
-        var i: usize = 0;
-        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
-        while (i < target) : (i += 1) {
-            if (self.source[i] == '\n') line_start = i + 1;
-        }
-        return @intCast(target - line_start + 1);
     }
 
     fn compileThunk(self: *Compiler, expr: *const Node) !void {

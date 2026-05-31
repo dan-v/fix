@@ -10,6 +10,8 @@ const Token = token.Token;
 const ast = @import("ast.zig");
 const Node = ast.Node;
 const NodeTag = ast.NodeTag;
+const diagnostic = @import("diagnostic.zig");
+const Diagnostic = diagnostic.Diagnostic;
 
 const Precedence = enum(u8) {
     none,
@@ -36,20 +38,6 @@ const Rule = struct {
     prefix: ?ParseFn,
     infix: ?InfixFn,
     prec: Precedence,
-};
-
-pub const Diagnostic = struct {
-    pub const Severity = enum { err, note };
-    pub const Kind = enum { parse, compile };
-
-    severity: Severity = .err,
-    kind: Kind = .parse,
-    line: u32,
-    column: u32,
-    offset: u32,
-    len: u32,
-    token_type: ?TokenType,
-    message: []const u8,
 };
 
 pub const Parser = struct {
@@ -130,22 +118,12 @@ pub const Parser = struct {
         const tok = self.current;
         self.diagnostics.append(self.allocator, .{
             .line = tok.line,
-            .column = self.columnForOffset(tok.offset),
+            .column = diagnostic.columnForOffset(self.source, tok.offset),
             .offset = tok.offset,
             .len = tok.len,
             .token_type = tok.type,
             .message = msg,
         }) catch {};
-    }
-
-    fn columnForOffset(self: *const Parser, offset: u32) u32 {
-        var line_start: usize = 0;
-        var i: usize = 0;
-        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
-        while (i < target) : (i += 1) {
-            if (self.source[i] == '\n') line_start = i + 1;
-        }
-        return @intCast(target - line_start + 1);
     }
 
     fn span(self: *const Parser, tok: Token) []const u8 {
