@@ -4,16 +4,25 @@
 //! task queue. When a worker runs out of work, it steals from another worker's
 //! queue. This minimizes contention while keeping all cores busy.
 //!
-//! Tasks represent thunks that need to be forced. A task is a (thunk_ptr)
-//! and the scheduler arranges for it to be evaluated on some thread.
+//! Tasks are small tagged values. Today the evaluator only submits thunks, but
+//! async filesystem work needs a way to park and later resume evaluation
+//! continuations without making worker queues depend on filesystem code.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const Thunk = @import("thunk.zig").Thunk;
 
+pub const Continuation = struct {
+    context: *anyopaque,
+    resume_fn: *const fn (*anyopaque) void,
+};
+
 /// A single entry in a worker's task queue.
-const Task = *Thunk;
+pub const Task = union(enum) {
+    thunk: *Thunk,
+    continuation: Continuation,
+};
 
 /// Bounded multi-producer multi-consumer queue for tasks.
 /// Workers push to their own queue (SPSC) and steal from others.
@@ -154,6 +163,14 @@ pub const Scheduler = struct {
         return self.queues[worker_idx].push(task);
     }
 
+    pub fn submitThunkTo(self: *Scheduler, worker_idx: u8, thunk: *Thunk) bool {
+        return self.submitTo(worker_idx, .{ .thunk = thunk });
+    }
+
+    pub fn submitContinuationTo(self: *Scheduler, worker_idx: u8, continuation: Continuation) bool {
+        return self.submitTo(worker_idx, .{ .continuation = continuation });
+    }
+
     /// Worker pops from its own queue.
     pub fn pop(self: *Scheduler, worker_idx: u8) ?Task {
         return self.queues[worker_idx].pop();
@@ -175,3 +192,41 @@ pub const Scheduler = struct {
         return null;
     }
 };
+
+fn markResumed(context: *anyopaque) void {
+    const resumed: *bool = @ptrCast(@alignCast(context));
+    resumed.* = true;
+}
+
+test "scheduler queues thunk tasks" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 1);
+    defer scheduler.deinit();
+
+    var thunk = Thunk.init(@import("value.zig").Value.null_val);
+    try std.testing.expect(scheduler.submitThunkTo(0, &thunk));
+
+    const task = scheduler.pop(0).?;
+    switch (task) {
+        .thunk => |queued| try std.testing.expectEqual(&thunk, queued),
+        .continuation => return error.UnexpectedContinuationTask,
+    }
+}
+
+test "scheduler queues continuation tasks" {
+    var scheduler = try Scheduler.init(std.testing.allocator, 1);
+    defer scheduler.deinit();
+
+    var resumed = false;
+    try std.testing.expect(scheduler.submitContinuationTo(0, .{
+        .context = &resumed,
+        .resume_fn = markResumed,
+    }));
+
+    const task = scheduler.pop(0).?;
+    switch (task) {
+        .continuation => |continuation| continuation.resume_fn(continuation.context),
+        .thunk => return error.UnexpectedThunkTask,
+    }
+
+    try std.testing.expect(resumed);
+}
