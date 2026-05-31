@@ -6,8 +6,8 @@ const std = @import("std");
 /// How many worker threads to spawn for the evaluation pool.
 pub const DEFAULT_WORKER_COUNT: u8 = 4;
 
-/// Initial stack capacity for a VM.
-pub const VM_STACK_CAP: usize = 4096;
+/// Maximum value stack slots for a VM.
+pub const VM_STACK_CAP: usize = 65_536;
 
 /// Maximum call frame depth.
 pub const MAX_FRAMES: usize = 512;
