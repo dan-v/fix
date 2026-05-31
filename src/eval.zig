@@ -36,6 +36,7 @@ pub const Evaluator = struct {
     heap: ObjectHeap,
     files: FileCache,
     imports: std.StringHashMapUnmanaged(Value),
+    imports_in_progress: std.StringHashMapUnmanaged(void),
     search_paths: []SearchPathEntry,
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
@@ -54,6 +55,7 @@ pub const Evaluator = struct {
             .heap = ObjectHeap.init(allocator),
             .files = FileCache.init(allocator),
             .imports = .empty,
+            .imports_in_progress = .empty,
             .search_paths = &.{},
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
@@ -69,6 +71,9 @@ pub const Evaluator = struct {
         var imports_iter = self.imports.iterator();
         while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
         self.imports.deinit(self.allocator);
+        var progress_iter = self.imports_in_progress.iterator();
+        while (progress_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        self.imports_in_progress.deinit(self.allocator);
         self.freeSearchPaths();
         self.files.deinit();
         self.heap.deinit();
@@ -239,6 +244,8 @@ pub const Evaluator = struct {
 
     fn importResolvedPath(self: *Evaluator, path: []const u8) anyerror!Value {
         if (self.imports.get(path)) |value| return value;
+        const progress_key = try self.beginImport(path);
+        defer self.endImport(progress_key);
 
         const source = self.files.readFile(path) catch |err| switch (err) {
             error.IsDir => return self.importDirectory(path),
@@ -265,6 +272,20 @@ pub const Evaluator = struct {
         const key = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(key);
         try self.imports.put(self.allocator, key, value);
+    }
+
+    fn beginImport(self: *Evaluator, path: []const u8) ![]u8 {
+        if (self.imports_in_progress.contains(path)) return error.ImportCycle;
+
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        try self.imports_in_progress.put(self.allocator, key, {});
+        return key;
+    }
+
+    fn endImport(self: *Evaluator, key: []u8) void {
+        _ = self.imports_in_progress.remove(key);
+        self.allocator.free(key);
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
@@ -956,6 +977,32 @@ test "evaluate directory import through default nix" {
 
     const imported = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 9), imported.asInt());
+}
+
+test "detect recursive imports" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cycle.nix", .data = "import ./cycle.nix\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "cycle.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "import {s}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    try std.testing.expectError(error.ImportCycle, ev.evaluate(source));
 }
 
 test "evaluate all and any builtins" {
