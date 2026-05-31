@@ -413,7 +413,7 @@ pub const Parser = struct {
         var depth: usize = 1;
         while (!probe.check(.eof)) {
             switch (probe.current.type) {
-                .left_brace, .left_bracket, .left_paren => depth += 1,
+                .left_brace, .left_bracket, .left_paren, .dollar_curly => depth += 1,
                 .right_brace, .right_bracket, .right_paren => {
                     depth -= 1;
                     if (depth == 0) {
@@ -1013,6 +1013,21 @@ test "parser recognizes attrset lambda defaults ellipsis and binding" {
     try std.testing.expect(node.data.lambda_attrs.bind_name != null);
     try std.testing.expect(node.data.lambda_attrs.allow_extra);
     try std.testing.expectEqual(@as(usize, 1), node.data.lambda_attrs.params.len);
+    try std.testing.expect(node.data.lambda_attrs.params[0].default != null);
+}
+
+test "parser recognizes attrset lambda defaults with dynamic attrs" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(
+        std.testing.allocator,
+        &arena,
+        "{ x ? let table = { a = { b = 1; }; }; in table.${\"a\"}.b }: x",
+    );
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.lambda_attrs, node.tag);
     try std.testing.expect(node.data.lambda_attrs.params[0].default != null);
 }
 
