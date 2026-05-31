@@ -73,5 +73,24 @@ test "end-to-end: if else false branch" {
     try std.testing.expectEqual(@as(i64, 2), result.asInt());
 }
 
+test "end-to-end: boolean operators short-circuit" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const and_result = try ev.evaluate("true && false");
+    try std.testing.expect(!and_result.asBool());
+
+    const or_result = try ev.evaluate("false || true");
+    try std.testing.expect(or_result.asBool());
+
+    const short_and = try ev.evaluate("false && (1 / 0)");
+    try std.testing.expect(!short_and.asBool());
+
+    const short_or = try ev.evaluate("true || (1 / 0)");
+    try std.testing.expect(short_or.asBool());
+}
+
 const std = @import("std");
 const ValueType = value.ValueType;

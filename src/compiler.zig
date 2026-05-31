@@ -144,6 +144,12 @@ pub const Compiler = struct {
 
     fn compileBinary(self: *Compiler, node: *const Node) !void {
         const bin = node.data.binary;
+        switch (bin.op) {
+            .and_ => return self.compileAnd(bin.left, bin.right),
+            .or_ => return self.compileOr(bin.left, bin.right),
+            else => {},
+        }
+
         try self.compileNode(bin.left);
         try self.compileNode(bin.right);
 
@@ -158,12 +164,38 @@ pub const Compiler = struct {
             .lte => try self.emitOp(.lte),
             .gt => try self.emitOp(.gt),
             .gte => try self.emitOp(.gte),
-            .and_ => try self.emitOp(.jump_if_false),
-            .or_ => try self.emitOp(.jump_if_false),
+            .and_, .or_ => unreachable,
             .update => return error.UnsupportedBinaryOp,
             .impl => return error.UnsupportedBinaryOp,
             .concat => return error.UnsupportedBinaryOp,
         }
+    }
+
+    fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void {
+        try self.compileNode(left);
+
+        const end_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOp(.pop);
+
+        try self.compileNode(right);
+        self.patchJump(end_jump, self.builder.code.items.len);
+    }
+
+    fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
+        try self.compileNode(left);
+
+        const false_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump_if_false, 0);
+
+        const end_jump = self.builder.code.items.len;
+        try self.emitOpU16(.jump, 0);
+
+        self.patchJump(false_jump, self.builder.code.items.len);
+        try self.emitOp(.pop);
+
+        try self.compileNode(right);
+        self.patchJump(end_jump, self.builder.code.items.len);
     }
 
     fn compileUnary(self: *Compiler, node: *const Node) !void {

@@ -73,6 +73,14 @@ pub const Scanner = struct {
                 if (self.match('/')) return self.makeToken(.double_slash, start, 2);
                 return self.makeToken(.slash, start, 1);
             },
+            '&' => {
+                if (self.match('&')) return self.makeToken(.amp_amp, start, 2);
+                return self.makeToken(.error_token, start, 1);
+            },
+            '|' => {
+                if (self.match('|')) return self.makeToken(.pipe_pipe, start, 2);
+                return self.makeToken(.error_token, start, 1);
+            },
             else => return self.makeToken(.error_token, start, 1),
         }
     }
@@ -214,3 +222,14 @@ pub const Scanner = struct {
         return mapping.get(s) orelse .identifier;
     }
 };
+
+test "scanner recognizes boolean operator tokens" {
+    var scanner = Scanner.init("true && false || true");
+
+    try std.testing.expectEqual(TokenType.kw_true, scanner.next().type);
+    try std.testing.expectEqual(TokenType.amp_amp, scanner.next().type);
+    try std.testing.expectEqual(TokenType.kw_false, scanner.next().type);
+    try std.testing.expectEqual(TokenType.pipe_pipe, scanner.next().type);
+    try std.testing.expectEqual(TokenType.kw_true, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}

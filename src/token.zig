@@ -27,8 +27,10 @@ pub const TokenType = enum(u8) {
     greater_equal,
     less,
     less_equal,
+    amp_amp, // &&
+    pipe_pipe, // ||
     double_slash, // // (update operator)
-    arrow,        // ->
+    arrow, // ->
 
     // ---- literals ----
     identifier,

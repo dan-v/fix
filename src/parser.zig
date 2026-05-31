@@ -150,6 +150,8 @@ pub const Parser = struct {
             .less_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
             .greater => return .{ .prefix = null, .infix = binary, .prec = .cmp },
             .greater_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
+            .amp_amp => return .{ .prefix = null, .infix = binary, .prec = .and_ },
+            .pipe_pipe => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
             .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
@@ -409,6 +411,8 @@ pub const Parser = struct {
             .less_equal => .lte,
             .greater => .gt,
             .greater_equal => .gte,
+            .amp_amp => .and_,
+            .pipe_pipe => .or_,
             .double_slash => .update,
             .arrow => .impl,
             else => unreachable,
@@ -466,3 +470,17 @@ pub const Parser = struct {
         });
     }
 };
+
+test "parser applies boolean operator precedence" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "true && false || true");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.or_, node.data.binary.op);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.binary.left.tag);
+    try std.testing.expectEqual(ast.BinaryOp.and_, node.data.binary.left.data.binary.op);
+    try std.testing.expectEqual(NodeTag.bool_true, node.data.binary.right.tag);
+}
