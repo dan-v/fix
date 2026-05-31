@@ -206,6 +206,7 @@ const ValuePrinter = struct {
             .thunk => try self.writeThunk(value.asObjectId()),
             .cell => try self.writeCell(value.asObjectId()),
             .builtin => try self.writer.writeAll("<builtin>"),
+            .builtin_closure => try self.writer.writeAll("<builtin-closure>"),
         }
     }
 
@@ -443,6 +444,28 @@ test "evaluate small unary builtins" {
     const values = try renderForTest("builtins.attrValues { b = 2; a = 1; }");
     defer std.testing.allocator.free(values);
     try std.testing.expectEqualStrings("[ ... ... ]", values);
+}
+
+test "evaluate curried binary builtins" {
+    const has_attr = try renderForTest("builtins.hasAttr \"a\" { a = 1; }");
+    defer std.testing.allocator.free(has_attr);
+    try std.testing.expectEqualStrings("true", has_attr);
+
+    const missing_attr = try renderForTest("builtins.hasAttr \"b\" { a = 1; }");
+    defer std.testing.allocator.free(missing_attr);
+    try std.testing.expectEqualStrings("false", missing_attr);
+
+    const get_attr = try renderForTest("builtins.getAttr \"a\" { a = 3; }");
+    defer std.testing.allocator.free(get_attr);
+    try std.testing.expectEqualStrings("3", get_attr);
+
+    const elem_at = try renderForTest("builtins.elemAt [ 1 2 3 ] 1");
+    defer std.testing.allocator.free(elem_at);
+    try std.testing.expectEqualStrings("2", elem_at);
+
+    const partial_is_function = try renderForTest("builtins.isFunction (builtins.elemAt [ 1 ])");
+    defer std.testing.allocator.free(partial_is_function);
+    try std.testing.expectEqualStrings("true", partial_is_function);
 }
 
 test "evaluate exposes parse diagnostics without printing" {

@@ -524,6 +524,7 @@ pub const VM = struct {
             .attrs => try self.attrsEqual(va.asObjectId(), vb.asObjectId()),
             .closure => false,
             .builtin => va.asBuiltinId() == vb.asBuiltinId(),
+            .builtin_closure => false,
             .thunk, .cell => unreachable,
         };
     }
@@ -715,6 +716,8 @@ pub const VM = struct {
             try self.pushFrame(ch, 1, closure_id);
         } else if (callee.discriminant == .builtin) {
             try self.push(try self.callBuiltin(callee, arg));
+        } else if (callee.discriminant == .builtin_closure) {
+            try self.push(try self.callBuiltinClosure(callee, arg));
         } else {
             return error.NotCallable;
         }
@@ -737,6 +740,27 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.tail) => self.builtinTail(arg),
             @intFromEnum(BuiltinId.attrNames) => self.builtinAttrNames(arg),
             @intFromEnum(BuiltinId.attrValues) => self.builtinAttrValues(arg),
+            @intFromEnum(BuiltinId.hasAttr),
+            @intFromEnum(BuiltinId.getAttr),
+            @intFromEnum(BuiltinId.elemAt),
+            => self.makeBuiltinClosure(callee.asBuiltinId(), arg),
+            else => error.InvalidBuiltin,
+        };
+    }
+
+    fn makeBuiltinClosure(self: *VM, builtin_id: u16, arg: Value) !Value {
+        return Value.builtinClosure(try self.heap.addBuiltinClosure(.{
+            .builtin_id = builtin_id,
+            .arg = arg,
+        }));
+    }
+
+    fn callBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
+        const partial = try self.heap.getBuiltinClosure(callee.asObjectId());
+        return switch (partial.builtin_id) {
+            @intFromEnum(BuiltinId.hasAttr) => self.builtinHasAttr(partial.arg, arg),
+            @intFromEnum(BuiltinId.getAttr) => self.builtinGetAttr(partial.arg, arg),
+            @intFromEnum(BuiltinId.elemAt) => self.builtinElemAt(partial.arg, arg),
             else => error.InvalidBuiltin,
         };
     }
@@ -753,7 +777,7 @@ pub const VM = struct {
 
     fn builtinIsFunction(self: *VM, arg: Value) !Value {
         const value = try self.forceValue(arg);
-        return Value.boolVal(value.discriminant == .closure or value.discriminant == .builtin);
+        return Value.boolVal(value.discriminant == .closure or value.discriminant == .builtin or value.discriminant == .builtin_closure);
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {
@@ -812,6 +836,38 @@ pub const VM = struct {
         const sorted = try self.allocator.dupe(heap_mod.AttrEntry, entries);
         std.mem.sort(heap_mod.AttrEntry, sorted, self, attrEntryNameLessThan);
         return sorted;
+    }
+
+    fn builtinHasAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
+        const name = try self.forceValue(name_arg);
+        const attrs = try self.forceValue(attrs_arg);
+        if (name.discriminant != .string or attrs.discriminant != .attrs) return error.TypeError;
+
+        _ = self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()) catch |err| switch (err) {
+            error.MissingAttribute => return Value.boolVal(false),
+            else => return err,
+        };
+        return Value.boolVal(true);
+    }
+
+    fn builtinGetAttr(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
+        const name = try self.forceValue(name_arg);
+        const attrs = try self.forceValue(attrs_arg);
+        if (name.discriminant != .string or attrs.discriminant != .attrs) return error.TypeError;
+
+        return self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()));
+    }
+
+    fn builtinElemAt(self: *VM, list_arg: Value, index_arg: Value) !Value {
+        const list = try self.forceValue(list_arg);
+        const index = try self.forceValue(index_arg);
+        if (list.discriminant != .list or index.discriminant != .int) return error.TypeError;
+        if (index.asInt() < 0) return error.IndexOutOfBounds;
+
+        const items = try self.heap.getList(list.asObjectId());
+        const i: usize = @intCast(index.asInt());
+        if (i >= items.len) return error.IndexOutOfBounds;
+        return self.forceValue(items[i]);
     }
 
     fn attrEntryNameLessThan(self: *VM, a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {

@@ -17,3 +17,8 @@ builtins.head [ 4 5 ]
 builtins.tail [ 4 5 ]
 builtins.attrNames { b = 2; a = 1; }
 builtins.attrValues { b = 2; a = 1; }
+builtins.hasAttr "a" { a = 1; }
+builtins.hasAttr "b" { a = 1; }
+builtins.getAttr "a" { a = 3; }
+builtins.elemAt [ 1 2 3 ] 1
+builtins.isFunction (builtins.elemAt [ 1 ])

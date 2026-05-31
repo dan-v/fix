@@ -40,6 +40,11 @@ pub const Closure = struct {
     upvalues: []const Value,
 };
 
+pub const BuiltinClosure = struct {
+    builtin_id: u16,
+    arg: Value,
+};
+
 const ClosureObject = struct {
     chunk_id: ChunkId,
     upvalues: ValueRange,
@@ -49,6 +54,7 @@ pub const Object = union(enum) {
     list: ValueRange,
     attrs: AttrRange,
     closure: ClosureObject,
+    builtin_closure: BuiltinClosure,
     thunk: Thunk,
     cell: Cell,
 };
@@ -162,6 +168,13 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn getBuiltinClosure(self: *const ObjectHeap, id: ObjectId) !BuiltinClosure {
+        return switch (self.getConst(id).*) {
+            .builtin_closure => |partial| partial,
+            else => error.InvalidObjectType,
+        };
+    }
+
     pub fn getThunk(self: *ObjectHeap, id: ObjectId) !*Thunk {
         return switch (self.get(id).*) {
             .thunk => |*thunk| thunk,
@@ -269,6 +282,10 @@ pub const ObjectHeap = struct {
             .chunk_id = chunk_id,
             .upvalues = range,
         } });
+    }
+
+    pub fn addBuiltinClosure(self: *ObjectHeap, partial: BuiltinClosure) !ObjectId {
+        return self.add(.{ .builtin_closure = partial });
     }
 
     pub fn addThunk(self: *ObjectHeap, thunk: Thunk) !ObjectId {
