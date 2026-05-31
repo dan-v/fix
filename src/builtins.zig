@@ -86,6 +86,9 @@ pub const BuiltinId = enum(u16) {
     zipAttrsValue = 75,
     toJSON = 76,
     fromJSON = 77,
+    compareVersions = 78,
+    splitVersion = 79,
+    parseDrvName = 80,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -125,6 +128,8 @@ pub fn arity(id: BuiltinId) u8 {
         .functionArgs,
         .toJSON,
         .fromJSON,
+        .splitVersion,
+        .parseDrvName,
         .floor,
         .ceil,
         .baseNameOf,
@@ -164,6 +169,7 @@ pub fn arity(id: BuiltinId) u8 {
         .zipAttrsWith,
         .hashString,
         .hashFile,
+        .compareVersions,
         => 2,
         .foldlStrict,
         .substring,
@@ -480,6 +486,18 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("fromJSON"),
             .value = Value.builtin(@intFromEnum(BuiltinId.fromJSON)),
+        },
+        .{
+            .name = try intern.intern("compareVersions"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.compareVersions)),
+        },
+        .{
+            .name = try intern.intern("splitVersion"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.splitVersion)),
+        },
+        .{
+            .name = try intern.intern("parseDrvName"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.parseDrvName)),
         },
         .{
             .name = try intern.intern("true"),

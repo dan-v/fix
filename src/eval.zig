@@ -1198,6 +1198,24 @@ test "evaluate JSON builtins" {
     try std.testing.expectEqualStrings("\"float\"", parsed_float_type);
 }
 
+test "evaluate version parsing builtins" {
+    const split = try renderForTest("builtins.splitVersion \"1.0-beta2\"");
+    defer std.testing.allocator.free(split);
+    try std.testing.expectEqualStrings("[ \"1\" \"0\" \"beta\" \"2\" ]", split);
+
+    const equal = try renderForTest("builtins.compareVersions \"1.02\" \"1.2\"");
+    defer std.testing.allocator.free(equal);
+    try std.testing.expectEqualStrings("0", equal);
+
+    const pre = try renderForTest("builtins.compareVersions \"1.0pre\" \"1.0\"");
+    defer std.testing.allocator.free(pre);
+    try std.testing.expectEqualStrings("-1", pre);
+
+    const drv = try renderForTest("(builtins.parseDrvName \"foo-bar-1.2pre3\").version");
+    defer std.testing.allocator.free(drv);
+    try std.testing.expectEqualStrings("\"1.2pre3\"", drv);
+}
+
 test "evaluate control and error builtins" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

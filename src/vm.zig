@@ -33,6 +33,7 @@ const derivation = @import("derivation.zig");
 const numeric = @import("runtime/numeric.zig");
 const path_ops = @import("runtime/paths.zig");
 const nix_hash = @import("runtime/hash.zig");
+const version = @import("runtime/version.zig");
 
 fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
     if (prefix.len == 0) return name;
@@ -856,6 +857,9 @@ pub const VM = struct {
             .zipAttrsValue => self.builtinZipAttrsValue(args[0], args[1], args[2]),
             .toJSON => self.builtinToJSON(args[0]),
             .fromJSON => self.builtinFromJSON(args[0]),
+            .compareVersions => self.builtinCompareVersions(args[0], args[1]),
+            .splitVersion => self.builtinSplitVersion(args[0]),
+            .parseDrvName => self.builtinParseDrvName(args[0]),
         };
     }
 
@@ -1163,6 +1167,40 @@ pub const VM = struct {
             };
         }
         return Value.attrs(try self.heap.addAttrs(entries));
+    }
+
+    fn builtinCompareVersions(self: *VM, left_arg: Value, right_arg: Value) !Value {
+        const left = try self.stringArg(left_arg);
+        const right = try self.stringArg(right_arg);
+        return Value.int(try version.compareVersions(self.allocator, left, right));
+    }
+
+    fn builtinSplitVersion(self: *VM, arg: Value) !Value {
+        const text = try self.stringArg(arg);
+        const parts = try version.splitVersion(self.allocator, text);
+        defer self.allocator.free(parts);
+
+        const values = try self.allocator.alloc(Value, parts.len);
+        defer self.allocator.free(values);
+        for (parts, values) |part, *value| {
+            value.* = Value.string(try self.intern.intern(part));
+        }
+        return Value.list(try self.heap.addList(values));
+    }
+
+    fn builtinParseDrvName(self: *VM, arg: Value) !Value {
+        const parsed = version.parseDrvName(try self.stringArg(arg));
+        const entries = [_]heap_mod.AttrEntry{
+            .{
+                .name = try self.intern.intern("name"),
+                .value = Value.string(try self.intern.intern(parsed.name)),
+            },
+            .{
+                .name = try self.intern.intern("version"),
+                .value = Value.string(try self.intern.intern(parsed.version)),
+            },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {
