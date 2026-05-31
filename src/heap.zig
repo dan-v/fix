@@ -201,3 +201,68 @@ pub const ObjectHeap = struct {
         return self.attrs.items[start..end];
     }
 };
+
+test "object heap stores list and attrs payloads behind object ids" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const list_id = try heap.addList(&.{
+        Value.int(1),
+        Value.int(2),
+        Value.int(3),
+    });
+
+    const attrs_id = try heap.addAttrs(&.{
+        .{ .name = 11, .value = Value.int(42) },
+        .{ .name = 12, .value = Value.boolVal(true) },
+    });
+
+    const items = try heap.getList(list_id);
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqual(@as(i64, 1), items[0].asInt());
+    try std.testing.expectEqual(@as(i64, 3), items[2].asInt());
+
+    const entries = try heap.getAttrs(attrs_id);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(InternId, 11), entries[0].name);
+    try std.testing.expectEqual(@as(i64, 42), entries[0].value.asInt());
+    try std.testing.expect(entries[1].value.asBool());
+}
+
+test "object heap preserves earlier ranges as side arenas grow" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const first_id = try heap.addList(&.{ Value.int(1), Value.int(2) });
+
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        _ = try heap.addList(&.{
+            Value.int(@intCast(i)),
+            Value.int(@intCast(i + 1)),
+            Value.int(@intCast(i + 2)),
+        });
+    }
+
+    const first = try heap.getList(first_id);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqual(@as(i64, 1), first[0].asInt());
+    try std.testing.expectEqual(@as(i64, 2), first[1].asInt());
+}
+
+test "object heap stores closures and mutable runtime cells" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const closure_id = try heap.addClosure(7, &.{ Value.int(10), Value.boolVal(false) });
+    const closure = try heap.getClosure(closure_id);
+    try std.testing.expectEqual(@as(ChunkId, 7), closure.chunk_id);
+    try std.testing.expectEqual(@as(usize, 2), closure.upvalues.len);
+    try std.testing.expectEqual(@as(i64, 10), closure.upvalues[0].asInt());
+    try std.testing.expect(!closure.upvalues[1].asBool());
+
+    const cell_id = try heap.addCell(.{ .value = Value.int(1) });
+    try std.testing.expectEqual(@as(i64, 1), (try heap.getCellValue(cell_id)).asInt());
+    try heap.setCellValue(cell_id, Value.int(2));
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getCellValue(cell_id)).asInt());
+}
