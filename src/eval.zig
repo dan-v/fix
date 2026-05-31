@@ -1118,6 +1118,14 @@ test "evaluate map concatMap mapAttrs and genList builtins" {
     defer std.testing.allocator.free(mapped_attrs);
     try std.testing.expectEqualStrings("3", mapped_attrs);
 
+    const map_attrs_lazy_select = try renderForTest("(builtins.mapAttrs (name: value: if name == \"a\" then value else builtins.throw \"bad\") { a = 1; b = 2; }).a");
+    defer std.testing.allocator.free(map_attrs_lazy_select);
+    try std.testing.expectEqualStrings("1", map_attrs_lazy_select);
+
+    const map_attrs_lazy_has_attr = try renderForTest("(builtins.mapAttrs (name: value: builtins.throw \"bad\") { a = 1; }) ? a");
+    defer std.testing.allocator.free(map_attrs_lazy_has_attr);
+    try std.testing.expectEqualStrings("true", map_attrs_lazy_has_attr);
+
     const generated = try renderForTest("builtins.genList (x: x + 1) 3");
     defer std.testing.allocator.free(generated);
     try std.testing.expectEqualStrings("[ 1 2 3 ]", generated);
@@ -1269,6 +1277,14 @@ test "evaluate nixpkgs-heavy collection builtins" {
     const zipped_first = try renderForTest("(builtins.zipAttrsWith (name: values: builtins.head values) [ { a = 1; } { a = 2; } ]).a");
     defer std.testing.allocator.free(zipped_first);
     try std.testing.expectEqualStrings("1", zipped_first);
+
+    const zipped_lazy_select = try renderForTest("(builtins.zipAttrsWith (name: values: if name == \"a\" then 1 else builtins.throw \"bad\") [ { a = 1; b = 2; } ]).a");
+    defer std.testing.allocator.free(zipped_lazy_select);
+    try std.testing.expectEqualStrings("1", zipped_lazy_select);
+
+    const zipped_lazy_has_attr = try renderForTest("(builtins.zipAttrsWith (name: values: builtins.throw \"bad\") [ { a = 1; } ]) ? a");
+    defer std.testing.allocator.free(zipped_lazy_has_attr);
+    try std.testing.expectEqualStrings("true", zipped_lazy_has_attr);
 }
 
 test "evaluate function metadata builtins" {

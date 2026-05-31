@@ -82,6 +82,8 @@ pub const BuiltinId = enum(u16) {
     zipAttrsWith = 71,
     hashString = 72,
     hashFile = 73,
+    mapAttrValue = 74,
+    zipAttrsValue = 75,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -162,6 +164,9 @@ pub fn arity(id: BuiltinId) u8 {
         .foldlStrict,
         .substring,
         .replaceStrings,
+        => 3,
+        .mapAttrValue,
+        .zipAttrsValue,
         => 3,
     };
 }

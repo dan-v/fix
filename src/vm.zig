@@ -645,13 +645,21 @@ pub const VM = struct {
     }
 
     fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
-        if (closure_val.discriminant != .closure) return error.NotCallable;
-        const closure_id = closure_val.asObjectId();
-        const closure = try self.getClosureById(closure_id);
-        const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-        const stop_depth = self.frames.items.len;
-        try self.pushFrame(ch, 0, closure_id);
-        return self.runUntil(stop_depth);
+        switch (closure_val.discriminant) {
+            .closure => {
+                const closure_id = closure_val.asObjectId();
+                const closure = try self.getClosureById(closure_id);
+                const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+                const stop_depth = self.frames.items.len;
+                try self.pushFrame(ch, 0, closure_id);
+                return self.runUntil(stop_depth);
+            },
+            .builtin_closure => {
+                const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());
+                return self.applyBuiltin(closure.builtin_id, closure.args);
+            },
+            else => return error.NotCallable,
+        }
     }
 
     fn makeThunk(self: *VM, closure: Value) !Value {
@@ -844,11 +852,17 @@ pub const VM = struct {
             .zipAttrsWith => self.builtinZipAttrsWith(args[0], args[1]),
             .hashString => self.builtinHashString(args[0], args[1]),
             .hashFile => self.builtinHashFile(args[0], args[1]),
+            .mapAttrValue => self.builtinMapAttrValue(args[0], args[1], args[2]),
+            .zipAttrsValue => self.builtinZipAttrsValue(args[0], args[1], args[2]),
         };
     }
 
     fn makeBuiltinClosure(self: *VM, builtin_id: u16, args: []const Value) !Value {
         return Value.builtinClosure(try self.heap.addBuiltinClosure(builtin_id, args));
+    }
+
+    fn makeBuiltinThunk(self: *VM, id: BuiltinId, args: []const Value) !Value {
+        return self.makeThunk(try self.makeBuiltinClosure(@intFromEnum(id), args));
     }
 
     fn builtinTypePredicate(self: *VM, arg: Value, expected: @import("value.zig").ValueType) !Value {
@@ -998,13 +1012,18 @@ pub const VM = struct {
         const entries = try self.allocator.alloc(heap_mod.AttrEntry, groups.items.len);
         defer self.allocator.free(entries);
         for (groups.items, entries) |group, *entry| {
-            const partial = try self.callValue(func, Value.string(group.name));
+            const values = Value.list(try self.heap.addList(group.values.items));
             entry.* = .{
                 .name = group.name,
-                .value = try self.callValue(partial, Value.list(try self.heap.addList(group.values.items))),
+                .value = try self.makeBuiltinThunk(.zipAttrsValue, &.{ func, Value.string(group.name), values }),
             };
         }
         return Value.attrs(try self.heap.addAttrs(entries));
+    }
+
+    fn builtinZipAttrsValue(self: *VM, func_arg: Value, name_arg: Value, values_arg: Value) !Value {
+        const partial = try self.callValue(func_arg, name_arg);
+        return self.callValue(partial, values_arg);
     }
 
     fn builtinHashString(self: *VM, algorithm_arg: Value, string_arg: Value) !Value {
@@ -1418,13 +1437,17 @@ pub const VM = struct {
         defer self.allocator.free(out);
 
         for (attr_entries, out) |entry, *mapped| {
-            const partial = try self.callValue(func, Value.string(entry.name));
             mapped.* = .{
                 .name = entry.name,
-                .value = try self.callValue(partial, entry.value),
+                .value = try self.makeBuiltinThunk(.mapAttrValue, &.{ func, Value.string(entry.name), entry.value }),
             };
         }
         return Value.attrs(try self.heap.addAttrs(out));
+    }
+
+    fn builtinMapAttrValue(self: *VM, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
+        const partial = try self.callValue(func_arg, name_arg);
+        return self.callValue(partial, value_arg);
     }
 
     fn builtinGenList(self: *VM, fn_arg: Value, count_arg: Value) !Value {

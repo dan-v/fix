@@ -75,6 +75,7 @@ builtins.filter (x: false) [ (1 / 0) ]
 builtins.map (x: x + 1) [ 1 2 ]
 builtins.concatMap (x: [ x ]) [ 1 2 ]
 (builtins.mapAttrs (name: value: value) { a = 1; }).a
+(builtins.mapAttrs (name: value: if name == "a" then value else builtins.throw "bad") { a = 1; b = 2; }).a
 builtins.genList (x: x) 2
 builtins.stringLength "abcd"
 builtins.concatStringsSep "," [ "a" "b" ]
@@ -90,6 +91,7 @@ builtins.sort (a: b: a < b) [ 2 1 ]
 (builtins.groupBy (x: "k") [ 1 2 ]).k
 builtins.catAttrs "a" [ { a = 1; } { b = 2; } { a = 3; } ]
 (builtins.zipAttrsWith (name: values: builtins.length values) [ { a = 1; } { a = 2; b = 3; } ]).a
+(builtins.zipAttrsWith (name: values: if name == "a" then 1 else builtins.throw "bad") [ { a = 1; b = 2; } ]).a
 (builtins.functionArgs ({ a ? 1 }: a)).a
 builtins.unsafeGetAttrPos "a" { a = 1; }
 builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]
