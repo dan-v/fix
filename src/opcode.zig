@@ -25,6 +25,8 @@ pub const OpCode = enum(u8) {
     get_local,
     /// Push local variable without forcing lazy cells (operand: 1-byte offset).
     capture_local,
+    /// Push captured upvalue without forcing lazy cells (operand: 1-byte offset).
+    capture_upvalue,
     /// Set local variable at offset, popping from stack.
     set_local,
     /// Set the value inside a local cell, popping from stack.

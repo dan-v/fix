@@ -192,6 +192,14 @@ pub const VM = struct {
                     try self.push(val);
                 },
 
+                .capture_upvalue => {
+                    const slot = code[frame.ip];
+                    frame.ip += 1;
+                    const closure_ptr = frame.closure_ptr orelse return error.MissingClosure;
+                    const upvalues = closureUpvalues(closure_ptr);
+                    try self.push(upvalues[slot]);
+                },
+
                 .set_local => {
                     const slot = code[frame.ip];
                     frame.ip += 1;

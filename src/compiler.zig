@@ -27,8 +27,11 @@ const Local = struct {
 };
 
 const Capture = struct {
+    const Kind = enum { local, upvalue };
+
     name: []const u8,
-    parent_slot: u16,
+    kind: Kind,
+    index: u16,
 };
 
 pub const Compiler = struct {
@@ -227,7 +230,7 @@ pub const Compiler = struct {
     fn compileApply(self: *Compiler, node: *const Node) !void {
         const ap = node.data.apply;
         try self.compileNode(ap.func);
-        try self.compileNode(ap.arg);
+        try self.compileThunk(ap.arg);
         try self.emitOp(.call);
     }
 
@@ -256,9 +259,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator);
         const child_id = try self.registry.register(child_chunk);
-        for (child.captures.items) |capture| {
-            try self.emitOpByte(.capture_local, @intCast(capture.parent_slot));
-        }
+        try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
         try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
     }
@@ -308,12 +309,19 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator);
         const child_id = try self.registry.register(child_chunk);
-        for (child.captures.items) |capture| {
-            try self.emitOpByte(.capture_local, @intCast(capture.parent_slot));
-        }
+        try self.emitCaptures(child.captures.items);
         try self.emitOpU16(.closure, @intCast(child_id));
         try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
         try self.emitOp(.make_thunk);
+    }
+
+    fn emitCaptures(self: *Compiler, captures: []const Capture) !void {
+        for (captures) |capture| {
+            switch (capture.kind) {
+                .local => try self.emitOpByte(.capture_local, @intCast(capture.index)),
+                .upvalue => try self.emitOpByte(.capture_upvalue, @intCast(capture.index)),
+            }
+        }
     }
 
     fn compileIfElse(self: *Compiler, node: *const Node) !void {
@@ -437,17 +445,26 @@ pub const Compiler = struct {
 
     fn resolveCapture(self: *Compiler, name: []const u8) !?u8 {
         const parent = self.parent orelse return null;
-        const parent_slot = parent.resolveLocal(name) orelse return null;
+        if (parent.resolveLocal(name)) |parent_slot| {
+            return try self.addCapture(name, .local, parent_slot);
+        }
+        if (try parent.resolveCapture(name)) |parent_upvalue| {
+            return try self.addCapture(name, .upvalue, parent_upvalue);
+        }
+        return null;
+    }
 
-        for (self.captures.items, 0..) |capture, index| {
-            if (capture.parent_slot == parent_slot and std.mem.eql(u8, capture.name, name)) {
-                return @intCast(index);
+    fn addCapture(self: *Compiler, name: []const u8, kind: Capture.Kind, capture_index: u16) !u8 {
+        for (self.captures.items, 0..) |capture, existing_index| {
+            if (capture.kind == kind and capture.index == capture_index and std.mem.eql(u8, capture.name, name)) {
+                return @intCast(existing_index);
             }
         }
 
         try self.captures.append(self.allocator, .{
             .name = name,
-            .parent_slot = parent_slot,
+            .kind = kind,
+            .index = capture_index,
         });
         return @intCast(self.captures.items.len - 1);
     }

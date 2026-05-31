@@ -86,6 +86,27 @@ test "end-to-end: guarded recursive let bindings can terminate" {
     try std.testing.expectEqual(@as(i64, 2), false_guard.asInt());
 }
 
+test "end-to-end: function arguments are lazy" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const unused_arg = try ev.evaluate("let f = x: 1; a = f b; b = a + 1; in b");
+    try std.testing.expectEqual(@as(i64, 2), unused_arg.asInt());
+
+    const guarded_arg = try ev.evaluate("let f = x: if true then 1 else x; a = f b; b = a + 1; in b");
+    try std.testing.expectEqual(@as(i64, 2), guarded_arg.asInt());
+
+    const used_arg = try ev.evaluate("let f = x: x + 1; a = f b; b = 3; in a");
+    try std.testing.expectEqual(@as(i64, 4), used_arg.asInt());
+
+    try std.testing.expectError(
+        error.RecursiveThunk,
+        ev.evaluate("let f = x: x + 1; a = f b; b = a + 1; in a"),
+    );
+}
+
 test "end-to-end: attribute set" {
     const alloc = std.testing.allocator;
 
