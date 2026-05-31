@@ -848,6 +848,13 @@ pub const VM = struct {
             .derivationStrict => self.builtinDerivation(args[0]),
             .storePath => self.builtinStorePath(args[0]),
             .path => self.builtinPath(args[0]),
+            .sort => self.builtinSort(args[0], args[1]),
+            .partition => self.builtinPartition(args[0], args[1]),
+            .groupBy => self.builtinGroupBy(args[0], args[1]),
+            .genericClosure => self.builtinGenericClosure(args[0]),
+            .functionArgs => self.builtinFunctionArgs(args[0]),
+            .isCallable => self.builtinIsFunction(args[0]),
+            .unsafeGetAttrPos => self.builtinUnsafeGetAttrPos(args[0], args[1]),
         };
     }
 
@@ -1043,6 +1050,36 @@ pub const VM = struct {
             if (entry.name == name) return i;
         }
         return null;
+    }
+
+    fn groupIndex(groups: anytype, name: InternId) ?usize {
+        for (groups, 0..) |group, i| {
+            if (group.name == name) return i;
+        }
+        return null;
+    }
+
+    fn callComparator(self: *VM, cmp: Value, left: Value, right: Value) !bool {
+        const partial = try self.callValue(cmp, left);
+        const result = try self.forceValue(try self.callValue(partial, right));
+        if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+        return result.discriminant == .bool_true;
+    }
+
+    fn genericClosureAppend(
+        self: *VM,
+        item: Value,
+        result: *std.ArrayListUnmanaged(Value),
+        keys: *std.ArrayListUnmanaged(Value),
+    ) !void {
+        const forced = try self.forceValue(item);
+        if (forced.discriminant != .attrs) return error.TypeError;
+        const key = try self.forceValue(try self.heap.getAttrValue(forced.asObjectId(), try self.intern.intern("key")));
+        for (keys.items) |seen| {
+            if (try self.valuesEqual(seen, key)) return;
+        }
+        try keys.append(self.allocator, key);
+        try result.append(self.allocator, item);
     }
 
     fn builtinAttrNames(self: *VM, arg: Value) !Value {
@@ -1542,6 +1579,141 @@ pub const VM = struct {
         }
 
         return Value.path(try self.intern.intern(path));
+    }
+
+    fn builtinSort(self: *VM, cmp_arg: Value, list_arg: Value) !Value {
+        const cmp = try self.forceValue(cmp_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const items = try self.heap.getList(list.asObjectId());
+        const sorted = try self.allocator.dupe(Value, items);
+        defer self.allocator.free(sorted);
+
+        var i: usize = 1;
+        while (i < sorted.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and try self.callComparator(cmp, sorted[j], sorted[j - 1])) : (j -= 1) {
+                std.mem.swap(Value, &sorted[j], &sorted[j - 1]);
+            }
+        }
+
+        return Value.list(try self.heap.addList(sorted));
+    }
+
+    fn builtinPartition(self: *VM, pred_arg: Value, list_arg: Value) !Value {
+        const pred = try self.forceValue(pred_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        var right: std.ArrayListUnmanaged(Value) = .empty;
+        defer right.deinit(self.allocator);
+        var wrong: std.ArrayListUnmanaged(Value) = .empty;
+        defer wrong.deinit(self.allocator);
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const result = try self.forceValue(try self.callValue(pred, item));
+            if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
+            if (result.discriminant == .bool_true) {
+                try right.append(self.allocator, item);
+            } else {
+                try wrong.append(self.allocator, item);
+            }
+        }
+
+        const entries = [_]heap_mod.AttrEntry{
+            .{ .name = try self.intern.intern("right"), .value = Value.list(try self.heap.addList(right.items)) },
+            .{ .name = try self.intern.intern("wrong"), .value = Value.list(try self.heap.addList(wrong.items)) },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
+    }
+
+    fn builtinGroupBy(self: *VM, fn_arg: Value, list_arg: Value) !Value {
+        const func = try self.forceValue(fn_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const Group = struct {
+            name: InternId,
+            items: std.ArrayListUnmanaged(Value) = .empty,
+        };
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        defer {
+            for (groups.items) |*group| group.items.deinit(self.allocator);
+            groups.deinit(self.allocator);
+        }
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const key = try self.forceValue(try self.callValue(func, item));
+            if (key.discriminant != .string) return error.TypeError;
+            const index = groupIndex(groups.items, key.asInternId()) orelse blk: {
+                try groups.append(self.allocator, .{ .name = key.asInternId() });
+                break :blk groups.items.len - 1;
+            };
+            try groups.items[index].items.append(self.allocator, item);
+        }
+
+        const entries = try self.allocator.alloc(heap_mod.AttrEntry, groups.items.len);
+        defer self.allocator.free(entries);
+        for (groups.items, entries) |group, *entry| {
+            entry.* = .{
+                .name = group.name,
+                .value = Value.list(try self.heap.addList(group.items.items)),
+            };
+        }
+        return Value.attrs(try self.heap.addAttrs(entries));
+    }
+
+    fn builtinGenericClosure(self: *VM, arg: Value) !Value {
+        const attrs = try self.forceValue(arg);
+        if (attrs.discriminant != .attrs) return error.TypeError;
+
+        const start_set = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("startSet")));
+        const operator = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("operator")));
+        if (start_set.discriminant != .list) return error.TypeError;
+
+        var result: std.ArrayListUnmanaged(Value) = .empty;
+        defer result.deinit(self.allocator);
+        var keys: std.ArrayListUnmanaged(Value) = .empty;
+        defer keys.deinit(self.allocator);
+
+        for (try self.heap.getList(start_set.asObjectId())) |item| {
+            try self.genericClosureAppend(item, &result, &keys);
+        }
+
+        var index: usize = 0;
+        while (index < result.items.len) : (index += 1) {
+            const produced = try self.forceValue(try self.callValue(operator, result.items[index]));
+            if (produced.discriminant != .list) return error.TypeError;
+            for (try self.heap.getList(produced.asObjectId())) |item| {
+                try self.genericClosureAppend(item, &result, &keys);
+            }
+        }
+
+        return Value.list(try self.heap.addList(result.items));
+    }
+
+    fn builtinFunctionArgs(self: *VM, arg: Value) !Value {
+        const func = try self.forceValue(arg);
+        if (func.discriminant == .builtin or func.discriminant == .builtin_closure) {
+            return Value.attrs(try self.heap.addAttrs(&.{}));
+        }
+        if (func.discriminant != .closure) return error.TypeError;
+
+        const closure = try self.heap.getClosure(func.asObjectId());
+        const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+        return Value.attrs(try self.heap.addAttrs(ch.function_args));
+    }
+
+    fn builtinUnsafeGetAttrPos(self: *VM, name_arg: Value, attrs_arg: Value) !Value {
+        const name = try self.forceValue(name_arg);
+        const attrs = try self.forceValue(attrs_arg);
+        if (name.discriminant != .string or attrs.discriminant != .attrs) return error.TypeError;
+        _ = self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()) catch |err| switch (err) {
+            error.MissingAttribute => return Value.null_val,
+            else => return err,
+        };
+        return Value.null_val;
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {

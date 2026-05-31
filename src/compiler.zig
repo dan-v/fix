@@ -468,10 +468,19 @@ pub const Compiler = struct {
         try child.emitOp(.validate_attrs);
         try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
         try child.builder.writeU16(child.allocator, @intCast(lambda.params.len));
+        var function_args: std.ArrayListUnmanaged(@import("heap.zig").AttrEntry) = .empty;
+        defer function_args.deinit(self.allocator);
+        try function_args.ensureTotalCapacity(self.allocator, lambda.params.len);
         for (lambda.params) |param| {
             const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-            try child.builder.writeU16(child.allocator, @intCast(try self.intern.intern(name)));
+            const name_id = try self.intern.intern(name);
+            try child.builder.writeU16(child.allocator, @intCast(name_id));
+            function_args.appendAssumeCapacity(.{
+                .name = name_id,
+                .value = @import("value.zig").Value.boolVal(param.default != null),
+            });
         }
+        try child_builder.setFunctionArgs(self.allocator, function_args.items);
 
         for (lambda.params) |param| {
             const name = self.source[param.name.offset .. param.name.offset + param.name.len];

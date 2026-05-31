@@ -59,6 +59,13 @@ pub const BuiltinId = enum(u16) {
     derivationStrict = 49,
     storePath = 50,
     path = 51,
+    sort = 52,
+    partition = 53,
+    groupBy = 54,
+    genericClosure = 55,
+    functionArgs = 56,
+    isCallable = 57,
+    unsafeGetAttrPos = 58,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -94,6 +101,9 @@ pub fn arity(id: BuiltinId) u8 {
         .derivationStrict,
         .storePath,
         .path,
+        .genericClosure,
+        .functionArgs,
+        .isCallable,
         => 1,
         .hasAttr,
         .getAttr,
@@ -113,6 +123,10 @@ pub fn arity(id: BuiltinId) u8 {
         .genList,
         .concatStringsSep,
         .trace,
+        .sort,
+        .partition,
+        .groupBy,
+        .unsafeGetAttrPos,
         => 2,
         .foldlStrict,
         .substring,
@@ -330,6 +344,34 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("path"),
             .value = Value.builtin(@intFromEnum(BuiltinId.path)),
+        },
+        .{
+            .name = try intern.intern("sort"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.sort)),
+        },
+        .{
+            .name = try intern.intern("partition"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.partition)),
+        },
+        .{
+            .name = try intern.intern("groupBy"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.groupBy)),
+        },
+        .{
+            .name = try intern.intern("genericClosure"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.genericClosure)),
+        },
+        .{
+            .name = try intern.intern("functionArgs"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.functionArgs)),
+        },
+        .{
+            .name = try intern.intern("isCallable"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.isCallable)),
+        },
+        .{
+            .name = try intern.intern("unsafeGetAttrPos"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.unsafeGetAttrPos)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

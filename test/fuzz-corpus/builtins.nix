@@ -67,6 +67,11 @@ builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type
 builtins.isPath (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
+builtins.sort (a: b: a < b) [ 2 1 ]
+(builtins.partition (x: x < 2) [ 1 2 ]).right
+(builtins.groupBy (x: "k") [ 1 2 ]).k
+(builtins.functionArgs ({ a ? 1 }: a)).a
+builtins.unsafeGetAttrPos "a" { a = 1; }
 builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]
 builtins.foldl' (a: b: a) 1 [ (1 / 0) ]
 builtins.foldl' (a: b: b) 0 [ 1 2 ]

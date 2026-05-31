@@ -1138,6 +1138,38 @@ test "evaluate path construction builtins" {
     try std.testing.expect(path.asBool());
 }
 
+test "evaluate nixpkgs-heavy collection builtins" {
+    const sorted = try renderForTest("builtins.sort (a: b: a < b) [ 3 1 2 ]");
+    defer std.testing.allocator.free(sorted);
+    try std.testing.expectEqualStrings("[ 1 2 3 ]", sorted);
+
+    const partitioned = try renderForTest("(builtins.partition (x: x < 3) [ 1 3 2 ]).right");
+    defer std.testing.allocator.free(partitioned);
+    try std.testing.expectEqualStrings("[ 1 2 ]", partitioned);
+
+    const grouped = try renderForTest("(builtins.groupBy (x: if x < 3 then \"small\" else \"big\") [ 1 3 2 ]).small");
+    defer std.testing.allocator.free(grouped);
+    try std.testing.expectEqualStrings("[ 1 2 ]", grouped);
+
+    const closure_len = try renderForTest("builtins.length (builtins.genericClosure { startSet = [ { key = 1; } ]; operator = item: if item.key < 3 then [ { key = item.key + 1; } ] else [ ]; })");
+    defer std.testing.allocator.free(closure_len);
+    try std.testing.expectEqualStrings("3", closure_len);
+}
+
+test "evaluate function metadata builtins" {
+    const args = try renderForTest("(builtins.functionArgs ({ a, b ? 1 }: a)).b");
+    defer std.testing.allocator.free(args);
+    try std.testing.expectEqualStrings("true", args);
+
+    const callable = try renderForTest("builtins.isCallable (x: x)");
+    defer std.testing.allocator.free(callable);
+    try std.testing.expectEqualStrings("true", callable);
+
+    const pos = try renderForTest("builtins.unsafeGetAttrPos \"a\" { a = 1; }");
+    defer std.testing.allocator.free(pos);
+    try std.testing.expectEqualStrings("null", pos);
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);
