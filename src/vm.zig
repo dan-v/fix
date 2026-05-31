@@ -23,6 +23,7 @@ const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const MemoCache = @import("cache.zig").MemoCache;
 const Thunk = @import("thunk.zig").Thunk;
+const Cell = @import("thunk.zig").Cell;
 const InternTable = @import("intern.zig").InternTable;
 const Scheduler = @import("scheduler.zig").Scheduler;
 
@@ -141,7 +142,11 @@ pub const VM = struct {
 
     // ---- main loop ----
 
-    fn run(self: *VM) !Value {
+    fn run(self: *VM) anyerror!Value {
+        return self.runUntil(0);
+    }
+
+    fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
         while (true) {
             var frame = self.currentFrame();
             const code = frame.chunk_ptr.code;
@@ -175,6 +180,14 @@ pub const VM = struct {
                 .get_local => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
+                    const raw = self.stack.items[frame.frame_base + slot];
+                    const val = try self.forceValue(raw);
+                    try self.push(val);
+                },
+
+                .capture_local => {
+                    const slot = code[frame.ip];
+                    frame.ip += 1;
                     const val = self.stack.items[frame.frame_base + slot];
                     try self.push(val);
                 },
@@ -186,12 +199,23 @@ pub const VM = struct {
                     self.setStack(frame.frame_base + slot, val);
                 },
 
+                .set_cell_local => {
+                    const slot = code[frame.ip];
+                    frame.ip += 1;
+                    const val = self.pop();
+                    const cell_val = self.stack.items[frame.frame_base + slot];
+                    if (cell_val.discriminant != .cell) return error.TypeError;
+                    const cell = cell_val.asPtr(Cell);
+                    cell.value = val;
+                },
+
                 .get_upvalue => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
                     const closure_ptr = frame.closure_ptr orelse return error.MissingClosure;
                     const upvalues = closureUpvalues(closure_ptr);
-                    try self.push(upvalues[slot]);
+                    const val = try self.forceValue(upvalues[slot]);
+                    try self.push(val);
                 },
 
                 // ---- integer arithmetic ----
@@ -389,8 +413,12 @@ pub const VM = struct {
 
                 // ---- thunks ----
                 .make_thunk => {
+                    const closure = self.pop();
+                    try self.push(try self.makeThunk(closure));
+                },
+                .make_cell => {
                     const val = self.pop();
-                    try self.push(makeResolvedThunk(val));
+                    try self.push(try self.makeCell(val));
                 },
 
                 // ---- attribute access ----
@@ -418,7 +446,7 @@ pub const VM = struct {
                 .ret => {
                     const result = self.pop();
                     const finished_frame = self.popFrame();
-                    if (self.frames.items.len == 0) {
+                    if (self.frames.items.len == stop_depth) {
                         return result;
                     }
                     self.sp = finished_frame.frame_base;
@@ -445,10 +473,8 @@ pub const VM = struct {
     }
 
     fn valuesEqual(self: *VM, a: Value, b: Value) bool {
-        var va = a;
-        var vb = b;
-        if (va.isThunk()) va = self.forceThunk(va);
-        if (vb.isThunk()) vb = self.forceThunk(vb);
+        const va = self.forceValue(a) catch Value.null_val;
+        const vb = self.forceValue(b) catch Value.null_val;
 
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
@@ -459,17 +485,15 @@ pub const VM = struct {
             .list => va.asPtr(u8) == vb.asPtr(u8),
             .attrs => va.asPtr(u8) == vb.asPtr(u8),
             .closure, .builtin => false,
-            .thunk => unreachable,
+            .thunk, .cell => unreachable,
         };
     }
 
     const CompareResult = enum { lt, eq, gt };
 
     fn compareValues(self: *VM, a: Value, b: Value) CompareResult {
-        var va = a;
-        var vb = b;
-        if (va.isThunk()) va = self.forceThunk(va);
-        if (vb.isThunk()) vb = self.forceThunk(vb);
+        const va = self.forceValue(a) catch Value.null_val;
+        const vb = self.forceValue(b) catch Value.null_val;
 
         switch (va.discriminant) {
             .int => {
@@ -498,22 +522,56 @@ pub const VM = struct {
     // ---- thunk management ----
 
     pub fn forceThunk(self: *VM, thunk_val: Value) Value {
+        return self.forceThunkFallible(thunk_val) catch Value.null_val;
+    }
+
+    fn forceValue(self: *VM, value: Value) anyerror!Value {
+        return switch (value.discriminant) {
+            .thunk => try self.forceThunkFallible(value),
+            .cell => {
+                const cell = value.asPtr(Cell);
+                const forced = try self.forceValue(cell.value);
+                cell.value = forced;
+                return forced;
+            },
+            else => value,
+        };
+    }
+
+    fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
         const t: *Thunk = thunk_val.asPtr(Thunk);
         switch (t.tryClaim()) {
             .already_resolved => return t.result,
             .claimed => {
-                const result = self.eval(t.chunk_id) catch Value.null_val;
+                const result = try self.evalThunkClosure(t.closure);
                 t.resolve(result);
                 return result;
             },
             .busy => {
-                return t.waitAndGet();
+                return error.RecursiveThunk;
             },
         }
     }
 
-    fn makeResolvedThunk(val: Value) Value {
-        return val;
+    fn evalThunkClosure(self: *VM, closure: Value) anyerror!Value {
+        if (closure.discriminant != .closure) return error.NotCallable;
+        const id_ptr: *ChunkId = @ptrCast(@alignCast(closure.asPtr(u8)));
+        const ch = self.registry.get(id_ptr.*) orelse return error.InvalidChunk;
+        const stop_depth = self.frames.items.len;
+        try self.pushFrame(ch, 0, closure.asPtr(u8));
+        return self.runUntil(stop_depth);
+    }
+
+    fn makeThunk(self: *VM, closure: Value) !Value {
+        const thunk = try self.allocator.create(Thunk);
+        thunk.* = Thunk.init(closure);
+        return Value.thunkPtr(thunk);
+    }
+
+    fn makeCell(self: *VM, val: Value) !Value {
+        const cell = try self.allocator.create(Cell);
+        cell.* = .{ .value = val };
+        return Value.cell(cell);
     }
 
     // ---- data structure builders ----

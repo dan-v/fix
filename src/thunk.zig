@@ -14,8 +14,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
-const ChunkId = types.ChunkId;
-const InternId = types.InternId;
 const ForceResult = types.ForceResult;
 
 pub const ThunkState = enum(u8) {
@@ -25,23 +23,26 @@ pub const ThunkState = enum(u8) {
     blackhole = 3,
 };
 
+pub const Cell = struct {
+    value: Value,
+};
+
 /// A thunk is heap-allocated and shared across threads via atomic operations.
 pub const Thunk = struct {
     /// Atomic state.
     state: std.atomic.Value(u8),
-    /// The chunk to execute when forcing.
-    chunk_id: ChunkId,
-    /// Captured environment at creation time (flattened).
-    /// The env is a slice of (InternId, Value) pairs stored inline.
-    env_pairs_count: u16,
-    env_pairs_data: [*]EnvPair,
+    /// Zero-argument closure to execute when forcing.
+    closure: Value,
     /// The resolved value (valid when state == .resolved).
     result: Value,
 
-    const EnvPair = extern struct {
-        name: InternId,
-        value: Value,
-    };
+    pub fn init(closure: Value) Thunk {
+        return .{
+            .state = std.atomic.Value(u8).init(@intFromEnum(ThunkState.unresolved)),
+            .closure = closure,
+            .result = Value.null_val,
+        };
+    }
 
     /// Try to claim this thunk for evaluation.
     /// Returns the result of the CAS.
@@ -94,23 +95,10 @@ pub const Thunk = struct {
     /// Check structural equality (for memoization). Two thunks are considered
     /// equal if they wrap the same chunk in the same environment.
     pub fn eq(self: *const Thunk, other: *const Thunk) bool {
-        if (self.chunk_id != other.chunk_id) return false;
-        if (self.env_pairs_count != other.env_pairs_count) return false;
-        const count = self.env_pairs_count;
-        var i: u16 = 0;
-        while (i < count) : (i += 1) {
-            const a = self.env_pairs_data[i];
-            const b = other.env_pairs_data[i];
-            if (a.name != b.name) return false;
-            if (!a.value.memoEq(b.value, @import("intern.zig").InternTable)) return false;
-        }
-        return true;
+        return self == other;
     }
 
     pub fn deinit(self: *Thunk, allocator: std.mem.Allocator) void {
-        const ptr: [*]EnvPair = self.env_pairs_data;
-        const count = self.env_pairs_count;
-        allocator.free(ptr[0..count]);
         allocator.destroy(self);
     }
 };

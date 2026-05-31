@@ -63,6 +63,29 @@ test "end-to-end: unused let binding is not evaluated" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: recursive let binding errors" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.RecursiveThunk, ev.evaluate("let a = a; in a"));
+    try std.testing.expectError(error.RecursiveThunk, ev.evaluate("let a = b; b = a; in a"));
+}
+
+test "end-to-end: guarded recursive let bindings can terminate" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const true_guard = try ev.evaluate("let a = if true then 1 else b; b = a + 1; in b");
+    try std.testing.expectEqual(@as(i64, 2), true_guard.asInt());
+
+    const false_guard = try ev.evaluate("let a = if false then b else 1; b = a + 1; in b");
+    try std.testing.expectEqual(@as(i64, 2), false_guard.asInt());
+}
+
 test "end-to-end: attribute set" {
     const alloc = std.testing.allocator;
 

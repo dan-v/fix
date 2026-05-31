@@ -23,8 +23,12 @@ pub const OpCode = enum(u8) {
     // ---- locals ----
     /// Push local variable at offset (operand: 1-byte offset from frame base).
     get_local,
+    /// Push local variable without forcing lazy cells (operand: 1-byte offset).
+    capture_local,
     /// Set local variable at offset, popping from stack.
     set_local,
+    /// Set the value inside a local cell, popping from stack.
+    set_cell_local,
     /// Push captured upvalue at offset (operand: 1-byte closure upvalue index).
     get_upvalue,
 
@@ -91,8 +95,10 @@ pub const OpCode = enum(u8) {
     tail_call,
 
     // ---- thunks ----
-    /// Wrap the top-of-stack value into a resolved thunk (for lazy values).
+    /// Wrap the top-of-stack zero-argument closure into a lazy thunk.
     make_thunk,
+    /// Wrap the top-of-stack value in a mutable lazy cell.
+    make_cell,
 
     // ---- attribute access ----
     /// Select an attribute from attrset on stack top.

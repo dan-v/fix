@@ -21,7 +21,8 @@ pub const ValueType = enum(u8) {
     closure = 9, // payload is *Closure (closure.zig)
     builtin = 10, // payload is *Builtin (builtins.zig)
     thunk = 11, // payload is *Thunk (thunk.zig)
-    // reserved 12..255 for future extensions
+    cell = 12, // payload is *Cell (thunk.zig)
+    // reserved 13..255 for future extensions
 };
 
 pub const Value = extern struct {
@@ -106,6 +107,13 @@ pub const Value = extern struct {
         };
     }
 
+    pub fn cell(ptr: *anyopaque) Value {
+        return .{
+            .discriminant = .cell,
+            .payload = @intFromPtr(ptr),
+        };
+    }
+
     // ---- accessors ----
 
     pub fn asInt(self: Value) i64 {
@@ -165,6 +173,7 @@ pub const Value = extern struct {
                 const t2: *const @import("thunk.zig").Thunk = @ptrCast(@alignCast(other.asPtr(u8)));
                 return t1.eq(t2);
             },
+            .cell => self.asPtr(u8) == other.asPtr(u8),
         };
     }
 
@@ -181,6 +190,7 @@ pub const Value = extern struct {
             .closure => @intFromPtr(self.asPtr(u8)),
             .builtin => @intFromPtr(self.asPtr(u8)),
             .thunk => @intFromPtr(self.asPtr(u8)),
+            .cell => @intFromPtr(self.asPtr(u8)),
         };
     }
 
@@ -201,6 +211,7 @@ pub const Value = extern struct {
             .closure => try writer.writeAll("<closure>"),
             .builtin => try writer.writeAll("<builtin>"),
             .thunk => try writer.writeAll("<thunk>"),
+            .cell => try writer.writeAll("<cell>"),
         }
     }
 };
