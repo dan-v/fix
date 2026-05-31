@@ -12,6 +12,7 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
 const Value = @import("value.zig").Value;
+const builtins = @import("builtins.zig");
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -20,6 +21,7 @@ pub const Evaluator = struct {
     scheduler: Scheduler,
     heap: ObjectHeap,
     runtime_arena: std.heap.ArenaAllocator,
+    builtins_value: ?Value,
     worker_count: u8,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
@@ -32,6 +34,7 @@ pub const Evaluator = struct {
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
+            .builtins_value = null,
             .worker_count = worker_count,
         };
     }
@@ -90,11 +93,19 @@ pub const Evaluator = struct {
             &self.intern,
             &self.heap,
             &self.scheduler,
+            try self.ensureBuiltins(),
             0,
         );
         defer vm.deinit();
 
         return vm.eval(chunk_id);
+    }
+
+    fn ensureBuiltins(self: *Evaluator) !Value {
+        if (self.builtins_value) |value| return value;
+        const value = try builtins.buildAttrSet(&self.intern, &self.heap);
+        self.builtins_value = value;
+        return value;
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {

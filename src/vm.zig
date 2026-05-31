@@ -25,12 +25,8 @@ const Thunk = @import("thunk.zig").Thunk;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
-const AttrEntry = heap_mod.AttrEntry;
 const Closure = heap_mod.Closure;
-
-const BuiltinId = enum(u16) {
-    toString = 0,
-};
+const BuiltinId = @import("builtins.zig").BuiltinId;
 
 /// A single call frame.
 pub const Frame = struct {
@@ -57,6 +53,8 @@ pub const VM = struct {
     heap: *ObjectHeap,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
+    /// Cached evaluator-owned builtins attrset.
+    builtins: Value,
     /// This VM's worker index.
     worker_id: u8,
 
@@ -73,6 +71,7 @@ pub const VM = struct {
         intern: *InternTable,
         heap: *ObjectHeap,
         scheduler: *Scheduler,
+        builtins: Value,
         worker_id: u8,
     ) !VM {
         return .{
@@ -81,6 +80,7 @@ pub const VM = struct {
             .intern = intern,
             .heap = heap,
             .scheduler = scheduler,
+            .builtins = builtins,
             .worker_id = worker_id,
             .stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP),
             .sp = 0,
@@ -385,7 +385,7 @@ pub const VM = struct {
                     const left = self.pop();
                     try self.push(try self.mergeAttrs(left, right));
                 },
-                .push_builtins => try self.push(try self.makeBuiltins()),
+                .push_builtins => try self.push(self.builtins),
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
@@ -666,17 +666,6 @@ pub const VM = struct {
         } else {
             return error.NotCallable;
         }
-    }
-
-    fn makeBuiltins(self: *VM) !Value {
-        const to_string_name = try self.intern.intern("toString");
-        const entries = [_]AttrEntry{
-            .{
-                .name = to_string_name,
-                .value = Value.builtin(@intFromEnum(BuiltinId.toString)),
-            },
-        };
-        return Value.attrs(try self.heap.addAttrs(&entries));
     }
 
     fn callBuiltin(self: *VM, callee: Value, arg: Value) !Value {

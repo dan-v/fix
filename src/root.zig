@@ -18,6 +18,7 @@ pub const thunk = @import("thunk.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
+pub const builtins = @import("builtins.zig");
 
 pub const Evaluator = eval.Evaluator;
 pub const Value = value.Value;
