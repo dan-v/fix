@@ -380,7 +380,7 @@ pub const Compiler = struct {
     fn compileList(self: *Compiler, node: *const Node) !void {
         const list = node.data.list;
         for (list.items) |item| {
-            try self.compileNode(item);
+            try self.compileThunk(item);
         }
         try self.emitOpU16(.build_list, @intCast(list.items.len));
     }

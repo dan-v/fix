@@ -118,6 +118,16 @@ test "end-to-end: attribute set" {
     try std.testing.expectEqual(value.ValueType.attrs, result.discriminant);
 }
 
+test "end-to-end: list elements are lazy" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("[ 1 (1 / 0) ]");
+    try std.testing.expectEqual(value.ValueType.list, result.discriminant);
+}
+
 test "end-to-end: attribute access" {
     const alloc = std.testing.allocator;
 
