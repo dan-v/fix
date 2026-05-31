@@ -37,11 +37,10 @@ pub fn main(init: std.process.Init) !void {
     defer ev.deinit();
     try ev.setBasePathFromCurrentPath(init.io);
 
-    const source = getSource(init.io, allocator, arg1, &args_iter) catch |err| {
+    const source = getSource(&ev, arg1, &args_iter) catch |err| {
         std.debug.print("Error reading source: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer if (source.owned) allocator.free(source.text);
 
     const result = ev.evaluate(source.text) catch |err| {
         if (ev.getDiagnostics().len > 0) {
@@ -64,24 +63,19 @@ pub fn main(init: std.process.Init) !void {
 
 const Source = struct {
     text: []const u8,
-    owned: bool,
 };
 
 fn getSource(
-    io: std.Io,
-    allocator: std.mem.Allocator,
+    ev: *Evaluator,
     first_arg: []const u8,
     args_iter: *std.process.Args.Iterator,
 ) !Source {
     if (std.mem.eql(u8, first_arg, "-e")) {
-        return .{ .text = args_iter.next() orelse return error.MissingExpression, .owned = false };
+        return .{ .text = args_iter.next() orelse return error.MissingExpression };
     }
     if (std.mem.eql(u8, first_arg, "--file")) {
         const path = args_iter.next() orelse return error.MissingPath;
-        return .{
-            .text = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)),
-            .owned = true,
-        };
+        return .{ .text = try ev.readSourceFile(path) };
     }
-    return .{ .text = first_arg, .owned = false };
+    return .{ .text = first_arg };
 }

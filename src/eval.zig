@@ -76,6 +76,12 @@ pub const Evaluator = struct {
         self.files.setIo(io);
     }
 
+    pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+        return self.files.readFile(resolved.text);
+    }
+
     fn clearDiagnostics(self: *Evaluator) void {
         self.diagnostics.clearRetainingCapacity();
     }
@@ -158,6 +164,21 @@ pub const Evaluator = struct {
             error.UndefinedVariable,
             => true,
             else => false,
+        };
+    }
+
+    const ResolvedHostPath = struct {
+        text: []const u8,
+        owned: bool,
+    };
+
+    fn resolveHostPath(self: *Evaluator, path: []const u8) !ResolvedHostPath {
+        if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
+
+        const base_path = self.base_path orelse return error.RelativePath;
+        return .{
+            .text = try std.fs.path.resolve(self.allocator, &.{ base_path, path }),
+            .owned = true,
         };
     }
 
@@ -603,6 +624,25 @@ test "evaluate pathExists and readFile builtins through file cache" {
 
     const reread = try ev.evaluate(read_source);
     try std.testing.expectEqual(contents.asInternId(), reread.asInternId());
+}
+
+test "read source files through evaluator file cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "source.nix", .data = "1 + 2\n" });
+
+    const relative_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/source.nix", .{tmp.sub_path});
+    defer std.testing.allocator.free(relative_path);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    try ev.setBasePathFromCurrentPath(std.testing.io);
+
+    const source = try ev.readSourceFile(relative_path);
+    try std.testing.expectEqualStrings("1 + 2\n", source);
+
+    const cached_source = try ev.readSourceFile(relative_path);
+    try std.testing.expectEqual(@intFromPtr(source.ptr), @intFromPtr(cached_source.ptr));
 }
 
 test "evaluate all and any builtins" {
