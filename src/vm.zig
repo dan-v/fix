@@ -385,15 +385,8 @@ pub const VM = struct {
                 .interpolate => {
                     const count: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
-                    // Pop count values, keep the template.
-                    var i: u16 = 0;
-                    while (i < count) : (i += 1) {
-                        _ = self.pop();
-                    }
-                    // Template is below the popped values now — but since
-                    // we popped everything above it, it's on top.
-                    // For now: just push a placeholder.
-                    try self.push(Value.string(0));
+                    _ = count;
+                    return error.UnsupportedInterpolation;
                 },
 
                 // ---- closure ----
