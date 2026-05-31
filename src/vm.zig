@@ -854,6 +854,8 @@ pub const VM = struct {
             .hashFile => self.builtinHashFile(args[0], args[1]),
             .mapAttrValue => self.builtinMapAttrValue(args[0], args[1], args[2]),
             .zipAttrsValue => self.builtinZipAttrsValue(args[0], args[1], args[2]),
+            .toJSON => self.builtinToJSON(args[0]),
+            .fromJSON => self.builtinFromJSON(args[0]),
         };
     }
 
@@ -1040,6 +1042,127 @@ pub const VM = struct {
         const digest = try nix_hash.hashBytes(self.allocator, algorithm, contents);
         defer self.allocator.free(digest);
         return Value.string(try self.intern.intern(digest));
+    }
+
+    fn builtinToJSON(self: *VM, arg: Value) !Value {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
+        var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+        defer seen.deinit(self.allocator);
+
+        try self.writeJsonValue(&out.writer, arg, &seen);
+        const text = try out.toOwnedSlice();
+        defer self.allocator.free(text);
+        return Value.string(try self.intern.intern(text));
+    }
+
+    const SeenJsonKind = enum { list, attrs };
+
+    const SeenJsonObject = struct {
+        kind: SeenJsonKind,
+        id: ObjectId,
+    };
+
+    fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
+        const forced = try self.forceValue(value);
+        switch (forced.discriminant) {
+            .null => try writer.writeAll("null"),
+            .bool_false => try writer.writeAll("false"),
+            .bool_true => try writer.writeAll("true"),
+            .int => try writer.print("{}", .{forced.asInt()}),
+            .float => try writer.print("{d}", .{forced.asFloat()}),
+            .string, .path => try std.json.Stringify.encodeJsonString(self.intern.get(forced.asInternId()), .{}, writer),
+            .list => try self.writeJsonList(writer, forced.asObjectId(), seen),
+            .attrs => try self.writeJsonAttrs(writer, forced.asObjectId(), seen),
+            .closure, .builtin, .builtin_closure => return error.TypeError,
+            .thunk, .cell => unreachable,
+        }
+    }
+
+    fn writeJsonList(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+        if (!try self.enterJsonObject(.list, id, seen)) return error.RecursiveThunk;
+        defer _ = seen.pop();
+
+        try writer.writeByte('[');
+        for (try self.heap.getList(id), 0..) |item, i| {
+            if (i > 0) try writer.writeByte(',');
+            try self.writeJsonValue(writer, item, seen);
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeJsonAttrs(self: *VM, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+        if (!try self.enterJsonObject(.attrs, id, seen)) return error.RecursiveThunk;
+        defer _ = seen.pop();
+
+        const sorted = try self.sortedAttrEntries(Value.attrs(id));
+        defer self.allocator.free(sorted);
+
+        try writer.writeByte('{');
+        for (sorted, 0..) |entry, i| {
+            if (i > 0) try writer.writeByte(',');
+            try std.json.Stringify.encodeJsonString(self.intern.get(entry.name), .{}, writer);
+            try writer.writeByte(':');
+            try self.writeJsonValue(writer, entry.value, seen);
+        }
+        try writer.writeByte('}');
+    }
+
+    fn enterJsonObject(self: *VM, kind: SeenJsonKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !bool {
+        for (seen.items) |item| {
+            if (item.kind == kind and item.id == id) return false;
+        }
+        try seen.append(self.allocator, .{ .kind = kind, .id = id });
+        return true;
+    }
+
+    fn builtinFromJSON(self: *VM, arg: Value) !Value {
+        const text = try self.stringArg(arg);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, text, .{});
+        defer parsed.deinit();
+        return self.valueFromJson(parsed.value);
+    }
+
+    fn valueFromJson(self: *VM, value: std.json.Value) anyerror!Value {
+        return switch (value) {
+            .null => Value.null_val,
+            .bool => |b| Value.boolVal(b),
+            .integer => |i| Value.int(i),
+            .float => |f| Value.float(f),
+            .number_string => |s| self.numberStringFromJson(s),
+            .string => |s| Value.string(try self.intern.intern(s)),
+            .array => |array| self.listFromJson(array.items),
+            .object => |object| self.attrsFromJson(object),
+        };
+    }
+
+    fn numberStringFromJson(self: *VM, text: []const u8) !Value {
+        _ = self;
+        if (std.fmt.parseInt(i64, text, 10)) |i| return Value.int(i) else |_| {}
+        return Value.float(std.fmt.parseFloat(f64, text) catch return error.TypeError);
+    }
+
+    fn listFromJson(self: *VM, values: []const std.json.Value) !Value {
+        const items = try self.allocator.alloc(Value, values.len);
+        defer self.allocator.free(items);
+        for (values, items) |item, *out| out.* = try self.valueFromJson(item);
+        return Value.list(try self.heap.addList(items));
+    }
+
+    fn attrsFromJson(self: *VM, object: anytype) !Value {
+        const entries = try self.allocator.alloc(heap_mod.AttrEntry, object.count());
+        defer self.allocator.free(entries);
+
+        var iter = object.iterator();
+        var index: usize = 0;
+        while (iter.next()) |entry| : (index += 1) {
+            entries[index] = .{
+                .name = try self.intern.intern(entry.key_ptr.*),
+                .value = try self.valueFromJson(entry.value_ptr.*),
+            };
+        }
+        return Value.attrs(try self.heap.addAttrs(entries));
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {

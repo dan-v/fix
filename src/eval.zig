@@ -1180,6 +1180,24 @@ test "evaluate hash builtins" {
     try std.testing.expectEqualStrings("a9993e364706816aba3e25717850c26c9cd0d89d", ev.intern.get(hash_file.asInternId()));
 }
 
+test "evaluate JSON builtins" {
+    const json = try renderForTest("builtins.toJSON { b = [ 2 false ]; a = \"x\"; }");
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("\"{\\\"a\\\":\\\"x\\\",\\\"b\\\":[2,false]}\"", json);
+
+    const json_forces_values = try renderForTest("builtins.toJSON { a = 1; }");
+    defer std.testing.allocator.free(json_forces_values);
+    try std.testing.expectEqualStrings("\"{\\\"a\\\":1}\"", json_forces_values);
+
+    const parsed_attr = try renderForTest("(builtins.fromJSON \"{\\\"b\\\":2,\\\"a\\\":[1,true,null]}\").a");
+    defer std.testing.allocator.free(parsed_attr);
+    try std.testing.expectEqualStrings("[ 1 true null ]", parsed_attr);
+
+    const parsed_float_type = try renderForTest("builtins.typeOf (builtins.fromJSON \"1.5\")");
+    defer std.testing.allocator.free(parsed_float_type);
+    try std.testing.expectEqualStrings("\"float\"", parsed_float_type);
+}
+
 test "evaluate control and error builtins" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

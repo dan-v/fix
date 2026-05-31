@@ -82,6 +82,8 @@ builtins.concatStringsSep "," [ "a" "b" ]
 builtins.substring 1 2 "abcd"
 builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
 builtins.hashString "sha256" "abc"
+builtins.toJSON { b = [ 2 false ]; a = "x"; }
+(builtins.fromJSON "{\"b\":2,\"a\":[1,true,null]}").a
 (builtins.tryEval (builtins.throw "x")).success
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type

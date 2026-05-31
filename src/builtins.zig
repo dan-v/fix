@@ -84,6 +84,8 @@ pub const BuiltinId = enum(u16) {
     hashFile = 73,
     mapAttrValue = 74,
     zipAttrsValue = 75,
+    toJSON = 76,
+    fromJSON = 77,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -121,6 +123,8 @@ pub fn arity(id: BuiltinId) u8 {
         .path,
         .genericClosure,
         .functionArgs,
+        .toJSON,
+        .fromJSON,
         .floor,
         .ceil,
         .baseNameOf,
@@ -468,6 +472,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("hashFile"),
             .value = Value.builtin(@intFromEnum(BuiltinId.hashFile)),
+        },
+        .{
+            .name = try intern.intern("toJSON"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.toJSON)),
+        },
+        .{
+            .name = try intern.intern("fromJSON"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.fromJSON)),
         },
         .{
             .name = try intern.intern("true"),
