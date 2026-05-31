@@ -46,6 +46,7 @@ const WithScope = struct {
 const AttrEntryView = struct {
     path: []const Node.Atom,
     expr: *const Node,
+    inherit_outer: bool = false,
 };
 
 const with_capture_name = "\x00with";
@@ -825,7 +826,11 @@ pub const Compiler = struct {
                 try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
                 return error.DuplicateAttribute;
             }
-            try self.compileThunk(leaf.?.expr);
+            const previous_skip = self.skip_local_slot;
+            if (leaf.?.inherit_outer) self.skip_local_slot = slot;
+            const compile_result = self.compileThunk(leaf.?.expr);
+            self.skip_local_slot = previous_skip;
+            try compile_result;
             try self.emitOpByte(.set_cell_local, @intCast(slot));
             count += 1;
         }
@@ -877,7 +882,7 @@ pub const Compiler = struct {
         const views = try self.allocator.alloc(AttrEntryView, entries.len);
         for (entries, views) |entry, *view| {
             std.debug.assert(entry.dynamic_name == null);
-            view.* = .{ .path = entry.path, .expr = entry.expr };
+            view.* = .{ .path = entry.path, .expr = entry.expr, .inherit_outer = entry.inherit_outer };
         }
         return views;
     }
@@ -892,7 +897,7 @@ pub const Compiler = struct {
         var i: usize = 0;
         for (entries) |entry| {
             if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) {
-                tails[i] = .{ .path = entry.path[1..], .expr = entry.expr };
+                tails[i] = .{ .path = entry.path[1..], .expr = entry.expr, .inherit_outer = entry.inherit_outer };
                 i += 1;
             }
         }

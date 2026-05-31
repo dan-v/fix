@@ -587,6 +587,7 @@ pub const Parser = struct {
             try entries.append(allocator, .{
                 .path = path,
                 .expr = expr,
+                .inherit_outer = source == null,
             });
             count += 1;
         }

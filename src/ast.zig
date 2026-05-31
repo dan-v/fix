@@ -161,6 +161,7 @@ pub const Node = struct {
         path: []Atom,
         dynamic_name: ?*Node = null,
         expr: *Node,
+        inherit_outer: bool = false,
     };
 
     pub const AttrSet = struct {

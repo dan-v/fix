@@ -365,6 +365,9 @@ test "end-to-end: simple inherit in attrsets" {
     const nested = try ev.evaluate("(let a = { inherit a; }; in a).a.a");
     try std.testing.expectEqual(value.ValueType.attrs, nested.discriminant);
 
+    const recursive_inherit = try ev.evaluate("let config = 1; in (rec { inherit config; }).config");
+    try std.testing.expectEqual(@as(i64, 1), recursive_inherit.asInt());
+
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("rec { x = 1; inherit x; }"));
 }
 
