@@ -526,6 +526,9 @@ test "end-to-end: attr path or defaults" {
     const missing_mid = try ev.evaluate("({}).a.b or 2");
     try std.testing.expectEqual(@as(i64, 2), missing_mid.asInt());
 
+    const concat_defaults = try ev.evaluate("let m = { require = [ 9 ]; }; in m.require or [ 1 ] ++ m.imports or [ 3 ]");
+    try std.testing.expectEqual(@as(usize, 2), (try ev.heap.getList(concat_defaults.asObjectId())).len);
+
     const lazy_default = try ev.evaluate("({ a.b = 1; }).a.b or (1 / 0)");
     try std.testing.expectEqual(@as(i64, 1), lazy_default.asInt());
 

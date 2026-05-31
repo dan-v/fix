@@ -169,7 +169,7 @@ pub const Parser = struct {
             .greater_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
             .amp_amp => return .{ .prefix = null, .infix = binary, .prec = .and_ },
             .pipe_pipe => return .{ .prefix = null, .infix = binary, .prec = .or_ },
-            .kw_or => return .{ .prefix = null, .infix = attrOr, .prec = .or_ },
+            .kw_or => return .{ .prefix = null, .infix = attrOr, .prec = .primary },
             .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
             .double_plus => return .{ .prefix = null, .infix = binary, .prec = .concat },
             .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
@@ -181,6 +181,37 @@ pub const Parser = struct {
 
     fn expression(self: *Parser) anyerror!*Node {
         return self.parsePrecedence(.assignment);
+    }
+
+    fn selectionExpression(self: *Parser) anyerror!*Node {
+        self.advance();
+        var left = switch (self.previous.type) {
+            .identifier => try self.arena.createNode(.identifier, .{ .atom = .{
+                .offset = self.previous.offset,
+                .len = self.previous.len,
+            } }),
+            .integer => try self.integer(),
+            .float_val => try self.floatLit(),
+            .string => try self.stringLit(),
+            .path => try self.pathLit(),
+            .search_path => try self.searchPathLit(),
+            .kw_true, .kw_false, .kw_null => try self.literal(),
+            .left_paren => try self.grouping(),
+            .left_brace => try self.braceExpr(),
+            .left_bracket => try self.list(),
+            .kw_rec => try self.recAttrSet(),
+            else => {
+                self.reportError("Expected selection expression after 'or'.");
+                return error.ParseError;
+            },
+        };
+
+        while (self.current.type == .dot or self.current.type == .kw_or) {
+            self.advance();
+            left = try rule(self.previous.type).infix.?(self, left);
+        }
+
+        return left;
     }
 
     fn parsePrecedence(self: *Parser, min_prec: Precedence) anyerror!*Node {
@@ -841,7 +872,7 @@ pub const Parser = struct {
         if (left.tag == .apply and
             (left.data.apply.arg.tag == .attr_path or left.data.apply.arg.tag == .attr_dynamic))
         {
-            const default = try self.expression();
+            const default = try self.selectionExpression();
             const defaulted_arg = try self.arena.createNode(.attr_or, .{
                 .attr_or = .{ .attr_path = left.data.apply.arg, .default = default },
             });
@@ -854,7 +885,7 @@ pub const Parser = struct {
             self.reportError("'or' default requires an attribute path.");
             return error.ParseError;
         }
-        const default = try self.expression();
+        const default = try self.selectionExpression();
         return self.arena.createNode(.attr_or, .{
             .attr_or = .{ .attr_path = left, .default = default },
         });
@@ -1130,6 +1161,19 @@ test "parser recognizes attr path or default" {
     try std.testing.expectEqual(NodeTag.attr_or, node.tag);
     try std.testing.expectEqual(NodeTag.attr_path, node.data.attr_or.attr_path.tag);
     try std.testing.expectEqual(NodeTag.integer, node.data.attr_or.default.tag);
+}
+
+test "parser gives attr defaults selection precedence" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "m.require or [ ] ++ m.imports or [ ]");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.concat, node.data.binary.op);
+    try std.testing.expectEqual(NodeTag.attr_or, node.data.binary.left.tag);
+    try std.testing.expectEqual(NodeTag.attr_or, node.data.binary.right.tag);
 }
 
 test "parser recognizes has-attr operator" {
