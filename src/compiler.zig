@@ -139,12 +139,60 @@ pub const Compiler = struct {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
         // Strip quotes "..." → ...
         var content = span;
+        var content_offset = node.data.atom.offset;
         if (content.len >= 2 and content[0] == '"' and content[content.len - 1] == '"') {
             content = content[1 .. content.len - 1];
+            content_offset += 1;
+        }
+        if (std.mem.indexOf(u8, content, "${") != null) {
+            try self.compileInterpolatedString(content, content_offset);
+            return;
         }
         const id = try self.intern.intern(content);
         const v = @import("value.zig").Value.string(id);
         try self.builder.emitConstant(self.allocator, v);
+    }
+
+    fn compileInterpolatedString(self: *Compiler, content: []const u8, content_offset: u32) !void {
+        var cursor: usize = 0;
+        var have_value = false;
+
+        while (std.mem.indexOfPos(u8, content, cursor, "${")) |start| {
+            try self.emitStringPart(content[cursor..start], &have_value);
+
+            const expr_start = start + 2;
+            const expr_end = std.mem.indexOfScalarPos(u8, content, expr_start, '}') orelse return error.ParseError;
+            try self.compileInterpolatedExpr(content[expr_start..expr_end], content_offset + @as(u32, @intCast(expr_start)));
+            if (have_value) try self.emitOp(.add_int);
+            have_value = true;
+
+            cursor = expr_end + 1;
+        }
+
+        try self.emitStringPart(content[cursor..], &have_value);
+        if (!have_value) {
+            const id = try self.intern.intern("");
+            try self.builder.emitConstant(self.allocator, @import("value.zig").Value.string(id));
+        }
+    }
+
+    fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
+        if (part.len == 0) return;
+
+        const id = try self.intern.intern(part);
+        try self.builder.emitConstant(self.allocator, @import("value.zig").Value.string(id));
+        if (have_value.*) try self.emitOp(.add_int);
+        have_value.* = true;
+    }
+
+    fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_offset: u32) !void {
+        var arena = ast.AstArena.init(self.allocator);
+        defer arena.deinit();
+
+        var parser = @import("parser.zig").Parser.init(self.allocator, &arena, expr_source);
+        const expr = try parser.parse();
+        offsetNode(expr, source_offset);
+        try self.compileNode(expr);
     }
 
     fn compilePath(self: *Compiler, node: *const Node) !void {
@@ -660,4 +708,65 @@ fn nodeMayEvaluateToFloat(node: *const Node) bool {
         },
         else => false,
     };
+}
+
+fn offsetNode(node: *Node, offset: u32) void {
+    switch (node.tag) {
+        .integer, .float_val, .string, .path, .identifier, .bool_true, .bool_false, .null => {
+            node.data.atom.offset += offset;
+        },
+        .unary_op => offsetNode(node.data.unary.expr, offset),
+        .binary_op => {
+            offsetNode(node.data.binary.left, offset);
+            offsetNode(node.data.binary.right, offset);
+        },
+        .apply => {
+            offsetNode(node.data.apply.func, offset);
+            offsetNode(node.data.apply.arg, offset);
+        },
+        .lambda => {
+            node.data.lambda.param_offset += offset;
+            offsetNode(node.data.lambda.body, offset);
+        },
+        .let_in => {
+            for (node.data.let_in.bindings) |*binding| {
+                binding.name_offset += offset;
+                offsetNode(binding.expr, offset);
+            }
+            offsetNode(node.data.let_in.body, offset);
+        },
+        .if_else => {
+            offsetNode(node.data.if_else.cond, offset);
+            offsetNode(node.data.if_else.then_branch, offset);
+            offsetNode(node.data.if_else.else_branch, offset);
+        },
+        .assert => {
+            offsetNode(node.data.assert.cond, offset);
+            offsetNode(node.data.assert.body, offset);
+        },
+        .with_expr => {
+            offsetNode(node.data.with_expr.attr_set, offset);
+            offsetNode(node.data.with_expr.body, offset);
+        },
+        .attr_set => {
+            for (node.data.attr_set.entries) |*entry| {
+                for (entry.path) |*segment| {
+                    segment.offset += offset;
+                }
+                offsetNode(entry.expr, offset);
+            }
+        },
+        .attr_path => {
+            offsetNode(node.data.attr_path.root, offset);
+            for (node.data.attr_path.segments) |*segment| {
+                segment.offset += offset;
+            }
+        },
+        .list => {
+            for (node.data.list.items) |item| {
+                offsetNode(item, offset);
+            }
+        },
+        .parens => offsetNode(node.data.parens, offset),
+    }
 }

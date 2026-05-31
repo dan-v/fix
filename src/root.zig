@@ -69,6 +69,18 @@ test "end-to-end: string concatenation" {
     try std.testing.expectError(error.TypeError, ev.evaluate("\"ab\" + 1"));
 }
 
+test "end-to-end: string interpolation" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
+    try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
+}
+
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 
