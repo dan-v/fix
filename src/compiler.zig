@@ -245,7 +245,7 @@ pub const Compiler = struct {
             .and_, .or_ => unreachable,
             .update => try self.emitOp(.merge_attrs),
             .impl => unreachable,
-            .concat => return error.UnsupportedBinaryOp,
+            .concat => try self.emitOp(.concat_lists),
         }
     }
 

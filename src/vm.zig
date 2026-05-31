@@ -385,6 +385,11 @@ pub const VM = struct {
                     const left = self.pop();
                     try self.push(try self.mergeAttrs(left, right));
                 },
+                .concat_lists => {
+                    const right = self.pop();
+                    const left = self.pop();
+                    try self.push(try self.concatLists(left, right));
+                },
                 .push_builtins => try self.push(self.builtins),
                 // ---- closure ----
                 .closure => {
@@ -624,6 +629,11 @@ pub const VM = struct {
     fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
         if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
         return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
+    }
+
+    fn concatLists(self: *VM, left: Value, right: Value) !Value {
+        if (left.discriminant != .list or right.discriminant != .list) return error.TypeError;
+        return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
     }
 
     fn concatStrings(self: *VM, a: Value, b: Value) !Value {

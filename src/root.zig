@@ -179,6 +179,21 @@ test "end-to-end: list elements are lazy" {
     try std.testing.expectEqual(value.ValueType.list, result.discriminant);
 }
 
+test "end-to-end: list concatenation" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const combined = try ev.evaluate("[ 1 ] ++ [ 2 3 ] == [ 1 2 3 ]");
+    try std.testing.expect(combined.asBool());
+
+    const lazy = try ev.evaluate("[ 1 / 0 ] ++ []");
+    try std.testing.expectEqual(value.ValueType.list, lazy.discriminant);
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("[ 1 ] ++ 2"));
+}
+
 test "end-to-end: attribute access" {
     const alloc = std.testing.allocator;
 

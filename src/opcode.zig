@@ -75,6 +75,8 @@ pub const OpCode = enum(u8) {
     build_list,
     /// Merge two attrsets, with right-hand keys overriding left-hand keys.
     merge_attrs,
+    /// Concatenate two lists.
+    concat_lists,
     /// Push the evaluator-owned builtins attrset.
     push_builtins,
 

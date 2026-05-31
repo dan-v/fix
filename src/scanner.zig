@@ -48,7 +48,10 @@ pub const Scanner = struct {
             '.' => return self.makeToken(.dot, start, 1),
             ';' => return self.makeToken(.semicolon, start, 1),
             '?' => return self.makeToken(.question_mark, start, 1),
-            '+' => return self.makeToken(.plus, start, 1),
+            '+' => {
+                if (self.match('+')) return self.makeToken(.double_plus, start, 2);
+                return self.makeToken(.plus, start, 1);
+            },
             '*' => return self.makeToken(.star, start, 1),
             '-' => {
                 if (self.match('>')) return self.makeToken(.arrow, start, 2);
@@ -241,13 +244,16 @@ pub const Scanner = struct {
 };
 
 test "scanner recognizes boolean operator tokens" {
-    var scanner = Scanner.init("true && false || true");
+    var scanner = Scanner.init("true && false || true ++ []");
 
     try std.testing.expectEqual(TokenType.kw_true, scanner.next().type);
     try std.testing.expectEqual(TokenType.amp_amp, scanner.next().type);
     try std.testing.expectEqual(TokenType.kw_false, scanner.next().type);
     try std.testing.expectEqual(TokenType.pipe_pipe, scanner.next().type);
     try std.testing.expectEqual(TokenType.kw_true, scanner.next().type);
+    try std.testing.expectEqual(TokenType.double_plus, scanner.next().type);
+    try std.testing.expectEqual(TokenType.left_bracket, scanner.next().type);
+    try std.testing.expectEqual(TokenType.right_bracket, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }
 

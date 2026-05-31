@@ -155,6 +155,7 @@ pub const Parser = struct {
             .pipe_pipe => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .kw_or => return .{ .prefix = null, .infix = attrOr, .prec = .or_ },
             .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
+            .double_plus => return .{ .prefix = null, .infix = binary, .prec = .concat },
             .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
             else => return .{ .prefix = null, .infix = null, .prec = .none },
@@ -452,6 +453,7 @@ pub const Parser = struct {
             .amp_amp => .and_,
             .pipe_pipe => .or_,
             .double_slash => .update,
+            .double_plus => .concat,
             .arrow => .impl,
             else => unreachable,
         };

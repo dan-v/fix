@@ -189,6 +189,18 @@ pub const ObjectHeap = struct {
         return self.add(.{ .list = range });
     }
 
+    pub fn addConcatenatedLists(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+        const left = try self.getList(left_id);
+        const right = try self.getList(right_id);
+
+        const range = try self.reserveValues(left.len + right.len);
+        errdefer self.rollbackValues(range);
+        const values = self.valueSliceMut(range);
+        @memcpy(values[0..left.len], left);
+        @memcpy(values[left.len..], right);
+        return self.add(.{ .list = range });
+    }
+
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrs(entries);
         self.sortAttrs(range);
