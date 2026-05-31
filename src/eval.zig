@@ -468,6 +468,20 @@ test "evaluate curried binary builtins" {
     try std.testing.expectEqualStrings("true", partial_is_function);
 }
 
+test "evaluate builtins.typeOf" {
+    const int_type = try renderForTest("builtins.typeOf 1");
+    defer std.testing.allocator.free(int_type);
+    try std.testing.expectEqualStrings("\"int\"", int_type);
+
+    const set_type = try renderForTest("builtins.typeOf { }");
+    defer std.testing.allocator.free(set_type);
+    try std.testing.expectEqualStrings("\"set\"", set_type);
+
+    const fn_type = try renderForTest("builtins.typeOf (x: x)");
+    defer std.testing.allocator.free(fn_type);
+    try std.testing.expectEqualStrings("\"lambda\"", fn_type);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

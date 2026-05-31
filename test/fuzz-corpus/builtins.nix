@@ -22,3 +22,6 @@ builtins.hasAttr "b" { a = 1; }
 builtins.getAttr "a" { a = 3; }
 builtins.elemAt [ 1 2 3 ] 1
 builtins.isFunction (builtins.elemAt [ 1 ])
+builtins.typeOf 1
+builtins.typeOf { }
+builtins.typeOf (x: x)

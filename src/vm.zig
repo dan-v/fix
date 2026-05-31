@@ -740,6 +740,7 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.tail) => self.builtinTail(arg),
             @intFromEnum(BuiltinId.attrNames) => self.builtinAttrNames(arg),
             @intFromEnum(BuiltinId.attrValues) => self.builtinAttrValues(arg),
+            @intFromEnum(BuiltinId.typeOf) => self.builtinTypeOf(arg),
             @intFromEnum(BuiltinId.hasAttr),
             @intFromEnum(BuiltinId.getAttr),
             @intFromEnum(BuiltinId.elemAt),
@@ -778,6 +779,23 @@ pub const VM = struct {
     fn builtinIsFunction(self: *VM, arg: Value) !Value {
         const value = try self.forceValue(arg);
         return Value.boolVal(value.discriminant == .closure or value.discriminant == .builtin or value.discriminant == .builtin_closure);
+    }
+
+    fn builtinTypeOf(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        const name: []const u8 = switch (value.discriminant) {
+            .null => "null",
+            .bool_false, .bool_true => "bool",
+            .int => "int",
+            .float => "float",
+            .string => "string",
+            .path => "path",
+            .list => "list",
+            .attrs => "set",
+            .closure, .builtin, .builtin_closure => "lambda",
+            .thunk, .cell => unreachable,
+        };
+        return Value.string(try self.intern.intern(name));
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {
