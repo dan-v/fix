@@ -12,6 +12,7 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const VM = @import("vm.zig").VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
 const Value = @import("value.zig").Value;
+const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 
 pub const Evaluator = struct {
@@ -109,21 +110,14 @@ pub const Evaluator = struct {
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
-        switch (value.discriminant) {
-            .null => try writer.writeAll("null"),
-            .bool_false => try writer.writeAll("false"),
-            .bool_true => try writer.writeAll("true"),
-            .int => try writer.print("{}", .{value.asInt()}),
-            .float => try writer.print("{d}", .{value.asFloat()}),
-            .string => try self.writeQuotedString(writer, self.intern.get(value.asInternId())),
-            .path => try writer.print("<path:{s}>", .{self.intern.get(value.asInternId())}),
-            .list => try writer.writeAll("[...]"),
-            .attrs => try writer.writeAll("{...}"),
-            .closure => try writer.writeAll("<closure>"),
-            .thunk => try writer.writeAll("<thunk>"),
-            .cell => try writer.writeAll("<cell>"),
-            .builtin => try writer.writeAll("<builtin>"),
-        }
+        var printer = ValuePrinter{
+            .ev = self,
+            .writer = writer,
+            .seen = .empty,
+        };
+        defer printer.seen.deinit(self.allocator);
+
+        try printer.write(value);
     }
 
     fn writeQuotedString(self: *Evaluator, writer: *std.Io.Writer, s: []const u8) !void {
@@ -142,3 +136,171 @@ pub const Evaluator = struct {
         try writer.writeByte('"');
     }
 };
+
+const ValuePrinter = struct {
+    ev: *Evaluator,
+    writer: *std.Io.Writer,
+    seen: std.ArrayListUnmanaged(SeenObject),
+
+    const SeenKind = enum { list, attrs, thunk, cell };
+
+    const SeenObject = struct {
+        kind: SeenKind,
+        id: types.ObjectId,
+    };
+
+    fn write(self: *ValuePrinter, value: Value) anyerror!void {
+        switch (value.discriminant) {
+            .null => try self.writer.writeAll("null"),
+            .bool_false => try self.writer.writeAll("false"),
+            .bool_true => try self.writer.writeAll("true"),
+            .int => try self.writer.print("{}", .{value.asInt()}),
+            .float => try self.writer.print("{d}", .{value.asFloat()}),
+            .string => try self.ev.writeQuotedString(self.writer, self.ev.intern.get(value.asInternId())),
+            .path => try self.writer.print("<path:{s}>", .{self.ev.intern.get(value.asInternId())}),
+            .list => try self.writeList(value.asObjectId()),
+            .attrs => try self.writeAttrs(value.asObjectId()),
+            .closure => try self.writer.writeAll("<closure>"),
+            .thunk => try self.writeThunk(value.asObjectId()),
+            .cell => try self.writeCell(value.asObjectId()),
+            .builtin => try self.writer.writeAll("<builtin>"),
+        }
+    }
+
+    fn writeList(self: *ValuePrinter, id: types.ObjectId) !void {
+        if (!try self.enter(.list, id)) {
+            try self.writer.writeAll("...");
+            return;
+        }
+        defer self.leave();
+
+        const items = try self.ev.heap.getList(id);
+        if (items.len == 0) {
+            try self.writer.writeAll("[ ]");
+            return;
+        }
+
+        try self.writer.writeAll("[ ");
+        for (items, 0..) |item, i| {
+            if (i > 0) try self.writer.writeByte(' ');
+            try self.write(item);
+        }
+        try self.writer.writeAll(" ]");
+    }
+
+    fn writeAttrs(self: *ValuePrinter, id: types.ObjectId) !void {
+        if (!try self.enter(.attrs, id)) {
+            try self.writer.writeAll("...");
+            return;
+        }
+        defer self.leave();
+
+        const entries = try self.ev.heap.getAttrs(id);
+        if (entries.len == 0) {
+            try self.writer.writeAll("{ }");
+            return;
+        }
+
+        try self.writer.writeAll("{ ");
+        for (entries) |entry| {
+            try self.writeAttrName(self.ev.intern.get(entry.name));
+            try self.writer.writeAll(" = ");
+            try self.write(entry.value);
+            try self.writer.writeAll("; ");
+        }
+        try self.writer.writeByte('}');
+    }
+
+    fn writeThunk(self: *ValuePrinter, id: types.ObjectId) !void {
+        if (!try self.enter(.thunk, id)) {
+            try self.writer.writeAll("...");
+            return;
+        }
+        defer self.leave();
+
+        const thunk = try self.ev.heap.getThunk(id);
+        const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
+        if (state != .resolved) {
+            try self.writer.writeAll("...");
+            return;
+        }
+
+        try self.write(thunk.result);
+    }
+
+    fn writeCell(self: *ValuePrinter, id: types.ObjectId) !void {
+        if (!try self.enter(.cell, id)) {
+            try self.writer.writeAll("...");
+            return;
+        }
+        defer self.leave();
+
+        try self.write(try self.ev.heap.getCellValue(id));
+    }
+
+    fn writeAttrName(self: *ValuePrinter, name: []const u8) !void {
+        if (isBareAttrName(name)) {
+            try self.writer.writeAll(name);
+        } else {
+            try self.ev.writeQuotedString(self.writer, name);
+        }
+    }
+
+    fn enter(self: *ValuePrinter, kind: SeenKind, id: types.ObjectId) !bool {
+        for (self.seen.items) |seen| {
+            if (seen.kind == kind and seen.id == id) return false;
+        }
+        try self.seen.append(self.ev.allocator, .{ .kind = kind, .id = id });
+        return true;
+    }
+
+    fn leave(self: *ValuePrinter) void {
+        _ = self.seen.pop();
+    }
+
+    fn isBareAttrName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (!isAttrNameStart(name[0])) return false;
+        for (name[1..]) |c| {
+            if (!isAttrNameContinue(c)) return false;
+        }
+        return true;
+    }
+
+    fn isAttrNameStart(c: u8) bool {
+        return std.ascii.isAlphabetic(c) or c == '_';
+    }
+
+    fn isAttrNameContinue(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '\'';
+    }
+};
+
+fn renderForTest(source: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate(source);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
+test "writeValue prints lazy containers without forcing contents" {
+    const list_output = try renderForTest("[ 1 (1 / 0) \"x\" ]");
+    defer std.testing.allocator.free(list_output);
+    try std.testing.expectEqualStrings("[ ... ... ... ]", list_output);
+
+    const attrs_output = try renderForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
+    defer std.testing.allocator.free(attrs_output);
+    try std.testing.expectEqualStrings("{ a = ...; b = ...; c = ...; }", attrs_output);
+}
+
+test "writeValue prints recursive attrsets without looping" {
+    const output = try renderForTest("rec { a = a; b = 1; }");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
+}
