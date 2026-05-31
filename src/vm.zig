@@ -788,6 +788,7 @@ pub const VM = struct {
             .all => self.builtinAll(args[0], args[1]),
             .any => self.builtinAny(args[0], args[1]),
             .filter => self.builtinFilter(args[0], args[1]),
+            .foldlStrict => self.builtinFoldlStrict(args[0], args[1], args[2]),
         };
     }
 
@@ -1025,6 +1026,20 @@ pub const VM = struct {
         }
 
         return Value.list(try self.heap.addList(out.items));
+    }
+
+    fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
+        const op = try self.forceValue(op_arg);
+        var acc = try self.forceValue(nul_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const partial = try self.callValue(op, acc);
+            acc = try self.forceValue(try self.callValue(partial, item));
+        }
+
+        return acc;
     }
 
     fn builtinRemoveAttrs(self: *VM, attrs_arg: Value, names_arg: Value) !Value {

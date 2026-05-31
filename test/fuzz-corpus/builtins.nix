@@ -45,3 +45,6 @@ builtins.any (x: x == 2) [ 1 3 ]
 builtins.filter (x: x < 3) [ 1 4 2 ]
 builtins.length (builtins.filter (x: true) [ (1 / 0) ])
 builtins.filter (x: false) [ (1 / 0) ]
+builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]
+builtins.foldl' (a: b: a) 1 [ (1 / 0) ]
+builtins.foldl' (a: b: b) 0 [ 1 2 ]

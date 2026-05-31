@@ -578,6 +578,20 @@ test "evaluate filter builtin" {
     try std.testing.expectEqualStrings("[ ]", reject_lazy);
 }
 
+test "evaluate foldl' builtin" {
+    const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
+    defer std.testing.allocator.free(sum);
+    try std.testing.expectEqualStrings("6", sum);
+
+    const ignores_item = try renderForTest("builtins.foldl' (a: b: a) 1 [ (1 / 0) ]");
+    defer std.testing.allocator.free(ignores_item);
+    try std.testing.expectEqualStrings("1", ignores_item);
+
+    const returns_item = try renderForTest("builtins.foldl' (a: b: b) 0 [ 1 2 ]");
+    defer std.testing.allocator.free(returns_item);
+    try std.testing.expectEqualStrings("2", returns_item);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
