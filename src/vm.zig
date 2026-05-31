@@ -26,7 +26,8 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const Closure = heap_mod.Closure;
-const BuiltinId = @import("builtins.zig").BuiltinId;
+const builtins_mod = @import("builtins.zig");
+const BuiltinId = builtins_mod.BuiltinId;
 
 /// A single call frame.
 pub const Frame = struct {
@@ -715,65 +716,60 @@ pub const VM = struct {
             try self.push(arg); // arg is first local
             try self.pushFrame(ch, 1, closure_id);
         } else if (callee.discriminant == .builtin) {
-            try self.push(try self.callBuiltin(callee, arg));
+            try self.push(try self.applyBuiltin(callee.asBuiltinId(), &.{arg}));
         } else if (callee.discriminant == .builtin_closure) {
-            try self.push(try self.callBuiltinClosure(callee, arg));
+            try self.push(try self.applyBuiltinClosure(callee, arg));
         } else {
             return error.NotCallable;
         }
     }
 
-    fn callBuiltin(self: *VM, callee: Value, arg: Value) !Value {
-        return switch (callee.asBuiltinId()) {
-            @intFromEnum(BuiltinId.toString) => self.builtinToString(arg),
-            @intFromEnum(BuiltinId.isAttrs) => self.builtinTypePredicate(arg, .attrs),
-            @intFromEnum(BuiltinId.isList) => self.builtinTypePredicate(arg, .list),
-            @intFromEnum(BuiltinId.isString) => self.builtinTypePredicate(arg, .string),
-            @intFromEnum(BuiltinId.isInt) => self.builtinTypePredicate(arg, .int),
-            @intFromEnum(BuiltinId.isBool) => self.builtinIsBool(arg),
-            @intFromEnum(BuiltinId.isNull) => self.builtinTypePredicate(arg, .null),
-            @intFromEnum(BuiltinId.isFloat) => self.builtinTypePredicate(arg, .float),
-            @intFromEnum(BuiltinId.isFunction) => self.builtinIsFunction(arg),
-            @intFromEnum(BuiltinId.isPath) => self.builtinTypePredicate(arg, .path),
-            @intFromEnum(BuiltinId.length) => self.builtinLength(arg),
-            @intFromEnum(BuiltinId.head) => self.builtinHead(arg),
-            @intFromEnum(BuiltinId.tail) => self.builtinTail(arg),
-            @intFromEnum(BuiltinId.attrNames) => self.builtinAttrNames(arg),
-            @intFromEnum(BuiltinId.attrValues) => self.builtinAttrValues(arg),
-            @intFromEnum(BuiltinId.typeOf) => self.builtinTypeOf(arg),
-            @intFromEnum(BuiltinId.concatLists) => self.builtinConcatLists(arg),
-            @intFromEnum(BuiltinId.listToAttrs) => self.builtinListToAttrs(arg),
-            @intFromEnum(BuiltinId.hasAttr),
-            @intFromEnum(BuiltinId.getAttr),
-            @intFromEnum(BuiltinId.elemAt),
-            @intFromEnum(BuiltinId.removeAttrs),
-            @intFromEnum(BuiltinId.intersectAttrs),
-            @intFromEnum(BuiltinId.elem),
-            @intFromEnum(BuiltinId.seq),
-            => self.makeBuiltinClosure(callee.asBuiltinId(), arg),
-            else => error.InvalidBuiltin,
+    fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
+        const closure = try self.heap.getBuiltinClosure(callee.asObjectId());
+        var args: [8]Value = undefined;
+        if (closure.args.len + 1 > args.len) return error.TooManyArguments;
+        @memcpy(args[0..closure.args.len], closure.args);
+        args[closure.args.len] = arg;
+        return self.applyBuiltin(closure.builtin_id, args[0 .. closure.args.len + 1]);
+    }
+
+    fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
+        const id: BuiltinId = @enumFromInt(builtin_id);
+        const arity = builtins_mod.arity(id);
+        if (args.len < arity) return self.makeBuiltinClosure(builtin_id, args);
+        if (args.len > arity) return error.TooManyArguments;
+
+        return switch (id) {
+            .toString => self.builtinToString(args[0]),
+            .isAttrs => self.builtinTypePredicate(args[0], .attrs),
+            .isList => self.builtinTypePredicate(args[0], .list),
+            .isString => self.builtinTypePredicate(args[0], .string),
+            .isInt => self.builtinTypePredicate(args[0], .int),
+            .isBool => self.builtinIsBool(args[0]),
+            .isNull => self.builtinTypePredicate(args[0], .null),
+            .isFloat => self.builtinTypePredicate(args[0], .float),
+            .isFunction => self.builtinIsFunction(args[0]),
+            .isPath => self.builtinTypePredicate(args[0], .path),
+            .length => self.builtinLength(args[0]),
+            .head => self.builtinHead(args[0]),
+            .tail => self.builtinTail(args[0]),
+            .attrNames => self.builtinAttrNames(args[0]),
+            .attrValues => self.builtinAttrValues(args[0]),
+            .typeOf => self.builtinTypeOf(args[0]),
+            .concatLists => self.builtinConcatLists(args[0]),
+            .listToAttrs => self.builtinListToAttrs(args[0]),
+            .hasAttr => self.builtinHasAttr(args[0], args[1]),
+            .getAttr => self.builtinGetAttr(args[0], args[1]),
+            .elemAt => self.builtinElemAt(args[0], args[1]),
+            .removeAttrs => self.builtinRemoveAttrs(args[0], args[1]),
+            .intersectAttrs => self.builtinIntersectAttrs(args[0], args[1]),
+            .elem => self.builtinElem(args[0], args[1]),
+            .seq => self.builtinSeq(args[0], args[1]),
         };
     }
 
-    fn makeBuiltinClosure(self: *VM, builtin_id: u16, arg: Value) !Value {
-        return Value.builtinClosure(try self.heap.addBuiltinClosure(.{
-            .builtin_id = builtin_id,
-            .arg = arg,
-        }));
-    }
-
-    fn callBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
-        const partial = try self.heap.getBuiltinClosure(callee.asObjectId());
-        return switch (partial.builtin_id) {
-            @intFromEnum(BuiltinId.hasAttr) => self.builtinHasAttr(partial.arg, arg),
-            @intFromEnum(BuiltinId.getAttr) => self.builtinGetAttr(partial.arg, arg),
-            @intFromEnum(BuiltinId.elemAt) => self.builtinElemAt(partial.arg, arg),
-            @intFromEnum(BuiltinId.removeAttrs) => self.builtinRemoveAttrs(partial.arg, arg),
-            @intFromEnum(BuiltinId.intersectAttrs) => self.builtinIntersectAttrs(partial.arg, arg),
-            @intFromEnum(BuiltinId.elem) => self.builtinElem(partial.arg, arg),
-            @intFromEnum(BuiltinId.seq) => self.builtinSeq(partial.arg, arg),
-            else => error.InvalidBuiltin,
-        };
+    fn makeBuiltinClosure(self: *VM, builtin_id: u16, args: []const Value) !Value {
+        return Value.builtinClosure(try self.heap.addBuiltinClosure(builtin_id, args));
     }
 
     fn builtinTypePredicate(self: *VM, arg: Value, expected: @import("value.zig").ValueType) !Value {

@@ -34,6 +34,38 @@ pub const BuiltinId = enum(u16) {
     seq = 24,
 };
 
+pub fn arity(id: BuiltinId) u8 {
+    return switch (id) {
+        .toString,
+        .isAttrs,
+        .isList,
+        .isString,
+        .isInt,
+        .isBool,
+        .isNull,
+        .isFloat,
+        .isFunction,
+        .isPath,
+        .length,
+        .head,
+        .tail,
+        .attrNames,
+        .attrValues,
+        .typeOf,
+        .concatLists,
+        .listToAttrs,
+        => 1,
+        .hasAttr,
+        .getAttr,
+        .elemAt,
+        .removeAttrs,
+        .intersectAttrs,
+        .elem,
+        .seq,
+        => 2,
+    };
+}
+
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
     const entries = [_]AttrEntry{
         .{
