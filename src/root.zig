@@ -536,6 +536,21 @@ test "end-to-end: attr path or defaults" {
     try std.testing.expectError(error.TypeError, ev.evaluate("1.a or 2"));
 }
 
+test "end-to-end: dynamic null attributes are omitted" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const present = try ev.evaluate("({ ${\"x\"} = 1; }).x");
+    try std.testing.expectEqual(@as(i64, 1), present.asInt());
+
+    const omitted = try ev.evaluate("builtins.attrNames { ${null} = 1; }");
+    try std.testing.expectEqual(@as(usize, 0), (try ev.heap.getList(omitted.asObjectId())).len);
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("{ ${true} = 1; }"));
+}
+
 test "end-to-end: with expressions" {
     const alloc = std.testing.allocator;
 

@@ -266,19 +266,33 @@ pub const ObjectHeap = struct {
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
         std.debug.assert(pairs.len % 2 == 0);
-        const range = try self.reserveAttrs(pairs.len / 2);
+
+        var count: usize = 0;
+        var pair_i: usize = 0;
+        while (pair_i < pairs.len) : (pair_i += 2) {
+            switch (pairs[pair_i].discriminant) {
+                .null => {},
+                .string => count += 1,
+                else => return error.TypeError,
+            }
+        }
+
+        const range = try self.reserveAttrs(count);
+        errdefer self.rollbackAttrs(range);
         const entries = self.attrSliceMut(range);
 
         var i: usize = 0;
+        var entry_i: usize = 0;
         while (i < pairs.len) : (i += 2) {
-            entries[i / 2] = .{
+            if (pairs[i].discriminant == .null) continue;
+            entries[entry_i] = .{
                 .name = pairs[i].asInternId(),
                 .value = pairs[i + 1],
             };
+            entry_i += 1;
         }
 
         self.sortAttrs(range);
-        errdefer self.rollbackAttrs(range);
         try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
     }
