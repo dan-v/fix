@@ -93,6 +93,12 @@ test "end-to-end: let binding" {
 
     const result = try ev.evaluate("let x = 10; y = 32; in x + y");
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
+
+    const right_operand = try ev.evaluate("1 + (let x = 2; in x)");
+    try std.testing.expectEqual(@as(i64, 3), right_operand.asInt());
+
+    const left_operand = try ev.evaluate("(let x = 2; in x) + 1");
+    try std.testing.expectEqual(@as(i64, 3), left_operand.asInt());
 }
 
 test "end-to-end: let forward references" {
@@ -291,6 +297,42 @@ test "end-to-end: attr path or defaults" {
 
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("({}).a.b or (1 / 0)"));
     try std.testing.expectError(error.TypeError, ev.evaluate("1.a or 2"));
+}
+
+test "end-to-end: with expressions" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const simple = try ev.evaluate("with { x = 40; y = 2; }; x + y");
+    try std.testing.expectEqual(@as(i64, 42), simple.asInt());
+
+    const lexical_shadow = try ev.evaluate("let x = 1; in with { x = 2; }; x");
+    try std.testing.expectEqual(@as(i64, 1), lexical_shadow.asInt());
+
+    const nested_shadow = try ev.evaluate("with { x = 1; }; with { x = 2; }; x");
+    try std.testing.expectEqual(@as(i64, 2), nested_shadow.asInt());
+
+    const outer_fallback = try ev.evaluate("with { x = 1; }; with { y = 2; }; x + y");
+    try std.testing.expectEqual(@as(i64, 3), outer_fallback.asInt());
+
+    const escaped_lambda = try ev.evaluate("let f = with { x = 41; }; y: x + y; in f 1");
+    try std.testing.expectEqual(@as(i64, 42), escaped_lambda.asInt());
+
+    const escaped_attr_thunk = try ev.evaluate("let a = with { x = 42; }; { y = x; }; in a.y");
+    try std.testing.expectEqual(@as(i64, 42), escaped_attr_thunk.asInt());
+
+    const lazy_unused_scope = try ev.evaluate("with (1 / 0); 42");
+    try std.testing.expectEqual(@as(i64, 42), lazy_unused_scope.asInt());
+
+    const lazy_unused_attr = try ev.evaluate("with { x = 42; y = 1 / 0; }; x");
+    try std.testing.expectEqual(@as(i64, 42), lazy_unused_attr.asInt());
+
+    const operand_position = try ev.evaluate("1 + (with { x = 2; }; x)");
+    try std.testing.expectEqual(@as(i64, 3), operand_position.asInt());
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("with 1; x"));
 }
 
 test "end-to-end: duplicate attributes are rejected" {
