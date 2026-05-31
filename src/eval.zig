@@ -546,6 +546,20 @@ test "evaluate seq builtin" {
     try std.testing.expectEqualStrings("3", unused);
 }
 
+test "evaluate deepSeq builtin" {
+    const attrs = try renderForTest("builtins.deepSeq { a = 1; b = [ 2 ]; } 3");
+    defer std.testing.allocator.free(attrs);
+    try std.testing.expectEqualStrings("3", attrs);
+
+    const unused = try renderForTest("let x = builtins.deepSeq [ (1 / 0) ] 2; in 3");
+    defer std.testing.allocator.free(unused);
+    try std.testing.expectEqualStrings("3", unused);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    try std.testing.expectError(error.DivisionByZero, ev.evaluate("builtins.deepSeq [ (1 / 0) ] 2"));
+}
+
 test "evaluate all and any builtins" {
     const all_true = try renderForTest("builtins.all (x: x < 3) [ 1 2 ]");
     defer std.testing.allocator.free(all_true);

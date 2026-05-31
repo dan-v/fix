@@ -789,6 +789,7 @@ pub const VM = struct {
             .any => self.builtinAny(args[0], args[1]),
             .filter => self.builtinFilter(args[0], args[1]),
             .foldlStrict => self.builtinFoldlStrict(args[0], args[1], args[2]),
+            .deepSeq => self.builtinDeepSeq(args[0], args[1]),
         };
     }
 
@@ -983,6 +984,45 @@ pub const VM = struct {
     fn builtinSeq(self: *VM, first: Value, second: Value) !Value {
         _ = try self.forceValue(first);
         return self.forceValue(second);
+    }
+
+    fn builtinDeepSeq(self: *VM, first: Value, second: Value) !Value {
+        var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
+        defer seen.deinit(self.allocator);
+        try self.forceDeep(first, &seen);
+        return self.forceValue(second);
+    }
+
+    const SeenDeepKind = enum { list, attrs };
+
+    const SeenDeepObject = struct {
+        kind: SeenDeepKind,
+        id: ObjectId,
+    };
+
+    fn forceDeep(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
+        const forced = try self.forceValue(value);
+        switch (forced.discriminant) {
+            .list => {
+                const id = forced.asObjectId();
+                if (!try self.enterDeep(.list, id, seen)) return;
+                for (try self.heap.getList(id)) |item| try self.forceDeep(item, seen);
+            },
+            .attrs => {
+                const id = forced.asObjectId();
+                if (!try self.enterDeep(.attrs, id, seen)) return;
+                for (try self.heap.getAttrs(id)) |entry| try self.forceDeep(entry.value, seen);
+            },
+            else => {},
+        }
+    }
+
+    fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenDeepObject)) !bool {
+        for (seen.items) |item| {
+            if (item.kind == kind and item.id == id) return false;
+        }
+        try seen.append(self.allocator, .{ .kind = kind, .id = id });
+        return true;
     }
 
     fn builtinAll(self: *VM, pred_arg: Value, list_arg: Value) !Value {

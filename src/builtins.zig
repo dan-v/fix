@@ -36,6 +36,7 @@ pub const BuiltinId = enum(u16) {
     any = 26,
     filter = 27,
     foldlStrict = 28,
+    deepSeq = 29,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -69,6 +70,7 @@ pub fn arity(id: BuiltinId) u8 {
         .all,
         .any,
         .filter,
+        .deepSeq,
         => 2,
         .foldlStrict => 3,
     };
@@ -191,6 +193,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("foldl'"),
             .value = Value.builtin(@intFromEnum(BuiltinId.foldlStrict)),
+        },
+        .{
+            .name = try intern.intern("deepSeq"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.deepSeq)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));
