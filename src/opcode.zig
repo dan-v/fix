@@ -68,7 +68,7 @@ pub const OpCode = enum(u8) {
     // ---- data ----
     /// Build an attribute set from pairs on the stack.
     /// Operand: 2-byte count of entries.
-    /// Stack layout: [valN, nameN, ..., val1, name1] (top = last pushed).
+    /// Stack layout from lower to higher indexes: [name1, val1, ..., nameN, valN].
     build_attrs,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
