@@ -20,6 +20,7 @@ pub const file_cache = @import("file_cache.zig");
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
 pub const builtins = @import("builtins.zig");
+pub const derivation = @import("derivation.zig");
 pub const diagnostic = @import("diagnostic.zig");
 
 pub const Evaluator = eval.Evaluator;

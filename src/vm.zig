@@ -29,6 +29,7 @@ const Closure = heap_mod.Closure;
 const FileCache = @import("file_cache.zig").FileCache;
 const builtins_mod = @import("builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
+const derivation = @import("derivation.zig");
 
 fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
     if (prefix.len == 0) return name;
@@ -43,14 +44,6 @@ fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
         if (std.mem.startsWith(u8, input, needle)) return i;
     }
     return null;
-}
-
-fn isDerivationSyntheticName(name: []const u8) bool {
-    const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "outputs" };
-    for (synthetic) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    return false;
 }
 
 /// A single call frame.
@@ -1392,43 +1385,52 @@ pub const VM = struct {
         if (name_value.discriminant != .string) return error.TypeError;
         const name = self.intern.get(name_value.asInternId());
 
-        var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
-        defer entries.deinit(self.allocator);
+        const output_names = try self.derivationOutputNames(attrs.asObjectId());
+        defer self.allocator.free(output_names);
 
-        for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
-            if (isDerivationSyntheticName(self.intern.get(entry.name))) continue;
-            try entries.append(self.allocator, entry);
+        const outputs = try self.allocator.alloc(derivation.Output, output_names.len);
+        defer self.allocator.free(outputs);
+        for (output_names, outputs) |output_name, *output| {
+            output.* = .{
+                .name = output_name,
+                .out_path = try derivation.storePath(self.allocator, self.intern, name, self.intern.get(output_name)),
+            };
         }
 
-        const out_path = try std.fmt.allocPrint(self.allocator, "/nix/store/fix-{s}", .{name});
-        defer self.allocator.free(out_path);
-        const drv_path = try std.fmt.allocPrint(self.allocator, "/nix/store/fix-{s}.drv", .{name});
-        defer self.allocator.free(drv_path);
-
-        try entries.appendSlice(self.allocator, &.{
-            .{
-                .name = try self.intern.intern("type"),
-                .value = Value.string(try self.intern.intern("derivation")),
-            },
-            .{
-                .name = try self.intern.intern("outputName"),
-                .value = Value.string(try self.intern.intern("out")),
-            },
-            .{
-                .name = try self.intern.intern("outPath"),
-                .value = Value.path(try self.intern.intern(out_path)),
-            },
-            .{
-                .name = try self.intern.intern("drvPath"),
-                .value = Value.path(try self.intern.intern(drv_path)),
-            },
-            .{
-                .name = try self.intern.intern("outputs"),
-                .value = Value.list(try self.heap.addList(&.{Value.string(try self.intern.intern("out"))})),
-            },
+        return derivation.buildValue(self.allocator, self.intern, self.heap, .{
+            .name = name,
+            .drv_path = try derivation.drvPath(self.allocator, self.intern, name),
+            .default_output = output_names[0],
+            .outputs = outputs,
+            .original_attrs = try self.heap.getAttrs(attrs.asObjectId()),
         });
+    }
 
-        return Value.attrs(try self.heap.addAttrs(entries.items));
+    fn derivationOutputNames(self: *VM, attrs_id: ObjectId) ![]InternId {
+        const outputs_id = try self.intern.intern("outputs");
+        const outputs_value = self.heap.getAttrValue(attrs_id, outputs_id) catch |err| switch (err) {
+            error.MissingAttribute => {
+                const names = try self.allocator.alloc(InternId, 1);
+                names[0] = try self.intern.intern("out");
+                return names;
+            },
+            else => return err,
+        };
+
+        const outputs_list = try self.forceValue(outputs_value);
+        if (outputs_list.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(outputs_list.asObjectId());
+        if (items.len == 0) return error.InvalidDerivationOutput;
+
+        const names = try self.allocator.alloc(InternId, items.len);
+        errdefer self.allocator.free(names);
+        for (items, names) |item, *name| {
+            const value = try self.forceValue(item);
+            if (value.discriminant != .string) return error.TypeError;
+            name.* = value.asInternId();
+            if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;
+        }
+        return names;
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
