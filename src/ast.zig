@@ -27,10 +27,9 @@ pub const NodeTag = enum(u8) {
     assert,
     with_expr,
     attr_set,
-    attr_path,     // foo.bar.baz
+    attr_path, // foo.bar.baz
     list,
-    parens,        // parenthesized subexpression
-    concat_string, // "foo ${bar} baz"
+    parens, // parenthesized subexpression
 };
 
 pub const BinaryOp = enum(u8) {
@@ -46,9 +45,9 @@ pub const BinaryOp = enum(u8) {
     gte,
     and_,
     or_,
-    impl,    // ->
-    update,  // //
-    concat,  // + on strings
+    impl, // ->
+    update, // //
+    concat, // + on strings
 };
 
 pub const UnaryOp = enum(u8) {
@@ -78,7 +77,6 @@ pub const Node = struct {
         attr_path: AttrPath,
         list: List,
         parens: *Node,
-        concat_string: []*Node,
     };
 
     pub const Atom = struct {
