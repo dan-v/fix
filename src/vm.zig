@@ -472,7 +472,7 @@ pub const VM = struct {
         };
     }
 
-    fn valuesEqual(self: *VM, a: Value, b: Value) !bool {
+    fn valuesEqual(self: *VM, a: Value, b: Value) anyerror!bool {
         const va = try self.forceValue(a);
         const vb = try self.forceValue(b);
 
@@ -482,13 +482,37 @@ pub const VM = struct {
             .int => va.asInt() == vb.asInt(),
             .float => va.asFloat() == vb.asFloat(),
             .string, .path => va.asInternId() == vb.asInternId(),
-            .list, .attrs => va.asObjectId() == vb.asObjectId(),
+            .list => try self.listsEqual(va.asObjectId(), vb.asObjectId()),
+            .attrs => try self.attrsEqual(va.asObjectId(), vb.asObjectId()),
             .closure => false,
             .thunk, .cell => unreachable,
         };
     }
 
     const CompareResult = enum { lt, eq, gt };
+
+    fn listsEqual(self: *VM, a_id: ObjectId, b_id: ObjectId) anyerror!bool {
+        const a_items = try self.heap.getList(a_id);
+        const b_items = try self.heap.getList(b_id);
+        if (a_items.len != b_items.len) return false;
+
+        for (a_items, b_items) |a_item, b_item| {
+            if (!try self.valuesEqual(a_item, b_item)) return false;
+        }
+        return true;
+    }
+
+    fn attrsEqual(self: *VM, a_id: ObjectId, b_id: ObjectId) anyerror!bool {
+        const a_entries = try self.heap.getAttrs(a_id);
+        const b_entries = try self.heap.getAttrs(b_id);
+        if (a_entries.len != b_entries.len) return false;
+
+        for (a_entries, b_entries) |a_entry, b_entry| {
+            if (a_entry.name != b_entry.name) return false;
+            if (!try self.valuesEqual(a_entry.value, b_entry.value)) return false;
+        }
+        return true;
+    }
 
     fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
         const va = try self.forceValue(a);
