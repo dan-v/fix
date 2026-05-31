@@ -410,10 +410,23 @@ pub const VM = struct {
                     const host = self.import_host orelse return error.SearchPathUnavailable;
                     try self.push(try host.find_file(host.context, self.intern.get(@intCast(name_id))));
                 },
+                .find_file_long => {
+                    const name_id: InternId = readU32(code, frame.ip);
+                    frame.ip += 4;
+                    const host = self.import_host orelse return error.SearchPathUnavailable;
+                    try self.push(try host.find_file(host.context, self.intern.get(name_id)));
+                },
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
+                    const upvalue_count = code[frame.ip];
+                    frame.ip += 1;
+                    try self.makeClosure(ch_id, upvalue_count);
+                },
+                .closure_long => {
+                    const ch_id: ChunkId = readU32(code, frame.ip);
+                    frame.ip += 4;
                     const upvalue_count = code[frame.ip];
                     frame.ip += 1;
                     try self.makeClosure(ch_id, upvalue_count);
@@ -443,6 +456,13 @@ pub const VM = struct {
                     const result = try self.getAttrValue(attrs_val, @intCast(name_id));
                     try self.push(result);
                 },
+                .get_attr_long => {
+                    const name_id: InternId = readU32(code, frame.ip);
+                    frame.ip += 4;
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrValue(attrs_val, name_id);
+                    try self.push(result);
+                },
                 .get_attr_dynamic => {
                     const name_val = try self.forceValue(self.pop());
                     if (name_val.discriminant != .string) return error.TypeError;
@@ -470,7 +490,17 @@ pub const VM = struct {
                     frame.ip += @as(usize, segment_count) * 2;
                     const default_val = self.pop();
                     const attrs_val = self.pop();
-                    const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip]);
+                    const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip], false);
+                    try self.push(result);
+                },
+                .get_attr_path_or_long => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 4;
+                    const default_val = self.pop();
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip], true);
                     try self.push(result);
                 },
                 .has_attr_path => {
@@ -479,7 +509,15 @@ pub const VM = struct {
                     const names_start = frame.ip;
                     frame.ip += @as(usize, segment_count) * 2;
                     const attrs_val = self.pop();
-                    try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip])));
+                    try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip], false)));
+                },
+                .has_attr_path_long => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 4;
+                    const attrs_val = self.pop();
+                    try self.push(Value.boolVal(try self.hasAttrPath(attrs_val, code[names_start..frame.ip], true)));
                 },
                 .has_attr_dynamic => {
                     const name_val = try self.forceValue(self.pop());
@@ -505,11 +543,28 @@ pub const VM = struct {
                     const names_start = frame.ip;
                     frame.ip += @as(usize, expected_count) * 2;
                     const attrs_val = self.pop();
-                    try self.validateAttrs(attrs_val, allow_extra, code[names_start..frame.ip]);
+                    try self.validateAttrs(attrs_val, allow_extra, code[names_start..frame.ip], false);
+                },
+                .validate_attrs_long => {
+                    const allow_extra = code[frame.ip] != 0;
+                    frame.ip += 1;
+                    const expected_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, expected_count) * 4;
+                    const attrs_val = self.pop();
+                    try self.validateAttrs(attrs_val, allow_extra, code[names_start..frame.ip], true);
                 },
                 .lookup_with => {
                     const name_id: InternId = @intCast(readU16(code, frame.ip));
                     frame.ip += 2;
+                    const scope_count = code[frame.ip];
+                    frame.ip += 1;
+                    try self.lookupWith(name_id, scope_count);
+                },
+                .lookup_with_long => {
+                    const name_id: InternId = readU32(code, frame.ip);
+                    frame.ip += 4;
                     const scope_count = code[frame.ip];
                     frame.ip += 1;
                     try self.lookupWith(name_id, scope_count);
@@ -813,7 +868,7 @@ pub const VM = struct {
         return self.heap.getClosure(closure_id);
     }
 
-    fn makeClosure(self: *VM, chunk_id: u16, upvalue_count: u8) !void {
+    fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u8) !void {
         const start = self.sp - upvalue_count;
         const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
         self.sp = start;
@@ -891,12 +946,13 @@ pub const VM = struct {
         return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
     }
 
-    fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8) !Value {
+    fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
         var current = try self.forceValue(attrs_val);
         var offset: usize = 0;
-        while (offset < encoded_names.len) : (offset += 2) {
+        const stride: usize = if (wide) 4 else 2;
+        while (offset < encoded_names.len) : (offset += stride) {
             if (current.discriminant != .attrs) return self.forceValue(default_val);
-            const name_id: InternId = @intCast(readU16(encoded_names, offset));
+            const name_id = readInternId(encoded_names, offset, wide);
             current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
                 error.MissingAttribute => return self.forceValue(default_val),
                 else => return err,
@@ -906,33 +962,35 @@ pub const VM = struct {
         return current;
     }
 
-    fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8) !bool {
+    fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide: bool) !bool {
         var current = try self.forceValue(attrs_val);
         var offset: usize = 0;
-        while (offset < encoded_names.len) : (offset += 2) {
+        const stride: usize = if (wide) 4 else 2;
+        while (offset < encoded_names.len) : (offset += stride) {
             if (current.discriminant != .attrs) return false;
-            const name_id: InternId = @intCast(readU16(encoded_names, offset));
+            const name_id = readInternId(encoded_names, offset, wide);
             const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
                 error.MissingAttribute => return false,
                 else => return err,
             };
-            if (offset + 2 >= encoded_names.len) return true;
+            if (offset + stride >= encoded_names.len) return true;
             current = try self.forceValue(attr);
         }
         return false;
     }
 
-    fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8) !void {
+    fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8, wide: bool) !void {
         const value = try self.forceValue(attrs_val);
         if (value.discriminant != .attrs) return error.TypeError;
         if (allow_extra) return;
 
         const entries = try self.heap.getAttrs(value.asObjectId());
+        const stride: usize = if (wide) 4 else 2;
         for (entries) |entry| {
             var found = false;
             var offset: usize = 0;
-            while (offset < encoded_names.len) : (offset += 2) {
-                const name_id: InternId = @intCast(readU16(encoded_names, offset));
+            while (offset < encoded_names.len) : (offset += stride) {
+                const name_id = readInternId(encoded_names, offset, wide);
                 if (entry.name == name_id) {
                     found = true;
                     break;
@@ -970,4 +1028,15 @@ pub const VM = struct {
 
 fn readU16(code: []const u8, ip: usize) u16 {
     return @as(u16, code[ip]) | (@as(u16, code[ip + 1]) << 8);
+}
+
+fn readU32(code: []const u8, ip: usize) u32 {
+    return @as(u32, code[ip]) |
+        (@as(u32, code[ip + 1]) << 8) |
+        (@as(u32, code[ip + 2]) << 16) |
+        (@as(u32, code[ip + 3]) << 24);
+}
+
+fn readInternId(code: []const u8, ip: usize, wide: bool) InternId {
+    return if (wide) readU32(code, ip) else @intCast(readU16(code, ip));
 }

@@ -70,6 +70,14 @@ pub const ChunkBuilder = struct {
         try self.code.append(allocator, @truncate(val >> 8));
     }
 
+    /// Write a four-byte operand (little-endian).
+    pub fn writeU32(self: *ChunkBuilder, allocator: std.mem.Allocator, val: u32) !void {
+        try self.code.append(allocator, @truncate(val));
+        try self.code.append(allocator, @truncate(val >> 8));
+        try self.code.append(allocator, @truncate(val >> 16));
+        try self.code.append(allocator, @truncate(val >> 24));
+    }
+
     /// Add a constant to the pool and return its index.
     pub fn addConstant(self: *ChunkBuilder, allocator: std.mem.Allocator, val: Value) !ConstIdx {
         try self.constants.append(allocator, val);

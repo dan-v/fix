@@ -148,6 +148,33 @@ pub const Compiler = struct {
         try self.builder.writeByte(self.allocator, val);
     }
 
+    fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: InternId) !void {
+        if (id <= std.math.maxInt(u16)) {
+            try self.emitOpU16(short_op, @intCast(id));
+        } else {
+            try self.emitOp(long_op);
+            try self.builder.writeU32(self.allocator, id);
+        }
+    }
+
+    fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
+        if (wide) {
+            try self.builder.writeU32(self.allocator, id);
+        } else {
+            try self.builder.writeU16(self.allocator, @intCast(id));
+        }
+    }
+
+    fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u8) !void {
+        if (chunk_id <= std.math.maxInt(u16)) {
+            try self.emitOpU16(.closure, @intCast(chunk_id));
+        } else {
+            try self.emitOp(.closure_long);
+            try self.builder.writeU32(self.allocator, chunk_id);
+        }
+        try self.builder.writeByte(self.allocator, upvalue_count);
+    }
+
     // ---- atom compilers ----
 
     fn compileInt(self: *Compiler, node: *const Node) !void {
@@ -263,7 +290,7 @@ pub const Compiler = struct {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
         if (span.len < 2) return error.InvalidSearchPath;
         const id = try self.intern.intern(span[1 .. span.len - 1]);
-        try self.emitOpU16(.find_file, @intCast(id));
+        try self.emitInternOp(.find_file, .find_file_long, id);
     }
 
     const ResolvedPath = struct {
@@ -318,7 +345,7 @@ pub const Compiler = struct {
 
         if (builtins.hasConstant(name)) {
             try self.emitOp(.push_builtins);
-            try self.emitOpU16(.get_attr, @intCast(try self.intern.intern(name)));
+            try self.emitInternOp(.get_attr, .get_attr_long, try self.intern.intern(name));
             return true;
         }
 
@@ -448,8 +475,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, @intCast(child.captures.items.len));
     }
 
     fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
@@ -478,8 +504,14 @@ pub const Compiler = struct {
             try child.emitOpByte(.set_local, @intCast(slot));
         }
 
+        var wide_params = false;
+        for (lambda.params) |param| {
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
+            if (try self.intern.intern(name) > std.math.maxInt(u16)) wide_params = true;
+        }
+
         try child.emitOpByte(.get_local, @intCast(arg_slot));
-        try child.emitOp(.validate_attrs);
+        try child.emitOp(if (wide_params) .validate_attrs_long else .validate_attrs);
         try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
         try child.builder.writeU16(child.allocator, @intCast(lambda.params.len));
         var function_args: std.ArrayListUnmanaged(@import("heap.zig").AttrEntry) = .empty;
@@ -488,7 +520,7 @@ pub const Compiler = struct {
         for (lambda.params) |param| {
             const name = self.source[param.name.offset .. param.name.offset + param.name.len];
             const name_id = try self.intern.intern(name);
-            try child.builder.writeU16(child.allocator, @intCast(name_id));
+            try child.writeInternId(name_id, wide_params);
             function_args.appendAssumeCapacity(.{
                 .name = name_id,
                 .value = @import("value.zig").Value.boolVal(param.default != null),
@@ -523,8 +555,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, @intCast(child.captures.items.len));
     }
 
     fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
@@ -546,11 +577,11 @@ pub const Compiler = struct {
         try child.emitOpByte(.get_upvalue, 0);
         if (default) |default_expr| {
             try child.compileThunk(default_expr);
-            try child.emitOp(.get_attr_path_or);
+            try child.emitOp(if (name_id > std.math.maxInt(u16)) .get_attr_path_or_long else .get_attr_path_or);
             try child.builder.writeByte(child.allocator, 1);
-            try child.builder.writeU16(child.allocator, @intCast(name_id));
+            try child.writeInternId(name_id, name_id > std.math.maxInt(u16));
         } else {
-            try child.emitOpU16(.get_attr, @intCast(name_id));
+            try child.emitInternOp(.get_attr, .get_attr_long, name_id);
         }
         try child.emitOp(.ret);
         try child.emitOp(.halt);
@@ -558,8 +589,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, @intCast(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
@@ -654,8 +684,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, @intCast(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
@@ -948,8 +977,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitOpU16(.closure, @intCast(child_id));
-        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, @intCast(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
@@ -1066,7 +1094,7 @@ pub const Compiler = struct {
             } else {
                 const name_span = self.attrSegmentSpan(seg);
                 const name_id = try self.intern.intern(name_span);
-                try self.emitOpU16(.get_attr, @intCast(name_id));
+                try self.emitInternOp(.get_attr, .get_attr_long, name_id);
             }
         }
     }
@@ -1092,24 +1120,34 @@ pub const Compiler = struct {
         const apath = attr_or.attr_path.data.attr_path;
         try self.compileNode(apath.root);
         try self.compileThunk(attr_or.default);
-        try self.emitOp(.get_attr_path_or);
+        var wide = false;
+        for (apath.segments) |seg| {
+            const name_span = self.attrSegmentSpan(seg);
+            if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+        }
+        try self.emitOp(if (wide) .get_attr_path_or_long else .get_attr_path_or);
         try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
         for (apath.segments) |seg| {
             const name_span = self.attrSegmentSpan(seg);
             const name_id = try self.intern.intern(name_span);
-            try self.builder.writeU16(self.allocator, @intCast(name_id));
+            try self.writeInternId(name_id, wide);
         }
     }
 
     fn compileHasAttr(self: *Compiler, node: *const Node) !void {
         const has_attr = node.data.has_attr;
         try self.compileNode(has_attr.root);
-        try self.emitOp(.has_attr_path);
+        var wide = false;
+        for (has_attr.segments) |seg| {
+            const name_span = self.attrSegmentSpan(seg);
+            if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+        }
+        try self.emitOp(if (wide) .has_attr_path_long else .has_attr_path);
         try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
         for (has_attr.segments) |seg| {
             const name_span = self.attrSegmentSpan(seg);
             const name_id = try self.intern.intern(name_span);
-            try self.builder.writeU16(self.allocator, @intCast(name_id));
+            try self.writeInternId(name_id, wide);
         }
     }
 
@@ -1144,7 +1182,7 @@ pub const Compiler = struct {
         }
 
         const name_id = try self.intern.intern(name);
-        try self.emitOpU16(.lookup_with, @intCast(name_id));
+        try self.emitInternOp(.lookup_with, .lookup_with_long, name_id);
         try self.builder.writeByte(self.allocator, @intCast(scopes.items.len));
         return true;
     }

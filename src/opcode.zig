@@ -82,12 +82,18 @@ pub const OpCode = enum(u8) {
     /// Resolve an evaluator search-path literal.
     /// Operand: 2-byte InternId of the search path text without angle brackets.
     find_file,
+    /// Resolve an evaluator search-path literal with a wide intern id.
+    /// Operand: 4-byte InternId.
+    find_file_long,
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.
     /// Operand: 2-byte ChunkId, 1-byte upvalue count.
     /// Upvalues are the top N values on the stack, popped.
     closure,
+    /// Create a closure whose chunk id does not fit in the short form.
+    /// Operand: 4-byte ChunkId, 1-byte upvalue count.
+    closure_long,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
@@ -105,6 +111,9 @@ pub const OpCode = enum(u8) {
     /// Select an attribute from attrset on stack top.
     /// Operand: 2-byte InternId of the attribute name.
     get_attr,
+    /// Select an attribute from attrset on stack top with a wide intern id.
+    /// Operand: 4-byte InternId.
+    get_attr_long,
     /// Select an attribute by a runtime string name.
     /// Stack layout before: [attrs, name].
     get_attr_dynamic,
@@ -115,10 +124,16 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].
     get_attr_path_or,
+    /// Wide-intern-id form of get_attr_path_or.
+    /// Operand: 1-byte segment count, then that many 4-byte InternIds.
+    get_attr_path_or_long,
     /// Test whether an attribute path exists without forcing the final value.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs].
     has_attr_path,
+    /// Wide-intern-id form of has_attr_path.
+    /// Operand: 1-byte segment count, then that many 4-byte InternIds.
+    has_attr_path_long,
     /// Test whether a runtime string attribute exists.
     /// Stack layout before: [attrs, name].
     has_attr_dynamic,
@@ -126,10 +141,16 @@ pub const OpCode = enum(u8) {
     /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
     /// Stack layout before: [attrs].
     validate_attrs,
+    /// Wide-intern-id form of validate_attrs.
+    /// Operand: 1-byte allow_extra flag, 2-byte expected count, then 4-byte InternIds.
+    validate_attrs_long,
     /// Look up a variable name through active with-scopes.
     /// Operand: 2-byte InternId, 1-byte scope count.
     /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.
     lookup_with,
+    /// Wide-intern-id form of lookup_with.
+    /// Operand: 4-byte InternId, 1-byte scope count.
+    lookup_with_long,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,
