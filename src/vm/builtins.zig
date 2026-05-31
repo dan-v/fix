@@ -1535,22 +1535,58 @@ fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
 }
 
 fn builtinToString(self: anytype, arg: Value) !Value {
+    return Value.string(try coerceToStringId(self, arg));
+}
+
+fn coerceToStringId(self: anytype, arg: Value) !InternId {
     const value = try self.forceValue(arg);
     switch (value.discriminant) {
-        .string => return value,
-        .path => return Value.string(value.asInternId()),
+        .string, .path => return value.asInternId(),
         .int => {
             const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
             defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            return self.intern.intern(s);
         },
         .float => {
             const s = try std.fmt.allocPrint(self.allocator, "{d}", .{value.asFloat()});
             defer self.allocator.free(s);
-            return Value.string(try self.intern.intern(s));
+            return self.intern.intern(s);
         },
-        .bool_false, .null => return Value.string(try self.intern.intern("")),
-        .bool_true => return Value.string(try self.intern.intern("1")),
+        .bool_false, .null => return self.intern.intern(""),
+        .bool_true => return self.intern.intern("1"),
+        .list => return coerceListToStringId(self, value.asObjectId()),
+        .attrs => return coerceAttrsToStringId(self, value),
         else => return error.TypeError,
     }
+}
+
+fn coerceListToStringId(self: anytype, list_id: ObjectId) !InternId {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(self.allocator);
+
+    for (try self.heap.getList(list_id), 0..) |item, i| {
+        if (i > 0) try out.append(self.allocator, ' ');
+        const item_id = try coerceToStringId(self, item);
+        try out.appendSlice(self.allocator, self.intern.get(item_id));
+    }
+
+    return self.intern.intern(out.items);
+}
+
+fn coerceAttrsToStringId(self: anytype, attrs: Value) !InternId {
+    const to_string_id = try self.intern.intern("__toString");
+    if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
+        const result = try self.callValue(try self.forceValue(to_string), attrs);
+        return coerceToStringId(self, result);
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+
+    const out_path_id = try self.intern.intern("outPath");
+    const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
+        error.MissingAttribute => return error.TypeError,
+        else => return err,
+    };
+    return coerceToStringId(self, out_path);
 }

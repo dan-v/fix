@@ -727,6 +727,15 @@ test "end-to-end: builtins.toString" {
     const shadowed = try ev.evaluate("let builtins = { toString = x: \"shadow\"; }; in builtins.toString 1");
     try std.testing.expectEqualStrings("shadow", ev.intern.get(shadowed.asInternId()));
 
+    const list_string = try ev.evaluate("builtins.toString [ 1 \"a\" false null ]");
+    try std.testing.expectEqualStrings("1 a  ", ev.intern.get(list_string.asInternId()));
+
+    const attr_string = try ev.evaluate("builtins.toString { __toString = self: self.name; name = \"pkg\"; }");
+    try std.testing.expectEqualStrings("pkg", ev.intern.get(attr_string.asInternId()));
+
+    const out_path_string = try ev.evaluate("builtins.toString { outPath = \"/nix/store/example\"; }");
+    try std.testing.expectEqualStrings("/nix/store/example", ev.intern.get(out_path_string.asInternId()));
+
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toString {}"));
 }
 
