@@ -64,8 +64,7 @@ pub const BuiltinId = enum(u16) {
     groupBy = 54,
     genericClosure = 55,
     functionArgs = 56,
-    isCallable = 57,
-    unsafeGetAttrPos = 58,
+    unsafeGetAttrPos = 57,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -103,7 +102,6 @@ pub fn arity(id: BuiltinId) u8 {
         .path,
         .genericClosure,
         .functionArgs,
-        .isCallable,
         => 1,
         .hasAttr,
         .getAttr,
@@ -364,10 +362,6 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("functionArgs"),
             .value = Value.builtin(@intFromEnum(BuiltinId.functionArgs)),
-        },
-        .{
-            .name = try intern.intern("isCallable"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isCallable)),
         },
         .{
             .name = try intern.intern("unsafeGetAttrPos"),

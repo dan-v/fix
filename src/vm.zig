@@ -853,7 +853,6 @@ pub const VM = struct {
             .groupBy => self.builtinGroupBy(args[0], args[1]),
             .genericClosure => self.builtinGenericClosure(args[0]),
             .functionArgs => self.builtinFunctionArgs(args[0]),
-            .isCallable => self.builtinIsFunction(args[0]),
             .unsafeGetAttrPos => self.builtinUnsafeGetAttrPos(args[0], args[1]),
         };
     }
@@ -1553,7 +1552,7 @@ pub const VM = struct {
     fn builtinStorePath(self: *VM, arg: Value) !Value {
         const path = try self.pathArg(arg);
         if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
-        return Value.path(try self.intern.intern(path));
+        return Value.string(try self.intern.intern(path));
     }
 
     fn builtinPath(self: *VM, arg: Value) !Value {
@@ -1578,7 +1577,7 @@ pub const VM = struct {
             if (name.discriminant != .string) return error.TypeError;
         }
 
-        return Value.path(try self.intern.intern(path));
+        return Value.string(try self.intern.intern(path));
     }
 
     fn builtinSort(self: *VM, cmp_arg: Value, list_arg: Value) !Value {

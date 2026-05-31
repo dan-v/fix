@@ -66,7 +66,7 @@ builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
 (builtins.tryEval (builtins.throw "x")).success
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type
-builtins.isPath (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
+builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
 builtins.sort (a: b: a < b) [ 2 1 ]
 (builtins.partition (x: x < 2) [ 1 2 ]).right
 (builtins.groupBy (x: "k") [ 1 2 ]).k

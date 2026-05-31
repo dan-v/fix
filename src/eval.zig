@@ -1123,9 +1123,9 @@ test "evaluate path construction builtins" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
 
-    const store_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isPath (builtins.storePath \"{s}\")", .{cwd});
+    const store_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.storePath \"{s}\")", .{cwd});
     defer std.testing.allocator.free(store_source);
-    const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isPath (builtins.path {{ path = \"{s}\"; name = \"cwd\"; }})", .{cwd});
+    const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.path {{ path = \"{s}\"; name = \"cwd\"; }})", .{cwd});
     defer std.testing.allocator.free(path_source);
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
@@ -1160,10 +1160,6 @@ test "evaluate function metadata builtins" {
     const args = try renderForTest("(builtins.functionArgs ({ a, b ? 1 }: a)).b");
     defer std.testing.allocator.free(args);
     try std.testing.expectEqualStrings("true", args);
-
-    const callable = try renderForTest("builtins.isCallable (x: x)");
-    defer std.testing.allocator.free(callable);
-    try std.testing.expectEqualStrings("true", callable);
 
     const pos = try renderForTest("builtins.unsafeGetAttrPos \"a\" { a = 1; }");
     defer std.testing.allocator.free(pos);
