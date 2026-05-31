@@ -8,6 +8,11 @@ const ObjectHeap = heap_mod.ObjectHeap;
 const AttrEntry = heap_mod.AttrEntry;
 const Value = @import("value.zig").Value;
 
+pub const NixPathEntry = struct {
+    prefix: []const u8,
+    path: []const u8,
+};
+
 pub const BuiltinId = enum(u16) {
     toString = 0,
     isAttrs = 1,
@@ -179,6 +184,32 @@ const builtin_bindings = [_]BuiltinBinding{
     .{ .name = "parseDrvName", .id = .parseDrvName },
 };
 
+const constant_bindings = [_][]const u8{
+    "true",
+    "false",
+    "null",
+    "langVersion",
+    "storeDir",
+    "currentSystem",
+    "currentTime",
+    "nixVersion",
+    "nixPath",
+};
+
+pub fn idForName(name: []const u8) ?BuiltinId {
+    for (builtin_bindings) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return binding.id;
+    }
+    return null;
+}
+
+pub fn hasConstant(name: []const u8) bool {
+    for (constant_bindings) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
 pub fn arity(id: BuiltinId) u8 {
     return switch (id) {
         .toString,
@@ -268,37 +299,41 @@ pub fn arity(id: BuiltinId) u8 {
     };
 }
 
-pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
-    const constant_count = 6;
-    var entries: [builtin_bindings.len + constant_count]AttrEntry = undefined;
-    var i: usize = 0;
+pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry) !Value {
+    var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
+    defer entries.deinit(heap.allocator);
+    try entries.ensureTotalCapacity(heap.allocator, builtin_bindings.len + constant_bindings.len);
 
     for (builtin_bindings) |binding| {
-        entries[i] = try builtinEntry(intern, binding);
-        i += 1;
+        entries.appendAssumeCapacity(try builtinEntry(intern, binding));
     }
 
-    entries[i] = .{ .name = try intern.intern("true"), .value = Value.boolVal(true) };
-    i += 1;
-    entries[i] = .{ .name = try intern.intern("false"), .value = Value.boolVal(false) };
-    i += 1;
-    entries[i] = .{ .name = try intern.intern("null"), .value = Value.null_val };
-    i += 1;
-    entries[i] = .{ .name = try intern.intern("langVersion"), .value = Value.int(6) };
-    i += 1;
-    entries[i] = .{
+    entries.appendAssumeCapacity(.{ .name = try intern.intern("true"), .value = Value.boolVal(true) });
+    entries.appendAssumeCapacity(.{ .name = try intern.intern("false"), .value = Value.boolVal(false) });
+    entries.appendAssumeCapacity(.{ .name = try intern.intern("null"), .value = Value.null_val });
+    entries.appendAssumeCapacity(.{ .name = try intern.intern("langVersion"), .value = Value.int(6) });
+    entries.appendAssumeCapacity(.{
         .name = try intern.intern("storeDir"),
         .value = Value.string(try intern.intern("/nix/store")),
-    };
-    i += 1;
-    entries[i] = .{
+    });
+    entries.appendAssumeCapacity(.{
         .name = try intern.intern("currentSystem"),
         .value = Value.string(try intern.intern(hostSystemName())),
-    };
-    i += 1;
+    });
+    entries.appendAssumeCapacity(.{
+        .name = try intern.intern("currentTime"),
+        .value = Value.int(0),
+    });
+    entries.appendAssumeCapacity(.{
+        .name = try intern.intern("nixVersion"),
+        .value = Value.string(try intern.intern("2.18.3")),
+    });
+    entries.appendAssumeCapacity(.{
+        .name = try intern.intern("nixPath"),
+        .value = try buildNixPathValue(intern, heap, nix_path),
+    });
 
-    std.debug.assert(i == entries.len);
-    return Value.attrs(try heap.addAttrs(&entries));
+    return Value.attrs(try heap.addAttrs(entries.items));
 }
 
 fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {
@@ -306,6 +341,29 @@ fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {
         .name = try intern.intern(binding.name),
         .value = Value.builtin(@intFromEnum(binding.id)),
     };
+}
+
+fn buildNixPathValue(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry) !Value {
+    const values = try heap.allocator.alloc(Value, nix_path.len);
+    defer heap.allocator.free(values);
+
+    const prefix_id = try intern.intern("prefix");
+    const path_id = try intern.intern("path");
+    for (nix_path, values) |entry, *value| {
+        const attrs = [_]AttrEntry{
+            .{
+                .name = prefix_id,
+                .value = Value.string(try intern.intern(entry.prefix)),
+            },
+            .{
+                .name = path_id,
+                .value = Value.string(try intern.intern(entry.path)),
+            },
+        };
+        value.* = Value.attrs(try heap.addAttrs(&attrs));
+    }
+
+    return Value.list(try heap.addList(values));
 }
 
 fn hostSystemName() []const u8 {

@@ -248,14 +248,29 @@ pub const Compiler = struct {
             try self.emitOpByte(.get_upvalue, slot);
         } else if (std.mem.eql(u8, span, "builtins")) {
             try self.emitOp(.push_builtins);
-        } else if (std.mem.eql(u8, span, "import")) {
-            try self.builder.emitConstant(self.allocator, @import("value.zig").Value.builtin(@intFromEnum(builtins.BuiltinId.import)));
+        } else if (try self.emitAmbientBuiltin(span)) {
+            return;
         } else if (try self.emitWithLookup(span)) {
             return;
         } else {
             try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "undefined variable");
             return error.UndefinedVariable;
         }
+    }
+
+    fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
+        if (builtins.idForName(name)) |id| {
+            try self.builder.emitConstant(self.allocator, @import("value.zig").Value.builtin(@intFromEnum(id)));
+            return true;
+        }
+
+        if (builtins.hasConstant(name)) {
+            try self.emitOp(.push_builtins);
+            try self.emitOpU16(.get_attr, @intCast(try self.intern.intern(name)));
+            return true;
+        }
+
+        return false;
     }
 
     // ---- compound compilers ----

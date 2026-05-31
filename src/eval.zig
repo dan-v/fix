@@ -290,7 +290,13 @@ pub const Evaluator = struct {
 
     fn ensureBuiltins(self: *Evaluator) !Value {
         if (self.builtins_value) |value| return value;
-        const value = try builtins.buildAttrSet(&self.intern, &self.heap);
+        const nix_path = try self.allocator.alloc(builtins.NixPathEntry, self.search_paths.len);
+        defer self.allocator.free(nix_path);
+        for (self.search_paths, nix_path) |entry, *out| {
+            out.* = .{ .prefix = entry.prefix, .path = entry.path };
+        }
+
+        const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);
         self.builtins_value = value;
         return value;
     }

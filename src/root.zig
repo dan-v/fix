@@ -153,6 +153,22 @@ test "end-to-end: indented strings" {
     try std.testing.expectEqualStrings("${ '' \n", ev.intern.get(escaped.asInternId()));
 }
 
+test "end-to-end: ambient builtins" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const first = try ev.evaluate("builtins.elemAt (map (x: x + 1) [ 1 2 ]) 0");
+    try std.testing.expectEqual(@as(i64, 2), first.asInt());
+
+    const shadowed = try ev.evaluate("let map = 7; in map");
+    try std.testing.expectEqual(@as(i64, 7), shadowed.asInt());
+
+    const version = try ev.evaluate("nixVersion");
+    try std.testing.expectEqual(value.ValueType.string, version.discriminant);
+}
+
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 
