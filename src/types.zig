@@ -35,6 +35,10 @@ pub const StackIdx = u32;
 /// An index into a chunk's constant pool. Bytecode encodes this as a u16.
 pub const ConstIdx = u16;
 
+/// An index into the evaluator object heap.
+pub const ObjectId = u32;
+pub const OBJECT_ID_NONE: ObjectId = std.math.maxInt(ObjectId);
+
 /// A fingerprint for memoization (hash of expression + environment).
 pub const MemoHash = u64;
 
