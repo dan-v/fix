@@ -26,6 +26,8 @@ pub const BuiltinId = enum(u16) {
     getAttr = 16,
     elemAt = 17,
     typeOf = 18,
+    concatLists = 19,
+    listToAttrs = 20,
 };
 
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
@@ -105,6 +107,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("typeOf"),
             .value = Value.builtin(@intFromEnum(BuiltinId.typeOf)),
+        },
+        .{
+            .name = try intern.intern("concatLists"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.concatLists)),
+        },
+        .{
+            .name = try intern.intern("listToAttrs"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.listToAttrs)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

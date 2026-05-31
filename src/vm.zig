@@ -741,6 +741,8 @@ pub const VM = struct {
             @intFromEnum(BuiltinId.attrNames) => self.builtinAttrNames(arg),
             @intFromEnum(BuiltinId.attrValues) => self.builtinAttrValues(arg),
             @intFromEnum(BuiltinId.typeOf) => self.builtinTypeOf(arg),
+            @intFromEnum(BuiltinId.concatLists) => self.builtinConcatLists(arg),
+            @intFromEnum(BuiltinId.listToAttrs) => self.builtinListToAttrs(arg),
             @intFromEnum(BuiltinId.hasAttr),
             @intFromEnum(BuiltinId.getAttr),
             @intFromEnum(BuiltinId.elemAt),
@@ -818,6 +820,57 @@ pub const VM = struct {
         const items = try self.heap.getList(value.asObjectId());
         if (items.len == 0) return error.IndexOutOfBounds;
         return Value.list(try self.heap.addList(items[1..]));
+    }
+
+    fn builtinConcatLists(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .list) return error.TypeError;
+
+        var out: std.ArrayListUnmanaged(Value) = .empty;
+        defer out.deinit(self.allocator);
+
+        const lists = try self.heap.getList(value.asObjectId());
+        for (lists) |list_item| {
+            const list = try self.forceValue(list_item);
+            if (list.discriminant != .list) return error.TypeError;
+            try out.appendSlice(self.allocator, try self.heap.getList(list.asObjectId()));
+        }
+
+        return Value.list(try self.heap.addList(out.items));
+    }
+
+    fn builtinListToAttrs(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        if (value.discriminant != .list) return error.TypeError;
+
+        const name_id = try self.intern.intern("name");
+        const value_id = try self.intern.intern("value");
+        var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        const items = try self.heap.getList(value.asObjectId());
+        for (items) |item| {
+            const item_value = try self.forceValue(item);
+            if (item_value.discriminant != .attrs) return error.TypeError;
+
+            const name_value = try self.forceValue(try self.heap.getAttrValue(item_value.asObjectId(), name_id));
+            if (name_value.discriminant != .string) return error.TypeError;
+            if (attrEntryNameIndex(entries.items, name_value.asInternId()) != null) continue;
+
+            try entries.append(self.allocator, .{
+                .name = name_value.asInternId(),
+                .value = try self.heap.getAttrValue(item_value.asObjectId(), value_id),
+            });
+        }
+
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    fn attrEntryNameIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize {
+        for (entries, 0..) |entry, i| {
+            if (entry.name == name) return i;
+        }
+        return null;
     }
 
     fn builtinAttrNames(self: *VM, arg: Value) !Value {

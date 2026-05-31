@@ -482,6 +482,20 @@ test "evaluate builtins.typeOf" {
     try std.testing.expectEqualStrings("\"lambda\"", fn_type);
 }
 
+test "evaluate concatLists and listToAttrs builtins" {
+    const concat = try renderForTest("builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]");
+    defer std.testing.allocator.free(concat);
+    try std.testing.expectEqualStrings("[ ... ... ... ]", concat);
+
+    const first_duplicate_wins = try renderForTest("(builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; value = 2; } ]).a");
+    defer std.testing.allocator.free(first_duplicate_wins);
+    try std.testing.expectEqualStrings("1", first_duplicate_wins);
+
+    const lazy_value = try renderForTest("(builtins.listToAttrs [ { name = \"a\"; value = 1 / 0; } ]) ? a");
+    defer std.testing.allocator.free(lazy_value);
+    try std.testing.expectEqualStrings("true", lazy_value);
+}
+
 test "evaluate exposes parse diagnostics without printing" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

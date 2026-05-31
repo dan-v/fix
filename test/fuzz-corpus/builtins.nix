@@ -25,3 +25,6 @@ builtins.isFunction (builtins.elemAt [ 1 ])
 builtins.typeOf 1
 builtins.typeOf { }
 builtins.typeOf (x: x)
+builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]
+(builtins.listToAttrs [ { name = "a"; value = 1; } { name = "a"; value = 2; } ]).a
+(builtins.listToAttrs [ { name = "a"; value = 1 / 0; } ]) ? a
