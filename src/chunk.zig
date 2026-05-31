@@ -86,7 +86,7 @@ pub const ChunkBuilder = struct {
 /// This is the "program" that the VM executes.
 pub const ChunkRegistry = struct {
     allocator: std.mem.Allocator,
-    chunks: std.ArrayListUnmanaged(Chunk),
+    chunks: std.ArrayListUnmanaged(*Chunk),
     mutex: std.atomic.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
@@ -98,23 +98,31 @@ pub const ChunkRegistry = struct {
     }
 
     pub fn deinit(self: *ChunkRegistry) void {
-        for (self.chunks.items) |*chunk| {
+        for (self.chunks.items) |chunk| {
             chunk.deinit(self.allocator);
+            self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
+        const stored = try self.allocator.create(Chunk);
+        errdefer {
+            stored.deinit(self.allocator);
+            self.allocator.destroy(stored);
+        }
+        stored.* = chunk;
+
         while (!std.atomic.Mutex.tryLock(&self.mutex)) {
             std.atomic.spinLoopHint();
         }
         defer std.atomic.Mutex.unlock(&self.mutex);
-        try self.chunks.append(self.allocator, chunk);
+        try self.chunks.append(self.allocator, stored);
         return @intCast(self.chunks.items.len - 1);
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
         if (id >= self.chunks.items.len) return null;
-        return &self.chunks.items[id];
+        return self.chunks.items[id];
     }
 };

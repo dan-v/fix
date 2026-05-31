@@ -15,6 +15,7 @@ const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("types.zig");
 const diagnostic = @import("diagnostic.zig");
+const builtins = @import("builtins.zig");
 const Diagnostic = diagnostic.Diagnostic;
 
 const InternId = types.InternId;
@@ -292,6 +293,8 @@ pub const Compiler = struct {
             try self.emitOpByte(.get_upvalue, slot);
         } else if (std.mem.eql(u8, span, "builtins")) {
             try self.emitOp(.push_builtins);
+        } else if (std.mem.eql(u8, span, "import")) {
+            try self.builder.emitConstant(self.allocator, @import("value.zig").Value.builtin(@intFromEnum(builtins.BuiltinId.import)));
         } else if (try self.emitWithLookup(span)) {
             return;
         } else {

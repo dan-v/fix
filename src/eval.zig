@@ -95,7 +95,10 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         self.clearDiagnostics();
+        return self.evaluateSource(source, self.base_path);
+    }
 
+    fn evaluateSource(self: *Evaluator, source: []const u8, base_path: ?[]const u8) !Value {
         // 1. Parse into AST.
         var arena = @import("ast.zig").AstArena.init(self.allocator);
         defer arena.deinit();
@@ -118,7 +121,7 @@ pub const Evaluator = struct {
             source,
             &self.intern,
         );
-        compiler.base_path = self.base_path;
+        compiler.base_path = base_path;
         defer compiler.deinit();
 
         compiler.compile(ast_node) catch |err| {
@@ -142,12 +145,27 @@ pub const Evaluator = struct {
             &self.heap,
             &self.files,
             &self.scheduler,
+            .{ .context = self, .import_value = importValue },
             try self.ensureBuiltins(),
             0,
         );
         defer vm.deinit();
 
         return vm.eval(chunk_id);
+    }
+
+    fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        return self.importPath(path);
+    }
+
+    fn importPath(self: *Evaluator, path: []const u8) !Value {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+
+        const source = try self.files.readFile(resolved.text);
+        const source_base = std.fs.path.dirname(resolved.text) orelse "/";
+        return self.evaluateSource(source, source_base);
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
@@ -643,6 +661,33 @@ test "read source files through evaluator file cache" {
 
     const cached_source = try ev.readSourceFile(relative_path);
     try std.testing.expectEqual(@intFromPtr(source.ptr), @intFromPtr(cached_source.ptr));
+}
+
+test "evaluate import through evaluator file cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "imported.nix", .data = "{ value = 42; }\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "imported.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).value", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const imported = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 42), imported.asInt());
 }
 
 test "evaluate all and any builtins" {

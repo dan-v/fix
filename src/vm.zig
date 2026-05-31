@@ -44,6 +44,11 @@ pub const Frame = struct {
     closure_id: ?ObjectId,
 };
 
+pub const ImportHost = struct {
+    context: *anyopaque,
+    import_value: *const fn (*anyopaque, []const u8) anyerror!Value,
+};
+
 /// Per-thread VM state. Each worker thread has one of these.
 pub const VM = struct {
     allocator: std.mem.Allocator,
@@ -57,6 +62,7 @@ pub const VM = struct {
     files: *FileCache,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
+    import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
     /// This VM's worker index.
@@ -76,6 +82,7 @@ pub const VM = struct {
         heap: *ObjectHeap,
         files: *FileCache,
         scheduler: *Scheduler,
+        import_host: ?ImportHost,
         builtins: Value,
         worker_id: u8,
     ) !VM {
@@ -86,6 +93,7 @@ pub const VM = struct {
             .heap = heap,
             .files = files,
             .scheduler = scheduler,
+            .import_host = import_host,
             .builtins = builtins,
             .worker_id = worker_id,
             .stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP),
@@ -785,6 +793,7 @@ pub const VM = struct {
             .listToAttrs => self.builtinListToAttrs(args[0]),
             .pathExists => self.builtinPathExists(args[0]),
             .readFile => self.builtinReadFile(args[0]),
+            .import => self.builtinImport(args[0]),
             .hasAttr => self.builtinHasAttr(args[0], args[1]),
             .getAttr => self.builtinGetAttr(args[0], args[1]),
             .elemAt => self.builtinElemAt(args[0], args[1]),
@@ -909,6 +918,11 @@ pub const VM = struct {
     fn builtinReadFile(self: *VM, arg: Value) !Value {
         const contents = try self.files.readFile(try self.pathArg(arg));
         return Value.string(try self.intern.intern(contents));
+    }
+
+    fn builtinImport(self: *VM, arg: Value) !Value {
+        const host = self.import_host orelse return error.ImportUnavailable;
+        return host.import_value(host.context, try self.pathArg(arg));
     }
 
     fn pathArg(self: *VM, arg: Value) ![]const u8 {
