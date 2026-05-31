@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (source.owned) allocator.free(source.text);
 
     const result = ev.evaluate(source.text) catch |err| {
-        if (err == error.ParseError and ev.getDiagnostics().len > 0) {
+        if (ev.getDiagnostics().len > 0) {
             printDiagnostics(source.text, ev.getDiagnostics());
         } else {
             std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
@@ -83,11 +83,25 @@ fn getSource(
 
 fn printDiagnostics(source: []const u8, diagnostics: []const eval.Diagnostic) void {
     for (diagnostics) |diagnostic| {
-        std.debug.print("error: parse error at {d}:{d}: {s}\n", .{
-            diagnostic.line,
-            diagnostic.column,
-            diagnostic.message,
-        });
+        switch (diagnostic.severity) {
+            .err => switch (diagnostic.kind) {
+                .parse => std.debug.print("error: parse error at {d}:{d}: {s}\n", .{
+                    diagnostic.line,
+                    diagnostic.column,
+                    diagnostic.message,
+                }),
+                .compile => std.debug.print("error: {s} at {d}:{d}\n", .{
+                    diagnostic.message,
+                    diagnostic.line,
+                    diagnostic.column,
+                }),
+            },
+            .note => std.debug.print("note: {s} at {d}:{d}\n", .{
+                diagnostic.message,
+                diagnostic.line,
+                diagnostic.column,
+            }),
+        }
 
         const line = lineSpan(source, diagnostic.offset);
         std.debug.print("{d: >4} | {s}\n", .{ diagnostic.line, source[line.start..line.end] });
@@ -99,7 +113,7 @@ fn printDiagnostics(source: []const u8, diagnostics: []const eval.Diagnostic) vo
             std.debug.print("^", .{});
         }
 
-        if (diagnostic.token_type != .eof) {
+        if (diagnostic.token_type == null or diagnostic.token_type.? != .eof) {
             const start: usize = @intCast(diagnostic.offset);
             const len: usize = @intCast(diagnostic.len);
             if (start <= source.len and len <= source.len - start) {

@@ -14,6 +14,7 @@ const chunk = @import("chunk.zig");
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("types.zig");
+const Diagnostic = @import("parser.zig").Diagnostic;
 
 const InternId = types.InternId;
 
@@ -55,6 +56,7 @@ pub const Compiler = struct {
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
+    diagnostics: std.ArrayListUnmanaged(Diagnostic),
     parent: ?*Compiler,
     skip_local_slot: ?u16,
     scope_depth: u8,
@@ -76,6 +78,7 @@ pub const Compiler = struct {
             .locals = .empty,
             .captures = .empty,
             .with_scopes = .empty,
+            .diagnostics = .empty,
             .parent = null,
             .skip_local_slot = null,
             .scope_depth = 0,
@@ -87,6 +90,7 @@ pub const Compiler = struct {
         self.with_scopes.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
+        self.diagnostics.deinit(self.allocator);
     }
 
     pub fn compile(self: *Compiler, node: *const Node) !void {
@@ -386,14 +390,59 @@ pub const Compiler = struct {
         self.endScope();
     }
 
-    fn rejectDuplicateLetBindings(self: *const Compiler, bindings: []const Node.Binding) !void {
+    fn rejectDuplicateLetBindings(self: *Compiler, bindings: []const Node.Binding) !void {
         for (bindings, 0..) |binding, i| {
             const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
             for (bindings[0..i]) |previous| {
                 const previous_name = self.source[previous.name_offset .. previous.name_offset + previous.name_len];
-                if (std.mem.eql(u8, name, previous_name)) return error.DuplicateBinding;
+                if (std.mem.eql(u8, name, previous_name)) {
+                    try self.reportCompileError(binding.name_offset, binding.name_len, "duplicate let binding");
+                    try self.reportCompileNote(previous.name_offset, previous.name_len, "first binding defined here");
+                    return error.DuplicateBinding;
+                }
             }
         }
+    }
+
+    fn reportCompileError(self: *Compiler, offset: u32, len: u32, message: []const u8) !void {
+        try self.reportDiagnostic(.err, offset, len, message);
+    }
+
+    fn reportCompileNote(self: *Compiler, offset: u32, len: u32, message: []const u8) !void {
+        try self.reportDiagnostic(.note, offset, len, message);
+    }
+
+    fn reportDiagnostic(self: *Compiler, severity: Diagnostic.Severity, offset: u32, len: u32, message: []const u8) !void {
+        try self.diagnostics.append(self.allocator, .{
+            .severity = severity,
+            .kind = .compile,
+            .line = self.lineForOffset(offset),
+            .column = self.columnForOffset(offset),
+            .offset = offset,
+            .len = len,
+            .token_type = null,
+            .message = message,
+        });
+    }
+
+    fn lineForOffset(self: *const Compiler, offset: u32) u32 {
+        var line: u32 = 1;
+        var i: usize = 0;
+        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
+        while (i < target) : (i += 1) {
+            if (self.source[i] == '\n') line += 1;
+        }
+        return line;
+    }
+
+    fn columnForOffset(self: *const Compiler, offset: u32) u32 {
+        var line_start: usize = 0;
+        var i: usize = 0;
+        const target: usize = @min(offset, @as(u32, @intCast(self.source.len)));
+        while (i < target) : (i += 1) {
+            if (self.source[i] == '\n') line_start = i + 1;
+        }
+        return @intCast(target - line_start + 1);
     }
 
     fn compileThunk(self: *Compiler, expr: *const Node) !void {
@@ -515,7 +564,10 @@ pub const Compiler = struct {
             if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
 
             const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
-            if (leaf_count > 1) return error.DuplicateAttribute;
+            if (leaf_count > 1) {
+                try self.reportDuplicateLeafAttribute(entries, entry.path[0]);
+                return error.DuplicateAttribute;
+            }
             const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
             if (leaf == null) {
                 const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
@@ -526,7 +578,10 @@ pub const Compiler = struct {
                 continue;
             }
 
-            if (self.hasNestedForFirstSegment(entries, entry.path[0])) return error.DuplicateAttribute;
+            if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
+                try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
+                return error.DuplicateAttribute;
+            }
             try self.emitAttrName(entry.path[0]);
             try self.compileThunk(leaf.?.expr);
             count += 1;
@@ -557,7 +612,10 @@ pub const Compiler = struct {
             const name_span = self.attrSegmentSpan(entry.path[0]);
             const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
             const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
-            if (leaf_count > 1) return error.DuplicateAttribute;
+            if (leaf_count > 1) {
+                try self.reportDuplicateLeafAttribute(entries, entry.path[0]);
+                return error.DuplicateAttribute;
+            }
             const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
             if (leaf == null) {
                 const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
@@ -568,7 +626,10 @@ pub const Compiler = struct {
                 continue;
             }
 
-            if (self.hasNestedForFirstSegment(entries, entry.path[0])) return error.DuplicateAttribute;
+            if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
+                try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
+                return error.DuplicateAttribute;
+            }
             try self.compileThunk(leaf.?.expr);
             try self.emitOpByte(.set_cell_local, @intCast(slot));
             count += 1;
@@ -601,7 +662,10 @@ pub const Compiler = struct {
         child.parent = self;
         defer child.deinit();
 
-        try child.compileAttrEntries(entries, recursive);
+        child.compileAttrEntries(entries, recursive) catch |err| {
+            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            return err;
+        };
         try child.emitOp(.ret);
         try child.emitOp(.halt);
 
@@ -636,6 +700,38 @@ pub const Compiler = struct {
             }
         }
         return tails;
+    }
+
+    fn reportDuplicateLeafAttribute(self: *Compiler, entries: []const AttrEntryView, first: Node.Atom) !void {
+        var first_leaf: ?Node.Atom = null;
+        for (entries) |entry| {
+            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) {
+                if (first_leaf) |original| {
+                    try self.reportDuplicateAttribute(entry.path[0], original);
+                    return;
+                }
+                first_leaf = entry.path[0];
+            }
+        }
+    }
+
+    fn reportDuplicateLeafAndNestedAttribute(
+        self: *Compiler,
+        entries: []const AttrEntryView,
+        leaf: AttrEntryView,
+        first: Node.Atom,
+    ) !void {
+        for (entries) |entry| {
+            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) {
+                try self.reportDuplicateAttribute(entry.path[0], leaf.path[0]);
+                return;
+            }
+        }
+    }
+
+    fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
+        try self.reportCompileError(duplicate.offset, duplicate.len, "duplicate attribute");
+        try self.reportCompileNote(original.offset, original.len, "first attribute defined here");
     }
 
     fn firstSegmentSeen(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) bool {

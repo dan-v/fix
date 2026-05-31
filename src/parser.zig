@@ -39,11 +39,16 @@ const Rule = struct {
 };
 
 pub const Diagnostic = struct {
+    pub const Severity = enum { err, note };
+    pub const Kind = enum { parse, compile };
+
+    severity: Severity = .err,
+    kind: Kind = .parse,
     line: u32,
     column: u32,
     offset: u32,
     len: u32,
-    token_type: TokenType,
+    token_type: ?TokenType,
     message: []const u8,
 };
 

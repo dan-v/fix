@@ -97,6 +97,7 @@ pub const Evaluator = struct {
         defer compiler.deinit();
 
         compiler.compile(ast_node) catch |err| {
+            try self.copyDiagnostics(compiler.diagnostics.items);
             if (err == error.DuplicateAttribute or err == error.DuplicateBinding) return err;
             return error.CompileError;
         };
@@ -339,4 +340,36 @@ test "evaluate exposes parse diagnostics without printing" {
     try std.testing.expectEqualStrings("Invalid token.", diagnostics[1].message);
     try std.testing.expectEqual(@as(u32, 2), diagnostics[1].offset);
     try std.testing.expectEqual(@as(u32, 3), diagnostics[1].column);
+}
+
+test "evaluate exposes duplicate binding diagnostics" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; x = 2; in x"));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
+    try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
+    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("duplicate let binding", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 11), diagnostics[0].offset);
+    try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
+    try std.testing.expectEqualStrings("first binding defined here", diagnostics[1].message);
+    try std.testing.expectEqual(@as(u32, 4), diagnostics[1].offset);
+}
+
+test "evaluate exposes duplicate attribute diagnostics" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
+    try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
+    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("duplicate attribute", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 9), diagnostics[0].offset);
+    try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
+    try std.testing.expectEqualStrings("first attribute defined here", diagnostics[1].message);
+    try std.testing.expectEqual(@as(u32, 2), diagnostics[1].offset);
 }
