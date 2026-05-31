@@ -1202,6 +1202,12 @@ test "evaluate string builtins" {
     defer std.testing.allocator.free(joined);
     try std.testing.expectEqualStrings("\"a,b,c\"", joined);
 
+    const joined_path = try renderForTest("builtins.concatStringsSep \",\" [ ./src/root.zig { outPath = \"/nix/store/example\"; } ]");
+    defer std.testing.allocator.free(joined_path);
+    try std.testing.expect(std.mem.indexOf(u8, joined_path, "/nix/store/example") != null);
+
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.concatStringsSep \",\" [ 1 ]"));
+
     const substring = try renderForTest("builtins.substring 1 2 \"abcd\"");
     defer std.testing.allocator.free(substring);
     try std.testing.expectEqualStrings("\"bc\"", substring);

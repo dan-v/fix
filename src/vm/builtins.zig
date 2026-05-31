@@ -1008,11 +1008,7 @@ fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Valu
     const items = try self.heap.getList(list.asObjectId());
     const item_ids = try self.allocator.alloc(InternId, items.len);
     defer self.allocator.free(item_ids);
-    for (items, item_ids) |item, *id| {
-        const value = try self.forceValue(item);
-        if (value.discriminant != .string) return error.TypeError;
-        id.* = value.asInternId();
-    }
+    for (items, item_ids) |item, *id| id.* = try coerceStringContextId(self, item);
 
     const sep = self.intern.get(sep_value.asInternId());
 
@@ -1025,6 +1021,33 @@ fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Valu
     }
 
     return Value.string(try self.intern.intern(out.items));
+}
+
+fn coerceStringContextId(self: anytype, arg: Value) !InternId {
+    const value = try self.forceValue(arg);
+    return switch (value.discriminant) {
+        .string, .path => value.asInternId(),
+        .attrs => coerceAttrsStringContextId(self, value),
+        else => error.TypeError,
+    };
+}
+
+fn coerceAttrsStringContextId(self: anytype, attrs: Value) !InternId {
+    const to_string_id = try self.intern.intern("__toString");
+    if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
+        const result = try self.callValue(try self.forceValue(to_string), attrs);
+        return coerceStringContextId(self, result);
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+
+    const out_path_id = try self.intern.intern("outPath");
+    const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
+        error.MissingAttribute => return error.TypeError,
+        else => return err,
+    };
+    return coerceStringContextId(self, out_path);
 }
 
 fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
