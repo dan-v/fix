@@ -1,5 +1,6 @@
 //! Evaluator-owned builtin values.
 
+const std = @import("std");
 const builtin = @import("builtin");
 const InternTable = @import("intern.zig").InternTable;
 const heap_mod = @import("heap.zig");
@@ -91,6 +92,93 @@ pub const BuiltinId = enum(u16) {
     parseDrvName = 80,
 };
 
+const BuiltinBinding = struct {
+    name: []const u8,
+    id: BuiltinId,
+};
+
+const builtin_bindings = [_]BuiltinBinding{
+    .{ .name = "toString", .id = .toString },
+    .{ .name = "isAttrs", .id = .isAttrs },
+    .{ .name = "isList", .id = .isList },
+    .{ .name = "isString", .id = .isString },
+    .{ .name = "isInt", .id = .isInt },
+    .{ .name = "isBool", .id = .isBool },
+    .{ .name = "isNull", .id = .isNull },
+    .{ .name = "isFloat", .id = .isFloat },
+    .{ .name = "isFunction", .id = .isFunction },
+    .{ .name = "isPath", .id = .isPath },
+    .{ .name = "length", .id = .length },
+    .{ .name = "head", .id = .head },
+    .{ .name = "tail", .id = .tail },
+    .{ .name = "attrNames", .id = .attrNames },
+    .{ .name = "attrValues", .id = .attrValues },
+    .{ .name = "hasAttr", .id = .hasAttr },
+    .{ .name = "getAttr", .id = .getAttr },
+    .{ .name = "elemAt", .id = .elemAt },
+    .{ .name = "typeOf", .id = .typeOf },
+    .{ .name = "concatLists", .id = .concatLists },
+    .{ .name = "listToAttrs", .id = .listToAttrs },
+    .{ .name = "removeAttrs", .id = .removeAttrs },
+    .{ .name = "intersectAttrs", .id = .intersectAttrs },
+    .{ .name = "elem", .id = .elem },
+    .{ .name = "seq", .id = .seq },
+    .{ .name = "all", .id = .all },
+    .{ .name = "any", .id = .any },
+    .{ .name = "filter", .id = .filter },
+    .{ .name = "foldl'", .id = .foldlStrict },
+    .{ .name = "deepSeq", .id = .deepSeq },
+    .{ .name = "pathExists", .id = .pathExists },
+    .{ .name = "readFile", .id = .readFile },
+    .{ .name = "import", .id = .import },
+    .{ .name = "readDir", .id = .readDir },
+    .{ .name = "readFileType", .id = .readFileType },
+    .{ .name = "findFile", .id = .findFile },
+    .{ .name = "map", .id = .map },
+    .{ .name = "concatMap", .id = .concatMap },
+    .{ .name = "mapAttrs", .id = .mapAttrs },
+    .{ .name = "genList", .id = .genList },
+    .{ .name = "stringLength", .id = .stringLength },
+    .{ .name = "concatStringsSep", .id = .concatStringsSep },
+    .{ .name = "substring", .id = .substring },
+    .{ .name = "replaceStrings", .id = .replaceStrings },
+    .{ .name = "throw", .id = .throw },
+    .{ .name = "abort", .id = .abort },
+    .{ .name = "tryEval", .id = .tryEval },
+    .{ .name = "trace", .id = .trace },
+    .{ .name = "derivation", .id = .derivation },
+    .{ .name = "derivationStrict", .id = .derivationStrict },
+    .{ .name = "storePath", .id = .storePath },
+    .{ .name = "path", .id = .path },
+    .{ .name = "sort", .id = .sort },
+    .{ .name = "partition", .id = .partition },
+    .{ .name = "groupBy", .id = .groupBy },
+    .{ .name = "genericClosure", .id = .genericClosure },
+    .{ .name = "functionArgs", .id = .functionArgs },
+    .{ .name = "unsafeGetAttrPos", .id = .unsafeGetAttrPos },
+    .{ .name = "add", .id = .add },
+    .{ .name = "sub", .id = .sub },
+    .{ .name = "mul", .id = .mul },
+    .{ .name = "div", .id = .div },
+    .{ .name = "lessThan", .id = .lessThan },
+    .{ .name = "bitAnd", .id = .bitAnd },
+    .{ .name = "bitOr", .id = .bitOr },
+    .{ .name = "bitXor", .id = .bitXor },
+    .{ .name = "floor", .id = .floor },
+    .{ .name = "ceil", .id = .ceil },
+    .{ .name = "baseNameOf", .id = .baseNameOf },
+    .{ .name = "dirOf", .id = .dirOf },
+    .{ .name = "catAttrs", .id = .catAttrs },
+    .{ .name = "zipAttrsWith", .id = .zipAttrsWith },
+    .{ .name = "hashString", .id = .hashString },
+    .{ .name = "hashFile", .id = .hashFile },
+    .{ .name = "toJSON", .id = .toJSON },
+    .{ .name = "fromJSON", .id = .fromJSON },
+    .{ .name = "compareVersions", .id = .compareVersions },
+    .{ .name = "splitVersion", .id = .splitVersion },
+    .{ .name = "parseDrvName", .id = .parseDrvName },
+};
+
 pub fn arity(id: BuiltinId) u8 {
     return switch (id) {
         .toString,
@@ -174,7 +262,6 @@ pub fn arity(id: BuiltinId) u8 {
         .foldlStrict,
         .substring,
         .replaceStrings,
-        => 3,
         .mapAttrValue,
         .zipAttrsValue,
         => 3,
@@ -182,349 +269,43 @@ pub fn arity(id: BuiltinId) u8 {
 }
 
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
-    const entries = [_]AttrEntry{
-        .{
-            .name = try intern.intern("toString"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.toString)),
-        },
-        .{
-            .name = try intern.intern("isAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isAttrs)),
-        },
-        .{
-            .name = try intern.intern("isList"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isList)),
-        },
-        .{
-            .name = try intern.intern("isString"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isString)),
-        },
-        .{
-            .name = try intern.intern("isInt"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isInt)),
-        },
-        .{
-            .name = try intern.intern("isBool"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isBool)),
-        },
-        .{
-            .name = try intern.intern("isNull"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isNull)),
-        },
-        .{
-            .name = try intern.intern("isFloat"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isFloat)),
-        },
-        .{
-            .name = try intern.intern("isFunction"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isFunction)),
-        },
-        .{
-            .name = try intern.intern("isPath"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.isPath)),
-        },
-        .{
-            .name = try intern.intern("length"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.length)),
-        },
-        .{
-            .name = try intern.intern("head"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.head)),
-        },
-        .{
-            .name = try intern.intern("tail"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.tail)),
-        },
-        .{
-            .name = try intern.intern("attrNames"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.attrNames)),
-        },
-        .{
-            .name = try intern.intern("attrValues"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.attrValues)),
-        },
-        .{
-            .name = try intern.intern("hasAttr"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.hasAttr)),
-        },
-        .{
-            .name = try intern.intern("getAttr"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.getAttr)),
-        },
-        .{
-            .name = try intern.intern("elemAt"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.elemAt)),
-        },
-        .{
-            .name = try intern.intern("typeOf"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.typeOf)),
-        },
-        .{
-            .name = try intern.intern("concatLists"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.concatLists)),
-        },
-        .{
-            .name = try intern.intern("listToAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.listToAttrs)),
-        },
-        .{
-            .name = try intern.intern("removeAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.removeAttrs)),
-        },
-        .{
-            .name = try intern.intern("intersectAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.intersectAttrs)),
-        },
-        .{
-            .name = try intern.intern("elem"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.elem)),
-        },
-        .{
-            .name = try intern.intern("seq"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.seq)),
-        },
-        .{
-            .name = try intern.intern("all"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.all)),
-        },
-        .{
-            .name = try intern.intern("any"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.any)),
-        },
-        .{
-            .name = try intern.intern("filter"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.filter)),
-        },
-        .{
-            .name = try intern.intern("foldl'"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.foldlStrict)),
-        },
-        .{
-            .name = try intern.intern("deepSeq"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.deepSeq)),
-        },
-        .{
-            .name = try intern.intern("pathExists"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.pathExists)),
-        },
-        .{
-            .name = try intern.intern("readFile"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.readFile)),
-        },
-        .{
-            .name = try intern.intern("import"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.import)),
-        },
-        .{
-            .name = try intern.intern("readDir"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.readDir)),
-        },
-        .{
-            .name = try intern.intern("readFileType"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.readFileType)),
-        },
-        .{
-            .name = try intern.intern("findFile"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.findFile)),
-        },
-        .{
-            .name = try intern.intern("map"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.map)),
-        },
-        .{
-            .name = try intern.intern("concatMap"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.concatMap)),
-        },
-        .{
-            .name = try intern.intern("mapAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.mapAttrs)),
-        },
-        .{
-            .name = try intern.intern("genList"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.genList)),
-        },
-        .{
-            .name = try intern.intern("stringLength"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.stringLength)),
-        },
-        .{
-            .name = try intern.intern("concatStringsSep"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.concatStringsSep)),
-        },
-        .{
-            .name = try intern.intern("substring"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.substring)),
-        },
-        .{
-            .name = try intern.intern("replaceStrings"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.replaceStrings)),
-        },
-        .{
-            .name = try intern.intern("throw"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.throw)),
-        },
-        .{
-            .name = try intern.intern("abort"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.abort)),
-        },
-        .{
-            .name = try intern.intern("tryEval"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.tryEval)),
-        },
-        .{
-            .name = try intern.intern("trace"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.trace)),
-        },
-        .{
-            .name = try intern.intern("derivation"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.derivation)),
-        },
-        .{
-            .name = try intern.intern("derivationStrict"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.derivationStrict)),
-        },
-        .{
-            .name = try intern.intern("storePath"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.storePath)),
-        },
-        .{
-            .name = try intern.intern("path"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.path)),
-        },
-        .{
-            .name = try intern.intern("sort"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.sort)),
-        },
-        .{
-            .name = try intern.intern("partition"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.partition)),
-        },
-        .{
-            .name = try intern.intern("groupBy"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.groupBy)),
-        },
-        .{
-            .name = try intern.intern("genericClosure"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.genericClosure)),
-        },
-        .{
-            .name = try intern.intern("functionArgs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.functionArgs)),
-        },
-        .{
-            .name = try intern.intern("unsafeGetAttrPos"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.unsafeGetAttrPos)),
-        },
-        .{
-            .name = try intern.intern("add"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.add)),
-        },
-        .{
-            .name = try intern.intern("sub"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.sub)),
-        },
-        .{
-            .name = try intern.intern("mul"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.mul)),
-        },
-        .{
-            .name = try intern.intern("div"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.div)),
-        },
-        .{
-            .name = try intern.intern("lessThan"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.lessThan)),
-        },
-        .{
-            .name = try intern.intern("bitAnd"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.bitAnd)),
-        },
-        .{
-            .name = try intern.intern("bitOr"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.bitOr)),
-        },
-        .{
-            .name = try intern.intern("bitXor"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.bitXor)),
-        },
-        .{
-            .name = try intern.intern("floor"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.floor)),
-        },
-        .{
-            .name = try intern.intern("ceil"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.ceil)),
-        },
-        .{
-            .name = try intern.intern("baseNameOf"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.baseNameOf)),
-        },
-        .{
-            .name = try intern.intern("dirOf"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.dirOf)),
-        },
-        .{
-            .name = try intern.intern("catAttrs"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.catAttrs)),
-        },
-        .{
-            .name = try intern.intern("zipAttrsWith"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.zipAttrsWith)),
-        },
-        .{
-            .name = try intern.intern("hashString"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.hashString)),
-        },
-        .{
-            .name = try intern.intern("hashFile"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.hashFile)),
-        },
-        .{
-            .name = try intern.intern("toJSON"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.toJSON)),
-        },
-        .{
-            .name = try intern.intern("fromJSON"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.fromJSON)),
-        },
-        .{
-            .name = try intern.intern("compareVersions"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.compareVersions)),
-        },
-        .{
-            .name = try intern.intern("splitVersion"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.splitVersion)),
-        },
-        .{
-            .name = try intern.intern("parseDrvName"),
-            .value = Value.builtin(@intFromEnum(BuiltinId.parseDrvName)),
-        },
-        .{
-            .name = try intern.intern("true"),
-            .value = Value.boolVal(true),
-        },
-        .{
-            .name = try intern.intern("false"),
-            .value = Value.boolVal(false),
-        },
-        .{
-            .name = try intern.intern("null"),
-            .value = Value.null_val,
-        },
-        .{
-            .name = try intern.intern("langVersion"),
-            .value = Value.int(6),
-        },
-        .{
-            .name = try intern.intern("storeDir"),
-            .value = Value.string(try intern.intern("/nix/store")),
-        },
-        .{
-            .name = try intern.intern("currentSystem"),
-            .value = Value.string(try intern.intern(hostSystemName())),
-        },
+    const constant_count = 6;
+    var entries: [builtin_bindings.len + constant_count]AttrEntry = undefined;
+    var i: usize = 0;
+
+    for (builtin_bindings) |binding| {
+        entries[i] = try builtinEntry(intern, binding);
+        i += 1;
+    }
+
+    entries[i] = .{ .name = try intern.intern("true"), .value = Value.boolVal(true) };
+    i += 1;
+    entries[i] = .{ .name = try intern.intern("false"), .value = Value.boolVal(false) };
+    i += 1;
+    entries[i] = .{ .name = try intern.intern("null"), .value = Value.null_val };
+    i += 1;
+    entries[i] = .{ .name = try intern.intern("langVersion"), .value = Value.int(6) };
+    i += 1;
+    entries[i] = .{
+        .name = try intern.intern("storeDir"),
+        .value = Value.string(try intern.intern("/nix/store")),
     };
+    i += 1;
+    entries[i] = .{
+        .name = try intern.intern("currentSystem"),
+        .value = Value.string(try intern.intern(hostSystemName())),
+    };
+    i += 1;
+
+    std.debug.assert(i == entries.len);
     return Value.attrs(try heap.addAttrs(&entries));
+}
+
+fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {
+    return .{
+        .name = try intern.intern(binding.name),
+        .value = Value.builtin(@intFromEnum(binding.id)),
+    };
 }
 
 fn hostSystemName() []const u8 {

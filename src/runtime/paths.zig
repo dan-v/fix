@@ -20,6 +20,14 @@ pub fn dirOf(path: []const u8) []const u8 {
     return trimmed[0..slash];
 }
 
+pub fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
+    if (prefix.len == 0) return name;
+    if (std.mem.eql(u8, prefix, name)) return "";
+    if (name.len <= prefix.len or name[prefix.len] != '/') return null;
+    if (!std.mem.eql(u8, prefix, name[0..prefix.len])) return null;
+    return name[prefix.len + 1 ..];
+}
+
 fn trimTrailingSlashes(path: []const u8) []const u8 {
     if (path.len <= 1) return path;
 
@@ -41,4 +49,11 @@ test "dirOf matches Nix path splitting edge cases" {
     try std.testing.expectEqualStrings("foo", dirOf("foo/bar"));
     try std.testing.expectEqualStrings(".", dirOf("foo"));
     try std.testing.expectEqualStrings(".", dirOf(""));
+}
+
+test "search path suffix honors nix path prefixes" {
+    try std.testing.expectEqualStrings("pkg/default.nix", searchPathSuffix("", "pkg/default.nix").?);
+    try std.testing.expectEqualStrings("", searchPathSuffix("pkg", "pkg").?);
+    try std.testing.expectEqualStrings("default.nix", searchPathSuffix("pkg", "pkg/default.nix").?);
+    try std.testing.expect(searchPathSuffix("pkg", "pkg-extra/default.nix") == null);
 }

@@ -17,16 +17,9 @@ const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
+const path_ops = @import("runtime/paths.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
-
-fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
-    if (prefix.len == 0) return name;
-    if (std.mem.eql(u8, prefix, name)) return "";
-    if (name.len <= prefix.len or name[prefix.len] != '/') return null;
-    if (!std.mem.eql(u8, prefix, name[0..prefix.len])) return null;
-    return name[prefix.len + 1 ..];
-}
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -45,12 +38,19 @@ pub const Evaluator = struct {
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
-        const scheduler = try Scheduler.init(allocator, worker_count);
+        var scheduler = try Scheduler.init(allocator, worker_count);
+        errdefer scheduler.deinit();
+
+        var intern = try InternTable.init(allocator);
+        errdefer intern.deinit();
+
+        var registry = try ChunkRegistry.init(allocator);
+        errdefer registry.deinit();
 
         return .{
             .allocator = allocator,
-            .intern = try InternTable.init(allocator),
-            .registry = try ChunkRegistry.init(allocator),
+            .intern = intern,
+            .registry = registry,
             .scheduler = scheduler,
             .heap = ObjectHeap.init(allocator),
             .files = FileCache.init(allocator),
@@ -228,7 +228,7 @@ pub const Evaluator = struct {
     }
 
     fn searchPathCandidate(self: *Evaluator, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
-        const suffix = searchPathSuffix(prefix, name) orelse return null;
+        const suffix = path_ops.searchPathSuffix(prefix, name) orelse return null;
         const candidate = try std.fs.path.resolve(self.allocator, &.{ base, suffix });
         errdefer self.allocator.free(candidate);
         if (try self.files.pathExists(candidate)) return candidate;

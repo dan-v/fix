@@ -423,7 +423,7 @@ pub const Compiler = struct {
         defer child.deinit();
 
         const param_id = try self.intern.intern(param_name);
-        _ = child.declareLocal(param_name, param_id);
+        _ = try child.declareLocal(param_name, param_id);
         child.compileNode(lambda.body) catch |err| {
             try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
             return err;
@@ -455,11 +455,11 @@ pub const Compiler = struct {
         child.base_path = self.base_path;
         defer child.deinit();
 
-        const arg_slot = child.declareLocal("\x00args", try self.intern.intern("\x00args"));
+        const arg_slot = try child.declareLocal("\x00args", try self.intern.intern("\x00args"));
         if (lambda.bind_name) |bind_name| {
             const name = self.source[bind_name.offset .. bind_name.offset + bind_name.len];
             const name_id = try self.intern.intern(name);
-            const slot = child.declareLocal(name, name_id);
+            const slot = try child.declareLocal(name, name_id);
             try child.emitOpByte(.capture_local, @intCast(arg_slot));
             try child.emitOpByte(.set_local, @intCast(slot));
         }
@@ -487,7 +487,7 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name);
             try child.emitOp(.push_null);
             try child.emitOp(.make_cell);
-            const slot = child.declareLocal(name, name_id);
+            const slot = try child.declareLocal(name, name_id);
             try child.emitOpByte(.set_local, @intCast(slot));
         }
 
@@ -560,7 +560,7 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name);
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
-            const slot = self.declareLocal(name, name_id);
+            const slot = try self.declareLocal(name, name_id);
             try self.emitOpByte(.set_local, @intCast(slot));
         }
 
@@ -703,7 +703,7 @@ pub const Compiler = struct {
 
         self.beginScope();
 
-        const scope_slot = self.declareLocal("", try self.intern.intern(""));
+        const scope_slot = try self.declareLocal("", try self.intern.intern(""));
         try self.compileThunk(with_node.attr_set);
         try self.emitOpByte(.set_local, @intCast(scope_slot));
         try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
@@ -775,7 +775,7 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name_span);
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
-            const slot = self.declareLocal(name_span, name_id);
+            const slot = try self.declareLocal(name_span, name_id);
             try self.emitOpByte(.set_local, @intCast(slot));
         }
 
@@ -1072,15 +1072,16 @@ pub const Compiler = struct {
         }
     }
 
-    fn declareLocal(self: *Compiler, name: []const u8, name_id: InternId) u16 {
+    fn declareLocal(self: *Compiler, name: []const u8, name_id: InternId) !u16 {
         const slot = self.slot_count;
         self.slot_count += 1;
-        self.locals.append(self.allocator, .{
+        errdefer self.slot_count -= 1;
+        try self.locals.append(self.allocator, .{
             .name = name,
             .name_id = name_id,
             .depth = self.scope_depth,
             .slot = slot,
-        }) catch @panic("oom: locals");
+        });
         return slot;
     }
 

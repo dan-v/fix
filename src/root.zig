@@ -82,6 +82,21 @@ test "end-to-end: string concatenation" {
     try std.testing.expectError(error.TypeError, ev.evaluate("\"ab\" + 1"));
 }
 
+test "end-to-end: path concatenation follows Nix left-path semantics" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const suffix = try ev.evaluate("./foo + \"x\"");
+    try std.testing.expectEqual(value.ValueType.path, suffix.discriminant);
+    try std.testing.expectEqualStrings("./foox", ev.intern.get(suffix.asInternId()));
+
+    const paths = try ev.evaluate("./foo + ./bar");
+    try std.testing.expectEqual(value.ValueType.path, paths.discriminant);
+    try std.testing.expectEqualStrings("./foo./bar", ev.intern.get(paths.asInternId()));
+}
+
 test "end-to-end: string interpolation" {
     const alloc = std.testing.allocator;
 

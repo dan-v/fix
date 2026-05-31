@@ -35,9 +35,15 @@ pub const ChunkBuilder = struct {
     function_args: std.ArrayListUnmanaged(AttrEntry),
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
+        var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
+        errdefer code.deinit(allocator);
+
+        var constants = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.CHUNK_CONSTANTS_CAP);
+        errdefer constants.deinit(allocator);
+
         return .{
-            .code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP),
-            .constants = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.CHUNK_CONSTANTS_CAP),
+            .code = code,
+            .constants = constants,
             .function_args = .empty,
         };
     }

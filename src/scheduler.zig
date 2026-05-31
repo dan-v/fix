@@ -32,8 +32,8 @@ const TaskQueue = struct {
     head: std.atomic.Value(u32),
     tail: std.atomic.Value(u32),
 
-    fn init(capacity: u32) TaskQueue {
-        const tasks = std.heap.page_allocator.alloc(Task, capacity) catch @panic("oom: task queue");
+    fn init(allocator: std.mem.Allocator, capacity: u32) !TaskQueue {
+        const tasks = try allocator.alloc(Task, capacity);
         @memset(tasks, undefined);
         return .{
             .tasks = tasks,
@@ -43,8 +43,8 @@ const TaskQueue = struct {
         };
     }
 
-    fn deinit(self: *TaskQueue) void {
-        std.heap.page_allocator.free(self.tasks);
+    fn deinit(self: *TaskQueue, allocator: std.mem.Allocator) void {
+        allocator.free(self.tasks);
     }
 
     /// Push a task to the back (called by the owner thread only — SPSC).
@@ -101,10 +101,19 @@ pub const Scheduler = struct {
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Scheduler {
         const queues = try allocator.alloc(TaskQueue, worker_count);
+        errdefer allocator.free(queues);
         const threads = try allocator.alloc(std.Thread, worker_count);
+        errdefer allocator.free(threads);
 
+        var initialized: usize = 0;
+        errdefer {
+            for (queues[0..initialized]) |*q| {
+                q.deinit(allocator);
+            }
+        }
         for (queues) |*q| {
-            q.* = TaskQueue.init(1024);
+            q.* = try TaskQueue.init(allocator, 1024);
+            initialized += 1;
         }
 
         return .{
@@ -119,7 +128,7 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         self.shutdown();
         for (self.queues) |*q| {
-            q.deinit();
+            q.deinit(self.allocator);
         }
         self.allocator.free(self.queues);
         self.allocator.free(self.threads);
@@ -127,6 +136,14 @@ pub const Scheduler = struct {
 
     pub fn start(self: *Scheduler, workerFn: anytype, ctx: anytype) !void {
         self.running.store(true, .release);
+        var started: usize = 0;
+        errdefer {
+            self.running.store(false, .release);
+            for (self.threads[0..started]) |*t| {
+                t.join();
+            }
+        }
+
         const Worker = struct {
             fn run(idx: u8, sched: *Scheduler, fn_ptr: @TypeOf(workerFn), c: @TypeOf(ctx)) void {
                 // Bind to a specific core for cache locality.
@@ -146,6 +163,7 @@ pub const Scheduler = struct {
                 workerFn,
                 ctx,
             });
+            started += 1;
         }
     }
 
