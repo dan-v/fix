@@ -12,6 +12,7 @@ pub const NodeTag = enum(u8) {
     float_val,
     string,
     path,
+    search_path,
     identifier,
     bool_true,
     bool_false,

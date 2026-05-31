@@ -42,6 +42,7 @@ pub const BuiltinId = enum(u16) {
     import = 32,
     readDir = 33,
     readFileType = 34,
+    findFile = 35,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -81,6 +82,7 @@ pub fn arity(id: BuiltinId) u8 {
         .any,
         .filter,
         .deepSeq,
+        .findFile,
         => 2,
         .foldlStrict => 3,
     };
@@ -227,6 +229,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("readFileType"),
             .value = Value.builtin(@intFromEnum(BuiltinId.readFileType)),
+        },
+        .{
+            .name = try intern.intern("findFile"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.findFile)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));

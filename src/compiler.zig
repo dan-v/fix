@@ -107,6 +107,7 @@ pub const Compiler = struct {
             .float_val => try self.compileFloat(node),
             .string => try self.compileString(node),
             .path => try self.compilePath(node),
+            .search_path => try self.compileSearchPath(node),
             .identifier => try self.compileIdent(node),
             .bool_true => try self.emitOp(.push_true),
             .bool_false => try self.emitOp(.push_false),
@@ -266,6 +267,13 @@ pub const Compiler = struct {
         const id = try self.intern.intern(path.text);
         const v = @import("value.zig").Value.path(id);
         try self.builder.emitConstant(self.allocator, v);
+    }
+
+    fn compileSearchPath(self: *Compiler, node: *const Node) !void {
+        const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+        if (span.len < 2) return error.InvalidSearchPath;
+        const id = try self.intern.intern(span[1 .. span.len - 1]);
+        try self.emitOpU16(.find_file, @intCast(id));
     }
 
     const ResolvedPath = struct {
@@ -1125,7 +1133,7 @@ fn nodeMayEvaluateToFloat(node: *const Node) bool {
 
 fn offsetNode(node: *Node, offset: u32) void {
     switch (node.tag) {
-        .integer, .float_val, .string, .path, .identifier, .bool_true, .bool_false, .null => {
+        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null => {
             node.data.atom.offset += offset;
         },
         .unary_op => offsetNode(node.data.unary.expr, offset),

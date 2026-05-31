@@ -79,6 +79,9 @@ pub const OpCode = enum(u8) {
     concat_lists,
     /// Push the evaluator-owned builtins attrset.
     push_builtins,
+    /// Resolve an evaluator search-path literal.
+    /// Operand: 2-byte InternId of the search path text without angle brackets.
+    find_file,
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.

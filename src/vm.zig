@@ -30,6 +30,14 @@ const FileCache = @import("file_cache.zig").FileCache;
 const builtins_mod = @import("builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 
+fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
+    if (prefix.len == 0) return name;
+    if (std.mem.eql(u8, prefix, name)) return "";
+    if (name.len <= prefix.len or name[prefix.len] != '/') return null;
+    if (!std.mem.eql(u8, prefix, name[0..prefix.len])) return null;
+    return name[prefix.len + 1 ..];
+}
+
 /// A single call frame.
 pub const Frame = struct {
     /// The chunk being executed.
@@ -47,6 +55,7 @@ pub const Frame = struct {
 pub const ImportHost = struct {
     context: *anyopaque,
     import_value: *const fn (*anyopaque, []const u8) anyerror!Value,
+    find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
@@ -420,6 +429,12 @@ pub const VM = struct {
                     try self.push(try self.concatLists(left, right));
                 },
                 .push_builtins => try self.push(self.builtins),
+                .find_file => {
+                    const name_id: u16 = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const host = self.import_host orelse return error.SearchPathUnavailable;
+                    try self.push(try host.find_file(host.context, self.intern.get(@intCast(name_id))));
+                },
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
@@ -796,6 +811,7 @@ pub const VM = struct {
             .import => self.builtinImport(args[0]),
             .readDir => self.builtinReadDir(args[0]),
             .readFileType => self.builtinReadFileType(args[0]),
+            .findFile => self.builtinFindFile(args[0], args[1]),
             .hasAttr => self.builtinHasAttr(args[0], args[1]),
             .getAttr => self.builtinGetAttr(args[0], args[1]),
             .elemAt => self.builtinElemAt(args[0], args[1]),
@@ -946,6 +962,48 @@ pub const VM = struct {
         }
 
         return Value.attrs(try self.heap.addAttrs(attrs.items));
+    }
+
+    fn builtinFindFile(self: *VM, search_path_arg: Value, name_arg: Value) !Value {
+        const search_path = try self.forceValue(search_path_arg);
+        if (search_path.discriminant != .list) return error.TypeError;
+        const name = try self.pathArg(name_arg);
+
+        const path_id = try self.intern.intern("path");
+        const prefix_id = try self.intern.intern("prefix");
+        for (try self.heap.getList(search_path.asObjectId())) |item| {
+            const entry = try self.forceValue(item);
+            if (entry.discriminant != .attrs) return error.TypeError;
+
+            const base_value = try self.forceValue(try self.heap.getAttrValue(entry.asObjectId(), path_id));
+            const base = switch (base_value.discriminant) {
+                .path, .string => self.intern.get(base_value.asInternId()),
+                else => return error.TypeError,
+            };
+
+            const prefix_value = self.heap.getAttrValue(entry.asObjectId(), prefix_id) catch |err| switch (err) {
+                error.MissingAttribute => Value.string(try self.intern.intern("")),
+                else => return err,
+            };
+            const prefix_forced = try self.forceValue(prefix_value);
+            if (prefix_forced.discriminant != .string) return error.TypeError;
+            const prefix = self.intern.get(prefix_forced.asInternId());
+
+            if (try self.findFileCandidate(base, prefix, name)) |candidate| {
+                defer self.allocator.free(candidate);
+                return Value.path(try self.intern.intern(candidate));
+            }
+        }
+        return error.FileNotFound;
+    }
+
+    fn findFileCandidate(self: *VM, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
+        const suffix = searchPathSuffix(prefix, name) orelse return null;
+        const candidate = try std.fs.path.resolve(self.allocator, &.{ base, suffix });
+        errdefer self.allocator.free(candidate);
+        if (try self.files.pathExists(candidate)) return candidate;
+        self.allocator.free(candidate);
+        return null;
     }
 
     fn pathArg(self: *VM, arg: Value) ![]const u8 {

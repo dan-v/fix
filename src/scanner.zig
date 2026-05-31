@@ -72,6 +72,7 @@ pub const Scanner = struct {
             },
             '<' => {
                 if (self.match('=')) return self.makeToken(.less_equal, start, 2);
+                if (isSearchPathStart(self.peek())) return self.lexSearchPath(start);
                 return self.makeToken(.less, start, 1);
             },
             '>' => {
@@ -227,6 +228,18 @@ pub const Scanner = struct {
         return self.makeToken(.path, start, self.pos - start);
     }
 
+    fn lexSearchPath(self: *Scanner, start: u32) Token {
+        while (self.pos < self.source.len and self.source[self.pos] != '>') {
+            if (!isSearchPathContinue(self.source[self.pos])) break;
+            self.pos += 1;
+        }
+        if (self.pos < self.source.len and self.source[self.pos] == '>') {
+            self.pos += 1;
+            return self.makeToken(.search_path, start, self.pos - start);
+        }
+        return self.makeToken(.less, start, 1);
+    }
+
     fn isAlpha(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
     }
@@ -237,6 +250,14 @@ pub const Scanner = struct {
 
     fn isPathContinue(c: u8) bool {
         return isAlpha(c) or isDigit(c) or c == '/' or c == '.' or c == '-' or c == '_' or c == '+';
+    }
+
+    fn isSearchPathStart(c: u8) bool {
+        return isAlpha(c) or c == '.' or c == '_' or c == '-';
+    }
+
+    fn isSearchPathContinue(c: u8) bool {
+        return isPathContinue(c);
     }
 
     fn keywordType(s: []const u8) TokenType {
@@ -288,5 +309,12 @@ test "scanner recognizes simple path literals" {
 
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
     try std.testing.expectEqual(TokenType.path, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes search path literals" {
+    var scanner = Scanner.init("<nixpkgs/lib>");
+
+    try std.testing.expectEqual(TokenType.search_path, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }

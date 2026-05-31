@@ -20,6 +20,14 @@ const diagnostic = @import("diagnostic.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
 
+fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
+    if (prefix.len == 0) return name;
+    if (std.mem.eql(u8, prefix, name)) return "";
+    if (name.len <= prefix.len or name[prefix.len] != '/') return null;
+    if (!std.mem.eql(u8, prefix, name[0..prefix.len])) return null;
+    return name[prefix.len + 1 ..];
+}
+
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
@@ -28,6 +36,7 @@ pub const Evaluator = struct {
     heap: ObjectHeap,
     files: FileCache,
     imports: std.StringHashMapUnmanaged(Value),
+    search_paths: []SearchPathEntry,
     runtime_arena: std.heap.ArenaAllocator,
     builtins_value: ?Value,
     base_path: ?[:0]u8,
@@ -45,6 +54,7 @@ pub const Evaluator = struct {
             .heap = ObjectHeap.init(allocator),
             .files = FileCache.init(allocator),
             .imports = .empty,
+            .search_paths = &.{},
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
             .builtins_value = null,
             .base_path = null,
@@ -59,6 +69,7 @@ pub const Evaluator = struct {
         var imports_iter = self.imports.iterator();
         while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
         self.imports.deinit(self.allocator);
+        self.freeSearchPaths();
         self.files.deinit();
         self.heap.deinit();
         self.runtime_arena.deinit();
@@ -79,6 +90,38 @@ pub const Evaluator = struct {
 
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
+    }
+
+    pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
+        self.freeSearchPaths();
+
+        var entries: std.ArrayListUnmanaged(SearchPathEntry) = .empty;
+        errdefer {
+            for (entries.items) |entry| entry.deinit(self.allocator);
+            entries.deinit(self.allocator);
+        }
+
+        var parts = std.mem.splitScalar(u8, nix_path, ':');
+        while (parts.next()) |part| {
+            if (part.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, part, '=');
+            const prefix = if (eq) |i| part[0..i] else "";
+            const raw_path = if (eq) |i| part[i + 1 ..] else part;
+            if (raw_path.len == 0) continue;
+
+            const resolved = self.resolveHostPath(raw_path) catch |err| switch (err) {
+                error.RelativePath => continue,
+                else => return err,
+            };
+            defer if (resolved.owned) self.allocator.free(resolved.text);
+
+            try entries.append(self.allocator, .{
+                .prefix = try self.allocator.dupe(u8, prefix),
+                .path = try self.allocator.dupe(u8, resolved.text),
+            });
+        }
+
+        self.search_paths = try entries.toOwnedSlice(self.allocator);
     }
 
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
@@ -150,7 +193,7 @@ pub const Evaluator = struct {
             &self.heap,
             &self.files,
             &self.scheduler,
-            .{ .context = self, .import_value = importValue },
+            .{ .context = self, .import_value = importValue, .find_file = findFile },
             try self.ensureBuiltins(),
             0,
         );
@@ -162,6 +205,30 @@ pub const Evaluator = struct {
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.importPath(path);
+    }
+
+    fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        return self.findFileInDefaultSearchPath(name);
+    }
+
+    fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {
+        for (self.search_paths) |entry| {
+            if (try self.searchPathCandidate(entry.path, entry.prefix, name)) |candidate| {
+                defer self.allocator.free(candidate);
+                return Value.path(try self.intern.intern(candidate));
+            }
+        }
+        return error.FileNotFound;
+    }
+
+    fn searchPathCandidate(self: *Evaluator, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
+        const suffix = searchPathSuffix(prefix, name) orelse return null;
+        const candidate = try std.fs.path.resolve(self.allocator, &.{ base, suffix });
+        errdefer self.allocator.free(candidate);
+        if (try self.files.pathExists(candidate)) return candidate;
+        self.allocator.free(candidate);
+        return null;
     }
 
     fn importPath(self: *Evaluator, path: []const u8) !Value {
@@ -221,6 +288,22 @@ pub const Evaluator = struct {
         text: []const u8,
         owned: bool,
     };
+
+    const SearchPathEntry = struct {
+        prefix: []u8,
+        path: []u8,
+
+        fn deinit(self: SearchPathEntry, allocator: std.mem.Allocator) void {
+            allocator.free(self.prefix);
+            allocator.free(self.path);
+        }
+    };
+
+    fn freeSearchPaths(self: *Evaluator) void {
+        for (self.search_paths) |entry| entry.deinit(self.allocator);
+        self.allocator.free(self.search_paths);
+        self.search_paths = &.{};
+    }
 
     fn resolveHostPath(self: *Evaluator, path: []const u8) !ResolvedHostPath {
         if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
@@ -762,6 +845,61 @@ test "evaluate readFileType builtin through file cache" {
 
     const dir_kind = try ev.evaluate(dir_source);
     try std.testing.expectEqualStrings("directory", ev.intern.get(dir_kind.asInternId()));
+}
+
+test "evaluate findFile builtin through explicit search path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.nix", .data = "1" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(base_path);
+    const expected_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "target.nix" });
+    defer std.testing.allocator.free(expected_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.findFile [ {{ prefix = \"pkg\"; path = {s}; }} ] \"pkg/target.nix\"", .{base_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const found = try ev.evaluate(source);
+    try std.testing.expectEqualStrings(expected_path, ev.intern.get(found.asInternId()));
+}
+
+test "evaluate angle search path literals through cached nix path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.nix", .data = "{ value = 5; }" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(base_path);
+
+    const nix_path = try std.fmt.allocPrint(std.testing.allocator, "pkg={s}", .{base_path});
+    defer std.testing.allocator.free(nix_path);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    try ev.setNixPath(nix_path);
+
+    const imported = try ev.evaluate("(import <pkg/target.nix>).value");
+    try std.testing.expectEqual(@as(i64, 5), imported.asInt());
 }
 
 test "evaluate import through evaluator file cache" {

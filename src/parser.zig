@@ -142,6 +142,7 @@ pub const Parser = struct {
             .float_val => return .{ .prefix = floatLit, .infix = null, .prec = .none },
             .string => return .{ .prefix = stringLit, .infix = null, .prec = .none },
             .path => return .{ .prefix = pathLit, .infix = null, .prec = .none },
+            .search_path => return .{ .prefix = searchPathLit, .infix = null, .prec = .none },
             .kw_true => return .{ .prefix = literal, .infix = null, .prec = .none },
             .kw_false => return .{ .prefix = literal, .infix = null, .prec = .none },
             .kw_null => return .{ .prefix = literal, .infix = null, .prec = .none },
@@ -218,6 +219,7 @@ pub const Parser = struct {
             .float_val,
             .string,
             .path,
+            .search_path,
             .left_paren,
             .left_brace,
             .left_bracket,
@@ -304,6 +306,13 @@ pub const Parser = struct {
 
     fn pathLit(self: *Parser) !*Node {
         return self.arena.createNode(.path, .{ .atom = .{
+            .offset = self.previous.offset,
+            .len = self.previous.len,
+        } });
+    }
+
+    fn searchPathLit(self: *Parser) !*Node {
+        return self.arena.createNode(.search_path, .{ .atom = .{
             .offset = self.previous.offset,
             .len = self.previous.len,
         } });
