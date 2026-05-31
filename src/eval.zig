@@ -1218,6 +1218,12 @@ test "evaluate string builtins" {
     defer std.testing.allocator.free(substring);
     try std.testing.expectEqualStrings("\"bc\"", substring);
 
+    const substring_to_end = try renderForTest("builtins.substring 1 (-1) \"abcd\"");
+    defer std.testing.allocator.free(substring_to_end);
+    try std.testing.expectEqualStrings("\"bcd\"", substring_to_end);
+
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.substring (-1) 2 \"abcd\""));
+
     const out_path_substring = try renderForTest("builtins.substring 0 1 { outPath = \"/x\"; }");
     defer std.testing.allocator.free(out_path_substring);
     try std.testing.expectEqualStrings("\"/\"", out_path_substring);

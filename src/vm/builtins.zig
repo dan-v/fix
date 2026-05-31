@@ -1054,13 +1054,13 @@ fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg:
     const start_value = try self.forceValue(start_arg);
     const len_value = try self.forceValue(len_arg);
     if (start_value.discriminant != .int or len_value.discriminant != .int) return error.TypeError;
-    if (start_value.asInt() < 0 or len_value.asInt() < 0) return error.TypeError;
+    if (start_value.asInt() < 0) return error.TypeError;
 
     const string = self.intern.get(try coerceStringContextId(self, string_arg));
     const start: usize = @intCast(start_value.asInt());
     if (start >= string.len) return Value.string(try self.intern.intern(""));
-    const requested_len: usize = @intCast(len_value.asInt());
     const available = string.len - start;
+    const requested_len: usize = if (len_value.asInt() < 0) available else @intCast(len_value.asInt());
     const end = start + @min(available, requested_len);
     return Value.string(try self.intern.intern(string[start..end]));
 }
