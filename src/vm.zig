@@ -518,8 +518,8 @@ pub const VM = struct {
 
     // ---- thunk management ----
 
-    pub fn forceThunk(self: *VM, thunk_val: Value) Value {
-        return self.forceThunkFallible(thunk_val) catch Value.null_val;
+    pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
+        return self.forceThunkFallible(thunk_val);
     }
 
     fn forceValue(self: *VM, value: Value) anyerror!Value {
