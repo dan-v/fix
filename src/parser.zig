@@ -164,6 +164,10 @@ pub const Parser = struct {
     }
 
     fn parsePrecedence(self: *Parser, min_prec: Precedence) anyerror!*Node {
+        return self.parsePrecedenceWithApply(min_prec, true);
+    }
+
+    fn parsePrecedenceWithApply(self: *Parser, min_prec: Precedence, allow_apply: bool) anyerror!*Node {
         self.advance();
         const prefix_fn = rule(self.previous.type).prefix orelse {
             self.reportError("Expected expression.");
@@ -173,7 +177,7 @@ pub const Parser = struct {
 
         while (true) {
             // Check for function application (juxtaposition)
-            if (canStartExpr(self.current.type) and @intFromEnum(min_prec) <= @intFromEnum(Precedence.apply)) {
+            if (allow_apply and canStartExpr(self.current.type) and @intFromEnum(min_prec) <= @intFromEnum(Precedence.apply)) {
                 const prev = self.previous;
                 _ = prev;
                 // Don't advance — parse the argument
@@ -331,11 +335,10 @@ pub const Parser = struct {
         var items: std.ArrayListUnmanaged(*Node) = .empty;
 
         while (!self.check(.right_bracket) and !self.check(.eof)) {
-            const item = try self.expression();
+            const item = try self.parsePrecedenceWithApply(.assignment, false);
             try items.append(arena_allocator, item);
 
-            if (!self.match(.comma)) break;
-            // Allow trailing comma before ]
+            _ = self.match(.comma);
         }
 
         _ = try self.expect(.right_bracket, "Expected ']' after list.");

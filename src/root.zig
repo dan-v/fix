@@ -227,10 +227,10 @@ test "end-to-end: lists and attrs compare structurally" {
     var ev = try Evaluator.init(alloc, 0);
     defer ev.deinit();
 
-    const lists_equal = try ev.evaluate("[ 1, 2 ] == [ 1, 2 ]");
+    const lists_equal = try ev.evaluate("[ 1 2 ] == [ 1 2 ]");
     try std.testing.expect(lists_equal.asBool());
 
-    const lists_not_equal = try ev.evaluate("[ 1, 2 ] == [ 1, 3 ]");
+    const lists_not_equal = try ev.evaluate("[ 1 2 ] == [ 1 3 ]");
     try std.testing.expect(!lists_not_equal.asBool());
 
     const attrs_equal = try ev.evaluate("{ b = 2; a = 1; } == { a = 1; b = 2; }");
@@ -239,7 +239,7 @@ test "end-to-end: lists and attrs compare structurally" {
     const attrs_not_equal = try ev.evaluate("{ a = 1; } == { a = 2; }");
     try std.testing.expect(!attrs_not_equal.asBool());
 
-    try std.testing.expectError(error.DivisionByZero, ev.evaluate("[ 1, (1 / 0) ] == [ 1, 2 ]"));
+    try std.testing.expectError(error.DivisionByZero, ev.evaluate("[ 1 (1 / 0) ] == [ 1 2 ]"));
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("{ a = 1 / 0; } == { a = 1; }"));
 }
 
