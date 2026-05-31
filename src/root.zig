@@ -424,6 +424,23 @@ test "end-to-end: builtins.toString" {
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toString {}"));
 }
 
+test "end-to-end: builtin type predicates" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    try std.testing.expect((try ev.evaluate("builtins.isAttrs {}")).asBool());
+    try std.testing.expect(!(try ev.evaluate("builtins.isAttrs []")).asBool());
+
+    try std.testing.expect((try ev.evaluate("builtins.isList [ 1 2 ]")).asBool());
+    try std.testing.expect((try ev.evaluate("builtins.isString \"x\"")).asBool());
+    try std.testing.expect((try ev.evaluate("builtins.isInt 1")).asBool());
+    try std.testing.expect(!(try ev.evaluate("builtins.isInt 1.5")).asBool());
+    try std.testing.expect((try ev.evaluate("builtins.isBool false")).asBool());
+    try std.testing.expect((try ev.evaluate("builtins.isNull null")).asBool());
+}
+
 test "end-to-end: assert and implication" {
     const alloc = std.testing.allocator;
 

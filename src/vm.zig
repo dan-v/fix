@@ -671,8 +671,24 @@ pub const VM = struct {
     fn callBuiltin(self: *VM, callee: Value, arg: Value) !Value {
         return switch (callee.asBuiltinId()) {
             @intFromEnum(BuiltinId.toString) => self.builtinToString(arg),
+            @intFromEnum(BuiltinId.isAttrs) => self.builtinTypePredicate(arg, .attrs),
+            @intFromEnum(BuiltinId.isList) => self.builtinTypePredicate(arg, .list),
+            @intFromEnum(BuiltinId.isString) => self.builtinTypePredicate(arg, .string),
+            @intFromEnum(BuiltinId.isInt) => self.builtinTypePredicate(arg, .int),
+            @intFromEnum(BuiltinId.isBool) => self.builtinIsBool(arg),
+            @intFromEnum(BuiltinId.isNull) => self.builtinTypePredicate(arg, .null),
             else => error.InvalidBuiltin,
         };
+    }
+
+    fn builtinTypePredicate(self: *VM, arg: Value, expected: @import("value.zig").ValueType) !Value {
+        const value = try self.forceValue(arg);
+        return Value.boolVal(value.discriminant == expected);
+    }
+
+    fn builtinIsBool(self: *VM, arg: Value) !Value {
+        const value = try self.forceValue(arg);
+        return Value.boolVal(value.isBool());
     }
 
     fn builtinToString(self: *VM, arg: Value) !Value {
