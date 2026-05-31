@@ -1141,6 +1141,37 @@ test "evaluate string builtins" {
     try std.testing.expectEqualStrings("\"XcY\"", replaced);
 }
 
+test "evaluate hash builtins" {
+    const hash_string = try renderForTest("builtins.hashString \"sha256\" \"abc\"");
+    defer std.testing.allocator.free(hash_string);
+    try std.testing.expectEqualStrings("\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"", hash_string);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "input.txt", .data = "abc" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "input.txt",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.hashFile \"sha1\" {s}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const hash_file = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("a9993e364706816aba3e25717850c26c9cd0d89d", ev.intern.get(hash_file.asInternId()));
+}
+
 test "evaluate control and error builtins" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

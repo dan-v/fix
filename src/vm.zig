@@ -32,6 +32,7 @@ const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("derivation.zig");
 const numeric = @import("runtime/numeric.zig");
 const path_ops = @import("runtime/paths.zig");
+const nix_hash = @import("runtime/hash.zig");
 
 fn searchPathSuffix(prefix: []const u8, name: []const u8) ?[]const u8 {
     if (prefix.len == 0) return name;
@@ -841,6 +842,8 @@ pub const VM = struct {
             .dirOf => self.builtinDirOf(args[0]),
             .catAttrs => self.builtinCatAttrs(args[0], args[1]),
             .zipAttrsWith => self.builtinZipAttrsWith(args[0], args[1]),
+            .hashString => self.builtinHashString(args[0], args[1]),
+            .hashFile => self.builtinHashFile(args[0], args[1]),
         };
     }
 
@@ -1002,6 +1005,22 @@ pub const VM = struct {
             };
         }
         return Value.attrs(try self.heap.addAttrs(entries));
+    }
+
+    fn builtinHashString(self: *VM, algorithm_arg: Value, string_arg: Value) !Value {
+        const algorithm = try self.stringArg(algorithm_arg);
+        const string = try self.stringArg(string_arg);
+        const digest = try nix_hash.hashBytes(self.allocator, algorithm, string);
+        defer self.allocator.free(digest);
+        return Value.string(try self.intern.intern(digest));
+    }
+
+    fn builtinHashFile(self: *VM, algorithm_arg: Value, path_arg: Value) !Value {
+        const algorithm = try self.stringArg(algorithm_arg);
+        const contents = try self.files.readFile(try self.pathArg(path_arg));
+        const digest = try nix_hash.hashBytes(self.allocator, algorithm, contents);
+        defer self.allocator.free(digest);
+        return Value.string(try self.intern.intern(digest));
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {

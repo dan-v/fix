@@ -80,6 +80,7 @@ builtins.stringLength "abcd"
 builtins.concatStringsSep "," [ "a" "b" ]
 builtins.substring 1 2 "abcd"
 builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
+builtins.hashString "sha256" "abc"
 (builtins.tryEval (builtins.throw "x")).success
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type

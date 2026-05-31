@@ -80,6 +80,8 @@ pub const BuiltinId = enum(u16) {
     dirOf = 69,
     catAttrs = 70,
     zipAttrsWith = 71,
+    hashString = 72,
+    hashFile = 73,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -154,6 +156,8 @@ pub fn arity(id: BuiltinId) u8 {
         .bitXor,
         .catAttrs,
         .zipAttrsWith,
+        .hashString,
+        .hashFile,
         => 2,
         .foldlStrict,
         .substring,
@@ -451,6 +455,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("zipAttrsWith"),
             .value = Value.builtin(@intFromEnum(BuiltinId.zipAttrsWith)),
+        },
+        .{
+            .name = try intern.intern("hashString"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.hashString)),
+        },
+        .{
+            .name = try intern.intern("hashFile"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.hashFile)),
         },
         .{
             .name = try intern.intern("true"),
