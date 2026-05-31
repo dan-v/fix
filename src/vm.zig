@@ -45,6 +45,14 @@ fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
     return null;
 }
 
+fn isDerivationSyntheticName(name: []const u8) bool {
+    const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "outputs" };
+    for (synthetic) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
 /// A single call frame.
 pub const Frame = struct {
     /// The chunk being executed.
@@ -843,6 +851,8 @@ pub const VM = struct {
             .abort => self.builtinAbort(args[0]),
             .tryEval => self.builtinTryEval(args[0]),
             .trace => self.builtinTrace(args[0], args[1]),
+            .derivation => self.builtinDerivation(args[0]),
+            .derivationStrict => self.builtinDerivation(args[0]),
         };
     }
 
@@ -1371,6 +1381,54 @@ pub const VM = struct {
             },
         };
         return Value.attrs(try self.heap.addAttrs(&entries));
+    }
+
+    fn builtinDerivation(self: *VM, arg: Value) !Value {
+        const attrs = try self.forceValue(arg);
+        if (attrs.discriminant != .attrs) return error.TypeError;
+
+        const name_id = try self.intern.intern("name");
+        const name_value = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
+        if (name_value.discriminant != .string) return error.TypeError;
+        const name = self.intern.get(name_value.asInternId());
+
+        var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
+            if (isDerivationSyntheticName(self.intern.get(entry.name))) continue;
+            try entries.append(self.allocator, entry);
+        }
+
+        const out_path = try std.fmt.allocPrint(self.allocator, "/nix/store/fix-{s}", .{name});
+        defer self.allocator.free(out_path);
+        const drv_path = try std.fmt.allocPrint(self.allocator, "/nix/store/fix-{s}.drv", .{name});
+        defer self.allocator.free(drv_path);
+
+        try entries.appendSlice(self.allocator, &.{
+            .{
+                .name = try self.intern.intern("type"),
+                .value = Value.string(try self.intern.intern("derivation")),
+            },
+            .{
+                .name = try self.intern.intern("outputName"),
+                .value = Value.string(try self.intern.intern("out")),
+            },
+            .{
+                .name = try self.intern.intern("outPath"),
+                .value = Value.path(try self.intern.intern(out_path)),
+            },
+            .{
+                .name = try self.intern.intern("drvPath"),
+                .value = Value.path(try self.intern.intern(drv_path)),
+            },
+            .{
+                .name = try self.intern.intern("outputs"),
+                .value = Value.list(try self.heap.addList(&.{Value.string(try self.intern.intern("out"))})),
+            },
+        });
+
+        return Value.attrs(try self.heap.addAttrs(entries.items));
     }
 
     fn builtinFoldlStrict(self: *VM, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {

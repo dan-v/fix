@@ -1093,6 +1093,16 @@ test "evaluate control and error builtins" {
     try std.testing.expectEqualStrings("42", traced);
 }
 
+test "evaluate minimal derivation builtins" {
+    const derivation_type = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).type");
+    defer std.testing.allocator.free(derivation_type);
+    try std.testing.expectEqualStrings("\"derivation\"", derivation_type);
+
+    const strict_output = try renderForTest("builtins.head (builtins.derivationStrict { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outputs");
+    defer std.testing.allocator.free(strict_output);
+    try std.testing.expectEqualStrings("\"out\"", strict_output);
+}
+
 test "evaluate foldl' builtin" {
     const sum = try renderForTest("builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]");
     defer std.testing.allocator.free(sum);

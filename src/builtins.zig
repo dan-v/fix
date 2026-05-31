@@ -55,6 +55,8 @@ pub const BuiltinId = enum(u16) {
     abort = 45,
     tryEval = 46,
     trace = 47,
+    derivation = 48,
+    derivationStrict = 49,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -86,6 +88,8 @@ pub fn arity(id: BuiltinId) u8 {
         .throw,
         .abort,
         .tryEval,
+        .derivation,
+        .derivationStrict,
         => 1,
         .hasAttr,
         .getAttr,
@@ -306,6 +310,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("trace"),
             .value = Value.builtin(@intFromEnum(BuiltinId.trace)),
+        },
+        .{
+            .name = try intern.intern("derivation"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.derivation)),
+        },
+        .{
+            .name = try intern.intern("derivationStrict"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.derivationStrict)),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));
