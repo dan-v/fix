@@ -56,6 +56,7 @@ pub const Compiler = struct {
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
     parent: ?*Compiler,
+    skip_local_slot: ?u16,
     scope_depth: u8,
     slot_count: u16,
 
@@ -76,6 +77,7 @@ pub const Compiler = struct {
             .captures = .empty,
             .with_scopes = .empty,
             .parent = null,
+            .skip_local_slot = null,
             .scope_depth = 0,
             .slot_count = 0,
         };
@@ -369,7 +371,11 @@ pub const Compiler = struct {
         for (let_in.bindings) |binding| {
             const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
             const slot = self.resolveLocal(name) orelse return error.UndefinedVariable;
-            try self.compileThunk(binding.expr);
+            const previous_skip = self.skip_local_slot;
+            if (binding.inherit_outer) self.skip_local_slot = slot;
+            const compile_result = self.compileThunk(binding.expr);
+            self.skip_local_slot = previous_skip;
+            try compile_result;
             try self.emitOpByte(.set_cell_local, @intCast(slot));
         }
 
@@ -788,6 +794,9 @@ pub const Compiler = struct {
         while (i > 0) {
             i -= 1;
             const local = self.locals.items[i];
+            if (self.skip_local_slot) |skip| {
+                if (local.slot == skip) continue;
+            }
             if (std.mem.eql(u8, local.name, name)) {
                 return local.slot;
             }

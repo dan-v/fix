@@ -209,6 +209,25 @@ test "end-to-end: inherit from source expression" {
     try std.testing.expectEqual(value.ValueType.attrs, lazy.discriminant);
 }
 
+test "end-to-end: inherit in let bindings" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const outer = try ev.evaluate("let x = 1; in let inherit x; in x");
+    try std.testing.expectEqual(@as(i64, 1), outer.asInt());
+
+    const sourced = try ev.evaluate("let inherit ({ x = 2; }) x; in x");
+    try std.testing.expectEqual(@as(i64, 2), sourced.asInt());
+
+    const contextual_or = try ev.evaluate("let inherit ({ or = 4; }) or; in ({ inherit or; }).or");
+    try std.testing.expectEqual(@as(i64, 4), contextual_or.asInt());
+
+    const lazy_source = try ev.evaluate("let src = 1 / 0; inherit (src) x; in { inherit x; }");
+    try std.testing.expectEqual(value.ValueType.attrs, lazy_source.discriminant);
+}
+
 test "end-to-end: or is contextual in attr names" {
     const alloc = std.testing.allocator;
 

@@ -522,6 +522,12 @@ pub const Parser = struct {
         var bindings: std.ArrayListUnmanaged(Node.Binding) = .empty;
 
         while (!self.check(.kw_in) and !self.check(.eof)) {
+            if (self.match(.kw_inherit)) {
+                try self.inheritLetBindings(arena_allocator, &bindings);
+                _ = try self.expect(.semicolon, "Expected ';' after inherit.");
+                continue;
+            }
+
             const name_tok = self.current;
             if (!self.matchLetBindingName()) {
                 self.reportError("Expected variable name in let binding.");
@@ -535,6 +541,7 @@ pub const Parser = struct {
                 .name_offset = name_tok.offset,
                 .name_len = name_tok.len,
                 .expr = expr,
+                .inherit_outer = false,
             });
         }
 
@@ -544,6 +551,49 @@ pub const Parser = struct {
         return self.arena.createNode(.let_in, .{
             .let_in = .{ .bindings = try bindings.toOwnedSlice(arena_allocator), .body = body },
         });
+    }
+
+    fn inheritLetBindings(
+        self: *Parser,
+        allocator: std.mem.Allocator,
+        bindings: *std.ArrayListUnmanaged(Node.Binding),
+    ) !void {
+        const source: ?*Node = if (self.match(.left_paren)) source: {
+            const expr = try self.expression();
+            _ = try self.expect(.right_paren, "Expected ')' after inherit source.");
+            break :source expr;
+        } else null;
+
+        var count: usize = 0;
+        while (!self.check(.semicolon) and !self.check(.kw_in) and !self.check(.eof)) {
+            const name_tok = self.current;
+            if (!self.matchLetBindingName()) {
+                self.reportError("Expected inherited variable name.");
+                return error.ParseError;
+            }
+
+            const name = Node.Atom{
+                .offset = name_tok.offset,
+                .len = name_tok.len,
+            };
+            const expr = if (source) |src|
+                try self.inheritSourceAttr(src, name)
+            else
+                try self.arena.createNode(.identifier, .{ .atom = name });
+
+            try bindings.append(allocator, .{
+                .name_offset = name.offset,
+                .name_len = name.len,
+                .expr = expr,
+                .inherit_outer = source == null,
+            });
+            count += 1;
+        }
+
+        if (count == 0) {
+            self.reportError("Expected inherited variable name.");
+            return error.ParseError;
+        }
     }
 
     // ---- infix parsers ----
@@ -768,6 +818,36 @@ test "parser recognizes contextual or attr names" {
         .len = entries[1].path[1].len,
         .line = 1,
     }));
+}
+
+test "parser desugars inherit in let bindings" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "let inherit a; inherit (src) b; in a");
+    defer parser.deinit();
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.let_in, node.tag);
+    const bindings = node.data.let_in.bindings;
+    try std.testing.expectEqual(@as(usize, 2), bindings.len);
+    try std.testing.expectEqualStrings("a", parser.span(.{
+        .type = .identifier,
+        .offset = bindings[0].name_offset,
+        .len = bindings[0].name_len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.identifier, bindings[0].expr.tag);
+    try std.testing.expect(bindings[0].inherit_outer);
+    try std.testing.expectEqualStrings("b", parser.span(.{
+        .type = .identifier,
+        .offset = bindings[1].name_offset,
+        .len = bindings[1].name_len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.attr_path, bindings[1].expr.tag);
+    try std.testing.expectEqual(NodeTag.identifier, bindings[1].expr.data.attr_path.root.tag);
+    try std.testing.expect(!bindings[1].inherit_outer);
 }
 
 test "parser recognizes attr path or default" {

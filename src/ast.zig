@@ -117,6 +117,7 @@ pub const Node = struct {
         name_offset: u32,
         name_len: u32,
         expr: *Node,
+        inherit_outer: bool = false,
     };
 
     pub const IfElse = struct {
