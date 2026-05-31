@@ -1286,6 +1286,23 @@ test "evaluate JSON builtins" {
     try std.testing.expectEqualStrings("\"float\"", parsed_float_type);
 }
 
+test "evaluate TOML builtin" {
+    const parsed = try renderForTest(
+        \\builtins.toJSON (let value = builtins.fromTOML ''
+        \\  title = "demo"
+        \\  enabled = true
+        \\  count = 0x10
+        \\  ratio = 1.5
+        \\  tags = [ "a", "b" ]
+        \\  [package]
+        \\  name = "pkg"
+        \\  meta.license = { text = "MIT" }
+        \\''; in [ value.title value.enabled value.count value.ratio value.tags value.package.name value.package.meta.license.text ])
+    );
+    defer std.testing.allocator.free(parsed);
+    try std.testing.expectEqualStrings("\"[\\\"demo\\\",true,16,1.5,[\\\"a\\\",\\\"b\\\"],\\\"pkg\\\",\\\"MIT\\\"]\"", parsed);
+}
+
 test "evaluate version parsing builtins" {
     const split = try renderForTest("builtins.splitVersion \"1.0-beta2\"");
     defer std.testing.allocator.free(split);

@@ -14,6 +14,7 @@ const path_ops = @import("../runtime/paths.zig");
 const nix_hash = @import("../runtime/hash.zig");
 const version = @import("../runtime/version.zig");
 const regex = @import("../runtime/regex.zig");
+const toml = @import("../runtime/toml.zig");
 
 fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
     for (needles, 0..) |needle, i| {
@@ -120,7 +121,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .getEnv => builtinGetEnv(self, args[0]),
         .match => builtinMatch(self, args[0], args[1]),
         .split => builtinSplit(self, args[0], args[1]),
-        .fromTOML,
+        .fromTOML => builtinFromTOML(self, args[0]),
         .toXML,
         .fetchurl,
         .fetchTarball,
@@ -458,6 +459,43 @@ fn attrsFromJson(self: anytype, object: anytype) !Value {
         entries[index] = .{
             .name = try self.intern.intern(entry.key_ptr.*),
             .value = try valueFromJson(self, entry.value_ptr.*),
+        };
+    }
+    return Value.attrs(try self.heap.addAttrs(entries));
+}
+
+fn builtinFromTOML(self: anytype, arg: Value) !Value {
+    const text = try stringArg(self, arg);
+    var parsed = try toml.parse(self.allocator, text);
+    defer parsed.deinit();
+    return valueFromToml(self, .{ .table = parsed.root });
+}
+
+fn valueFromToml(self: anytype, value: toml.Value) anyerror!Value {
+    return switch (value) {
+        .boolean => |b| Value.boolVal(b),
+        .integer => |i| Value.int(i),
+        .float => |f| Value.float(f),
+        .string => |s| Value.string(try self.intern.intern(s)),
+        .array => |items| listFromToml(self, items),
+        .table => |table| attrsFromToml(self, table),
+    };
+}
+
+fn listFromToml(self: anytype, values: []const toml.Value) !Value {
+    const items = try self.allocator.alloc(Value, values.len);
+    defer self.allocator.free(items);
+    for (values, items) |item, *out| out.* = try valueFromToml(self, item);
+    return Value.list(try self.heap.addList(items));
+}
+
+fn attrsFromToml(self: anytype, table: *toml.Table) !Value {
+    const entries = try self.allocator.alloc(heap_mod.AttrEntry, table.entries.items.len);
+    defer self.allocator.free(entries);
+    for (table.entries.items, entries) |entry, *out| {
+        out.* = .{
+            .name = try self.intern.intern(entry.key),
+            .value = try valueFromToml(self, entry.value),
         };
     }
     return Value.attrs(try self.heap.addAttrs(entries));
