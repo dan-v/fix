@@ -87,6 +87,8 @@ builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name 
 builtins.sort (a: b: a < b) [ 2 1 ]
 (builtins.partition (x: x < 2) [ 1 2 ]).right
 (builtins.groupBy (x: "k") [ 1 2 ]).k
+builtins.catAttrs "a" [ { a = 1; } { b = 2; } { a = 3; } ]
+(builtins.zipAttrsWith (name: values: builtins.length values) [ { a = 1; } { a = 2; b = 3; } ]).a
 (builtins.functionArgs ({ a ? 1 }: a)).a
 builtins.unsafeGetAttrPos "a" { a = 1; }
 builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]

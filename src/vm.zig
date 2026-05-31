@@ -839,6 +839,8 @@ pub const VM = struct {
             .ceil => self.builtinCeil(args[0]),
             .baseNameOf => self.builtinBaseNameOf(args[0]),
             .dirOf => self.builtinDirOf(args[0]),
+            .catAttrs => self.builtinCatAttrs(args[0], args[1]),
+            .zipAttrsWith => self.builtinZipAttrsWith(args[0], args[1]),
         };
     }
 
@@ -939,6 +941,67 @@ pub const VM = struct {
             .string => Value.string(dir),
             else => unreachable,
         };
+    }
+
+    fn builtinCatAttrs(self: *VM, name_arg: Value, list_arg: Value) !Value {
+        const name = try self.forceValue(name_arg);
+        const list = try self.forceValue(list_arg);
+        if (name.discriminant != .string or list.discriminant != .list) return error.TypeError;
+
+        var values: std.ArrayListUnmanaged(Value) = .empty;
+        defer values.deinit(self.allocator);
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const attrs = try self.forceValue(item);
+            if (attrs.discriminant != .attrs) return error.TypeError;
+            const value = self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()) catch |err| switch (err) {
+                error.MissingAttribute => continue,
+                else => return err,
+            };
+            try values.append(self.allocator, value);
+        }
+
+        return Value.list(try self.heap.addList(values.items));
+    }
+
+    fn builtinZipAttrsWith(self: *VM, func_arg: Value, list_arg: Value) !Value {
+        const func = try self.forceValue(func_arg);
+        const list = try self.forceValue(list_arg);
+        if (list.discriminant != .list) return error.TypeError;
+
+        const Group = struct {
+            name: InternId,
+            values: std.ArrayListUnmanaged(Value) = .empty,
+        };
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        defer {
+            for (groups.items) |*group| group.values.deinit(self.allocator);
+            groups.deinit(self.allocator);
+        }
+
+        for (try self.heap.getList(list.asObjectId())) |item| {
+            const attrs = try self.forceValue(item);
+            if (attrs.discriminant != .attrs) return error.TypeError;
+
+            for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
+                const index = groupIndex(groups.items, entry.name) orelse blk: {
+                    try groups.append(self.allocator, .{ .name = entry.name });
+                    break :blk groups.items.len - 1;
+                };
+                try groups.items[index].values.append(self.allocator, entry.value);
+            }
+        }
+
+        const entries = try self.allocator.alloc(heap_mod.AttrEntry, groups.items.len);
+        defer self.allocator.free(entries);
+        for (groups.items, entries) |group, *entry| {
+            const partial = try self.callValue(func, Value.string(group.name));
+            entry.* = .{
+                .name = group.name,
+                .value = try self.callValue(partial, Value.list(try self.heap.addList(group.values.items))),
+            };
+        }
+        return Value.attrs(try self.heap.addAttrs(entries));
     }
 
     fn builtinLength(self: *VM, arg: Value) !Value {

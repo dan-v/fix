@@ -1222,6 +1222,22 @@ test "evaluate nixpkgs-heavy collection builtins" {
     const closure_len = try renderForTest("builtins.length (builtins.genericClosure { startSet = [ { key = 1; } ]; operator = item: if item.key < 3 then [ { key = item.key + 1; } ] else [ ]; })");
     defer std.testing.allocator.free(closure_len);
     try std.testing.expectEqualStrings("3", closure_len);
+
+    const cat_attrs = try renderForTest("builtins.elemAt (builtins.catAttrs \"a\" [ { a = 1; } { b = 2; } { a = 3; } ]) 1");
+    defer std.testing.allocator.free(cat_attrs);
+    try std.testing.expectEqualStrings("3", cat_attrs);
+
+    const cat_attrs_lazy = try renderForTest("builtins.length (builtins.catAttrs \"a\" [ { a = 1 / 0; } ])");
+    defer std.testing.allocator.free(cat_attrs_lazy);
+    try std.testing.expectEqualStrings("1", cat_attrs_lazy);
+
+    const zipped_len = try renderForTest("(builtins.zipAttrsWith (name: values: builtins.length values) [ { a = 1; } { a = 2; b = 3; } ]).a");
+    defer std.testing.allocator.free(zipped_len);
+    try std.testing.expectEqualStrings("2", zipped_len);
+
+    const zipped_first = try renderForTest("(builtins.zipAttrsWith (name: values: builtins.head values) [ { a = 1; } { a = 2; } ]).a");
+    defer std.testing.allocator.free(zipped_first);
+    try std.testing.expectEqualStrings("1", zipped_first);
 }
 
 test "evaluate function metadata builtins" {

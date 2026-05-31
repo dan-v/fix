@@ -78,6 +78,8 @@ pub const BuiltinId = enum(u16) {
     ceil = 67,
     baseNameOf = 68,
     dirOf = 69,
+    catAttrs = 70,
+    zipAttrsWith = 71,
 };
 
 pub fn arity(id: BuiltinId) u8 {
@@ -150,6 +152,8 @@ pub fn arity(id: BuiltinId) u8 {
         .bitAnd,
         .bitOr,
         .bitXor,
+        .catAttrs,
+        .zipAttrsWith,
         => 2,
         .foldlStrict,
         .substring,
@@ -439,6 +443,14 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap) !Value {
         .{
             .name = try intern.intern("dirOf"),
             .value = Value.builtin(@intFromEnum(BuiltinId.dirOf)),
+        },
+        .{
+            .name = try intern.intern("catAttrs"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.catAttrs)),
+        },
+        .{
+            .name = try intern.intern("zipAttrsWith"),
+            .value = Value.builtin(@intFromEnum(BuiltinId.zipAttrsWith)),
         },
         .{
             .name = try intern.intern("true"),
