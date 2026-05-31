@@ -33,6 +33,22 @@ test "end-to-end: simple arithmetic" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: float arithmetic" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const add = try ev.evaluate("1.5 + 2.25");
+    try std.testing.expectEqual(@as(f64, 3.75), add.asFloat());
+
+    const mixed = try ev.evaluate("1 + 2.5");
+    try std.testing.expectEqual(@as(f64, 3.5), mixed.asFloat());
+
+    const nested = try ev.evaluate("(1.5 + 2) * 2");
+    try std.testing.expectEqual(@as(f64, 7.0), nested.asFloat());
+}
+
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 
@@ -219,6 +235,12 @@ test "end-to-end: comparisons reject incompatible types" {
     try std.testing.expectError(error.TypeError, ev.evaluate("1 < true"));
     try std.testing.expectError(error.TypeError, ev.evaluate("\"a\" < 1"));
     try std.testing.expectError(error.TypeError, ev.evaluate("true < false"));
+
+    const mixed_lt = try ev.evaluate("1 < 1.5");
+    try std.testing.expect(mixed_lt.asBool());
+
+    const mixed_gt = try ev.evaluate("2 > 1.5");
+    try std.testing.expect(mixed_gt.asBool());
 }
 
 test "end-to-end: lists and attrs compare structurally" {

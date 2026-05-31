@@ -174,10 +174,10 @@ pub const Compiler = struct {
         try self.compileNode(bin.right);
 
         switch (bin.op) {
-            .add => try self.emitOp(.add_int),
-            .sub => try self.emitOp(.sub_int),
-            .mul => try self.emitOp(.mul_int),
-            .div => try self.emitOp(.div_int),
+            .add => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .add_float else .add_int),
+            .sub => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .sub_float else .sub_int),
+            .mul => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .mul_float else .mul_int),
+            .div => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .div_float else .div_int),
             .eq => try self.emitOp(.eq),
             .neq => try self.emitOp(.neq),
             .lt => try self.emitOp(.lt),
@@ -469,3 +469,17 @@ pub const Compiler = struct {
         return @intCast(self.captures.items.len - 1);
     }
 };
+
+fn nodeMayEvaluateToFloat(node: *const Node) bool {
+    return switch (node.tag) {
+        .float_val => true,
+        .parens => nodeMayEvaluateToFloat(node.data.parens),
+        .unary_op => nodeMayEvaluateToFloat(node.data.unary.expr),
+        .binary_op => switch (node.data.binary.op) {
+            .add, .sub, .mul, .div => nodeMayEvaluateToFloat(node.data.binary.left) or
+                nodeMayEvaluateToFloat(node.data.binary.right),
+            else => false,
+        },
+        else => false,
+    };
+}

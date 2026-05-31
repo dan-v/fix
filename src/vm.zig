@@ -523,13 +523,16 @@ pub const VM = struct {
         switch (va.discriminant) {
             .int => {
                 const ai = va.asInt();
-                const bi = switch (vb.discriminant) {
-                    .int => vb.asInt(),
-                    .float => @as(i64, @intFromFloat(vb.asFloat())),
-                    else => return error.TypeError,
-                };
-                if (ai < bi) return .lt;
-                if (ai > bi) return .gt;
+                if (vb.discriminant == .float) {
+                    const af: f64 = @floatFromInt(ai);
+                    const bf = vb.asFloat();
+                    if (af < bf) return .lt;
+                    if (af > bf) return .gt;
+                    return .eq;
+                }
+                if (vb.discriminant != .int) return error.TypeError;
+                if (ai < vb.asInt()) return .lt;
+                if (ai > vb.asInt()) return .gt;
                 return .eq;
             },
             .float => {
