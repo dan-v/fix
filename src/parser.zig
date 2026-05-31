@@ -729,18 +729,16 @@ pub const Parser = struct {
                 continue;
             }
 
-            const name_tok = self.current;
-            if (!self.matchLetBindingName()) {
-                self.reportError("Expected variable name in let binding.");
-                return error.ParseError;
-            }
+            const path = try self.letBindingPath(arena_allocator);
+            const first = path[0];
             _ = try self.expect(.equal, "Expected '=' after variable name.");
             const expr = try self.expression();
             _ = try self.expect(.semicolon, "Expected ';' after let binding.");
 
             try bindings.append(arena_allocator, .{
-                .name_offset = name_tok.offset,
-                .name_len = name_tok.len,
+                .name_offset = first.offset,
+                .name_len = first.len,
+                .path = path,
                 .expr = expr,
                 .inherit_outer = false,
             });
@@ -752,6 +750,34 @@ pub const Parser = struct {
         return self.arena.createNode(.let_in, .{
             .let_in = .{ .bindings = try bindings.toOwnedSlice(arena_allocator), .body = body },
         });
+    }
+
+    fn letBindingPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
+        var path: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        errdefer path.deinit(allocator);
+
+        const name_tok = self.current;
+        if (!self.matchLetBindingName()) {
+            self.reportError("Expected variable name in let binding.");
+            return error.ParseError;
+        }
+        try path.append(allocator, .{
+            .offset = name_tok.offset,
+            .len = name_tok.len,
+        });
+
+        while (self.match(.dot)) {
+            if (!self.matchAttrName()) {
+                self.reportError("Expected attribute name.");
+                return error.ParseError;
+            }
+            try path.append(allocator, .{
+                .offset = self.previous.offset,
+                .len = self.previous.len,
+            });
+        }
+
+        return path.toOwnedSlice(allocator);
     }
 
     fn inheritLetBindings(
@@ -785,6 +811,7 @@ pub const Parser = struct {
             try bindings.append(allocator, .{
                 .name_offset = name.offset,
                 .name_len = name.len,
+                .path = try self.singleAtomPath(allocator, name),
                 .expr = expr,
                 .inherit_outer = source == null,
             });
@@ -795,6 +822,13 @@ pub const Parser = struct {
             self.reportError("Expected inherited variable name.");
             return error.ParseError;
         }
+    }
+
+    fn singleAtomPath(self: *Parser, allocator: std.mem.Allocator, atom: Node.Atom) ![]Node.Atom {
+        _ = self;
+        const path = try allocator.alloc(Node.Atom, 1);
+        path[0] = atom;
+        return path;
     }
 
     // ---- infix parsers ----

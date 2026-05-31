@@ -137,6 +137,7 @@ pub const Node = struct {
     pub const Binding = struct {
         name_offset: u32,
         name_len: u32,
+        path: []Atom,
         expr: *Node,
         inherit_outer: bool = false,
     };

@@ -245,6 +245,18 @@ test "end-to-end: let binding" {
 
     const left_operand = try ev.evaluate("(let x = 2; in x) + 1");
     try std.testing.expectEqual(@as(i64, 3), left_operand.asInt());
+
+    const attr_path = try ev.evaluate("let a.b = 1; in a.b");
+    try std.testing.expectEqual(@as(i64, 1), attr_path.asInt());
+
+    const nested_attr_path = try ev.evaluate("let a.b.c = 2; in a.b.c");
+    try std.testing.expectEqual(@as(i64, 2), nested_attr_path.asInt());
+
+    const recursive_attr_path = try ev.evaluate("let a.b = a.c; a.c = 3; in a.b");
+    try std.testing.expectEqual(@as(i64, 3), recursive_attr_path.asInt());
+
+    const extended_attr_path = try ev.evaluate("let a.b = { c = 1; }; a.b.d = 2; in a.b.d");
+    try std.testing.expectEqual(@as(i64, 2), extended_attr_path.asInt());
 }
 
 test "end-to-end: duplicate let bindings are rejected" {
@@ -257,6 +269,8 @@ test "end-to-end: duplicate let bindings are rejected" {
     try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; inherit x; in x"));
     try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let inherit ({ x = 1; }) x; x = 2; in x"));
     try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let or = 1; inherit ({ or = 2; }) or; in ({ inherit or; }).or"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("let a = 1; a.b = 2; in a"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("let a.b = 1; a.b.c = 2; in a.b"));
 }
 
 test "end-to-end: undefined variables are rejected with source diagnostics" {

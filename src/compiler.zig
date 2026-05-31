@@ -595,12 +595,12 @@ pub const Compiler = struct {
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
         const let_in = node.data.let_in;
-        try self.rejectDuplicateLetBindings(let_in.bindings);
 
         self.beginScope();
 
-        for (let_in.bindings) |binding| {
-            const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
+        for (let_in.bindings, 0..) |binding, index| {
+            if (self.bindingRootSeen(let_in.bindings[0..index], binding.path[0])) continue;
+            const name = self.attrSegmentSpan(binding.path[0]);
             const name_id = try self.intern.intern(name);
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
@@ -608,14 +608,11 @@ pub const Compiler = struct {
             try self.emitOpByte(.set_local, @intCast(slot));
         }
 
-        for (let_in.bindings) |binding| {
-            const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
+        for (let_in.bindings, 0..) |binding, index| {
+            if (self.bindingRootSeen(let_in.bindings[0..index], binding.path[0])) continue;
+            const name = self.attrSegmentSpan(binding.path[0]);
             const slot = self.resolveLocal(name) orelse return error.UndefinedVariable;
-            const previous_skip = self.skip_local_slot;
-            if (binding.inherit_outer) self.skip_local_slot = slot;
-            const compile_result = self.compileThunk(binding.expr);
-            self.skip_local_slot = previous_skip;
-            try compile_result;
+            try self.compileLetRootBinding(let_in.bindings, binding.path[0], slot);
             try self.emitOpByte(.set_cell_local, @intCast(slot));
         }
 
@@ -624,18 +621,66 @@ pub const Compiler = struct {
         self.endScope();
     }
 
-    fn rejectDuplicateLetBindings(self: *Compiler, bindings: []const Node.Binding) !void {
-        for (bindings, 0..) |binding, i| {
-            const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
-            for (bindings[0..i]) |previous| {
-                const previous_name = self.source[previous.name_offset .. previous.name_offset + previous.name_len];
-                if (std.mem.eql(u8, name, previous_name)) {
+    fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16) !void {
+        var leaf: ?Node.Binding = null;
+        var tail_count: usize = 0;
+
+        for (bindings) |binding| {
+            if (!self.attrSegmentsEqual(binding.path[0], root)) continue;
+            if (binding.path.len == 1) {
+                if (leaf) |previous| {
                     try self.reportCompileError(binding.name_offset, binding.name_len, "duplicate let binding");
                     try self.reportCompileNote(previous.name_offset, previous.name_len, "first binding defined here");
                     return error.DuplicateBinding;
                 }
+                leaf = binding;
+            } else {
+                tail_count += 1;
             }
         }
+
+        if (tail_count == 0) {
+            const binding = leaf orelse return error.UndefinedVariable;
+            const previous_skip = self.skip_local_slot;
+            if (binding.inherit_outer) self.skip_local_slot = slot;
+            const compile_result = self.compileThunk(binding.expr);
+            self.skip_local_slot = previous_skip;
+            return compile_result;
+        }
+
+        const tails = try self.allocator.alloc(AttrEntryView, tail_count);
+        defer self.allocator.free(tails);
+        var i: usize = 0;
+        for (bindings) |binding| {
+            if (!self.attrSegmentsEqual(binding.path[0], root) or binding.path.len == 1) continue;
+            tails[i] = .{
+                .path = binding.path[1..],
+                .expr = binding.expr,
+                .inherit_outer = binding.inherit_outer,
+            };
+            i += 1;
+        }
+
+        if (leaf) |root_leaf| {
+            if (root_leaf.expr.tag != .attr_set) {
+                try self.reportDuplicateAttribute(tails[0].path[0], root_leaf.path[0]);
+                return error.DuplicateAttribute;
+            }
+            return self.compileExtendedAttrSetLiteralThunk(.{
+                .path = root_leaf.path,
+                .expr = root_leaf.expr,
+                .inherit_outer = root_leaf.inherit_outer,
+            }, tails);
+        }
+
+        return self.compileAttrEntriesThunk(tails, true);
+    }
+
+    fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
+        for (bindings) |binding| {
+            if (binding.path.len > 0 and self.attrSegmentsEqual(binding.path[0], root)) return true;
+        }
+        return false;
     }
 
     fn reportCompileError(self: *Compiler, offset: u32, len: u32, message: []const u8) !void {
@@ -1344,6 +1389,9 @@ fn offsetNode(node: *Node, offset: u32) void {
         .let_in => {
             for (node.data.let_in.bindings) |*binding| {
                 binding.name_offset += offset;
+                for (binding.path) |*segment| {
+                    segment.offset += offset;
+                }
                 offsetNode(binding.expr, offset);
             }
             offsetNode(node.data.let_in.body, offset);
