@@ -71,6 +71,8 @@ pub const OpCode = enum(u8) {
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     build_list,
+    /// Merge two attrsets, with right-hand keys overriding left-hand keys.
+    merge_attrs,
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.

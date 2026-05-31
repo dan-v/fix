@@ -374,6 +374,11 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.buildList(count);
                 },
+                .merge_attrs => {
+                    const right = self.pop();
+                    const left = self.pop();
+                    try self.push(try self.mergeAttrs(left, right));
+                },
                 // ---- closure ----
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
@@ -596,6 +601,11 @@ pub const VM = struct {
         const id = try self.heap.addList(self.stack.items[start..self.sp]);
         self.sp = start;
         try self.push(Value.list(id));
+    }
+
+    fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
+        if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
+        return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
     }
 
     fn concatStrings(self: *VM, a: Value, b: Value) !Value {

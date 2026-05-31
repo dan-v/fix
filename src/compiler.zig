@@ -238,7 +238,7 @@ pub const Compiler = struct {
             .gt => try self.emitOp(.gt),
             .gte => try self.emitOp(.gte),
             .and_, .or_ => unreachable,
-            .update => return error.UnsupportedBinaryOp,
+            .update => try self.emitOp(.merge_attrs),
             .impl => return error.UnsupportedBinaryOp,
             .concat => return error.UnsupportedBinaryOp,
         }

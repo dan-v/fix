@@ -197,6 +197,40 @@ pub const ObjectHeap = struct {
         return self.add(.{ .attrs = range });
     }
 
+    pub fn addMergedAttrs(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+        const left = try self.getAttrs(left_id);
+        const right = try self.getAttrs(right_id);
+
+        var merged = try std.ArrayListUnmanaged(AttrEntry).initCapacity(self.allocator, left.len + right.len);
+        defer merged.deinit(self.allocator);
+
+        var left_i: usize = 0;
+        var right_i: usize = 0;
+        while (left_i < left.len and right_i < right.len) {
+            const l = left[left_i];
+            const r = right[right_i];
+            if (l.name < r.name) {
+                merged.appendAssumeCapacity(l);
+                left_i += 1;
+            } else if (l.name > r.name) {
+                merged.appendAssumeCapacity(r);
+                right_i += 1;
+            } else {
+                merged.appendAssumeCapacity(r);
+                left_i += 1;
+                right_i += 1;
+            }
+        }
+        while (left_i < left.len) : (left_i += 1) {
+            merged.appendAssumeCapacity(left[left_i]);
+        }
+        while (right_i < right.len) : (right_i += 1) {
+            merged.appendAssumeCapacity(right[right_i]);
+        }
+
+        return self.addAttrs(merged.items);
+    }
+
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
         std.debug.assert(pairs.len % 2 == 0);
         const range = try self.reserveAttrs(pairs.len / 2);

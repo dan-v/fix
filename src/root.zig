@@ -237,6 +237,24 @@ test "end-to-end: nested attribute declarations" {
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
 }
 
+test "end-to-end: attrset update operator" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const added = try ev.evaluate("({ a = 1; } // { b = 2; }).b");
+    try std.testing.expectEqual(@as(i64, 2), added.asInt());
+
+    const overridden = try ev.evaluate("({ a = 1; b = 2; } // { b = 3; }).b");
+    try std.testing.expectEqual(@as(i64, 3), overridden.asInt());
+
+    const lazy = try ev.evaluate("({ a = 1 / 0; } // { a = 4; }).a");
+    try std.testing.expectEqual(@as(i64, 4), lazy.asInt());
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("{ a = 1; } // 1"));
+}
+
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 
