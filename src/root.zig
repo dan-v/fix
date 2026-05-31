@@ -43,6 +43,26 @@ test "end-to-end: let binding" {
     try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }
 
+test "end-to-end: let forward references" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("let a = b + 1; b = 3; in a + b");
+    try std.testing.expectEqual(@as(i64, 7), result.asInt());
+}
+
+test "end-to-end: unused let binding is not evaluated" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate("let x = 1 / 0; in 42");
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
 test "end-to-end: attribute set" {
     const alloc = std.testing.allocator;
 

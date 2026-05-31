@@ -31,6 +31,19 @@ const Capture = struct {
     parent_slot: u16,
 };
 
+const LetBindingStatus = enum {
+    uncompiled,
+    compiling,
+    compiled,
+};
+
+const LetBindingState = struct {
+    binding: Node.Binding,
+    name: []const u8,
+    slot: u16,
+    status: LetBindingStatus,
+};
+
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
     builder: *ChunkBuilder,
@@ -267,17 +280,119 @@ pub const Compiler = struct {
         const let_in = node.data.let_in;
         self.beginScope();
 
-        for (let_in.bindings) |binding| {
+        const states = try self.allocator.alloc(LetBindingState, let_in.bindings.len);
+        defer self.allocator.free(states);
+
+        for (let_in.bindings, 0..) |binding, index| {
             const name = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
             const name_id = try self.intern.intern(name);
-            try self.compileNode(binding.expr);
+            try self.emitOp(.push_null);
             const slot = self.declareLocal(name, name_id);
             try self.emitOpByte(.set_local, @intCast(slot));
+
+            states[index] = .{
+                .binding = binding,
+                .name = name,
+                .slot = slot,
+                .status = .uncompiled,
+            };
         }
 
+        try self.compileLetDependencies(states, let_in.body, &.{});
         try self.compileNode(let_in.body);
 
         self.endScope();
+    }
+
+    fn compileLetBinding(self: *Compiler, states: []LetBindingState, index: usize) anyerror!void {
+        switch (states[index].status) {
+            .compiled => return,
+            .compiling => return error.RecursiveLetBinding,
+            .uncompiled => {},
+        }
+
+        states[index].status = .compiling;
+        try self.compileLetDependencies(states, states[index].binding.expr, &.{});
+        try self.compileNode(states[index].binding.expr);
+        try self.emitOpByte(.set_local, @intCast(states[index].slot));
+        try self.emitOp(.pop);
+        states[index].status = .compiled;
+    }
+
+    fn compileLetDependencies(
+        self: *Compiler,
+        states: []LetBindingState,
+        node: *const Node,
+        shadows: []const []const u8,
+    ) anyerror!void {
+        switch (node.tag) {
+            .identifier => {
+                const name = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+                if (isShadowed(name, shadows)) return;
+                if (findLetBinding(states, name)) |index| {
+                    try self.compileLetBinding(states, index);
+                }
+            },
+            .unary_op => try self.compileLetDependencies(states, node.data.unary.expr, shadows),
+            .binary_op => {
+                try self.compileLetDependencies(states, node.data.binary.left, shadows);
+                try self.compileLetDependencies(states, node.data.binary.right, shadows);
+            },
+            .apply => {
+                try self.compileLetDependencies(states, node.data.apply.func, shadows);
+                try self.compileLetDependencies(states, node.data.apply.arg, shadows);
+            },
+            .lambda => {
+                const param = self.source[node.data.lambda.param_offset .. node.data.lambda.param_offset + node.data.lambda.param_len];
+                const nested_shadows = try appendShadow(self.allocator, shadows, param);
+                defer self.allocator.free(nested_shadows);
+                try self.compileLetDependencies(states, node.data.lambda.body, nested_shadows);
+            },
+            .let_in => {
+                const nested = node.data.let_in;
+                var nested_shadows = try self.allocator.alloc([]const u8, shadows.len + nested.bindings.len);
+                defer self.allocator.free(nested_shadows);
+                @memcpy(nested_shadows[0..shadows.len], shadows);
+                for (nested.bindings, 0..) |binding, i| {
+                    nested_shadows[shadows.len + i] = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
+                }
+                for (nested.bindings) |binding| {
+                    try self.compileLetDependencies(states, binding.expr, nested_shadows);
+                }
+                try self.compileLetDependencies(states, nested.body, nested_shadows);
+            },
+            .if_else => {
+                try self.compileLetDependencies(states, node.data.if_else.cond, shadows);
+                try self.compileLetDependencies(states, node.data.if_else.then_branch, shadows);
+                try self.compileLetDependencies(states, node.data.if_else.else_branch, shadows);
+            },
+            .assert => {
+                try self.compileLetDependencies(states, node.data.assert.cond, shadows);
+                try self.compileLetDependencies(states, node.data.assert.body, shadows);
+            },
+            .with_expr => {
+                try self.compileLetDependencies(states, node.data.with_expr.attr_set, shadows);
+                try self.compileLetDependencies(states, node.data.with_expr.body, shadows);
+            },
+            .attr_set => {
+                for (node.data.attr_set.entries) |entry| {
+                    try self.compileLetDependencies(states, entry.expr, shadows);
+                }
+            },
+            .attr_path => try self.compileLetDependencies(states, node.data.attr_path.root, shadows),
+            .list => {
+                for (node.data.list.items) |item| {
+                    try self.compileLetDependencies(states, item, shadows);
+                }
+            },
+            .parens => try self.compileLetDependencies(states, node.data.parens, shadows),
+            .concat_string => {
+                for (node.data.concat_string) |part| {
+                    try self.compileLetDependencies(states, part, shadows);
+                }
+            },
+            .integer, .float_val, .string, .path, .bool_true, .bool_false, .null => {},
+        }
     }
 
     fn compileIfElse(self: *Compiler, node: *const Node) !void {
@@ -416,3 +531,28 @@ pub const Compiler = struct {
         return @intCast(self.captures.items.len - 1);
     }
 };
+
+fn findLetBinding(states: []const LetBindingState, name: []const u8) ?usize {
+    for (states, 0..) |state, index| {
+        if (std.mem.eql(u8, state.name, name)) return index;
+    }
+    return null;
+}
+
+fn isShadowed(name: []const u8, shadows: []const []const u8) bool {
+    for (shadows) |shadow| {
+        if (std.mem.eql(u8, name, shadow)) return true;
+    }
+    return false;
+}
+
+fn appendShadow(
+    allocator: std.mem.Allocator,
+    shadows: []const []const u8,
+    shadow: []const u8,
+) ![]const []const u8 {
+    const nested = try allocator.alloc([]const u8, shadows.len + 1);
+    @memcpy(nested[0..shadows.len], shadows);
+    nested[shadows.len] = shadow;
+    return nested;
+}
