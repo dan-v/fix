@@ -107,6 +107,25 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn getAttrValue(self: *const ObjectHeap, id: ObjectId, name: InternId) !Value {
+        const entries = try self.getAttrs(id);
+        var lo: usize = 0;
+        var hi: usize = entries.len;
+
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const entry = entries[mid];
+            if (entry.name == name) return entry.value;
+            if (entry.name < name) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        return error.MissingAttribute;
+    }
+
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
         return switch (self.getConst(id).*) {
             .closure => |closure| .{
@@ -145,6 +164,7 @@ pub const ObjectHeap = struct {
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrs(entries);
+        self.sortAttrs(range);
         return self.add(.{ .attrs = range });
     }
 
@@ -161,10 +181,12 @@ pub const ObjectHeap = struct {
             });
         }
 
-        return self.add(.{ .attrs = .{
+        const range: AttrRange = .{
             .start = @intCast(start),
             .len = @intCast(pairs.len / 2),
-        } });
+        };
+        self.sortAttrs(range);
+        return self.add(.{ .attrs = range });
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
@@ -213,6 +235,16 @@ pub const ObjectHeap = struct {
         return self.attrs.items[start..end];
     }
 
+    fn attrSliceMut(self: *ObjectHeap, range: AttrRange) []AttrEntry {
+        const start: usize = range.start;
+        const end = start + range.len;
+        return self.attrs.items[start..end];
+    }
+
+    fn sortAttrs(self: *ObjectHeap, range: AttrRange) void {
+        std.mem.sort(AttrEntry, self.attrSliceMut(range), {}, attrEntryLessThan);
+    }
+
     fn ensureObjectPage(self: *ObjectHeap, id: ObjectId) !void {
         const page_index: usize = @intCast(id / OBJECTS_PER_PAGE);
         if (page_index < self.object_pages.items.len) return;
@@ -234,6 +266,10 @@ pub const ObjectHeap = struct {
         return &self.object_pages.items[page_index][slot];
     }
 };
+
+fn attrEntryLessThan(_: void, lhs: AttrEntry, rhs: AttrEntry) bool {
+    return lhs.name < rhs.name;
+}
 
 test "object heap stores list and attrs payloads behind object ids" {
     var heap = ObjectHeap.init(std.testing.allocator);
@@ -260,6 +296,27 @@ test "object heap stores list and attrs payloads behind object ids" {
     try std.testing.expectEqual(@as(InternId, 11), entries[0].name);
     try std.testing.expectEqual(@as(i64, 42), entries[0].value.asInt());
     try std.testing.expect(entries[1].value.asBool());
+    try std.testing.expectEqual(@as(i64, 42), (try heap.getAttrValue(attrs_id, 11)).asInt());
+    try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 13));
+}
+
+test "object heap sorts attrs for binary lookup" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const attrs_id = try heap.addAttrs(&.{
+        .{ .name = 30, .value = Value.int(3) },
+        .{ .name = 10, .value = Value.int(1) },
+        .{ .name = 20, .value = Value.int(2) },
+    });
+
+    const entries = try heap.getAttrs(attrs_id);
+    try std.testing.expectEqual(@as(InternId, 10), entries[0].name);
+    try std.testing.expectEqual(@as(InternId, 20), entries[1].name);
+    try std.testing.expectEqual(@as(InternId, 30), entries[2].name);
+    try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 20)).asInt());
+    try std.testing.expectEqual(@as(i64, 3), (try heap.getAttrValue(attrs_id, 30)).asInt());
 }
 
 test "object heap preserves earlier ranges as side arenas grow" {
