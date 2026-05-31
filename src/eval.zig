@@ -56,10 +56,7 @@ pub const Evaluator = struct {
         defer arena.deinit();
 
         var parser = @import("parser.zig").Parser.init(self.allocator, &arena, source);
-        const ast_node = parser.parse() catch |err| {
-            std.debug.print("Parse error: {}\n", .{err});
-            return error.ParseError;
-        };
+        const ast_node = parser.parse() catch return error.ParseError;
 
         // 2. Compile AST to bytecode.
         var builder = try ChunkBuilder.init(self.allocator);
@@ -76,7 +73,6 @@ pub const Evaluator = struct {
 
         compiler.compile(ast_node) catch |err| {
             if (err == error.DuplicateAttribute) return err;
-            std.debug.print("Compile error: {}\n", .{err});
             return error.CompileError;
         };
 

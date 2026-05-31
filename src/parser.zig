@@ -105,15 +105,9 @@ pub const Parser = struct {
     }
 
     fn reportError(self: *Parser, msg: []const u8) void {
+        _ = msg;
         if (self.had_error) return;
         self.had_error = true;
-        const tok = &self.current;
-        std.debug.print("[line {d}] parse error", .{tok.line});
-        if (tok.type != .eof) {
-            const token_span = self.source[tok.offset .. tok.offset + tok.len];
-            std.debug.print(" at '{s}'", .{token_span});
-        }
-        std.debug.print(": {s}\n", .{msg});
     }
 
     fn span(self: *const Parser, tok: Token) []const u8 {
