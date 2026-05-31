@@ -27,7 +27,6 @@ const InternTable = @import("intern.zig").InternTable;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
-const AttrEntry = heap_mod.AttrEntry;
 const Closure = heap_mod.Closure;
 
 /// A single call frame.
@@ -591,30 +590,17 @@ pub const VM = struct {
     // ---- data structure builders ----
 
     fn buildAttrs(self: *VM, count: u16) !void {
-        const entries = try self.heap.allocator.alloc(AttrEntry, count);
-        var i: u16 = 0;
-        while (i < count) : (i += 1) {
-            const val = self.pop();
-            const name_val = self.pop();
-            entries[count - 1 - i] = .{
-                .name = name_val.asInternId(),
-                .value = val,
-            };
-        }
-
-        const id = try self.heap.addAttrs(entries);
+        const value_count: u32 = @as(u32, count) * 2;
+        const start = self.sp - value_count;
+        const id = try self.heap.addAttrsFromStackPairs(self.stack.items[start..self.sp]);
+        self.sp = start;
         try self.push(Value.attrs(id));
     }
 
     fn buildList(self: *VM, count: u16) !void {
-        const items = try self.heap.allocator.alloc(Value, count);
-        var i: u16 = count;
-        while (i > 0) {
-            i -= 1;
-            items[i] = self.pop();
-        }
-
-        const id = try self.heap.addList(items);
+        const start = self.sp - count;
+        const id = try self.heap.addList(self.stack.items[start..self.sp]);
+        self.sp = start;
         try self.push(Value.list(id));
     }
 
@@ -640,14 +626,9 @@ pub const VM = struct {
     }
 
     fn makeClosure(self: *VM, chunk_id: u16, upvalue_count: u8) !void {
-        const upvalues = try self.heap.allocator.alloc(Value, upvalue_count);
-        var i: u8 = upvalue_count;
-        while (i > 0) {
-            i -= 1;
-            upvalues[i] = self.pop();
-        }
-
-        const id = try self.heap.addClosure(chunk_id, upvalues);
+        const start = self.sp - upvalue_count;
+        const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
+        self.sp = start;
         try self.push(Value.closure(id));
     }
 
