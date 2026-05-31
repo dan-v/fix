@@ -28,6 +28,7 @@ pub const NodeTag = enum(u8) {
     with_expr,
     attr_set,
     attr_path, // foo.bar.baz
+    attr_or, // foo.bar or default
     list,
     parens, // parenthesized subexpression
 };
@@ -75,6 +76,7 @@ pub const Node = struct {
         with_expr: WithExpr,
         attr_set: AttrSet,
         attr_path: AttrPath,
+        attr_or: AttrOr,
         list: List,
         parens: *Node,
     };
@@ -148,6 +150,11 @@ pub const Node = struct {
         /// Attribute names (as source offsets).
         /// e.g., `a.b.c` → [a, b, c]
         segments: []Atom,
+    };
+
+    pub const AttrOr = struct {
+        attr_path: *Node,
+        default: *Node,
     };
 
     pub const List = struct {

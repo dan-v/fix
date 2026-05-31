@@ -255,6 +255,28 @@ test "end-to-end: attrset update operator" {
     try std.testing.expectError(error.TypeError, ev.evaluate("{ a = 1; } // 1"));
 }
 
+test "end-to-end: attr path or defaults" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const present = try ev.evaluate("({ a.b = 1; }).a.b or 2");
+    try std.testing.expectEqual(@as(i64, 1), present.asInt());
+
+    const missing_leaf = try ev.evaluate("({ a = {}; }).a.b or 2");
+    try std.testing.expectEqual(@as(i64, 2), missing_leaf.asInt());
+
+    const missing_mid = try ev.evaluate("({}).a.b or 2");
+    try std.testing.expectEqual(@as(i64, 2), missing_mid.asInt());
+
+    const lazy_default = try ev.evaluate("({ a.b = 1; }).a.b or (1 / 0)");
+    try std.testing.expectEqual(@as(i64, 1), lazy_default.asInt());
+
+    try std.testing.expectError(error.DivisionByZero, ev.evaluate("({}).a.b or (1 / 0)"));
+    try std.testing.expectError(error.TypeError, ev.evaluate("1.a or 2"));
+}
+
 test "end-to-end: duplicate attributes are rejected" {
     const alloc = std.testing.allocator;
 

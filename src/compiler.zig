@@ -99,6 +99,7 @@ pub const Compiler = struct {
             .if_else => try self.compileIfElse(node),
             .attr_set => try self.compileAttrSet(node),
             .attr_path => try self.compileAttrPath(node),
+            .attr_or => try self.compileAttrOr(node),
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
             else => return error.UnsupportedNode,
@@ -603,6 +604,21 @@ pub const Compiler = struct {
         }
     }
 
+    fn compileAttrOr(self: *Compiler, node: *const Node) !void {
+        const attr_or = node.data.attr_or;
+        const apath = attr_or.attr_path.data.attr_path;
+
+        try self.compileNode(apath.root);
+        try self.compileThunk(attr_or.default);
+        try self.emitOp(.get_attr_path_or);
+        try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
+        for (apath.segments) |seg| {
+            const name_span = self.attrSegmentSpan(seg);
+            const name_id = try self.intern.intern(name_span);
+            try self.builder.writeU16(self.allocator, @intCast(name_id));
+        }
+    }
+
     fn compileList(self: *Compiler, node: *const Node) !void {
         const list = node.data.list;
         for (list.items) |item| {
@@ -761,6 +777,10 @@ fn offsetNode(node: *Node, offset: u32) void {
             for (node.data.attr_path.segments) |*segment| {
                 segment.offset += offset;
             }
+        },
+        .attr_or => {
+            offsetNode(node.data.attr_or.attr_path, offset);
+            offsetNode(node.data.attr_or.default, offset);
         },
         .list => {
             for (node.data.list.items) |item| {

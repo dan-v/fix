@@ -412,6 +412,16 @@ pub const VM = struct {
                     const result = try self.getAttrValue(attrs_val, @intCast(name_id));
                     try self.push(result);
                 },
+                .get_attr_path_or => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 2;
+                    const default_val = self.pop();
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip]);
+                    try self.push(result);
+                },
                 // ---- termination ----
                 .ret => {
                     const result = self.pop();
@@ -651,6 +661,21 @@ pub const VM = struct {
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
         if (attrs_val.discriminant != .attrs) return error.TypeError;
         return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
+    }
+
+    fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8) !Value {
+        var current = try self.forceValue(attrs_val);
+        var offset: usize = 0;
+        while (offset < encoded_names.len) : (offset += 2) {
+            if (current.discriminant != .attrs) return error.TypeError;
+            const name_id: InternId = @intCast(readU16(encoded_names, offset));
+            current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => return self.forceValue(default_val),
+                else => return err,
+            };
+            current = try self.forceValue(current);
+        }
+        return current;
     }
 };
 

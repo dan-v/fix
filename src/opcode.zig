@@ -96,6 +96,10 @@ pub const OpCode = enum(u8) {
     /// Select an attribute from attrset on stack top.
     /// Operand: 2-byte InternId of the attribute name.
     get_attr,
+    /// Select an attribute path with a lazy default if any segment is missing.
+    /// Operand: 1-byte segment count, then that many 2-byte InternIds.
+    /// Stack layout before: [attrs, default_thunk].
+    get_attr_path_or,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,

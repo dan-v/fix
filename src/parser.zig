@@ -153,6 +153,7 @@ pub const Parser = struct {
             .greater_equal => return .{ .prefix = null, .infix = binary, .prec = .cmp },
             .amp_amp => return .{ .prefix = null, .infix = binary, .prec = .and_ },
             .pipe_pipe => return .{ .prefix = null, .infix = binary, .prec = .or_ },
+            .kw_or => return .{ .prefix = null, .infix = attrOr, .prec = .or_ },
             .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
             .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
             .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
@@ -490,6 +491,17 @@ pub const Parser = struct {
                 .root = left,
                 .segments = try segments.toOwnedSlice(arena_allocator),
             },
+        });
+    }
+
+    fn attrOr(self: *Parser, left: *Node) !*Node {
+        if (left.tag != .attr_path) {
+            self.reportError("'or' default requires an attribute path.");
+            return error.ParseError;
+        }
+        const default = try self.expression();
+        return self.arena.createNode(.attr_or, .{
+            .attr_or = .{ .attr_path = left, .default = default },
         });
     }
 
