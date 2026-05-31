@@ -425,7 +425,7 @@ const DecodedIndentedEscape = struct {
     bytes_len: u8,
     source_len: usize,
 
-    fn bytes(self: DecodedIndentedEscape) []const u8 {
+    fn bytes(self: *const DecodedIndentedEscape) []const u8 {
         return self.buf[0..self.bytes_len];
     }
 };

@@ -560,9 +560,9 @@ pub const VM = struct {
             .string, .path => va.asInternId() == vb.asInternId(),
             .list => try self.listsEqual(va.asObjectId(), vb.asObjectId()),
             .attrs => try self.attrsEqual(va.asObjectId(), vb.asObjectId()),
-            .closure => false,
+            .closure => va.asObjectId() == vb.asObjectId(),
             .builtin => va.asBuiltinId() == vb.asBuiltinId(),
-            .builtin_closure => false,
+            .builtin_closure => va.asObjectId() == vb.asObjectId(),
             .thunk, .cell => unreachable,
         };
     }

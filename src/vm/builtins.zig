@@ -13,6 +13,7 @@ const numeric = @import("../runtime/numeric.zig");
 const path_ops = @import("../runtime/paths.zig");
 const nix_hash = @import("../runtime/hash.zig");
 const version = @import("../runtime/version.zig");
+const regex = @import("../runtime/regex.zig");
 
 fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
     for (needles, 0..) |needle, i| {
@@ -110,10 +111,10 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .splitVersion => builtinSplitVersion(self, args[0]),
         .parseDrvName => builtinParseDrvName(self, args[0]),
         .getEnv => builtinGetEnv(self, args[0]),
+        .match => builtinMatch(self, args[0], args[1]),
+        .split => builtinSplit(self, args[0], args[1]),
         .fromTOML,
         .toXML,
-        .match,
-        .split,
         .fetchurl,
         .fetchTarball,
         .fetchGit,
@@ -467,6 +468,68 @@ fn builtinSplitVersion(self: anytype, arg: Value) !Value {
     defer self.allocator.free(values);
     for (parts, values) |part, *value| {
         value.* = Value.string(try self.intern.intern(part));
+    }
+    return Value.list(try self.heap.addList(values));
+}
+
+fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
+    const pattern_text = try stringArg(self, regex_arg);
+    const text = try stringArg(self, text_arg);
+
+    var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
+    defer pattern.deinit();
+
+    const matched = (try pattern.matchFull(self.allocator, text)) orelse return Value.null_val;
+    defer matched.deinit(self.allocator);
+    return regexCapturesValue(self, matched.captures);
+}
+
+fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
+    const pattern_text = try stringArg(self, regex_arg);
+    const text = try stringArg(self, text_arg);
+
+    var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
+    defer pattern.deinit();
+
+    var out: std.ArrayListUnmanaged(Value) = .empty;
+    defer out.deinit(self.allocator);
+
+    var cursor: usize = 0;
+    var search_start: usize = 0;
+    while (search_start <= text.len) {
+        const found = (try pattern.find(self.allocator, text, search_start)) orelse break;
+        errdefer found.deinit(self.allocator);
+
+        try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor..found.start])));
+        try out.append(self.allocator, try regexCapturesValue(self, found.captures));
+
+        cursor = found.end;
+        search_start = found.end;
+        if (found.start == found.end) {
+            if (cursor >= text.len) {
+                found.deinit(self.allocator);
+                break;
+            }
+            try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor .. cursor + 1])));
+            cursor += 1;
+            search_start = cursor;
+        }
+        found.deinit(self.allocator);
+    }
+
+    try out.append(self.allocator, Value.string(try self.intern.intern(text[cursor..])));
+    return Value.list(try self.heap.addList(out.items));
+}
+
+fn regexCapturesValue(self: anytype, captures: []const ?[]const u8) !Value {
+    const values = try self.allocator.alloc(Value, captures.len);
+    defer self.allocator.free(values);
+
+    for (captures, values) |capture, *value| {
+        value.* = if (capture) |text|
+            Value.string(try self.intern.intern(text))
+        else
+            Value.null_val;
     }
     return Value.list(try self.heap.addList(values));
 }

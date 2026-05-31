@@ -255,17 +255,20 @@ pub const Evaluator = struct {
     }
 
     fn importResolvedPath(self: *Evaluator, path: []const u8) anyerror!Value {
-        if (self.imports.get(path)) |value| return value;
-        const progress_key = try self.beginImport(path);
+        const stable_path = try self.allocator.dupe(u8, path);
+        defer self.allocator.free(stable_path);
+
+        if (self.imports.get(stable_path)) |value| return value;
+        const progress_key = try self.beginImport(stable_path);
         defer self.endImport(progress_key);
 
-        const source = self.files.readFile(path) catch |err| switch (err) {
-            error.IsDir => return self.importDirectory(path),
+        const source = self.files.readFile(stable_path) catch |err| switch (err) {
+            error.IsDir => return self.importDirectory(stable_path),
             else => return err,
         };
-        const source_base = std.fs.path.dirname(path) orelse "/";
+        const source_base = std.fs.path.dirname(stable_path) orelse "/";
         const value = try self.evaluateSource(source, source_base);
-        try self.cacheImportValue(path, value);
+        try self.cacheImportValue(stable_path, value);
         return value;
     }
 
@@ -1240,6 +1243,20 @@ test "evaluate version parsing builtins" {
     const drv = try renderForTest("(builtins.parseDrvName \"foo-bar-1.2pre3\").version");
     defer std.testing.allocator.free(drv);
     try std.testing.expectEqualStrings("\"1.2pre3\"", drv);
+}
+
+test "evaluate regex builtins" {
+    const matched = try renderForTest("builtins.match \"(.*)e?abi.*\" \"gnueabihf\"");
+    defer std.testing.allocator.free(matched);
+    try std.testing.expectEqualStrings("[ \"gnue\" ]", matched);
+
+    const unmatched = try renderForTest("builtins.match \"[[:digit:]]+\" \"abc\"");
+    defer std.testing.allocator.free(unmatched);
+    try std.testing.expectEqualStrings("null", unmatched);
+
+    const split = try renderForTest("builtins.split \"[^[:alnum:]+._?=-]+\" \"abc///def\"");
+    defer std.testing.allocator.free(split);
+    try std.testing.expectEqualStrings("[ \"abc\" [ ] \"def\" ]", split);
 }
 
 test "evaluate control and error builtins" {

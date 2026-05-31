@@ -657,6 +657,12 @@ test "end-to-end: lists and attrs compare structurally" {
     const attrs_not_equal = try ev.evaluate("{ a = 1; } == { a = 2; }");
     try std.testing.expect(!attrs_not_equal.asBool());
 
+    const same_lambda = try ev.evaluate("let f = x: x; in { inherit f; } == { inherit f; }");
+    try std.testing.expect(same_lambda.asBool());
+
+    const distinct_lambdas = try ev.evaluate("{ f = x: x; } == { f = x: x; }");
+    try std.testing.expect(!distinct_lambdas.asBool());
+
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("[ 1 (1 / 0) ] == [ 1 2 ]"));
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("{ a = 1 / 0; } == { a = 1; }"));
 }
