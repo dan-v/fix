@@ -254,9 +254,19 @@ pub const Parser = struct {
     }
 
     fn variable(self: *Parser) !*Node {
+        const name_tok = self.previous;
+        if (self.match(.colon)) {
+            const body = try self.expression();
+            return self.arena.createNode(.lambda, .{ .lambda = .{
+                .param_offset = name_tok.offset,
+                .param_len = name_tok.len,
+                .body = body,
+            } });
+        }
+
         return self.arena.createNode(.identifier, .{ .atom = .{
-            .offset = self.previous.offset,
-            .len = self.previous.len,
+            .offset = name_tok.offset,
+            .len = name_tok.len,
         } });
     }
 
@@ -483,4 +493,21 @@ test "parser applies boolean operator precedence" {
     try std.testing.expectEqual(NodeTag.binary_op, node.data.binary.left.tag);
     try std.testing.expectEqual(ast.BinaryOp.and_, node.data.binary.left.data.binary.op);
     try std.testing.expectEqual(NodeTag.bool_true, node.data.binary.right.tag);
+}
+
+test "parser recognizes identifier lambda" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "x: x + 1");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.lambda, node.tag);
+    try std.testing.expectEqualStrings("x", parser.span(.{
+        .type = .identifier,
+        .offset = node.data.lambda.param_offset,
+        .len = node.data.lambda.param_len,
+        .line = 1,
+    }));
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda.body.tag);
 }

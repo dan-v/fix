@@ -102,5 +102,30 @@ test "end-to-end: boolean operators short-circuit" {
     try std.testing.expect(short_or.asBool());
 }
 
+test "end-to-end: single argument lambdas" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const direct = try ev.evaluate("(x: x + 1) 41");
+    try std.testing.expectEqual(@as(i64, 42), direct.asInt());
+
+    const bound = try ev.evaluate("let inc = x: x + 1; in inc 41");
+    try std.testing.expectEqual(@as(i64, 42), bound.asInt());
+
+    const shadowed = try ev.evaluate("(x: (x: x + 1) 41) 0");
+    try std.testing.expectEqual(@as(i64, 42), shadowed.asInt());
+
+    const precedence = try ev.evaluate("(x: x) 1 + 2");
+    try std.testing.expectEqual(@as(i64, 3), precedence.asInt());
+
+    const repeated_calls = try ev.evaluate("let f = x: x; in (f 1) + (f 2)");
+    try std.testing.expectEqual(@as(i64, 3), repeated_calls.asInt());
+
+    const captured = try ev.evaluate("let y = 1; in (x: x + y) 41");
+    try std.testing.expectEqual(@as(i64, 42), captured.asInt());
+}
+
 const std = @import("std");
 const ValueType = value.ValueType;

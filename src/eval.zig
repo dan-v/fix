@@ -73,6 +73,7 @@ pub const Evaluator = struct {
         var compiler = @import("compiler.zig").Compiler.init(
             self.allocator,
             &builder,
+            &self.registry,
             source,
             &self.intern,
         );

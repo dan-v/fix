@@ -36,6 +36,8 @@ pub const Frame = struct {
     frame_base: u32,
     /// Number of locals in this frame (for cleanup).
     local_count: u32,
+    /// Closure currently executing, used for captured upvalue loads.
+    closure_ptr: ?*u8,
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
@@ -92,18 +94,19 @@ pub const VM = struct {
         const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
 
         // Push initial frame.
-        try self.pushFrame(ch, 0);
+        try self.pushFrame(ch, 0, null);
         return self.run();
     }
 
     // ---- frame management ----
 
-    fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32) !void {
+    fn pushFrame(self: *VM, ch: *const Chunk, local_count: u32, closure_ptr: ?*u8) !void {
         try self.frames.append(self.allocator, .{
             .chunk_ptr = ch,
             .ip = 0,
             .frame_base = self.sp - local_count,
             .local_count = local_count,
+            .closure_ptr = closure_ptr,
         });
     }
 
@@ -181,6 +184,14 @@ pub const VM = struct {
                     frame.ip += 1;
                     const val = self.stack.items[self.sp - 1];
                     self.setStack(frame.frame_base + slot, val);
+                },
+
+                .get_upvalue => {
+                    const slot = code[frame.ip];
+                    frame.ip += 1;
+                    const closure_ptr = frame.closure_ptr orelse return error.MissingClosure;
+                    const upvalues = closureUpvalues(closure_ptr);
+                    try self.push(upvalues[slot]);
                 },
 
                 // ---- integer arithmetic ----
@@ -406,10 +417,11 @@ pub const VM = struct {
                 // ---- termination ----
                 .ret => {
                     const result = self.pop();
-                    _ = self.popFrame();
+                    const finished_frame = self.popFrame();
                     if (self.frames.items.len == 0) {
                         return result;
                     }
+                    self.sp = finished_frame.frame_base;
                     try self.push(result);
                 },
                 .halt => {
@@ -598,7 +610,7 @@ pub const VM = struct {
             const id_ptr: *ChunkId = @ptrCast(@alignCast(callee.asPtr(u8)));
             const ch = self.registry.get(id_ptr.*) orelse return error.InvalidChunk;
             try self.push(arg); // arg is first local
-            try self.pushFrame(ch, 1);
+            try self.pushFrame(ch, 1, callee.asPtr(u8));
         } else if (callee.discriminant == .builtin) {
             try self.push(arg);
             try self.push(callee);
@@ -616,8 +628,10 @@ pub const VM = struct {
             var frame = self.currentFrame();
             frame.chunk_ptr = ch;
             frame.ip = 0;
+            frame.closure_ptr = callee.asPtr(u8);
             self.sp = frame.frame_base;
             try self.push(arg);
+            frame.local_count = 1;
         } else {
             try self.push(callee);
             try self.push(arg);
@@ -660,4 +674,9 @@ fn getAttrValue(attrs_val: Value, name_id: InternId) !Value {
 
 fn getAttrOrValue(attrs_val: Value, name_id: InternId, default_val: Value) Value {
     return getAttrValue(attrs_val, name_id) catch default_val;
+}
+
+fn closureUpvalues(ptr: *u8) [*]Value {
+    const upvalues_offset = std.mem.alignForward(usize, @sizeOf(ChunkId), @alignOf(Value));
+    return @ptrCast(@alignCast(@as([*]u8, @ptrCast(ptr)) + upvalues_offset));
 }

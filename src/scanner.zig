@@ -44,6 +44,7 @@ pub const Scanner = struct {
             '[' => return self.makeToken(.left_bracket, start, 1),
             ']' => return self.makeToken(.right_bracket, start, 1),
             ',' => return self.makeToken(.comma, start, 1),
+            ':' => return self.makeToken(.colon, start, 1),
             '.' => return self.makeToken(.dot, start, 1),
             ';' => return self.makeToken(.semicolon, start, 1),
             '?' => return self.makeToken(.question_mark, start, 1),
@@ -231,5 +232,14 @@ test "scanner recognizes boolean operator tokens" {
     try std.testing.expectEqual(TokenType.kw_false, scanner.next().type);
     try std.testing.expectEqual(TokenType.pipe_pipe, scanner.next().type);
     try std.testing.expectEqual(TokenType.kw_true, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes lambda colon" {
+    var scanner = Scanner.init("x: x");
+
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.colon, scanner.next().type);
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }

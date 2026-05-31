@@ -12,6 +12,7 @@ const BinaryOp = ast.BinaryOp;
 const OpCode = @import("opcode.zig").OpCode;
 const chunk = @import("chunk.zig");
 const ChunkBuilder = chunk.ChunkBuilder;
+const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("types.zig");
 
 const InternId = types.InternId;
@@ -25,33 +26,46 @@ const Local = struct {
     slot: u16,
 };
 
+const Capture = struct {
+    name: []const u8,
+    parent_slot: u16,
+};
+
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
     builder: *ChunkBuilder,
+    registry: *ChunkRegistry,
     source: []const u8,
     intern: *@import("intern.zig").InternTable,
     locals: std.ArrayListUnmanaged(Local),
+    captures: std.ArrayListUnmanaged(Capture),
+    parent: ?*Compiler,
     scope_depth: u8,
     slot_count: u16,
 
     pub fn init(
         allocator: std.mem.Allocator,
         builder: *ChunkBuilder,
+        registry: *ChunkRegistry,
         source: []const u8,
         intern: *@import("intern.zig").InternTable,
     ) Compiler {
         return .{
             .allocator = allocator,
             .builder = builder,
+            .registry = registry,
             .source = source,
             .intern = intern,
             .locals = .empty,
+            .captures = .empty,
+            .parent = null,
             .scope_depth = 0,
             .slot_count = 0,
         };
     }
 
     pub fn deinit(self: *Compiler) void {
+        self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
     }
 
@@ -72,6 +86,7 @@ pub const Compiler = struct {
             .binary_op => try self.compileBinary(node),
             .unary_op => try self.compileUnary(node),
             .apply => try self.compileApply(node),
+            .lambda => try self.compileLambda(node),
             .let_in => try self.compileLetIn(node),
             .if_else => try self.compileIfElse(node),
             .attr_set => try self.compileAttrSet(node),
@@ -135,6 +150,8 @@ pub const Compiler = struct {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
         if (self.resolveLocal(span)) |slot| {
             try self.emitOpByte(.get_local, @intCast(slot));
+        } else if (try self.resolveCapture(span)) |slot| {
+            try self.emitOpByte(.get_upvalue, slot);
         } else {
             return error.UndefinedVariable;
         }
@@ -212,6 +229,38 @@ pub const Compiler = struct {
         try self.compileNode(ap.func);
         try self.compileNode(ap.arg);
         try self.emitOp(.call);
+    }
+
+    fn compileLambda(self: *Compiler, node: *const Node) !void {
+        const lambda = node.data.lambda;
+        const param_name = self.source[lambda.param_offset .. lambda.param_offset + lambda.param_len];
+
+        var child_builder = try ChunkBuilder.init(self.allocator);
+        defer child_builder.deinit(self.allocator);
+
+        var child = Compiler.init(
+            self.allocator,
+            &child_builder,
+            self.registry,
+            self.source,
+            self.intern,
+        );
+        child.parent = self;
+        defer child.deinit();
+
+        const param_id = try self.intern.intern(param_name);
+        _ = child.declareLocal(param_name, param_id);
+        try child.compileNode(lambda.body);
+        try child.emitOp(.ret);
+        try child.emitOp(.halt);
+
+        const child_chunk = try child_builder.finish(self.allocator);
+        const child_id = try self.registry.register(child_chunk);
+        for (child.captures.items) |capture| {
+            try self.emitOpByte(.get_local, @intCast(capture.parent_slot));
+        }
+        try self.emitOpU16(.closure, @intCast(child_id));
+        try self.builder.writeByte(self.allocator, @intCast(child.captures.items.len));
     }
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
@@ -348,5 +397,22 @@ pub const Compiler = struct {
             }
         }
         return null;
+    }
+
+    fn resolveCapture(self: *Compiler, name: []const u8) !?u8 {
+        const parent = self.parent orelse return null;
+        const parent_slot = parent.resolveLocal(name) orelse return null;
+
+        for (self.captures.items, 0..) |capture, index| {
+            if (capture.parent_slot == parent_slot and std.mem.eql(u8, capture.name, name)) {
+                return @intCast(index);
+            }
+        }
+
+        try self.captures.append(self.allocator, .{
+            .name = name,
+            .parent_slot = parent_slot,
+        });
+        return @intCast(self.captures.items.len - 1);
     }
 };

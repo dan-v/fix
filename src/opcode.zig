@@ -25,6 +25,8 @@ pub const OpCode = enum(u8) {
     get_local,
     /// Set local variable at offset, popping from stack.
     set_local,
+    /// Push captured upvalue at offset (operand: 1-byte closure upvalue index).
+    get_upvalue,
 
     // ---- arithmetic ----
     add_int,
