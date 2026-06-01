@@ -54,6 +54,10 @@ pub fn buildValue(
             .name = try intern.intern("outputs"),
             .value = Value.list(try outputNamesList(allocator, heap, spec.outputs)),
         },
+        .{
+            .name = try intern.intern("drvAttrs"),
+            .value = Value.attrs(try heap.addAttrs(spec.original_attrs)),
+        },
     });
 
     const default = outputByName(spec.outputs, spec.default_output) orelse return error.InvalidDerivationOutput;
@@ -118,7 +122,7 @@ pub fn stablePlaceholderHash(name: []const u8, output: []const u8) [16]u8 {
 }
 
 pub fn isSyntheticName(intern: *InternTable, name: []const u8, outputs: []const Output) bool {
-    const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "outputs", "all" };
+    const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "drvAttrs", "outputs", "all" };
     for (synthetic) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
     }

@@ -90,6 +90,11 @@ builtins.splitVersion "1.0-beta2"
 (builtins.tryEval (builtins.throw "x")).success
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type
+(builtins.derivation { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; }).dev.outputName
+(builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; env = { A = 1; B = [ "x" ]; }; passAsFile = [ "foo" ]; foo = "bar"; }).drvAttrs.env.B
+builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }))
+builtins.attrNames builtins.builtins
+rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
 builtins.sort (a: b: a < b) [ 2 1 ]
 (builtins.partition (x: x < 2) [ 1 2 ]).right

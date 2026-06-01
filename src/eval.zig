@@ -1733,6 +1733,10 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(all_len);
     try std.testing.expectEqualStrings("2", all_len);
 
+    const drv_attrs = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ 1 true null ]; __structuredAttrs = true; env = { A = 1; }; }).drvAttrs.env.A");
+    defer std.testing.allocator.free(drv_attrs);
+    try std.testing.expectEqualStrings("1", drv_attrs);
+
     const preserved_int = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; version = 1; }).version");
     defer std.testing.allocator.free(preserved_int);
     try std.testing.expectEqualStrings("1", preserved_int);
