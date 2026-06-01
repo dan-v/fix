@@ -1753,6 +1753,28 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(implicit_outputs);
     try std.testing.expectEqualStrings("false", implicit_outputs);
 
+    const derivation_laziness = try renderForTest(
+        \\builtins.toJSON {
+        \\  lazy = (builtins.tryEval (builtins.derivation {
+        \\    name = builtins.throw "x";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\  })).success;
+        \\  lazyOutPath = (builtins.tryEval (builtins.derivation {
+        \\    name = builtins.throw "x";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\  }).outPath).success;
+        \\  strict = (builtins.tryEval (builtins.derivationStrict {
+        \\    name = builtins.throw "x";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\  })).success;
+        \\}
+    );
+    defer std.testing.allocator.free(derivation_laziness);
+    try std.testing.expectEqualStrings("\"{\\\"lazy\\\":true,\\\"lazyOutPath\\\":false,\\\"strict\\\":false}\"", derivation_laziness);
+
     const all_len = try renderForTest("builtins.length (builtins.derivation { name = \"pkg\"; outputs = [ \"out\" \"dev\" ]; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).all");
     defer std.testing.allocator.free(all_len);
     try std.testing.expectEqualStrings("2", all_len);

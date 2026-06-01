@@ -147,6 +147,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .toPath => builtinToPath(self, args[0]),
         .toFile => builtinToFile(self, args[0], args[1]),
         .placeholder => builtinPlaceholder(self, args[0]),
+        .derivationLazyAttr => builtinDerivationLazyAttr(self, args[0], args[1]),
     };
 }
 
@@ -2094,12 +2095,103 @@ fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value {
     const attrs = try self.forceValue(arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
+    if (mode == .lazy) return buildLazyDerivationValue(self, attrs.asObjectId());
+    return buildForcedDerivationValue(self, attrs.asObjectId(), .strict);
+}
+
+fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Value) !Value {
+    const attrs = try self.forceValue(attrs_arg);
+    const name = try self.forceValue(name_arg);
+    if (attrs.discriminant != .attrs or !isPlainString(name)) return error.TypeError;
+
+    const value = try buildForcedDerivationValue(self, attrs.asObjectId(), .lazy);
+    return self.heap.getAttrValue(value.asObjectId(), try stringTextInternId(self, name));
+}
+
+fn buildLazyDerivationValue(self: anytype, attrs_id: ObjectId) !Value {
+    const output_names = try derivationOutputNames(self, attrs_id);
+    defer self.allocator.free(output_names.names);
+
+    const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
+    defer self.allocator.free(outputs);
+    for (output_names.names, outputs) |output_name, *output| {
+        output.* = .{ .name = output_name, .out_path = output_name };
+    }
+
+    const original_attrs = try self.heap.getAttrs(attrs_id);
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+
+    for (original_attrs) |entry| {
+        if (derivation.isSyntheticName(self.intern, self.intern.get(entry.name), outputs)) continue;
+        try entries.append(self.allocator, entry);
+    }
+
+    try entries.append(self.allocator, .{
+        .name = try self.intern.intern("type"),
+        .value = Value.string(try self.intern.intern("derivation")),
+    });
+    try entries.append(self.allocator, .{
+        .name = try self.intern.intern("outputName"),
+        .value = Value.string(output_names.names[0]),
+    });
+    if (output_names.explicit) {
+        try entries.append(self.allocator, .{
+            .name = try self.intern.intern("outputs"),
+            .value = Value.list(try lazyOutputNamesList(self, output_names.names)),
+        });
+    }
+    try entries.append(self.allocator, .{
+        .name = try self.intern.intern("drvAttrs"),
+        .value = Value.attrs(try self.heap.addAttrs(original_attrs)),
+    });
+
+    try appendLazyDerivationAttr(self, &entries, attrs_id, "drvPath");
+    try appendLazyDerivationAttr(self, &entries, attrs_id, "outPath");
+    for (output_names.names) |output_name| {
+        try appendLazyDerivationAttrId(self, &entries, attrs_id, output_name);
+    }
+    try appendLazyDerivationAttr(self, &entries, attrs_id, "all");
+
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+fn lazyOutputNamesList(self: anytype, names: []const InternId) !ObjectId {
+    const values = try self.allocator.alloc(Value, names.len);
+    defer self.allocator.free(values);
+    for (names, values) |name, *value| value.* = Value.string(name);
+    return self.heap.addList(values);
+}
+
+fn appendLazyDerivationAttr(
+    self: anytype,
+    entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    attrs_id: ObjectId,
+    name: []const u8,
+) !void {
+    try appendLazyDerivationAttrId(self, entries, attrs_id, try self.intern.intern(name));
+}
+
+fn appendLazyDerivationAttrId(
+    self: anytype,
+    entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry),
+    attrs_id: ObjectId,
+    name: InternId,
+) !void {
+    const args = [_]Value{ Value.attrs(attrs_id), Value.string(name) };
+    try entries.append(self.allocator, .{
+        .name = name,
+        .value = try makeBuiltinThunk(self, .derivationLazyAttr, &args),
+    });
+}
+
+fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     const name_id = try self.intern.intern("name");
-    const name_value = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
+    const name_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
     const drv_name_id = try stringTextInternId(self, name_value);
 
-    const output_names = try derivationOutputNames(self, attrs.asObjectId());
+    const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
 
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
@@ -2116,7 +2208,7 @@ fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value {
         .default_output = output_names.names[0],
         .outputs = outputs,
         .explicit_outputs = output_names.explicit,
-        .original_attrs = try self.heap.getAttrs(attrs.asObjectId()),
+        .original_attrs = try self.heap.getAttrs(attrs_id),
     };
     return switch (mode) {
         .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),

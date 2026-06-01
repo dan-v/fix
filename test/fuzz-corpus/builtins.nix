@@ -99,6 +99,8 @@ builtins.attrNames (builtins.derivation { name = "pkg"; outputs = [ "out" "dev" 
 builtins.attrNames (builtins.derivationStrict { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; })
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; env = { A = 1; B = [ "x" ]; }; passAsFile = [ "foo" ]; foo = "bar"; }).drvAttrs.env.B
 builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }))
+(builtins.tryEval (builtins.derivation { name = builtins.throw "x"; system = "x86_64-linux"; builder = "/bin/sh"; })).success
+(builtins.tryEval (builtins.derivation { name = builtins.throw "x"; system = "x86_64-linux"; builder = "/bin/sh"; }).outPath).success
 builtins.attrNames builtins.builtins
 rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
