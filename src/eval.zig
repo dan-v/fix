@@ -1612,6 +1612,17 @@ test "evaluate TOML builtin" {
     );
     defer std.testing.allocator.free(parsed);
     try std.testing.expectEqualStrings("\"[\\\"demo\\\",true,16,1.5,[\\\"a\\\",\\\"b\\\"],\\\"pkg\\\",\\\"MIT\\\"]\"", parsed);
+
+    const array_table = try renderForTest(
+        \\let value = builtins.fromTOML ''
+        \\  [[products]]
+        \\  name = "hammer"
+        \\  [[products]]
+        \\  name = "nail"
+        \\''; in builtins.toJSON (builtins.map (p: p.name) value.products)
+    );
+    defer std.testing.allocator.free(array_table);
+    try std.testing.expectEqualStrings("\"[\\\"hammer\\\",\\\"nail\\\"]\"", array_table);
 }
 
 test "evaluate version parsing builtins" {

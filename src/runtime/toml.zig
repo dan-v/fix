@@ -62,10 +62,16 @@ const Parser = struct {
             if (self.eof()) return;
             if (self.peek() == '[') {
                 _ = self.advance();
-                if (self.peek() == '[') return error.UnsupportedToml;
-                const path = try self.parseKeyPath(']');
-                self.expectChar(']') catch return error.InvalidToml;
-                self.current = try self.ensureTablePath(self.root, path);
+                if (self.consume('[')) {
+                    const path = try self.parseKeyPath(']');
+                    self.expectChar(']') catch return error.InvalidToml;
+                    self.expectChar(']') catch return error.InvalidToml;
+                    self.current = try self.appendArrayTablePath(self.root, path);
+                } else {
+                    const path = try self.parseKeyPath(']');
+                    self.expectChar(']') catch return error.InvalidToml;
+                    self.current = try self.ensureTablePath(self.root, path);
+                }
             } else {
                 const path = try self.parseKeyPath('=');
                 self.expectChar('=') catch return error.InvalidToml;
@@ -223,6 +229,50 @@ const Parser = struct {
             }
         }
         return table;
+    }
+
+    fn appendArrayTablePath(self: *Parser, base: *Table, path: []const []const u8) !*Table {
+        if (path.len == 0) return error.InvalidToml;
+        var table = base;
+        for (path[0 .. path.len - 1]) |key| {
+            table = try self.descendArrayAwareTable(table, key);
+        }
+
+        const child = try newTable(self.allocator);
+        const key = path[path.len - 1];
+        if (table.find(key)) |entry| {
+            if (entry.value != .array) return error.DuplicateAttribute;
+            entry.value.array = try self.appendValue(entry.value.array, .{ .table = child });
+        } else {
+            const values = try self.allocator.alloc(Value, 1);
+            values[0] = .{ .table = child };
+            try table.entries.append(self.allocator, .{ .key = key, .value = .{ .array = values } });
+        }
+        return child;
+    }
+
+    fn descendArrayAwareTable(self: *Parser, table: *Table, key: []const u8) !*Table {
+        if (table.find(key)) |entry| {
+            switch (entry.value) {
+                .table => |child| return child,
+                .array => |items| {
+                    if (items.len == 0 or items[items.len - 1] != .table) return error.InvalidToml;
+                    return items[items.len - 1].table;
+                },
+                else => return error.DuplicateAttribute,
+            }
+        }
+
+        const child = try newTable(self.allocator);
+        try table.entries.append(self.allocator, .{ .key = key, .value = .{ .table = child } });
+        return child;
+    }
+
+    fn appendValue(self: *Parser, values: []const Value, value: Value) ![]const Value {
+        const out = try self.allocator.alloc(Value, values.len + 1);
+        @memcpy(out[0..values.len], values);
+        out[values.len] = value;
+        return out;
     }
 
     fn putPath(self: *Parser, base: *Table, path: []const []const u8, value: Value) !void {
