@@ -17,6 +17,7 @@ const types = @import("types.zig");
 const diagnostic = @import("diagnostic.zig");
 const builtins = @import("builtins.zig");
 const string_syntax = @import("string_syntax.zig");
+const heap_mod = @import("heap.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const Value = @import("value.zig").Value;
 
@@ -59,6 +60,8 @@ pub const Compiler = struct {
     source: []const u8,
     intern: *@import("intern.zig").InternTable,
     base_path: ?[]const u8,
+    source_path: ?[]const u8,
+    source_file_id: ?InternId,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
@@ -82,6 +85,8 @@ pub const Compiler = struct {
             .source = source,
             .intern = intern,
             .base_path = null,
+            .source_path = null,
+            .source_file_id = null,
             .locals = .empty,
             .captures = .empty,
             .with_scopes = .empty,
@@ -164,6 +169,22 @@ pub const Compiler = struct {
     fn emitOpU16(self: *Compiler, op: OpCode, val: u16) !void {
         try self.emitOp(op);
         try self.builder.writeU16(self.allocator, val);
+    }
+
+    fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+        if (positions.len == 0) {
+            try self.emitOpU16(.build_attrs, count);
+            return;
+        }
+
+        try self.emitOpU16(.build_attrs_with_pos, count);
+        try self.builder.writeU16(self.allocator, @intCast(positions.len));
+        for (positions) |position| {
+            try self.builder.writeU32(self.allocator, position.name);
+            try self.builder.writeU32(self.allocator, position.pos.file);
+            try self.builder.writeU32(self.allocator, position.pos.line);
+            try self.builder.writeU32(self.allocator, position.pos.column);
+        }
     }
 
     fn emitOpByte(self: *Compiler, op: OpCode, val: u8) !void {
@@ -498,6 +519,8 @@ pub const Compiler = struct {
         );
         child.parent = self;
         child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
         defer child.deinit();
 
         const param_id = try self.intern.intern(param_name);
@@ -530,6 +553,8 @@ pub const Compiler = struct {
         );
         child.parent = self;
         child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
         defer child.deinit();
 
         const arg_slot = try child.declareLocal("\x00args", try self.intern.intern("\x00args"));
@@ -608,6 +633,8 @@ pub const Compiler = struct {
         );
         child.parent = self;
         child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
         defer child.deinit();
 
         _ = try child.addCapture("\x00args", .local, arg_slot);
@@ -754,6 +781,8 @@ pub const Compiler = struct {
         );
         child.parent = self;
         child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
         defer child.deinit();
 
         child.compileNode(expr) catch |err| {
@@ -954,6 +983,8 @@ pub const Compiler = struct {
 
     fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
         var count: u16 = 0;
+        var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+        defer positions.deinit(self.allocator);
 
         for (entries, 0..) |entry, index| {
             if (entry.path.len == 0) return error.InvalidAttributePath;
@@ -970,6 +1001,7 @@ pub const Compiler = struct {
                 defer self.allocator.free(tails);
                 try self.emitAttrName(entry.path[0]);
                 try self.compileAttrEntriesThunk(tails, false);
+                try self.appendAttrPosition(&positions, entry.path[0]);
                 count += 1;
                 continue;
             }
@@ -983,15 +1015,17 @@ pub const Compiler = struct {
                 defer self.allocator.free(tails);
                 try self.emitAttrName(entry.path[0]);
                 try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
+                try self.appendAttrPosition(&positions, entry.path[0]);
                 count += 1;
                 continue;
             }
             try self.emitAttrName(entry.path[0]);
             try self.compileThunk(leaf.?.expr);
+            try self.appendAttrPosition(&positions, entry.path[0]);
             count += 1;
         }
 
-        try self.emitOpU16(.build_attrs, count);
+        try self.emitBuildAttrs(count, positions.items);
     }
 
     fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
@@ -1056,6 +1090,9 @@ pub const Compiler = struct {
 
     fn emitRecursiveAttrObject(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
         var count: u16 = 0;
+        var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+        defer positions.deinit(self.allocator);
+
         for (entries, 0..) |entry, index| {
             if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
             try self.emitAttrName(entry.path[0]);
@@ -1063,10 +1100,11 @@ pub const Compiler = struct {
             const name_span = self.attrSegmentSpan(entry.path[0]);
             const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
             try self.emitOpByte(.capture_local, @intCast(slot));
+            try self.appendAttrPosition(&positions, entry.path[0]);
             count += 1;
         }
 
-        try self.emitOpU16(.build_attrs, count);
+        try self.emitBuildAttrs(count, positions.items);
     }
 
     fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {
@@ -1096,6 +1134,8 @@ pub const Compiler = struct {
         );
         child.parent = self;
         child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
         defer child.deinit();
 
         child.compileAttrEntries(entries, recursive) catch |err| {
@@ -1212,6 +1252,30 @@ pub const Compiler = struct {
         const name_id = try self.intern.intern(name_span);
         const name_val = @import("value.zig").Value.string(name_id);
         try self.builder.emitConstant(self.allocator, name_val);
+    }
+
+    fn appendAttrPosition(
+        self: *Compiler,
+        positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
+        atom: Node.Atom,
+    ) !void {
+        _ = self.source_path orelse return;
+        try positions.append(self.allocator, .{
+            .name = try self.intern.intern(self.attrSegmentSpan(atom)),
+            .pos = .{
+                .file = try self.sourceFileId(),
+                .line = diagnostic.lineForOffset(self.source, atom.offset),
+                .column = diagnostic.columnForOffset(self.source, atom.offset),
+            },
+        });
+    }
+
+    fn sourceFileId(self: *Compiler) !InternId {
+        if (self.source_file_id) |id| return id;
+        const path = self.source_path orelse return error.MissingSourcePath;
+        const id = try self.intern.intern(path);
+        self.source_file_id = id;
+        return id;
     }
 
     fn compileAttrPath(self: *Compiler, node: *const Node) !void {

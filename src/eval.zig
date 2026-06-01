@@ -160,10 +160,16 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         self.clearDiagnostics();
-        return self.evaluateSource(source, self.base_path, null);
+        return self.evaluateSource(source, self.base_path, null, null);
     }
 
-    fn evaluateSource(self: *Evaluator, source: []const u8, base_path: ?[]const u8, scope: ?Value) !Value {
+    fn evaluateSource(
+        self: *Evaluator,
+        source: []const u8,
+        base_path: ?[]const u8,
+        source_path: ?[]const u8,
+        scope: ?Value,
+    ) !Value {
         // 1. Parse into AST.
         var arena = @import("ast.zig").AstArena.init(self.allocator);
         defer arena.deinit();
@@ -187,6 +193,7 @@ pub const Evaluator = struct {
             &self.intern,
         );
         compiler.base_path = base_path;
+        compiler.source_path = source_path;
         defer compiler.deinit();
 
         compiler.compileWithScope(ast_node, scope) catch |err| {
@@ -286,7 +293,7 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base, null);
+        const value = try self.evaluateSource(source, source_base, stable_path, null);
         try self.cacheImportValue(stable_path, value);
         return value;
     }
@@ -312,7 +319,7 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        return self.evaluateSource(source, source_base, scope);
+        return self.evaluateSource(source, source_base, stable_path, scope);
     }
 
     fn corepkgsSource(path: []const u8) ?[]const u8 {
@@ -607,6 +614,20 @@ const ValuePrinter = struct {
 fn renderForTest(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
+
+    const result = try ev.evaluate(source);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
+fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    try ev.setBasePathFromCurrentPath(std.testing.io);
 
     const result = try ev.evaluate(source);
 
@@ -1890,6 +1911,19 @@ test "evaluate function metadata builtins" {
     const pos = try renderForTest("builtins.unsafeGetAttrPos \"a\" { a = 1; }");
     defer std.testing.allocator.free(pos);
     try std.testing.expectEqualStrings("null", pos);
+
+    const imported_pos = try renderForTestFromCurrentPath("builtins.toJSON (builtins.unsafeGetAttrPos \"value\" (import ./test/fuzz-corpus/imported.nix))");
+    defer std.testing.allocator.free(imported_pos);
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const expected_imported_pos = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"{{\\\"column\\\":3,\\\"file\\\":\\\"{s}/test/fuzz-corpus/imported.nix\\\",\\\"line\\\":1}}\"",
+        .{cwd},
+    );
+    defer std.testing.allocator.free(expected_imported_pos);
+    try std.testing.expectEqualStrings(expected_imported_pos, imported_pos);
 }
 
 test "evaluate foldl' builtin" {

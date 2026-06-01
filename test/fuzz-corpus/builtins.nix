@@ -115,6 +115,7 @@ builtins.catAttrs "a" [ { a = 1; } { b = 2; } { a = 3; } ]
 (builtins.zipAttrsWith (name: values: if name == "a" then 1 else builtins.throw "bad") [ { a = 1; b = 2; } ]).a
 (builtins.functionArgs ({ a ? 1 }: a)).a
 builtins.unsafeGetAttrPos "a" { a = 1; }
+builtins.unsafeGetAttrPos "value" (import ./test/fuzz-corpus/imported.nix)
 builtins.foldl' (a: b: a + b) 0 [ 1 2 3 ]
 builtins.foldl' (a: b: a) 1 [ (1 / 0) ]
 builtins.foldl' (a: b: b) 0 [ 1 2 ]

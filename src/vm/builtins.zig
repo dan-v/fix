@@ -2610,11 +2610,29 @@ fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value) !Va
     const name = try self.forceValue(name_arg);
     const attrs = try self.forceValue(attrs_arg);
     if (!isPlainString(name) or attrs.discriminant != .attrs) return error.TypeError;
-    _ = self.heap.getAttrValue(attrs.asObjectId(), try stringTextInternId(self, name)) catch |err| switch (err) {
+    const object_id = attrs.asObjectId();
+    const name_id = try stringTextInternId(self, name);
+    _ = self.heap.getAttrValue(object_id, name_id) catch |err| switch (err) {
         error.MissingAttribute => return Value.null_val,
         else => return err,
     };
-    return Value.null_val;
+
+    const pos = self.heap.getAttrPos(object_id, name_id) orelse return Value.null_val;
+    const entries = [_]heap_mod.AttrEntry{
+        .{
+            .name = try self.intern.intern("column"),
+            .value = Value.int(@intCast(pos.column)),
+        },
+        .{
+            .name = try self.intern.intern("file"),
+            .value = Value.string(pos.file),
+        },
+        .{
+            .name = try self.intern.intern("line"),
+            .value = Value.int(@intCast(pos.line)),
+        },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
 fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {

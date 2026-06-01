@@ -70,6 +70,10 @@ pub const OpCode = enum(u8) {
     /// Operand: 2-byte count of entries.
     /// Stack layout from lower to higher indexes: [name1, val1, ..., nameN, valN].
     build_attrs,
+    /// Build an attribute set from pairs on the stack and attach source positions.
+    /// Operand: 2-byte count, 2-byte source-position count, then repeated
+    /// 4-byte name InternId, 4-byte file InternId, 4-byte line, 4-byte column.
+    build_attrs_with_pos,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     build_list,

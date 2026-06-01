@@ -391,6 +391,32 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.buildAttrs(count);
                 },
+                .build_attrs_with_pos => {
+                    const count: u16 = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const pos_count: u16 = readU16(code, frame.ip);
+                    frame.ip += 2;
+
+                    var stack_positions: [32]heap_mod.AttrPosEntry = undefined;
+                    const positions = if (pos_count <= stack_positions.len)
+                        stack_positions[0..pos_count]
+                    else
+                        try self.allocator.alloc(heap_mod.AttrPosEntry, pos_count);
+                    defer if (positions.ptr != stack_positions[0..].ptr) self.allocator.free(positions);
+
+                    for (positions) |*position| {
+                        position.* = .{
+                            .name = readU32(code, frame.ip),
+                            .pos = .{
+                                .file = readU32(code, frame.ip + 4),
+                                .line = readU32(code, frame.ip + 8),
+                                .column = readU32(code, frame.ip + 12),
+                            },
+                        };
+                        frame.ip += 16;
+                    }
+                    try self.buildAttrsWithPositions(count, positions);
+                },
                 .build_list => {
                     const count: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
@@ -800,6 +826,14 @@ pub const VM = struct {
         const value_count: u32 = @as(u32, count) * 2;
         const start = self.sp - value_count;
         const id = try self.heap.addAttrsFromStackPairs(self.stack.items[start..self.sp]);
+        self.sp = start;
+        try self.push(Value.attrs(id));
+    }
+
+    fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+        const value_count: u32 = @as(u32, count) * 2;
+        const start = self.sp - value_count;
+        const id = try self.heap.addAttrsFromStackPairsWithPositions(self.stack.items[start..self.sp], positions);
         self.sp = start;
         try self.push(Value.attrs(id));
     }
