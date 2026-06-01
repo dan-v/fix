@@ -1587,6 +1587,14 @@ test "evaluate JSON builtins" {
     const parsed_float_type = try renderForTest("builtins.typeOf (builtins.fromJSON \"1.5\")");
     defer std.testing.allocator.free(parsed_float_type);
     try std.testing.expectEqualStrings("\"float\"", parsed_float_type);
+
+    const out_path_json = try renderForTest("builtins.toJSON { outPath = \"/nix/store/example\"; a = 1; }");
+    defer std.testing.allocator.free(out_path_json);
+    try std.testing.expectEqualStrings("\"\\\"/nix/store/example\\\"\"", out_path_json);
+
+    const to_string_json = try renderForTest("builtins.toJSON { __toString = self: self.name; name = \"pkg\"; }");
+    defer std.testing.allocator.free(to_string_json);
+    try std.testing.expectEqualStrings("\"\\\"pkg\\\"\"", to_string_json);
 }
 
 test "evaluate XML builtin" {

@@ -83,6 +83,8 @@ builtins.substring 1 2 "abcd"
 builtins.replaceStrings [ "a" "d" ] [ "A" "D" ] "abcd"
 builtins.hashString "sha256" "abc"
 builtins.toJSON { b = [ 2 false ]; a = "x"; }
+builtins.toJSON { outPath = "/nix/store/example"; a = 1; }
+builtins.toJSON { __toString = self: self.name; name = "pkg"; }
 (builtins.fromJSON "{\"b\":2,\"a\":[1,true,null]}").a
 builtins.compareVersions "1.0pre" "1.0"
 builtins.splitVersion "1.0-beta2"

@@ -373,9 +373,35 @@ fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value, seen: *st
         .float => try writer.print("{d}", .{forced.asFloat()}),
         .string, .path, .string_context => try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, forced)), .{}, writer),
         .list => try writeJsonList(self, writer, forced.asObjectId(), seen),
-        .attrs => try writeJsonAttrs(self, writer, forced.asObjectId(), seen),
+        .attrs => {
+            if (try jsonAttrsStringValue(self, forced)) |string_value| {
+                try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, string_value)), .{}, writer);
+            } else {
+                try writeJsonAttrs(self, writer, forced.asObjectId(), seen);
+            }
+        },
         .closure, .builtin, .builtin_closure => return error.TypeError,
         .thunk, .cell => unreachable,
+    }
+}
+
+fn jsonAttrsStringValue(self: anytype, attrs: Value) !?Value {
+    const attrs_id = attrs.asObjectId();
+
+    const to_string_id = try self.intern.intern("__toString");
+    if (self.heap.getAttrValue(attrs_id, to_string_id)) |_| {
+        return try coerceAttrsToStringValue(self, attrs);
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+
+    const out_path_id = try self.intern.intern("outPath");
+    if (self.heap.getAttrValue(attrs_id, out_path_id)) |_| {
+        return try coerceAttrsToStringValue(self, attrs);
+    } else |err| switch (err) {
+        error.MissingAttribute => return null,
+        else => return err,
     }
 }
 
