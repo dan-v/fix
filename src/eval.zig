@@ -1765,20 +1765,28 @@ test "evaluate minimal derivation builtins" {
 test "evaluate path construction builtins" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ cwd, "test/fuzz-corpus/imported.nix" });
+    defer std.testing.allocator.free(file_path);
 
     const store_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.storePath \"{s}\")", .{cwd});
     defer std.testing.allocator.free(store_source);
-    const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.path {{ path = \"{s}\"; name = \"cwd\"; }})", .{cwd});
+    const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
     defer std.testing.allocator.free(path_source);
+    const path_prefix_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.toJSON (builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }}))", .{file_path});
+    defer std.testing.allocator.free(path_prefix_source);
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
+    ev.setFileIo(std.testing.io);
 
     const store_path = try ev.evaluate(store_source);
     try std.testing.expect(store_path.asBool());
 
     const path = try ev.evaluate(path_source);
     try std.testing.expect(path.asBool());
+
+    const path_prefix = try ev.evaluate(path_prefix_source);
+    try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix.asInternId()));
 }
 
 test "evaluate nixpkgs-heavy collection builtins" {

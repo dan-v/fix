@@ -100,6 +100,7 @@ builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; syst
 builtins.attrNames builtins.builtins
 rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
+builtins.substring 0 11 (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
 builtins.sort (a: b: a < b) [ 2 1 ]
 (builtins.partition (x: x < 2) [ 1 2 ]).right
 (builtins.groupBy (x: "k") [ 1 2 ]).k

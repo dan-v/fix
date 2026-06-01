@@ -1976,6 +1976,39 @@ fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool 
     return forced.discriminant == .bool_true;
 }
 
+fn appendPathFingerprint(
+    self: anytype,
+    path: []const u8,
+    fingerprint: *std.ArrayListUnmanaged(u8),
+) !void {
+    const kind = try self.files.fileType(path);
+    try fingerprint.appendSlice(self.allocator, path);
+    try fingerprint.append(self.allocator, 0);
+    try fingerprint.appendSlice(self.allocator, kind.nixTypeName());
+    try fingerprint.append(self.allocator, '\n');
+
+    switch (kind) {
+        .regular => {
+            const contents = try self.files.readFile(path);
+            try fingerprint.appendSlice(self.allocator, contents);
+            try fingerprint.append(self.allocator, '\n');
+        },
+        .directory => {
+            const entries = try self.files.readDir(path);
+            const sorted = try self.allocator.dupe(file_cache.FileCache.DirEntry, entries);
+            defer self.allocator.free(sorted);
+            std.mem.sort(file_cache.FileCache.DirEntry, sorted, {}, dirEntryNameLessThan);
+
+            for (sorted) |entry| {
+                const child_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
+                defer self.allocator.free(child_path);
+                try appendPathFingerprint(self, child_path, fingerprint);
+            }
+        },
+        .symlink, .unknown => {},
+    }
+}
+
 fn appendFilteredTreeFingerprint(
     self: anytype,
     pred: Value,
@@ -2144,12 +2177,19 @@ fn builtinPath(self: anytype, arg: Value) !Value {
         error.MissingAttribute => Value.null_val,
         else => return err,
     };
+    var store_name = path_ops.baseName(path);
     if (name_value.discriminant != .null) {
         const name = try self.forceValue(name_value);
         if (!isPlainString(name)) return error.TypeError;
+        store_name = self.intern.get(try stringTextInternId(self, name));
     }
 
-    return contextStringWithPath(self, try self.intern.intern(path));
+    var fingerprint: std.ArrayListUnmanaged(u8) = .empty;
+    defer fingerprint.deinit(self.allocator);
+    try fingerprint.appendSlice(self.allocator, "path\n");
+    try appendPathFingerprint(self, path, &fingerprint);
+
+    return contextStringWithPath(self, try storeLikePath(self, store_name, fingerprint.items));
 }
 
 fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
