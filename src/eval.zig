@@ -1444,6 +1444,18 @@ test "evaluate JSON builtins" {
     try std.testing.expectEqualStrings("\"float\"", parsed_float_type);
 }
 
+test "evaluate XML builtin" {
+    const xml = try renderForTest("builtins.toXML { b = [ true \"x\" null ]; a = 1; }");
+    defer std.testing.allocator.free(xml);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<?xml version='1.0' encoding='utf-8'?>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<attr name=\\\"a\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<bool value=\\\"true\\\" />") != null);
+
+    const escaped = try renderForTest("builtins.toXML \"a<&\\\"b\"");
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "a&lt;&amp;&quot;b") != null);
+}
+
 test "evaluate TOML builtin" {
     const parsed = try renderForTest(
         \\builtins.toJSON (let value = builtins.fromTOML ''

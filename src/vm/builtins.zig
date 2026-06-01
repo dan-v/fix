@@ -117,6 +117,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .zipAttrsValue => builtinZipAttrsValue(self, args[0], args[1], args[2]),
         .toJSON => builtinToJSON(self, args[0]),
         .fromJSON => builtinFromJSON(self, args[0]),
+        .toXML => builtinToXML(self, args[0]),
         .compareVersions => builtinCompareVersions(self, args[0], args[1]),
         .splitVersion => builtinSplitVersion(self, args[0]),
         .parseDrvName => builtinParseDrvName(self, args[0]),
@@ -130,7 +131,6 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .fetchTarball => builtinFetchTarball(self, args[0]),
         .parseFlakeRef => builtinParseFlakeRef(self, args[0]),
         .flakeRefToString => builtinFlakeRefToString(self, args[0]),
-        .toXML,
         .fetchMercurial,
         .fetchTree,
         .getFlake,
@@ -416,6 +416,94 @@ fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *std.A
     }
     try seen.append(self.allocator, .{ .kind = kind, .id = id });
     return true;
+}
+
+fn builtinToXML(self: anytype, arg: Value) !Value {
+    var out: std.Io.Writer.Allocating = .init(self.allocator);
+    defer out.deinit();
+
+    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+    defer seen.deinit(self.allocator);
+
+    try out.writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
+    try writeXmlValue(self, &out.writer, arg, 1, &seen);
+    try out.writer.writeAll("</expr>\n");
+
+    const text = try out.toOwnedSlice();
+    defer self.allocator.free(text);
+    return Value.string(try self.intern.intern(text));
+}
+
+fn writeXmlValue(self: anytype, writer: *std.Io.Writer, value: Value, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
+    const forced = try self.forceValue(value);
+    try writeXmlIndent(writer, depth);
+    switch (forced.discriminant) {
+        .null => try writer.writeAll("<null />\n"),
+        .bool_false => try writer.writeAll("<bool value=\"false\" />\n"),
+        .bool_true => try writer.writeAll("<bool value=\"true\" />\n"),
+        .int => try writer.print("<int value=\"{}\" />\n", .{forced.asInt()}),
+        .float => try writer.print("<float value=\"{d}\" />\n", .{forced.asFloat()}),
+        .string => {
+            try writer.writeAll("<string value=\"");
+            try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
+            try writer.writeAll("\" />\n");
+        },
+        .path => {
+            try writer.writeAll("<path value=\"");
+            try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
+            try writer.writeAll("\" />\n");
+        },
+        .list => try writeXmlList(self, writer, forced.asObjectId(), depth, seen),
+        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, seen),
+        .closure, .builtin, .builtin_closure => try writer.writeAll("<function />\n"),
+        .thunk, .cell => unreachable,
+    }
+}
+
+fn writeXmlList(self: anytype, writer: *std.Io.Writer, id: ObjectId, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+    if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
+    defer _ = seen.pop();
+
+    try writer.writeAll("<list>\n");
+    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1, seen);
+    try writeXmlIndent(writer, depth);
+    try writer.writeAll("</list>\n");
+}
+
+fn writeXmlAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+    if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
+    defer _ = seen.pop();
+
+    const sorted = try sortedAttrEntries(self, Value.attrs(id));
+    defer self.allocator.free(sorted);
+
+    try writer.writeAll("<attrs>\n");
+    for (sorted) |entry| {
+        try writeXmlIndent(writer, depth + 1);
+        try writer.writeAll("<attr name=\"");
+        try writeXmlEscaped(writer, self.intern.get(entry.name));
+        try writer.writeAll("\">\n");
+        try writeXmlValue(self, writer, entry.value, depth + 2, seen);
+        try writeXmlIndent(writer, depth + 1);
+        try writer.writeAll("</attr>\n");
+    }
+    try writeXmlIndent(writer, depth);
+    try writer.writeAll("</attrs>\n");
+}
+
+fn writeXmlIndent(writer: *std.Io.Writer, depth: usize) !void {
+    for (0..depth) |_| try writer.writeAll("  ");
+}
+
+fn writeXmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '&' => try writer.writeAll("&amp;"),
+        '<' => try writer.writeAll("&lt;"),
+        '>' => try writer.writeAll("&gt;"),
+        '"' => try writer.writeAll("&quot;"),
+        '\'' => try writer.writeAll("&apos;"),
+        else => try writer.writeByte(c),
+    };
 }
 
 fn builtinFromJSON(self: anytype, arg: Value) !Value {
