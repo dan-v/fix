@@ -30,6 +30,7 @@ const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
 const numeric = @import("runtime/numeric.zig");
 const vm_builtins = @import("vm/builtins.zig");
+const eval_trace = @import("eval_trace.zig");
 
 /// A single call frame.
 pub const Frame = struct {
@@ -68,6 +69,8 @@ pub const VM = struct {
     fetchers: *FetchCache,
     /// Global scheduler (for spawning work).
     scheduler: *Scheduler,
+    /// Evaluator-owned error trace collector.
+    trace: ?*eval_trace.Trace,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -89,6 +92,7 @@ pub const VM = struct {
         files: *FileCache,
         fetchers: *FetchCache,
         scheduler: *Scheduler,
+        trace: ?*eval_trace.Trace,
         import_host: ?ImportHost,
         builtins: Value,
         worker_id: u8,
@@ -107,6 +111,7 @@ pub const VM = struct {
             .files = files,
             .fetchers = fetchers,
             .scheduler = scheduler,
+            .trace = trace,
             .import_host = import_host,
             .builtins = builtins,
             .worker_id = worker_id,
@@ -139,6 +144,18 @@ pub const VM = struct {
 
     pub fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
         try vm_builtins.writeJsonValue(self, writer, value);
+    }
+
+    pub fn setErrorMessage(self: *VM, message: []const u8) !void {
+        if (self.trace) |trace| try trace.setMessage(message);
+    }
+
+    pub fn pushErrorContext(self: *VM, message: []const u8) !void {
+        if (self.trace) |trace| try trace.pushFrame(message);
+    }
+
+    pub fn clearErrorTrace(self: *VM) void {
+        if (self.trace) |trace| trace.clear();
     }
 
     // ---- frame management ----

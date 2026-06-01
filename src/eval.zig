@@ -18,9 +18,11 @@ const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
+const eval_trace = @import("eval_trace.zig");
 const path_ops = @import("runtime/paths.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
+pub const EvalTrace = eval_trace.Trace;
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
@@ -39,6 +41,7 @@ pub const Evaluator = struct {
     env_map: ?*const std.process.Environ.Map,
     worker_count: u8,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    trace: EvalTrace,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
         var scheduler = try Scheduler.init(allocator, worker_count);
@@ -67,11 +70,13 @@ pub const Evaluator = struct {
             .env_map = null,
             .worker_count = worker_count,
             .diagnostics = .empty,
+            .trace = EvalTrace.init(allocator),
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
         if (self.base_path) |path| self.allocator.free(path);
+        self.trace.deinit();
         self.diagnostics.deinit(self.allocator);
         var imports_iter = self.imports.iterator();
         while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
@@ -91,6 +96,10 @@ pub const Evaluator = struct {
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
         return self.diagnostics.items;
+    }
+
+    pub fn getTrace(self: *const Evaluator) *const EvalTrace {
+        return &self.trace;
     }
 
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
@@ -149,6 +158,7 @@ pub const Evaluator = struct {
 
     fn clearDiagnostics(self: *Evaluator) void {
         self.diagnostics.clearRetainingCapacity();
+        self.trace.clear();
     }
 
     fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic) !void {
@@ -225,6 +235,7 @@ pub const Evaluator = struct {
             &self.files,
             &self.fetchers,
             &self.scheduler,
+            &self.trace,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,
@@ -232,6 +243,7 @@ pub const Evaluator = struct {
     }
 
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
 

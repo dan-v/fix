@@ -136,7 +136,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .getFlake => builtinGetFlake(self, args[0]),
         .scopedImport => builtinScopedImport(self, args[0], args[1]),
         .traceVerbose => builtinTraceVerbose(self, args[0], args[1]),
-        .addErrorContext => self.forceValue(args[1]),
+        .addErrorContext => builtinAddErrorContext(self, args[0], args[1]),
         .unsafeDiscardStringContext => builtinUnsafeDiscardStringContext(self, args[0]),
         .unsafeDiscardOutputDependency => builtinUnsafeDiscardOutputDependency(self, args[0]),
         .addDrvOutputDependencies => builtinAddDrvOutputDependencies(self, args[0]),
@@ -1288,12 +1288,12 @@ fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_a
 }
 
 fn builtinThrow(self: anytype, message_arg: Value) !Value {
-    _ = try stringArg(self, message_arg);
+    try self.setErrorMessage(try stringArg(self, message_arg));
     return error.NixThrow;
 }
 
 fn builtinAbort(self: anytype, message_arg: Value) !Value {
-    _ = try stringArg(self, message_arg);
+    try self.setErrorMessage(try stringArg(self, message_arg));
     return error.NixAbort;
 }
 
@@ -1303,10 +1303,21 @@ fn builtinTryEval(self: anytype, arg: Value) !Value {
         error.NixAbort,
         error.AssertionFailed,
         error.FileNotFound,
-        => return tryEvalResult(self, false, Value.boolVal(false)),
+        => {
+            self.clearErrorTrace();
+            return tryEvalResult(self, false, Value.boolVal(false));
+        },
         else => return err,
     };
     return tryEvalResult(self, true, value);
+}
+
+fn builtinAddErrorContext(self: anytype, message_arg: Value, value_arg: Value) !Value {
+    return self.forceValue(value_arg) catch |err| {
+        const message = stringArg(self, message_arg) catch return err;
+        self.pushErrorContext(message) catch return err;
+        return err;
+    };
 }
 
 fn builtinTrace(self: anytype, message_arg: Value, value_arg: Value) !Value {

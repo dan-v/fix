@@ -5,12 +5,14 @@ const builtin = @import("builtin");
 const eval = @import("eval.zig");
 const diagnostic = @import("diagnostic.zig");
 const Evaluator = eval.Evaluator;
+const Value = @import("value.zig").Value;
 
 const usage =
     \\usage: fix [options] (<expression> | -e <expression> | --file <path>)
     \\
     \\options:
     \\  --json                 write the evaluated value as JSON
+    \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
     \\  --no-color             disable color diagnostics
     \\  -h, --help             show this help
@@ -36,6 +38,7 @@ const SourceArg = union(enum) {
 const Options = struct {
     output: OutputFormat = .nix,
     color: ColorMode = .auto,
+    show_trace: bool = false,
     source: ?SourceArg = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
@@ -91,14 +94,21 @@ pub fn main(init: std.process.Init) !void {
             try diagnostic.writeAllWithOptions(&stderr.interface, source.text, ev.getDiagnostics(), .{ .color = use_color });
             try stderr.interface.flush();
         } else {
-            std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
+            try writeEvaluationError(init.io, use_color, options.show_trace, &ev, err);
         }
         std.process.exit(1);
     };
 
+    writeResult(init.io, options.output, &ev, result) catch |err| {
+        try writeEvaluationError(init.io, use_color, options.show_trace, &ev, err);
+        std.process.exit(1);
+    };
+}
+
+fn writeResult(io: std.Io, output: OutputFormat, ev: *Evaluator, result: Value) !void {
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    switch (options.output) {
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    switch (output) {
         .nix => try ev.writeValue(&stdout.interface, result),
         .json => try ev.writeJsonValue(&stdout.interface, result),
     }
@@ -126,6 +136,8 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             options.output = .json;
+        } else if (std.mem.eql(u8, arg, "--show-trace")) {
+            options.show_trace = true;
         } else if (std.mem.eql(u8, arg, "--color")) {
             options.color = .always;
         } else if (std.mem.startsWith(u8, arg, "--color=")) {
@@ -181,4 +193,75 @@ fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
         if (std.mem.eql(u8, term, "dumb")) return false;
     }
     return std.Io.File.stderr().isTty(io) catch false;
+}
+
+const TraceStyle = enum {
+    error_label,
+    trace_label,
+    dim,
+};
+
+const default_trace_limit = 8;
+
+fn writeEvaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *const Evaluator, err: anyerror) !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    const writer = &stderr.interface;
+    const trace = ev.getTrace();
+
+    try traceStyle(writer, use_color, .error_label);
+    try writer.writeAll("error");
+    try traceReset(writer, use_color);
+    if (trace.message) |message| {
+        try writer.print(": {s}\n", .{message});
+    } else {
+        try writer.print(": evaluation failed with {s}\n", .{@errorName(err)});
+    }
+
+    try writeTraceFrames(writer, use_color, show_trace, trace.frames.items);
+    try writer.flush();
+}
+
+fn writeTraceFrames(writer: *std.Io.Writer, use_color: bool, show_trace: bool, frames: []const []const u8) !void {
+    if (frames.len == 0) return;
+
+    try traceStyle(writer, use_color, .dim);
+    try writer.writeAll("\ntrace:\n");
+    try traceReset(writer, use_color);
+
+    if (show_trace or frames.len <= default_trace_limit) {
+        for (frames) |frame| try writeTraceFrame(writer, use_color, frame);
+        return;
+    }
+
+    const head_count = default_trace_limit / 2;
+    const tail_count = default_trace_limit - head_count;
+    for (frames[0..head_count]) |frame| try writeTraceFrame(writer, use_color, frame);
+
+    try traceStyle(writer, use_color, .dim);
+    try writer.print("  ... {d} frames omitted; use --show-trace to show all\n", .{frames.len - default_trace_limit});
+    try traceReset(writer, use_color);
+
+    for (frames[frames.len - tail_count ..]) |frame| try writeTraceFrame(writer, use_color, frame);
+}
+
+fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, frame: []const u8) !void {
+    try writer.writeAll("  ");
+    try traceStyle(writer, use_color, .trace_label);
+    try writer.writeAll("while evaluating");
+    try traceReset(writer, use_color);
+    try writer.print(": {s}\n", .{frame});
+}
+
+fn traceStyle(writer: *std.Io.Writer, use_color: bool, style: TraceStyle) !void {
+    if (!use_color) return;
+    try writer.writeAll(switch (style) {
+        .error_label => "\x1b[1;31m",
+        .trace_label => "\x1b[36m",
+        .dim => "\x1b[2m",
+    });
+}
+
+fn traceReset(writer: *std.Io.Writer, use_color: bool) !void {
+    if (use_color) try writer.writeAll("\x1b[0m");
 }
