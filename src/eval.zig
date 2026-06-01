@@ -837,6 +837,10 @@ test "evaluate primitive path and metadata builtins" {
     const store_dir = try renderForTest("builtins.storeDir");
     defer std.testing.allocator.free(store_dir);
     try std.testing.expectEqualStrings("\"/nix/store\"", store_dir);
+
+    const nested_builtins = try renderForTest("builtins.builtins.storeDir");
+    defer std.testing.allocator.free(nested_builtins);
+    try std.testing.expectEqualStrings("\"/nix/store\"", nested_builtins);
 }
 
 test "evaluate builtins.typeOf" {

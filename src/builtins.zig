@@ -383,7 +383,7 @@ pub fn arity(id: BuiltinId) u8 {
 pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const NixPathEntry) !Value {
     var entries: std.ArrayListUnmanaged(AttrEntry) = .empty;
     defer entries.deinit(heap.allocator);
-    try entries.ensureTotalCapacity(heap.allocator, builtin_bindings.len + constant_bindings.len);
+    try entries.ensureTotalCapacity(heap.allocator, builtin_bindings.len + constant_bindings.len + 1);
 
     for (builtin_bindings) |binding| {
         entries.appendAssumeCapacity(try builtinEntry(intern, binding));
@@ -412,6 +412,10 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("nixPath"),
         .value = try buildNixPathValue(intern, heap, nix_path),
+    });
+    entries.appendAssumeCapacity(.{
+        .name = try intern.intern("builtins"),
+        .value = Value.attrs(heap.object_count),
     });
 
     return Value.attrs(try heap.addAttrs(entries.items));
