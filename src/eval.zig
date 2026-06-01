@@ -1523,6 +1523,10 @@ test "evaluate control and error builtins" {
     const traced = try renderForTest("builtins.trace \"message\" 42");
     defer std.testing.allocator.free(traced);
     try std.testing.expectEqualStrings("42", traced);
+
+    const broken = try renderForTest("builtins.break 42");
+    defer std.testing.allocator.free(broken);
+    try std.testing.expectEqualStrings("42", broken);
 }
 
 test "evaluate minimal derivation builtins" {
