@@ -174,8 +174,9 @@ pub fn storePath(
     intern: *InternTable,
     name: []const u8,
     output: []const u8,
+    fingerprint: []const u8,
 ) !InternId {
-    const hash = stablePlaceholderHash(name, output);
+    const hash = stablePlaceholderHash(name, output, fingerprint);
     const text = if (std.mem.eql(u8, output, "out"))
         try std.fmt.allocPrint(allocator, "/nix/store/{s}-{s}", .{ hash, name })
     else
@@ -188,18 +189,21 @@ pub fn drvPath(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     name: []const u8,
+    fingerprint: []const u8,
 ) !InternId {
-    const hash = stablePlaceholderHash(name, "drv");
+    const hash = stablePlaceholderHash(name, "drv", fingerprint);
     const text = try std.fmt.allocPrint(allocator, "/nix/store/{s}-{s}.drv", .{ hash, name });
     defer allocator.free(text);
     return intern.intern(text);
 }
 
-pub fn stablePlaceholderHash(name: []const u8, output: []const u8) [16]u8 {
+pub fn stablePlaceholderHash(name: []const u8, output: []const u8, fingerprint: []const u8) [16]u8 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(name);
     hasher.update(&.{0});
     hasher.update(output);
+    hasher.update(&.{0});
+    hasher.update(fingerprint);
     const digest = hasher.final();
 
     var encoded: [16]u8 = undefined;
@@ -273,10 +277,12 @@ fn outputByName(outputs: []const Output, name: InternId) ?Output {
 }
 
 test "stable placeholder hash depends on name and output" {
-    const out_hash = stablePlaceholderHash("pkg", "out");
-    const dev_hash = stablePlaceholderHash("pkg", "dev");
-    const repeat = stablePlaceholderHash("pkg", "out");
+    const out_hash = stablePlaceholderHash("pkg", "out", "a");
+    const dev_hash = stablePlaceholderHash("pkg", "dev", "a");
+    const changed_hash = stablePlaceholderHash("pkg", "out", "b");
+    const repeat = stablePlaceholderHash("pkg", "out", "a");
 
     try std.testing.expectEqualStrings(&out_hash, &repeat);
     try std.testing.expect(!std.mem.eql(u8, &out_hash, &dev_hash));
+    try std.testing.expect(!std.mem.eql(u8, &out_hash, &changed_hash));
 }

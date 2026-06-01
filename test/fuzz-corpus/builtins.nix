@@ -101,6 +101,8 @@ builtins.attrNames (builtins.derivationStrict { name = "pkg"; outputs = [ "out" 
 builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }))
 (builtins.tryEval (builtins.derivation { name = builtins.throw "x"; system = "x86_64-linux"; builder = "/bin/sh"; })).success
 (builtins.tryEval (builtins.derivation { name = builtins.throw "x"; system = "x86_64-linux"; builder = "/bin/sh"; }).outPath).success
+(let mk = builder: builtins.derivation { name = "pkg"; system = "x86_64-linux"; inherit builder; }; in (mk "/bin/sh").outPath == (mk "/bin/bash").outPath)
+(let mk = hash: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = hash; outputHashAlgo = "sha256"; outputHashMode = "flat"; }; in (mk "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").outPath == (mk "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=").outPath)
 builtins.attrNames builtins.builtins
 rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })

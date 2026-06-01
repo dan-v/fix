@@ -1779,6 +1779,27 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(all_len);
     try std.testing.expectEqualStrings("2", all_len);
 
+    const input_sensitive_paths = try renderForTest(
+        \\let
+        \\  mkBuilder = builder: builtins.derivation { name = "pkg"; system = "x86_64-linux"; inherit builder; };
+        \\  mkHash = hash: builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = hash;
+        \\    outputHashAlgo = "sha256";
+        \\    outputHashMode = "flat";
+        \\  };
+        \\in builtins.toJSON {
+        \\  builderOutSame = (mkBuilder "/bin/sh").outPath == (mkBuilder "/bin/bash").outPath;
+        \\  builderDrvSame = (mkBuilder "/bin/sh").drvPath == (mkBuilder "/bin/bash").drvPath;
+        \\  hashOutSame = (mkHash "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").outPath == (mkHash "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=").outPath;
+        \\  hashDrvSame = (mkHash "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").drvPath == (mkHash "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=").drvPath;
+        \\}
+    );
+    defer std.testing.allocator.free(input_sensitive_paths);
+    try std.testing.expectEqualStrings("\"{\\\"builderDrvSame\\\":false,\\\"builderOutSame\\\":false,\\\"hashDrvSame\\\":false,\\\"hashOutSame\\\":false}\"", input_sensitive_paths);
+
     const drv_attrs = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ 1 true null ]; __structuredAttrs = true; env = { A = 1; }; }).drvAttrs.env.A");
     defer std.testing.allocator.free(drv_attrs);
     try std.testing.expectEqualStrings("1", drv_attrs);
