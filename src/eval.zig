@@ -1504,9 +1504,13 @@ test "evaluate filter builtin" {
 }
 
 test "evaluate map concatMap mapAttrs and genList builtins" {
-    const mapped = try renderForTest("builtins.map (x: x + 1) [ 1 2 3 ]");
+    const mapped = try renderForTest("builtins.toJSON (builtins.map (x: x + 1) [ 1 2 3 ])");
     defer std.testing.allocator.free(mapped);
-    try std.testing.expectEqualStrings("[ 2 3 4 ]", mapped);
+    try std.testing.expectEqualStrings("\"[2,3,4]\"", mapped);
+
+    const map_lazy_length = try renderForTest("builtins.length (builtins.map (x: builtins.throw \"bad\") [ 1 ])");
+    defer std.testing.allocator.free(map_lazy_length);
+    try std.testing.expectEqualStrings("1", map_lazy_length);
 
     const concat_mapped = try renderForTest("builtins.elemAt (builtins.concatMap (x: [ x (x + 10) ]) [ 1 2 ]) 1");
     defer std.testing.allocator.free(concat_mapped);
@@ -1523,6 +1527,10 @@ test "evaluate map concatMap mapAttrs and genList builtins" {
     const map_attrs_lazy_has_attr = try renderForTest("(builtins.mapAttrs (name: value: builtins.throw \"bad\") { a = 1; }) ? a");
     defer std.testing.allocator.free(map_attrs_lazy_has_attr);
     try std.testing.expectEqualStrings("true", map_attrs_lazy_has_attr);
+
+    const map_attrs_fixed_point = try renderForTest("let fix = f: let x = f x; in x; in builtins.attrNames (fix (self: let y = builtins.mapAttrs self.f { a = 1; }; in { f = n: v: v; } // y))");
+    defer std.testing.allocator.free(map_attrs_fixed_point);
+    try std.testing.expectEqualStrings("[ \"a\" \"f\" ]", map_attrs_fixed_point);
 
     const generated = try renderForTest("builtins.genList (x: x + 1) 3");
     defer std.testing.allocator.free(generated);

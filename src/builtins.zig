@@ -123,6 +123,7 @@ pub const BuiltinId = enum(u16) {
     flakeRefToString = 106,
     break_ = 107,
     derivationLazyAttr = 108,
+    mapValue = 109,
 };
 
 const BuiltinBinding = struct {
@@ -371,6 +372,7 @@ pub fn arity(id: BuiltinId) u8 {
         .toFile,
         .filterSource,
         .scopedImport,
+        .mapValue,
         .derivationLazyAttr,
         => 2,
         .foldlStrict,

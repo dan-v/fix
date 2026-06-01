@@ -75,8 +75,10 @@ builtins.filter (x: x < 3) [ 1 4 2 ]
 builtins.length (builtins.filter (x: true) [ (1 / 0) ])
 builtins.filter (x: false) [ (1 / 0) ]
 builtins.map (x: x + 1) [ 1 2 ]
+builtins.length (builtins.map (x: builtins.throw "x") [ 1 ])
 builtins.concatMap (x: [ x ]) [ 1 2 ]
 (builtins.mapAttrs (name: value: value) { a = 1; }).a
+(let fix = f: let x = f x; in x; in builtins.attrNames (fix (self: let y = builtins.mapAttrs self.f { a = 1; }; in { f = n: v: v; } // y)))
 (builtins.mapAttrs (name: value: if name == "a" then value else builtins.throw "bad") { a = 1; b = 2; }).a
 builtins.genList (x: x) 2
 builtins.stringLength "abcd"

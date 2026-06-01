@@ -148,6 +148,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .toFile => builtinToFile(self, args[0], args[1]),
         .placeholder => builtinPlaceholder(self, args[0]),
         .derivationLazyAttr => builtinDerivationLazyAttr(self, args[0], args[1]),
+        .mapValue => builtinMapValue(self, args[0], args[1]),
     };
 }
 
@@ -1096,6 +1097,7 @@ fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
 
 fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     const func = try self.forceValue(fn_arg);
+    if (!try isCallable(self, func)) return error.NotCallable;
     const list = try self.forceValue(list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
@@ -1104,9 +1106,14 @@ fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     defer self.allocator.free(out);
 
     for (items, out) |item, *mapped| {
-        mapped.* = try self.callValue(func, item);
+        mapped.* = try makeBuiltinThunk(self, .mapValue, &.{ func, item });
     }
     return Value.list(try self.heap.addList(out));
+}
+
+fn builtinMapValue(self: anytype, func_arg: Value, item_arg: Value) !Value {
+    const func = try self.forceValue(func_arg);
+    return self.callValue(func, item_arg);
 }
 
 fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
@@ -1126,7 +1133,6 @@ fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
 }
 
 fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
-    const func = try self.forceValue(fn_arg);
     const attrs = try self.forceValue(attrs_arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
@@ -1137,14 +1143,15 @@ fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
     for (attr_entries, out) |entry, *mapped| {
         mapped.* = .{
             .name = entry.name,
-            .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ func, Value.string(entry.name), entry.value }),
+            .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry.name), entry.value }),
         };
     }
     return Value.attrs(try self.heap.addAttrs(out));
 }
 
 fn builtinMapAttrValue(self: anytype, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
-    const partial = try self.callValue(func_arg, name_arg);
+    const func = try self.forceValue(func_arg);
+    const partial = try self.callValue(func, name_arg);
     return self.callValue(partial, value_arg);
 }
 
@@ -2709,6 +2716,20 @@ fn isStringLike(value: Value) bool {
 
 fn isPlainString(value: Value) bool {
     return value.discriminant == .string or value.discriminant == .string_context;
+}
+
+fn isCallable(self: anytype, value: Value) !bool {
+    return switch (value.discriminant) {
+        .closure, .builtin, .builtin_closure => true,
+        .attrs => blk: {
+            _ = self.heap.getAttrValue(value.asObjectId(), try self.intern.intern("__functor")) catch |err| switch (err) {
+                error.MissingAttribute => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 fn stringTextInternId(self: anytype, value: Value) !InternId {
