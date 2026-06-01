@@ -11,6 +11,7 @@ const usage =
     \\usage: fix [options] (<expression> | -e <expression> | --file <path>)
     \\
     \\options:
+    \\  --repl                 read and evaluate expressions interactively
     \\  --json                 write the evaluated value as JSON
     \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
@@ -39,6 +40,7 @@ const Options = struct {
     output: OutputFormat = .nix,
     color: ColorMode = .auto,
     show_trace: bool = false,
+    repl: bool = false,
     source: ?SourceArg = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
@@ -77,6 +79,15 @@ pub fn main(init: std.process.Init) !void {
     const use_color = shouldColor(options.color, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
 
+    if (options.repl) {
+        if (options.source != null) {
+            std.debug.print("error: --repl does not take an expression or file\n\n{s}", .{usage});
+            std.process.exit(1);
+        }
+        try runRepl(init.io, options, use_color, &ev);
+        return;
+    }
+
     const source_arg = options.source orelse {
         std.debug.print("{s}", .{usage});
         std.process.exit(1);
@@ -87,22 +98,47 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const result = ev.evaluate(source.text) catch |err| {
-        if (ev.getDiagnostics().len > 0) {
-            var stderr_buffer: [1024]u8 = undefined;
-            var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
-            try diagnostic.writeAllWithOptions(&stderr.interface, source.text, ev.getDiagnostics(), .{ .color = use_color });
-            try stderr.interface.flush();
-        } else {
-            try writeEvaluationError(init.io, use_color, options.show_trace, &ev, err);
-        }
+    if (!try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, &ev, source.text)) {
         std.process.exit(1);
+    }
+}
+
+fn evaluateAndWrite(
+    io: std.Io,
+    output: OutputFormat,
+    use_color: bool,
+    show_trace: bool,
+    ev: *Evaluator,
+    source: []const u8,
+) !bool {
+    const result = ev.evaluate(source) catch |err| {
+        try writeEvalFailure(io, use_color, show_trace, ev, source, err);
+        return false;
     };
 
-    writeResult(init.io, options.output, &ev, result) catch |err| {
-        try writeEvaluationError(init.io, use_color, options.show_trace, &ev, err);
-        std.process.exit(1);
+    writeResult(io, output, ev, result) catch |err| {
+        try writeEvaluationError(io, use_color, show_trace, ev, err);
+        return false;
     };
+    return true;
+}
+
+fn writeEvalFailure(
+    io: std.Io,
+    use_color: bool,
+    show_trace: bool,
+    ev: *const Evaluator,
+    source: []const u8,
+    err: anyerror,
+) !void {
+    if (ev.getDiagnostics().len > 0) {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+        try diagnostic.writeAllWithOptions(&stderr.interface, source, ev.getDiagnostics(), .{ .color = use_color });
+        try stderr.interface.flush();
+    } else {
+        try writeEvaluationError(io, use_color, show_trace, ev, err);
+    }
 }
 
 fn writeResult(io: std.Io, output: OutputFormat, ev: *Evaluator, result: Value) !void {
@@ -134,7 +170,9 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
     var options: Options = .{};
 
     while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
+        if (std.mem.eql(u8, arg, "--repl")) {
+            options.repl = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
             options.output = .json;
         } else if (std.mem.eql(u8, arg, "--show-trace")) {
             options.show_trace = true;
@@ -193,6 +231,75 @@ fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
         if (std.mem.eql(u8, term, "dumb")) return false;
     }
     return std.Io.File.stderr().isTty(io) catch false;
+}
+
+fn runRepl(io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
+    const interactive = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
+
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+
+    if (interactive) {
+        try stdout.interface.writeAll("fix repl\n");
+        try stdout.interface.flush();
+    }
+
+    while (true) {
+        if (interactive) {
+            if (use_color) try stdout.interface.writeAll("\x1b[1;34m");
+            try stdout.interface.writeAll("fix> ");
+            if (use_color) try stdout.interface.writeAll("\x1b[0m");
+            try stdout.interface.flush();
+        }
+
+        const raw_line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                try writeReplInputError(io, use_color, "input line is too long");
+                _ = stdin.interface.discardDelimiterInclusive('\n') catch {};
+                continue;
+            },
+            else => return err,
+        };
+        const line = raw_line orelse break;
+        const source = std.mem.trim(u8, line, " \t\r");
+        if (source.len == 0) continue;
+
+        if (std.mem.eql(u8, source, ":q") or
+            std.mem.eql(u8, source, ":quit") or
+            std.mem.eql(u8, source, ":exit"))
+        {
+            break;
+        }
+        if (std.mem.eql(u8, source, ":help")) {
+            try writeReplHelp(&stdout.interface);
+            try stdout.interface.flush();
+            continue;
+        }
+
+        _ = try evaluateAndWrite(io, options.output, use_color, options.show_trace, ev, source);
+    }
+}
+
+fn writeReplHelp(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
+        \\:help   show commands
+        \\:q      exit
+        \\:quit   exit
+        \\
+    );
+}
+
+fn writeReplInputError(io: std.Io, use_color: bool, message: []const u8) !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
+    try traceStyle(&stderr.interface, use_color, .error_label);
+    try stderr.interface.writeAll("error");
+    try traceReset(&stderr.interface, use_color);
+    try stderr.interface.print(": {s}\n", .{message});
+    try stderr.interface.flush();
 }
 
 const TraceStyle = enum {
