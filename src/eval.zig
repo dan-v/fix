@@ -1721,13 +1721,21 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(derivation_type);
     try std.testing.expectEqualStrings("\"derivation\"", derivation_type);
 
-    const strict_output = try renderForTest("builtins.head (builtins.derivationStrict { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outputs");
-    defer std.testing.allocator.free(strict_output);
-    try std.testing.expectEqualStrings("\"out\"", strict_output);
+    const strict_attrs = try renderForTest("builtins.attrNames (builtins.derivationStrict { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; })");
+    defer std.testing.allocator.free(strict_attrs);
+    try std.testing.expectEqualStrings("[ \"drvPath\" \"out\" ]", strict_attrs);
 
     const named_output = try renderForTest("(builtins.derivation { name = \"pkg\"; outputs = [ \"out\" \"dev\" ]; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).dev.outputName");
     defer std.testing.allocator.free(named_output);
     try std.testing.expectEqualStrings("\"dev\"", named_output);
+
+    const named_output_attrs = try renderForTest("builtins.attrNames (builtins.derivation { name = \"pkg\"; outputs = [ \"out\" \"dev\" ]; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).dev");
+    defer std.testing.allocator.free(named_output_attrs);
+    try std.testing.expectEqualStrings("[ \"all\" \"builder\" \"dev\" \"drvAttrs\" \"drvPath\" \"name\" \"out\" \"outPath\" \"outputName\" \"outputs\" \"system\" \"type\" ]", named_output_attrs);
+
+    const implicit_outputs = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }) ? outputs");
+    defer std.testing.allocator.free(implicit_outputs);
+    try std.testing.expectEqualStrings("false", implicit_outputs);
 
     const all_len = try renderForTest("builtins.length (builtins.derivation { name = \"pkg\"; outputs = [ \"out\" \"dev\" ]; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).all");
     defer std.testing.allocator.free(all_len);

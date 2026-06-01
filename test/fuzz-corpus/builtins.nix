@@ -91,6 +91,8 @@ builtins.splitVersion "1.0-beta2"
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type
 (builtins.derivation { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; }).dev.outputName
+builtins.attrNames (builtins.derivation { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; }).dev
+builtins.attrNames (builtins.derivationStrict { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; })
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; env = { A = 1; B = [ "x" ]; }; passAsFile = [ "foo" ]; foo = "bar"; }).drvAttrs.env.B
 builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }))
 builtins.attrNames builtins.builtins

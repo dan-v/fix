@@ -87,8 +87,8 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .abort => builtinAbort(self, args[0]),
         .tryEval => builtinTryEval(self, args[0]),
         .trace => builtinTrace(self, args[0], args[1]),
-        .derivation => builtinDerivation(self, args[0]),
-        .derivationStrict => builtinDerivation(self, args[0]),
+        .derivation => builtinDerivation(self, args[0], .lazy),
+        .derivationStrict => builtinDerivation(self, args[0], .strict),
         .storePath => builtinStorePath(self, args[0]),
         .path => builtinPath(self, args[0]),
         .sort => builtinSort(self, args[0], args[1]),
@@ -2027,7 +2027,9 @@ fn tryEvalResult(self: anytype, success: bool, value: Value) !Value {
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
-fn builtinDerivation(self: anytype, arg: Value) !Value {
+const DerivationMode = enum { lazy, strict };
+
+fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value {
     const attrs = try self.forceValue(arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
@@ -2037,32 +2039,42 @@ fn builtinDerivation(self: anytype, arg: Value) !Value {
     const drv_name_id = try stringTextInternId(self, name_value);
 
     const output_names = try derivationOutputNames(self, attrs.asObjectId());
-    defer self.allocator.free(output_names);
+    defer self.allocator.free(output_names.names);
 
-    const outputs = try self.allocator.alloc(derivation.Output, output_names.len);
+    const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);
-    for (output_names, outputs) |output_name, *output| {
+    for (output_names.names, outputs) |output_name, *output| {
         output.* = .{
             .name = output_name,
             .out_path = try derivation.storePath(self.allocator, self.intern, self.intern.get(drv_name_id), self.intern.get(output_name)),
         };
     }
 
-    return derivation.buildValue(self.allocator, self.intern, self.heap, .{
+    const spec: derivation.Spec = .{
         .drv_path = try derivation.drvPath(self.allocator, self.intern, self.intern.get(drv_name_id)),
-        .default_output = output_names[0],
+        .default_output = output_names.names[0],
         .outputs = outputs,
+        .explicit_outputs = output_names.explicit,
         .original_attrs = try self.heap.getAttrs(attrs.asObjectId()),
-    });
+    };
+    return switch (mode) {
+        .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),
+        .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
+    };
 }
 
-fn derivationOutputNames(self: anytype, attrs_id: ObjectId) ![]InternId {
+const DerivationOutputNames = struct {
+    names: []InternId,
+    explicit: bool,
+};
+
+fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNames {
     const outputs_id = try self.intern.intern("outputs");
     const outputs_value = self.heap.getAttrValue(attrs_id, outputs_id) catch |err| switch (err) {
         error.MissingAttribute => {
             const names = try self.allocator.alloc(InternId, 1);
             names[0] = try self.intern.intern("out");
-            return names;
+            return .{ .names = names, .explicit = false };
         },
         else => return err,
     };
@@ -2080,7 +2092,7 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) ![]InternId {
         name.* = try stringTextInternId(self, value);
         if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;
     }
-    return names;
+    return .{ .names = names, .explicit = true };
 }
 
 fn builtinStorePath(self: anytype, arg: Value) !Value {
