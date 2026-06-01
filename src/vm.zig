@@ -279,12 +279,9 @@ pub const VM = struct {
                     if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
                         try self.push(try numeric.add(a, b));
                     } else if (a.discriminant == .path) {
-                        const b_id = try self.stringLikeInternId(b);
-                        try self.push(try self.concatInternedPath(a.asInternId(), b_id));
+                        try self.push(try self.concatPathLike(a, b));
                     } else {
-                        const a_id = try self.stringLikeInternId(a);
-                        const b_id = try self.stringLikeInternId(b);
-                        try self.push(Value.string(try self.concatInternedString(a_id, b_id)));
+                        try self.push(try self.concatStringLike(a, b));
                     }
                 },
                 .sub_int => {
@@ -627,18 +624,20 @@ pub const VM = struct {
             return try numeric.toFloat(va) == try numeric.toFloat(vb);
         }
 
+        if (isStringComparable(va) and isStringComparable(vb)) {
+            return (try self.stringTextInternId(try self.stringLikeValue(va))) == (try self.stringTextInternId(try self.stringLikeValue(vb)));
+        }
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
             .null, .bool_false, .bool_true => true,
             .int => va.asInt() == vb.asInt(),
             .float => va.asFloat() == vb.asFloat(),
-            .string, .path => va.asInternId() == vb.asInternId(),
             .list => try self.listsEqual(va, vb, seen),
             .attrs => try self.attrsEqual(va, vb, seen),
             .closure => va.asObjectId() == vb.asObjectId(),
             .builtin => va.asBuiltinId() == vb.asBuiltinId(),
             .builtin_closure => va.asObjectId() == vb.asObjectId(),
-            .thunk, .cell => unreachable,
+            .string, .path, .string_context, .thunk, .cell => unreachable,
         };
     }
 
@@ -711,9 +710,9 @@ pub const VM = struct {
                 if (af > bf) return .gt;
                 return .eq;
             },
-            .string, .path => {
-                if (vb.discriminant != va.discriminant) return error.TypeError;
-                return switch (std.mem.order(u8, self.intern.get(va.asInternId()), self.intern.get(vb.asInternId()))) {
+            .string, .path, .string_context => {
+                if (!isStringComparable(vb) or vb.discriminant != va.discriminant) return error.TypeError;
+                return switch (std.mem.order(u8, self.intern.get(try self.stringTextInternId(va)), self.intern.get(try self.stringTextInternId(vb)))) {
                     .lt => .lt,
                     .eq => .eq,
                     .gt => .gt,
@@ -721,6 +720,10 @@ pub const VM = struct {
             },
             else => return error.TypeError,
         }
+    }
+
+    fn isStringComparable(value: Value) bool {
+        return value.discriminant == .string or value.discriminant == .path or value.discriminant == .string_context;
     }
 
     // ---- thunk management ----
@@ -818,14 +821,6 @@ pub const VM = struct {
         return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
     }
 
-    fn concatStrings(self: *VM, a: Value, b: Value) !Value {
-        return Value.string(try self.concatInternedString(a.asInternId(), b.asInternId()));
-    }
-
-    fn concatPath(self: *VM, a: Value, b: Value) !Value {
-        return Value.path(try self.concatInternedString(a.asInternId(), b.asInternId()));
-    }
-
     fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
         const s_a = self.intern.get(a);
         const s_b = self.intern.get(b);
@@ -838,23 +833,31 @@ pub const VM = struct {
         return self.intern.intern(buf);
     }
 
-    fn concatInternedPath(self: *VM, a: InternId, b: InternId) !Value {
-        return Value.path(try self.concatInternedString(a, b));
-    }
-
-    fn stringLikeInternId(self: *VM, value: Value) !InternId {
+    pub fn stringLikeValue(self: *VM, value: Value) !Value {
         const forced = try self.forceValue(value);
         return switch (forced.discriminant) {
-            .string, .path => forced.asInternId(),
-            .attrs => try self.attrsStringLikeInternId(forced),
+            .string, .path, .string_context => forced,
+            .attrs => try self.attrsStringLikeValue(forced),
             else => error.TypeError,
         };
     }
 
-    fn attrsStringLikeInternId(self: *VM, attrs: Value) !InternId {
+    pub fn stringLikeInternId(self: *VM, value: Value) !InternId {
+        return self.stringTextInternId(try self.stringLikeValue(value));
+    }
+
+    pub fn stringTextInternId(self: *VM, value: Value) !InternId {
+        return switch (value.discriminant) {
+            .string, .path => value.asInternId(),
+            .string_context => (try self.heap.getContextString(value.asObjectId())).text,
+            else => error.TypeError,
+        };
+    }
+
+    fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
         const to_string_id = try self.intern.intern("__toString");
         if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
-            return self.stringLikeInternId(try self.callValue(try self.forceValue(to_string), attrs));
+            return self.stringLikeValue(try self.callValue(try self.forceValue(to_string), attrs));
         } else |err| switch (err) {
             error.MissingAttribute => {},
             else => return err,
@@ -865,7 +868,71 @@ pub const VM = struct {
             error.MissingAttribute => return error.TypeError,
             else => return err,
         };
-        return self.stringLikeInternId(out_path);
+        return self.stringLikeValue(out_path);
+    }
+
+    fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
+        const right_like = try self.stringLikeValue(right);
+        const text_id = try self.concatInternedString(left.asInternId(), try self.stringTextInternId(right_like));
+
+        var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer context.deinit(self.allocator);
+        if (right_like.discriminant == .string_context) {
+            try self.appendStringContext(&context, right_like);
+        }
+        if (context.items.len == 0) return Value.path(text_id);
+        return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    }
+
+    fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
+        const left_like = try self.stringLikeValue(left);
+        const right_like = try self.stringLikeValue(right);
+        const text_id = try self.concatInternedString(try self.stringTextInternId(left_like), try self.stringTextInternId(right_like));
+
+        var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+        defer context.deinit(self.allocator);
+        try self.appendStringContext(&context, left_like);
+        try self.appendStringContext(&context, right_like);
+        if (context.items.len == 0) return Value.string(text_id);
+        return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    }
+
+    fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {
+        switch (value.discriminant) {
+            .string => {},
+            .path => try self.appendContextEntry(context, value.asInternId(), try self.pathContextValue()),
+            .string_context => {
+                const string = try self.heap.getContextString(value.asObjectId());
+                for (string.context) |entry| try self.appendContextEntry(context, entry.name, entry.value);
+            },
+            else => return error.TypeError,
+        }
+    }
+
+    fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {
+        for (context.items) |*entry| {
+            if (entry.name == name) {
+                entry.value = try self.mergeContextValues(entry.value, value);
+                return;
+            }
+        }
+        try context.append(self.allocator, .{ .name = name, .value = value });
+    }
+
+    fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
+        const left_forced = try self.forceValue(left);
+        const right_forced = try self.forceValue(right);
+        if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
+            return Value.attrs(try self.heap.addMergedAttrs(left_forced.asObjectId(), right_forced.asObjectId()));
+        }
+        return right;
+    }
+
+    fn pathContextValue(self: *VM) !Value {
+        const entries = [_]heap_mod.AttrEntry{
+            .{ .name = try self.intern.intern("path"), .value = Value.boolVal(true) },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
     }
 
     // ---- closures ----

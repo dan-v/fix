@@ -45,6 +45,11 @@ pub const BuiltinClosure = struct {
     args: []const Value,
 };
 
+pub const ContextString = struct {
+    text: InternId,
+    context: []const AttrEntry,
+};
+
 const BuiltinClosureObject = struct {
     builtin_id: u16,
     args: ValueRange,
@@ -55,6 +60,11 @@ const ClosureObject = struct {
     upvalues: ValueRange,
 };
 
+const ContextStringObject = struct {
+    text: InternId,
+    context: AttrRange,
+};
+
 pub const Object = union(enum) {
     list: ValueRange,
     attrs: AttrRange,
@@ -62,6 +72,7 @@ pub const Object = union(enum) {
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
     cell: Cell,
+    context_string: ContextStringObject,
 };
 
 pub const ObjectHeap = struct {
@@ -183,6 +194,16 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn getContextString(self: *const ObjectHeap, id: ObjectId) !ContextString {
+        return switch (self.getConst(id).*) {
+            .context_string => |string| .{
+                .text = string.text,
+                .context = self.attrSlice(string.context),
+            },
+            else => error.InvalidObjectType,
+        };
+    }
+
     pub fn getThunk(self: *ObjectHeap, id: ObjectId) !*Thunk {
         return switch (self.get(id).*) {
             .thunk => |*thunk| thunk,
@@ -228,6 +249,14 @@ pub const ObjectHeap = struct {
         errdefer self.rollbackAttrs(range);
         try self.rejectDuplicateAttrs(range);
         return self.add(.{ .attrs = range });
+    }
+
+    pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
+        const range = try self.appendAttrs(context);
+        self.sortAttrs(range);
+        errdefer self.rollbackAttrs(range);
+        try self.rejectDuplicateAttrs(range);
+        return self.add(.{ .context_string = .{ .text = text, .context = range } });
     }
 
     pub fn addMergedAttrs(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {

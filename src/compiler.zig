@@ -231,7 +231,7 @@ pub const Compiler = struct {
             switch (part) {
                 .text => |text| try self.emitStringPart(text.bytes, &have_value),
                 .interpolation => |span| {
-                    try self.compileInterpolatedExpr(self.source[span.start..span.end], span.start);
+                    try self.compileInterpolatedExprToString(self.source[span.start..span.end], span.start);
                     if (have_value) try self.emitOp(.add_int);
                     have_value = true;
                 },
@@ -262,6 +262,20 @@ pub const Compiler = struct {
         const expr = try parser.parse();
         offsetNode(expr, source_offset);
         try self.compileNode(expr);
+    }
+
+    fn compileInterpolatedExprToString(self: *Compiler, expr_source: []const u8, source_offset: u32) !void {
+        var arena = ast.AstArena.init(self.allocator);
+        defer arena.deinit();
+
+        var parser = @import("parser.zig").Parser.init(self.allocator, &arena, expr_source);
+        defer parser.deinit();
+        const expr = try parser.parse();
+        offsetNode(expr, source_offset);
+
+        try self.builder.emitConstant(self.allocator, Value.builtin(@intFromEnum(builtins.BuiltinId.toString)));
+        try self.compileThunk(expr);
+        try self.emitOp(.call);
     }
 
     fn compilePath(self: *Compiler, node: *const Node) !void {

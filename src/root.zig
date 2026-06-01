@@ -131,7 +131,8 @@ test "end-to-end: string interpolation" {
     const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
     try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
 
-    try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
+    const numeric = try ev.evaluate("\"a${1}c\"");
+    try std.testing.expectEqualStrings("a1c", ev.intern.get(numeric.asInternId()));
 }
 
 test "end-to-end: nested interpolation in strings" {
@@ -605,7 +606,9 @@ test "end-to-end: builtins.toFile returns store-like string" {
     defer ev.deinit();
 
     const file_value = try ev.evaluate("builtins.toFile \"x y\" \"hello\"");
-    const text = ev.intern.get(file_value.asInternId());
+    try std.testing.expectEqual(value.ValueType.string_context, file_value.discriminant);
+    const string = try ev.heap.getContextString(file_value.asObjectId());
+    const text = ev.intern.get(string.text);
     try std.testing.expect(std.mem.startsWith(u8, text, "/nix/store/"));
     try std.testing.expect(std.mem.endsWith(u8, text, "-x-y"));
 

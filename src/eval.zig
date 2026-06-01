@@ -481,6 +481,10 @@ const ValuePrinter = struct {
             .float => try self.writer.print("{d}", .{value.asFloat()}),
             .string => try self.ev.writeQuotedString(self.writer, self.ev.intern.get(value.asInternId())),
             .path => try self.writer.writeAll(self.ev.intern.get(value.asInternId())),
+            .string_context => {
+                const string = try self.ev.heap.getContextString(value.asObjectId());
+                try self.ev.writeQuotedString(self.writer, self.ev.intern.get(string.text));
+            },
             .list => try self.writeList(value.asObjectId()),
             .attrs => try self.writeAttrs(value.asObjectId()),
             .closure => try self.writer.writeAll("<closure>"),
@@ -1658,6 +1662,37 @@ test "evaluate control and error builtins" {
     const broken = try renderForTest("builtins.break 42");
     defer std.testing.allocator.free(broken);
     try std.testing.expectEqualStrings("42", broken);
+}
+
+test "evaluate string context builtins" {
+    const drv_context = try renderForTest(
+        \\let d = builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\in builtins.hasContext (builtins.toString d)
+    );
+    defer std.testing.allocator.free(drv_context);
+    try std.testing.expectEqualStrings("true", drv_context);
+
+    const interpolated = try renderForTest(
+        \\let d = builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\in builtins.hasContext "${d}"
+    );
+    defer std.testing.allocator.free(interpolated);
+    try std.testing.expectEqualStrings("true", interpolated);
+
+    const discarded = try renderForTest(
+        \\let d = builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\in builtins.getContext (builtins.unsafeDiscardOutputDependency d.drvPath)
+    );
+    defer std.testing.allocator.free(discarded);
+    try std.testing.expect(std.mem.indexOf(u8, discarded, "path = true") != null);
+
+    const appended = try renderForTest(
+        \\builtins.hasContext (builtins.appendContext "x" {
+        \\  "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv" = { outputs = [ "out" ]; };
+        \\})
+    );
+    defer std.testing.allocator.free(appended);
+    try std.testing.expectEqualStrings("true", appended);
 }
 
 test "evaluate minimal derivation builtins" {

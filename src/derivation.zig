@@ -48,7 +48,7 @@ pub fn buildValue(
         },
         .{
             .name = try intern.intern("drvPath"),
-            .value = Value.path(spec.drv_path),
+            .value = try drvPathString(allocator, intern, heap, spec.drv_path),
         },
         .{
             .name = try intern.intern("outputs"),
@@ -59,7 +59,7 @@ pub fn buildValue(
     const default = outputByName(spec.outputs, spec.default_output) orelse return error.InvalidDerivationOutput;
     try entries.append(allocator, .{
         .name = try intern.intern("outPath"),
-        .value = Value.path(default.out_path),
+        .value = try outputPathString(allocator, intern, heap, spec.drv_path, default),
     });
 
     const output_values = try allocator.alloc(Value, spec.outputs.len);
@@ -135,7 +135,6 @@ fn buildOutputValue(
     spec: Spec,
     output: Output,
 ) !Value {
-    _ = allocator;
     const entries = [_]AttrEntry{
         .{
             .name = try intern.intern("type"),
@@ -147,11 +146,11 @@ fn buildOutputValue(
         },
         .{
             .name = try intern.intern("outPath"),
-            .value = Value.path(output.out_path),
+            .value = try outputPathString(allocator, intern, heap, spec.drv_path, output),
         },
         .{
             .name = try intern.intern("drvPath"),
-            .value = Value.path(spec.drv_path),
+            .value = try drvPathString(allocator, intern, heap, spec.drv_path),
         },
     };
     return Value.attrs(try heap.addAttrs(&entries));
@@ -166,6 +165,42 @@ fn outputNamesList(
     defer allocator.free(values);
     for (outputs, values) |output, *value| value.* = Value.string(output.name);
     return heap.addList(values);
+}
+
+fn drvPathString(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    heap: *ObjectHeap,
+    drv_path: InternId,
+) !Value {
+    const all_outputs = [_]AttrEntry{
+        .{ .name = try intern.intern("allOutputs"), .value = Value.boolVal(true) },
+    };
+    const context_value = Value.attrs(try heap.addAttrs(&all_outputs));
+    const context = [_]AttrEntry{
+        .{ .name = drv_path, .value = context_value },
+    };
+    _ = allocator;
+    return Value.contextString(try heap.addContextString(drv_path, &context));
+}
+
+fn outputPathString(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    heap: *ObjectHeap,
+    drv_path: InternId,
+    output: Output,
+) !Value {
+    const output_values = [_]Value{Value.string(output.name)};
+    const outputs = [_]AttrEntry{
+        .{ .name = try intern.intern("outputs"), .value = Value.list(try heap.addList(&output_values)) },
+    };
+    const context_value = Value.attrs(try heap.addAttrs(&outputs));
+    const context = [_]AttrEntry{
+        .{ .name = drv_path, .value = context_value },
+    };
+    _ = allocator;
+    return Value.contextString(try heap.addContextString(output.out_path, &context));
 }
 
 fn outputByName(outputs: []const Output, name: InternId) ?Output {
