@@ -1713,6 +1713,18 @@ test "evaluate control and error builtins" {
     defer std.testing.allocator.free(try_value);
     try std.testing.expectEqualStrings("false", try_value);
 
+    const try_attr_select = try renderForTest("(builtins.tryEval ((builtins.throw \"nope\").a)).success");
+    defer std.testing.allocator.free(try_attr_select);
+    try std.testing.expectEqualStrings("false", try_attr_select);
+
+    const try_attr_or = try renderForTest("(builtins.tryEval ((builtins.throw \"nope\").a or false)).success");
+    defer std.testing.allocator.free(try_attr_or);
+    try std.testing.expectEqualStrings("false", try_attr_or);
+
+    const try_after_failed_call = try renderForTest("let f = x: builtins.throw \"nope\"; in builtins.toJSON (builtins.tryEval (f 1))");
+    defer std.testing.allocator.free(try_after_failed_call);
+    try std.testing.expectEqualStrings("\"{\\\"success\\\":false,\\\"value\\\":false}\"", try_after_failed_call);
+
     const traced = try renderForTest("builtins.trace \"message\" 42");
     defer std.testing.allocator.free(traced);
     try std.testing.expectEqualStrings("42", traced);

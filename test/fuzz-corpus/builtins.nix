@@ -92,6 +92,8 @@ builtins.compareVersions "1.0pre" "1.0"
 builtins.splitVersion "1.0-beta2"
 (builtins.parseDrvName "foo-bar-1.2pre3").version
 (builtins.tryEval (builtins.throw "x")).success
+(builtins.tryEval ((builtins.throw "x").a)).success
+(builtins.tryEval ((builtins.throw "x").a or false)).success
 builtins.trace "x" 1
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).type
 (builtins.derivation { name = "pkg"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; }).dev.outputName

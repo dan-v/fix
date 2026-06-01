@@ -798,9 +798,7 @@ pub const VM = struct {
                 const closure_id = closure_val.asObjectId();
                 const closure = try self.getClosureById(closure_id);
                 const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-                const stop_depth = self.frames.items.len;
-                try self.pushFrame(ch, 0, closure_id);
-                return self.runUntil(stop_depth);
+                return self.runIsolatedFrame(ch, 0, closure_id);
             },
             .builtin_closure => {
                 const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());
@@ -1008,10 +1006,8 @@ pub const VM = struct {
             const closure_id = callee.asObjectId();
             const closure = try self.getClosureById(closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-            const stop_depth = self.frames.items.len;
             try self.push(arg);
-            try self.pushFrame(ch, 1, closure_id);
-            return self.runUntil(stop_depth);
+            return self.runIsolatedFrame(ch, 1, closure_id);
         }
         if (callee.discriminant == .builtin) {
             return self.applyBuiltin(callee.asBuiltinId(), &.{arg});
@@ -1024,6 +1020,20 @@ pub const VM = struct {
             return self.callValue(callable, arg);
         }
         return error.NotCallable;
+    }
+
+    fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) anyerror!Value {
+        const stop_depth = self.frames.items.len;
+        const base_sp = self.sp - arg_count;
+        self.pushFrame(ch, arg_count, closure_id) catch |err| {
+            self.sp = base_sp;
+            return err;
+        };
+        return self.runUntil(stop_depth) catch |err| {
+            self.frames.shrinkRetainingCapacity(stop_depth);
+            self.sp = base_sp;
+            return err;
+        };
     }
 
     fn callAttrFunctor(self: *VM, callee: Value) !Value {
@@ -1049,8 +1059,9 @@ pub const VM = struct {
     }
 
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
-        if (attrs_val.discriminant != .attrs) return error.TypeError;
-        return self.forceValue(try self.heap.getAttrValue(attrs_val.asObjectId(), name_id));
+        const attrs = try self.forceValue(attrs_val);
+        if (attrs.discriminant != .attrs) return error.TypeError;
+        return self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
     }
 
     fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
