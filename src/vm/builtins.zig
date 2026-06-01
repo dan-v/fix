@@ -349,13 +349,17 @@ fn builtinToJSON(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
-    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
-    defer seen.deinit(self.allocator);
-
-    try writeJsonValue(self, &out.writer, arg, &seen);
+    try writeJsonValue(self, &out.writer, arg);
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
     return Value.string(try self.intern.intern(text));
+}
+
+pub fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+    defer seen.deinit(self.allocator);
+
+    try writeJsonValueInner(self, writer, value, &seen);
 }
 
 const SeenJsonKind = enum { list, attrs };
@@ -365,7 +369,7 @@ const SeenJsonObject = struct {
     id: ObjectId,
 };
 
-fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
+fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
     const forced = try self.forceValue(value);
     switch (forced.discriminant) {
         .null => try writer.writeAll("null"),
@@ -414,7 +418,7 @@ fn writeJsonList(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std
     try writer.writeByte('[');
     for (try self.heap.getList(id), 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeJsonValue(self, writer, item, seen);
+        try writeJsonValueInner(self, writer, item, seen);
     }
     try writer.writeByte(']');
 }
@@ -431,7 +435,7 @@ fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *st
         if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.encodeJsonString(self.intern.get(entry.name), .{}, writer);
         try writer.writeByte(':');
-        try writeJsonValue(self, writer, entry.value, seen);
+        try writeJsonValueInner(self, writer, entry.value, seen);
     }
     try writer.writeByte('}');
 }

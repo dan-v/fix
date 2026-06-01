@@ -210,7 +210,14 @@ pub const Evaluator = struct {
         const chunk_id = try self.registry.register(chunk);
 
         // 3. Evaluate via a VM.
-        var vm = try VM.init(
+        var vm = try self.initVm(0);
+        defer vm.deinit();
+
+        return vm.eval(chunk_id);
+    }
+
+    fn initVm(self: *Evaluator, worker_id: u8) !VM {
+        return VM.init(
             self.runtime_arena.allocator(),
             &self.registry,
             &self.intern,
@@ -220,11 +227,15 @@ pub const Evaluator = struct {
             &self.scheduler,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
-            0,
+            worker_id,
         );
+    }
+
+    pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        var vm = try self.initVm(0);
         defer vm.deinit();
 
-        return vm.eval(chunk_id);
+        try vm.writeJsonValue(writer, value);
     }
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {

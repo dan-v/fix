@@ -137,6 +137,10 @@ pub const VM = struct {
         return self.forceValue(try self.heap.getListItem(list_val.asObjectId(), index));
     }
 
+    pub fn writeJsonValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
+        try vm_builtins.writeJsonValue(self, writer, value);
+    }
+
     // ---- frame management ----
 
     fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) !void {
