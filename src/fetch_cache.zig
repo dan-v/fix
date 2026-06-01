@@ -33,6 +33,12 @@ pub const FetchCache = struct {
         name: []const u8 = "source",
     };
 
+    pub const MercurialSpec = struct {
+        url: []const u8,
+        name: []const u8 = "source",
+        rev: ?[]const u8 = null,
+    };
+
     pub const UrlResult = struct {
         path: []u8,
         hash: []u8,
@@ -58,6 +64,20 @@ pub const FetchCache = struct {
             allocator.free(self.rev);
             allocator.free(self.short_rev);
             allocator.free(self.last_modified_date);
+            allocator.free(self.nar_hash);
+        }
+    };
+
+    pub const MercurialResult = struct {
+        out_path: []u8,
+        rev: []u8,
+        short_rev: []u8,
+        nar_hash: []u8,
+
+        pub fn deinit(self: MercurialResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.out_path);
+            allocator.free(self.rev);
+            allocator.free(self.short_rev);
             allocator.free(self.nar_hash);
         }
     };
@@ -116,6 +136,13 @@ pub const FetchCache = struct {
         return out_path;
     }
 
+    pub fn fetchMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec) !MercurialResult {
+        if (localFetchPath(spec.url)) |path| {
+            return self.localMercurial(files, path, spec);
+        }
+        return self.remoteMercurial(files, spec);
+    }
+
     fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8) ![]u8 {
         if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
 
@@ -167,6 +194,33 @@ pub const FetchCache = struct {
         const rev = try self.gitOneLine(&.{ "git", "-C", path, "rev-parse", "HEAD" });
         errdefer self.allocator.free(rev);
         return self.gitResult(path, rev, spec.submodules, true);
+    }
+
+    fn localMercurial(self: *FetchCache, files: *FileCache, path: []const u8, spec: MercurialSpec) !MercurialResult {
+        const rev = if (spec.rev) |r| try self.allocator.dupe(u8, r) else try self.localMercurialRevision(files, path) orelse try self.allocator.dupe(u8, "");
+        defer self.allocator.free(rev);
+        return self.mercurialResult(path, rev);
+    }
+
+    fn remoteMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec) !MercurialResult {
+        const io = self.io orelse return error.FetchIoUnavailable;
+        const path = try self.remoteMercurialPath(io, spec);
+        defer self.allocator.free(path);
+
+        const hg_dir = try std.fs.path.join(self.allocator, &.{ path, ".hg" });
+        defer self.allocator.free(hg_dir);
+        if (!try files.pathExists(hg_dir)) {
+            try std.Io.Dir.cwd().createDirPath(io, path);
+            try self.runCommandDiscard(&.{ "hg", "clone", spec.url, path });
+        }
+
+        if (spec.rev) |rev| {
+            try self.runCommandDiscard(&.{ "hg", "--cwd", path, "update", "--rev", rev });
+        }
+
+        const rev = try self.commandOneLine(&.{ "hg", "--cwd", path, "id", "--id" });
+        defer self.allocator.free(rev);
+        return self.mercurialResult(path, stripMercurialDirtySuffix(rev));
     }
 
     fn gitResult(self: *FetchCache, path: []const u8, rev: []u8, submodules: bool, query_git: bool) !GitResult {
@@ -225,6 +279,20 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "git", digest[0..32] });
     }
 
+    fn remoteMercurialPath(self: *FetchCache, io: std.Io, spec: MercurialSpec) ![]u8 {
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        defer key.deinit(self.allocator);
+        try key.appendSlice(self.allocator, spec.url);
+        try key.append(self.allocator, 0);
+        if (spec.rev) |rev| try key.appendSlice(self.allocator, rev);
+
+        const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
+        defer self.allocator.free(digest);
+        const cwd = try std.process.currentPathAlloc(io, self.allocator);
+        defer self.allocator.free(cwd);
+        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "hg", digest[0..32] });
+    }
+
     fn urlCachePath(self: *FetchCache, io: std.Io, name: []const u8, hash: []const u8) ![]u8 {
         const cwd = try std.process.currentPathAlloc(io, self.allocator);
         defer self.allocator.free(cwd);
@@ -241,7 +309,7 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "tarball", hash[0..32], clean_name });
     }
 
-    fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {
+    pub fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {
         var key: std.ArrayListUnmanaged(u8) = .empty;
         defer key.deinit(self.allocator);
         try key.appendSlice(self.allocator, path);
@@ -250,6 +318,33 @@ pub const FetchCache = struct {
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
         return std.fmt.allocPrint(self.allocator, "sha256-{s}", .{digest});
+    }
+
+    fn mercurialResult(self: *FetchCache, path: []const u8, rev: []const u8) !MercurialResult {
+        const clean_rev = stripMercurialDirtySuffix(rev);
+        const short_len = @min(clean_rev.len, 12);
+        const short_rev = try self.allocator.dupe(u8, clean_rev[0..short_len]);
+        errdefer self.allocator.free(short_rev);
+
+        const nar_hash = try self.sourceHash(path, clean_rev);
+        errdefer self.allocator.free(nar_hash);
+
+        return .{
+            .out_path = try self.allocator.dupe(u8, path),
+            .rev = try self.allocator.dupe(u8, clean_rev),
+            .short_rev = short_rev,
+            .nar_hash = nar_hash,
+        };
+    }
+
+    fn localMercurialRevision(self: *FetchCache, files: *FileCache, repo_path: []const u8) !?[]u8 {
+        const hg_dir = try std.fs.path.join(self.allocator, &.{ repo_path, ".hg" });
+        defer self.allocator.free(hg_dir);
+        if (!try files.pathExists(hg_dir)) return null;
+        if (self.io == null) return null;
+        const rev = self.commandOneLine(&.{ "hg", "--cwd", repo_path, "id", "--id" }) catch return null;
+        defer self.allocator.free(rev);
+        return try self.allocator.dupe(u8, stripMercurialDirtySuffix(rev));
     }
 
     fn localGitRevision(self: *FetchCache, files: *FileCache, repo_path: []const u8) !?[]u8 {
@@ -297,6 +392,10 @@ pub const FetchCache = struct {
     }
 
     fn gitOneLine(self: *FetchCache, argv: []const []const u8) ![]u8 {
+        return self.commandOneLine(argv);
+    }
+
+    fn commandOneLine(self: *FetchCache, argv: []const []const u8) ![]u8 {
         const result = try self.runGit(argv, null);
         defer self.allocator.free(result.stderr);
         defer self.allocator.free(result.stdout);
@@ -358,4 +457,9 @@ fn localFetchPath(url: []const u8) ?[]const u8 {
     if (std.fs.path.isAbsolute(url)) return url;
     if (std.mem.startsWith(u8, url, "file://")) return url["file://".len..];
     return null;
+}
+
+fn stripMercurialDirtySuffix(rev: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, rev, "+")) return rev[0 .. rev.len - 1];
+    return rev;
 }

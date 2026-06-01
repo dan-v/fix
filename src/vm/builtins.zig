@@ -129,13 +129,12 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .fetchGit => builtinFetchGit(self, args[0]),
         .fetchurl => builtinFetchurl(self, args[0]),
         .fetchTarball => builtinFetchTarball(self, args[0]),
+        .fetchTree => builtinFetchTree(self, args[0]),
         .parseFlakeRef => builtinParseFlakeRef(self, args[0]),
         .flakeRefToString => builtinFlakeRefToString(self, args[0]),
-        .fetchMercurial,
-        .fetchTree,
-        .getFlake,
-        .scopedImport,
-        => unsupportedBuiltin(id),
+        .fetchMercurial => builtinFetchMercurial(self, args[0]),
+        .getFlake => builtinGetFlake(self, args[0]),
+        .scopedImport => builtinScopedImport(self, args[0], args[1]),
         .traceVerbose => builtinTraceVerbose(self, args[0], args[1]),
         .addErrorContext => self.forceValue(args[1]),
         .unsafeDiscardStringContext,
@@ -150,11 +149,6 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .toFile => builtinToFile(self, args[0], args[1]),
         .placeholder => builtinPlaceholder(self, args[0]),
     };
-}
-
-fn unsupportedBuiltin(id: BuiltinId) !Value {
-    _ = id;
-    return error.UnsupportedBuiltin;
 }
 
 fn makeBuiltinClosure(self: anytype, builtin_id: u16, args: []const Value) !Value {
@@ -781,6 +775,13 @@ fn builtinImport(self: anytype, arg: Value) !Value {
     return host.import_value(host.context, try pathArg(self, arg));
 }
 
+fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Value {
+    const scope = try self.forceValue(scope_arg);
+    if (scope.discriminant != .attrs) return error.TypeError;
+    const host = self.import_host orelse return error.ImportUnavailable;
+    return host.scoped_import(host.context, scope, try pathArg(self, path_arg));
+}
+
 fn builtinReadDir(self: anytype, arg: Value) !Value {
     const dir_entries = try self.files.readDir(try pathArg(self, arg));
     var attrs: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -1333,7 +1334,10 @@ fn builtinFetchGit(self: anytype, arg: Value) !Value {
 
     const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
+    return gitResultValue(self, result);
+}
 
+fn gitResultValue(self: anytype, result: fetch_cache.FetchCache.GitResult) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(result.last_modified) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(result.last_modified_date)) },
@@ -1343,6 +1347,24 @@ fn builtinFetchGit(self: anytype, arg: Value) !Value {
         .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) },
         .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
         .{ .name = try self.intern.intern("submodules"), .value = Value.boolVal(result.submodules) },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
+fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
+fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
@@ -1361,7 +1383,10 @@ fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
         };
     }
 
-    const attrs_id = value.asObjectId();
+    return fetchGitSpecFromAttrs(self, value.asObjectId());
+}
+
+fn fetchGitSpecFromAttrs(self: anytype, attrs_id: ObjectId) !FetchGitSpec {
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
@@ -1415,10 +1440,16 @@ fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
         };
     }
 
-    const attrs_id = value.asObjectId();
+    return fetchUrlSpecFromAttrs(self, value.asObjectId(), null);
+}
+
+fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]const u8) !FetchUrlSpec {
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
-    const name = try optionalStringAttr(self, attrs_id, "name") orelse try defaultFetchName(self, url);
+    const name = try optionalStringAttr(self, attrs_id, "name") orelse if (default_name) |name|
+        try self.allocator.dupe(u8, name)
+    else
+        try defaultFetchName(self, url);
     return .{ .url = url, .name = name };
 }
 
@@ -1429,6 +1460,255 @@ fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
     defer self.fetchers.allocator.free(path);
     return Value.string(try self.intern.intern(path));
+}
+
+const FetchMercurialSpec = struct {
+    url: []u8,
+    name: []u8,
+    rev: ?[]u8,
+
+    fn deinit(self: FetchMercurialSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.name);
+        if (self.rev) |rev| allocator.free(rev);
+    }
+
+    fn borrowed(self: FetchMercurialSpec) fetch_cache.FetchCache.MercurialSpec {
+        return .{ .url = self.url, .name = self.name, .rev = self.rev };
+    }
+};
+
+fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
+    const spec = try fetchMercurialSpec(self, arg);
+    defer spec.deinit(self.allocator);
+
+    const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
+    defer result.deinit(self.fetchers.allocator);
+
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
+        .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
+        .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
+fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
+    const value = try self.forceValue(arg);
+    if (value.discriminant != .attrs) {
+        const url = try self.allocator.dupe(u8, try pathArg(self, value));
+        errdefer self.allocator.free(url);
+        return .{
+            .url = url,
+            .name = try self.allocator.dupe(u8, "source"),
+            .rev = null,
+        };
+    }
+
+    return fetchMercurialSpecFromAttrs(self, value.asObjectId());
+}
+
+fn fetchMercurialSpecFromAttrs(self: anytype, attrs_id: ObjectId) !FetchMercurialSpec {
+    const url = try dupPathAttr(self, attrs_id, "url");
+    errdefer self.allocator.free(url);
+    const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
+    errdefer self.allocator.free(name);
+    const rev = try optionalStringAttr(self, attrs_id, "rev");
+    errdefer if (rev) |owned| self.allocator.free(owned);
+
+    return .{ .url = url, .name = name, .rev = rev };
+}
+
+const GithubTreeSpec = struct {
+    url: []u8,
+    name: []u8,
+    rev: ?[]u8,
+
+    fn deinit(self: GithubTreeSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.name);
+        if (self.rev) |rev| allocator.free(rev);
+    }
+};
+
+fn githubTreeSpec(self: anytype, attrs_id: ObjectId) !GithubTreeSpec {
+    const owner = try requiredStringAttr(self, attrs_id, "owner");
+    defer self.allocator.free(owner);
+    const repo = try requiredStringAttr(self, attrs_id, "repo");
+    defer self.allocator.free(repo);
+    const rev = try optionalStringAttr(self, attrs_id, "rev") orelse try optionalStringAttr(self, attrs_id, "ref");
+    errdefer if (rev) |owned| self.allocator.free(owned);
+    const archive_ref = rev orelse "HEAD";
+    const url = try std.fmt.allocPrint(self.allocator, "https://github.com/{s}/{s}/archive/{s}.tar.gz", .{ owner, repo, archive_ref });
+    errdefer self.allocator.free(url);
+    const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
+    return .{ .url = url, .name = name, .rev = rev };
+}
+
+fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?[]const u8) !Value {
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    try entries.appendSlice(self.allocator, &.{
+        .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
+        .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
+    });
+    if (rev) |value| {
+        try appendStringAttr(self, &entries, "rev", value);
+        try appendStringAttr(self, &entries, "shortRev", value[0..@min(value.len, 7)]);
+    }
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+fn builtinFetchTree(self: anytype, arg: Value) !Value {
+    const attrs = try self.forceValue(arg);
+    if (attrs.discriminant == .path) {
+        const path = self.intern.get(attrs.asInternId());
+        const nar_hash = try self.fetchers.sourceHash(path, "");
+        defer self.fetchers.allocator.free(nar_hash);
+        return pathTreeValue(self, path, nar_hash);
+    }
+    if (attrs.discriminant == .string) {
+        const parsed = try builtinParseFlakeRef(self, attrs);
+        return builtinFetchTree(self, parsed);
+    }
+    if (attrs.discriminant != .attrs) return error.TypeError;
+
+    const attrs_id = attrs.asObjectId();
+    const type_value = try requiredStringAttr(self, attrs_id, "type");
+    defer self.allocator.free(type_value);
+
+    if (std.mem.eql(u8, type_value, "path")) {
+        const path = try dupPathAttr(self, attrs_id, "path");
+        defer self.allocator.free(path);
+        const nar_hash = try self.fetchers.sourceHash(path, "");
+        defer self.fetchers.allocator.free(nar_hash);
+        return pathTreeValue(self, path, nar_hash);
+    }
+
+    if (std.mem.eql(u8, type_value, "file")) {
+        const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
+        defer spec.deinit(self.allocator);
+        const result = try self.fetchers.fetchUrl(self.files, spec.borrowed());
+        defer result.deinit(self.fetchers.allocator);
+        return fileTreeValue(self, result.path, result.hash);
+    }
+
+    if (std.mem.eql(u8, type_value, "tarball")) {
+        const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
+        defer spec.deinit(self.allocator);
+        const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+        defer self.fetchers.allocator.free(path);
+        const nar_hash = try self.fetchers.sourceHash(path, "");
+        defer self.fetchers.allocator.free(nar_hash);
+        return pathTreeValue(self, path, nar_hash);
+    }
+
+    if (std.mem.eql(u8, type_value, "git")) {
+        const spec = try fetchGitSpecFromAttrs(self, attrs_id);
+        defer spec.deinit(self.allocator);
+        const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
+        defer result.deinit(self.fetchers.allocator);
+        return gitResultValue(self, result);
+    }
+
+    if (std.mem.eql(u8, type_value, "github")) {
+        const spec = try githubTreeSpec(self, attrs_id);
+        defer spec.deinit(self.allocator);
+        const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+        defer self.fetchers.allocator.free(path);
+        const nar_hash = try self.fetchers.sourceHash(path, spec.rev orelse "");
+        defer self.fetchers.allocator.free(nar_hash);
+        return githubTreeValue(self, path, nar_hash, spec.rev);
+    }
+
+    if (std.mem.eql(u8, type_value, "mercurial")) {
+        const spec = try fetchMercurialSpecFromAttrs(self, attrs_id);
+        defer spec.deinit(self.allocator);
+        const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
+        defer result.deinit(self.fetchers.allocator);
+        const entries = [_]heap_mod.AttrEntry{
+            .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
+            .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
+            .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
+            .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
+        };
+        return Value.attrs(try self.heap.addAttrs(&entries));
+    }
+
+    return error.InvalidFlakeRef;
+}
+
+fn builtinGetFlake(self: anytype, arg: Value) !Value {
+    const ref = try stringArg(self, arg);
+    const ref_value = Value.string(try self.intern.intern(ref));
+    const source_info = try builtinFetchTree(self, try builtinParseFlakeRef(self, ref_value));
+    const out_path = try requiredStringAttr(self, source_info.asObjectId(), "outPath");
+    defer self.allocator.free(out_path);
+
+    const flake_path = try std.fs.path.join(self.allocator, &.{ out_path, "flake.nix" });
+    defer self.allocator.free(flake_path);
+
+    const host = self.import_host orelse return error.ImportUnavailable;
+    const flake_value = try self.forceValue(try host.import_value(host.context, flake_path));
+    if (flake_value.discriminant != .attrs) return error.TypeError;
+
+    const outputs_id = try self.intern.intern("outputs");
+    const outputs_func = try self.forceValue(try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
+    const self_input = try flakeSelfInput(self, source_info);
+    const inputs_entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("self"), .value = self_input },
+    };
+    const inputs = Value.attrs(try self.heap.addAttrs(&inputs_entries));
+    const outputs = try self.forceValue(try self.callValue(outputs_func, inputs));
+    if (outputs.discriminant != .attrs) return error.TypeError;
+
+    return flakeResultValue(self, source_info, inputs, outputs);
+}
+
+fn flakeSelfInput(self: anytype, source_info: Value) !Value {
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
+    try appendExistingAttr(self, &entries, source_info.asObjectId(), "outPath");
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("sourceInfo"), .value = source_info });
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+fn flakeResultValue(self: anytype, source_info: Value, inputs: Value, outputs: Value) !Value {
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("inputs"), .value = inputs });
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("outputs"), .value = outputs });
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("sourceInfo"), .value = source_info });
+
+    const source_attrs_id = source_info.asObjectId();
+    try appendExistingAttr(self, &entries, source_attrs_id, "lastModified");
+    try appendExistingAttr(self, &entries, source_attrs_id, "lastModifiedDate");
+    try appendExistingAttr(self, &entries, source_attrs_id, "narHash");
+    try appendExistingAttr(self, &entries, source_attrs_id, "outPath");
+    try appendExistingAttr(self, &entries, source_attrs_id, "rev");
+    try appendExistingAttr(self, &entries, source_attrs_id, "shortRev");
+
+    for (try self.heap.getAttrs(outputs.asObjectId())) |entry| {
+        if (attrEntryNameIndex(entries.items, entry.name) == null) {
+            try entries.append(self.allocator, entry);
+        }
+    }
+    return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+fn appendExistingAttr(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), attrs_id: ObjectId, name: []const u8) !void {
+    const name_id = try self.intern.intern(name);
+    const value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
+        error.MissingAttribute => return,
+        else => return err,
+    };
+    try entries.append(self.allocator, .{ .name = name_id, .value = value });
 }
 
 fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
@@ -1456,6 +1736,12 @@ fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
         const path = if (query_start) |i| rest[0..i] else rest;
         try appendStringAttr(self, &entries, "path", path);
         if (query_start) |i| try appendFlakeQueryAttrs(self, &entries, rest[i + 1 ..]);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    if (std.fs.path.isAbsolute(ref)) {
+        try appendStringAttr(self, &entries, "type", "path");
+        try appendStringAttr(self, &entries, "path", ref);
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
 

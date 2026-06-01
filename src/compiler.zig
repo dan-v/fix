@@ -18,6 +18,7 @@ const diagnostic = @import("diagnostic.zig");
 const builtins = @import("builtins.zig");
 const string_syntax = @import("string_syntax.zig");
 const Diagnostic = diagnostic.Diagnostic;
+const Value = @import("value.zig").Value;
 
 const InternId = types.InternId;
 
@@ -101,6 +102,28 @@ pub const Compiler = struct {
 
     pub fn compile(self: *Compiler, node: *const Node) !void {
         try self.compileNode(node);
+    }
+
+    pub fn compileWithScope(self: *Compiler, node: *const Node, scope: ?Value) !void {
+        if (scope) |scope_value| {
+            try self.compileAmbientScope(node, scope_value);
+        } else {
+            try self.compileNode(node);
+        }
+    }
+
+    fn compileAmbientScope(self: *Compiler, node: *const Node, scope_value: Value) !void {
+        self.beginScope();
+
+        const scope_slot = try self.declareLocal("", try self.intern.intern(""));
+        try self.builder.emitConstant(self.allocator, scope_value);
+        try self.emitOpByte(.set_local, @intCast(scope_slot));
+        try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
+
+        try self.compileNode(node);
+
+        _ = self.with_scopes.pop();
+        self.endScope();
     }
 
     fn compileNode(self: *Compiler, node: *const Node) anyerror!void {

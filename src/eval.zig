@@ -160,10 +160,10 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         self.clearDiagnostics();
-        return self.evaluateSource(source, self.base_path);
+        return self.evaluateSource(source, self.base_path, null);
     }
 
-    fn evaluateSource(self: *Evaluator, source: []const u8, base_path: ?[]const u8) !Value {
+    fn evaluateSource(self: *Evaluator, source: []const u8, base_path: ?[]const u8, scope: ?Value) !Value {
         // 1. Parse into AST.
         var arena = @import("ast.zig").AstArena.init(self.allocator);
         defer arena.deinit();
@@ -189,7 +189,7 @@ pub const Evaluator = struct {
         compiler.base_path = base_path;
         defer compiler.deinit();
 
-        compiler.compile(ast_node) catch |err| {
+        compiler.compileWithScope(ast_node, scope) catch |err| {
             try self.copyDiagnostics(compiler.diagnostics.items);
             if (preserveCompileError(err)) return err;
             return error.CompileError;
@@ -211,7 +211,7 @@ pub const Evaluator = struct {
             &self.files,
             &self.fetchers,
             &self.scheduler,
-            .{ .context = self, .import_value = importValue, .find_file = findFile, .get_env = getEnv },
+            .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             0,
         );
@@ -223,6 +223,11 @@ pub const Evaluator = struct {
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.importPath(path);
+    }
+
+    fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8) anyerror!Value {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        return self.scopedImportPath(scope, path);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
@@ -281,9 +286,33 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base);
+        const value = try self.evaluateSource(source, source_base, null);
         try self.cacheImportValue(stable_path, value);
         return value;
+    }
+
+    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8) !Value {
+        const resolved = try self.resolveHostPath(path);
+        defer if (resolved.owned) self.allocator.free(resolved.text);
+        return self.scopedImportResolvedPath(scope, resolved.text);
+    }
+
+    fn scopedImportResolvedPath(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
+        const stable_path = try self.allocator.dupe(u8, path);
+        defer self.allocator.free(stable_path);
+
+        const progress_key = try self.beginImport(stable_path);
+        defer self.endImport(progress_key);
+
+        const source = if (corepkgsSource(stable_path)) |core_source|
+            core_source
+        else
+            self.files.readFile(stable_path) catch |err| switch (err) {
+                error.IsDir => return self.scopedImportDirectory(scope, stable_path),
+                else => return err,
+            };
+        const source_base = std.fs.path.dirname(stable_path) orelse "/";
+        return self.evaluateSource(source, source_base, scope);
     }
 
     fn corepkgsSource(path: []const u8) ?[]const u8 {
@@ -319,6 +348,12 @@ pub const Evaluator = struct {
         const value = try self.importResolvedPath(default_path);
         try self.cacheImportValue(path, value);
         return value;
+    }
+
+    fn scopedImportDirectory(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
+        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
+        defer self.allocator.free(default_path);
+        return self.scopedImportResolvedPath(scope, default_path);
     }
 
     fn cacheImportValue(self: *Evaluator, path: []const u8, value: Value) !void {
@@ -1146,6 +1181,44 @@ test "evaluate fetchTarball builtin through fetch cache" {
     try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
 }
 
+test "evaluate fetchTree builtin through fetch cache" {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "payload.txt",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const path_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.fetchTree {{ type = \"path\"; path = \"{s}\"; }}).outPath", .{cwd});
+    defer std.testing.allocator.free(path_source);
+    const file_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.readFile (builtins.fetchTree {{ type = \"file\"; url = \"file://{s}\"; }}).outPath", .{file_path});
+    defer std.testing.allocator.free(file_source);
+    const git_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.stringLength (builtins.fetchTree {{ type = \"git\"; url = \"{s}\"; }}).shortRev", .{cwd});
+    defer std.testing.allocator.free(git_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const out_path = try ev.evaluate(path_source);
+    try std.testing.expectEqualStrings(cwd, ev.intern.get(out_path.asInternId()));
+
+    const contents = try ev.evaluate(file_source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+
+    const short_rev_len = try ev.evaluate(git_source);
+    try std.testing.expectEqual(@as(i64, 7), short_rev_len.asInt());
+}
+
 test "evaluate flake ref builtins" {
     const github = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"github:NixOS/nixpkgs/nixos-unstable\")");
     defer std.testing.allocator.free(github);
@@ -1158,6 +1231,43 @@ test "evaluate flake ref builtins" {
     const stringified = try renderForTest("builtins.flakeRefToString { type = \"github\"; owner = \"NixOS\"; repo = \"nixpkgs\"; ref = \"nixos-unstable\"; }");
     defer std.testing.allocator.free(stringified);
     try std.testing.expectEqualStrings("\"github:NixOS/nixpkgs/nixos-unstable\"", stringified);
+}
+
+test "evaluate getFlake builtin for local path ref" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "flake.nix",
+        .data =
+        \\{
+        \\  outputs = inputs: {
+        \\    value = 7;
+        \\    source = inputs.self.outPath;
+        \\  };
+        \\}
+        ,
+    });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const flake_dir = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(flake_dir);
+
+    const value_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").value", .{flake_dir});
+    defer std.testing.allocator.free(value_source);
+    const output_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").outputs.value", .{flake_dir});
+    defer std.testing.allocator.free(output_source);
+    const self_source = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").source", .{flake_dir});
+    defer std.testing.allocator.free(self_source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    try std.testing.expectEqual(@as(i64, 7), (try ev.evaluate(value_source)).asInt());
+    try std.testing.expectEqual(@as(i64, 7), (try ev.evaluate(output_source)).asInt());
+    const self_path = try ev.evaluate(self_source);
+    try std.testing.expectEqualStrings(flake_dir, ev.intern.get(self_path.asInternId()));
 }
 
 test "evaluate findFile builtin through explicit search path" {
@@ -1269,6 +1379,27 @@ test "evaluate directory import through default nix" {
 
     const imported = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 9), imported.asInt());
+}
+
+test "evaluate scopedImport through ambient scope" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scope.nix", .data = "x + y\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "scope.nix" });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "builtins.scopedImport {{ x = 1; y = 2; }} {s}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const imported = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 3), imported.asInt());
 }
 
 test "detect recursive imports" {

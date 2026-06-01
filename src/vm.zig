@@ -48,6 +48,7 @@ pub const Frame = struct {
 pub const ImportHost = struct {
     context: *anyopaque,
     import_value: *const fn (*anyopaque, []const u8) anyerror!Value,
+    scoped_import: *const fn (*anyopaque, Value, []const u8) anyerror!Value,
     find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
     get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
 };
