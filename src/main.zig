@@ -7,17 +7,25 @@ const diagnostic = @import("diagnostic.zig");
 const Evaluator = eval.Evaluator;
 
 const usage =
-    \\usage: fix [--json] (<expression> | -e <expression> | --file <path>)
+    \\usage: fix [options] (<expression> | -e <expression> | --file <path>)
     \\
     \\options:
-    \\  --json        write the evaluated value as JSON
-    \\  -h, --help    show this help
+    \\  --json                 write the evaluated value as JSON
+    \\  --color[=when]         color diagnostics: auto, always, never
+    \\  --no-color             disable color diagnostics
+    \\  -h, --help             show this help
     \\
 ;
 
 const OutputFormat = enum {
     nix,
     json,
+};
+
+const ColorMode = enum {
+    auto,
+    always,
+    never,
 };
 
 const SourceArg = union(enum) {
@@ -27,6 +35,7 @@ const SourceArg = union(enum) {
 
 const Options = struct {
     output: OutputFormat = .nix,
+    color: ColorMode = .auto,
     source: ?SourceArg = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
@@ -62,6 +71,8 @@ pub fn main(init: std.process.Init) !void {
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
+    const use_color = shouldColor(options.color, init.io, init.environ_map);
+    if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
 
     const source_arg = options.source orelse {
         std.debug.print("{s}", .{usage});
@@ -77,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
         if (ev.getDiagnostics().len > 0) {
             var stderr_buffer: [1024]u8 = undefined;
             var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
-            try diagnostic.writeAll(&stderr.interface, source.text, ev.getDiagnostics());
+            try diagnostic.writeAllWithOptions(&stderr.interface, source.text, ev.getDiagnostics(), .{ .color = use_color });
             try stderr.interface.flush();
         } else {
             std.debug.print("Evaluation error: {s}\n", .{@errorName(err)});
@@ -115,6 +126,12 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
             options.output = .json;
+        } else if (std.mem.eql(u8, arg, "--color")) {
+            options.color = .always;
+        } else if (std.mem.startsWith(u8, arg, "--color=")) {
+            options.color = parseColorMode(arg["--color=".len..]) orelse return error.InvalidColorMode;
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            options.color = .never;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -137,7 +154,31 @@ fn optionErrorMessage(err: anyerror) []const u8 {
         error.MissingExpression => "missing expression after -e",
         error.MissingPath => "missing path after --file",
         error.TooManySources => "provide only one expression or file",
+        error.InvalidColorMode => "expected --color to be auto, always, or never",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };
+}
+
+fn parseColorMode(text: []const u8) ?ColorMode {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
+    if (std.mem.eql(u8, text, "always")) return .always;
+    if (std.mem.eql(u8, text, "never")) return .never;
+    return null;
+}
+
+fn shouldColor(mode: ColorMode, io: std.Io, env: *const std.process.Environ.Map) bool {
+    return switch (mode) {
+        .always => true,
+        .never => false,
+        .auto => autoColor(io, env),
+    };
+}
+
+fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
+    if (env.get("NO_COLOR")) |_| return false;
+    if (env.get("TERM")) |term| {
+        if (std.mem.eql(u8, term, "dumb")) return false;
+    }
+    return std.Io.File.stderr().isTty(io) catch false;
 }
