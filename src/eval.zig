@@ -814,6 +814,14 @@ test "evaluate primitive path and metadata builtins" {
     defer std.testing.allocator.free(string_dir);
     try std.testing.expectEqualStrings("\"foo\"", string_dir);
 
+    const to_path_type = try renderForTest("builtins.typeOf (builtins.toPath /foo/bar)");
+    defer std.testing.allocator.free(to_path_type);
+    try std.testing.expectEqualStrings("\"string\"", to_path_type);
+
+    const to_path_is_path = try renderForTest("builtins.isPath (builtins.toPath /foo/bar)");
+    defer std.testing.allocator.free(to_path_is_path);
+    try std.testing.expectEqualStrings("false", to_path_is_path);
+
     const path_dir = try renderForTest("builtins.dirOf /foo/bar");
     defer std.testing.allocator.free(path_dir);
     try std.testing.expectEqualStrings("/foo", path_dir);

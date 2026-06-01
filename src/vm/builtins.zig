@@ -1382,11 +1382,13 @@ fn builtinGetEnv(self: anytype, name_arg: Value) !Value {
 
 fn builtinToPath(self: anytype, arg: Value) !Value {
     const value = try self.forceValue(arg);
-    return switch (value.discriminant) {
-        .path => value,
-        .string, .string_context => Value.path(try stringTextInternId(self, value)),
-        else => error.TypeError,
+    const text_id: InternId = switch (value.discriminant) {
+        .path, .string, .string_context => try stringTextInternId(self, value),
+        else => return error.TypeError,
     };
+    if (!std.fs.path.isAbsolute(self.intern.get(text_id))) return error.RelativePath;
+    if (value.discriminant == .string_context) return value;
+    return Value.string(text_id);
 }
 
 fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {

@@ -37,6 +37,8 @@ builtins.floor (-1.2)
 builtins.ceil (-1.8)
 builtins.baseNameOf /foo/bar
 builtins.dirOf /foo/bar
+builtins.typeOf (builtins.toPath /foo/bar)
+builtins.isPath (builtins.toPath /foo/bar)
 builtins.true
 builtins.false
 builtins.null
