@@ -852,7 +852,7 @@ pub const Compiler = struct {
     }
 
     fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
-        if (recursive) return error.UnsupportedDynamicAttribute;
+        if (recursive) return self.compileMixedRecursiveAttrSet(entries);
 
         const static_count = self.staticAttrEntryCount(entries);
         if (static_count > 0) {
@@ -881,6 +881,50 @@ pub const Compiler = struct {
             try self.emitOpU16(.build_attrs, 1);
             try self.emitOp(.merge_attrs);
         }
+    }
+
+    fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry) !void {
+        const static_count = self.staticAttrEntryCount(entries);
+        const static_entries = try self.allocator.alloc(Node.AttrSetEntry, static_count);
+        defer self.allocator.free(static_entries);
+
+        var static_i: usize = 0;
+        for (entries) |entry| {
+            if (entry.dynamic_name == null) {
+                static_entries[static_i] = entry;
+                static_i += 1;
+            }
+        }
+
+        const views = try self.attrEntryViews(static_entries);
+        defer self.allocator.free(views);
+
+        self.beginScope();
+
+        for (views, 0..) |entry, index| {
+            if (entry.path.len == 0) return error.InvalidAttributePath;
+            if (self.firstSegmentSeen(views[0..index], entry.path[0])) continue;
+
+            const name_span = self.attrSegmentSpan(entry.path[0]);
+            const name_id = try self.intern.intern(name_span);
+            try self.emitOp(.push_null);
+            try self.emitOp(.make_cell);
+            const slot = try self.declareLocal(name_span, name_id);
+            try self.emitOpByte(.set_local, @intCast(slot));
+        }
+
+        try self.compileRecursiveAttrCells(views);
+        try self.emitRecursiveAttrObject(views);
+
+        for (entries) |entry| {
+            const name = entry.dynamic_name orelse continue;
+            try self.compileNode(name);
+            try self.compileThunk(entry.expr);
+            try self.emitOpU16(.build_attrs, 1);
+            try self.emitOp(.merge_attrs);
+        }
+
+        self.endScope();
     }
 
     fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
@@ -965,7 +1009,12 @@ pub const Compiler = struct {
             try self.emitOpByte(.set_local, @intCast(slot));
         }
 
-        var count: u16 = 0;
+        try self.compileRecursiveAttrCells(entries);
+        try self.emitRecursiveAttrObject(entries);
+        self.endScope();
+    }
+
+    fn compileRecursiveAttrCells(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
         for (entries, 0..) |entry, index| {
             if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
 
@@ -982,7 +1031,6 @@ pub const Compiler = struct {
                 defer self.allocator.free(tails);
                 try self.compileAttrEntriesThunk(tails, false);
                 try self.emitOpByte(.set_cell_local, @intCast(slot));
-                count += 1;
                 continue;
             }
 
@@ -995,7 +1043,6 @@ pub const Compiler = struct {
                 defer self.allocator.free(tails);
                 try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
                 try self.emitOpByte(.set_cell_local, @intCast(slot));
-                count += 1;
                 continue;
             }
             const previous_skip = self.skip_local_slot;
@@ -1004,9 +1051,11 @@ pub const Compiler = struct {
             self.skip_local_slot = previous_skip;
             try compile_result;
             try self.emitOpByte(.set_cell_local, @intCast(slot));
-            count += 1;
         }
+    }
 
+    fn emitRecursiveAttrObject(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
+        var count: u16 = 0;
         for (entries, 0..) |entry, index| {
             if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
             try self.emitAttrName(entry.path[0]);
@@ -1014,10 +1063,10 @@ pub const Compiler = struct {
             const name_span = self.attrSegmentSpan(entry.path[0]);
             const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
             try self.emitOpByte(.capture_local, @intCast(slot));
+            count += 1;
         }
 
         try self.emitOpU16(.build_attrs, count);
-        self.endScope();
     }
 
     fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {

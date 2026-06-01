@@ -633,6 +633,12 @@ test "writeValue prints recursive attrsets without looping" {
     try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
 }
 
+test "evaluate recursive dynamic attrsets" {
+    const dynamic = try renderForTest("rec { a = 1; ${\"x\"} = a + 1; }.x");
+    defer std.testing.allocator.free(dynamic);
+    try std.testing.expectEqualStrings("2", dynamic);
+}
+
 test "evaluate matches Nix toString bool and null semantics" {
     const true_output = try renderForTest("builtins.toString true");
     defer std.testing.allocator.free(true_output);
