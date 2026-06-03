@@ -977,6 +977,7 @@ pub const VM = struct {
         var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
         defer context.deinit(self.allocator);
         if (right_like.discriminant == .string_context) {
+            if (try self.hasStorePathContext(right_like)) return error.InvalidPathConcatenation;
             try self.appendStringContext(&context, right_like);
         }
         if (context.items.len == 0) return Value.path(text_id);
@@ -1010,6 +1011,15 @@ pub const VM = struct {
             },
             else => return error.TypeError,
         }
+    }
+
+    fn hasStorePathContext(self: *VM, value: Value) !bool {
+        if (value.discriminant != .string_context) return false;
+        const string = try self.heap.getContextString(value.asObjectId());
+        for (string.context) |entry| {
+            if (std.mem.startsWith(u8, self.intern.get(entry.name), "/nix/store/")) return true;
+        }
+        return false;
     }
 
     fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {

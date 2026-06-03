@@ -1973,6 +1973,8 @@ test "evaluate path construction builtins" {
     defer std.testing.allocator.free(path_source);
     const path_prefix_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.toJSON (builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }}))", .{file_path});
     defer std.testing.allocator.free(path_prefix_source);
+    const path_append_store_context_source = try std.fmt.allocPrint(std.testing.allocator, "/foo + builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
+    defer std.testing.allocator.free(path_append_store_context_source);
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
@@ -1986,6 +1988,8 @@ test "evaluate path construction builtins" {
 
     const path_prefix = try ev.evaluate(path_prefix_source);
     try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix.asInternId()));
+
+    try std.testing.expectError(error.InvalidPathConcatenation, ev.evaluate(path_append_store_context_source));
 }
 
 test "evaluate nixpkgs-heavy collection builtins" {
