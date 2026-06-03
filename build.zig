@@ -101,7 +101,6 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration-test", "Run differential integration tests against nix-instantiate");
     const integration_cmd = b.addRunArtifact(integration_diff_exe);
     integration_cmd.step.dependOn(b.getInstallStep());
-    integration_cmd.addArgs(&.{ "--iterations", "1000", "--seed-count", "4" });
     if (b.args) |args| {
         integration_cmd.addArgs(args);
     }
