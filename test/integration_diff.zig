@@ -7,15 +7,17 @@
 const std = @import("std");
 
 const Config = struct {
-    iterations: ?usize = null,
     seed: ?u64 = null,
     corpus_dir: []const u8 = "test/fuzz-corpus",
     failure_dir: []const u8 = "",
     fix_bin: []const u8 = "zig-out/bin/fix",
     nix_bin: []const u8 = "nix-instantiate",
-    max_depth: u8 = 3,
+    min_depth: u8 = 0,
+    max_depth: u8 = 4,
     jobs: usize = 0,
     shrink: bool = false,
+    dump_cases_path: ?[]const u8 = null,
+    dump_skipped_path: ?[]const u8 = null,
 };
 
 const Corpus = std.ArrayListUnmanaged([]const u8);
@@ -27,6 +29,8 @@ const Reporter = struct {
     progress_every: usize = 0,
     next_progress: usize = 0,
     found_count: usize = 0,
+    checked_count: usize = 0,
+    skipped_count: usize = 0,
 
     fn init(io: std.Io, env: *const std.process.Environ.Map, total_jobs: usize) Reporter {
         const interval = progressInterval(total_jobs);
@@ -41,22 +45,24 @@ const Reporter = struct {
         const dim = if (self.use_color) "\x1b[2m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --iterations={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s} --max-depth={}",
+            "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --min-depth={} --max-depth={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s}",
             .{
                 dim,
                 reset,
                 seed,
                 worker_count,
-                total_jobs,
+                config.min_depth,
+                config.max_depth,
                 config.corpus_dir,
                 config.failure_dir,
                 config.fix_bin,
                 config.nix_bin,
-                config.max_depth,
             },
         );
         if (config.shrink) std.debug.print(" --shrink", .{});
-        std.debug.print("\n", .{});
+        if (config.dump_cases_path) |path| std.debug.print(" --dump-cases={s}", .{path});
+        if (config.dump_skipped_path) |path| std.debug.print(" --dump-skipped={s}", .{path});
+        std.debug.print(" # generated={}\n", .{total_jobs});
     }
 
     fn progress(self: *Reporter, completed: usize, total: usize) void {
@@ -64,10 +70,18 @@ const Reporter = struct {
         const dim = if (self.use_color) "\x1b[2m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff:{s} progress {}/{} found={}\n",
-            .{ dim, reset, completed, total, self.found_count },
+            "{s}integration-diff:{s} progress generated={}/{} checked={} skipped={} found={}\n",
+            .{ dim, reset, completed, total, self.checked_count, self.skipped_count, self.found_count },
         );
         while (self.next_progress <= completed) self.next_progress += self.progress_every;
+    }
+
+    fn checked(self: *Reporter) void {
+        self.checked_count += 1;
+    }
+
+    fn skipped(self: *Reporter) void {
+        self.skipped_count += 1;
     }
 
     fn commandError(self: Reporter, seed: u64, iteration: usize, err: anyerror, expr: []const u8) void {
@@ -107,8 +121,8 @@ const Reporter = struct {
             "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff: found={} checked={}{s}\n",
-            .{ color, self.found_count, total, reset },
+            "{s}integration-diff: found={} checked={} skipped={} generated={}{s}\n",
+            .{ color, self.found_count, self.checked_count, self.skipped_count, total, reset },
         );
     }
 
@@ -196,11 +210,22 @@ pub fn main(init: std.process.Init) !void {
     }
     sortCorpus(corpus.items);
 
-    const total_jobs = config.iterations orelse try defaultCaseCount(corpus.items.len);
+    if (config.min_depth > config.max_depth) {
+        early_reporter.corpusError("--min-depth must be less than or equal to --max-depth", .{});
+        std.process.exit(1);
+    }
+
+    const total_jobs = try generatedCaseCount(corpus.items.len, config.min_depth, config.max_depth);
     var reporter = Reporter.init(init.io, init.environ_map, total_jobs);
     reporter.printRepro(config, seed, worker_count, total_jobs);
 
     if (total_jobs == 0) {
+        reporter.finish(total_jobs);
+        return;
+    }
+
+    if (config.dump_cases_path != null or config.dump_skipped_path != null) {
+        try dumpGeneratedCases(allocator, init.io, &config, corpus.items, seed, total_jobs, &reporter);
         reporter.finish(total_jobs);
         return;
     }
@@ -357,6 +382,11 @@ fn runHarness(
                 command_error = err;
                 reporter.commandError(mutable_current.seed, mutable_current.iteration, err, mutable_current.expr);
             } else if (mutable_current.classification) |*classification| {
+                if (classification.outcome == .skipped) {
+                    reporter.skipped();
+                } else {
+                    reporter.checked();
+                }
                 if (classification.interesting()) {
                     found_mismatch = true;
                     reportInteresting(
@@ -396,18 +426,14 @@ fn producerMain(context: *ProducerContext) void {
 }
 
 fn produceJobs(context: *ProducerContext) !void {
-    var prng = std.Random.DefaultPrng.init(context.seed);
-    const random = prng.random();
-
     var iteration: usize = 0;
     while (iteration < context.total_jobs) : (iteration += 1) {
         const expr = try generateExpression(
             context.allocator,
-            random,
             context.corpus,
             context.seed,
             iteration,
-            context.config.max_depth,
+            context.config.min_depth,
         );
         errdefer context.allocator.free(expr);
         try context.jobs.put(context.io, .{
@@ -457,9 +483,7 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
 
     _ = args.next();
     while (args.next()) |arg| {
-        if (try optionValue(&args, arg, "--iterations")) |value| {
-            config.iterations = try std.fmt.parseInt(usize, value, 10);
-        } else if (try optionValue(&args, arg, "--seed")) |value| {
+        if (try optionValue(&args, arg, "--seed")) |value| {
             config.seed = try std.fmt.parseInt(u64, value, 0);
         } else if (try optionValue(&args, arg, "--corpus")) |value| {
             config.corpus_dir = value;
@@ -469,12 +493,18 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
             config.fix_bin = value;
         } else if (try optionValue(&args, arg, "--nix-bin")) |value| {
             config.nix_bin = value;
+        } else if (try optionValue(&args, arg, "--min-depth")) |value| {
+            config.min_depth = try std.fmt.parseInt(u8, value, 10);
         } else if (try optionValue(&args, arg, "--max-depth")) |value| {
             config.max_depth = try std.fmt.parseInt(u8, value, 10);
         } else if (try optionValue(&args, arg, "--jobs")) |value| {
             config.jobs = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--shrink")) {
             config.shrink = true;
+        } else if (try optionValue(&args, arg, "--dump-cases")) |value| {
+            config.dump_cases_path = value;
+        } else if (try optionValue(&args, arg, "--dump-skipped")) |value| {
+            config.dump_skipped_path = value;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
             std.process.exit(0);
@@ -499,15 +529,17 @@ fn usage() void {
         \\usage: zig build integration-test -- [options]
         \\
         \\options:
-        \\  --iterations N      generated case budget (default: max(64000, corpus^2))
         \\  --seed N            deterministic RNG seed; random when omitted
         \\  --corpus PATH       directory of .nix seed files
         \\  --failures PATH     directory for reproducers (default: /tmp/fix-integration-failures-$seed-$nonce)
         \\  --fix-bin PATH      fix executable (default: zig-out/bin/fix)
         \\  --nix-bin PATH      nix-instantiate executable
-        \\  --max-depth N       maximum force-preserving wrapper depth (default: 3)
+        \\  --min-depth N       minimum composition depth (default: 0)
+        \\  --max-depth N       maximum composition depth (default: 4)
         \\  --jobs N            parallel evaluator jobs; 0 means CPU count
         \\  --shrink            minimize each saved failing candidate
+        \\  --dump-cases PATH   write generated checkable cases and exit
+        \\  --dump-skipped PATH write generated skipped candidates and exit
         \\
     , .{});
 }
@@ -517,9 +549,10 @@ fn resolveWorkerCount(requested: usize) !usize {
     return @max(@as(usize, 1), try std.Thread.getCpuCount());
 }
 
-fn defaultCaseCount(corpus_len: usize) !usize {
+fn generatedCaseCount(corpus_len: usize, min_depth: u8, max_depth: u8) !usize {
     const pair_count = std.math.mul(usize, corpus_len, corpus_len) catch return error.TooManyCases;
-    return @max(@as(usize, 64_000), pair_count);
+    const depth_count = @as(usize, max_depth - min_depth) + 1;
+    return std.math.mul(usize, pair_count, depth_count) catch error.TooManyCases;
 }
 
 fn randomSeed(io: std.Io) u64 {
@@ -578,26 +611,68 @@ fn lessThanExpr(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
 
+fn dumpGeneratedCases(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: *const Config,
+    corpus: []const []const u8,
+    seed: u64,
+    total_jobs: usize,
+    reporter: *Reporter,
+) !void {
+    var cases: std.ArrayListUnmanaged(u8) = .empty;
+    defer cases.deinit(allocator);
+    var skipped: std.ArrayListUnmanaged(u8) = .empty;
+    defer skipped.deinit(allocator);
+
+    var iteration: usize = 0;
+    while (iteration < total_jobs) : (iteration += 1) {
+        const expr = try generateExpression(
+            allocator,
+            corpus,
+            seed,
+            iteration,
+            config.min_depth,
+        );
+        errdefer allocator.free(expr);
+
+        if (config.dump_cases_path != null) {
+            try cases.appendSlice(allocator, expr);
+            try cases.append(allocator, '\n');
+        }
+        allocator.free(expr);
+        reporter.checked();
+        reporter.progress(iteration + 1, total_jobs);
+    }
+
+    if (config.dump_cases_path) |path| try writeDumpFile(io, path, cases.items);
+    if (config.dump_skipped_path) |path| try writeDumpFile(io, path, skipped.items);
+}
+
+fn writeDumpFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
 fn generateExpression(
     allocator: std.mem.Allocator,
-    random: std.Random,
     corpus: []const []const u8,
     seed: u64,
     iteration: usize,
-    max_depth: u8,
+    min_depth: u8,
 ) ![]u8 {
     const pair_count = try pairCount(corpus.len);
-    const pair_round = iteration / pair_count;
+    const depth_index: u8 = @intCast(iteration / pair_count);
     const pair_index = permutedIndex(seed, iteration % pair_count, pair_count);
     const left = corpus[pair_index / corpus.len];
     const right = corpus[pair_index % corpus.len];
-    var expr = try generatePairCore(allocator, random, left, right, pair_round);
+    var expr = try generatePairCore(allocator, left, right);
     errdefer allocator.free(expr);
 
-    const depth = if (max_depth == 0) 0 else random.intRangeAtMost(u8, 0, max_depth);
+    const depth = min_depth + depth_index;
     var i: u8 = 0;
     while (i < depth) : (i += 1) {
-        const wrapped = try wrapForced(allocator, random, expr);
+        const wrapped = try wrapForced(allocator, variation(seed, iteration, i), expr);
         allocator.free(expr);
         expr = wrapped;
     }
@@ -606,24 +681,14 @@ fn generateExpression(
 
 fn generatePairCore(
     allocator: std.mem.Allocator,
-    random: std.Random,
     left: []const u8,
     right: []const u8,
-    round: usize,
 ) ![]u8 {
-    const op = binaryOpForRound(round);
-    return switch (random.intRangeLessThan(u8, 0, 8)) {
-        0, 1, 2 => binary(allocator, left, op, right),
-        3 => std.mem.concat(allocator, u8, &.{ "let x = ", left, "; y = ", right, "; in x ", op, " y" }),
-        4 => std.mem.concat(allocator, u8, &.{ "with { x = ", left, "; y = ", right, "; }; x ", op, " y" }),
-        5 => std.mem.concat(allocator, u8, &.{ "(rec { x = ", left, "; y = ", right, "; z = x ", op, " y; }).z" }),
-        6 => std.mem.concat(allocator, u8, &.{ "(x: y: x ", op, " y) (", left, ") (", right, ")" }),
-        else => std.mem.concat(allocator, u8, &.{ "if true then (", left, ") ", op, " (", right, ") else 1" }),
-    };
+    return binary(allocator, left, "+", right);
 }
 
-fn wrapForced(allocator: std.mem.Allocator, random: std.Random, expr: []const u8) ![]u8 {
-    return switch (random.intRangeLessThan(u8, 0, 8)) {
+fn wrapForced(allocator: std.mem.Allocator, choice: u64, expr: []const u8) ![]u8 {
+    return switch (choice % 8) {
         0 => wrap(allocator, "(", expr, ")"),
         1 => wrap(allocator, "let x = ", expr, "; in x"),
         2 => wrap(allocator, "if true then ", expr, " else 1"),
@@ -635,14 +700,14 @@ fn wrapForced(allocator: std.mem.Allocator, random: std.Random, expr: []const u8
     };
 }
 
-fn binaryOpForRound(round: usize) []const u8 {
-    return switch (round % 8) {
-        0, 1, 2, 3 => "+",
-        4 => "==",
-        5 => "//",
-        6 => "or",
-        else => "+",
-    };
+fn variation(seed: u64, iteration: usize, depth: u8) u64 {
+    var x = seed ^ @as(u64, @intCast(iteration)) ^ (@as(u64, depth) << 56);
+    x ^= x >> 30;
+    x *%= 0xbf58476d1ce4e5b9;
+    x ^= x >> 27;
+    x *%= 0x94d049bb133111eb;
+    x ^= x >> 31;
+    return x;
 }
 
 fn pairCount(corpus_len: usize) !usize {
