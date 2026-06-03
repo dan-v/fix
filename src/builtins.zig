@@ -124,6 +124,7 @@ pub const BuiltinId = enum(u16) {
     break_ = 107,
     derivationLazyAttr = 108,
     mapValue = 109,
+    constantValue = 110,
 };
 
 const BuiltinBinding = struct {
@@ -324,6 +325,7 @@ pub fn arity(id: BuiltinId) u8 {
         .parseFlakeRef,
         .flakeRefToString,
         .break_,
+        .constantValue,
         .floor,
         .ceil,
         .baseNameOf,

@@ -150,6 +150,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .placeholder => builtinPlaceholder(self, args[0]),
         .derivationLazyAttr => builtinDerivationLazyAttr(self, args[0], args[1]),
         .mapValue => builtinMapValue(self, args[0], args[1]),
+        .constantValue => args[0],
     };
 }
 
@@ -2694,7 +2695,7 @@ fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value) !Va
     const entries = [_]heap_mod.AttrEntry{
         .{
             .name = try self.intern.intern("column"),
-            .value = Value.int(@intCast(pos.column)),
+            .value = try makeBuiltinThunk(self, .constantValue, &.{Value.int(@intCast(pos.column))}),
         },
         .{
             .name = try self.intern.intern("file"),
@@ -2702,7 +2703,7 @@ fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value) !Va
         },
         .{
             .name = try self.intern.intern("line"),
-            .value = Value.int(@intCast(pos.line)),
+            .value = try makeBuiltinThunk(self, .constantValue, &.{Value.int(@intCast(pos.line))}),
         },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
