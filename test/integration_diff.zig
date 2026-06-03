@@ -1,19 +1,19 @@
 //! Differential integration runner for fix.
 //!
-//! The generator deliberately avoids owning a second Nix grammar. It mutates a
+//! The generator deliberately avoids owning a second Nix grammar. It combines a
 //! corpus of real expressions, then asks real Nix and fix what each candidate
 //! means.
 
 const std = @import("std");
 
 const Config = struct {
-    iterations: usize = 64_000,
+    iterations: ?usize = null,
     seed: ?u64 = null,
     corpus_dir: []const u8 = "test/fuzz-corpus",
-    failure_dir: []const u8 = "zig-out/integration-failures",
+    failure_dir: []const u8 = "",
     fix_bin: []const u8 = "zig-out/bin/fix",
     nix_bin: []const u8 = "nix-instantiate",
-    max_mutations: u8 = 5,
+    max_depth: u8 = 3,
     jobs: usize = 0,
     shrink: bool = false,
 };
@@ -21,6 +21,105 @@ const Config = struct {
 const Corpus = std.ArrayListUnmanaged([]const u8);
 const command_stdout_limit = 8 * 1024 * 1024;
 const command_stderr_limit = 1024 * 1024;
+
+const Reporter = struct {
+    use_color: bool,
+    progress_every: usize = 0,
+    next_progress: usize = 0,
+    found_count: usize = 0,
+
+    fn init(io: std.Io, env: *const std.process.Environ.Map, total_jobs: usize) Reporter {
+        const interval = progressInterval(total_jobs);
+        return .{
+            .use_color = autoColor(io, env),
+            .progress_every = interval,
+            .next_progress = interval,
+        };
+    }
+
+    fn printRepro(self: Reporter, config: Config, seed: u64, worker_count: usize, total_jobs: usize) void {
+        const dim = if (self.use_color) "\x1b[2m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --iterations={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s} --max-depth={}",
+            .{
+                dim,
+                reset,
+                seed,
+                worker_count,
+                total_jobs,
+                config.corpus_dir,
+                config.failure_dir,
+                config.fix_bin,
+                config.nix_bin,
+                config.max_depth,
+            },
+        );
+        if (config.shrink) std.debug.print(" --shrink", .{});
+        std.debug.print("\n", .{});
+    }
+
+    fn progress(self: *Reporter, completed: usize, total: usize) void {
+        if (self.progress_every == 0 or completed < self.next_progress or completed >= total) return;
+        const dim = if (self.use_color) "\x1b[2m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff:{s} progress {}/{} found={}\n",
+            .{ dim, reset, completed, total, self.found_count },
+        );
+        while (self.next_progress <= completed) self.next_progress += self.progress_every;
+    }
+
+    fn commandError(self: Reporter, seed: u64, iteration: usize, err: anyerror, expr: []const u8) void {
+        const red = if (self.use_color) "\x1b[31m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff: command failed{s} at seed {} iteration {}: {s}\n",
+            .{ red, reset, seed, iteration, @errorName(err) },
+        );
+        std.debug.print("expression:\n{s}\n", .{expr});
+    }
+
+    fn saveError(self: Reporter, seed: u64, iteration: usize, err: anyerror) void {
+        const red = if (self.use_color) "\x1b[31m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff: failed to save mismatch{s} at seed {} iteration {}: {s}\n",
+            .{ red, reset, seed, iteration, @errorName(err) },
+        );
+    }
+
+    fn mismatch(self: *Reporter, outcome: Outcome, seed: u64, iteration: usize, failure_dir: []const u8, expr: []const u8) void {
+        self.found_count += 1;
+        const red = if (self.use_color) "\x1b[31m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff: found {s}{s} at seed {} iteration {}; saved under {s}\n",
+            .{ red, @tagName(outcome), reset, seed, iteration, failure_dir },
+        );
+        std.debug.print("expression:\n{s}\n", .{expr});
+    }
+
+    fn finish(self: Reporter, total: usize) void {
+        const color = if (self.use_color)
+            if (self.found_count == 0) "\x1b[32m" else "\x1b[31m"
+        else
+            "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print(
+            "{s}integration-diff: found={} checked={}{s}\n",
+            .{ color, self.found_count, total, reset },
+        );
+    }
+
+    fn corpusError(self: Reporter, comptime fmt: []const u8, args: anytype) void {
+        const red = if (self.use_color) "\x1b[31m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        std.debug.print("{s}integration-diff: ", .{red});
+        std.debug.print(fmt, args);
+        std.debug.print("{s}\n", .{reset});
+    }
+};
 
 const Outcome = enum {
     skipped,
@@ -67,32 +166,46 @@ pub fn main(init: std.process.Init) !void {
     var config = Config{};
     try parseArgs(&config, init);
 
+    const seed = config.seed orelse randomSeed(init.io);
+    const worker_count = try resolveWorkerCount(config.jobs);
+
+    var default_failure_dir: ?[]u8 = null;
+    defer if (default_failure_dir) |dir| allocator.free(dir);
+    if (config.failure_dir.len == 0) {
+        default_failure_dir = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/fix-integration-failures-{d}-{d}",
+            .{ seed, randomSeed(init.io) },
+        );
+        config.failure_dir = default_failure_dir.?;
+    }
+
+    const early_reporter = Reporter.init(init.io, init.environ_map, 0);
     var corpus: Corpus = .empty;
     defer {
         for (corpus.items) |expr| allocator.free(expr);
         corpus.deinit(allocator);
     }
-    try loadCorpus(allocator, init.io, config.corpus_dir, &corpus);
-    if (corpus.items.len == 0) try loadDefaultCorpus(allocator, &corpus);
-
-    const seed = config.seed orelse randomSeed(init.io);
-    const total_jobs = config.iterations;
-    const worker_count = try resolveWorkerCount(config.jobs);
-
-    std.debug.print(
-        "integration-diff: iterations={} seed={} corpus={} jobs={}\n",
-        .{ config.iterations, seed, corpus.items.len, worker_count },
-    );
-    if (config.seed == null) {
-        std.debug.print("integration-diff: reproduce with --seed {}\n", .{seed});
+    loadCorpus(allocator, init.io, config.corpus_dir, &corpus) catch |err| {
+        early_reporter.corpusError("failed to load corpus {s}: {s}", .{ config.corpus_dir, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (corpus.items.len == 0) {
+        early_reporter.corpusError("corpus {s} did not contain any expressions", .{config.corpus_dir});
+        std.process.exit(1);
     }
+    sortCorpus(corpus.items);
+
+    const total_jobs = config.iterations orelse try defaultCaseCount(corpus.items.len);
+    var reporter = Reporter.init(init.io, init.environ_map, total_jobs);
+    reporter.printRepro(config, seed, worker_count, total_jobs);
 
     if (total_jobs == 0) {
-        std.debug.print("integration-diff: no mismatches found\n", .{});
+        reporter.finish(total_jobs);
         return;
     }
 
-    try runHarness(allocator, init.io, &config, corpus.items, seed, worker_count, total_jobs);
+    try runHarness(allocator, init.io, &config, corpus.items, seed, worker_count, total_jobs, &reporter);
 }
 
 const Job = struct {
@@ -160,6 +273,7 @@ const ProducerContext = struct {
     config: *const Config,
     corpus: []const []const u8,
     seed: u64,
+    total_jobs: usize,
     jobs: *JobQueue,
 };
 
@@ -179,6 +293,7 @@ fn runHarness(
     seed: u64,
     worker_count: usize,
     total_jobs: usize,
+    reporter: *Reporter,
 ) !void {
     const queue_len = queueCapacity(worker_count, total_jobs);
 
@@ -196,6 +311,7 @@ fn runHarness(
         .config = config,
         .corpus = corpus,
         .seed = seed,
+        .total_jobs = total_jobs,
         .jobs = &job_queue,
     };
     const producer = try std.Thread.spawn(.{}, producerMain, .{&producer_context});
@@ -239,11 +355,7 @@ fn runHarness(
 
             if (mutable_current.err) |err| {
                 command_error = err;
-                std.debug.print(
-                    "integration-diff: command failed at seed {} iteration {}: {s}\n",
-                    .{ mutable_current.seed, mutable_current.iteration, @errorName(err) },
-                );
-                std.debug.print("expression:\n{s}\n", .{mutable_current.expr});
+                reporter.commandError(mutable_current.seed, mutable_current.iteration, err, mutable_current.expr);
             } else if (mutable_current.classification) |*classification| {
                 if (classification.interesting()) {
                     found_mismatch = true;
@@ -255,17 +367,16 @@ fn runHarness(
                         mutable_current.iteration,
                         mutable_current.expr,
                         classification,
+                        reporter,
                     ) catch |err| {
                         command_error = err;
-                        std.debug.print(
-                            "integration-diff: failed to save mismatch at seed {} iteration {}: {s}\n",
-                            .{ mutable_current.seed, mutable_current.iteration, @errorName(err) },
-                        );
+                        reporter.saveError(mutable_current.seed, mutable_current.iteration, err);
                     };
                 }
             }
 
             next_to_report += 1;
+            reporter.progress(next_to_report, total_jobs);
         }
     }
 
@@ -273,8 +384,8 @@ fn runHarness(
     for (workers) |worker| worker.join();
 
     if (command_error) |err| return err;
-    if (found_mismatch) return error.DifferentialMismatch;
-    std.debug.print("integration-diff: no mismatches found\n", .{});
+    reporter.finish(total_jobs);
+    if (found_mismatch) std.process.exit(1);
 }
 
 fn producerMain(context: *ProducerContext) void {
@@ -289,8 +400,15 @@ fn produceJobs(context: *ProducerContext) !void {
     const random = prng.random();
 
     var iteration: usize = 0;
-    while (iteration < context.config.iterations) : (iteration += 1) {
-        const expr = try mutateExpression(context.allocator, random, context.corpus, context.config.max_mutations);
+    while (iteration < context.total_jobs) : (iteration += 1) {
+        const expr = try generateExpression(
+            context.allocator,
+            random,
+            context.corpus,
+            context.seed,
+            iteration,
+            context.config.max_depth,
+        );
         errdefer context.allocator.free(expr);
         try context.jobs.put(context.io, .{
             .index = iteration,
@@ -339,22 +457,22 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
 
     _ = args.next();
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--iterations")) {
-            config.iterations = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
-        } else if (std.mem.eql(u8, arg, "--seed")) {
-            config.seed = try std.fmt.parseInt(u64, args.next() orelse return error.MissingArgument, 0);
-        } else if (std.mem.eql(u8, arg, "--corpus")) {
-            config.corpus_dir = args.next() orelse return error.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--failures")) {
-            config.failure_dir = args.next() orelse return error.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--fix-bin")) {
-            config.fix_bin = args.next() orelse return error.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--nix-bin")) {
-            config.nix_bin = args.next() orelse return error.MissingArgument;
-        } else if (std.mem.eql(u8, arg, "--max-mutations")) {
-            config.max_mutations = try std.fmt.parseInt(u8, args.next() orelse return error.MissingArgument, 10);
-        } else if (std.mem.eql(u8, arg, "--jobs")) {
-            config.jobs = try std.fmt.parseInt(usize, args.next() orelse return error.MissingArgument, 10);
+        if (try optionValue(&args, arg, "--iterations")) |value| {
+            config.iterations = try std.fmt.parseInt(usize, value, 10);
+        } else if (try optionValue(&args, arg, "--seed")) |value| {
+            config.seed = try std.fmt.parseInt(u64, value, 0);
+        } else if (try optionValue(&args, arg, "--corpus")) |value| {
+            config.corpus_dir = value;
+        } else if (try optionValue(&args, arg, "--failures")) |value| {
+            config.failure_dir = value;
+        } else if (try optionValue(&args, arg, "--fix-bin")) |value| {
+            config.fix_bin = value;
+        } else if (try optionValue(&args, arg, "--nix-bin")) |value| {
+            config.nix_bin = value;
+        } else if (try optionValue(&args, arg, "--max-depth")) |value| {
+            config.max_depth = try std.fmt.parseInt(u8, value, 10);
+        } else if (try optionValue(&args, arg, "--jobs")) |value| {
+            config.jobs = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, arg, "--shrink")) {
             config.shrink = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -368,18 +486,26 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
     }
 }
 
+fn optionValue(args: anytype, arg: []const u8, comptime name: []const u8) !?[]const u8 {
+    if (std.mem.eql(u8, arg, name)) return args.next() orelse error.MissingArgument;
+    if (std.mem.startsWith(u8, arg, name) and arg.len > name.len and arg[name.len] == '=') {
+        return arg[name.len + 1 ..];
+    }
+    return null;
+}
+
 fn usage() void {
     std.debug.print(
         \\usage: zig build integration-test -- [options]
         \\
         \\options:
-        \\  --iterations N      number of generated expressions (default: 64000)
+        \\  --iterations N      generated case budget (default: max(64000, corpus^2))
         \\  --seed N            deterministic RNG seed; random when omitted
         \\  --corpus PATH       directory of .nix seed files
-        \\  --failures PATH     directory for reproducers
+        \\  --failures PATH     directory for reproducers (default: /tmp/fix-integration-failures-$seed-$nonce)
         \\  --fix-bin PATH      fix executable (default: zig-out/bin/fix)
         \\  --nix-bin PATH      nix-instantiate executable
-        \\  --max-mutations N   mutations per candidate (default: 5)
+        \\  --max-depth N       maximum force-preserving wrapper depth (default: 3)
         \\  --jobs N            parallel evaluator jobs; 0 means CPU count
         \\  --shrink            minimize each saved failing candidate
         \\
@@ -391,10 +517,28 @@ fn resolveWorkerCount(requested: usize) !usize {
     return @max(@as(usize, 1), try std.Thread.getCpuCount());
 }
 
+fn defaultCaseCount(corpus_len: usize) !usize {
+    const pair_count = std.math.mul(usize, corpus_len, corpus_len) catch return error.TooManyCases;
+    return @max(@as(usize, 64_000), pair_count);
+}
+
 fn randomSeed(io: std.Io) u64 {
     var bytes: [8]u8 = undefined;
     io.random(&bytes);
     return @bitCast(bytes);
+}
+
+fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
+    if (env.get("NO_COLOR")) |_| return false;
+    if (env.get("TERM")) |term| {
+        if (std.mem.eql(u8, term, "dumb")) return false;
+    }
+    return std.Io.File.stderr().isTty(io) catch false;
+}
+
+fn progressInterval(total_jobs: usize) usize {
+    if (total_jobs < 1000) return 0;
+    return @max(@as(usize, 1000), total_jobs / 16);
 }
 
 fn loadCorpus(
@@ -403,10 +547,7 @@ fn loadCorpus(
     path: []const u8,
     corpus: *Corpus,
 ) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
 
     var iter = dir.iterate();
@@ -420,18 +561,6 @@ fn loadCorpus(
     }
 }
 
-fn loadDefaultCorpus(allocator: std.mem.Allocator, corpus: *Corpus) !void {
-    const defaults = [_][]const u8{
-        "1",
-        "1 + 2",
-        "let x = 1; in x",
-        "{ a = 1; }",
-        "[ 1 2 ]",
-        "(x: x) 1",
-    };
-    for (defaults) |expr| try corpus.append(allocator, try allocator.dupe(u8, expr));
-}
-
 fn appendCorpusLines(allocator: std.mem.Allocator, text: []const u8, corpus: *Corpus) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -441,51 +570,112 @@ fn appendCorpusLines(allocator: std.mem.Allocator, text: []const u8, corpus: *Co
     }
 }
 
-fn mutateExpression(
+fn sortCorpus(corpus: [][]const u8) void {
+    std.mem.sort([]const u8, corpus, {}, lessThanExpr);
+}
+
+fn lessThanExpr(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
+fn generateExpression(
     allocator: std.mem.Allocator,
     random: std.Random,
     corpus: []const []const u8,
-    max_mutations: u8,
+    seed: u64,
+    iteration: usize,
+    max_depth: u8,
 ) ![]u8 {
-    var expr = try allocator.dupe(u8, corpus[random.intRangeLessThan(usize, 0, corpus.len)]);
+    const pair_count = try pairCount(corpus.len);
+    const pair_round = iteration / pair_count;
+    const pair_index = permutedIndex(seed, iteration % pair_count, pair_count);
+    const left = corpus[pair_index / corpus.len];
+    const right = corpus[pair_index % corpus.len];
+    var expr = try generatePairCore(allocator, random, left, right, pair_round);
     errdefer allocator.free(expr);
 
-    const mutation_count = random.intRangeAtMost(u8, 1, @max(max_mutations, 1));
+    const depth = if (max_depth == 0) 0 else random.intRangeAtMost(u8, 0, max_depth);
     var i: u8 = 0;
-    while (i < mutation_count) : (i += 1) {
-        const next = try mutateOnce(allocator, random, expr, corpus);
+    while (i < depth) : (i += 1) {
+        const wrapped = try wrapForced(allocator, random, expr);
         allocator.free(expr);
-        expr = next;
+        expr = wrapped;
     }
     return expr;
 }
 
-fn mutateOnce(
+fn generatePairCore(
     allocator: std.mem.Allocator,
     random: std.Random,
-    expr: []const u8,
-    corpus: []const []const u8,
+    left: []const u8,
+    right: []const u8,
+    round: usize,
 ) ![]u8 {
-    const other = corpus[random.intRangeLessThan(usize, 0, corpus.len)];
-    return switch (random.intRangeLessThan(u8, 0, 17)) {
+    const op = binaryOpForRound(round);
+    return switch (random.intRangeLessThan(u8, 0, 8)) {
+        0, 1, 2 => binary(allocator, left, op, right),
+        3 => std.mem.concat(allocator, u8, &.{ "let x = ", left, "; y = ", right, "; in x ", op, " y" }),
+        4 => std.mem.concat(allocator, u8, &.{ "with { x = ", left, "; y = ", right, "; }; x ", op, " y" }),
+        5 => std.mem.concat(allocator, u8, &.{ "(rec { x = ", left, "; y = ", right, "; z = x ", op, " y; }).z" }),
+        6 => std.mem.concat(allocator, u8, &.{ "(x: y: x ", op, " y) (", left, ") (", right, ")" }),
+        else => std.mem.concat(allocator, u8, &.{ "if true then (", left, ") ", op, " (", right, ") else 1" }),
+    };
+}
+
+fn wrapForced(allocator: std.mem.Allocator, random: std.Random, expr: []const u8) ![]u8 {
+    return switch (random.intRangeLessThan(u8, 0, 8)) {
         0 => wrap(allocator, "(", expr, ")"),
         1 => wrap(allocator, "let x = ", expr, "; in x"),
         2 => wrap(allocator, "if true then ", expr, " else 1"),
         3 => wrap(allocator, "if false then 1 else ", expr, ""),
-        4 => wrap(allocator, "[ ", expr, " ]"),
-        5 => wrap(allocator, "{ a = ", expr, "; }"),
-        6 => wrap(allocator, "({ a = ", expr, "; }).a"),
-        7 => wrap(allocator, "(rec { a = ", expr, "; b = a; }).b"),
-        8 => wrap(allocator, "with { x = ", expr, "; }; x"),
-        9 => wrap(allocator, "assert true; ", expr, ""),
-        10 => wrap(allocator, "(x: ", expr, ") 1"),
-        11 => binary(allocator, expr, "+", other),
-        12 => binary(allocator, expr, "==", other),
-        13 => binary(allocator, expr, "//", other),
-        14 => binary(allocator, expr, "or", other),
-        15 => replaceLiteral(allocator, random),
-        else => spliceLet(allocator, expr, other),
+        4 => wrap(allocator, "({ a = ", expr, "; }).a"),
+        5 => wrap(allocator, "(rec { a = ", expr, "; b = a; }).b"),
+        6 => wrap(allocator, "with { x = ", expr, "; }; x"),
+        else => wrap(allocator, "assert true; ", expr, ""),
     };
+}
+
+fn binaryOpForRound(round: usize) []const u8 {
+    return switch (round % 8) {
+        0, 1, 2, 3 => "+",
+        4 => "==",
+        5 => "//",
+        6 => "or",
+        else => "+",
+    };
+}
+
+fn pairCount(corpus_len: usize) !usize {
+    return std.math.mul(usize, corpus_len, corpus_len) catch error.TooManyCases;
+}
+
+fn permutedIndex(seed: u64, iteration: usize, count: usize) usize {
+    const offset: usize = @intCast(seed % count);
+    const stride = coprimeStride(seed / @as(u64, @intCast(count)), count);
+    return (offset + iteration *% stride) % count;
+}
+
+fn coprimeStride(seed: u64, count: usize) usize {
+    std.debug.assert(count > 0);
+    if (count == 1) return 1;
+    var stride: usize = @intCast(seed % count);
+    stride = @max(stride, 1);
+    while (gcd(stride, count) != 1) {
+        stride += 1;
+        if (stride == count) stride = 1;
+    }
+    return stride;
+}
+
+fn gcd(a_start: usize, b_start: usize) usize {
+    var a = a_start;
+    var b = b_start;
+    while (b != 0) {
+        const next = a % b;
+        a = b;
+        b = next;
+    }
+    return a;
 }
 
 fn wrap(allocator: std.mem.Allocator, prefix: []const u8, expr: []const u8, suffix: []const u8) ![]u8 {
@@ -494,28 +684,6 @@ fn wrap(allocator: std.mem.Allocator, prefix: []const u8, expr: []const u8, suff
 
 fn binary(allocator: std.mem.Allocator, left: []const u8, op: []const u8, right: []const u8) ![]u8 {
     return std.mem.concat(allocator, u8, &.{ "(", left, ") ", op, " (", right, ")" });
-}
-
-fn spliceLet(allocator: std.mem.Allocator, left: []const u8, right: []const u8) ![]u8 {
-    return std.mem.concat(allocator, u8, &.{ "let x = ", left, "; y = ", right, "; in x" });
-}
-
-fn replaceLiteral(allocator: std.mem.Allocator, random: std.Random) ![]u8 {
-    const literals = [_][]const u8{
-        "0",
-        "1",
-        "-1",
-        "1.5",
-        "true",
-        "false",
-        "null",
-        "\"x\"",
-        "\"\"",
-        "[]",
-        "{}",
-        "1 / 0",
-    };
-    return allocator.dupe(u8, literals[random.intRangeLessThan(usize, 0, literals.len)]);
 }
 
 fn classify(
@@ -945,9 +1113,10 @@ fn reportInteresting(
     iteration: usize,
     expr: []const u8,
     classification: *const Classification,
+    reporter: *Reporter,
 ) !void {
     if (!config.shrink) {
-        try saveAndPrintFailure(allocator, io, config, seed, iteration, expr, classification.*);
+        try saveAndPrintFailure(allocator, io, config, seed, iteration, expr, classification.*, reporter);
         return;
     }
 
@@ -957,7 +1126,7 @@ fn reportInteresting(
     var saved_classification = try classify(allocator, io, config, saved_expr);
     defer saved_classification.deinit(allocator);
 
-    try saveAndPrintFailure(allocator, io, config, seed, iteration, saved_expr, saved_classification);
+    try saveAndPrintFailure(allocator, io, config, seed, iteration, saved_expr, saved_classification, reporter);
 }
 
 fn saveAndPrintFailure(
@@ -968,13 +1137,10 @@ fn saveAndPrintFailure(
     iteration: usize,
     expr: []const u8,
     classification: Classification,
+    reporter: *Reporter,
 ) !void {
     try saveFailure(allocator, io, config, seed, iteration, expr, classification);
-    std.debug.print(
-        "integration-diff: found {s} at seed {} iteration {}; saved under {s}\n",
-        .{ @tagName(classification.outcome), seed, iteration, config.failure_dir },
-    );
-    std.debug.print("expression:\n{s}\n", .{expr});
+    reporter.mismatch(classification.outcome, seed, iteration, config.failure_dir, expr);
 }
 
 fn saveFailure(
