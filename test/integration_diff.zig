@@ -158,10 +158,11 @@ const Reporter = struct {
         const rate = casesPerSecond(completed, elapsed_ns);
         const eta_s = etaSeconds(total - completed, rate);
         const percent = if (total == 0) 100 else completed * 100 / total;
+        const skip_permille = permille(self.skipped_count, completed);
         const spinner = spinnerFrame(elapsed_ns);
         if (self.interactive) std.debug.print("\r\x1b[2K", .{});
         std.debug.print(
-            "{s}integration-diff:{s} {c} cases={}/{} {}% checked={} skipped={} found={} rate={}/s eta={}s elapsed={}s",
+            "{s}integration-diff:{s} {c} done={}/{} {}% skipped={}.{}% ({}) found={} rate={}/s eta={}s elapsed={}s",
             .{
                 dim,
                 reset,
@@ -169,7 +170,8 @@ const Reporter = struct {
                 completed,
                 total,
                 percent,
-                self.checked_count,
+                skip_permille / 10,
+                skip_permille % 10,
                 self.skipped_count,
                 self.found_count,
                 rate,
@@ -692,6 +694,11 @@ fn casesPerSecond(completed: usize, elapsed_ns: i96) u64 {
 fn etaSeconds(remaining: usize, rate: u64) u64 {
     if (rate == 0) return 0;
     return @intCast((remaining + rate - 1) / rate);
+}
+
+fn permille(part: usize, whole: usize) usize {
+    if (whole == 0) return 0;
+    return part * 1000 / whole;
 }
 
 fn spinnerFrame(elapsed_ns: i96) u8 {
