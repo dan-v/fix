@@ -20,24 +20,101 @@ const Config = struct {
     dump_skipped_path: ?[]const u8 = null,
 };
 
-const Corpus = std.ArrayListUnmanaged([]const u8);
+const Fragment = struct {
+    text: []const u8,
+    free_names: []const []const u8 = &.{},
+
+    fn deinit(self: Fragment, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.free_names) |name| allocator.free(name);
+        if (self.free_names.len != 0) allocator.free(self.free_names);
+    }
+
+    fn closed(self: Fragment) bool {
+        return self.free_names.len == 0;
+    }
+};
+
+const GeneratedCase = struct {
+    index: usize,
+    expr: []u8,
+    skipped: bool = false,
+
+    fn deinit(self: GeneratedCase, allocator: std.mem.Allocator) void {
+        allocator.free(self.expr);
+    }
+};
+
+const CaseStream = struct {
+    allocator: std.mem.Allocator,
+    corpus: []const Fragment,
+    seed: u64,
+    min_depth: u8,
+    total: usize,
+    next_index: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        corpus: []const Fragment,
+        seed: u64,
+        min_depth: u8,
+        max_depth: u8,
+    ) !CaseStream {
+        return .{
+            .allocator = allocator,
+            .corpus = corpus,
+            .seed = seed,
+            .min_depth = min_depth,
+            .total = try generatedCaseCount(corpus.len, min_depth, max_depth),
+        };
+    }
+
+    fn next(self: *CaseStream) !?GeneratedCase {
+        if (self.next_index >= self.total) return null;
+        const index = self.next_index;
+        self.next_index += 1;
+        return try generateCase(self.allocator, self.corpus, self.seed, index, self.min_depth);
+    }
+};
+
+const Template = enum {
+    direct_add,
+    let_scope,
+    with_scope,
+    rec_scope,
+    lambda_scope,
+};
+
+const FragmentCorpus = std.ArrayListUnmanaged(Fragment);
+const ShrinkCandidates = std.ArrayListUnmanaged([]const u8);
 const command_stdout_limit = 8 * 1024 * 1024;
 const command_stderr_limit = 1024 * 1024;
+const progress_interval_ns = std.time.ns_per_s;
+const job_queue_per_worker = 64;
+const job_queue_min = 1024;
+const result_queue_per_worker = 8;
+const result_queue_min = 128;
 
 const Reporter = struct {
+    io: std.Io,
+    interactive: bool,
     use_color: bool,
-    progress_every: usize = 0,
-    next_progress: usize = 0,
+    started_ns: i96,
+    next_progress_ns: i96,
+    drew_progress: bool = false,
     found_count: usize = 0,
     checked_count: usize = 0,
     skipped_count: usize = 0,
 
-    fn init(io: std.Io, env: *const std.process.Environ.Map, total_jobs: usize) Reporter {
-        const interval = progressInterval(total_jobs);
+    fn init(io: std.Io, env: *const std.process.Environ.Map) Reporter {
+        const now = nowNs(io);
+        const interactive = interactiveOutput(io, env);
         return .{
-            .use_color = autoColor(io, env),
-            .progress_every = interval,
-            .next_progress = interval,
+            .io = io,
+            .interactive = interactive,
+            .use_color = autoColor(interactive, env),
+            .started_ns = now,
+            .next_progress_ns = now + progress_interval_ns,
         };
     }
 
@@ -62,18 +139,46 @@ const Reporter = struct {
         if (config.shrink) std.debug.print(" --shrink", .{});
         if (config.dump_cases_path) |path| std.debug.print(" --dump-cases={s}", .{path});
         if (config.dump_skipped_path) |path| std.debug.print(" --dump-skipped={s}", .{path});
-        std.debug.print(" # generated={}\n", .{total_jobs});
+        std.debug.print(" # cases={}\n", .{total_jobs});
     }
 
     fn progress(self: *Reporter, completed: usize, total: usize) void {
-        if (self.progress_every == 0 or completed < self.next_progress or completed >= total) return;
+        if (total == 0 or completed >= total) return;
+        const now = nowNs(self.io);
+        if (now < self.next_progress_ns) return;
+        self.printProgress(now, completed, total);
+        while (self.next_progress_ns <= now) self.next_progress_ns += progress_interval_ns;
+    }
+
+    fn printProgress(self: *Reporter, now: i96, completed: usize, total: usize) void {
         const dim = if (self.use_color) "\x1b[2m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
+        const elapsed_ns = @max(now - self.started_ns, 1);
+        const elapsed_s = @as(u64, @intCast(@max(@divTrunc(elapsed_ns, std.time.ns_per_s), 0)));
+        const rate = casesPerSecond(completed, elapsed_ns);
+        const eta_s = etaSeconds(total - completed, rate);
+        const percent = if (total == 0) 100 else completed * 100 / total;
+        const spinner = spinnerFrame(elapsed_ns);
+        if (self.interactive) std.debug.print("\r\x1b[2K", .{});
         std.debug.print(
-            "{s}integration-diff:{s} progress generated={}/{} checked={} skipped={} found={}\n",
-            .{ dim, reset, completed, total, self.checked_count, self.skipped_count, self.found_count },
+            "{s}integration-diff:{s} {c} cases={}/{} {}% checked={} skipped={} found={} rate={}/s eta={}s elapsed={}s",
+            .{
+                dim,
+                reset,
+                spinner,
+                completed,
+                total,
+                percent,
+                self.checked_count,
+                self.skipped_count,
+                self.found_count,
+                rate,
+                eta_s,
+                elapsed_s,
+            },
         );
-        while (self.next_progress <= completed) self.next_progress += self.progress_every;
+        if (!self.interactive) std.debug.print("\n", .{});
+        self.drew_progress = true;
     }
 
     fn checked(self: *Reporter) void {
@@ -115,13 +220,14 @@ const Reporter = struct {
     }
 
     fn finish(self: Reporter, total: usize) void {
+        if (self.interactive and self.drew_progress) std.debug.print("\r\x1b[2K", .{});
         const color = if (self.use_color)
             if (self.found_count == 0) "\x1b[32m" else "\x1b[31m"
         else
             "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff: found={} checked={} skipped={} generated={}{s}\n",
+            "{s}integration-diff: found={} checked={} skipped={} cases={}{s}\n",
             .{ color, self.found_count, self.checked_count, self.skipped_count, total, reset },
         );
     }
@@ -194,10 +300,10 @@ pub fn main(init: std.process.Init) !void {
         config.failure_dir = default_failure_dir.?;
     }
 
-    const early_reporter = Reporter.init(init.io, init.environ_map, 0);
-    var corpus: Corpus = .empty;
+    const early_reporter = Reporter.init(init.io, init.environ_map);
+    var corpus: FragmentCorpus = .empty;
     defer {
-        for (corpus.items) |expr| allocator.free(expr);
+        for (corpus.items) |fragment| fragment.deinit(allocator);
         corpus.deinit(allocator);
     }
     loadCorpus(allocator, init.io, config.corpus_dir, &corpus) catch |err| {
@@ -215,8 +321,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    const total_jobs = try generatedCaseCount(corpus.items.len, config.min_depth, config.max_depth);
-    var reporter = Reporter.init(init.io, init.environ_map, total_jobs);
+    var stream = try CaseStream.init(allocator, corpus.items, seed, config.min_depth, config.max_depth);
+    const total_jobs = stream.total;
+    var reporter = Reporter.init(init.io, init.environ_map);
     reporter.printRepro(config, seed, worker_count, total_jobs);
 
     if (total_jobs == 0) {
@@ -225,12 +332,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.dump_cases_path != null or config.dump_skipped_path != null) {
-        try dumpGeneratedCases(allocator, init.io, &config, corpus.items, seed, total_jobs, &reporter);
+        try dumpGeneratedCases(allocator, init.io, &config, &stream, &reporter);
         reporter.finish(total_jobs);
         return;
     }
 
-    try runHarness(allocator, init.io, &config, corpus.items, seed, worker_count, total_jobs, &reporter);
+    try runHarness(allocator, init.io, &config, &stream, worker_count, total_jobs, &reporter);
 }
 
 const Job = struct {
@@ -238,6 +345,7 @@ const Job = struct {
     seed: u64,
     iteration: usize,
     expr: []u8,
+    skipped: bool = false,
 };
 
 const JobResult = struct {
@@ -247,6 +355,7 @@ const JobResult = struct {
     expr: []u8,
     classification: ?Classification = null,
     err: ?anyerror = null,
+    skipped: bool = false,
 
     fn deinit(self: *JobResult, allocator: std.mem.Allocator) void {
         if (self.classification) |classification| classification.deinit(allocator);
@@ -295,10 +404,7 @@ const ResultQueue = BlockingQueue(JobResult);
 const ProducerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    config: *const Config,
-    corpus: []const []const u8,
-    seed: u64,
-    total_jobs: usize,
+    stream: *CaseStream,
     jobs: *JobQueue,
 };
 
@@ -314,29 +420,26 @@ fn runHarness(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
-    corpus: []const []const u8,
-    seed: u64,
+    stream: *CaseStream,
     worker_count: usize,
     total_jobs: usize,
     reporter: *Reporter,
 ) !void {
-    const queue_len = queueCapacity(worker_count, total_jobs);
+    const job_queue_len = queueCapacity(worker_count, total_jobs, job_queue_per_worker, job_queue_min);
+    const result_queue_len = queueCapacity(worker_count, total_jobs, result_queue_per_worker, result_queue_min);
 
-    const job_storage = try allocator.alloc(Job, queue_len);
+    const job_storage = try allocator.alloc(Job, job_queue_len);
     defer allocator.free(job_storage);
     var job_queue = JobQueue.init(job_storage);
 
-    const result_storage = try allocator.alloc(JobResult, queue_len);
+    const result_storage = try allocator.alloc(JobResult, result_queue_len);
     defer allocator.free(result_storage);
     var result_queue = ResultQueue.init(result_storage);
 
     var producer_context: ProducerContext = .{
         .allocator = allocator,
         .io = io,
-        .config = config,
-        .corpus = corpus,
-        .seed = seed,
-        .total_jobs = total_jobs,
+        .stream = stream,
         .jobs = &job_queue,
     };
     const producer = try std.Thread.spawn(.{}, producerMain, .{&producer_context});
@@ -378,7 +481,9 @@ fn runHarness(
             var mutable_current = current;
             defer mutable_current.deinit(allocator);
 
-            if (mutable_current.err) |err| {
+            if (mutable_current.skipped) {
+                reporter.skipped();
+            } else if (mutable_current.err) |err| {
                 command_error = err;
                 reporter.commandError(mutable_current.seed, mutable_current.iteration, err, mutable_current.expr);
             } else if (mutable_current.classification) |*classification| {
@@ -426,21 +531,14 @@ fn producerMain(context: *ProducerContext) void {
 }
 
 fn produceJobs(context: *ProducerContext) !void {
-    var iteration: usize = 0;
-    while (iteration < context.total_jobs) : (iteration += 1) {
-        const expr = try generateExpression(
-            context.allocator,
-            context.corpus,
-            context.seed,
-            iteration,
-            context.config.min_depth,
-        );
-        errdefer context.allocator.free(expr);
+    while (try context.stream.next()) |generated| {
+        errdefer generated.deinit(context.allocator);
         try context.jobs.put(context.io, .{
-            .index = iteration,
-            .seed = context.seed,
-            .iteration = iteration,
-            .expr = expr,
+            .index = generated.index,
+            .seed = context.stream.seed,
+            .iteration = generated.index,
+            .expr = generated.expr,
+            .skipped = generated.skipped,
         });
     }
 }
@@ -456,7 +554,15 @@ fn workerMain(context: *WorkerContext) void {
             .seed = job.seed,
             .iteration = job.iteration,
             .expr = job.expr,
+            .skipped = job.skipped,
         };
+        if (job.skipped) {
+            context.results.put(context.io, result) catch |err| {
+                std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
+            };
+            continue;
+        }
+
         result.classification = classify(context.allocator, context.io, context.config, job.expr) catch |err| {
             result.err = err;
             result.classification = null;
@@ -472,9 +578,9 @@ fn workerMain(context: *WorkerContext) void {
     }
 }
 
-fn queueCapacity(worker_count: usize, total_jobs: usize) usize {
-    const scaled = std.math.mul(usize, worker_count, 4) catch total_jobs;
-    return @min(total_jobs, @max(scaled, 1));
+fn queueCapacity(worker_count: usize, total_jobs: usize, per_worker: usize, minimum: usize) usize {
+    const scaled = std.math.mul(usize, worker_count, per_worker) catch total_jobs;
+    return @min(total_jobs, @max(@max(scaled, minimum), 1));
 }
 
 fn parseArgs(config: *Config, init: std.process.Init) !void {
@@ -561,24 +667,44 @@ fn randomSeed(io: std.Io) u64 {
     return @bitCast(bytes);
 }
 
-fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
-    if (env.get("NO_COLOR")) |_| return false;
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Clock.awake.now(io).toNanoseconds();
+}
+
+fn interactiveOutput(io: std.Io, env: *const std.process.Environ.Map) bool {
     if (env.get("TERM")) |term| {
         if (std.mem.eql(u8, term, "dumb")) return false;
     }
     return std.Io.File.stderr().isTty(io) catch false;
 }
 
-fn progressInterval(total_jobs: usize) usize {
-    if (total_jobs < 1000) return 0;
-    return @max(@as(usize, 1000), total_jobs / 16);
+fn autoColor(interactive: bool, env: *const std.process.Environ.Map) bool {
+    if (!interactive) return false;
+    if (env.get("NO_COLOR")) |_| return false;
+    return true;
+}
+
+fn casesPerSecond(completed: usize, elapsed_ns: i96) u64 {
+    const elapsed = @as(u128, @intCast(@max(elapsed_ns, 1)));
+    return @intCast((@as(u128, completed) * std.time.ns_per_s) / elapsed);
+}
+
+fn etaSeconds(remaining: usize, rate: u64) u64 {
+    if (rate == 0) return 0;
+    return @intCast((remaining + rate - 1) / rate);
+}
+
+fn spinnerFrame(elapsed_ns: i96) u8 {
+    const frames = [_]u8{ '|', '/', '-', '\\' };
+    const tick: usize = @intCast(@divTrunc(@max(elapsed_ns, 0), std.time.ns_per_s));
+    return frames[tick % frames.len];
 }
 
 fn loadCorpus(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    corpus: *Corpus,
+    corpus: *FragmentCorpus,
 ) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
@@ -594,120 +720,291 @@ fn loadCorpus(
     }
 }
 
-fn appendCorpusLines(allocator: std.mem.Allocator, text: []const u8, corpus: *Corpus) !void {
+fn appendCorpusLines(allocator: std.mem.Allocator, text: []const u8, corpus: *FragmentCorpus) !void {
+    var pending_free_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (pending_free_names.items) |name| allocator.free(name);
+        pending_free_names.deinit(allocator);
+    }
+
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        try corpus.append(allocator, try allocator.dupe(u8, trimmed));
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') {
+            if (std.mem.startsWith(u8, trimmed, "# free:")) {
+                for (pending_free_names.items) |name| allocator.free(name);
+                pending_free_names.clearRetainingCapacity();
+                try appendFreeNameList(allocator, &pending_free_names, trimmed["# free:".len..]);
+            }
+            continue;
+        }
+
+        const free_names = try pending_free_names.toOwnedSlice(allocator);
+        pending_free_names = .empty;
+        const fragment_text = allocator.dupe(u8, trimmed) catch |err| {
+            freeNames(allocator, free_names);
+            return err;
+        };
+        var fragment: Fragment = .{
+            .text = fragment_text,
+            .free_names = free_names,
+        };
+        corpus.append(allocator, fragment) catch |err| {
+            fragment.deinit(allocator);
+            return err;
+        };
     }
 }
 
-fn sortCorpus(corpus: [][]const u8) void {
-    std.mem.sort([]const u8, corpus, {}, lessThanExpr);
+fn appendFreeNameList(
+    allocator: std.mem.Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    text: []const u8,
+) !void {
+    var parts = std.mem.tokenizeAny(u8, text, " \t\r,");
+    while (parts.next()) |name| {
+        if (!validBinderName(name)) return error.InvalidFreeName;
+        try appendUniqueName(allocator, names, name);
+    }
 }
 
-fn lessThanExpr(_: void, lhs: []const u8, rhs: []const u8) bool {
-    return std.mem.lessThan(u8, lhs, rhs);
+fn validBinderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isIdentStart(name[0])) return false;
+    for (name[1..]) |c| {
+        if (!isIdentRest(c)) return false;
+    }
+    return true;
+}
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn isIdentRest(c: u8) bool {
+    return isIdentStart(c) or std.ascii.isDigit(c) or c == '\'' or c == '-';
+}
+
+fn sortCorpus(corpus: []Fragment) void {
+    std.mem.sort(Fragment, corpus, {}, lessThanExpr);
+}
+
+fn lessThanExpr(_: void, lhs: Fragment, rhs: Fragment) bool {
+    return std.mem.lessThan(u8, lhs.text, rhs.text);
 }
 
 fn dumpGeneratedCases(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
-    corpus: []const []const u8,
-    seed: u64,
-    total_jobs: usize,
+    stream: *CaseStream,
     reporter: *Reporter,
 ) !void {
-    var cases: std.ArrayListUnmanaged(u8) = .empty;
-    defer cases.deinit(allocator);
-    var skipped: std.ArrayListUnmanaged(u8) = .empty;
-    defer skipped.deinit(allocator);
+    var cases = try DumpFile.open(io, config.dump_cases_path);
+    defer cases.close();
+    var skipped = try DumpFile.open(io, config.dump_skipped_path);
+    defer skipped.close();
 
-    var iteration: usize = 0;
-    while (iteration < total_jobs) : (iteration += 1) {
-        const expr = try generateExpression(
-            allocator,
-            corpus,
-            seed,
-            iteration,
-            config.min_depth,
-        );
-        errdefer allocator.free(expr);
+    while (try stream.next()) |generated| {
+        errdefer generated.deinit(allocator);
 
-        if (config.dump_cases_path != null) {
-            try cases.appendSlice(allocator, expr);
-            try cases.append(allocator, '\n');
+        if (generated.skipped) {
+            try skipped.writeLine(generated.expr);
+            reporter.skipped();
+        } else {
+            try cases.writeLine(generated.expr);
+            reporter.checked();
         }
-        allocator.free(expr);
-        reporter.checked();
-        reporter.progress(iteration + 1, total_jobs);
+        generated.deinit(allocator);
+        reporter.progress(stream.next_index, stream.total);
+    }
+}
+
+const DumpFile = struct {
+    io: std.Io,
+    file: ?std.Io.File = null,
+
+    fn open(io: std.Io, maybe_path: ?[]const u8) !DumpFile {
+        const path = maybe_path orelse return .{ .io = io };
+        if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+        return .{
+            .io = io,
+            .file = try std.Io.Dir.cwd().createFile(io, path, .{}),
+        };
     }
 
-    if (config.dump_cases_path) |path| try writeDumpFile(io, path, cases.items);
-    if (config.dump_skipped_path) |path| try writeDumpFile(io, path, skipped.items);
-}
+    fn close(self: *DumpFile) void {
+        if (self.file) |file| file.close(self.io);
+        self.file = null;
+    }
 
-fn writeDumpFile(io: std.Io, path: []const u8, data: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
-}
+    fn writeLine(self: DumpFile, line: []const u8) !void {
+        const file = self.file orelse return;
+        try file.writeStreamingAll(self.io, line);
+        try file.writeStreamingAll(self.io, "\n");
+    }
+};
 
-fn generateExpression(
+fn generateCase(
     allocator: std.mem.Allocator,
-    corpus: []const []const u8,
+    corpus: []const Fragment,
     seed: u64,
     iteration: usize,
     min_depth: u8,
-) ![]u8 {
+) !GeneratedCase {
     const pair_count = try pairCount(corpus.len);
-    const depth_index: u8 = @intCast(iteration / pair_count);
+    const depth = min_depth + @as(u8, @intCast(iteration / pair_count));
     const pair_index = permutedIndex(seed, iteration % pair_count, pair_count);
     const left = corpus[pair_index / corpus.len];
     const right = corpus[pair_index % corpus.len];
-    var expr = try generatePairCore(allocator, left, right);
-    errdefer allocator.free(expr);
+    var fragment = if (right.free_names.len != 0)
+        try scopedBodyFragment(allocator, left, right, depth)
+    else if (left.free_names.len != 0)
+        try scopedBodyFragment(allocator, right, left, depth)
+    else
+        try closedPairFragment(allocator, left, right, depth);
+    errdefer fragment.deinit(allocator);
 
-    const depth = min_depth + depth_index;
-    var i: u8 = 0;
-    while (i < depth) : (i += 1) {
-        const wrapped = try wrapForced(allocator, variation(seed, iteration, i), expr);
-        allocator.free(expr);
-        expr = wrapped;
-    }
-    return expr;
+    const skipped = !fragment.closed();
+    const expr = try allocator.dupe(u8, fragment.text);
+    fragment.deinit(allocator);
+    return .{ .index = iteration, .expr = expr, .skipped = skipped };
 }
 
-fn generatePairCore(
-    allocator: std.mem.Allocator,
-    left: []const u8,
-    right: []const u8,
-) ![]u8 {
-    return binary(allocator, left, "+", right);
-}
-
-fn wrapForced(allocator: std.mem.Allocator, choice: u64, expr: []const u8) ![]u8 {
-    return switch (choice % 8) {
-        0 => wrap(allocator, "(", expr, ")"),
-        1 => wrap(allocator, "let x = ", expr, "; in x"),
-        2 => wrap(allocator, "if true then ", expr, " else 1"),
-        3 => wrap(allocator, "if false then 1 else ", expr, ""),
-        4 => wrap(allocator, "({ a = ", expr, "; }).a"),
-        5 => wrap(allocator, "(rec { a = ", expr, "; b = a; }).b"),
-        6 => wrap(allocator, "with { x = ", expr, "; }; x"),
-        else => wrap(allocator, "assert true; ", expr, ""),
+fn closedPairFragment(allocator: std.mem.Allocator, left: Fragment, right: Fragment, depth: u8) !Fragment {
+    const template = closedTemplate(depth);
+    const text = switch (template) {
+        .direct_add => try binary(allocator, left.text, "+", right.text),
+        .let_scope => try std.mem.concat(allocator, u8, &.{ "let x = ", left.text, "; y = ", right.text, "; in x + y" }),
+        .with_scope => try std.mem.concat(allocator, u8, &.{ "with { x = ", left.text, "; y = ", right.text, "; }; x + y" }),
+        .rec_scope => try std.mem.concat(allocator, u8, &.{ "(rec { x = ", left.text, "; y = ", right.text, "; z = x + y; }).z" }),
+        .lambda_scope => try std.mem.concat(allocator, u8, &.{ "(x: y: x + y) (", left.text, ") (", right.text, ")" }),
+    };
+    errdefer allocator.free(text);
+    return .{
+        .text = text,
+        .free_names = try unionNames(allocator, left.free_names, right.free_names),
     };
 }
 
-fn variation(seed: u64, iteration: usize, depth: u8) u64 {
-    var x = seed ^ @as(u64, @intCast(iteration)) ^ (@as(u64, depth) << 56);
-    x ^= x >> 30;
-    x *%= 0xbf58476d1ce4e5b9;
-    x ^= x >> 27;
-    x *%= 0x94d049bb133111eb;
-    x ^= x >> 31;
-    return x;
+fn scopedBodyFragment(allocator: std.mem.Allocator, value: Fragment, body: Fragment, depth: u8) !Fragment {
+    var fragment = try cloneFragment(allocator, body);
+    errdefer fragment.deinit(allocator);
+
+    var step: u8 = 0;
+    while (step < depth and fragment.free_names.len != 0) : (step += 1) {
+        const name = fragment.free_names[0];
+        const template = binderTemplate(step);
+        const next = try bindOneFreeName(allocator, template, value, fragment, name);
+        fragment.deinit(allocator);
+        fragment = next;
+    }
+
+    return fragment;
+}
+
+fn closedTemplate(depth: u8) Template {
+    return switch (depth) {
+        0 => .direct_add,
+        1 => .let_scope,
+        2 => .with_scope,
+        3 => .rec_scope,
+        else => .lambda_scope,
+    };
+}
+
+fn binderTemplate(step: u8) Template {
+    return switch (step % 4) {
+        0 => .let_scope,
+        1 => .with_scope,
+        2 => .rec_scope,
+        else => .lambda_scope,
+    };
+}
+
+fn bindOneFreeName(
+    allocator: std.mem.Allocator,
+    template: Template,
+    value: Fragment,
+    body: Fragment,
+    name: []const u8,
+) !Fragment {
+    const text = switch (template) {
+        .let_scope => try std.mem.concat(allocator, u8, &.{ "let ", name, " = ", value.text, "; in ", body.text }),
+        .with_scope => try std.mem.concat(allocator, u8, &.{ "with { ", name, " = ", value.text, "; }; ", body.text }),
+        .rec_scope => try std.mem.concat(allocator, u8, &.{ "(rec { ", name, " = ", value.text, "; result = ", body.text, "; }).result" }),
+        .lambda_scope => try std.mem.concat(allocator, u8, &.{ "(", name, ": ", body.text, ") (", value.text, ")" }),
+        .direct_add => unreachable,
+    };
+    errdefer allocator.free(text);
+
+    const remaining_body_names = try subtractName(allocator, body.free_names, name);
+    defer freeNames(allocator, remaining_body_names);
+    return .{
+        .text = text,
+        .free_names = try unionNames(allocator, value.free_names, remaining_body_names),
+    };
+}
+
+fn cloneFragment(allocator: std.mem.Allocator, fragment: Fragment) !Fragment {
+    return .{
+        .text = try allocator.dupe(u8, fragment.text),
+        .free_names = try dupeNames(allocator, fragment.free_names),
+    };
+}
+
+fn dupeNames(allocator: std.mem.Allocator, names: []const []const u8) ![]const []const u8 {
+    if (names.len == 0) return &.{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |name| allocator.free(name);
+        out.deinit(allocator);
+    }
+    for (names) |name| try appendUniqueName(allocator, &out, name);
+    return out.toOwnedSlice(allocator);
+}
+
+fn unionNames(allocator: std.mem.Allocator, left: []const []const u8, right: []const []const u8) ![]const []const u8 {
+    if (left.len == 0 and right.len == 0) return &.{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |name| allocator.free(name);
+        out.deinit(allocator);
+    }
+    for (left) |name| try appendUniqueName(allocator, &out, name);
+    for (right) |name| try appendUniqueName(allocator, &out, name);
+    return out.toOwnedSlice(allocator);
+}
+
+fn subtractName(allocator: std.mem.Allocator, names: []const []const u8, bound: []const u8) ![]const []const u8 {
+    if (names.len == 0) return &.{};
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |name| allocator.free(name);
+        out.deinit(allocator);
+    }
+    for (names) |name| {
+        if (!std.mem.eql(u8, name, bound)) try appendUniqueName(allocator, &out, name);
+    }
+    if (out.items.len == 0) return &.{};
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendUniqueName(
+    allocator: std.mem.Allocator,
+    names: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+) !void {
+    for (names.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    try names.append(allocator, try allocator.dupe(u8, name));
+}
+
+fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| allocator.free(name);
+    if (names.len != 0) allocator.free(names);
 }
 
 fn pairCount(corpus_len: usize) !usize {
@@ -741,10 +1038,6 @@ fn gcd(a_start: usize, b_start: usize) usize {
         b = next;
     }
     return a;
-}
-
-fn wrap(allocator: std.mem.Allocator, prefix: []const u8, expr: []const u8, suffix: []const u8) ![]u8 {
-    return std.mem.concat(allocator, u8, &.{ prefix, expr, suffix });
 }
 
 fn binary(allocator: std.mem.Allocator, left: []const u8, op: []const u8, right: []const u8) ![]u8 {
@@ -1060,7 +1353,7 @@ fn shrinkInteresting(
     while (changed) {
         changed = false;
 
-        var candidates: Corpus = .empty;
+        var candidates: ShrinkCandidates = .empty;
         defer {
             for (candidates.items) |candidate| allocator.free(candidate);
             candidates.deinit(allocator);
@@ -1083,7 +1376,7 @@ fn shrinkInteresting(
     return current;
 }
 
-fn shrinkCandidates(allocator: std.mem.Allocator, expr: []const u8, out: *Corpus) !void {
+fn shrinkCandidates(allocator: std.mem.Allocator, expr: []const u8, out: *ShrinkCandidates) !void {
     const constants = [_][]const u8{ "1", "true", "false", "null", "[]", "{}" };
     for (constants) |constant| try out.append(allocator, try allocator.dupe(u8, constant));
 
