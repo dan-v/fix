@@ -356,26 +356,26 @@ pub const Evaluator = struct {
     fn corepkgsSource(path: []const u8) ?[]const u8 {
         if (!std.mem.eql(u8, path, "/__corepkgs__/fetchurl.nix")) return null;
         return
-            \\{
-            \\  name ? baseNameOf url,
-            \\  url,
-            \\  hash ? "",
-            \\  sha256 ? hash,
-            \\  executable ? false,
-            \\  ...
-            \\}:
-            \\derivation {
-            \\  inherit name url executable;
-            \\  urls = [ url ];
-            \\  builder = "builtin:fetchurl";
-            \\  system = "builtin";
-            \\  outputHash = sha256;
-            \\  outputHashAlgo = "sha256";
-            \\  outputHashMode = "flat";
-            \\  preferLocalBuild = true;
-            \\  impureEnvVars = [ ];
-            \\  unpack = false;
-            \\}
+        \\{
+        \\  name ? baseNameOf url,
+        \\  url,
+        \\  hash ? "",
+        \\  sha256 ? hash,
+        \\  executable ? false,
+        \\  ...
+        \\}:
+        \\derivation {
+        \\  inherit name url executable;
+        \\  urls = [ url ];
+        \\  builder = "builtin:fetchurl";
+        \\  system = "builtin";
+        \\  outputHash = sha256;
+        \\  outputHashAlgo = "sha256";
+        \\  outputHashMode = "flat";
+        \\  preferLocalBuild = true;
+        \\  impureEnvVars = [ ];
+        \\  unpack = false;
+        \\}
         ;
     }
 
@@ -685,25 +685,28 @@ fn renderXmlForTest(source: []const u8) ![]u8 {
 test "writeValue prints lazy containers without forcing contents" {
     const list_output = try renderForTest("[ 1 (1 / 0) \"x\" ]");
     defer std.testing.allocator.free(list_output);
-    try std.testing.expectEqualStrings("[ ... ... ... ]", list_output);
+    try std.testing.expectEqualStrings("[ 1 ... \"x\" ]", list_output);
 
     const attrs_output = try renderForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
     defer std.testing.allocator.free(attrs_output);
-    try std.testing.expectEqualStrings("{ a = ...; b = ...; c = ...; }", attrs_output);
+    try std.testing.expectEqualStrings("{ a = 1; b = ...; c = \"x\"; }", attrs_output);
 }
 
 test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
+    try std.testing.expectEqualStrings("{ a = ...; b = 1; }", output);
 }
 
 test "writeXmlValue prints lazy containers without forcing contents" {
-    const attrs_output = try renderXmlForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
+    const attrs_output = try renderXmlForTest("{ a = 1; b = 1 / 0; c = \"x\"; d = []; e = [ 1 ]; f = { x = 1; }; }");
     defer std.testing.allocator.free(attrs_output);
-    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"a\">\n      <unevaluated />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"a\">\n      <int value=\"1\" />") != null);
     try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"b\">\n      <unevaluated />") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"c\">\n      <unevaluated />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"c\">\n      <string value=\"x\" />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"d\">\n      <list>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"e\">\n      <unevaluated />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"f\">\n      <unevaluated />") != null);
 }
 
 test "writeXmlValue prints resolved lazy children" {
@@ -822,7 +825,7 @@ test "evaluate small unary builtins" {
 
     const values = try renderForTest("builtins.attrValues { b = 2; a = 1; }");
     defer std.testing.allocator.free(values);
-    try std.testing.expectEqualStrings("[ ... ... ]", values);
+    try std.testing.expectEqualStrings("[ 1 2 ]", values);
 }
 
 test "evaluate curried binary builtins" {
@@ -948,7 +951,7 @@ test "evaluate builtins.typeOf" {
 test "evaluate concatLists and listToAttrs builtins" {
     const concat = try renderForTest("builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]");
     defer std.testing.allocator.free(concat);
-    try std.testing.expectEqualStrings("[ ... ... ... ]", concat);
+    try std.testing.expectEqualStrings("[ 1 ... 3 ]", concat);
 
     const first_duplicate_wins = try renderForTest("(builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; value = 2; } ]).a");
     defer std.testing.allocator.free(first_duplicate_wins);
@@ -1480,8 +1483,7 @@ test "evaluate path builtins coerce outPath attrsets" {
     });
     defer std.testing.allocator.free(payload_path);
 
-    const source = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const source = try std.fmt.allocPrint(std.testing.allocator,
         \\let
         \\  imported = (import {{ outPath = "{s}"; }}).value;
         \\  contents = builtins.readFile {{ outPath = "{s}"; }};

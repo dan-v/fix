@@ -1045,7 +1045,7 @@ pub const Compiler = struct {
                 continue;
             }
             try self.emitAttrName(entry.path[0]);
-            try self.compileThunk(leaf.?.expr);
+            try self.compileLazyContainerValue(leaf.?.expr);
             try self.appendAttrPosition(&positions, entry.path[0]);
             count += 1;
         }
@@ -1106,7 +1106,7 @@ pub const Compiler = struct {
             }
             const previous_skip = self.skip_local_slot;
             if (leaf.?.inherit_outer) self.skip_local_slot = slot;
-            const compile_result = self.compileThunk(leaf.?.expr);
+            const compile_result = self.compileLazyContainerValue(leaf.?.expr);
             self.skip_local_slot = previous_skip;
             try compile_result;
             try self.emitOpByte(.set_cell_local, @intCast(slot));
@@ -1381,9 +1381,51 @@ pub const Compiler = struct {
     fn compileList(self: *Compiler, node: *const Node) !void {
         const list = node.data.list;
         for (list.items) |item| {
-            try self.compileThunk(item);
+            try self.compileLazyContainerValue(item);
         }
         try self.emitOpU16(.build_list, @intCast(list.items.len));
+    }
+
+    fn compileLazyContainerValue(self: *Compiler, node: *const Node) !void {
+        if (try self.compileImmediateContainerValue(node)) return;
+        try self.compileThunk(node);
+    }
+
+    fn compileImmediateContainerValue(self: *Compiler, node: *const Node) !bool {
+        const unwrapped = unwrapParens(node);
+        switch (unwrapped.tag) {
+            .integer => try self.compileInt(unwrapped),
+            .float_val => try self.compileFloat(unwrapped),
+            .string => {
+                if (self.stringHasInterpolation(unwrapped)) return false;
+                try self.compileString(unwrapped);
+            },
+            .path => {
+                if (self.pathHasInterpolation(unwrapped)) return false;
+                try self.compilePath(unwrapped);
+            },
+            .bool_true => try self.emitOp(.push_true),
+            .bool_false => try self.emitOp(.push_false),
+            .null => try self.emitOp(.push_null),
+            .list => {
+                if (unwrapped.data.list.items.len != 0) return false;
+                try self.emitOpU16(.build_list, 0);
+            },
+            else => return false,
+        }
+        return true;
+    }
+
+    fn stringHasInterpolation(self: *Compiler, node: *const Node) bool {
+        const atom = node.data.atom;
+        const span = self.source[atom.offset .. atom.offset + atom.len];
+        return std.mem.indexOf(u8, span, "${") != null;
+    }
+
+    fn pathHasInterpolation(self: *Compiler, node: *const Node) bool {
+        const atom = node.data.atom;
+        const span = self.source[atom.offset .. atom.offset + atom.len];
+        return std.mem.indexOf(u8, span, "${") != null;
     }
 
     fn emitWithLookup(self: *Compiler, name: []const u8) !bool {
@@ -1567,6 +1609,12 @@ fn nodeSourceSpan(node: *const Node) ?Node.Atom {
         .list => listSourceSpan(node.data.list),
         .parens => nodeSourceSpan(node.data.parens),
     };
+}
+
+fn unwrapParens(node: *const Node) *const Node {
+    var current = node;
+    while (current.tag == .parens) current = current.data.parens;
+    return current;
 }
 
 fn combineNodeSpans(left: *const Node, right: *const Node) ?Node.Atom {
