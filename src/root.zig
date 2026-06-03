@@ -117,6 +117,11 @@ test "end-to-end: path concatenation follows Nix left-path semantics" {
     const paths = try ev.evaluate("./foo + ./bar");
     try std.testing.expectEqual(value.ValueType.path, paths.discriminant);
     try std.testing.expectEqualStrings("./foo./bar", ev.intern.get(paths.asInternId()));
+
+    var ev_with_base = try Evaluator.init(alloc, 0);
+    defer ev_with_base.deinit();
+    try ev_with_base.setBasePathFromCurrentPath(std.testing.io);
+    try std.testing.expectError(error.FileNotFound, ev_with_base.evaluate("\"x\" + ./missing-source-path"));
 }
 
 test "end-to-end: string interpolation" {

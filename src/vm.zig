@@ -995,7 +995,11 @@ pub const VM = struct {
     fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {
         switch (value.discriminant) {
             .string => {},
-            .path => try self.appendContextEntry(context, value.asInternId(), try self.pathContextValue()),
+            .path => {
+                const path = self.intern.get(value.asInternId());
+                if (!try self.files.pathExists(path)) return error.FileNotFound;
+                try self.appendContextEntry(context, value.asInternId(), try self.pathContextValue());
+            },
             .string_context => {
                 const string = try self.heap.getContextString(value.asObjectId());
                 for (string.context) |entry| try self.appendContextEntry(context, entry.name, entry.value);
