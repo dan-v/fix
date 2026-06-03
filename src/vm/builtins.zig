@@ -1221,7 +1221,7 @@ fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
     defer self.allocator.free(out);
 
     for (out, 0..) |*value, i| {
-        value.* = try self.callValue(func, Value.int(@intCast(i)));
+        value.* = try makeBuiltinThunk(self, .mapValue, &.{ func, Value.int(@intCast(i)) });
     }
     return Value.list(try self.heap.addList(out));
 }

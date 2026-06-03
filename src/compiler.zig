@@ -51,6 +51,10 @@ const AttrEntryView = struct {
     inherit_outer: bool = false,
 };
 
+const ContainerValueOptions = struct {
+    raw_identifier: bool = false,
+};
+
 const with_capture_name = "\x00with";
 
 pub const Compiler = struct {
@@ -524,7 +528,7 @@ pub const Compiler = struct {
     fn compileApply(self: *Compiler, node: *const Node) !void {
         const ap = node.data.apply;
         try self.compileNode(ap.func);
-        try self.compileThunk(ap.arg);
+        try self.compileContainerValue(ap.arg, .{});
         try self.emitOp(.call);
     }
 
@@ -732,7 +736,7 @@ pub const Compiler = struct {
             const binding = leaf orelse return error.UndefinedVariable;
             const previous_skip = self.skip_local_slot;
             if (binding.inherit_outer) self.skip_local_slot = slot;
-            const compile_result = self.compileThunk(binding.expr);
+            const compile_result = self.compileContainerValue(binding.expr, .{});
             self.skip_local_slot = previous_skip;
             return compile_result;
         }
@@ -1045,7 +1049,7 @@ pub const Compiler = struct {
                 continue;
             }
             try self.emitAttrName(entry.path[0]);
-            try self.compileLazyContainerValue(leaf.?.expr);
+            try self.compileContainerValue(leaf.?.expr, .{ .raw_identifier = true });
             try self.appendAttrPosition(&positions, entry.path[0]);
             count += 1;
         }
@@ -1106,7 +1110,7 @@ pub const Compiler = struct {
             }
             const previous_skip = self.skip_local_slot;
             if (leaf.?.inherit_outer) self.skip_local_slot = slot;
-            const compile_result = self.compileLazyContainerValue(leaf.?.expr);
+            const compile_result = self.compileContainerValue(leaf.?.expr, .{});
             self.skip_local_slot = previous_skip;
             try compile_result;
             try self.emitOpByte(.set_cell_local, @intCast(slot));
@@ -1381,17 +1385,17 @@ pub const Compiler = struct {
     fn compileList(self: *Compiler, node: *const Node) !void {
         const list = node.data.list;
         for (list.items) |item| {
-            try self.compileLazyContainerValue(item);
+            try self.compileContainerValue(item, .{ .raw_identifier = true });
         }
         try self.emitOpU16(.build_list, @intCast(list.items.len));
     }
 
-    fn compileLazyContainerValue(self: *Compiler, node: *const Node) !void {
-        if (try self.compileImmediateContainerValue(node)) return;
+    fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {
+        if (try self.compileImmediateContainerValue(node, options)) return;
         try self.compileThunk(node);
     }
 
-    fn compileImmediateContainerValue(self: *Compiler, node: *const Node) !bool {
+    fn compileImmediateContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !bool {
         const unwrapped = unwrapParens(node);
         switch (unwrapped.tag) {
             .integer => try self.compileInt(unwrapped),
@@ -1411,9 +1415,26 @@ pub const Compiler = struct {
                 if (unwrapped.data.list.items.len != 0) return false;
                 try self.emitOpU16(.build_list, 0);
             },
+            .identifier => {
+                if (!options.raw_identifier) return false;
+                if (!try self.compileRawIdent(unwrapped)) return false;
+            },
             else => return false,
         }
         return true;
+    }
+
+    fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
+        const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+        if (self.resolveLocal(span)) |slot| {
+            try self.emitOpByte(.capture_local, @intCast(slot));
+            return true;
+        }
+        if (try self.resolveCapture(span)) |slot| {
+            try self.emitOpByte(.capture_upvalue, slot);
+            return true;
+        }
+        return false;
     }
 
     fn stringHasInterpolation(self: *Compiler, node: *const Node) bool {
