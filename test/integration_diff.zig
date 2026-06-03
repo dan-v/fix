@@ -101,14 +101,12 @@ const result_queue_min = 128;
 const QueueSnapshot = struct {
     job_depth: usize,
     job_capacity: usize,
-    ready_results: usize,
 };
 
 const QueueStats = struct {
     job_capacity: usize,
     jobs_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     jobs_taken: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    results_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn init(job_capacity: usize) QueueStats {
         return .{
@@ -124,18 +122,12 @@ const QueueStats = struct {
         _ = self.jobs_taken.fetchAdd(1, .monotonic);
     }
 
-    fn resultPut(self: *QueueStats) void {
-        _ = self.results_put.fetchAdd(1, .monotonic);
-    }
-
-    fn snapshot(self: *const QueueStats, reported: usize) QueueSnapshot {
+    fn snapshot(self: *const QueueStats) QueueSnapshot {
         const jobs_put = self.jobs_put.load(.monotonic);
         const jobs_taken = self.jobs_taken.load(.monotonic);
-        const results_put = self.results_put.load(.monotonic);
         return .{
             .job_depth = saturatedSub(jobs_put, jobs_taken),
             .job_capacity = self.job_capacity,
-            .ready_results = saturatedSub(results_put, reported),
         };
     }
 };
@@ -204,7 +196,7 @@ const Reporter = struct {
         const eta_s = etaSeconds(total - completed, rate);
         const percent_x10 = percentTenths(completed, total);
         const skip_permille = permille(self.skipped_count, completed);
-        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot(completed) else null;
+        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot() else null;
         const spinner = spinnerFrame(elapsed_ns);
 
         if (self.interactive) {
@@ -594,62 +586,45 @@ fn runHarness(
         worker.* = try std.Thread.spawn(.{}, workerMain, .{&worker_context});
     }
 
-    var pending = try allocator.alloc(?JobResult, total_jobs);
-    defer allocator.free(pending);
-    @memset(pending, null);
-    defer {
-        for (pending) |*maybe_result| {
-            if (maybe_result.*) |*result| result.deinit(allocator);
-        }
-    }
-
-    var next_to_report: usize = 0;
     var received: usize = 0;
     var found_mismatch = false;
     var command_error: ?anyerror = null;
 
     while (received < total_jobs) : (received += 1) {
         const result = (try result_queue.get(io)) orelse return error.ResultQueueClosed;
-        pending[result.index] = result;
+        var mutable_result = result;
+        defer mutable_result.deinit(allocator);
 
-        while (next_to_report < total_jobs) {
-            const current = pending[next_to_report] orelse break;
-            pending[next_to_report] = null;
-            var mutable_current = current;
-            defer mutable_current.deinit(allocator);
-
-            if (mutable_current.skipped) {
+        if (mutable_result.skipped) {
+            reporter.skipped();
+        } else if (mutable_result.err) |err| {
+            command_error = err;
+            reporter.commandError(mutable_result.seed, mutable_result.iteration, err, mutable_result.expr);
+        } else if (mutable_result.classification) |*classification| {
+            if (classification.outcome == .skipped) {
                 reporter.skipped();
-            } else if (mutable_current.err) |err| {
-                command_error = err;
-                reporter.commandError(mutable_current.seed, mutable_current.iteration, err, mutable_current.expr);
-            } else if (mutable_current.classification) |*classification| {
-                if (classification.outcome == .skipped) {
-                    reporter.skipped();
-                } else {
-                    reporter.checked();
-                }
-                if (classification.interesting()) {
-                    found_mismatch = true;
-                    reportInteresting(
-                        allocator,
-                        io,
-                        config,
-                        mutable_current.seed,
-                        mutable_current.iteration,
-                        mutable_current.expr,
-                        classification,
-                        reporter,
-                    ) catch |err| {
-                        command_error = err;
-                        reporter.saveError(mutable_current.seed, mutable_current.iteration, err);
-                    };
-                }
+            } else {
+                reporter.checked();
             }
-
-            next_to_report += 1;
-            reporter.progress(next_to_report, total_jobs);
+            if (classification.interesting()) {
+                found_mismatch = true;
+                reportInteresting(
+                    allocator,
+                    io,
+                    config,
+                    mutable_result.seed,
+                    mutable_result.iteration,
+                    mutable_result.expr,
+                    classification,
+                    reporter,
+                ) catch |err| {
+                    command_error = err;
+                    reporter.saveError(mutable_result.seed, mutable_result.iteration, err);
+                };
+            }
         }
+
+        reporter.progress(received + 1, total_jobs);
     }
 
     producer.join();
@@ -699,7 +674,6 @@ fn workerMain(context: *WorkerContext) void {
             context.results.put(context.io, result) catch |err| {
                 std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
             };
-            context.stats.resultPut();
             continue;
         }
 
@@ -709,14 +683,12 @@ fn workerMain(context: *WorkerContext) void {
             context.results.put(context.io, result) catch |queue_err| {
                 std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(queue_err)});
             };
-            context.stats.resultPut();
             continue;
         };
 
         context.results.put(context.io, result) catch |err| {
             std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
         };
-        context.stats.resultPut();
     }
 }
 
@@ -889,13 +861,12 @@ fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
     } else "";
     const reset = if (use_color) "\x1b[0m" else "";
 
-    std.debug.print("{s}{s}{s} jobs {}/{} ready {}", .{
+    std.debug.print("{s}{s}{s} jobs {}/{}", .{
         color,
         @tagName(state),
         reset,
         snapshot.job_depth,
         snapshot.job_capacity,
-        snapshot.ready_results,
     });
 }
 
