@@ -89,16 +89,62 @@ const FragmentCorpus = std.ArrayListUnmanaged(Fragment);
 const ShrinkCandidates = std.ArrayListUnmanaged([]const u8);
 const command_stdout_limit = 8 * 1024 * 1024;
 const command_stderr_limit = 1024 * 1024;
-const progress_interval_ns = std.time.ns_per_s;
+const interactive_progress_interval_ns = 250 * std.time.ns_per_ms;
+const log_progress_interval_ns = 5 * std.time.ns_per_s;
+const progress_bar_width = 28;
+const progress_dashboard_lines = 3;
 const job_queue_per_worker = 64;
 const job_queue_min = 1024;
 const result_queue_per_worker = 8;
 const result_queue_min = 128;
 
+const QueueSnapshot = struct {
+    job_depth: usize,
+    job_capacity: usize,
+    ready_results: usize,
+};
+
+const QueueStats = struct {
+    job_capacity: usize,
+    jobs_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    jobs_taken: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    results_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn init(job_capacity: usize) QueueStats {
+        return .{
+            .job_capacity = job_capacity,
+        };
+    }
+
+    fn jobPut(self: *QueueStats) void {
+        _ = self.jobs_put.fetchAdd(1, .monotonic);
+    }
+
+    fn jobTaken(self: *QueueStats) void {
+        _ = self.jobs_taken.fetchAdd(1, .monotonic);
+    }
+
+    fn resultPut(self: *QueueStats) void {
+        _ = self.results_put.fetchAdd(1, .monotonic);
+    }
+
+    fn snapshot(self: *const QueueStats, reported: usize) QueueSnapshot {
+        const jobs_put = self.jobs_put.load(.monotonic);
+        const jobs_taken = self.jobs_taken.load(.monotonic);
+        const results_put = self.results_put.load(.monotonic);
+        return .{
+            .job_depth = saturatedSub(jobs_put, jobs_taken),
+            .job_capacity = self.job_capacity,
+            .ready_results = saturatedSub(results_put, reported),
+        };
+    }
+};
+
 const Reporter = struct {
     io: std.Io,
     interactive: bool,
     use_color: bool,
+    queue_stats: ?*const QueueStats = null,
     started_ns: i96,
     next_progress_ns: i96,
     drew_progress: bool = false,
@@ -114,7 +160,7 @@ const Reporter = struct {
             .interactive = interactive,
             .use_color = autoColor(interactive, env),
             .started_ns = now,
-            .next_progress_ns = now + progress_interval_ns,
+            .next_progress_ns = now + progressInterval(interactive),
         };
     }
 
@@ -147,40 +193,112 @@ const Reporter = struct {
         const now = nowNs(self.io);
         if (now < self.next_progress_ns) return;
         self.printProgress(now, completed, total);
-        while (self.next_progress_ns <= now) self.next_progress_ns += progress_interval_ns;
+        const interval = progressInterval(self.interactive);
+        while (self.next_progress_ns <= now) self.next_progress_ns += interval;
     }
 
     fn printProgress(self: *Reporter, now: i96, completed: usize, total: usize) void {
-        const dim = if (self.use_color) "\x1b[2m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
         const elapsed_ns = @max(now - self.started_ns, 1);
         const elapsed_s = @as(u64, @intCast(@max(@divTrunc(elapsed_ns, std.time.ns_per_s), 0)));
         const rate = casesPerSecond(completed, elapsed_ns);
         const eta_s = etaSeconds(total - completed, rate);
-        const percent = if (total == 0) 100 else completed * 100 / total;
+        const percent_x10 = percentTenths(completed, total);
         const skip_permille = permille(self.skipped_count, completed);
+        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot(completed) else null;
         const spinner = spinnerFrame(elapsed_ns);
-        if (self.interactive) std.debug.print("\r\x1b[2K", .{});
-        std.debug.print(
-            "{s}integration-diff:{s} {c} done={}/{} {}% skipped={}.{}% ({}) found={} rate={}/s eta={}s elapsed={}s",
-            .{
-                dim,
-                reset,
-                spinner,
-                completed,
-                total,
-                percent,
-                skip_permille / 10,
-                skip_permille % 10,
-                self.skipped_count,
-                self.found_count,
-                rate,
-                eta_s,
-                elapsed_s,
-            },
-        );
-        if (!self.interactive) std.debug.print("\n", .{});
+
+        if (self.interactive) {
+            self.printDashboard(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, queue_snapshot);
+        } else {
+            self.printLogProgress(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, queue_snapshot);
+        }
         self.drew_progress = true;
+    }
+
+    fn printDashboard(
+        self: *Reporter,
+        spinner: u8,
+        completed: usize,
+        total: usize,
+        percent_x10: usize,
+        skip_permille: usize,
+        rate: u64,
+        eta_s: u64,
+        elapsed_s: u64,
+        queue_snapshot: ?QueueSnapshot,
+    ) void {
+        if (self.drew_progress) std.debug.print("\x1b[{}F", .{progress_dashboard_lines});
+
+        const reset = if (self.use_color) "\x1b[0m" else "";
+        const dim = if (self.use_color) "\x1b[2m" else "";
+        const status_color = if (self.use_color) if (self.found_count == 0) "\x1b[32m" else "\x1b[31m" else "";
+        const status = if (self.found_count == 0) "RUN" else "FAIL";
+
+        std.debug.print("\x1b[2K{s}integration-diff{s} {s}{s}{s} {c} ", .{ dim, reset, status_color, status, reset, spinner });
+        self.printProgressBar(completed, total);
+        std.debug.print(" {}.{}%  {}/{}\n", .{ percent_x10 / 10, percent_x10 % 10, completed, total });
+
+        std.debug.print("\x1b[2K  rate {}/s  eta ", .{rate});
+        printDuration(eta_s);
+        std.debug.print("  elapsed ", .{});
+        printDuration(elapsed_s);
+        std.debug.print("  skipped {}.{}% ({})  found {}\n", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.found_count });
+
+        std.debug.print("\x1b[2K  pipeline ", .{});
+        if (queue_snapshot) |snapshot| {
+            self.printPipeline(snapshot);
+        } else {
+            std.debug.print("{s}n/a{s}", .{ dim, reset });
+        }
+        std.debug.print("\n", .{});
+    }
+
+    fn printLogProgress(
+        self: *Reporter,
+        spinner: u8,
+        completed: usize,
+        total: usize,
+        percent_x10: usize,
+        skip_permille: usize,
+        rate: u64,
+        eta_s: u64,
+        elapsed_s: u64,
+        queue_snapshot: ?QueueSnapshot,
+    ) void {
+        std.debug.print(
+            "integration-diff: {c} {}.{}% {}/{} rate {}/s eta ",
+            .{ spinner, percent_x10 / 10, percent_x10 % 10, completed, total, rate },
+        );
+        printDuration(eta_s);
+        std.debug.print(" elapsed ", .{});
+        printDuration(elapsed_s);
+        std.debug.print(" skipped {}.{}% ({}) found {}", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.found_count });
+        if (queue_snapshot) |snapshot| {
+            std.debug.print(" pipe ", .{});
+            printPipelineText(snapshot, self.use_color);
+        }
+        std.debug.print("\n", .{});
+    }
+
+    fn printProgressBar(self: Reporter, completed: usize, total: usize) void {
+        const filled = if (total == 0) progress_bar_width else @min(progress_bar_width, completed * progress_bar_width / total);
+        const fill_color = if (self.use_color) if (self.found_count == 0) "\x1b[32m" else "\x1b[31m" else "";
+        const dim = if (self.use_color) "\x1b[2m" else "";
+        const reset = if (self.use_color) "\x1b[0m" else "";
+
+        std.debug.print("[", .{});
+        var i: usize = 0;
+        while (i < progress_bar_width) : (i += 1) {
+            if (i == 0 and filled != 0) std.debug.print("{s}", .{fill_color});
+            if (i == filled and filled != progress_bar_width) std.debug.print("{s}{s}", .{ reset, dim });
+            const char: u8 = if (i < filled) '#' else '-';
+            std.debug.print("{c}", .{char});
+        }
+        std.debug.print("{s}]", .{reset});
+    }
+
+    fn printPipeline(self: Reporter, snapshot: QueueSnapshot) void {
+        printPipelineText(snapshot, self.use_color);
     }
 
     fn checked(self: *Reporter) void {
@@ -191,7 +309,15 @@ const Reporter = struct {
         self.skipped_count += 1;
     }
 
-    fn commandError(self: Reporter, seed: u64, iteration: usize, err: anyerror, expr: []const u8) void {
+    fn clearProgress(self: *Reporter) void {
+        if (self.interactive and self.drew_progress) {
+            std.debug.print("\x1b[{}F\x1b[J", .{progress_dashboard_lines});
+            self.drew_progress = false;
+        }
+    }
+
+    fn commandError(self: *Reporter, seed: u64, iteration: usize, err: anyerror, expr: []const u8) void {
+        self.clearProgress();
         const red = if (self.use_color) "\x1b[31m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
@@ -201,7 +327,8 @@ const Reporter = struct {
         std.debug.print("expression:\n{s}\n", .{expr});
     }
 
-    fn saveError(self: Reporter, seed: u64, iteration: usize, err: anyerror) void {
+    fn saveError(self: *Reporter, seed: u64, iteration: usize, err: anyerror) void {
+        self.clearProgress();
         const red = if (self.use_color) "\x1b[31m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
@@ -211,6 +338,7 @@ const Reporter = struct {
     }
 
     fn mismatch(self: *Reporter, outcome: Outcome, seed: u64, iteration: usize, failure_dir: []const u8, expr: []const u8) void {
+        self.clearProgress();
         self.found_count += 1;
         const red = if (self.use_color) "\x1b[31m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
@@ -221,8 +349,8 @@ const Reporter = struct {
         std.debug.print("expression:\n{s}\n", .{expr});
     }
 
-    fn finish(self: Reporter, total: usize) void {
-        if (self.interactive and self.drew_progress) std.debug.print("\r\x1b[2K", .{});
+    fn finish(self: *Reporter, total: usize) void {
+        self.clearProgress();
         const color = if (self.use_color)
             if (self.found_count == 0) "\x1b[32m" else "\x1b[31m"
         else
@@ -408,6 +536,7 @@ const ProducerContext = struct {
     io: std.Io,
     stream: *CaseStream,
     jobs: *JobQueue,
+    stats: *QueueStats,
 };
 
 const WorkerContext = struct {
@@ -416,6 +545,7 @@ const WorkerContext = struct {
     config: *const Config,
     jobs: *JobQueue,
     results: *ResultQueue,
+    stats: *QueueStats,
 };
 
 fn runHarness(
@@ -438,11 +568,15 @@ fn runHarness(
     defer allocator.free(result_storage);
     var result_queue = ResultQueue.init(result_storage);
 
+    var queue_stats = QueueStats.init(job_queue_len);
+    reporter.queue_stats = &queue_stats;
+
     var producer_context: ProducerContext = .{
         .allocator = allocator,
         .io = io,
         .stream = stream,
         .jobs = &job_queue,
+        .stats = &queue_stats,
     };
     const producer = try std.Thread.spawn(.{}, producerMain, .{&producer_context});
 
@@ -452,6 +586,7 @@ fn runHarness(
         .config = config,
         .jobs = &job_queue,
         .results = &result_queue,
+        .stats = &queue_stats,
     };
     const workers = try allocator.alloc(std.Thread, worker_count);
     defer allocator.free(workers);
@@ -542,6 +677,7 @@ fn produceJobs(context: *ProducerContext) !void {
             .expr = generated.expr,
             .skipped = generated.skipped,
         });
+        context.stats.jobPut();
     }
 }
 
@@ -550,6 +686,7 @@ fn workerMain(context: *WorkerContext) void {
         const job = context.jobs.get(context.io) catch |err| {
             std.debug.panic("integration-diff job queue failed: {s}", .{@errorName(err)});
         } orelse return;
+        context.stats.jobTaken();
 
         var result: JobResult = .{
             .index = job.index,
@@ -562,6 +699,7 @@ fn workerMain(context: *WorkerContext) void {
             context.results.put(context.io, result) catch |err| {
                 std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
             };
+            context.stats.resultPut();
             continue;
         }
 
@@ -571,12 +709,14 @@ fn workerMain(context: *WorkerContext) void {
             context.results.put(context.io, result) catch |queue_err| {
                 std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(queue_err)});
             };
+            context.stats.resultPut();
             continue;
         };
 
         context.results.put(context.io, result) catch |err| {
             std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
         };
+        context.stats.resultPut();
     }
 }
 
@@ -686,6 +826,10 @@ fn autoColor(interactive: bool, env: *const std.process.Environ.Map) bool {
     return true;
 }
 
+fn progressInterval(interactive: bool) i96 {
+    return if (interactive) interactive_progress_interval_ns else log_progress_interval_ns;
+}
+
 fn casesPerSecond(completed: usize, elapsed_ns: i96) u64 {
     const elapsed = @as(u128, @intCast(@max(elapsed_ns, 1)));
     return @intCast((@as(u128, completed) * std.time.ns_per_s) / elapsed);
@@ -696,15 +840,63 @@ fn etaSeconds(remaining: usize, rate: u64) u64 {
     return @intCast((remaining + rate - 1) / rate);
 }
 
+fn percentTenths(completed: usize, total: usize) usize {
+    if (total == 0) return 1000;
+    return completed * 1000 / total;
+}
+
 fn permille(part: usize, whole: usize) usize {
     if (whole == 0) return 0;
     return part * 1000 / whole;
 }
 
+fn saturatedSub(lhs: usize, rhs: usize) usize {
+    return if (lhs > rhs) lhs - rhs else 0;
+}
+
 fn spinnerFrame(elapsed_ns: i96) u8 {
     const frames = [_]u8{ '|', '/', '-', '\\' };
-    const tick: usize = @intCast(@divTrunc(@max(elapsed_ns, 0), std.time.ns_per_s));
+    const tick: usize = @intCast(@divTrunc(@max(elapsed_ns, 0), interactive_progress_interval_ns));
     return frames[tick % frames.len];
+}
+
+fn printDuration(seconds: u64) void {
+    const hours = seconds / 3600;
+    const minutes = (seconds / 60) % 60;
+    const secs = seconds % 60;
+    if (hours != 0) {
+        std.debug.print("{}h{}m", .{ hours, minutes });
+    } else if (minutes != 0) {
+        std.debug.print("{}m{}s", .{ minutes, secs });
+    } else {
+        std.debug.print("{}s", .{secs});
+    }
+}
+
+fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
+    const low_water = @max(@as(usize, 1), snapshot.job_capacity / 16);
+    const state: enum { fed, thin, starved } = if (snapshot.job_depth == 0)
+        .starved
+    else if (snapshot.job_depth <= low_water)
+        .thin
+    else
+        .fed;
+
+    const color = if (use_color) switch (state) {
+        .fed => "\x1b[32m",
+        .thin => "\x1b[33m",
+        .starved => "\x1b[31m",
+    } else "";
+    const reset = if (use_color) "\x1b[0m" else "";
+
+    std.debug.print("{s}{s}{s} jobs {}/{} ready {}", .{
+        color,
+        @tagName(state),
+        reset,
+        snapshot.job_depth,
+        snapshot.job_capacity,
+        snapshot.ready_results,
+    });
 }
 
 fn loadCorpus(
