@@ -883,7 +883,7 @@ fn findFileCandidate(self: anytype, base: []const u8, prefix: []const u8, name: 
 }
 
 fn pathArg(self: anytype, arg: Value) ![]const u8 {
-    const value = try self.forceValue(arg);
+    const value = try self.stringLikeValue(arg);
     return switch (value.discriminant) {
         .path, .string => self.intern.get(value.asInternId()),
         .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),

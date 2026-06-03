@@ -1419,6 +1419,48 @@ test "evaluate import through evaluator file cache" {
     try std.testing.expectEqual(@as(u32, 1), ev.imports.count());
 }
 
+test "evaluate path builtins coerce outPath attrsets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "imported.nix", .data = "{ value = 21; }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const imported_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "imported.nix",
+    });
+    defer std.testing.allocator.free(imported_path);
+    const payload_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "payload.txt",
+    });
+    defer std.testing.allocator.free(payload_path);
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\let
+        \\  imported = (import {{ outPath = "{s}"; }}).value;
+        \\  contents = builtins.readFile {{ outPath = "{s}"; }};
+        \\in imported + builtins.stringLength contents
+    , .{ imported_path, payload_path });
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 28), result.asInt());
+}
+
 test "evaluate directory import through default nix" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
