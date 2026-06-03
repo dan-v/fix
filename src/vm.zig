@@ -150,6 +150,10 @@ pub const VM = struct {
         try vm_builtins.writeJsonValue(self, writer, value);
     }
 
+    pub fn writeXmlValue(self: *VM, writer: *std.Io.Writer, value: Value) !void {
+        try vm_builtins.writeLazyXmlValue(self, writer, value);
+    }
+
     pub fn setErrorMessage(self: *VM, message: []const u8) !void {
         if (self.trace) |trace| try trace.setMessage(message);
     }

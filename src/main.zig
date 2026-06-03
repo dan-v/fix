@@ -15,6 +15,7 @@ const usage =
     \\  --repl                 read and evaluate expressions interactively
     \\  -e, --expr EXPR        evaluate expression text
     \\  --json                 write the evaluated value as JSON
+    \\  --xml                  write the evaluated value as XML
     \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
     \\  --no-color             disable color diagnostics
@@ -25,6 +26,7 @@ const usage =
 const OutputFormat = enum {
     nix,
     json,
+    xml,
 };
 
 const ColorMode = enum {
@@ -149,8 +151,9 @@ fn writeResult(io: std.Io, output: OutputFormat, ev: *Evaluator, result: Value) 
     switch (output) {
         .nix => try ev.writeValue(&stdout.interface, result),
         .json => try ev.writeJsonValue(&stdout.interface, result),
+        .xml => try ev.writeXmlValue(&stdout.interface, result),
     }
-    try stdout.interface.writeByte('\n');
+    if (output != .xml) try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
 }
 
@@ -176,6 +179,8 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
             options.repl = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             options.output = .json;
+        } else if (std.mem.eql(u8, arg, "--xml")) {
+            options.output = .xml;
         } else if (std.mem.eql(u8, arg, "--show-trace")) {
             options.show_trace = true;
         } else if (std.mem.eql(u8, arg, "--color")) {

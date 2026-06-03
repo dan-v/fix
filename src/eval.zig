@@ -250,6 +250,14 @@ pub const Evaluator = struct {
         try vm.writeJsonValue(writer, value);
     }
 
+    pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.trace.clear();
+        var vm = try self.initVm(0);
+        defer vm.deinit();
+
+        try vm.writeXmlValue(writer, value);
+    }
+
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.importPath(path);
@@ -661,6 +669,19 @@ fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn renderXmlForTest(source: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate(source);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeXmlValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
 test "writeValue prints lazy containers without forcing contents" {
     const list_output = try renderForTest("[ 1 (1 / 0) \"x\" ]");
     defer std.testing.allocator.free(list_output);
@@ -675,6 +696,21 @@ test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("{ a = ...; b = ...; }", output);
+}
+
+test "writeXmlValue prints lazy containers without forcing contents" {
+    const attrs_output = try renderXmlForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
+    defer std.testing.allocator.free(attrs_output);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"a\">\n      <unevaluated />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"b\">\n      <unevaluated />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attrs_output, "<attr name=\"c\">\n      <unevaluated />") != null);
+}
+
+test "writeXmlValue prints resolved lazy children" {
+    const output = try renderXmlForTest("let xs = [ 1 (1 / 0) ]; in builtins.seq (builtins.elemAt xs 0) xs");
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<int value=\"1\" />") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "<unevaluated />") != null);
 }
 
 test "evaluate recursive dynamic attrsets" {

@@ -17,6 +17,7 @@ const nix_hash = @import("../runtime/hash.zig");
 const version = @import("../runtime/version.zig");
 const regex = @import("../runtime/regex.zig");
 const toml = @import("../runtime/toml.zig");
+const ThunkState = @import("../thunk.zig").ThunkState;
 
 fn firstReplacementAt(input: []const u8, needles: []const []const u8) ?usize {
     for (needles, 0..) |needle, i| {
@@ -452,20 +453,43 @@ fn builtinToXML(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
-    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
     defer seen.deinit(self.allocator);
-
-    try out.writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
-    try writeXmlValue(self, &out.writer, arg, 1, &seen);
-    try out.writer.writeAll("</expr>\n");
+    try forceDeep(self, arg, &seen);
+    try writeXmlDocument(self, &out.writer, try self.forceValue(arg));
 
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
     return Value.string(try self.intern.intern(text));
 }
 
-fn writeXmlValue(self: anytype, writer: *std.Io.Writer, value: Value, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
-    const forced = try self.forceValue(value);
+pub fn writeLazyXmlValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+    try writeXmlDocument(self, writer, try self.forceValue(value));
+}
+
+fn writeXmlDocument(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+    defer seen.deinit(self.allocator);
+
+    try writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
+    try writeXmlValue(self, writer, value, 1, &seen);
+    try writer.writeAll("</expr>\n");
+}
+
+fn writeXmlValue(
+    self: anytype,
+    writer: *std.Io.Writer,
+    value: Value,
+    depth: usize,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+) anyerror!void {
+    const maybe_forced = try xmlVisibleValue(self, value);
+    const forced = maybe_forced orelse {
+        try writeXmlIndent(writer, depth);
+        try writer.writeAll("<unevaluated />\n");
+        return;
+    };
+
     try writeXmlIndent(writer, depth);
     switch (forced.discriminant) {
         .null => try writer.writeAll("<null />\n"),
@@ -495,7 +519,28 @@ fn writeXmlValue(self: anytype, writer: *std.Io.Writer, value: Value, depth: usi
     }
 }
 
-fn writeXmlList(self: anytype, writer: *std.Io.Writer, id: ObjectId, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+fn xmlVisibleValue(self: anytype, value: Value) anyerror!?Value {
+    return switch (value.discriminant) {
+        .thunk => xmlThunkValue(self, value.asObjectId()),
+        .cell => xmlVisibleValue(self, try self.heap.getCellValue(value.asObjectId())),
+        else => value,
+    };
+}
+
+fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
+    const thunk = try self.heap.getThunk(id);
+    const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
+    if (state != .resolved) return null;
+    return xmlVisibleValue(self, thunk.result);
+}
+
+fn writeXmlList(
+    self: anytype,
+    writer: *std.Io.Writer,
+    id: ObjectId,
+    depth: usize,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+) !void {
     if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
@@ -505,7 +550,13 @@ fn writeXmlList(self: anytype, writer: *std.Io.Writer, id: ObjectId, depth: usiz
     try writer.writeAll("</list>\n");
 }
 
-fn writeXmlAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, depth: usize, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+fn writeXmlAttrs(
+    self: anytype,
+    writer: *std.Io.Writer,
+    id: ObjectId,
+    depth: usize,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+) !void {
     if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
