@@ -12,6 +12,20 @@ const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
 pub const Chunk = struct {
+    pub const SourceSpan = struct {
+        file: ?@import("types.zig").InternId,
+        offset: u32,
+        len: u32,
+        line: u32,
+        column: u32,
+    };
+
+    pub const SourceMapEntry = struct {
+        start: u32,
+        end: u32,
+        span: SourceSpan,
+    };
+
     /// Bytecode stream.
     code: []u8,
     /// Constant pool.
@@ -20,11 +34,14 @@ pub const Chunk = struct {
     local_count: u16,
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
+    /// Source span ranges for cold-path error traces.
+    source_map: []const SourceMapEntry = &.{},
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.constants);
         allocator.free(self.function_args);
+        allocator.free(self.source_map);
     }
 };
 
@@ -33,6 +50,7 @@ pub const ChunkBuilder = struct {
     code: std.ArrayListUnmanaged(u8),
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
+    source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -45,6 +63,7 @@ pub const ChunkBuilder = struct {
             .code = code,
             .constants = constants,
             .function_args = .empty,
+            .source_map = .empty,
         };
     }
 
@@ -52,6 +71,7 @@ pub const ChunkBuilder = struct {
         self.code.deinit(allocator);
         self.constants.deinit(allocator);
         self.function_args.deinit(allocator);
+        self.source_map.deinit(allocator);
     }
 
     /// Write a single opcode byte.
@@ -96,6 +116,15 @@ pub const ChunkBuilder = struct {
         try self.function_args.appendSlice(allocator, args);
     }
 
+    pub fn addSourceMapEntry(self: *ChunkBuilder, allocator: std.mem.Allocator, start: usize, end: usize, span: Chunk.SourceSpan) !void {
+        if (start >= end) return;
+        try self.source_map.append(allocator, .{
+            .start = @intCast(start),
+            .end = @intCast(end),
+            .span = span,
+        });
+    }
+
     /// Finalize into an immutable Chunk.
     pub fn finish(self: *ChunkBuilder, allocator: std.mem.Allocator, local_count: u16) !Chunk {
         const code = try allocator.dupe(u8, self.code.items);
@@ -103,11 +132,14 @@ pub const ChunkBuilder = struct {
         const constants = try allocator.dupe(Value, self.constants.items);
         errdefer allocator.free(constants);
         const function_args = try allocator.dupe(AttrEntry, self.function_args.items);
+        errdefer allocator.free(function_args);
+        const source_map = try allocator.dupe(Chunk.SourceMapEntry, self.source_map.items);
         return Chunk{
             .code = code,
             .constants = constants,
             .local_count = local_count,
             .function_args = function_args,
+            .source_map = source_map,
         };
     }
 };

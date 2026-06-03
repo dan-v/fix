@@ -315,7 +315,7 @@ fn classify(
     const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--expr", nix_expr });
     errdefer nix.deinit(allocator);
 
-    const fix = try runCommand(allocator, io, &.{ config.fix_bin, expr });
+    const fix = try runCommand(allocator, io, &.{ config.fix_bin, "--expr", expr });
     errdefer fix.deinit(allocator);
 
     const outcome: Outcome = if (nix.ok and fix.ok)

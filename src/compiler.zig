@@ -132,6 +132,15 @@ pub const Compiler = struct {
     }
 
     fn compileNode(self: *Compiler, node: *const Node) anyerror!void {
+        const start = self.builder.code.items.len;
+        try self.compileNodeImpl(node);
+        const end = self.builder.code.items.len;
+        if (try self.sourceSpanForNode(node)) |span| {
+            try self.builder.addSourceMapEntry(self.allocator, start, end, span);
+        }
+    }
+
+    fn compileNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
         switch (node.tag) {
             .integer => try self.compileInt(node),
             .float_val => try self.compileFloat(node),
@@ -160,6 +169,22 @@ pub const Compiler = struct {
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
         }
+    }
+
+    fn sourceSpanForNode(self: *Compiler, node: *const Node) !?chunk.Chunk.SourceSpan {
+        const span = nodeSourceSpan(node) orelse return null;
+        return .{
+            .file = try self.optionalSourceFileId(),
+            .offset = span.offset,
+            .len = span.len,
+            .line = diagnostic.lineForOffset(self.source, span.offset),
+            .column = diagnostic.columnForOffset(self.source, span.offset),
+        };
+    }
+
+    fn optionalSourceFileId(self: *Compiler) !?InternId {
+        if (self.source_path == null) return null;
+        return try self.sourceFileId();
     }
 
     fn emitOp(self: *Compiler, op: OpCode) !void {
@@ -1506,6 +1531,105 @@ fn nodeMayEvaluateToFloat(node: *const Node) bool {
         },
         else => false,
     };
+}
+
+fn nodeSourceSpan(node: *const Node) ?Node.Atom {
+    return switch (node.tag) {
+        .integer,
+        .float_val,
+        .string,
+        .path,
+        .search_path,
+        .identifier,
+        .bool_true,
+        .bool_false,
+        .null,
+        => node.data.atom,
+
+        .unary_op => nodeSourceSpan(node.data.unary.expr),
+        .binary_op => combineNodeSpans(node.data.binary.left, node.data.binary.right),
+        .apply => combineNodeSpans(node.data.apply.func, node.data.apply.arg),
+        .lambda => combineAtoms(
+            .{ .offset = node.data.lambda.param_offset, .len = node.data.lambda.param_len },
+            nodeSourceSpan(node.data.lambda.body),
+        ),
+        .lambda_attrs => lambdaAttrsSourceSpan(node.data.lambda_attrs),
+        .let_in => letSourceSpan(node.data.let_in),
+        .if_else => combineAtoms(nodeSourceSpan(node.data.if_else.cond), combineNodeSpans(node.data.if_else.then_branch, node.data.if_else.else_branch)),
+        .assert => combineAtoms(nodeSourceSpan(node.data.assert.cond), nodeSourceSpan(node.data.assert.body)),
+        .with_expr => combineNodeSpans(node.data.with_expr.attr_set, node.data.with_expr.body),
+        .attr_set => attrSetSourceSpan(node.data.attr_set),
+        .attr_path => attrPathSourceSpan(node.data.attr_path),
+        .attr_dynamic => combineNodeSpans(node.data.attr_dynamic.root, node.data.attr_dynamic.name),
+        .attr_or => combineNodeSpans(node.data.attr_or.attr_path, node.data.attr_or.default),
+        .has_attr => hasAttrSourceSpan(node.data.has_attr),
+        .has_attr_dynamic => combineNodeSpans(node.data.has_attr_dynamic.root, node.data.has_attr_dynamic.name),
+        .list => listSourceSpan(node.data.list),
+        .parens => nodeSourceSpan(node.data.parens),
+    };
+}
+
+fn combineNodeSpans(left: *const Node, right: *const Node) ?Node.Atom {
+    return combineAtoms(nodeSourceSpan(left), nodeSourceSpan(right));
+}
+
+fn combineAtoms(left: ?Node.Atom, right: ?Node.Atom) ?Node.Atom {
+    if (left == null) return right;
+    if (right == null) return left;
+
+    const a = left.?;
+    const b = right.?;
+    const start = @min(a.offset, b.offset);
+    const end = @max(a.offset + a.len, b.offset + b.len);
+    return .{ .offset = start, .len = end - start };
+}
+
+fn lambdaAttrsSourceSpan(lambda: Node.LambdaAttrs) ?Node.Atom {
+    var span = nodeSourceSpan(lambda.body);
+    if (lambda.bind_name) |bind_name| span = combineAtoms(span, bind_name);
+    for (lambda.params) |param| {
+        span = combineAtoms(span, param.name);
+        if (param.default) |default| span = combineAtoms(span, nodeSourceSpan(default));
+    }
+    return span;
+}
+
+fn letSourceSpan(let_in: Node.LetIn) ?Node.Atom {
+    var span = nodeSourceSpan(let_in.body);
+    for (let_in.bindings) |binding| {
+        span = combineAtoms(span, .{ .offset = binding.name_offset, .len = binding.name_len });
+        for (binding.path) |segment| span = combineAtoms(span, segment);
+        span = combineAtoms(span, nodeSourceSpan(binding.expr));
+    }
+    return span;
+}
+
+fn attrSetSourceSpan(attr_set: Node.AttrSet) ?Node.Atom {
+    var span: ?Node.Atom = null;
+    for (attr_set.entries) |entry| {
+        for (entry.path) |segment| span = combineAtoms(span, segment);
+        if (entry.dynamic_name) |dynamic_name| span = combineAtoms(span, nodeSourceSpan(dynamic_name));
+        span = combineAtoms(span, nodeSourceSpan(entry.expr));
+    }
+    return span;
+}
+
+fn attrPathSourceSpan(attr_path: Node.AttrPath) ?Node.Atom {
+    var span = nodeSourceSpan(attr_path.root);
+    for (attr_path.segments) |segment| span = combineAtoms(span, segment);
+    return span;
+}
+
+fn hasAttrSourceSpan(has_attr: Node.HasAttr) ?Node.Atom {
+    var span = nodeSourceSpan(has_attr.root);
+    for (has_attr.segments) |segment| span = combineAtoms(span, segment);
+    return span;
+}
+
+fn listSourceSpan(list: Node.List) ?Node.Atom {
+    var span: ?Node.Atom = null;
+    for (list.items) |item| span = combineAtoms(span, nodeSourceSpan(item));
+    return span;
 }
 
 fn offsetNode(node: *Node, offset: u32) void {

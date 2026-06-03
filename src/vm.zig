@@ -31,6 +31,7 @@ const FetchCache = @import("fetch_cache.zig").FetchCache;
 const numeric = @import("runtime/numeric.zig");
 const vm_builtins = @import("vm/builtins.zig");
 const eval_trace = @import("eval_trace.zig");
+const diagnostic = @import("diagnostic.zig");
 
 /// A single call frame.
 pub const Frame = struct {
@@ -134,7 +135,10 @@ pub const VM = struct {
 
         // Push initial frame.
         try self.pushFrame(ch, 0, null);
-        return self.run();
+        return self.run() catch |err| {
+            self.captureErrorTrace(err) catch {};
+            return err;
+        };
     }
 
     pub fn forceListItem(self: *VM, list_val: Value, index: usize) !Value {
@@ -156,6 +160,42 @@ pub const VM = struct {
 
     pub fn clearErrorTrace(self: *VM) void {
         if (self.trace) |trace| trace.clear();
+    }
+
+    pub fn typeErrorExpected(self: *VM, expected: []const u8, got: Value) error{TypeError} {
+        if (self.trace) |trace| {
+            const message = std.fmt.allocPrint(self.allocator, "expected {s}, got {s}", .{ expected, self.valueTypeName(got) }) catch return error.TypeError;
+            defer self.allocator.free(message);
+            trace.setMessageIfAbsent(message) catch {};
+        }
+        return error.TypeError;
+    }
+
+    pub fn notCallableError(self: *VM, got: Value) error{NotCallable} {
+        if (self.trace) |trace| {
+            const message = std.fmt.allocPrint(self.allocator, "expected function, got {s}", .{self.valueTypeName(got)}) catch return error.NotCallable;
+            defer self.allocator.free(message);
+            trace.setMessageIfAbsent(message) catch {};
+        }
+        return error.NotCallable;
+    }
+
+    pub fn valueTypeName(self: *VM, value: Value) []const u8 {
+        _ = self;
+        return switch (value.discriminant) {
+            .null => "null",
+            .bool_false, .bool_true => "bool",
+            .int => "int",
+            .float => "float",
+            .string => "string",
+            .path => "path",
+            .list => "list",
+            .attrs => "attrs",
+            .closure, .builtin, .builtin_closure => "function",
+            .thunk => "thunk",
+            .cell => "cell",
+            .string_context => "string",
+        };
     }
 
     // ---- frame management ----
@@ -865,12 +905,14 @@ pub const VM = struct {
     }
 
     fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
-        if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
+        if (left.discriminant != .attrs) return self.typeErrorExpected("attrs", left);
+        if (right.discriminant != .attrs) return self.typeErrorExpected("attrs", right);
         return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
     }
 
     fn concatLists(self: *VM, left: Value, right: Value) !Value {
-        if (left.discriminant != .list or right.discriminant != .list) return error.TypeError;
+        if (left.discriminant != .list) return self.typeErrorExpected("list", left);
+        if (right.discriminant != .list) return self.typeErrorExpected("list", right);
         return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
     }
 
@@ -891,7 +933,7 @@ pub const VM = struct {
         return switch (forced.discriminant) {
             .string, .path, .string_context => forced,
             .attrs => try self.attrsStringLikeValue(forced),
-            else => error.TypeError,
+            else => self.typeErrorExpected("string or path", forced),
         };
     }
 
@@ -918,7 +960,7 @@ pub const VM = struct {
 
         const out_path_id = try self.intern.intern("outPath");
         const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
-            error.MissingAttribute => return error.TypeError,
+            error.MissingAttribute => return self.typeErrorExpected("string or path", attrs),
             else => return err,
         };
         return self.stringLikeValue(out_path);
@@ -1017,9 +1059,7 @@ pub const VM = struct {
         } else if (callee.discriminant == .attrs) {
             const callable = try self.callAttrFunctor(callee);
             try self.doCall(callable, arg);
-        } else {
-            return error.NotCallable;
-        }
+        } else return self.notCallableError(callee);
     }
 
     pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
@@ -1040,7 +1080,7 @@ pub const VM = struct {
             const callable = try self.callAttrFunctor(callee);
             return self.callValue(callable, arg);
         }
-        return error.NotCallable;
+        return self.notCallableError(callee);
     }
 
     fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) anyerror!Value {
@@ -1051,9 +1091,76 @@ pub const VM = struct {
             return err;
         };
         return self.runUntil(stop_depth) catch |err| {
+            self.captureErrorTrace(err) catch {};
             self.frames.shrinkRetainingCapacity(stop_depth);
             self.sp = base_sp;
             return err;
+        };
+    }
+
+    fn captureErrorTrace(self: *VM, err: anyerror) !void {
+        const trace = self.trace orelse return;
+        try trace.setMessageIfAbsent(defaultErrorMessage(err));
+        if (trace.captured_stack) return;
+
+        var previous: ?chunk.Chunk.SourceSpan = null;
+        var i = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const frame = self.frames.items[i];
+            const span = sourceSpanForFrame(frame) orelse continue;
+            if (previous) |prev| {
+                if (sameSourceSpan(prev, span)) continue;
+            }
+            previous = span;
+            const diag_frame = diagnostic.Diagnostic{
+                .severity = .note,
+                .kind = .compile,
+                .line = span.line,
+                .column = span.column,
+                .offset = span.offset,
+                .len = span.len,
+                .token_type = null,
+                .message = "while evaluating",
+            };
+            const source_path = if (span.file) |file| self.intern.get(file) else null;
+            try trace.pushDiagnosticFrame(source_path, diag_frame);
+        }
+        trace.markCapturedStack();
+    }
+
+    fn sourceSpanForFrame(frame: Frame) ?chunk.Chunk.SourceSpan {
+        if (frame.chunk_ptr.source_map.len == 0) return null;
+        const pc = if (frame.ip == 0) 0 else frame.ip - 1;
+        var best: ?chunk.Chunk.SourceMapEntry = null;
+        for (frame.chunk_ptr.source_map) |entry| {
+            if (pc < entry.start or pc >= entry.end) continue;
+            if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
+                best = entry;
+            }
+        }
+        return if (best) |entry| entry.span else null;
+    }
+
+    fn sameSourceSpan(left: chunk.Chunk.SourceSpan, right: chunk.Chunk.SourceSpan) bool {
+        return left.file == right.file and
+            left.offset == right.offset and
+            left.len == right.len and
+            left.line == right.line and
+            left.column == right.column;
+    }
+
+    fn defaultErrorMessage(err: anyerror) []const u8 {
+        return switch (err) {
+            error.TypeError => "type error",
+            error.NotCallable => "value is not callable",
+            error.MissingAttribute => "missing attribute",
+            error.UndefinedVariable => "undefined variable",
+            error.DivisionByZero => "division by zero",
+            error.AssertionFailed => "assertion failed",
+            error.ImportCycle => "import cycle detected",
+            error.FileNotFound => "file not found",
+            else => @errorName(err),
         };
     }
 
@@ -1081,7 +1188,7 @@ pub const VM = struct {
 
     fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
         const attrs = try self.forceValue(attrs_val);
-        if (attrs.discriminant != .attrs) return error.TypeError;
+        if (attrs.discriminant != .attrs) return self.typeErrorExpected("attrs", attrs);
         return self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
     }
 
@@ -1120,7 +1227,7 @@ pub const VM = struct {
 
     fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8, wide: bool) !void {
         const value = try self.forceValue(attrs_val);
-        if (value.discriminant != .attrs) return error.TypeError;
+        if (value.discriminant != .attrs) return self.typeErrorExpected("attrs", value);
         if (allow_extra) return;
 
         const entries = try self.heap.getAttrs(value.asObjectId());

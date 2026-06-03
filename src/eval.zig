@@ -2043,3 +2043,56 @@ test "evaluate exposes undefined variable diagnostics" {
     try std.testing.expectEqual(@as(u32, 8), diagnostics[0].offset);
     try std.testing.expectEqual(@as(u32, 9), diagnostics[0].column);
 }
+
+test "evaluate records runtime error message and expression trace" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.TypeError, ev.evaluate("let y = 1 + \"x\"; in y"));
+
+    const trace = ev.getTrace();
+    try std.testing.expect(trace.message != null);
+    try std.testing.expectEqualStrings("expected string or path, got int", trace.message.?);
+    try std.testing.expect(trace.frames.items.len >= 2);
+    try std.testing.expect(trace.frames.items[0].diagnostic != null);
+    try std.testing.expect(trace.frames.items[0].source_path == null);
+    try std.testing.expectEqualStrings("while evaluating", trace.frames.items[0].message);
+    try std.testing.expectEqual(@as(u32, 1), trace.frames.items[0].diagnostic.?.line);
+    try std.testing.expectEqual(@as(u32, 9), trace.frames.items[0].diagnostic.?.column);
+}
+
+test "evaluate records imported file source trace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "boom.nix", .data = "let y = 1 + \"x\"; in y\n" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd,
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "boom.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "import {s}", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    try std.testing.expectError(error.TypeError, ev.evaluate(source));
+
+    const trace = ev.getTrace();
+    try std.testing.expect(trace.message != null);
+    try std.testing.expectEqualStrings("expected string or path, got int", trace.message.?);
+    try std.testing.expect(trace.frames.items.len >= 1);
+    try std.testing.expect(trace.frames.items[0].diagnostic != null);
+    try std.testing.expect(trace.frames.items[0].source_path != null);
+    try std.testing.expectEqualStrings(file_path, trace.frames.items[0].source_path.?);
+    try std.testing.expectEqual(@as(u32, 1), trace.frames.items[0].diagnostic.?.line);
+    try std.testing.expectEqual(@as(u32, 9), trace.frames.items[0].diagnostic.?.column);
+}

@@ -819,7 +819,7 @@ fn builtinImport(self: anytype, arg: Value) !Value {
 
 fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Value {
     const scope = try self.forceValue(scope_arg);
-    if (scope.discriminant != .attrs) return error.TypeError;
+    if (scope.discriminant != .attrs) return self.typeErrorExpected("attrs", scope);
     const host = self.import_host orelse return error.ImportUnavailable;
     return host.scoped_import(host.context, scope, try pathArg(self, path_arg));
 }
@@ -887,7 +887,7 @@ fn pathArg(self: anytype, arg: Value) ![]const u8 {
     return switch (value.discriminant) {
         .path, .string => self.intern.get(value.asInternId()),
         .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
-        else => error.TypeError,
+        else => self.typeErrorExpected("path or string", value),
     };
 }
 
