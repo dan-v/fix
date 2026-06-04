@@ -263,6 +263,14 @@ pub const Evaluator = struct {
         try vm.writeXmlValue(writer, value);
     }
 
+    fn forceValue(self: *Evaluator, value: Value) !Value {
+        self.trace.clear();
+        var vm = try self.initVm(0);
+        defer vm.deinit();
+
+        return vm.forceValue(value);
+    }
+
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.importPath(path);
@@ -560,6 +568,11 @@ const ValuePrinter = struct {
     }
 
     fn writeAttrs(self: *ValuePrinter, id: types.ObjectId) !void {
+        if (try self.derivationDrvPath(id)) |path| {
+            try self.writer.writeAll(path);
+            return;
+        }
+
         if (!try self.enter(.attrs, id)) {
             try self.writer.writeAll("...");
             return;
@@ -580,6 +593,35 @@ const ValuePrinter = struct {
             try self.writer.writeAll("; ");
         }
         try self.writer.writeByte('}');
+    }
+
+    fn derivationDrvPath(self: *ValuePrinter, id: types.ObjectId) !?[]const u8 {
+        const type_id = try self.ev.intern.intern("type");
+        const type_value = self.ev.heap.getAttrValue(id, type_id) catch |err| switch (err) {
+            error.MissingAttribute => return null,
+            else => return err,
+        };
+        const forced_type = try self.ev.forceValue(type_value);
+        if (forced_type.discriminant != .string) return null;
+        if (!std.mem.eql(u8, self.ev.intern.get(forced_type.asInternId()), "derivation")) return null;
+
+        const drv_path_id = try self.ev.intern.intern("drvPath");
+        const drv_path = self.ev.heap.getAttrValue(id, drv_path_id) catch |err| switch (err) {
+            error.MissingAttribute => return null,
+            else => return err,
+        };
+        return try self.stringText(try self.ev.forceValue(drv_path));
+    }
+
+    fn stringText(self: *ValuePrinter, value: Value) ![]const u8 {
+        return switch (value.discriminant) {
+            .string, .path => self.ev.intern.get(value.asInternId()),
+            .string_context => blk: {
+                const string = try self.ev.heap.getContextString(value.asObjectId());
+                break :blk self.ev.intern.get(string.text);
+            },
+            else => error.TypeError,
+        };
     }
 
     fn writeThunk(self: *ValuePrinter, id: types.ObjectId) !void {
@@ -701,6 +743,12 @@ test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("{ a = ...; b = 1; }", output);
+}
+
+test "writeValue prints derivations as drv paths" {
+    const output = try renderForTest("builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv", output);
 }
 
 test "writeXmlValue prints lazy containers without forcing contents" {
@@ -1993,6 +2041,45 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(exact_derivation_paths);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv\\\",\\\"/nix/store/8w6a3g1mvf8qkz788dysw8k4hmq91cc8-pkg\\\",\\\"/nix/store/n9r8k4kqcj2019llzmc59f5258a33dip-pkg.drv\\\",\\\"/nix/store/92ysms3lcbywv6148gql79ab6zkfwcin-pkg\\\",\\\"/nix/store/16898da86iz5v475hj6bcy0r0c36zxq8-pkg-dev\\\",\\\"/nix/store/rbh6cczsi8jvv5bvdwy39j5p4xmn8z34-pkg.drv\\\",\\\"/nix/store/nrakis94lbi82m0f5n8fbkx78l568y4l-pkg\\\",\\\"/nix/store/n2gl5gv2n8980c52hly1c5d95jxyjs3h-b.drv\\\",\\\"/nix/store/4bcpp52bhq3g1l44b927m0s8rnxzgwvl-b\\\",\\\"/nix/store/bmwfaizv61s5jq8ba6n3xzlz3c7znln4-pkg-structured.drv\\\",\\\"/nix/store/8gn7x4yg0pdiklpk9giczxlb4i4gjkk3-pkg-structured\\\",\\\"/nix/store/dy56prsjy94iy9dxqkjg57k0hi5wj3qq-b.drv\\\",\\\"/nix/store/1mxidf53h5j44ypw18jqq3gc2yzcag4c-b\\\"]\"", exact_derivation_paths);
 
+    const fixed_null_hash_algo = try renderForTest(
+        \\let
+        \\  flat = builtins.derivation {
+        \\    name = "src";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        \\    outputHashAlgo = null;
+        \\    outputHashMode = "flat";
+        \\  };
+        \\  recursive = builtins.derivation {
+        \\    name = "src";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        \\    outputHashAlgo = null;
+        \\    outputHashMode = "recursive";
+        \\  };
+        \\in builtins.toJSON [ flat.outPath recursive.outPath ]
+    );
+    defer std.testing.allocator.free(fixed_null_hash_algo);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/v7fhk503far527r9d9sk8dh2w6c7h695-src\\\",\\\"/nix/store/v1bh6bzphg5c2dc9ck7wdd3g1p6g19vd-src\\\"]\"", fixed_null_hash_algo);
+
+    var missing_hash_algo_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer missing_hash_algo_ev.deinit();
+    try std.testing.expectError(
+        error.InvalidHashAlgorithm,
+        missing_hash_algo_ev.evaluate(
+            \\(builtins.derivation {
+            \\  name = "src";
+            \\  system = "x86_64-linux";
+            \\  builder = "/bin/sh";
+            \\  outputHash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            \\  outputHashAlgo = null;
+            \\  outputHashMode = "flat";
+            \\}).outPath
+        ),
+    );
+
     const stable_context_inputs = try renderForTest(
         \\let
         \\  dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
@@ -2092,10 +2179,19 @@ test "evaluate path construction builtins" {
     defer std.testing.allocator.free(path_prefix_source);
     const path_append_store_context_source = try std.fmt.allocPrint(std.testing.allocator, "/foo + builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
     defer std.testing.allocator.free(path_append_store_context_source);
+    const literal_path_source =
+        \\let p = ./build.zig; in builtins.toJSON {
+        \\  raw = builtins.toString p;
+        \\  interp = "${p}";
+        \\  concat = builtins.concatStringsSep "" [ p ];
+        \\  json = builtins.toJSON p;
+        \\}
+    ;
 
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
+    try ev.setBasePathFromCurrentPath(std.testing.io);
 
     const store_path = try ev.evaluate(store_source);
     try std.testing.expect(store_path.asBool());
@@ -2105,6 +2201,12 @@ test "evaluate path construction builtins" {
 
     const path_prefix = try ev.evaluate(path_prefix_source);
     try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix.asInternId()));
+
+    const literal_paths = try ev.evaluate(literal_path_source);
+    const literal_paths_text = ev.intern.get(literal_paths.asInternId());
+    try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, cwd) != null);
+    try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, "/nix/store/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, "-build.zig") != null);
 
     try std.testing.expectError(error.InvalidPathConcatenation, ev.evaluate(path_append_store_context_source));
 }

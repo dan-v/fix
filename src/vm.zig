@@ -30,6 +30,7 @@ const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
 const numeric = @import("runtime/numeric.zig");
+const source_paths = @import("runtime/source_path.zig");
 const vm_builtins = @import("vm/builtins.zig");
 const eval_trace = @import("eval_trace.zig");
 const diagnostic = @import("diagnostic.zig");
@@ -1014,8 +1015,8 @@ pub const VM = struct {
     }
 
     fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
-        const left_like = try self.stringLikeValue(left);
-        const right_like = try self.stringLikeValue(right);
+        const left_like = try self.coerceLanguageStringValue(left);
+        const right_like = try self.coerceLanguageStringValue(right);
         const text_id = try self.concatInternedString(try self.stringTextInternId(left_like), try self.stringTextInternId(right_like));
 
         var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -1024,6 +1025,49 @@ pub const VM = struct {
         try self.appendStringContext(&context, right_like);
         if (context.items.len == 0) return Value.string(text_id);
         return Value.contextString(try self.heap.addContextString(text_id, context.items));
+    }
+
+    fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
+        const forced = try self.forceValue(value);
+        return switch (forced.discriminant) {
+            .string, .string_context => forced,
+            .path => try self.sourcePathStringValue(forced.asInternId()),
+            .attrs => blk: {
+                const to_string_id = try self.intern.intern("__toString");
+                if (self.heap.getAttrValue(forced.asObjectId(), to_string_id)) |to_string| {
+                    break :blk try self.coerceLanguageStringValue(try self.callValue(try self.forceValue(to_string), forced));
+                } else |err| switch (err) {
+                    error.MissingAttribute => {},
+                    else => return err,
+                }
+
+                const out_path_id = try self.intern.intern("outPath");
+                const out_path = self.heap.getAttrValue(forced.asObjectId(), out_path_id) catch |err| switch (err) {
+                    error.MissingAttribute => return self.typeErrorExpected("string or path", forced),
+                    else => return err,
+                };
+                break :blk try self.coerceLanguageStringValue(out_path);
+            },
+            else => self.typeErrorExpected("string or path", forced),
+        };
+    }
+
+    fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
+        const path = self.intern.get(path_id);
+        if (!std.fs.path.isAbsolute(path)) {
+            const entries = [_]heap_mod.AttrEntry{
+                .{ .name = path_id, .value = try self.pathContextValue() },
+            };
+            return Value.contextString(try self.heap.addContextString(path_id, &entries));
+        }
+        if (!try self.files.pathExists(path)) return error.FileNotFound;
+        const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+        defer self.allocator.free(store_path);
+        const store_path_id = try self.intern.intern(store_path);
+        const entries = [_]heap_mod.AttrEntry{
+            .{ .name = store_path_id, .value = try self.pathContextValue() },
+        };
+        return Value.contextString(try self.heap.addContextString(store_path_id, &entries));
     }
 
     fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {

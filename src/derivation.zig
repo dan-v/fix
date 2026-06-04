@@ -507,11 +507,18 @@ fn fixedOutputPath(
 ) ![]u8 {
     const output_name = try outputPathName(allocator, drv_name, output);
     defer allocator.free(output_name);
+    if (std.mem.startsWith(u8, hash_algo, "r:")) {
+        return storePathFromInnerDigest(allocator, store_dir, "source", hash, output_name);
+    }
     const inner = try std.fmt.allocPrint(allocator, "fixed:out:{s}:{s}:", .{ hash_algo, hash });
     defer allocator.free(inner);
     const digest = try sha256Hex(allocator, inner);
     defer allocator.free(digest);
     return storePathFromInnerDigest(allocator, store_dir, "output:out", digest, output_name);
+}
+
+pub fn sourcePath(allocator: std.mem.Allocator, store_dir: []const u8, name: []const u8, nar_hash_hex: []const u8) ![]u8 {
+    return storePathFromInnerDigest(allocator, store_dir, "source", nar_hash_hex, name);
 }
 
 fn textStorePath(

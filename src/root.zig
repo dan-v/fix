@@ -136,8 +136,7 @@ test "end-to-end: string interpolation" {
     const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
     try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
 
-    const numeric = try ev.evaluate("\"a${1}c\"");
-    try std.testing.expectEqualStrings("a1c", ev.intern.get(numeric.asInternId()));
+    try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
 }
 
 test "end-to-end: nested interpolation in strings" {

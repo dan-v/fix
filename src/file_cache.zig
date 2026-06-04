@@ -125,6 +125,21 @@ pub const FileCache = struct {
         return kind;
     }
 
+    pub fn isExecutable(self: *FileCache, path: []const u8) !bool {
+        const entry = try self.entryFor(path);
+        const io = self.io orelse return error.FileIoUnavailable;
+        const stat = try std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false });
+        return @TypeOf(stat.permissions).has_executable_bit and stat.permissions.toMode() & 0o111 != 0;
+    }
+
+    pub fn readLink(self: *FileCache, path: []const u8) ![]u8 {
+        const entry = try self.entryFor(path);
+        const io = self.io orelse return error.FileIoUnavailable;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try std.Io.Dir.readLinkAbsolute(io, entry.path, &buffer);
+        return self.allocator.dupe(u8, buffer[0..len]);
+    }
+
     pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
         var entry = try self.entryFor(path);
         if (entry.dir_entries) |entries| return entries;

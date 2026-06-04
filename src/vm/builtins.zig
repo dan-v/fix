@@ -13,6 +13,7 @@ const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("../derivation.zig");
 const numeric = @import("../runtime/numeric.zig");
 const path_ops = @import("../runtime/paths.zig");
+const source_paths = @import("../runtime/source_path.zig");
 const nix_hash = @import("../runtime/hash.zig");
 const version = @import("../runtime/version.zig");
 const regex = @import("../runtime/regex.zig");
@@ -351,17 +352,23 @@ fn builtinToJSON(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
-    try writeJsonValue(self, &out.writer, arg);
+    try writeJsonValueWithPathMode(self, &out.writer, arg, .source);
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
     return Value.string(try self.intern.intern(text));
 }
 
 pub fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+    try writeJsonValueWithPathMode(self, writer, value, .raw);
+}
+
+const JsonPathMode = enum { raw, source };
+
+fn writeJsonValueWithPathMode(self: anytype, writer: *std.Io.Writer, value: Value, path_mode: JsonPathMode) !void {
     var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
     defer seen.deinit(self.allocator);
 
-    try writeJsonValueInner(self, writer, value, &seen);
+    try writeJsonValueInner(self, writer, value, &seen, path_mode);
 }
 
 const SeenJsonKind = enum { list, attrs };
@@ -371,7 +378,7 @@ const SeenJsonObject = struct {
     id: ObjectId,
 };
 
-fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject)) anyerror!void {
+fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) anyerror!void {
     const forced = try self.forceValue(value);
     switch (forced.discriminant) {
         .null => try writer.writeAll("null"),
@@ -379,13 +386,23 @@ fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen
         .bool_true => try writer.writeAll("true"),
         .int => try writer.print("{}", .{forced.asInt()}),
         .float => try writer.print("{d}", .{forced.asFloat()}),
-        .string, .path, .string_context => try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, forced)), .{}, writer),
-        .list => try writeJsonList(self, writer, forced.asObjectId(), seen),
+        .string, .string_context => try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, forced)), .{}, writer),
+        .path => {
+            const text = switch (path_mode) {
+                .raw => self.intern.get(forced.asInternId()),
+                .source => blk: {
+                    const string_value = try sourcePathStringValue(self, forced.asInternId());
+                    break :blk self.intern.get(try stringTextInternId(self, string_value));
+                },
+            };
+            try std.json.Stringify.encodeJsonString(text, .{}, writer);
+        },
+        .list => try writeJsonList(self, writer, forced.asObjectId(), seen, path_mode),
         .attrs => {
-            if (try jsonAttrsStringValue(self, forced)) |string_value| {
+            if (try jsonAttrsStringValue(self, forced, path_mode)) |string_value| {
                 try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, string_value)), .{}, writer);
             } else {
-                try writeJsonAttrs(self, writer, forced.asObjectId(), seen);
+                try writeJsonAttrs(self, writer, forced.asObjectId(), seen, path_mode);
             }
         },
         .closure, .builtin, .builtin_closure => return error.TypeError,
@@ -393,12 +410,15 @@ fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen
     }
 }
 
-fn jsonAttrsStringValue(self: anytype, attrs: Value) !?Value {
+fn jsonAttrsStringValue(self: anytype, attrs: Value, path_mode: JsonPathMode) !?Value {
     const attrs_id = attrs.asObjectId();
 
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs_id, to_string_id)) |_| {
-        return try coerceAttrsToStringValue(self, attrs);
+        return switch (path_mode) {
+            .raw => try coerceAttrsToStringValue(self, attrs),
+            .source => try coerceStringContextValue(self, attrs),
+        };
     } else |err| switch (err) {
         error.MissingAttribute => {},
         else => return err,
@@ -406,26 +426,29 @@ fn jsonAttrsStringValue(self: anytype, attrs: Value) !?Value {
 
     const out_path_id = try self.intern.intern("outPath");
     if (self.heap.getAttrValue(attrs_id, out_path_id)) |_| {
-        return try coerceAttrsToStringValue(self, attrs);
+        return switch (path_mode) {
+            .raw => try coerceAttrsToStringValue(self, attrs),
+            .source => try coerceStringContextValue(self, attrs),
+        };
     } else |err| switch (err) {
         error.MissingAttribute => return null,
         else => return err,
     }
 }
 
-fn writeJsonList(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+fn writeJsonList(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) !void {
     if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
     try writer.writeByte('[');
     for (try self.heap.getList(id), 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeJsonValueInner(self, writer, item, seen);
+        try writeJsonValueInner(self, writer, item, seen, path_mode);
     }
     try writer.writeByte(']');
 }
 
-fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !void {
+fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) !void {
     if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
@@ -437,7 +460,7 @@ fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *st
         if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.encodeJsonString(self.intern.get(entry.name), .{}, writer);
         try writer.writeByte(':');
-        try writeJsonValueInner(self, writer, entry.value, seen);
+        try writeJsonValueInner(self, writer, entry.value, seen, path_mode);
     }
     try writer.writeByte('}');
 }
@@ -1268,7 +1291,8 @@ fn coerceStringContextId(self: anytype, arg: Value) !InternId {
 fn coerceStringContextValue(self: anytype, arg: Value) !Value {
     const value = try self.forceValue(arg);
     return switch (value.discriminant) {
-        .string, .path, .string_context => value,
+        .string, .string_context => value,
+        .path => sourcePathStringValue(self, value.asInternId()),
         .attrs => coerceAttrsStringContextValue(self, value),
         else => error.TypeError,
     };
@@ -1290,6 +1314,15 @@ fn coerceAttrsStringContextValue(self: anytype, attrs: Value) !Value {
         else => return err,
     };
     return coerceStringContextValue(self, out_path);
+}
+
+fn sourcePathStringValue(self: anytype, path_id: InternId) !Value {
+    const path = self.intern.get(path_id);
+    if (!std.fs.path.isAbsolute(path)) return contextStringWithPath(self, path_id);
+    if (!try self.files.pathExists(path)) return error.FileNotFound;
+    const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+    defer self.allocator.free(store_path);
+    return contextStringWithPath(self, try self.intern.intern(store_path));
 }
 
 fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
@@ -2367,12 +2400,13 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
     const system = try requiredDerivationString(self, attrs_id, "system", &inputs, &owned_strings);
     const builder = try requiredDerivationString(self, attrs_id, "builder", &inputs, &owned_strings);
     const structured = try derivationStructuredAttrs(self, attrs_id);
+    const ignore_nulls = try derivationIgnoreNulls(self, attrs_id);
 
     var env: std.ArrayListUnmanaged(derivation.EnvVar) = .empty;
     errdefer env.deinit(self.allocator);
     const original_attrs = try self.heap.getAttrs(attrs_id);
     if (structured) {
-        const json = try structuredAttrsJson(self, attrs_id, output_names.names, &inputs, &owned_strings);
+        const json = try structuredAttrsJson(self, attrs_id, output_names.names, ignore_nulls, &inputs, &owned_strings);
         try owned_strings.append(self.allocator, json);
         try env.append(self.allocator, .{ .name = "__json", .value = json });
     } else {
@@ -2380,6 +2414,8 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
             const attr_name_text = self.intern.get(entry.name);
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
+            if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
+            if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
             if (isDerivationSyntheticAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
                 if (output_names.explicit) {
@@ -2431,13 +2467,12 @@ fn applyFixedOutputAttrs(
         else => return err,
     };
     if (outputs.len != 1) return error.InvalidDerivationOutput;
-    const algo_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashAlgo")));
     const mode_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashMode")));
     const hash_forced = try self.forceValue(hash_value);
-    if (!isPlainString(algo_value) or !isPlainString(mode_value) or !isPlainString(hash_forced)) return error.TypeError;
-    const algo = self.intern.get(try stringTextInternId(self, algo_value));
+    if (!isPlainString(mode_value) or !isPlainString(hash_forced)) return error.TypeError;
     const mode = self.intern.get(try stringTextInternId(self, mode_value));
     const hash_text = self.intern.get(try stringTextInternId(self, hash_forced));
+    const algo = try fixedOutputHashAlgorithm(self, attrs_id, hash_text);
     const hash_hex = try derivation.hashToBase16(self.allocator, algo, hash_text);
     errdefer self.allocator.free(hash_hex);
     try owned_strings.append(self.allocator, hash_hex);
@@ -2451,6 +2486,26 @@ fn applyFixedOutputAttrs(
     } else return error.InvalidHashMode;
     outputs[0].hash_algo = hash_algo;
     outputs[0].hash = hash_hex;
+}
+
+fn derivationIgnoreNulls(self: anytype, attrs_id: ObjectId) !bool {
+    const value = self.heap.getAttrValue(attrs_id, try self.intern.intern("__ignoreNulls")) catch |err| switch (err) {
+        error.MissingAttribute => return false,
+        else => return err,
+    };
+    const forced = try self.forceValue(value);
+    if (!forced.isBool()) return error.TypeError;
+    return forced.asBool();
+}
+
+fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []const u8) ![]const u8 {
+    const algo_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashAlgo")));
+    if (isPlainString(algo_value)) return self.intern.get(try stringTextInternId(self, algo_value));
+    if (algo_value.discriminant != .null) return error.TypeError;
+
+    const dash = std.mem.indexOfScalar(u8, hash_text, '-') orelse return error.InvalidHashAlgorithm;
+    if (dash == 0) return error.InvalidHashAlgorithm;
+    return hash_text[0..dash];
 }
 
 fn derivationArgs(
@@ -2488,9 +2543,8 @@ fn derivationAttrString(
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const u8 {
-    const string_value = try coerceToStringValue(self, value);
-    try appendContextInputs(self, string_value, inputs, owned_strings);
-    return ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, string_value)));
+    const string_value = try coerceDerivationStringValue(self, value);
+    return normalizeDerivationString(self, string_value, inputs, owned_strings);
 }
 
 fn joinedOutputNames(self: anytype, names: []const InternId) ![]u8 {
@@ -2514,6 +2568,7 @@ fn structuredAttrsJson(
     self: anytype,
     attrs_id: ObjectId,
     outputs: []const InternId,
+    ignore_nulls: bool,
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]u8 {
@@ -2529,9 +2584,11 @@ fn structuredAttrsJson(
     for (entries) |entry| {
         const name = self.intern.get(entry.name);
         if (std.mem.eql(u8, name, "__structuredAttrs")) continue;
+        if (std.mem.eql(u8, name, "__ignoreNulls")) continue;
         if (std.mem.eql(u8, name, "args")) continue;
         if (std.mem.eql(u8, name, "outputs")) continue;
         if (isDerivationSyntheticAttr(self, name, outputs)) continue;
+        if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
         if (!first) try out.append(self.allocator, ',');
         first = false;
         try appendJsonString(self, &out, name);
@@ -2573,7 +2630,7 @@ fn appendStructuredJsonValue(
             try out.append(self.allocator, ']');
         },
         .attrs => {
-            if (try jsonAttrsStringValue(self, forced)) |string_value| {
+            if (try jsonAttrsStringValue(self, forced, .source)) |string_value| {
                 try appendStructuredJsonStringValue(self, out, string_value, inputs, owned_strings);
                 return;
             }
@@ -2605,9 +2662,9 @@ fn appendStructuredJsonStringValue(
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    const string_value = try coerceToStringValue(self, value);
-    try appendContextInputs(self, string_value, inputs, owned_strings);
-    try appendJsonString(self, out, self.intern.get(try stringTextInternId(self, string_value)));
+    const string_value = try coerceDerivationStringValue(self, value);
+    const text = try normalizeDerivationString(self, string_value, inputs, owned_strings);
+    try appendJsonString(self, out, text);
 }
 
 fn appendJsonString(self: anytype, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
@@ -2653,13 +2710,17 @@ const DerivationInputs = struct {
     }
 };
 
-fn appendContextInputs(
+fn normalizeDerivationString(
     self: anytype,
     value: Value,
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
-) !void {
+) ![]const u8 {
     const text = self.intern.get(try stringTextInternId(self, value));
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var cursor: usize = 0;
+
     for (try contextEntriesForValue(self, value)) |entry| {
         const path = self.intern.get(entry.name);
         if (std.mem.endsWith(u8, path, ".drv")) {
@@ -2670,9 +2731,29 @@ fn appendContextInputs(
             try appendInputDrv(self, inputs, owned_path, outputs);
             if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, owned_path);
         } else {
-            try appendInputSrc(self, inputs, try ownDerivationString(self, owned_strings, path));
+            const store_path = try sourceStorePathForContext(self, path, owned_strings);
+            try appendInputSrc(self, inputs, store_path);
+            while (std.mem.indexOf(u8, text[cursor..], path)) |relative_index| {
+                const index = cursor + relative_index;
+                try out.appendSlice(self.allocator, text[cursor..index]);
+                try out.appendSlice(self.allocator, store_path);
+                cursor = index + path.len;
+            }
         }
     }
+    if (out.items.len == 0) return ownDerivationString(self, owned_strings, text);
+    try out.appendSlice(self.allocator, text[cursor..]);
+    const normalized = try out.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(normalized);
+    try owned_strings.append(self.allocator, normalized);
+    return normalized;
+}
+
+fn sourceStorePathForContext(self: anytype, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+    const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+    errdefer self.allocator.free(store_path);
+    try owned_strings.append(self.allocator, store_path);
+    return store_path;
 }
 
 fn contextOutputs(
@@ -3170,7 +3251,7 @@ fn coerceToStringValue(self: anytype, arg: Value) !Value {
     const value = try self.forceValue(arg);
     switch (value.discriminant) {
         .string, .string_context => return value,
-        .path => return contextStringWithPath(self, value.asInternId()),
+        .path => return Value.string(value.asInternId()),
         .int => {
             const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
             defer self.allocator.free(s);
@@ -3230,4 +3311,66 @@ fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
         else => return err,
     };
     return coerceToStringValue(self, out_path);
+}
+
+fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
+    const value = try self.forceValue(arg);
+    switch (value.discriminant) {
+        .string, .string_context => return value,
+        .path => return sourcePathStringValue(self, value.asInternId()),
+        .int => {
+            const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
+            defer self.allocator.free(s);
+            return Value.string(try self.intern.intern(s));
+        },
+        .float => {
+            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{value.asFloat()});
+            defer self.allocator.free(s);
+            return Value.string(try self.intern.intern(s));
+        },
+        .bool_false, .null => return Value.string(try self.intern.intern("")),
+        .bool_true => return Value.string(try self.intern.intern("1")),
+        .list => return coerceDerivationListToStringValue(self, value.asObjectId()),
+        .attrs => return coerceDerivationAttrsToStringValue(self, value),
+        else => return error.TypeError,
+    }
+}
+
+fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(self.allocator);
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+
+    for (try self.heap.getList(list_id), 0..) |item, i| {
+        if (i > 0) try out.append(self.allocator, ' ');
+        const item_value = try coerceDerivationStringValue(self, item);
+        const item_id = try stringTextInternId(self, item_value);
+        try out.appendSlice(self.allocator, self.intern.get(item_id));
+        for (try contextEntriesForValue(self, item_value)) |entry| {
+            try appendContextEntry(self, &context, entry.name, entry.value);
+        }
+    }
+
+    const text_id = try self.intern.intern(out.items);
+    if (context.items.len == 0) return Value.string(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+}
+
+fn coerceDerivationAttrsToStringValue(self: anytype, attrs: Value) !Value {
+    const to_string_id = try self.intern.intern("__toString");
+    if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
+        const result = try self.callValue(try self.forceValue(to_string), attrs);
+        return coerceDerivationStringValue(self, result);
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+
+    const out_path_id = try self.intern.intern("outPath");
+    const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
+        error.MissingAttribute => return error.TypeError,
+        else => return err,
+    };
+    return coerceDerivationStringValue(self, out_path);
 }
