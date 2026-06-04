@@ -14,6 +14,7 @@ const Config = struct {
     nix_bin: []const u8 = "nix-instantiate",
     min_depth: u8 = 0,
     max_depth: u8 = 4,
+    case_count: usize = default_case_count,
     jobs: usize = 0,
     command_timeout_seconds: u32 = 60,
     shrink: bool = false,
@@ -46,35 +47,15 @@ const GeneratedCase = struct {
     }
 };
 
-const CaseStream = struct {
-    allocator: std.mem.Allocator,
+const CaseSpace = struct {
     corpus: []const Fragment,
     seed: u64,
     min_depth: u8,
+    max_depth: u8,
     total: usize,
-    next_index: usize = 0,
 
-    fn init(
-        allocator: std.mem.Allocator,
-        corpus: []const Fragment,
-        seed: u64,
-        min_depth: u8,
-        max_depth: u8,
-    ) !CaseStream {
-        return .{
-            .allocator = allocator,
-            .corpus = corpus,
-            .seed = seed,
-            .min_depth = min_depth,
-            .total = try generatedCaseCount(corpus.len, min_depth, max_depth),
-        };
-    }
-
-    fn next(self: *CaseStream) !?GeneratedCase {
-        if (self.next_index >= self.total) return null;
-        const index = self.next_index;
-        self.next_index += 1;
-        return try generateCase(self.allocator, self.corpus, self.seed, index, self.min_depth);
+    fn generate(self: CaseSpace, allocator: std.mem.Allocator, index: usize) !GeneratedCase {
+        return generateCase(allocator, self.corpus, self.seed, index, self.min_depth, self.max_depth);
     }
 };
 
@@ -90,53 +71,43 @@ const FragmentCorpus = std.ArrayListUnmanaged(Fragment);
 const ShrinkCandidates = std.ArrayListUnmanaged([]const u8);
 const command_stdout_limit = 8 * 1024 * 1024;
 const command_stderr_limit = 1024 * 1024;
+const default_case_count = 64_000;
 const interactive_progress_interval_ns = 250 * std.time.ns_per_ms;
 const log_progress_interval_ns = 5 * std.time.ns_per_s;
 const progress_bar_width = 28;
 const progress_dashboard_lines = 3;
-const job_queue_per_worker = 64;
-const job_queue_min = 1024;
 const result_queue_per_worker = 8;
 const result_queue_min = 128;
 
-const QueueSnapshot = struct {
-    job_depth: usize,
-    job_capacity: usize,
+const WorkSnapshot = struct {
     worker_count: usize,
-    unscheduled: usize,
+    claimed: usize,
     in_flight: usize,
+    remaining: usize,
 };
 
-const QueueStats = struct {
-    job_capacity: usize,
+const WorkStats = struct {
     worker_count: usize,
-    jobs_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    jobs_taken: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    next_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    fn init(job_capacity: usize, worker_count: usize) QueueStats {
+    fn init(worker_count: usize) WorkStats {
         return .{
-            .job_capacity = job_capacity,
             .worker_count = worker_count,
         };
     }
 
-    fn jobPut(self: *QueueStats) void {
-        _ = self.jobs_put.fetchAdd(1, .monotonic);
+    fn claim(self: *WorkStats, total: usize) ?usize {
+        const index = self.next_index.fetchAdd(1, .monotonic);
+        return if (index < total) index else null;
     }
 
-    fn jobTaken(self: *QueueStats) void {
-        _ = self.jobs_taken.fetchAdd(1, .monotonic);
-    }
-
-    fn snapshot(self: *const QueueStats, completed: usize, total: usize) QueueSnapshot {
-        const jobs_put = self.jobs_put.load(.monotonic);
-        const jobs_taken = self.jobs_taken.load(.monotonic);
+    fn snapshot(self: *const WorkStats, completed: usize, total: usize) WorkSnapshot {
+        const claimed = @min(self.next_index.load(.monotonic), total);
         return .{
-            .job_depth = saturatedSub(jobs_put, jobs_taken),
-            .job_capacity = self.job_capacity,
             .worker_count = self.worker_count,
-            .unscheduled = saturatedSub(total, jobs_put),
-            .in_flight = saturatedSub(jobs_taken, completed),
+            .claimed = claimed,
+            .in_flight = saturatedSub(claimed, completed),
+            .remaining = saturatedSub(total, claimed),
         };
     }
 };
@@ -145,7 +116,7 @@ const Reporter = struct {
     io: std.Io,
     interactive: bool,
     use_color: bool,
-    queue_stats: ?*const QueueStats = null,
+    work_stats: ?*const WorkStats = null,
     started_ns: i96,
     next_progress_ns: i96,
     drew_progress: bool = false,
@@ -170,7 +141,7 @@ const Reporter = struct {
         const dim = if (self.use_color) "\x1b[2m" else "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --min-depth={} --max-depth={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s}",
+            "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --min-depth={} --max-depth={} --cases={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s}",
             .{
                 dim,
                 reset,
@@ -178,6 +149,7 @@ const Reporter = struct {
                 worker_count,
                 config.min_depth,
                 config.max_depth,
+                config.case_count,
                 config.corpus_dir,
                 config.failure_dir,
                 config.fix_bin,
@@ -207,13 +179,13 @@ const Reporter = struct {
         const eta_s = etaSeconds(total - completed, rate);
         const percent_x10 = percentTenths(completed, total);
         const skip_permille = permille(self.skipped_count, completed);
-        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot(completed, total) else null;
+        const work_snapshot = if (self.work_stats) |stats| stats.snapshot(completed, total) else null;
         const spinner = spinnerFrame(elapsed_ns);
 
         if (self.interactive) {
-            self.printDashboard(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, queue_snapshot);
+            self.printDashboard(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, work_snapshot);
         } else {
-            self.printLogProgress(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, queue_snapshot);
+            self.printLogProgress(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, work_snapshot);
         }
         self.drew_progress = true;
     }
@@ -228,7 +200,7 @@ const Reporter = struct {
         rate: u64,
         eta_s: u64,
         elapsed_s: u64,
-        queue_snapshot: ?QueueSnapshot,
+        work_snapshot: ?WorkSnapshot,
     ) void {
         if (self.drew_progress) std.debug.print("\x1b[{}F", .{progress_dashboard_lines});
 
@@ -247,9 +219,9 @@ const Reporter = struct {
         printDuration(elapsed_s);
         std.debug.print("  skipped {}.{}% ({})  timed out {}  found {}\n", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
 
-        std.debug.print("\x1b[2K  pipeline ", .{});
-        if (queue_snapshot) |snapshot| {
-            self.printPipeline(snapshot);
+        std.debug.print("\x1b[2K  work ", .{});
+        if (work_snapshot) |snapshot| {
+            self.printWork(snapshot);
         } else {
             std.debug.print("{s}n/a{s}", .{ dim, reset });
         }
@@ -266,7 +238,7 @@ const Reporter = struct {
         rate: u64,
         eta_s: u64,
         elapsed_s: u64,
-        queue_snapshot: ?QueueSnapshot,
+        work_snapshot: ?WorkSnapshot,
     ) void {
         std.debug.print(
             "integration-diff: {c} {}.{}% {}/{} rate {}/s eta ",
@@ -276,9 +248,9 @@ const Reporter = struct {
         std.debug.print(" elapsed ", .{});
         printDuration(elapsed_s);
         std.debug.print(" skipped {}.{}% ({}) timeout {} found {}", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
-        if (queue_snapshot) |snapshot| {
-            std.debug.print(" pipe ", .{});
-            printPipelineText(snapshot, self.use_color);
+        if (work_snapshot) |snapshot| {
+            std.debug.print(" work ", .{});
+            printWorkText(snapshot, self.use_color);
         }
         std.debug.print("\n", .{});
     }
@@ -300,8 +272,8 @@ const Reporter = struct {
         std.debug.print("{s}]", .{reset});
     }
 
-    fn printPipeline(self: Reporter, snapshot: QueueSnapshot) void {
-        printPipelineText(snapshot, self.use_color);
+    fn printWork(self: Reporter, snapshot: WorkSnapshot) void {
+        printWorkText(snapshot, self.use_color);
     }
 
     fn checked(self: *Reporter) void {
@@ -467,8 +439,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    var stream = try CaseStream.init(allocator, corpus.items, seed, config.min_depth, config.max_depth);
-    const total_jobs = stream.total;
+    const case_space: CaseSpace = .{
+        .corpus = corpus.items,
+        .seed = seed,
+        .min_depth = config.min_depth,
+        .max_depth = config.max_depth,
+        .total = config.case_count,
+    };
+    const total_jobs = case_space.total;
     var reporter = Reporter.init(init.io, init.environ_map);
     reporter.printRepro(config, seed, worker_count, total_jobs);
 
@@ -478,17 +456,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.dump_cases_path != null or config.dump_skipped_path != null) {
-        try dumpGeneratedCases(allocator, init.io, &config, &stream, &reporter);
+        try dumpGeneratedCases(allocator, init.io, &config, case_space, &reporter);
         reporter.finish(total_jobs);
         return;
     }
 
-    try runHarness(allocator, init.io, &config, &stream, worker_count, total_jobs, &reporter);
+    try runHarness(allocator, init.io, &config, case_space, worker_count, total_jobs, &reporter);
 }
-
-const Job = struct {
-    index: usize,
-};
 
 const JobResult = struct {
     index: usize,
@@ -540,69 +514,44 @@ fn BlockingQueue(comptime T: type) type {
     };
 }
 
-const JobQueue = BlockingQueue(Job);
 const ResultQueue = BlockingQueue(JobResult);
-
-const ProducerContext = struct {
-    io: std.Io,
-    total_jobs: usize,
-    jobs: *JobQueue,
-    stats: *QueueStats,
-};
 
 const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
-    corpus: []const Fragment,
-    seed: u64,
-    min_depth: u8,
-    jobs: *JobQueue,
+    case_space: CaseSpace,
+    total_jobs: usize,
     results: *ResultQueue,
-    stats: *QueueStats,
+    stats: *WorkStats,
 };
 
 fn runHarness(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
-    stream: *CaseStream,
+    case_space: CaseSpace,
     worker_count: usize,
     total_jobs: usize,
     reporter: *Reporter,
 ) !void {
-    const job_queue_len = queueCapacity(worker_count, total_jobs, job_queue_per_worker, job_queue_min);
     const result_queue_len = queueCapacity(worker_count, total_jobs, result_queue_per_worker, result_queue_min);
-
-    const job_storage = try allocator.alloc(Job, job_queue_len);
-    defer allocator.free(job_storage);
-    var job_queue = JobQueue.init(job_storage);
 
     const result_storage = try allocator.alloc(JobResult, result_queue_len);
     defer allocator.free(result_storage);
     var result_queue = ResultQueue.init(result_storage);
 
-    var queue_stats = QueueStats.init(job_queue_len, worker_count);
-    reporter.queue_stats = &queue_stats;
-
-    var producer_context: ProducerContext = .{
-        .io = io,
-        .total_jobs = total_jobs,
-        .jobs = &job_queue,
-        .stats = &queue_stats,
-    };
-    const producer = try std.Thread.spawn(.{}, producerMain, .{&producer_context});
+    var work_stats = WorkStats.init(worker_count);
+    reporter.work_stats = &work_stats;
 
     var worker_context: WorkerContext = .{
         .allocator = allocator,
         .io = io,
         .config = config,
-        .corpus = stream.corpus,
-        .seed = stream.seed,
-        .min_depth = stream.min_depth,
-        .jobs = &job_queue,
+        .case_space = case_space,
+        .total_jobs = total_jobs,
         .results = &result_queue,
-        .stats = &queue_stats,
+        .stats = &work_stats,
     };
     const workers = try allocator.alloc(std.Thread, worker_count);
     defer allocator.free(workers);
@@ -652,7 +601,6 @@ fn runHarness(
         reporter.progress(received + 1, total_jobs);
     }
 
-    producer.join();
     for (workers) |worker| worker.join();
 
     if (command_error) |err| return err;
@@ -660,38 +608,16 @@ fn runHarness(
     if (found_mismatch) std.process.exit(1);
 }
 
-fn producerMain(context: *ProducerContext) void {
-    defer context.jobs.close(context.io);
-    produceJobs(context) catch |err| {
-        std.debug.panic("integration-diff producer failed: {s}", .{@errorName(err)});
-    };
-}
-
-fn produceJobs(context: *ProducerContext) !void {
-    var index: usize = 0;
-    while (index < context.total_jobs) : (index += 1) {
-        try context.jobs.put(context.io, .{
-            .index = index,
-        });
-        context.stats.jobPut();
-    }
-}
-
 fn workerMain(context: *WorkerContext) void {
-    while (true) {
-        const job = context.jobs.get(context.io) catch |err| {
-            std.debug.panic("integration-diff job queue failed: {s}", .{@errorName(err)});
-        } orelse return;
-        context.stats.jobTaken();
-
-        const generated = generateWorkerCase(context.allocator, context.corpus, context.seed, job.index, context.min_depth) catch |err| {
+    while (context.stats.claim(context.total_jobs)) |index| {
+        const generated = generateWorkerCase(context.allocator, context.case_space, index) catch |err| {
             std.debug.panic("integration-diff case generation failed: {s}", .{@errorName(err)});
         };
 
         var result: JobResult = .{
-            .index = job.index,
-            .seed = context.seed,
-            .iteration = job.index,
+            .index = index,
+            .seed = context.case_space.seed,
+            .iteration = index,
             .expr = generated.expr,
             .skipped = generated.skipped,
         };
@@ -702,7 +628,7 @@ fn workerMain(context: *WorkerContext) void {
             continue;
         }
 
-        result.classification = classify(context.allocator, context.io, context.config, job.expr) catch |err| {
+        result.classification = classify(context.allocator, context.io, context.config, result.expr) catch |err| {
             result.err = err;
             result.classification = null;
             context.results.put(context.io, result) catch |queue_err| {
@@ -742,6 +668,8 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
             config.min_depth = try std.fmt.parseInt(u8, value, 10);
         } else if (try optionValue(&args, arg, "--max-depth")) |value| {
             config.max_depth = try std.fmt.parseInt(u8, value, 10);
+        } else if (try optionValue(&args, arg, "--cases")) |value| {
+            config.case_count = try std.fmt.parseInt(usize, value, 10);
         } else if (try optionValue(&args, arg, "--jobs")) |value| {
             config.jobs = try std.fmt.parseInt(usize, value, 10);
         } else if (try optionValue(&args, arg, "--command-timeout-seconds")) |value| {
@@ -783,6 +711,7 @@ fn usage() void {
         \\  --nix-bin PATH      nix-instantiate executable
         \\  --min-depth N       minimum composition depth (default: 0)
         \\  --max-depth N       maximum composition depth (default: 4)
+        \\  --cases N           generated fuzz cases to run (default: 64000)
         \\  --jobs N            parallel evaluator jobs; 0 means CPU count
         \\  --command-timeout-seconds N
         \\                      max seconds for one evaluator command (default: 60)
@@ -796,12 +725,6 @@ fn usage() void {
 fn resolveWorkerCount(requested: usize) !usize {
     if (requested != 0) return requested;
     return @max(@as(usize, 1), try std.Thread.getCpuCount());
-}
-
-fn generatedCaseCount(corpus_len: usize, min_depth: u8, max_depth: u8) !usize {
-    const pair_count = std.math.mul(usize, corpus_len, corpus_len) catch return error.TooManyCases;
-    const depth_count = @as(usize, max_depth - min_depth) + 1;
-    return std.math.mul(usize, pair_count, depth_count) catch error.TooManyCases;
 }
 
 fn randomSeed(io: std.Io) u64 {
@@ -874,42 +797,37 @@ fn printDuration(seconds: u64) void {
     }
 }
 
-fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
-    const low_water = @max(@as(usize, 1), snapshot.job_capacity / 16);
+fn printWorkText(snapshot: WorkSnapshot, use_color: bool) void {
     const workers_busy = snapshot.in_flight >= snapshot.worker_count;
-    const state: enum { fed, thin, saturated, starved, draining, done } =
-        if (snapshot.job_depth == 0 and snapshot.unscheduled == 0 and snapshot.in_flight == 0)
+    const state: enum { saturated, active, starved, draining, done } =
+        if (snapshot.remaining == 0 and snapshot.in_flight == 0)
             .done
-        else if (snapshot.job_depth == 0 and snapshot.unscheduled == 0)
+        else if (snapshot.remaining == 0)
             .draining
-        else if (snapshot.job_depth == 0 and workers_busy)
+        else if (workers_busy)
             .saturated
-        else if (snapshot.job_depth == 0)
-            .starved
-        else if (snapshot.job_depth <= low_water)
-            .thin
+        else if (snapshot.in_flight != 0)
+            .active
         else
-            .fed;
+            .starved;
 
     const color = if (use_color) switch (state) {
-        .fed => "\x1b[32m",
-        .thin => "\x1b[33m",
         .saturated => "\x1b[32m",
+        .active => "\x1b[33m",
         .starved => "\x1b[31m",
         .draining => "\x1b[33m",
         .done => "\x1b[32m",
     } else "";
     const reset = if (use_color) "\x1b[0m" else "";
 
-    std.debug.print("{s}{s}{s} jobs {}/{} workers {}/{} unscheduled {}", .{
+    std.debug.print("{s}{s}{s} workers {}/{} claimed {} remaining {}", .{
         color,
         @tagName(state),
         reset,
-        snapshot.job_depth,
-        snapshot.job_capacity,
         snapshot.in_flight,
         snapshot.worker_count,
-        snapshot.unscheduled,
+        snapshot.claimed,
+        snapshot.remaining,
     });
 }
 
@@ -1011,7 +929,7 @@ fn dumpGeneratedCases(
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
-    stream: *CaseStream,
+    case_space: CaseSpace,
     reporter: *Reporter,
 ) !void {
     var cases = try DumpFile.open(io, config.dump_cases_path);
@@ -1019,7 +937,9 @@ fn dumpGeneratedCases(
     var skipped = try DumpFile.open(io, config.dump_skipped_path);
     defer skipped.close();
 
-    while (try stream.next()) |generated| {
+    var index: usize = 0;
+    while (index < case_space.total) : (index += 1) {
+        const generated = try case_space.generate(allocator, index);
         errdefer generated.deinit(allocator);
 
         if (generated.skipped) {
@@ -1030,7 +950,7 @@ fn dumpGeneratedCases(
             reporter.checked();
         }
         generated.deinit(allocator);
-        reporter.progress(stream.next_index, stream.total);
+        reporter.progress(index + 1, case_space.total);
     }
 }
 
@@ -1065,12 +985,13 @@ fn generateCase(
     seed: u64,
     iteration: usize,
     min_depth: u8,
+    max_depth: u8,
 ) !GeneratedCase {
-    const pair_count = try pairCount(corpus.len);
-    const depth = min_depth + @as(u8, @intCast(iteration / pair_count));
-    const pair_index = permutedIndex(seed, iteration % pair_count, pair_count);
-    const left = corpus[pair_index / corpus.len];
-    const right = corpus[pair_index % corpus.len];
+    var prng = casePrng(seed, iteration);
+    const random = prng.random();
+    const depth = random.intRangeAtMost(u8, min_depth, max_depth);
+    const left = corpus[random.uintLessThan(usize, corpus.len)];
+    const right = corpus[random.uintLessThan(usize, corpus.len)];
     var fragment = if (right.free_names.len != 0)
         try scopedBodyFragment(allocator, left, right, depth)
     else if (left.free_names.len != 0)
@@ -1087,20 +1008,24 @@ fn generateCase(
 
 fn generateWorkerCase(
     allocator: std.mem.Allocator,
-    corpus: []const Fragment,
-    seed: u64,
-    iteration: usize,
-    min_depth: u8,
+    case_space: CaseSpace,
+    index: usize,
 ) !GeneratedCase {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const generated = try generateCase(arena.allocator(), corpus, seed, iteration, min_depth);
+    const generated = try case_space.generate(arena.allocator(), index);
     return .{
         .index = generated.index,
         .expr = try allocator.dupe(u8, generated.expr),
         .skipped = generated.skipped,
     };
+}
+
+fn casePrng(seed: u64, index: usize) std.Random.DefaultPrng {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @intCast(index), .little);
+    return std.Random.DefaultPrng.init(std.hash.Wyhash.hash(seed, &bytes));
 }
 
 fn closedPairFragment(allocator: std.mem.Allocator, left: Fragment, right: Fragment, depth: u8) !Fragment {
@@ -1236,39 +1161,6 @@ fn appendUniqueName(
 fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
     for (names) |name| allocator.free(name);
     if (names.len != 0) allocator.free(names);
-}
-
-fn pairCount(corpus_len: usize) !usize {
-    return std.math.mul(usize, corpus_len, corpus_len) catch error.TooManyCases;
-}
-
-fn permutedIndex(seed: u64, iteration: usize, count: usize) usize {
-    const offset: usize = @intCast(seed % count);
-    const stride = coprimeStride(seed / @as(u64, @intCast(count)), count);
-    return (offset + iteration *% stride) % count;
-}
-
-fn coprimeStride(seed: u64, count: usize) usize {
-    std.debug.assert(count > 0);
-    if (count == 1) return 1;
-    var stride: usize = @intCast(seed % count);
-    stride = @max(stride, 1);
-    while (gcd(stride, count) != 1) {
-        stride += 1;
-        if (stride == count) stride = 1;
-    }
-    return stride;
-}
-
-fn gcd(a_start: usize, b_start: usize) usize {
-    var a = a_start;
-    var b = b_start;
-    while (b != 0) {
-        const next = a % b;
-        a = b;
-        b = next;
-    }
-    return a;
 }
 
 fn binary(allocator: std.mem.Allocator, left: []const u8, op: []const u8, right: []const u8) ![]u8 {
