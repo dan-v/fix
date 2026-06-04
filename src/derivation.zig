@@ -176,7 +176,7 @@ pub fn storePath(
     output: []const u8,
     fingerprint: []const u8,
 ) !InternId {
-    const hash = stablePlaceholderHash(name, output, fingerprint);
+    const hash = stableStoreHash(name, output, fingerprint);
     const text = if (std.mem.eql(u8, output, "out"))
         try std.fmt.allocPrint(allocator, "/nix/store/{s}-{s}", .{ hash, name })
     else
@@ -191,23 +191,53 @@ pub fn drvPath(
     name: []const u8,
     fingerprint: []const u8,
 ) !InternId {
-    const hash = stablePlaceholderHash(name, "drv", fingerprint);
+    const hash = stableStoreHash(name, "drv", fingerprint);
     const text = try std.fmt.allocPrint(allocator, "/nix/store/{s}-{s}.drv", .{ hash, name });
     defer allocator.free(text);
     return intern.intern(text);
 }
 
-pub fn stablePlaceholderHash(name: []const u8, output: []const u8, fingerprint: []const u8) [16]u8 {
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(name);
-    hasher.update(&.{0});
-    hasher.update(output);
-    hasher.update(&.{0});
-    hasher.update(fingerprint);
-    const digest = hasher.final();
+pub fn stableStoreHash(name: []const u8, output: []const u8, fingerprint: []const u8) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    updateHashPart(&hasher, "name", name);
+    updateHashPart(&hasher, "output", output);
+    updateHashPart(&hasher, "fingerprint", fingerprint);
 
-    var encoded: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&encoded, "{x:0>16}", .{digest}) catch unreachable;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return nixBase32(compressDigest(&digest));
+}
+
+fn updateHashPart(hasher: anytype, tag: []const u8, bytes: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, bytes.len, .little);
+    hasher.update(tag);
+    hasher.update(&.{0});
+    hasher.update(&len);
+    hasher.update(bytes);
+    hasher.update(&.{0});
+}
+
+fn compressDigest(digest: []const u8) [20]u8 {
+    var compressed = [_]u8{0} ** 20;
+    for (digest, 0..) |byte, index| compressed[index % compressed.len] ^= byte;
+    return compressed;
+}
+
+fn nixBase32(bytes: [20]u8) [32]u8 {
+    const alphabet = "0123456789abcdfghijklmnpqrsvwxyz";
+    var encoded: [32]u8 = undefined;
+    for (0..encoded.len) |n| {
+        const bit = n * 5;
+        const byte_index = bit / 8;
+        const bit_index: u3 = @intCast(bit % 8);
+        var value: u16 = bytes[byte_index] >> bit_index;
+        if (byte_index + 1 < bytes.len) {
+            const next_shift: u4 = 8 - @as(u4, bit_index);
+            value |= @as(u16, bytes[byte_index + 1]) << next_shift;
+        }
+        encoded[encoded.len - n - 1] = alphabet[@as(usize, value & 0x1f)];
+    }
     return encoded;
 }
 
@@ -276,13 +306,16 @@ fn outputByName(outputs: []const Output, name: InternId) ?Output {
     return null;
 }
 
-test "stable placeholder hash depends on name and output" {
-    const out_hash = stablePlaceholderHash("pkg", "out", "a");
-    const dev_hash = stablePlaceholderHash("pkg", "dev", "a");
-    const changed_hash = stablePlaceholderHash("pkg", "out", "b");
-    const repeat = stablePlaceholderHash("pkg", "out", "a");
+test "stable store hash is nix-shaped and depends on name output and fingerprint" {
+    const out_hash = stableStoreHash("pkg", "out", "a");
+    const dev_hash = stableStoreHash("pkg", "dev", "a");
+    const changed_hash = stableStoreHash("pkg", "out", "b");
+    const repeat = stableStoreHash("pkg", "out", "a");
 
     try std.testing.expectEqualStrings(&out_hash, &repeat);
     try std.testing.expect(!std.mem.eql(u8, &out_hash, &dev_hash));
     try std.testing.expect(!std.mem.eql(u8, &out_hash, &changed_hash));
+    for (out_hash) |char| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, "0123456789abcdfghijklmnpqrsvwxyz", char) != null);
+    }
 }

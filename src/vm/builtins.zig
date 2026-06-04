@@ -2277,21 +2277,73 @@ fn appendDerivationFingerprint(
 
     const sorted = try sortedAttrEntries(self, Value.attrs(attrs_id));
     defer self.allocator.free(sorted);
+    const structured = try derivationStructuredAttrs(self, attrs_id);
 
     try out.appendSlice(self.allocator, "derivation{");
     for (sorted) |entry| {
         const attr_name = self.intern.get(entry.name);
         try appendFingerprintString(self, "name", attr_name, out);
-        if (strictDerivationFingerprintAttr(attr_name)) {
-            appendFingerprintValue(self, entry.value, out, &seen) catch |err| switch (err) {
-                error.MissingAttribute => try out.appendSlice(self.allocator, "missing;"),
-                else => return err,
-            };
-        } else {
-            try out.appendSlice(self.allocator, "opaque;");
-        }
+        appendDerivationAttrFingerprintValue(self, entry.value, structured, out, &seen) catch |err| switch (err) {
+            error.MissingAttribute => try out.appendSlice(self.allocator, "missing;"),
+            else => return err,
+        };
     }
     try out.appendSlice(self.allocator, "};");
+}
+
+fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
+    const name = try self.intern.intern("__structuredAttrs");
+    const value = self.heap.getAttrValue(attrs_id, name) catch |err| switch (err) {
+        error.MissingAttribute => return false,
+        else => return err,
+    };
+    const forced = try self.forceValue(value);
+    if (!forced.isBool()) return error.TypeError;
+    return forced.asBool();
+}
+
+fn appendDerivationAttrFingerprintValue(
+    self: anytype,
+    value: Value,
+    structured: bool,
+    out: *std.ArrayListUnmanaged(u8),
+    seen: *std.ArrayListUnmanaged(FingerprintSeen),
+) !void {
+    if (structured) return appendFingerprintValue(self, value, out, seen);
+    return appendUnstructuredDerivationAttrFingerprintValue(self, value, out, seen);
+}
+
+fn appendUnstructuredDerivationAttrFingerprintValue(
+    self: anytype,
+    value: Value,
+    out: *std.ArrayListUnmanaged(u8),
+    seen: *std.ArrayListUnmanaged(FingerprintSeen),
+) !void {
+    const forced = try self.forceValue(value);
+    if (forced.discriminant == .list) {
+        try appendUnstructuredDerivationListFingerprintValue(self, forced.asObjectId(), out, seen);
+        return;
+    }
+
+    const coerced = try coerceToStringValue(self, forced);
+    try appendFingerprintValue(self, coerced, out, seen);
+}
+
+fn appendUnstructuredDerivationListFingerprintValue(
+    self: anytype,
+    id: ObjectId,
+    out: *std.ArrayListUnmanaged(u8),
+    seen: *std.ArrayListUnmanaged(FingerprintSeen),
+) !void {
+    if (!try enterFingerprintObject(self, seen, .list, id)) return error.RecursiveThunk;
+    defer _ = seen.pop();
+
+    try out.appendSlice(self.allocator, "list[");
+    for (try self.heap.getList(id)) |item| {
+        const coerced = try coerceToStringValue(self, item);
+        try appendFingerprintValue(self, coerced, out, seen);
+    }
+    try out.appendSlice(self.allocator, "];");
 }
 
 fn appendFingerprintValue(
@@ -2311,25 +2363,10 @@ fn appendFingerprintValue(
         .path => try appendFingerprintString(self, "path", self.intern.get(forced.asInternId()), out),
         .string_context => try appendFingerprintContextString(self, forced.asObjectId(), out, seen),
         .list => try appendFingerprintList(self, forced.asObjectId(), out, seen),
-        .attrs => {
-            if (try fingerprintAttrsOutPathValue(self, forced)) |string_value| {
-                try appendFingerprintValue(self, string_value, out, seen);
-            } else {
-                try out.appendSlice(self.allocator, "attrs;");
-            }
-        },
+        .attrs => try appendFingerprintAttrs(self, forced.asObjectId(), out, seen),
         .closure, .builtin, .builtin_closure => try out.appendSlice(self.allocator, "function;"),
         .thunk, .cell => unreachable,
     }
-}
-
-fn fingerprintAttrsOutPathValue(self: anytype, attrs: Value) !?Value {
-    const out_path_id = try self.intern.intern("outPath");
-    const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
-        error.MissingAttribute => return null,
-        else => return err,
-    };
-    return try coerceToStringValue(self, out_path);
 }
 
 fn appendFingerprintString(
@@ -2410,31 +2447,10 @@ fn appendFingerprintEntries(
         try appendFingerprintString(self, "name", attr_name, out);
         appendFingerprintValue(self, entry.value, out, seen) catch |err| switch (err) {
             error.MissingAttribute => try out.appendSlice(self.allocator, "missing;"),
-            error.TypeError => if (strictDerivationFingerprintAttr(attr_name))
-                return err
-            else
-                try out.appendSlice(self.allocator, "opaque;"),
             else => return err,
         };
     }
     try out.appendSlice(self.allocator, "};");
-}
-
-fn strictDerivationFingerprintAttr(name: []const u8) bool {
-    const strict = [_][]const u8{
-        "args",
-        "builder",
-        "name",
-        "outputHash",
-        "outputHashAlgo",
-        "outputHashMode",
-        "outputs",
-        "system",
-    };
-    for (strict) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    return false;
 }
 
 fn enterFingerprintObject(

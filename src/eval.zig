@@ -1948,6 +1948,28 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(input_sensitive_paths);
     try std.testing.expectEqualStrings("\"{\\\"builderDrvSame\\\":false,\\\"builderOutSame\\\":false,\\\"hashDrvSame\\\":false,\\\"hashOutSame\\\":false}\"", input_sensitive_paths);
 
+    const semantic_paths = try renderForTest(
+        \\let
+        \\  mk = value: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; inherit value; };
+        \\  mkMeta = meta: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; inherit meta; };
+        \\  mkStructured = value: builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    __structuredAttrs = true;
+        \\    env = { A = value; };
+        \\  };
+        \\in builtins.toJSON {
+        \\  drvPathLength = builtins.stringLength (mk "x").drvPath;
+        \\  listStringSame = (mk [ 1 true null ]).outPath == (mk "1  ").outPath;
+        \\  metaSame = (mkMeta 1).outPath == (mkMeta 2).outPath;
+        \\  structuredIntStringSame = (mkStructured 1).outPath == (mkStructured "1").outPath;
+        \\  unstructuredIntStringSame = (mk 1).outPath == (mk "1").outPath;
+        \\}
+    );
+    defer std.testing.allocator.free(semantic_paths);
+    try std.testing.expectEqualStrings("\"{\\\"drvPathLength\\\":51,\\\"listStringSame\\\":false,\\\"metaSame\\\":false,\\\"structuredIntStringSame\\\":false,\\\"unstructuredIntStringSame\\\":true}\"", semantic_paths);
+
     const drv_attrs = try renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = [ 1 true null ]; __structuredAttrs = true; env = { A = 1; }; }).drvAttrs.env.A");
     defer std.testing.allocator.free(drv_attrs);
     try std.testing.expectEqualStrings("1", drv_attrs);

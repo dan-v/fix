@@ -107,6 +107,10 @@ builtins.hasContext (builtins.toString (builtins.derivation { name = "pkg"; syst
 (builtins.tryEval (builtins.derivation { name = builtins.throw "x"; system = "x86_64-linux"; builder = "/bin/sh"; }).outPath).success
 (let mk = builder: builtins.derivation { name = "pkg"; system = "x86_64-linux"; inherit builder; }; in (mk "/bin/sh").outPath == (mk "/bin/bash").outPath)
 (let mk = hash: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; outputHash = hash; outputHashAlgo = "sha256"; outputHashMode = "flat"; }; in (mk "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").outPath == (mk "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=").outPath)
+(let mk = value: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; inherit value; }; in (mk 1).outPath == (mk "1").outPath)
+(let mk = value: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; inherit value; }; in (mk [ 1 true null ]).outPath == (mk "1  ").outPath)
+(let mk = value: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; __structuredAttrs = true; env = { A = value; }; }; in (mk 1).outPath == (mk "1").outPath)
+builtins.stringLength (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath
 builtins.attrNames builtins.builtins
 rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
