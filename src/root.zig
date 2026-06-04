@@ -224,8 +224,14 @@ test "end-to-end: dynamic attribute selection" {
     const declared = try ev.evaluate("let key = \"x\"; in ({ ${key} = 4; }).x");
     try std.testing.expectEqual(@as(i64, 4), declared.asInt());
 
+    const declared_quoted = try ev.evaluate("let key = \"x\"; in ({ \"${key}Suffix\" = 4; }).xSuffix");
+    try std.testing.expectEqual(@as(i64, 4), declared_quoted.asInt());
+
     const defaulted = try ev.evaluate("let key = \"missing\"; attrs = {}; in attrs.${key} or 9");
     try std.testing.expectEqual(@as(i64, 9), defaulted.asInt());
+
+    const defaulted_missing_prefix = try ev.evaluate("let key = \"missing\"; attrs = {}; in attrs.prefix.${key} or 9");
+    try std.testing.expectEqual(@as(i64, 9), defaulted_missing_prefix.asInt());
 
     const defaulted_arg = try ev.evaluate("let v = x: x; final = {}; in v final.gcc.arch or \"default\"");
     try std.testing.expectEqualStrings("default", ev.intern.get(defaulted_arg.asInternId()));
@@ -573,6 +579,9 @@ test "end-to-end: attr path or defaults" {
 
     const missing_mid = try ev.evaluate("({}).a.b or 2");
     try std.testing.expectEqual(@as(i64, 2), missing_mid.asInt());
+
+    const dynamic_missing_mid = try ev.evaluate("let key = \"b\"; in ({}).a.${key} or 2");
+    try std.testing.expectEqual(@as(i64, 2), dynamic_missing_mid.asInt());
 
     const concat_defaults = try ev.evaluate("let m = { require = [ 9 ]; }; in m.require or [ 1 ] ++ m.imports or [ 3 ]");
     try std.testing.expectEqual(@as(usize, 2), (try ev.heap.getList(concat_defaults.asObjectId())).len);

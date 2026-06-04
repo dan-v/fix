@@ -725,6 +725,10 @@ test "evaluate recursive dynamic attrsets" {
     const dynamic = try renderForTest("rec { a = 1; ${\"x\"} = a + 1; }.x");
     defer std.testing.allocator.free(dynamic);
     try std.testing.expectEqualStrings("2", dynamic);
+
+    const dynamic_or_missing_prefix = try renderForTest("let switch = { kindFallback = \"ignore\"; }; kind = \"broken\"; in switch.kindSpecific.${kind} or switch.kindFallback");
+    defer std.testing.allocator.free(dynamic_or_missing_prefix);
+    try std.testing.expectEqualStrings("\"ignore\"", dynamic_or_missing_prefix);
 }
 
 test "evaluate matches Nix toString bool and null semantics" {
@@ -2003,6 +2007,41 @@ test "evaluate minimal derivation builtins" {
     );
     defer std.testing.allocator.free(stable_context_inputs);
     try std.testing.expectEqualStrings("true", stable_context_inputs);
+
+    const structured_derivation_input = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    __structuredAttrs = true;
+        \\    env = {
+        \\      dep = dep;
+        \\      nested = { also = dep; };
+        \\    };
+        \\  };
+        \\in builtins.isString pkg.outPath
+    );
+    defer std.testing.allocator.free(structured_derivation_input);
+    try std.testing.expectEqualStrings("true", structured_derivation_input);
+
+    var recursive_structured_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer recursive_structured_ev.deinit();
+    try std.testing.expectError(
+        error.RecursiveThunk,
+        recursive_structured_ev.evaluate(
+            \\let
+            \\  loop = rec { self = loop; };
+            \\in (builtins.derivation {
+            \\  name = "pkg";
+            \\  system = "x86_64-linux";
+            \\  builder = "/bin/sh";
+            \\  __structuredAttrs = true;
+            \\  env = loop;
+            \\}).outPath
+        ),
+    );
 
     const semantic_paths = try renderForTest(
         \\let

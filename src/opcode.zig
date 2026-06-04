@@ -124,6 +124,14 @@ pub const OpCode = enum(u8) {
     /// Select a runtime string attribute with a lazy default.
     /// Stack layout before: [attrs, name, default_thunk].
     get_attr_dynamic_or,
+    /// Select a static attribute path prefix followed by a runtime string
+    /// attribute with a lazy default if any segment is missing.
+    /// Operand: 1-byte segment count, then that many 2-byte InternIds.
+    /// Stack layout before: [attrs, name, default_thunk].
+    get_attr_path_dynamic_or,
+    /// Wide-intern-id form of get_attr_path_dynamic_or.
+    /// Operand: 1-byte segment count, then that many 4-byte InternIds.
+    get_attr_path_dynamic_or_long,
     /// Select an attribute path with a lazy default if any segment is missing.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].

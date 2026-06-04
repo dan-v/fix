@@ -2519,6 +2519,9 @@ fn structuredAttrsJson(
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
+    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
+    defer seen.deinit(self.allocator);
+
     var first = true;
     try out.append(self.allocator, '{');
     const entries = try sortedAttrEntries(self, Value.attrs(attrs_id));
@@ -2533,7 +2536,7 @@ fn structuredAttrsJson(
         first = false;
         try appendJsonString(self, &out, name);
         try out.append(self.allocator, ':');
-        try appendStructuredJsonValue(self, &out, entry.value, inputs, owned_strings);
+        try appendStructuredJsonValue(self, &out, entry.value, inputs, owned_strings, &seen);
     }
     try out.append(self.allocator, '}');
     return out.toOwnedSlice(self.allocator);
@@ -2545,6 +2548,7 @@ fn appendStructuredJsonValue(
     value: Value,
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) !void {
     const forced = try self.forceValue(value);
     switch (forced.discriminant) {
@@ -2554,19 +2558,30 @@ fn appendStructuredJsonValue(
         .int => try appendJsonFmt(self, out, "{}", .{forced.asInt()}),
         .float => try appendJsonFmt(self, out, "{d}", .{forced.asFloat()}),
         .string, .path, .string_context => {
-            const string_value = try coerceToStringValue(self, forced);
-            try appendContextInputs(self, string_value, inputs, owned_strings);
-            try appendJsonString(self, out, self.intern.get(try stringTextInternId(self, string_value)));
+            try appendStructuredJsonStringValue(self, out, forced, inputs, owned_strings);
         },
         .list => {
+            const list_id = forced.asObjectId();
+            if (!try enterJsonObject(self, .list, list_id, seen)) return error.RecursiveThunk;
+            defer _ = seen.pop();
+
             try out.append(self.allocator, '[');
-            for (try self.heap.getList(forced.asObjectId()), 0..) |item, index| {
+            for (try self.heap.getList(list_id), 0..) |item, index| {
                 if (index != 0) try out.append(self.allocator, ',');
-                try appendStructuredJsonValue(self, out, item, inputs, owned_strings);
+                try appendStructuredJsonValue(self, out, item, inputs, owned_strings, seen);
             }
             try out.append(self.allocator, ']');
         },
         .attrs => {
+            if (try jsonAttrsStringValue(self, forced)) |string_value| {
+                try appendStructuredJsonStringValue(self, out, string_value, inputs, owned_strings);
+                return;
+            }
+
+            const attrs_id = forced.asObjectId();
+            if (!try enterJsonObject(self, .attrs, attrs_id, seen)) return error.RecursiveThunk;
+            defer _ = seen.pop();
+
             try out.append(self.allocator, '{');
             const entries = try sortedAttrEntries(self, forced);
             defer self.allocator.free(entries);
@@ -2574,13 +2589,25 @@ fn appendStructuredJsonValue(
                 if (index != 0) try out.append(self.allocator, ',');
                 try appendJsonString(self, out, self.intern.get(entry.name));
                 try out.append(self.allocator, ':');
-                try appendStructuredJsonValue(self, out, entry.value, inputs, owned_strings);
+                try appendStructuredJsonValue(self, out, entry.value, inputs, owned_strings, seen);
             }
             try out.append(self.allocator, '}');
         },
         .closure, .builtin, .builtin_closure => return error.TypeError,
         .thunk, .cell => unreachable,
     }
+}
+
+fn appendStructuredJsonStringValue(
+    self: anytype,
+    out: *std.ArrayListUnmanaged(u8),
+    value: Value,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const string_value = try coerceToStringValue(self, value);
+    try appendContextInputs(self, string_value, inputs, owned_strings);
+    try appendJsonString(self, out, self.intern.get(try stringTextInternId(self, string_value)));
 }
 
 fn appendJsonString(self: anytype, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {

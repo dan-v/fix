@@ -919,7 +919,7 @@ pub const Compiler = struct {
 
             var i: usize = 0;
             for (entries) |entry| {
-                if (entry.dynamic_name == null) {
+                if (!self.isDynamicAttrEntry(entry)) {
                     static_entries[i] = entry;
                     i += 1;
                 }
@@ -933,8 +933,8 @@ pub const Compiler = struct {
         }
 
         for (entries) |entry| {
-            const name = entry.dynamic_name orelse continue;
-            try self.compileNode(name);
+            if (!self.isDynamicAttrEntry(entry)) continue;
+            try self.compileDynamicAttrName(entry);
             try self.compileThunk(entry.expr);
             try self.emitOpU16(.build_attrs, 1);
             try self.emitOp(.merge_attrs);
@@ -948,7 +948,7 @@ pub const Compiler = struct {
 
         var static_i: usize = 0;
         for (entries) |entry| {
-            if (entry.dynamic_name == null) {
+            if (!self.isDynamicAttrEntry(entry)) {
                 static_entries[static_i] = entry;
                 static_i += 1;
             }
@@ -975,8 +975,8 @@ pub const Compiler = struct {
         try self.emitRecursiveAttrObject(views);
 
         for (entries) |entry| {
-            const name = entry.dynamic_name orelse continue;
-            try self.compileNode(name);
+            if (!self.isDynamicAttrEntry(entry)) continue;
+            try self.compileDynamicAttrName(entry);
             try self.compileThunk(entry.expr);
             try self.emitOpU16(.build_attrs, 1);
             try self.emitOp(.merge_attrs);
@@ -986,20 +986,30 @@ pub const Compiler = struct {
     }
 
     fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
-        _ = self;
         for (entries) |entry| {
-            if (entry.dynamic_name != null) return true;
+            if (self.isDynamicAttrEntry(entry)) return true;
         }
         return false;
     }
 
     fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSetEntry) usize {
-        _ = self;
         var count: usize = 0;
         for (entries) |entry| {
-            if (entry.dynamic_name == null) count += 1;
+            if (!self.isDynamicAttrEntry(entry)) count += 1;
         }
         return count;
+    }
+
+    fn isDynamicAttrEntry(self: *const Compiler, entry: Node.AttrSetEntry) bool {
+        return entry.dynamic_name != null or (entry.path.len == 1 and self.attrSegmentHasInterpolation(entry.path[0]));
+    }
+
+    fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
+        if (entry.dynamic_name) |name| return self.compileNode(name);
+        if (entry.path.len == 1 and self.attrSegmentHasInterpolation(entry.path[0])) {
+            return self.compileStringAtom(entry.path[0]);
+        }
+        return error.InvalidAttributePath;
     }
 
     fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
@@ -1334,6 +1344,25 @@ pub const Compiler = struct {
         const attr_or = node.data.attr_or;
         if (attr_or.attr_path.tag == .attr_dynamic) {
             const dynamic = attr_or.attr_path.data.attr_dynamic;
+            if (dynamic.root.tag == .attr_path) {
+                const root_path = dynamic.root.data.attr_path;
+                try self.compileNode(root_path.root);
+                try self.compileNode(dynamic.name);
+                try self.compileThunk(attr_or.default);
+                var wide = false;
+                for (root_path.segments) |seg| {
+                    const name_span = self.attrSegmentSpan(seg);
+                    if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+                }
+                try self.emitOp(if (wide) .get_attr_path_dynamic_or_long else .get_attr_path_dynamic_or);
+                try self.builder.writeByte(self.allocator, @intCast(root_path.segments.len));
+                for (root_path.segments) |seg| {
+                    const name_span = self.attrSegmentSpan(seg);
+                    const name_id = try self.intern.intern(name_span);
+                    try self.writeInternId(name_id, wide);
+                }
+                return;
+            }
             try self.compileNode(dynamic.root);
             try self.compileNode(dynamic.name);
             try self.compileThunk(attr_or.default);

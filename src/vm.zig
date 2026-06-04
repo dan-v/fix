@@ -582,6 +582,30 @@ pub const VM = struct {
                     };
                     try self.push(try self.forceValue(result));
                 },
+                .get_attr_path_dynamic_or => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 2;
+                    const default_val = self.pop();
+                    const name_val = try self.forceValue(self.pop());
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val.asInternId(), default_val, code[names_start..frame.ip], false);
+                    try self.push(result);
+                },
+                .get_attr_path_dynamic_or_long => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const names_start = frame.ip;
+                    frame.ip += @as(usize, segment_count) * 4;
+                    const default_val = self.pop();
+                    const name_val = try self.forceValue(self.pop());
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val.asInternId(), default_val, code[names_start..frame.ip], true);
+                    try self.push(result);
+                },
                 .get_attr_path_or => {
                     const segment_count = code[frame.ip];
                     frame.ip += 1;
@@ -1229,6 +1253,27 @@ pub const VM = struct {
             current = try self.forceValue(current);
         }
         return current;
+    }
+
+    fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: InternId, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
+        var current = try self.forceValue(attrs_val);
+        var offset: usize = 0;
+        const stride: usize = if (wide) 4 else 2;
+        while (offset < encoded_names.len) : (offset += stride) {
+            if (current.discriminant != .attrs) return self.forceValue(default_val);
+            const name_id = readInternId(encoded_names, offset, wide);
+            current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => return self.forceValue(default_val),
+                else => return err,
+            };
+            current = try self.forceValue(current);
+        }
+        if (current.discriminant != .attrs) return self.forceValue(default_val);
+        const result = self.heap.getAttrValue(current.asObjectId(), dynamic_name) catch |err| switch (err) {
+            error.MissingAttribute => return self.forceValue(default_val),
+            else => return err,
+        };
+        return self.forceValue(result);
     }
 
     fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide: bool) !bool {
