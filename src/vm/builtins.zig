@@ -2260,37 +2260,6 @@ fn appendLazyDerivationAttrId(
     });
 }
 
-const FingerprintSeenKind = enum { list, attrs, context_string };
-
-const FingerprintSeen = struct {
-    kind: FingerprintSeenKind,
-    id: ObjectId,
-};
-
-fn appendDerivationFingerprint(
-    self: anytype,
-    attrs_id: ObjectId,
-    out: *std.ArrayListUnmanaged(u8),
-) !void {
-    var seen: std.ArrayListUnmanaged(FingerprintSeen) = .empty;
-    defer seen.deinit(self.allocator);
-
-    const sorted = try sortedAttrEntries(self, Value.attrs(attrs_id));
-    defer self.allocator.free(sorted);
-    const structured = try derivationStructuredAttrs(self, attrs_id);
-
-    try out.appendSlice(self.allocator, "derivation{");
-    for (sorted) |entry| {
-        const attr_name = self.intern.get(entry.name);
-        try appendFingerprintString(self, "name", attr_name, out);
-        appendDerivationAttrFingerprintValue(self, entry.value, structured, out, &seen) catch |err| switch (err) {
-            error.MissingAttribute => try out.appendSlice(self.allocator, "missing;"),
-            else => return err,
-        };
-    }
-    try out.appendSlice(self.allocator, "};");
-}
-
 fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
     const name = try self.intern.intern("__structuredAttrs");
     const value = self.heap.getAttrValue(attrs_id, name) catch |err| switch (err) {
@@ -2302,194 +2271,34 @@ fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
     return forced.asBool();
 }
 
-fn appendDerivationAttrFingerprintValue(
-    self: anytype,
-    value: Value,
-    structured: bool,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    if (structured) return appendFingerprintValue(self, value, out, seen);
-    return appendUnstructuredDerivationAttrFingerprintValue(self, value, out, seen);
-}
-
-fn appendUnstructuredDerivationAttrFingerprintValue(
-    self: anytype,
-    value: Value,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    const forced = try self.forceValue(value);
-    if (forced.discriminant == .list) {
-        try appendUnstructuredDerivationListFingerprintValue(self, forced.asObjectId(), out, seen);
-        return;
-    }
-
-    const coerced = try coerceToStringValue(self, forced);
-    try appendFingerprintValue(self, coerced, out, seen);
-}
-
-fn appendUnstructuredDerivationListFingerprintValue(
-    self: anytype,
-    id: ObjectId,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    if (!try enterFingerprintObject(self, seen, .list, id)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
-    try out.appendSlice(self.allocator, "list[");
-    for (try self.heap.getList(id)) |item| {
-        const coerced = try coerceToStringValue(self, item);
-        try appendFingerprintValue(self, coerced, out, seen);
-    }
-    try out.appendSlice(self.allocator, "];");
-}
-
-fn appendFingerprintValue(
-    self: anytype,
-    value: Value,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) anyerror!void {
-    const forced = try self.forceValue(value);
-    switch (forced.discriminant) {
-        .null => try out.appendSlice(self.allocator, "null;"),
-        .bool_false => try out.appendSlice(self.allocator, "bool:false;"),
-        .bool_true => try out.appendSlice(self.allocator, "bool:true;"),
-        .int => try appendFingerprintFmt(self, out, "int:{};", .{forced.asInt()}),
-        .float => try appendFingerprintFmt(self, out, "float:{d};", .{forced.asFloat()}),
-        .string => try appendFingerprintString(self, "string", self.intern.get(forced.asInternId()), out),
-        .path => try appendFingerprintString(self, "path", self.intern.get(forced.asInternId()), out),
-        .string_context => try appendFingerprintContextString(self, forced.asObjectId(), out, seen),
-        .list => try appendFingerprintList(self, forced.asObjectId(), out, seen),
-        .attrs => try appendFingerprintAttrs(self, forced.asObjectId(), out, seen),
-        .closure, .builtin, .builtin_closure => try out.appendSlice(self.allocator, "function;"),
-        .thunk, .cell => unreachable,
-    }
-}
-
-fn appendFingerprintString(
-    self: anytype,
-    tag: []const u8,
-    text: []const u8,
-    out: *std.ArrayListUnmanaged(u8),
-) !void {
-    try out.appendSlice(self.allocator, tag);
-    try out.append(self.allocator, ':');
-    try appendFingerprintFmt(self, out, "{}:", .{text.len});
-    try out.appendSlice(self.allocator, text);
-    try out.append(self.allocator, ';');
-}
-
-fn appendFingerprintFmt(
-    self: anytype,
-    out: *std.ArrayListUnmanaged(u8),
-    comptime fmt: []const u8,
-    args: anytype,
-) !void {
-    const text = try std.fmt.allocPrint(self.allocator, fmt, args);
-    defer self.allocator.free(text);
-    try out.appendSlice(self.allocator, text);
-}
-
-fn appendFingerprintContextString(
-    self: anytype,
-    id: ObjectId,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    if (!try enterFingerprintObject(self, seen, .context_string, id)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
-    const string = try self.heap.getContextString(id);
-    try appendFingerprintString(self, "context-string", self.intern.get(string.text), out);
-    try appendFingerprintEntries(self, string.context, out, seen);
-}
-
-fn appendFingerprintList(
-    self: anytype,
-    id: ObjectId,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    if (!try enterFingerprintObject(self, seen, .list, id)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
-    try out.appendSlice(self.allocator, "list[");
-    for (try self.heap.getList(id)) |item| try appendFingerprintValue(self, item, out, seen);
-    try out.appendSlice(self.allocator, "];");
-}
-
-fn appendFingerprintAttrs(
-    self: anytype,
-    id: ObjectId,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    if (!try enterFingerprintObject(self, seen, .attrs, id)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
-    const sorted = try sortedAttrEntries(self, Value.attrs(id));
-    defer self.allocator.free(sorted);
-    try appendFingerprintEntries(self, sorted, out, seen);
-}
-
-fn appendFingerprintEntries(
-    self: anytype,
-    entries: []const heap_mod.AttrEntry,
-    out: *std.ArrayListUnmanaged(u8),
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-) !void {
-    try out.appendSlice(self.allocator, "attrs{");
-    for (entries) |entry| {
-        const attr_name = self.intern.get(entry.name);
-        try appendFingerprintString(self, "name", attr_name, out);
-        appendFingerprintValue(self, entry.value, out, seen) catch |err| switch (err) {
-            error.MissingAttribute => try out.appendSlice(self.allocator, "missing;"),
-            else => return err,
-        };
-    }
-    try out.appendSlice(self.allocator, "};");
-}
-
-fn enterFingerprintObject(
-    self: anytype,
-    seen: *std.ArrayListUnmanaged(FingerprintSeen),
-    kind: FingerprintSeenKind,
-    id: ObjectId,
-) !bool {
-    for (seen.items) |item| {
-        if (item.kind == kind and item.id == id) return false;
-    }
-    try seen.append(self.allocator, .{ .kind = kind, .id = id });
-    return true;
-}
-
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     const name_id = try self.intern.intern("name");
     const name_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
     const drv_name_id = try stringTextInternId(self, name_value);
 
-    var fingerprint: std.ArrayListUnmanaged(u8) = .empty;
-    defer fingerprint.deinit(self.allocator);
-    try appendDerivationFingerprint(self, attrs_id, &fingerprint);
-
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
+
+    var normalized = try normalizeDerivation(self, attrs_id, self.intern.get(drv_name_id), output_names);
+    defer normalized.deinit(self.allocator);
+    const computed = try normalized.drv.computePaths(self.allocator, self.derivations.resolver());
+    defer self.allocator.free(computed.drv_path);
+    defer computed.hash_modulo.deinit(self.allocator);
+    try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
 
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {
+        const path = normalized.outputPath(self.intern.get(output_name)) orelse return error.InvalidDerivationOutput;
         output.* = .{
             .name = output_name,
-            .out_path = try derivation.storePath(self.allocator, self.intern, self.intern.get(drv_name_id), self.intern.get(output_name), fingerprint.items),
+            .out_path = try self.intern.intern(path),
         };
     }
 
     const spec: derivation.Spec = .{
-        .drv_path = try derivation.drvPath(self.allocator, self.intern, self.intern.get(drv_name_id), fingerprint.items),
+        .drv_path = try self.intern.intern(computed.drv_path),
         .default_output = output_names.names[0],
         .outputs = outputs,
         .explicit_outputs = output_names.explicit,
@@ -2499,6 +2308,374 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
     };
+}
+
+const NormalizedDerivation = struct {
+    drv: derivation.Drv,
+    owned_strings: std.ArrayListUnmanaged([]u8),
+    owned_output_lists: std.ArrayListUnmanaged([]const []const u8),
+
+    fn deinit(self: *NormalizedDerivation, allocator: std.mem.Allocator) void {
+        for (self.drv.outputs) |output| {
+            if (output.path.len != 0) allocator.free(output.path);
+        }
+        allocator.free(self.drv.outputs);
+        allocator.free(self.drv.args);
+        allocator.free(self.drv.env);
+        allocator.free(self.drv.input_drvs);
+        allocator.free(self.drv.input_srcs);
+        for (self.owned_output_lists.items) |list| allocator.free(list);
+        self.owned_output_lists.deinit(allocator);
+        for (self.owned_strings.items) |string| allocator.free(string);
+        self.owned_strings.deinit(allocator);
+    }
+
+    fn outputPath(self: *const NormalizedDerivation, name: []const u8) ?[]const u8 {
+        for (self.drv.outputs) |output| {
+            if (std.mem.eql(u8, output.name, name)) return output.path;
+        }
+        return null;
+    }
+};
+
+fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, output_names: DerivationOutputNames) !NormalizedDerivation {
+    var owned_strings: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (owned_strings.items) |string| self.allocator.free(string);
+        owned_strings.deinit(self.allocator);
+    }
+    var owned_output_lists: std.ArrayListUnmanaged([]const []const u8) = .empty;
+    errdefer {
+        for (owned_output_lists.items) |list| self.allocator.free(list);
+        owned_output_lists.deinit(self.allocator);
+    }
+
+    const outputs = try self.allocator.alloc(derivation.DrvOutput, output_names.names.len);
+    errdefer self.allocator.free(outputs);
+    for (output_names.names, outputs) |name, *output| {
+        output.* = .{ .name = self.intern.get(name) };
+    }
+
+    try applyFixedOutputAttrs(self, attrs_id, outputs, &owned_strings);
+
+    var inputs = DerivationInputs{};
+    defer inputs.deinit(self.allocator);
+
+    const args = try derivationArgs(self, attrs_id, &inputs);
+    errdefer self.allocator.free(args);
+    const system = try requiredDerivationString(self, attrs_id, "system", &inputs);
+    const builder = try requiredDerivationString(self, attrs_id, "builder", &inputs);
+    const structured = try derivationStructuredAttrs(self, attrs_id);
+
+    var env: std.ArrayListUnmanaged(derivation.EnvVar) = .empty;
+    errdefer env.deinit(self.allocator);
+    const original_attrs = try self.heap.getAttrs(attrs_id);
+    if (structured) {
+        const json = try structuredAttrsJson(self, attrs_id, output_names.names, &inputs);
+        try owned_strings.append(self.allocator, json);
+        try env.append(self.allocator, .{ .name = "__json", .value = json });
+    } else {
+        for (original_attrs) |entry| {
+            const attr_name = self.intern.get(entry.name);
+            if (std.mem.eql(u8, attr_name, "args")) continue;
+            if (isDerivationSyntheticAttr(self, attr_name, output_names.names)) continue;
+            if (std.mem.eql(u8, attr_name, "outputs")) {
+                if (output_names.explicit) {
+                    const joined = try joinedOutputNames(self, output_names.names);
+                    try owned_strings.append(self.allocator, joined);
+                    try env.append(self.allocator, .{ .name = "outputs", .value = joined });
+                }
+                continue;
+            }
+            const text = try derivationAttrString(self, entry.value, &inputs);
+            try env.append(self.allocator, .{ .name = attr_name, .value = text });
+        }
+    }
+    for (outputs) |output| {
+        try env.append(self.allocator, .{ .name = output.name, .value = "" });
+    }
+
+    const input_drvs = try inputs.input_drvs.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(input_drvs);
+    const input_srcs = try inputs.input_srcs.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(input_srcs);
+    owned_output_lists = inputs.owned_output_lists;
+    inputs.owned_output_lists = .empty;
+
+    return .{
+        .drv = .{
+            .name = drv_name,
+            .outputs = outputs,
+            .input_drvs = input_drvs,
+            .input_srcs = input_srcs,
+            .system = system,
+            .builder = builder,
+            .args = args,
+            .env = try env.toOwnedSlice(self.allocator),
+        },
+        .owned_strings = owned_strings,
+        .owned_output_lists = owned_output_lists,
+    };
+}
+
+fn applyFixedOutputAttrs(
+    self: anytype,
+    attrs_id: ObjectId,
+    outputs: []derivation.DrvOutput,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const hash_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHash")) catch |err| switch (err) {
+        error.MissingAttribute => return,
+        else => return err,
+    };
+    if (outputs.len != 1) return error.InvalidDerivationOutput;
+    const algo_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashAlgo")));
+    const mode_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashMode")));
+    const hash_forced = try self.forceValue(hash_value);
+    if (!isPlainString(algo_value) or !isPlainString(mode_value) or !isPlainString(hash_forced)) return error.TypeError;
+    const algo = self.intern.get(try stringTextInternId(self, algo_value));
+    const mode = self.intern.get(try stringTextInternId(self, mode_value));
+    const hash_text = self.intern.get(try stringTextInternId(self, hash_forced));
+    const hash_hex = try derivation.hashToBase16(self.allocator, algo, hash_text);
+    errdefer self.allocator.free(hash_hex);
+    try owned_strings.append(self.allocator, hash_hex);
+    const hash_algo = if (std.mem.eql(u8, mode, "recursive")) blk: {
+        const text = try std.fmt.allocPrint(self.allocator, "r:{s}", .{algo});
+        errdefer self.allocator.free(text);
+        try owned_strings.append(self.allocator, text);
+        break :blk text;
+    } else if (std.mem.eql(u8, mode, "flat"))
+        algo
+    else
+        return error.InvalidHashMode;
+    outputs[0].hash_algo = hash_algo;
+    outputs[0].hash = hash_hex;
+}
+
+fn derivationArgs(self: anytype, attrs_id: ObjectId, inputs: *DerivationInputs) ![]const []const u8 {
+    const args_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("args")) catch |err| switch (err) {
+        error.MissingAttribute => return self.allocator.alloc([]const u8, 0),
+        else => return err,
+    };
+    const list = try self.forceValue(args_value);
+    if (list.discriminant != .list) return error.TypeError;
+    const items = try self.heap.getList(list.asObjectId());
+    const args = try self.allocator.alloc([]const u8, items.len);
+    errdefer self.allocator.free(args);
+    for (items, args) |item, *arg| arg.* = try derivationAttrString(self, item, inputs);
+    return args;
+}
+
+fn requiredDerivationString(self: anytype, attrs_id: ObjectId, name: []const u8, inputs: *DerivationInputs) ![]const u8 {
+    return derivationAttrString(self, try self.heap.getAttrValue(attrs_id, try self.intern.intern(name)), inputs);
+}
+
+fn derivationAttrString(self: anytype, value: Value, inputs: *DerivationInputs) ![]const u8 {
+    const string_value = try coerceToStringValue(self, value);
+    try appendContextInputs(self, string_value, inputs);
+    return self.intern.get(try stringTextInternId(self, string_value));
+}
+
+fn joinedOutputNames(self: anytype, names: []const InternId) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    for (names, 0..) |name, index| {
+        if (index != 0) try out.append(self.allocator, ' ');
+        try out.appendSlice(self.allocator, self.intern.get(name));
+    }
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn structuredAttrsJson(self: anytype, attrs_id: ObjectId, outputs: []const InternId, inputs: *DerivationInputs) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var first = true;
+    try out.append(self.allocator, '{');
+    const entries = try sortedAttrEntries(self, Value.attrs(attrs_id));
+    defer self.allocator.free(entries);
+    for (entries) |entry| {
+        const name = self.intern.get(entry.name);
+        if (std.mem.eql(u8, name, "__structuredAttrs")) continue;
+        if (std.mem.eql(u8, name, "args")) continue;
+        if (std.mem.eql(u8, name, "outputs")) continue;
+        if (isDerivationSyntheticAttr(self, name, outputs)) continue;
+        if (!first) try out.append(self.allocator, ',');
+        first = false;
+        try appendJsonString(self, &out, name);
+        try out.append(self.allocator, ':');
+        try appendStructuredJsonValue(self, &out, entry.value, inputs);
+    }
+    try out.append(self.allocator, '}');
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn appendStructuredJsonValue(self: anytype, out: *std.ArrayListUnmanaged(u8), value: Value, inputs: *DerivationInputs) !void {
+    const forced = try self.forceValue(value);
+    switch (forced.discriminant) {
+        .null => try out.appendSlice(self.allocator, "null"),
+        .bool_false => try out.appendSlice(self.allocator, "false"),
+        .bool_true => try out.appendSlice(self.allocator, "true"),
+        .int => try appendJsonFmt(self, out, "{}", .{forced.asInt()}),
+        .float => try appendJsonFmt(self, out, "{d}", .{forced.asFloat()}),
+        .string, .path, .string_context => {
+            const string_value = try coerceToStringValue(self, forced);
+            try appendContextInputs(self, string_value, inputs);
+            try appendJsonString(self, out, self.intern.get(try stringTextInternId(self, string_value)));
+        },
+        .list => {
+            try out.append(self.allocator, '[');
+            for (try self.heap.getList(forced.asObjectId()), 0..) |item, index| {
+                if (index != 0) try out.append(self.allocator, ',');
+                try appendStructuredJsonValue(self, out, item, inputs);
+            }
+            try out.append(self.allocator, ']');
+        },
+        .attrs => {
+            try out.append(self.allocator, '{');
+            const entries = try sortedAttrEntries(self, forced);
+            defer self.allocator.free(entries);
+            for (entries, 0..) |entry, index| {
+                if (index != 0) try out.append(self.allocator, ',');
+                try appendJsonString(self, out, self.intern.get(entry.name));
+                try out.append(self.allocator, ':');
+                try appendStructuredJsonValue(self, out, entry.value, inputs);
+            }
+            try out.append(self.allocator, '}');
+        },
+        .closure, .builtin, .builtin_closure => return error.TypeError,
+        .thunk, .cell => unreachable,
+    }
+}
+
+fn appendJsonString(self: anytype, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    try out.append(self.allocator, '"');
+    for (text) |char| switch (char) {
+        '"' => try out.appendSlice(self.allocator, "\\\""),
+        '\\' => try out.appendSlice(self.allocator, "\\\\"),
+        '\n' => try out.appendSlice(self.allocator, "\\n"),
+        '\r' => try out.appendSlice(self.allocator, "\\r"),
+        '\t' => try out.appendSlice(self.allocator, "\\t"),
+        else => try out.append(self.allocator, char),
+    };
+    try out.append(self.allocator, '"');
+}
+
+fn appendJsonFmt(self: anytype, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(self.allocator, fmt, args);
+    defer self.allocator.free(text);
+    try out.appendSlice(self.allocator, text);
+}
+
+fn isDerivationSyntheticAttr(self: anytype, attr_name: []const u8, outputs: []const InternId) bool {
+    const synthetic = [_][]const u8{ "type", "outputName", "outPath", "drvPath", "drvAttrs", "all" };
+    for (synthetic) |candidate| {
+        if (std.mem.eql(u8, attr_name, candidate)) return true;
+    }
+    for (outputs) |output| {
+        if (std.mem.eql(u8, attr_name, self.intern.get(output))) return true;
+    }
+    return false;
+}
+
+const DerivationInputs = struct {
+    input_drvs: std.ArrayListUnmanaged(derivation.DrvInput) = .empty,
+    input_srcs: std.ArrayListUnmanaged([]const u8) = .empty,
+    owned_output_lists: std.ArrayListUnmanaged([]const []const u8) = .empty,
+
+    fn deinit(self: *DerivationInputs, allocator: std.mem.Allocator) void {
+        self.input_drvs.deinit(allocator);
+        self.input_srcs.deinit(allocator);
+        for (self.owned_output_lists.items) |list| allocator.free(list);
+        self.owned_output_lists.deinit(allocator);
+    }
+};
+
+fn appendContextInputs(self: anytype, value: Value, inputs: *DerivationInputs) !void {
+    const text = self.intern.get(try stringTextInternId(self, value));
+    for (try contextEntriesForValue(self, value)) |entry| {
+        const path = self.intern.get(entry.name);
+        if (std.mem.endsWith(u8, path, ".drv")) {
+            const outputs = try contextOutputs(self, path, entry.value);
+            errdefer self.allocator.free(outputs);
+            try inputs.owned_output_lists.append(self.allocator, outputs);
+            try appendInputDrv(self, inputs, path, outputs);
+            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, path);
+        } else {
+            try appendInputSrc(self, inputs, path);
+        }
+    }
+}
+
+fn contextOutputs(self: anytype, path: []const u8, value: Value) ![]const []const u8 {
+    const attrs = try self.forceValue(value);
+    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
+        const list = try self.forceValue(outputs_value);
+        if (list.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(list.asObjectId());
+        const outputs = try self.allocator.alloc([]const u8, items.len);
+        errdefer self.allocator.free(outputs);
+        for (items, outputs) |item, *output| {
+            const item_value = try self.forceValue(item);
+            if (!isPlainString(item_value)) return error.TypeError;
+            output.* = self.intern.get(try stringTextInternId(self, item_value));
+        }
+        return outputs;
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+    if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("allOutputs"))) |all_outputs_value| {
+        const all_outputs = try self.forceValue(all_outputs_value);
+        if (!all_outputs.isBool()) return error.TypeError;
+        if (all_outputs.asBool()) {
+            const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
+            const outputs = try self.allocator.alloc([]const u8, known.len);
+            @memcpy(outputs, known);
+            return outputs;
+        }
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+    const fallback = try self.allocator.alloc([]const u8, 1);
+    fallback[0] = "out";
+    return fallback;
+}
+
+fn appendInputDrv(self: anytype, inputs: *DerivationInputs, path: []const u8, outputs: []const []const u8) !void {
+    for (inputs.input_drvs.items) |*input| {
+        if (std.mem.eql(u8, input.path, path)) {
+            input.outputs = try unionOutputNames(self, inputs, input.outputs, outputs);
+            return;
+        }
+    }
+    try inputs.input_drvs.append(self.allocator, .{ .path = path, .outputs = outputs });
+}
+
+fn unionOutputNames(self: anytype, inputs: *DerivationInputs, a: []const []const u8, b: []const []const u8) ![]const []const u8 {
+    var merged: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer merged.deinit(self.allocator);
+    for (a) |name| try appendUniqueOutputName(self, &merged, name);
+    for (b) |name| try appendUniqueOutputName(self, &merged, name);
+    const list = try merged.toOwnedSlice(self.allocator);
+    errdefer self.allocator.free(list);
+    try inputs.owned_output_lists.append(self.allocator, list);
+    return list;
+}
+
+fn appendUniqueOutputName(self: anytype, outputs: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    for (outputs.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    try outputs.append(self.allocator, name);
+}
+
+fn appendInputSrc(self: anytype, inputs: *DerivationInputs, path: []const u8) !void {
+    for (inputs.input_srcs.items) |src| {
+        if (std.mem.eql(u8, src, path)) return;
+    }
+    try inputs.input_srcs.append(self.allocator, path);
 }
 
 const DerivationOutputNames = struct {
