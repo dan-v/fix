@@ -709,8 +709,8 @@ fn usage() void {
         \\  --failures PATH     directory for reproducers (default: /tmp/fix-integration-failures-$seed-$nonce)
         \\  --fix-bin PATH      fix executable (default: zig-out/bin/fix)
         \\  --nix-bin PATH      nix-instantiate executable
-        \\  --min-depth N       minimum composition depth (default: 0)
-        \\  --max-depth N       maximum composition depth (default: 4)
+        \\  --min-depth N       minimum recursive composition depth (default: 0)
+        \\  --max-depth N       maximum recursive composition depth (default: 4)
         \\  --cases N           generated fuzz cases to run (default: 64000)
         \\  --jobs N            parallel evaluator jobs; 0 means CPU count
         \\  --command-timeout-seconds N
@@ -990,20 +990,79 @@ fn generateCase(
     var prng = casePrng(seed, iteration);
     const random = prng.random();
     const depth = random.intRangeAtMost(u8, min_depth, max_depth);
-    const left = corpus[random.uintLessThan(usize, corpus.len)];
-    const right = corpus[random.uintLessThan(usize, corpus.len)];
-    var fragment = if (right.free_names.len != 0)
-        try scopedBodyFragment(allocator, left, right, depth)
-    else if (left.free_names.len != 0)
-        try scopedBodyFragment(allocator, right, left, depth)
-    else
-        try closedPairFragment(allocator, left, right, depth);
+    var fragment = try generateFragment(allocator, corpus, random, depth);
     errdefer fragment.deinit(allocator);
 
     const skipped = !fragment.closed();
     const expr = try allocator.dupe(u8, fragment.text);
     fragment.deinit(allocator);
     return .{ .index = iteration, .expr = expr, .skipped = skipped };
+}
+
+fn generateFragment(
+    allocator: std.mem.Allocator,
+    corpus: []const Fragment,
+    random: std.Random,
+    depth: u8,
+) !Fragment {
+    if (depth == 0) {
+        return cloneFragment(allocator, corpus[random.uintLessThan(usize, corpus.len)]);
+    }
+
+    var left = try generateFragment(allocator, corpus, random, depth - 1);
+    defer left.deinit(allocator);
+    var right = try generateFragment(allocator, corpus, random, depth - 1);
+    defer right.deinit(allocator);
+
+    return composeFragments(allocator, left, right, depth);
+}
+
+fn composeFragments(allocator: std.mem.Allocator, left: Fragment, right: Fragment, depth: u8) !Fragment {
+    return if (right.free_names.len != 0)
+        scopedBodyFragment(allocator, left, right, depth)
+    else if (left.free_names.len != 0)
+        scopedBodyFragment(allocator, right, left, depth)
+    else
+        closedPairFragment(allocator, left, right, depth);
+}
+
+test "generated fragments recursively compose to requested depth" {
+    const corpus = [_]Fragment{.{ .text = "1" }};
+    var prng = std.Random.DefaultPrng.init(0);
+    const random = prng.random();
+
+    var leaf = try generateFragment(std.testing.allocator, &corpus, random, 0);
+    defer leaf.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("1", leaf.text);
+
+    var one = try generateFragment(std.testing.allocator, &corpus, random, 1);
+    defer one.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("(1) + (1)", one.text);
+
+    var two = try generateFragment(std.testing.allocator, &corpus, random, 2);
+    defer two.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("let x = (1) + (1); y = (1) + (1); in x + y", two.text);
+}
+
+test "generated fragments bind free names during composition" {
+    const free_names = [_][]const u8{"x"};
+    const value: Fragment = .{ .text = "1" };
+    const body: Fragment = .{ .text = "x", .free_names = &free_names };
+
+    var fragment = try composeFragments(std.testing.allocator, value, body, 1);
+    defer fragment.deinit(std.testing.allocator);
+
+    try std.testing.expect(fragment.closed());
+    try std.testing.expectEqualStrings("let x = 1; in x", fragment.text);
+}
+
+test "daemon permission errors are not comparable harness results" {
+    try std.testing.expect(environmentCommandFailure("error: cannot connect to socket at '/nix/var/nix/daemon-socket/socket': Operation not permitted"));
+    try std.testing.expect(environmentCommandFailure(
+        \\error: path '/nix/store/example.drv' does not exist in the store
+        \\note: trace involved the following derivations:
+    ));
+    try std.testing.expect(!environmentCommandFailure("error: cannot coerce an integer to a string: 1"));
 }
 
 fn generateWorkerCase(
@@ -1061,7 +1120,8 @@ fn scopedBodyFragment(allocator: std.mem.Allocator, value: Fragment, body: Fragm
 }
 
 fn closedTemplate(depth: u8) Template {
-    return switch (depth) {
+    const tier = if (depth == 0) 0 else (depth - 1) % 5;
+    return switch (tier) {
         0 => .direct_add,
         1 => .let_scope,
         2 => .with_scope,
@@ -1235,9 +1295,17 @@ fn runCommand(
 
     return .{
         .ok = ok,
+        .comparable = ok or !environmentCommandFailure(result.stderr),
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
+}
+
+fn environmentCommandFailure(stderr: []const u8) bool {
+    if (std.mem.indexOf(u8, stderr, "/nix/var/nix/daemon-socket/socket") != null and
+        std.mem.indexOf(u8, stderr, "Operation not permitted") != null) return true;
+    return std.mem.indexOf(u8, stderr, "does not exist in the store") != null and
+        std.mem.indexOf(u8, stderr, "trace involved the following derivations") != null;
 }
 
 fn commandTimeout(seconds: u32) std.Io.Clock.Duration {
