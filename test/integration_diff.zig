@@ -102,18 +102,21 @@ const result_queue_min = 128;
 const QueueSnapshot = struct {
     job_depth: usize,
     job_capacity: usize,
+    worker_count: usize,
     unscheduled: usize,
     in_flight: usize,
 };
 
 const QueueStats = struct {
     job_capacity: usize,
+    worker_count: usize,
     jobs_put: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     jobs_taken: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    fn init(job_capacity: usize) QueueStats {
+    fn init(job_capacity: usize, worker_count: usize) QueueStats {
         return .{
             .job_capacity = job_capacity,
+            .worker_count = worker_count,
         };
     }
 
@@ -131,6 +134,7 @@ const QueueStats = struct {
         return .{
             .job_depth = saturatedSub(jobs_put, jobs_taken),
             .job_capacity = self.job_capacity,
+            .worker_count = self.worker_count,
             .unscheduled = saturatedSub(total, jobs_put),
             .in_flight = saturatedSub(jobs_taken, completed),
         };
@@ -484,10 +488,6 @@ pub fn main(init: std.process.Init) !void {
 
 const Job = struct {
     index: usize,
-    seed: u64,
-    iteration: usize,
-    expr: []u8,
-    skipped: bool = false,
 };
 
 const JobResult = struct {
@@ -544,9 +544,8 @@ const JobQueue = BlockingQueue(Job);
 const ResultQueue = BlockingQueue(JobResult);
 
 const ProducerContext = struct {
-    allocator: std.mem.Allocator,
     io: std.Io,
-    stream: *CaseStream,
+    total_jobs: usize,
     jobs: *JobQueue,
     stats: *QueueStats,
 };
@@ -555,6 +554,9 @@ const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
+    corpus: []const Fragment,
+    seed: u64,
+    min_depth: u8,
     jobs: *JobQueue,
     results: *ResultQueue,
     stats: *QueueStats,
@@ -580,13 +582,12 @@ fn runHarness(
     defer allocator.free(result_storage);
     var result_queue = ResultQueue.init(result_storage);
 
-    var queue_stats = QueueStats.init(job_queue_len);
+    var queue_stats = QueueStats.init(job_queue_len, worker_count);
     reporter.queue_stats = &queue_stats;
 
     var producer_context: ProducerContext = .{
-        .allocator = allocator,
         .io = io,
-        .stream = stream,
+        .total_jobs = total_jobs,
         .jobs = &job_queue,
         .stats = &queue_stats,
     };
@@ -596,6 +597,9 @@ fn runHarness(
         .allocator = allocator,
         .io = io,
         .config = config,
+        .corpus = stream.corpus,
+        .seed = stream.seed,
+        .min_depth = stream.min_depth,
         .jobs = &job_queue,
         .results = &result_queue,
         .stats = &queue_stats,
@@ -664,14 +668,10 @@ fn producerMain(context: *ProducerContext) void {
 }
 
 fn produceJobs(context: *ProducerContext) !void {
-    while (try context.stream.next()) |generated| {
-        errdefer generated.deinit(context.allocator);
+    var index: usize = 0;
+    while (index < context.total_jobs) : (index += 1) {
         try context.jobs.put(context.io, .{
-            .index = generated.index,
-            .seed = context.stream.seed,
-            .iteration = generated.index,
-            .expr = generated.expr,
-            .skipped = generated.skipped,
+            .index = index,
         });
         context.stats.jobPut();
     }
@@ -684,14 +684,18 @@ fn workerMain(context: *WorkerContext) void {
         } orelse return;
         context.stats.jobTaken();
 
+        const generated = generateWorkerCase(context.allocator, context.corpus, context.seed, job.index, context.min_depth) catch |err| {
+            std.debug.panic("integration-diff case generation failed: {s}", .{@errorName(err)});
+        };
+
         var result: JobResult = .{
             .index = job.index,
-            .seed = job.seed,
-            .iteration = job.iteration,
-            .expr = job.expr,
-            .skipped = job.skipped,
+            .seed = context.seed,
+            .iteration = job.index,
+            .expr = generated.expr,
+            .skipped = generated.skipped,
         };
-        if (job.skipped) {
+        if (generated.skipped) {
             context.results.put(context.io, result) catch |err| {
                 std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
             };
@@ -872,11 +876,14 @@ fn printDuration(seconds: u64) void {
 
 fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
     const low_water = @max(@as(usize, 1), snapshot.job_capacity / 16);
-    const state: enum { fed, thin, starved, draining, done } =
+    const workers_busy = snapshot.in_flight >= snapshot.worker_count;
+    const state: enum { fed, thin, saturated, starved, draining, done } =
         if (snapshot.job_depth == 0 and snapshot.unscheduled == 0 and snapshot.in_flight == 0)
             .done
         else if (snapshot.job_depth == 0 and snapshot.unscheduled == 0)
             .draining
+        else if (snapshot.job_depth == 0 and workers_busy)
+            .saturated
         else if (snapshot.job_depth == 0)
             .starved
         else if (snapshot.job_depth <= low_water)
@@ -887,19 +894,21 @@ fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
     const color = if (use_color) switch (state) {
         .fed => "\x1b[32m",
         .thin => "\x1b[33m",
+        .saturated => "\x1b[32m",
         .starved => "\x1b[31m",
         .draining => "\x1b[33m",
         .done => "\x1b[32m",
     } else "";
     const reset = if (use_color) "\x1b[0m" else "";
 
-    std.debug.print("{s}{s}{s} jobs {}/{} in-flight {} unscheduled {}", .{
+    std.debug.print("{s}{s}{s} jobs {}/{} workers {}/{} unscheduled {}", .{
         color,
         @tagName(state),
         reset,
         snapshot.job_depth,
         snapshot.job_capacity,
         snapshot.in_flight,
+        snapshot.worker_count,
         snapshot.unscheduled,
     });
 }
@@ -1074,6 +1083,24 @@ fn generateCase(
     const expr = try allocator.dupe(u8, fragment.text);
     fragment.deinit(allocator);
     return .{ .index = iteration, .expr = expr, .skipped = skipped };
+}
+
+fn generateWorkerCase(
+    allocator: std.mem.Allocator,
+    corpus: []const Fragment,
+    seed: u64,
+    iteration: usize,
+    min_depth: u8,
+) !GeneratedCase {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const generated = try generateCase(arena.allocator(), corpus, seed, iteration, min_depth);
+    return .{
+        .index = generated.index,
+        .expr = try allocator.dupe(u8, generated.expr),
+        .skipped = generated.skipped,
+    };
 }
 
 fn closedPairFragment(allocator: std.mem.Allocator, left: Fragment, right: Fragment, depth: u8) !Fragment {
