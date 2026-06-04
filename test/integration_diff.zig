@@ -15,6 +15,7 @@ const Config = struct {
     min_depth: u8 = 0,
     max_depth: u8 = 4,
     jobs: usize = 0,
+    command_timeout_seconds: u32 = 60,
     shrink: bool = false,
     dump_cases_path: ?[]const u8 = null,
     dump_skipped_path: ?[]const u8 = null,
@@ -101,6 +102,8 @@ const result_queue_min = 128;
 const QueueSnapshot = struct {
     job_depth: usize,
     job_capacity: usize,
+    unscheduled: usize,
+    in_flight: usize,
 };
 
 const QueueStats = struct {
@@ -122,12 +125,14 @@ const QueueStats = struct {
         _ = self.jobs_taken.fetchAdd(1, .monotonic);
     }
 
-    fn snapshot(self: *const QueueStats) QueueSnapshot {
+    fn snapshot(self: *const QueueStats, completed: usize, total: usize) QueueSnapshot {
         const jobs_put = self.jobs_put.load(.monotonic);
         const jobs_taken = self.jobs_taken.load(.monotonic);
         return .{
             .job_depth = saturatedSub(jobs_put, jobs_taken),
             .job_capacity = self.job_capacity,
+            .unscheduled = saturatedSub(total, jobs_put),
+            .in_flight = saturatedSub(jobs_taken, completed),
         };
     }
 };
@@ -143,6 +148,7 @@ const Reporter = struct {
     found_count: usize = 0,
     checked_count: usize = 0,
     skipped_count: usize = 0,
+    timeout_count: usize = 0,
 
     fn init(io: std.Io, env: *const std.process.Environ.Map) Reporter {
         const now = nowNs(io);
@@ -175,6 +181,7 @@ const Reporter = struct {
             },
         );
         if (config.shrink) std.debug.print(" --shrink", .{});
+        std.debug.print(" --command-timeout-seconds={}", .{config.command_timeout_seconds});
         if (config.dump_cases_path) |path| std.debug.print(" --dump-cases={s}", .{path});
         if (config.dump_skipped_path) |path| std.debug.print(" --dump-skipped={s}", .{path});
         std.debug.print(" # cases={}\n", .{total_jobs});
@@ -196,7 +203,7 @@ const Reporter = struct {
         const eta_s = etaSeconds(total - completed, rate);
         const percent_x10 = percentTenths(completed, total);
         const skip_permille = permille(self.skipped_count, completed);
-        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot() else null;
+        const queue_snapshot = if (self.queue_stats) |stats| stats.snapshot(completed, total) else null;
         const spinner = spinnerFrame(elapsed_ns);
 
         if (self.interactive) {
@@ -234,7 +241,7 @@ const Reporter = struct {
         printDuration(eta_s);
         std.debug.print("  elapsed ", .{});
         printDuration(elapsed_s);
-        std.debug.print("  skipped {}.{}% ({})  found {}\n", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.found_count });
+        std.debug.print("  skipped {}.{}% ({})  timed out {}  found {}\n", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
 
         std.debug.print("\x1b[2K  pipeline ", .{});
         if (queue_snapshot) |snapshot| {
@@ -264,7 +271,7 @@ const Reporter = struct {
         printDuration(eta_s);
         std.debug.print(" elapsed ", .{});
         printDuration(elapsed_s);
-        std.debug.print(" skipped {}.{}% ({}) found {}", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.found_count });
+        std.debug.print(" skipped {}.{}% ({}) timeout {} found {}", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
         if (queue_snapshot) |snapshot| {
             std.debug.print(" pipe ", .{});
             printPipelineText(snapshot, self.use_color);
@@ -299,6 +306,10 @@ const Reporter = struct {
 
     fn skipped(self: *Reporter) void {
         self.skipped_count += 1;
+    }
+
+    fn timedOut(self: *Reporter) void {
+        self.timeout_count += 1;
     }
 
     fn clearProgress(self: *Reporter) void {
@@ -349,8 +360,8 @@ const Reporter = struct {
             "";
         const reset = if (self.use_color) "\x1b[0m" else "";
         std.debug.print(
-            "{s}integration-diff: found={} checked={} skipped={} cases={}{s}\n",
-            .{ color, self.found_count, self.checked_count, self.skipped_count, total, reset },
+            "{s}integration-diff: found={} checked={} skipped={} timed_out={} cases={}{s}\n",
+            .{ color, self.found_count, self.checked_count, self.skipped_count, self.timeout_count, total, reset },
         );
     }
 
@@ -375,6 +386,7 @@ const Outcome = enum {
 const CommandResult = struct {
     ok: bool,
     comparable: bool = true,
+    timed_out: bool = false,
     stdout: []u8,
     stderr: []u8,
 
@@ -399,6 +411,10 @@ const Classification = struct {
             .skipped, .both_ok_same, .both_reject => false,
             .both_ok_different, .nix_accepts_fix_rejects, .fix_accepts_nix_rejects => true,
         };
+    }
+
+    fn timedOut(self: Classification) bool {
+        return self.nix.timed_out or self.fix.timed_out;
     }
 };
 
@@ -440,6 +456,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (config.min_depth > config.max_depth) {
         early_reporter.corpusError("--min-depth must be less than or equal to --max-depth", .{});
+        std.process.exit(1);
+    }
+    if (config.command_timeout_seconds == 0) {
+        early_reporter.corpusError("--command-timeout-seconds must be greater than zero", .{});
         std.process.exit(1);
     }
 
@@ -603,6 +623,7 @@ fn runHarness(
         } else if (mutable_result.classification) |*classification| {
             if (classification.outcome == .skipped) {
                 reporter.skipped();
+                if (classification.timedOut()) reporter.timedOut();
             } else {
                 reporter.checked();
             }
@@ -719,6 +740,8 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
             config.max_depth = try std.fmt.parseInt(u8, value, 10);
         } else if (try optionValue(&args, arg, "--jobs")) |value| {
             config.jobs = try std.fmt.parseInt(usize, value, 10);
+        } else if (try optionValue(&args, arg, "--command-timeout-seconds")) |value| {
+            config.command_timeout_seconds = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, arg, "--shrink")) {
             config.shrink = true;
         } else if (try optionValue(&args, arg, "--dump-cases")) |value| {
@@ -757,6 +780,8 @@ fn usage() void {
         \\  --min-depth N       minimum composition depth (default: 0)
         \\  --max-depth N       maximum composition depth (default: 4)
         \\  --jobs N            parallel evaluator jobs; 0 means CPU count
+        \\  --command-timeout-seconds N
+        \\                      max seconds for one evaluator command (default: 60)
         \\  --shrink            minimize each saved failing candidate
         \\  --dump-cases PATH   write generated checkable cases and exit
         \\  --dump-skipped PATH write generated skipped candidates and exit
@@ -847,26 +872,35 @@ fn printDuration(seconds: u64) void {
 
 fn printPipelineText(snapshot: QueueSnapshot, use_color: bool) void {
     const low_water = @max(@as(usize, 1), snapshot.job_capacity / 16);
-    const state: enum { fed, thin, starved } = if (snapshot.job_depth == 0)
-        .starved
-    else if (snapshot.job_depth <= low_water)
-        .thin
-    else
-        .fed;
+    const state: enum { fed, thin, starved, draining, done } =
+        if (snapshot.job_depth == 0 and snapshot.unscheduled == 0 and snapshot.in_flight == 0)
+            .done
+        else if (snapshot.job_depth == 0 and snapshot.unscheduled == 0)
+            .draining
+        else if (snapshot.job_depth == 0)
+            .starved
+        else if (snapshot.job_depth <= low_water)
+            .thin
+        else
+            .fed;
 
     const color = if (use_color) switch (state) {
         .fed => "\x1b[32m",
         .thin => "\x1b[33m",
         .starved => "\x1b[31m",
+        .draining => "\x1b[33m",
+        .done => "\x1b[32m",
     } else "";
     const reset = if (use_color) "\x1b[0m" else "";
 
-    std.debug.print("{s}{s}{s} jobs {}/{}", .{
+    std.debug.print("{s}{s}{s} jobs {}/{} in-flight {} unscheduled {}", .{
         color,
         @tagName(state),
         reset,
         snapshot.job_depth,
         snapshot.job_capacity,
+        snapshot.in_flight,
+        snapshot.unscheduled,
     });
 }
 
@@ -1223,10 +1257,10 @@ fn classify(
     const nix_expr = try std.mem.concat(allocator, u8, &.{ "(", expr, ")" });
     defer allocator.free(nix_expr);
 
-    const nix = try runCommand(allocator, io, &.{ config.nix_bin, "--eval", "--xml", "--expr", nix_expr });
+    const nix = try runCommand(allocator, io, config.command_timeout_seconds, &.{ config.nix_bin, "--eval", "--xml", "--expr", nix_expr });
     errdefer nix.deinit(allocator);
 
-    const fix = try runCommand(allocator, io, &.{ config.fix_bin, "--xml", "--expr", expr });
+    const fix = try runCommand(allocator, io, config.command_timeout_seconds, &.{ config.fix_bin, "--xml", "--expr", expr });
     errdefer fix.deinit(allocator);
 
     const outcome: Outcome = if (!nix.comparable or !fix.comparable)
@@ -1250,13 +1284,22 @@ fn classify(
 fn runCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
+    timeout_seconds: u32,
     argv: []const []const u8,
 ) !CommandResult {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
         .stdout_limit = .limited(command_stdout_limit),
         .stderr_limit = .limited(command_stderr_limit),
+        .timeout = .{ .duration = commandTimeout(timeout_seconds) },
     }) catch |err| switch (err) {
+        error.Timeout => return .{
+            .ok = false,
+            .comparable = false,
+            .timed_out = true,
+            .stdout = try allocator.dupe(u8, ""),
+            .stderr = try std.fmt.allocPrint(allocator, "command timed out after {}s", .{timeout_seconds}),
+        },
         error.StreamTooLong => return .{
             .ok = false,
             .comparable = false,
@@ -1275,6 +1318,13 @@ fn runCommand(
         .ok = ok,
         .stdout = result.stdout,
         .stderr = result.stderr,
+    };
+}
+
+fn commandTimeout(seconds: u32) std.Io.Clock.Duration {
+    return .{
+        .raw = std.Io.Duration.fromSeconds(@intCast(seconds)),
+        .clock = .awake,
     };
 }
 
