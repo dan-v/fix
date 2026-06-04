@@ -2349,11 +2349,12 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         for (owned_output_lists.items) |list| self.allocator.free(list);
         owned_output_lists.deinit(self.allocator);
     }
+    const drv_name_owned = try ownDerivationString(self, &owned_strings, drv_name);
 
     const outputs = try self.allocator.alloc(derivation.DrvOutput, output_names.names.len);
     errdefer self.allocator.free(outputs);
     for (output_names.names, outputs) |name, *output| {
-        output.* = .{ .name = self.intern.get(name) };
+        output.* = .{ .name = try ownDerivationString(self, &owned_strings, self.intern.get(name)) };
     }
 
     try applyFixedOutputAttrs(self, attrs_id, outputs, &owned_strings);
@@ -2361,22 +2362,23 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
     var inputs = DerivationInputs{};
     defer inputs.deinit(self.allocator);
 
-    const args = try derivationArgs(self, attrs_id, &inputs);
+    const args = try derivationArgs(self, attrs_id, &inputs, &owned_strings);
     errdefer self.allocator.free(args);
-    const system = try requiredDerivationString(self, attrs_id, "system", &inputs);
-    const builder = try requiredDerivationString(self, attrs_id, "builder", &inputs);
+    const system = try requiredDerivationString(self, attrs_id, "system", &inputs, &owned_strings);
+    const builder = try requiredDerivationString(self, attrs_id, "builder", &inputs, &owned_strings);
     const structured = try derivationStructuredAttrs(self, attrs_id);
 
     var env: std.ArrayListUnmanaged(derivation.EnvVar) = .empty;
     errdefer env.deinit(self.allocator);
     const original_attrs = try self.heap.getAttrs(attrs_id);
     if (structured) {
-        const json = try structuredAttrsJson(self, attrs_id, output_names.names, &inputs);
+        const json = try structuredAttrsJson(self, attrs_id, output_names.names, &inputs, &owned_strings);
         try owned_strings.append(self.allocator, json);
         try env.append(self.allocator, .{ .name = "__json", .value = json });
     } else {
         for (original_attrs) |entry| {
-            const attr_name = self.intern.get(entry.name);
+            const attr_name_text = self.intern.get(entry.name);
+            const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (isDerivationSyntheticAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
@@ -2387,7 +2389,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
                 }
                 continue;
             }
-            const text = try derivationAttrString(self, entry.value, &inputs);
+            const text = try derivationAttrString(self, entry.value, &inputs, &owned_strings);
             try env.append(self.allocator, .{ .name = attr_name, .value = text });
         }
     }
@@ -2404,7 +2406,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
 
     return .{
         .drv = .{
-            .name = drv_name,
+            .name = drv_name_owned,
             .outputs = outputs,
             .input_drvs = input_drvs,
             .input_srcs = input_srcs,
@@ -2444,15 +2446,19 @@ fn applyFixedOutputAttrs(
         errdefer self.allocator.free(text);
         try owned_strings.append(self.allocator, text);
         break :blk text;
-    } else if (std.mem.eql(u8, mode, "flat"))
-        algo
-    else
-        return error.InvalidHashMode;
+    } else if (std.mem.eql(u8, mode, "flat")) blk: {
+        break :blk try ownDerivationString(self, owned_strings, algo);
+    } else return error.InvalidHashMode;
     outputs[0].hash_algo = hash_algo;
     outputs[0].hash = hash_hex;
 }
 
-fn derivationArgs(self: anytype, attrs_id: ObjectId, inputs: *DerivationInputs) ![]const []const u8 {
+fn derivationArgs(
+    self: anytype,
+    attrs_id: ObjectId,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) ![]const []const u8 {
     const args_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("args")) catch |err| switch (err) {
         error.MissingAttribute => return self.allocator.alloc([]const u8, 0),
         else => return err,
@@ -2462,18 +2468,29 @@ fn derivationArgs(self: anytype, attrs_id: ObjectId, inputs: *DerivationInputs) 
     const items = try self.heap.getList(list.asObjectId());
     const args = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(args);
-    for (items, args) |item, *arg| arg.* = try derivationAttrString(self, item, inputs);
+    for (items, args) |item, *arg| arg.* = try derivationAttrString(self, item, inputs, owned_strings);
     return args;
 }
 
-fn requiredDerivationString(self: anytype, attrs_id: ObjectId, name: []const u8, inputs: *DerivationInputs) ![]const u8 {
-    return derivationAttrString(self, try self.heap.getAttrValue(attrs_id, try self.intern.intern(name)), inputs);
+fn requiredDerivationString(
+    self: anytype,
+    attrs_id: ObjectId,
+    name: []const u8,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    return derivationAttrString(self, try self.heap.getAttrValue(attrs_id, try self.intern.intern(name)), inputs, owned_strings);
 }
 
-fn derivationAttrString(self: anytype, value: Value, inputs: *DerivationInputs) ![]const u8 {
+fn derivationAttrString(
+    self: anytype,
+    value: Value,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
     const string_value = try coerceToStringValue(self, value);
-    try appendContextInputs(self, string_value, inputs);
-    return self.intern.get(try stringTextInternId(self, string_value));
+    try appendContextInputs(self, string_value, inputs, owned_strings);
+    return ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, string_value)));
 }
 
 fn joinedOutputNames(self: anytype, names: []const InternId) ![]u8 {
@@ -2486,7 +2503,20 @@ fn joinedOutputNames(self: anytype, names: []const InternId) ![]u8 {
     return out.toOwnedSlice(self.allocator);
 }
 
-fn structuredAttrsJson(self: anytype, attrs_id: ObjectId, outputs: []const InternId, inputs: *DerivationInputs) ![]u8 {
+fn ownDerivationString(self: anytype, owned_strings: *std.ArrayListUnmanaged([]u8), text: []const u8) ![]const u8 {
+    const owned = try self.allocator.dupe(u8, text);
+    errdefer self.allocator.free(owned);
+    try owned_strings.append(self.allocator, owned);
+    return owned;
+}
+
+fn structuredAttrsJson(
+    self: anytype,
+    attrs_id: ObjectId,
+    outputs: []const InternId,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
     var first = true;
@@ -2503,13 +2533,19 @@ fn structuredAttrsJson(self: anytype, attrs_id: ObjectId, outputs: []const Inter
         first = false;
         try appendJsonString(self, &out, name);
         try out.append(self.allocator, ':');
-        try appendStructuredJsonValue(self, &out, entry.value, inputs);
+        try appendStructuredJsonValue(self, &out, entry.value, inputs, owned_strings);
     }
     try out.append(self.allocator, '}');
     return out.toOwnedSlice(self.allocator);
 }
 
-fn appendStructuredJsonValue(self: anytype, out: *std.ArrayListUnmanaged(u8), value: Value, inputs: *DerivationInputs) !void {
+fn appendStructuredJsonValue(
+    self: anytype,
+    out: *std.ArrayListUnmanaged(u8),
+    value: Value,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) !void {
     const forced = try self.forceValue(value);
     switch (forced.discriminant) {
         .null => try out.appendSlice(self.allocator, "null"),
@@ -2519,14 +2555,14 @@ fn appendStructuredJsonValue(self: anytype, out: *std.ArrayListUnmanaged(u8), va
         .float => try appendJsonFmt(self, out, "{d}", .{forced.asFloat()}),
         .string, .path, .string_context => {
             const string_value = try coerceToStringValue(self, forced);
-            try appendContextInputs(self, string_value, inputs);
+            try appendContextInputs(self, string_value, inputs, owned_strings);
             try appendJsonString(self, out, self.intern.get(try stringTextInternId(self, string_value)));
         },
         .list => {
             try out.append(self.allocator, '[');
             for (try self.heap.getList(forced.asObjectId()), 0..) |item, index| {
                 if (index != 0) try out.append(self.allocator, ',');
-                try appendStructuredJsonValue(self, out, item, inputs);
+                try appendStructuredJsonValue(self, out, item, inputs, owned_strings);
             }
             try out.append(self.allocator, ']');
         },
@@ -2538,7 +2574,7 @@ fn appendStructuredJsonValue(self: anytype, out: *std.ArrayListUnmanaged(u8), va
                 if (index != 0) try out.append(self.allocator, ',');
                 try appendJsonString(self, out, self.intern.get(entry.name));
                 try out.append(self.allocator, ':');
-                try appendStructuredJsonValue(self, out, entry.value, inputs);
+                try appendStructuredJsonValue(self, out, entry.value, inputs, owned_strings);
             }
             try out.append(self.allocator, '}');
         },
@@ -2590,23 +2626,34 @@ const DerivationInputs = struct {
     }
 };
 
-fn appendContextInputs(self: anytype, value: Value, inputs: *DerivationInputs) !void {
+fn appendContextInputs(
+    self: anytype,
+    value: Value,
+    inputs: *DerivationInputs,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) !void {
     const text = self.intern.get(try stringTextInternId(self, value));
     for (try contextEntriesForValue(self, value)) |entry| {
         const path = self.intern.get(entry.name);
         if (std.mem.endsWith(u8, path, ".drv")) {
-            const outputs = try contextOutputs(self, path, entry.value);
+            const owned_path = try ownDerivationString(self, owned_strings, path);
+            const outputs = try contextOutputs(self, path, entry.value, owned_strings);
             errdefer self.allocator.free(outputs);
             try inputs.owned_output_lists.append(self.allocator, outputs);
-            try appendInputDrv(self, inputs, path, outputs);
-            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, path);
+            try appendInputDrv(self, inputs, owned_path, outputs);
+            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, owned_path);
         } else {
-            try appendInputSrc(self, inputs, path);
+            try appendInputSrc(self, inputs, try ownDerivationString(self, owned_strings, path));
         }
     }
 }
 
-fn contextOutputs(self: anytype, path: []const u8, value: Value) ![]const []const u8 {
+fn contextOutputs(
+    self: anytype,
+    path: []const u8,
+    value: Value,
+    owned_strings: *std.ArrayListUnmanaged([]u8),
+) ![]const []const u8 {
     const attrs = try self.forceValue(value);
     if (attrs.discriminant != .attrs) return error.TypeError;
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
@@ -2618,7 +2665,7 @@ fn contextOutputs(self: anytype, path: []const u8, value: Value) ![]const []cons
         for (items, outputs) |item, *output| {
             const item_value = try self.forceValue(item);
             if (!isPlainString(item_value)) return error.TypeError;
-            output.* = self.intern.get(try stringTextInternId(self, item_value));
+            output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
         }
         return outputs;
     } else |err| switch (err) {
@@ -2631,7 +2678,10 @@ fn contextOutputs(self: anytype, path: []const u8, value: Value) ![]const []cons
         if (all_outputs.asBool()) {
             const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
             const outputs = try self.allocator.alloc([]const u8, known.len);
-            @memcpy(outputs, known);
+            errdefer self.allocator.free(outputs);
+            for (known, outputs) |output, *dest| {
+                dest.* = try ownDerivationString(self, owned_strings, output);
+            }
             return outputs;
         }
     } else |err| switch (err) {
@@ -2639,7 +2689,7 @@ fn contextOutputs(self: anytype, path: []const u8, value: Value) ![]const []cons
         else => return err,
     }
     const fallback = try self.allocator.alloc([]const u8, 1);
-    fallback[0] = "out";
+    fallback[0] = try ownDerivationString(self, owned_strings, "out");
     return fallback;
 }
 

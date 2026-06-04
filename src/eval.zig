@@ -1989,6 +1989,21 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(exact_derivation_paths);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv\\\",\\\"/nix/store/8w6a3g1mvf8qkz788dysw8k4hmq91cc8-pkg\\\",\\\"/nix/store/n9r8k4kqcj2019llzmc59f5258a33dip-pkg.drv\\\",\\\"/nix/store/92ysms3lcbywv6148gql79ab6zkfwcin-pkg\\\",\\\"/nix/store/16898da86iz5v475hj6bcy0r0c36zxq8-pkg-dev\\\",\\\"/nix/store/rbh6cczsi8jvv5bvdwy39j5p4xmn8z34-pkg.drv\\\",\\\"/nix/store/nrakis94lbi82m0f5n8fbkx78l568y4l-pkg\\\",\\\"/nix/store/n2gl5gv2n8980c52hly1c5d95jxyjs3h-b.drv\\\",\\\"/nix/store/4bcpp52bhq3g1l44b927m0s8rnxzgwvl-b\\\",\\\"/nix/store/bmwfaizv61s5jq8ba6n3xzlz3c7znln4-pkg-structured.drv\\\",\\\"/nix/store/8gn7x4yg0pdiklpk9giczxlb4i4gjkk3-pkg-structured\\\",\\\"/nix/store/dy56prsjy94iy9dxqkjg57k0hi5wj3qq-b.drv\\\",\\\"/nix/store/1mxidf53h5j44ypw18jqq3gc2yzcag4c-b\\\"]\"", exact_derivation_paths);
 
+    const stable_context_inputs = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  churn = builtins.concatStringsSep "" (builtins.genList (n: "long-derivation-input-context-${builtins.toString n}") 4096);
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    args = [ dep.outPath churn dep.outPath ];
+        \\  };
+        \\in builtins.isString pkg.outPath
+    );
+    defer std.testing.allocator.free(stable_context_inputs);
+    try std.testing.expectEqualStrings("true", stable_context_inputs);
+
     const semantic_paths = try renderForTest(
         \\let
         \\  mk = value: builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; inherit value; };

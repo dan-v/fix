@@ -114,6 +114,7 @@ builtins.stringLength (builtins.derivation { name = "pkg"; system = "x86_64-linu
 (builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath == "/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv"
 (let a = builtins.derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; }; b = builtins.derivation { name = "b"; system = "x86_64-linux"; builder = "/bin/sh"; src = a; }; in b.outPath == "/nix/store/4bcpp52bhq3g1l44b927m0s8rnxzgwvl-b")
 (let a = builtins.derivation { name = "a"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; }; b = builtins.derivation { name = "b"; system = "x86_64-linux"; builder = "/bin/sh"; src = a.drvPath; }; in b.drvPath == "/nix/store/dy56prsjy94iy9dxqkjg57k0hi5wj3qq-b.drv")
+(let dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; }; churn = builtins.concatStringsSep "" (builtins.genList (n: "ctx-${builtins.toString n}") 64); pkg = builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; args = [ dep.outPath churn dep.outPath ]; }; in builtins.isString pkg.outPath)
 builtins.attrNames builtins.builtins
 rec { a = 1; ${"b"} = a + 1; }.b
 builtins.isString (builtins.path { path = ./test/fuzz-corpus/imported.nix; name = "imported"; })
