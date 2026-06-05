@@ -2443,10 +2443,17 @@ fn applyFixedOutputAttrs(
         else => return err,
     };
     if (outputs.len != 1) return error.InvalidDerivationOutput;
-    const mode_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashMode")));
     const hash_forced = try self.forceValue(hash_value);
-    if (!isPlainString(mode_value) or !isPlainString(hash_forced)) return error.TypeError;
-    const mode = self.intern.get(try stringTextInternId(self, mode_value));
+    if (!isPlainString(hash_forced)) return error.TypeError;
+    const mode = blk: {
+        const mode_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashMode")) catch |err| switch (err) {
+            error.MissingAttribute => break :blk "flat",
+            else => return err,
+        };
+        const forced = try self.forceValue(mode_value);
+        if (!isPlainString(forced)) return error.TypeError;
+        break :blk self.intern.get(try stringTextInternId(self, forced));
+    };
     const hash_text = self.intern.get(try stringTextInternId(self, hash_forced));
     const algo = try fixedOutputHashAlgorithm(self, attrs_id, hash_text);
     const hash_hex = try derivation.hashToBase16(self.allocator, algo, hash_text);

@@ -2509,6 +2509,20 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(fixed_empty_hash_algo_sri);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/srzzssay8777dg3ifm829wbfqvylx4i8-empty-algo-sri.drv\\\",\\\"/nix/store/gmy97hacw4bpawimq98pjrldf5qv0fhw-empty-algo-sri\\\"]\"", fixed_empty_hash_algo_sri);
 
+    const fixed_missing_hash_mode = try renderForTest(
+        \\let
+        \\  pkg = builtins.derivation {
+        \\    name = "missing-hash-mode";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        \\    outputHashAlgo = "sha256";
+        \\  };
+        \\in builtins.toJSON [ pkg.drvPath pkg.outPath ]
+    );
+    defer std.testing.allocator.free(fixed_missing_hash_mode);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/czbxqk95397lb4h8jjznyszi6xlni10y-missing-hash-mode.drv\\\",\\\"/nix/store/4kmqy9s0k8m72rpxf4hyybq94gd4wgjr-missing-hash-mode\\\"]\"", fixed_missing_hash_mode);
+
     const fixed_missing_hash_algo = try renderForTest(
         \\let
         \\  dep = builtins.derivation {
