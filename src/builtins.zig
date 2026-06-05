@@ -263,8 +263,25 @@ pub fn idForName(name: []const u8) ?BuiltinId {
 pub fn ambientIdForName(name: []const u8) ?BuiltinId {
     const id = idForName(name) orelse return null;
     return switch (id) {
-        .fetchurl => null,
-        else => id,
+        .abort,
+        .baseNameOf,
+        .derivation,
+        .dirOf,
+        .fetchGit,
+        .fetchMercurial,
+        .fetchTarball,
+        .fetchTree,
+        .fromTOML,
+        .import,
+        .isNull,
+        .map,
+        .placeholder,
+        .removeAttrs,
+        .scopedImport,
+        .throw,
+        .toString,
+        => id,
+        else => null,
     };
 }
 

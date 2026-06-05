@@ -194,6 +194,17 @@ test "end-to-end: ambient builtins" {
     const fetchurl_shadowed = try ev.evaluate("with { fetchurl = \"pkg\"; }; fetchurl");
     try std.testing.expectEqualStrings("pkg", ev.intern.get(fetchurl_shadowed.asInternId()));
 
+    try std.testing.expectError(error.UndefinedVariable, ev.evaluate("all"));
+    try std.testing.expectError(error.UndefinedVariable, ev.evaluate("elem"));
+
+    const all_from_with = try ev.evaluate("with { all = [ 1 ]; }; builtins.typeOf all");
+    try std.testing.expectEqualStrings("list", ev.intern.get(all_from_with.asInternId()));
+
+    const inner_with_shadows_outer_with = try ev.evaluate(
+        "let outer = { all = x: x; platforms = { all = [ 1 ]; }; }; in with outer; with platforms; builtins.typeOf all",
+    );
+    try std.testing.expectEqualStrings("list", ev.intern.get(inner_with_shadows_outer_with.asInternId()));
+
     const version = try ev.evaluate("nixVersion");
     try std.testing.expectEqual(value.ValueType.string, version.discriminant);
 
