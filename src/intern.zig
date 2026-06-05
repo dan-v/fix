@@ -10,6 +10,19 @@ const Entry = struct {
     offset: u32,
 };
 
+test "intern accepts slices borrowed from intern storage" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const path_id = try table.intern("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source/file.txt");
+    table.data.shrinkAndFree(std.testing.allocator, table.data.items.len);
+
+    const path = table.get(path_id);
+    const base = path[path.len - "file.txt".len ..];
+    const base_id = try table.intern(base);
+    try std.testing.expectEqualStrings("file.txt", table.get(base_id));
+}
+
 pub const InternTable = struct {
     allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex,
@@ -67,8 +80,15 @@ pub const InternTable = struct {
             }
         }
 
+        const source_offset = self.dataOffset(s);
+        try self.data.ensureUnusedCapacity(self.allocator, s.len);
+
+        const source = if (source_offset) |offset|
+            self.data.items[offset..][0..s.len]
+        else
+            s;
         const offset: u32 = @intCast(self.data.items.len);
-        try self.data.appendSlice(self.allocator, s);
+        self.data.appendSliceAssumeCapacity(source);
 
         const id: InternId = @intCast(self.entries.items.len);
         try self.entries.append(self.allocator, .{
@@ -85,6 +105,17 @@ pub const InternTable = struct {
         if (id == 0 or id >= self.entries.items.len) return "";
         const entry = self.entries.items[id];
         return self.data.items[entry.offset..][0..entry.len];
+    }
+
+    fn dataOffset(self: *const InternTable, s: []const u8) ?usize {
+        if (s.len == 0 or self.data.items.len == 0) return null;
+
+        const data_start = @intFromPtr(self.data.items.ptr);
+        const data_end = data_start + self.data.items.len;
+        const slice_start = @intFromPtr(s.ptr);
+        const slice_end = slice_start + s.len;
+        if (slice_start < data_start or slice_end > data_end) return null;
+        return slice_start - data_start;
     }
 
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {
