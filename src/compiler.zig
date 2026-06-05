@@ -70,6 +70,8 @@ pub const Compiler = struct {
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    line_index: diagnostic.LineIndex,
+    line_index_ready: bool,
     parent: ?*Compiler,
     skip_local_slot: ?u16,
     scope_depth: u8,
@@ -95,6 +97,8 @@ pub const Compiler = struct {
             .captures = .empty,
             .with_scopes = .empty,
             .diagnostics = .empty,
+            .line_index = .empty,
+            .line_index_ready = false,
             .parent = null,
             .skip_local_slot = null,
             .scope_depth = 0,
@@ -107,6 +111,9 @@ pub const Compiler = struct {
         self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
+        if (self.parent == null and self.line_index_ready) {
+            self.line_index.deinit(self.allocator);
+        }
     }
 
     pub fn compile(self: *Compiler, node: *const Node) !void {
@@ -177,12 +184,13 @@ pub const Compiler = struct {
 
     fn sourceSpanForNode(self: *Compiler, node: *const Node) !?chunk.Chunk.SourceSpan {
         const span = nodeSourceSpan(node) orelse return null;
+        const position = try self.sourcePositionForOffset(span.offset);
         return .{
             .file = try self.optionalSourceFileId(),
             .offset = span.offset,
             .len = span.len,
-            .line = diagnostic.lineForOffset(self.source, span.offset),
-            .column = diagnostic.columnForOffset(self.source, span.offset),
+            .line = position.line,
+            .column = position.column,
         };
     }
 
@@ -776,11 +784,12 @@ pub const Compiler = struct {
     }
 
     fn reportDiagnostic(self: *Compiler, severity: Diagnostic.Severity, offset: u32, len: u32, message: []const u8) !void {
+        const position = try self.sourcePositionForOffset(offset);
         try self.diagnostics.append(self.allocator, .{
             .severity = severity,
             .kind = .compile,
-            .line = diagnostic.lineForOffset(self.source, offset),
-            .column = diagnostic.columnForOffset(self.source, offset),
+            .line = position.line,
+            .column = position.column,
             .offset = offset,
             .len = len,
             .token_type = null,
@@ -1290,12 +1299,13 @@ pub const Compiler = struct {
         atom: Node.Atom,
     ) !void {
         _ = self.source_path orelse return;
+        const position = try self.sourcePositionForOffset(atom.offset);
         try positions.append(self.allocator, .{
             .name = try self.intern.intern(self.attrSegmentSpan(atom)),
             .pos = .{
                 .file = try self.sourceFileId(),
-                .line = diagnostic.lineForOffset(self.source, atom.offset),
-                .column = diagnostic.columnForOffset(self.source, atom.offset),
+                .line = position.line,
+                .column = position.column,
             },
         });
     }
@@ -1599,6 +1609,20 @@ pub const Compiler = struct {
             .index = capture_index,
         });
         return @intCast(self.captures.items.len - 1);
+    }
+
+    fn sourcePositionForOffset(self: *Compiler, offset: u32) !diagnostic.SourcePosition {
+        const index = try self.ensureLineIndex();
+        return index.positionForOffset(offset);
+    }
+
+    fn ensureLineIndex(self: *Compiler) !*const diagnostic.LineIndex {
+        if (self.parent) |parent| return parent.ensureLineIndex();
+        if (!self.line_index_ready) {
+            self.line_index = try diagnostic.LineIndex.init(self.allocator, self.source);
+            self.line_index_ready = true;
+        }
+        return &self.line_index;
     }
 };
 

@@ -22,6 +22,70 @@ pub const LineSpan = struct {
     end: usize,
 };
 
+pub const SourcePosition = struct {
+    line: u32,
+    column: u32,
+};
+
+pub const LineIndex = struct {
+    source_len: usize = 0,
+    line_starts: []const u32 = &.{},
+
+    pub const empty: LineIndex = .{};
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !LineIndex {
+        var line_starts = try std.ArrayListUnmanaged(u32).initCapacity(
+            allocator,
+            std.mem.count(u8, source, "\n") + 1,
+        );
+        errdefer line_starts.deinit(allocator);
+
+        line_starts.appendAssumeCapacity(0);
+        for (source, 0..) |byte, i| {
+            if (byte == '\n') {
+                try line_starts.append(allocator, @intCast(i + 1));
+            }
+        }
+
+        return .{
+            .source_len = source.len,
+            .line_starts = try line_starts.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn deinit(self: *LineIndex, allocator: std.mem.Allocator) void {
+        allocator.free(self.line_starts);
+        self.* = .empty;
+    }
+
+    pub fn positionForOffset(self: *const LineIndex, offset: u32) SourcePosition {
+        std.debug.assert(self.line_starts.len > 0);
+
+        const target = @min(@as(usize, @intCast(offset)), self.source_len);
+        const line_index = self.lineIndexForTarget(target);
+        const line_start: usize = @intCast(self.line_starts[line_index]);
+        return .{
+            .line = @intCast(line_index + 1),
+            .column = @intCast(target - line_start + 1),
+        };
+    }
+
+    fn lineIndexForTarget(self: *const LineIndex, target: usize) usize {
+        var low: usize = 0;
+        var high: usize = self.line_starts.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const line_start: usize = @intCast(self.line_starts[mid]);
+            if (line_start <= target) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return low - 1;
+    }
+};
+
 pub const RenderOptions = struct {
     color: bool = false,
 };
@@ -168,4 +232,17 @@ fn style(writer: *std.Io.Writer, options: RenderOptions, which: Style) !void {
 
 fn reset(writer: *std.Io.Writer, options: RenderOptions) !void {
     if (options.color) try writer.writeAll("\x1b[0m");
+}
+
+test "line index matches offset helpers" {
+    const source = "first\nsecond\n\nfourth";
+    var index = try LineIndex.init(std.testing.allocator, source);
+    defer index.deinit(std.testing.allocator);
+
+    const offsets = [_]u32{ 0, 4, 5, 6, 12, 13, 14, 20, 100 };
+    for (offsets) |offset| {
+        const position = index.positionForOffset(offset);
+        try std.testing.expectEqual(lineForOffset(source, offset), position.line);
+        try std.testing.expectEqual(columnForOffset(source, offset), position.column);
+    }
 }
