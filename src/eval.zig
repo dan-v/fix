@@ -2209,6 +2209,28 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(exact_derivation_paths);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv\\\",\\\"/nix/store/8w6a3g1mvf8qkz788dysw8k4hmq91cc8-pkg\\\",\\\"/nix/store/n9r8k4kqcj2019llzmc59f5258a33dip-pkg.drv\\\",\\\"/nix/store/92ysms3lcbywv6148gql79ab6zkfwcin-pkg\\\",\\\"/nix/store/16898da86iz5v475hj6bcy0r0c36zxq8-pkg-dev\\\",\\\"/nix/store/rbh6cczsi8jvv5bvdwy39j5p4xmn8z34-pkg.drv\\\",\\\"/nix/store/nrakis94lbi82m0f5n8fbkx78l568y4l-pkg\\\",\\\"/nix/store/n2gl5gv2n8980c52hly1c5d95jxyjs3h-b.drv\\\",\\\"/nix/store/4bcpp52bhq3g1l44b927m0s8rnxzgwvl-b\\\",\\\"/nix/store/bmwfaizv61s5jq8ba6n3xzlz3c7znln4-pkg-structured.drv\\\",\\\"/nix/store/8gn7x4yg0pdiklpk9giczxlb4i4gjkk3-pkg-structured\\\",\\\"/nix/store/dy56prsjy94iy9dxqkjg57k0hi5wj3qq-b.drv\\\",\\\"/nix/store/1mxidf53h5j44ypw18jqq3gc2yzcag4c-b\\\"]\"", exact_derivation_paths);
 
+    const derivation_synthetic_env_attrs = try renderForTest(
+        \\let
+        \\  base = {
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    type = "user-type";
+        \\    outputName = "user-outputName";
+        \\    outPath = "user-outPath";
+        \\    drvPath = "user-drvPath";
+        \\    drvAttrs = "user-drvAttrs";
+        \\    all = "user-all";
+        \\  };
+        \\  unstructured = builtins.derivation ({ name = "synthetic-env"; } // base);
+        \\  structured = builtins.derivation ({ name = "structured-type-env"; __structuredAttrs = true; } // base);
+        \\in builtins.toJSON [
+        \\  unstructured.drvPath unstructured.outPath unstructured.type unstructured.drvAttrs.type unstructured.drvAttrs.drvPath
+        \\  structured.drvPath structured.outPath structured.type structured.drvAttrs.type structured.drvAttrs.drvPath
+        \\]
+    );
+    defer std.testing.allocator.free(derivation_synthetic_env_attrs);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/7cg97kw06gcw1jj53vqvimpf0scg6z6k-synthetic-env.drv\\\",\\\"/nix/store/ab1lp4jhwyzl8153x5kl88vqjxpsjj6w-synthetic-env\\\",\\\"derivation\\\",\\\"user-type\\\",\\\"user-drvPath\\\",\\\"/nix/store/izgykj0r86cpacqq7mvzpqpp7bgckmqf-structured-type-env.drv\\\",\\\"/nix/store/6s8glb8gq36fkjn9kasrw24bz7ryix20-structured-type-env\\\",\\\"derivation\\\",\\\"user-type\\\",\\\"user-drvPath\\\"]\"", derivation_synthetic_env_attrs);
+
     const fixed_null_hash_algo = try renderForTest(
         \\let
         \\  flat = builtins.derivation {

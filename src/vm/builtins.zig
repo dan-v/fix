@@ -2335,7 +2335,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
             if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
-            if (isDerivationSyntheticAttr(self, attr_name, output_names.names)) continue;
+            if (isDerivationOutputAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
                 if (output_names.explicit) {
                     const joined = try joinedOutputNames(self, output_names.names);
@@ -2507,7 +2507,7 @@ fn structuredAttrsJson(
         if (std.mem.eql(u8, name, "__ignoreNulls")) continue;
         if (std.mem.eql(u8, name, "args")) continue;
         if (std.mem.eql(u8, name, "outputs") and !explicit_outputs) continue;
-        if (isDerivationSyntheticAttr(self, name, outputs)) continue;
+        if (isDerivationOutputAttr(self, name, outputs)) continue;
         if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
         if (!first) try out.append(self.allocator, ',');
         first = false;
@@ -2611,6 +2611,10 @@ fn isDerivationSyntheticAttr(self: anytype, attr_name: []const u8, outputs: []co
     for (synthetic) |candidate| {
         if (std.mem.eql(u8, attr_name, candidate)) return true;
     }
+    return isDerivationOutputAttr(self, attr_name, outputs);
+}
+
+fn isDerivationOutputAttr(self: anytype, attr_name: []const u8, outputs: []const InternId) bool {
     for (outputs) |output| {
         if (std.mem.eql(u8, attr_name, self.intern.get(output))) return true;
     }
