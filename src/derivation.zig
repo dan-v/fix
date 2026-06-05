@@ -379,7 +379,7 @@ pub const Drv = struct {
                 .drv => |hash| {
                     const outputs = try allocator.dupe([]const u8, input.outputs);
                     errdefer allocator.free(outputs);
-                    try inputs.append(allocator, .{ .path = hash, .outputs = outputs });
+                    try appendMergedInput(allocator, &inputs, hash, outputs);
                 },
                 .outputs => |output_hashes| {
                     for (input.outputs) |output_name| {
@@ -387,7 +387,7 @@ pub const Drv = struct {
                         const outputs = try allocator.alloc([]const u8, 1);
                         errdefer allocator.free(outputs);
                         outputs[0] = "out";
-                        try inputs.append(allocator, .{ .path = hash, .outputs = outputs });
+                        try appendMergedInput(allocator, &inputs, hash, outputs);
                     }
                 },
             }
@@ -982,6 +982,42 @@ fn outputHashByName(outputs: []const OutputHash, name: []const u8) ?[]const u8 {
 fn freeHashModuloInputs(allocator: std.mem.Allocator, inputs: []const DrvInput) void {
     for (inputs) |input| allocator.free(input.outputs);
     allocator.free(inputs);
+}
+
+fn appendMergedInput(
+    allocator: std.mem.Allocator,
+    inputs: *std.ArrayListUnmanaged(DrvInput),
+    path: []const u8,
+    outputs: []const []const u8,
+) !void {
+    errdefer allocator.free(outputs);
+
+    for (inputs.items) |*existing| {
+        if (!std.mem.eql(u8, existing.path, path)) continue;
+
+        var merged = existing.outputs;
+        for (outputs) |output| {
+            if (containsString(merged, output)) continue;
+
+            const expanded = try allocator.alloc([]const u8, merged.len + 1);
+            @memcpy(expanded[0..merged.len], merged);
+            expanded[merged.len] = output;
+            allocator.free(merged);
+            existing.outputs = expanded;
+            merged = expanded;
+        }
+        allocator.free(outputs);
+        return;
+    }
+
+    try inputs.append(allocator, .{ .path = path, .outputs = outputs });
+}
+
+fn containsString(strings: []const []const u8, needle: []const u8) bool {
+    for (strings) |string| {
+        if (std.mem.eql(u8, string, needle)) return true;
+    }
+    return false;
 }
 
 fn isHex(text: []const u8) bool {

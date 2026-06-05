@@ -2393,6 +2393,32 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(exact_derivation_paths);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv\\\",\\\"/nix/store/8w6a3g1mvf8qkz788dysw8k4hmq91cc8-pkg\\\",\\\"/nix/store/n9r8k4kqcj2019llzmc59f5258a33dip-pkg.drv\\\",\\\"/nix/store/92ysms3lcbywv6148gql79ab6zkfwcin-pkg\\\",\\\"/nix/store/16898da86iz5v475hj6bcy0r0c36zxq8-pkg-dev\\\",\\\"/nix/store/rbh6cczsi8jvv5bvdwy39j5p4xmn8z34-pkg.drv\\\",\\\"/nix/store/nrakis94lbi82m0f5n8fbkx78l568y4l-pkg\\\",\\\"/nix/store/n2gl5gv2n8980c52hly1c5d95jxyjs3h-b.drv\\\",\\\"/nix/store/4bcpp52bhq3g1l44b927m0s8rnxzgwvl-b\\\",\\\"/nix/store/bmwfaizv61s5jq8ba6n3xzlz3c7znln4-pkg-structured.drv\\\",\\\"/nix/store/8gn7x4yg0pdiklpk9giczxlb4i4gjkk3-pkg-structured\\\",\\\"/nix/store/dy56prsjy94iy9dxqkjg57k0hi5wj3qq-b.drv\\\",\\\"/nix/store/1mxidf53h5j44ypw18jqq3gc2yzcag4c-b\\\"]\"", exact_derivation_paths);
 
+    const duplicate_fixed_inputs = try renderForTest(
+        \\let
+        \\  dep = url: builtins.derivation {
+        \\    name = "same-dep";
+        \\    system = "builtin";
+        \\    builder = "builtin:fetchurl";
+        \\    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        \\    outputHashAlgo = null;
+        \\    outputHashMode = "flat";
+        \\    inherit url;
+        \\    urls = [ url ];
+        \\  };
+        \\  a = dep "https://example.com/a";
+        \\  b = dep "https://example.com/b";
+        \\  parent = builtins.derivation {
+        \\    name = "duplicate-fixed-inputs";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    args = [ "-c" "true" ];
+        \\    inherit a b;
+        \\  };
+        \\in builtins.toJSON [ a.drvPath b.drvPath a.outPath b.outPath parent.drvPath parent.outPath ]
+    );
+    defer std.testing.allocator.free(duplicate_fixed_inputs);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/6qx84nkmqbsgj08x7w3r04jz5703fi7j-same-dep.drv\\\",\\\"/nix/store/06bch28pzp0aw8yg8qp1imzl8158nhp8-same-dep.drv\\\",\\\"/nix/store/rf5miwzgfd7wj1flkm28zrv1isxmqk1s-same-dep\\\",\\\"/nix/store/rf5miwzgfd7wj1flkm28zrv1isxmqk1s-same-dep\\\",\\\"/nix/store/cz51cfz99k3r5rxnl41vczi9axgnrb1h-duplicate-fixed-inputs.drv\\\",\\\"/nix/store/x4ysk6ka96pi60rh59ny7i4lw3wfd16c-duplicate-fixed-inputs\\\"]\"", duplicate_fixed_inputs);
+
     const derivation_synthetic_env_attrs = try renderForTest(
         \\let
         \\  base = {
