@@ -1233,7 +1233,13 @@ pub const VM = struct {
 
     fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
         const right_like = try self.stringLikeValue(right);
-        const text_id = try self.concatInternedString(left.asInternId(), try self.stringTextInternId(right_like));
+        const raw_text_id = try self.concatInternedString(left.asInternId(), try self.stringTextInternId(right_like));
+        const raw_text = self.intern.get(raw_text_id);
+        const text_id = if (std.fs.path.isAbsolute(raw_text)) text_id: {
+            const normalized = try std.fs.path.resolve(self.allocator, &.{raw_text});
+            defer self.allocator.free(normalized);
+            break :text_id try self.intern.intern(normalized);
+        } else raw_text_id;
 
         var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
         defer context.deinit(self.allocator);

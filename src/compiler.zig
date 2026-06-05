@@ -72,6 +72,7 @@ const AttrEntryGroups = struct {
     fn deinit(self: *AttrEntryGroups, allocator: std.mem.Allocator) void {
         allocator.free(self.leaves);
         allocator.free(self.tails);
+        for (self.groups) |group| allocator.free(group.name);
         allocator.free(self.groups);
         self.* = .{};
     }
@@ -448,7 +449,10 @@ pub const Compiler = struct {
 
     fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
         if (std.fs.path.isAbsolute(span)) {
-            return .{ .text = span, .owned = false };
+            return .{
+                .text = try std.fs.path.resolve(self.allocator, &.{span}),
+                .owned = true,
+            };
         }
         const cwd = self.base_path orelse return .{ .text = span, .owned = false };
 
@@ -1487,28 +1491,39 @@ pub const Compiler = struct {
     }
 
     fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGroups {
-        var group_index: std.StringHashMapUnmanaged(usize) = .empty;
+        var group_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
         defer group_index.deinit(self.allocator);
 
         var groups_list: std.ArrayListUnmanaged(AttrEntryGroup) = .empty;
-        errdefer groups_list.deinit(self.allocator);
+        var groups_list_owned = true;
+        errdefer if (groups_list_owned) {
+            for (groups_list.items) |group| self.allocator.free(group.name);
+            groups_list.deinit(self.allocator);
+        };
 
         var total_leaves: usize = 0;
         var total_tails: usize = 0;
         for (entries) |entry| {
             if (entry.path.len == 0) return error.InvalidAttributePath;
 
-            const name = self.attrSegmentSpan(entry.path[0]);
-            const index = group_index.get(name) orelse blk: {
+            var name: ?[]u8 = try self.attrSegmentNameAlloc(entry.path[0]);
+            errdefer if (name) |owned| self.allocator.free(owned);
+            const name_id = try self.intern.intern(name.?);
+            const index = group_index.get(name_id) orelse blk: {
                 const new_index = groups_list.items.len;
+                try group_index.put(self.allocator, name_id, new_index);
                 try groups_list.append(self.allocator, .{
                     .first = entry.path[0],
-                    .name = name,
-                    .name_id = try self.intern.intern(name),
+                    .name = name.?,
+                    .name_id = name_id,
                 });
-                try group_index.put(self.allocator, name, new_index);
+                name = null;
                 break :blk new_index;
             };
+            if (name) |owned| {
+                self.allocator.free(owned);
+                name = null;
+            }
 
             const group = &groups_list.items[index];
             if (entry.path.len == 1) {
@@ -1527,7 +1542,11 @@ pub const Compiler = struct {
         }
 
         var groups = try groups_list.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(groups);
+        groups_list_owned = false;
+        errdefer {
+            for (groups) |group| self.allocator.free(group.name);
+            self.allocator.free(groups);
+        }
 
         const leaves = try self.allocator.alloc(AttrEntryView, total_leaves);
         errdefer self.allocator.free(leaves);
@@ -1551,7 +1570,8 @@ pub const Compiler = struct {
         }
 
         for (entries) |entry| {
-            const index = group_index.get(self.attrSegmentSpan(entry.path[0])).?;
+            const name_id = try self.attrSegmentNameId(entry.path[0]);
+            const index = group_index.get(name_id).?;
             const group = &groups[index];
             if (entry.path.len == 1) {
                 group.leaves[group.leaf_count] = entry;
@@ -1618,8 +1638,7 @@ pub const Compiler = struct {
                 try self.compileStringAtom(seg);
                 try self.emitOp(.get_attr_dynamic);
             } else {
-                const name_span = self.attrSegmentSpan(seg);
-                const name_id = try self.intern.intern(name_span);
+                const name_id = try self.attrSegmentNameId(seg);
                 try self.emitInternOp(.get_attr, .get_attr_long, name_id);
             }
         }
@@ -1643,14 +1662,12 @@ pub const Compiler = struct {
                 try self.compileThunk(attr_or.default);
                 var wide = false;
                 for (root_path.segments) |seg| {
-                    const name_span = self.attrSegmentSpan(seg);
-                    if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+                    if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
                 }
                 try self.emitOp(if (wide) .get_attr_path_dynamic_or_long else .get_attr_path_dynamic_or);
                 try self.builder.writeByte(self.allocator, @intCast(root_path.segments.len));
                 for (root_path.segments) |seg| {
-                    const name_span = self.attrSegmentSpan(seg);
-                    const name_id = try self.intern.intern(name_span);
+                    const name_id = try self.attrSegmentNameId(seg);
                     try self.writeInternId(name_id, wide);
                 }
                 return;
@@ -1681,7 +1698,7 @@ pub const Compiler = struct {
                     try self.builder.writeByte(self.allocator, 1);
                 } else {
                     try self.builder.writeByte(self.allocator, 0);
-                    try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(seg)));
+                    try self.builder.writeU32(self.allocator, try self.attrSegmentNameId(seg));
                 }
             }
             return;
@@ -1691,14 +1708,12 @@ pub const Compiler = struct {
         try self.compileThunk(attr_or.default);
         var wide = false;
         for (apath.segments) |seg| {
-            const name_span = self.attrSegmentSpan(seg);
-            if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+            if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
         }
         try self.emitOp(if (wide) .get_attr_path_or_long else .get_attr_path_or);
         try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
         for (apath.segments) |seg| {
-            const name_span = self.attrSegmentSpan(seg);
-            const name_id = try self.intern.intern(name_span);
+            const name_id = try self.attrSegmentNameId(seg);
             try self.writeInternId(name_id, wide);
         }
     }
@@ -1729,7 +1744,7 @@ pub const Compiler = struct {
                     try self.builder.writeByte(self.allocator, 1);
                 } else {
                     try self.builder.writeByte(self.allocator, 0);
-                    try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(seg)));
+                    try self.builder.writeU32(self.allocator, try self.attrSegmentNameId(seg));
                 }
             }
             return;
@@ -1737,14 +1752,12 @@ pub const Compiler = struct {
 
         var wide = false;
         for (has_attr.segments) |seg| {
-            const name_span = self.attrSegmentSpan(seg);
-            if (try self.intern.intern(name_span) > std.math.maxInt(u16)) wide = true;
+            if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
         }
         try self.emitOp(if (wide) .has_attr_path_long else .has_attr_path);
         try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
         for (has_attr.segments) |seg| {
-            const name_span = self.attrSegmentSpan(seg);
-            const name_id = try self.intern.intern(name_span);
+            const name_id = try self.attrSegmentNameId(seg);
             try self.writeInternId(name_id, wide);
         }
     }
@@ -1785,7 +1798,7 @@ pub const Compiler = struct {
                         try self.builder.writeByte(self.allocator, 1);
                     } else {
                         try self.builder.writeByte(self.allocator, 0);
-                        try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(atom)));
+                        try self.builder.writeU32(self.allocator, try self.attrSegmentNameId(atom));
                     }
                 },
                 .dynamic => try self.builder.writeByte(self.allocator, 1),
@@ -1926,9 +1939,40 @@ pub const Compiler = struct {
         return span;
     }
 
+    fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
+        const name = try self.attrSegmentNameAlloc(atom);
+        defer self.allocator.free(name);
+        return self.intern.intern(name);
+    }
+
+    fn attrSegmentNameAlloc(self: *Compiler, atom: Node.Atom) ![]u8 {
+        const span = self.source[atom.offset .. atom.offset + atom.len];
+        if (string_syntax.kindAt(self.source, atom.offset) == null) {
+            return self.allocator.dupe(u8, span);
+        }
+
+        const parsed = try string_syntax.parseLiteral(self.allocator, self.source, .{
+            .start = atom.offset,
+            .end = atom.offset + atom.len,
+        });
+        defer parsed.deinit();
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        for (parsed.parts) |part| {
+            switch (part) {
+                .text => |text| try out.appendSlice(self.allocator, text.bytes),
+                .interpolation => return error.InvalidAttributePath,
+            }
+        }
+
+        return out.toOwnedSlice(self.allocator);
+    }
+
     fn attrSegmentHasInterpolation(self: *const Compiler, atom: Node.Atom) bool {
         const span = self.source[atom.offset .. atom.offset + atom.len];
-        return span.len >= 2 and span[0] == '"' and std.mem.indexOf(u8, span, "${") != null;
+        return string_syntax.kindAt(self.source, atom.offset) != null and std.mem.indexOf(u8, span, "${") != null;
     }
 
     // ---- scope management ----

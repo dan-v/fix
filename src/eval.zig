@@ -950,6 +950,10 @@ test "evaluate checks attribute paths without forcing final value" {
     const missing = try renderForTest("({ a = {}; } ? a.b)");
     defer std.testing.allocator.free(missing);
     try std.testing.expectEqualStrings("false", missing);
+
+    const escaped_names = try renderForTest("builtins.toJSON [ (builtins.hasAttr \"\\n\" { \"\\n\" = 1; }) (builtins.getAttr \"\\\\\" { \"\\\\\" = 2; }) ({ \"\\r\" = 3; }.\"\\r\") ]");
+    defer std.testing.allocator.free(escaped_names);
+    try std.testing.expectEqualStrings("\"[true,2,3]\"", escaped_names);
 }
 
 test "evaluate simple attrset function parameters" {
@@ -1199,6 +1203,10 @@ test "evaluate primitive path and metadata builtins" {
     const path_dir = try renderForTest("builtins.dirOf /foo/bar");
     defer std.testing.allocator.free(path_dir);
     try std.testing.expectEqualStrings("/foo", path_dir);
+
+    const normalized_paths = try renderForTest("builtins.toJSON [ (toString /.) (toString /foo/../bar) (toString (/. + \"/foo\")) (toString (/foo + \"/../bar\")) ]");
+    defer std.testing.allocator.free(normalized_paths);
+    try std.testing.expectEqualStrings("\"[\\\"/\\\",\\\"/bar\\\",\\\"/foo\\\",\\\"/bar\\\"]\"", normalized_paths);
 
     const true_value = try renderForTest("builtins.true");
     defer std.testing.allocator.free(true_value);
@@ -2221,6 +2229,10 @@ test "evaluate regex builtins" {
     const unmatched = try renderForTest("builtins.match \"[[:digit:]]+\" \"abc\"");
     defer std.testing.allocator.free(unmatched);
     try std.testing.expectEqualStrings("null", unmatched);
+
+    const interval = try renderForTest("builtins.match \"^$|^[[:alnum:]]([[:alnum:]_-]{0,61}[[:alnum:]])?$\" \"nixos\"");
+    defer std.testing.allocator.free(interval);
+    try std.testing.expectEqualStrings("[ \"ixos\" ]", interval);
 
     const split = try renderForTest("builtins.split \"[^[:alnum:]+._?=-]+\" \"abc///def\"");
     defer std.testing.allocator.free(split);

@@ -189,20 +189,69 @@ const Parser = struct {
 
     fn parseRepeat(self: *Parser) anyerror!*Node {
         const atom = try self.parseAtom();
-        if (self.atEnd()) return atom;
+        const repeat = try self.parseRepeatSuffix() orelse return atom;
+        return self.node(.{
+            .tag = .repeat,
+            .child = atom,
+            .repeat = repeat,
+        });
+    }
+
+    fn parseRepeatSuffix(self: *Parser) anyerror!?Repeat {
+        if (self.atEnd()) return null;
         const repeat: ?Repeat = switch (self.peek()) {
             '*' => .{ .min = 0, .max = null },
             '+' => .{ .min = 1, .max = null },
             '?' => .{ .min = 0, .max = 1 },
+            '{' => return self.parseIntervalRepeat(),
             else => null,
         };
-        const r = repeat orelse return atom;
+        const r = repeat orelse return null;
         self.index += 1;
-        return self.node(.{
-            .tag = .repeat,
-            .child = atom,
-            .repeat = r,
-        });
+        return r;
+    }
+
+    fn parseIntervalRepeat(self: *Parser) anyerror!?Repeat {
+        const start = self.index;
+        self.index += 1;
+
+        const min = self.parseDecimal() orelse {
+            self.index = start;
+            return null;
+        };
+
+        if (self.peek() == '}') {
+            self.index += 1;
+            return .{ .min = min, .max = min };
+        }
+
+        if (self.peek() != ',') {
+            self.index = start;
+            return null;
+        }
+        self.index += 1;
+
+        const max = self.parseDecimal();
+        if (self.peek() != '}') {
+            self.index = start;
+            return null;
+        }
+        self.index += 1;
+
+        if (max) |limit| {
+            if (limit < min) return error.InvalidRegex;
+        }
+        return .{ .min = min, .max = max };
+    }
+
+    fn parseDecimal(self: *Parser) ?usize {
+        const start = self.index;
+        var value: usize = 0;
+        while (!self.atEnd() and std.ascii.isDigit(self.peek())) {
+            value = value * 10 + (self.advance() - '0');
+        }
+        if (self.index == start) return null;
+        return value;
     }
 
     fn parseAtom(self: *Parser) anyerror!*Node {
@@ -488,4 +537,10 @@ test "regex supports posix classes alternation and search" {
     defer found.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), found.start);
     try std.testing.expectEqual(@as(usize, 6), found.end);
+
+    var hostname_pattern = try Pattern.compile(std.testing.allocator, "^$|^[[:alnum:]]([[:alnum:]_-]{0,61}[[:alnum:]])?$");
+    defer hostname_pattern.deinit();
+    const hostname = (try hostname_pattern.matchFull(std.testing.allocator, "nixos")).?;
+    defer hostname.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ixos", hostname.captures[0].?);
 }
