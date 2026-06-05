@@ -405,9 +405,9 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
         }
 
         if (source[i] == '\'' and i + 1 < body_end and source[i + 1] == '\'' and isIndentedEscape(source, i)) {
-            const decoded = decodeIndentedEscape(source, i);
-            accountIndentEscape(decoded.bytes(), &best, &line_indent, &line_has_content, &at_line_start);
-            i += decoded.source_len;
+            line_has_content = true;
+            at_line_start = false;
+            i += indentedEscapeLen(source, i);
             continue;
         }
 
@@ -416,25 +416,6 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
     }
     if (line_has_content) best = @min(best orelse line_indent, line_indent);
     return best orelse 0;
-}
-
-fn accountIndentEscape(
-    bytes: []const u8,
-    best: *?usize,
-    line_indent: *usize,
-    line_has_content: *bool,
-    at_line_start: *bool,
-) void {
-    at_line_start.* = false;
-    line_has_content.* = true;
-    for (bytes) |byte| {
-        if (byte == '\n') {
-            if (line_has_content.*) best.* = @min(best.* orelse line_indent.*, line_indent.*);
-            line_indent.* = 0;
-            line_has_content.* = false;
-            at_line_start.* = true;
-        }
-    }
 }
 
 fn accountIndentByte(
@@ -553,4 +534,18 @@ test "parses indented string escapes after stripping source indentation" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
     try std.testing.expectEqualStrings("\t['name'] = {\n\t\tloader = 'file',\n", parsed.parts[0].text.bytes);
+}
+
+test "parses indented string escaped newlines after stripping source indentation" {
+    const source =
+        \\''
+        \\  alpha ''\nbeta
+        \\  gamma
+        \\''
+    ;
+    const parsed = try parseLiteral(std.testing.allocator, source, .{ .start = 0, .end = @intCast(source.len) });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
+    try std.testing.expectEqualStrings("alpha \nbeta\ngamma\n", parsed.parts[0].text.bytes);
 }
