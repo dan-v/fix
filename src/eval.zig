@@ -1009,6 +1009,18 @@ test "evaluate dynamic attr paths with static tails" {
     defer std.testing.allocator.free(static_prefix_tail);
     try std.testing.expectEqualStrings("3", static_prefix_tail);
 
+    const quoted_interpolation_tail = try renderForTest("let suffix = \"X\"; in builtins.toJSON { env.\"A_${suffix}\" = \"v\"; }");
+    defer std.testing.allocator.free(quoted_interpolation_tail);
+    try std.testing.expectEqualStrings("\"{\\\"env\\\":{\\\"A_X\\\":\\\"v\\\"}}\"", quoted_interpolation_tail);
+
+    const quoted_interpolation_root = try renderForTest("let x = \"a\"; in ({ \"${x}\".b = 1; }).a.b");
+    defer std.testing.allocator.free(quoted_interpolation_root);
+    try std.testing.expectEqualStrings("1", quoted_interpolation_root);
+
+    const quoted_interpolation_let_tail = try renderForTest("let x = \"b\"; a.\"${x}\" = 1; in a.b");
+    defer std.testing.allocator.free(quoted_interpolation_let_tail);
+    try std.testing.expectEqualStrings("1", quoted_interpolation_let_tail);
+
     const merged_static_prefix = try renderForTest("let x = \"b\"; in builtins.attrNames { a.${x} = 1; a.c = 2; }.a");
     defer std.testing.allocator.free(merged_static_prefix);
     try std.testing.expectEqualStrings("[ \"b\" \"c\" ]", merged_static_prefix);
@@ -1020,6 +1032,7 @@ test "evaluate dynamic attr paths with static tails" {
     try std.testing.expectError(error.DuplicateAttribute, renderForTest("{ ${\"a\"} = 1; a = 2; } ? a"));
     try std.testing.expectError(error.DuplicateAttribute, renderForTest("{ ${\"a\"}.b = 1; a.b = 2; } ? a"));
     try std.testing.expectError(error.DuplicateAttribute, renderForTest("let x = \"b\"; in { a.${x} = 1; a.b = 2; }.a"));
+    try std.testing.expectError(error.DuplicateAttribute, renderForTest("let x = \"b\"; in { a.\"${x}\" = 1; a.b = 2; }.a"));
 }
 
 test "evaluate attrset function parameters past byte local slots" {

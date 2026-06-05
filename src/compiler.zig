@@ -1097,12 +1097,12 @@ pub const Compiler = struct {
     }
 
     fn isDynamicAttrEntry(self: *const Compiler, entry: Node.AttrSetEntry) bool {
-        return entry.dynamic_name != null or (entry.path.len == 1 and self.attrSegmentHasInterpolation(entry.path[0]));
+        return entry.dynamic_name != null or (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0]));
     }
 
     fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
         if (entry.dynamic_name) |name| return self.compileNode(name);
-        if (entry.path.len == 1 and self.attrSegmentHasInterpolation(entry.path[0])) {
+        if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
             return self.compileStringAtom(entry.path[0]);
         }
         return error.InvalidAttributePath;
@@ -1121,12 +1121,27 @@ pub const Compiler = struct {
             return self.compileNodeAttrEntriesThunk(&nested, false);
         }
 
-        if (entry.dynamic_name == null or entry.path.len == 0) return self.compileThunk(entry.expr);
+        if (entry.dynamic_name) |_| {
+            if (entry.path.len == 0) return self.compileThunk(entry.expr);
 
-        const views = [_]AttrEntryView{
-            .{ .path = entry.path, .expr = entry.expr, .inherit_outer = entry.inherit_outer },
-        };
-        try self.compileAttrEntriesThunk(&views, false);
+            const views = [_]AttrEntryView{
+                .{ .path = entry.path, .expr = entry.expr, .inherit_outer = entry.inherit_outer },
+            };
+            try self.compileAttrEntriesThunk(&views, false);
+            return;
+        }
+
+        if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
+            if (entry.path.len == 1) return self.compileThunk(entry.expr);
+
+            const views = [_]AttrEntryView{
+                .{ .path = entry.path[1..], .expr = entry.expr, .inherit_outer = entry.inherit_outer },
+            };
+            try self.compileAttrEntriesThunk(&views, false);
+            return;
+        }
+
+        return error.InvalidAttributePath;
     }
 
     fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
@@ -1161,11 +1176,118 @@ pub const Compiler = struct {
     }
 
     fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
+        if (self.hasDynamicAttrEntryViews(entries)) {
+            return self.compileMixedAttrEntryViews(entries, recursive);
+        }
+
         if (recursive) {
             try self.compileRecursiveAttrEntries(entries);
         } else {
             try self.compilePlainAttrEntries(entries);
         }
+    }
+
+    fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, recursive: bool) !void {
+        if (recursive) return self.compileMixedRecursiveAttrEntryViews(entries);
+
+        const static_count = self.staticAttrEntryViewCount(entries);
+        if (static_count > 0) {
+            const static_entries = try self.allocator.alloc(AttrEntryView, static_count);
+            defer self.allocator.free(static_entries);
+
+            var i: usize = 0;
+            for (entries) |entry| {
+                if (!self.isDynamicAttrEntryView(entry)) {
+                    static_entries[i] = entry;
+                    i += 1;
+                }
+            }
+
+            try self.compileAttrEntries(static_entries, false);
+        } else {
+            try self.emitOpU16(.build_attrs, 0);
+        }
+
+        for (entries) |entry| {
+            if (!self.isDynamicAttrEntryView(entry)) continue;
+            try self.compileDynamicAttrViewName(entry);
+            try self.compileDynamicAttrViewValueThunk(entry);
+            try self.emitOpU16(.build_attrs, 1);
+            try self.emitOp(.merge_attrs_strict);
+        }
+    }
+
+    fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEntryView) !void {
+        const static_count = self.staticAttrEntryViewCount(entries);
+        const static_entries = try self.allocator.alloc(AttrEntryView, static_count);
+        defer self.allocator.free(static_entries);
+
+        var static_i: usize = 0;
+        for (entries) |entry| {
+            if (!self.isDynamicAttrEntryView(entry)) {
+                static_entries[static_i] = entry;
+                static_i += 1;
+            }
+        }
+
+        var grouped = try self.attrEntryGroups(static_entries);
+        defer grouped.deinit(self.allocator);
+
+        self.beginScope();
+        errdefer self.endScope();
+
+        try self.declareRecursiveAttrLocals(grouped.groups);
+        try self.compileRecursiveAttrCells(grouped.groups);
+        try self.emitRecursiveAttrObject(grouped.groups);
+
+        for (entries) |entry| {
+            if (!self.isDynamicAttrEntryView(entry)) continue;
+            try self.compileDynamicAttrViewName(entry);
+            try self.compileDynamicAttrViewValueThunk(entry);
+            try self.emitOpU16(.build_attrs, 1);
+            try self.emitOp(.merge_attrs_strict);
+        }
+
+        self.endScope();
+    }
+
+    fn hasDynamicAttrEntryViews(self: *const Compiler, entries: []const AttrEntryView) bool {
+        for (entries) |entry| {
+            if (self.isDynamicAttrEntryView(entry)) return true;
+        }
+        return false;
+    }
+
+    fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntryView) usize {
+        var count: usize = 0;
+        for (entries) |entry| {
+            if (!self.isDynamicAttrEntryView(entry)) count += 1;
+        }
+        return count;
+    }
+
+    fn isDynamicAttrEntryView(self: *const Compiler, entry: AttrEntryView) bool {
+        return entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0]);
+    }
+
+    fn compileDynamicAttrViewName(self: *Compiler, entry: AttrEntryView) !void {
+        if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
+            return self.compileStringAtom(entry.path[0]);
+        }
+        return error.InvalidAttributePath;
+    }
+
+    fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void {
+        if (entry.path.len == 1) return self.compileThunk(entry.expr);
+
+        const views = [_]AttrEntryView{
+            .{
+                .path = entry.path[1..],
+                .expr = entry.expr,
+                .inherit_outer = entry.inherit_outer,
+            },
+        };
+        try self.compileAttrEntriesThunk(&views, false);
     }
 
     fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
