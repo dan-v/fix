@@ -274,9 +274,7 @@ fn parseIndented(
 
         if (source[i] == '\'' and i + 1 < body_end and source[i + 1] == '\'' and isIndentedEscape(source, i)) {
             const decoded = decodeIndentedEscape(source, i);
-            for (decoded.bytes()) |byte| {
-                try appendIndentedByte(allocator, &text, &state, byte);
-            }
+            try appendIndentedEscape(allocator, &text, &state, decoded.bytes());
             i += decoded.source_len;
             continue;
         }
@@ -333,6 +331,23 @@ fn appendIndentedByte(
     }
 }
 
+fn appendIndentedEscape(
+    allocator: std.mem.Allocator,
+    text: *std.ArrayListUnmanaged(u8),
+    state: *IndentState,
+    bytes: []const u8,
+) !void {
+    state.noteNonIndent();
+    for (bytes) |byte| {
+        try text.append(allocator, byte);
+        if (byte == '\n') {
+            state.afterNewline();
+        } else {
+            state.noteNonIndent();
+        }
+    }
+}
+
 fn flushOwnedText(
     allocator: std.mem.Allocator,
     text: *std.ArrayListUnmanaged(u8),
@@ -369,9 +384,7 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
 
         if (source[i] == '\'' and i + 1 < body_end and source[i + 1] == '\'' and isIndentedEscape(source, i)) {
             const decoded = decodeIndentedEscape(source, i);
-            for (decoded.bytes()) |byte| {
-                accountIndentByte(byte, &best, &line_indent, &line_has_content, &at_line_start);
-            }
+            accountIndentEscape(decoded.bytes(), &best, &line_indent, &line_has_content, &at_line_start);
             i += decoded.source_len;
             continue;
         }
@@ -381,6 +394,25 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
     }
     if (line_has_content) best = @min(best orelse line_indent, line_indent);
     return best orelse 0;
+}
+
+fn accountIndentEscape(
+    bytes: []const u8,
+    best: *?usize,
+    line_indent: *usize,
+    line_has_content: *bool,
+    at_line_start: *bool,
+) void {
+    at_line_start.* = false;
+    line_has_content.* = true;
+    for (bytes) |byte| {
+        if (byte == '\n') {
+            if (line_has_content.*) best.* = @min(best.* orelse line_indent.*, line_indent.*);
+            line_indent.* = 0;
+            line_has_content.* = false;
+            at_line_start.* = true;
+        }
+    }
 }
 
 fn accountIndentByte(
@@ -485,4 +517,18 @@ test "parses indented strings" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
     try std.testing.expectEqualStrings("a\nb\n", parsed.parts[0].text.bytes);
+}
+
+test "parses indented string escapes after stripping source indentation" {
+    const source =
+        \\''
+        \\  ''\t['name'] = {
+        \\  ''\t''\tloader = 'file',
+        \\''
+    ;
+    const parsed = try parseLiteral(std.testing.allocator, source, .{ .start = 0, .end = @intCast(source.len) });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.parts.len);
+    try std.testing.expectEqualStrings("\t['name'] = {\n\t\tloader = 'file',\n", parsed.parts[0].text.bytes);
 }
