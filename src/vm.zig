@@ -530,6 +530,11 @@ pub const VM = struct {
                     const left = self.pop();
                     try self.push(try self.mergeAttrs(left, right));
                 },
+                .merge_attrs_strict => {
+                    const right = self.pop();
+                    const left = self.pop();
+                    try self.push(try self.mergeAttrsStrict(left, right));
+                },
                 .concat_lists => {
                     const right = self.pop();
                     const left = self.pop();
@@ -1093,6 +1098,56 @@ pub const VM = struct {
         if (left.discriminant != .attrs) return self.typeErrorExpected("attrs", left);
         if (right.discriminant != .attrs) return self.typeErrorExpected("attrs", right);
         return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
+    }
+
+    fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {
+        if (left.discriminant != .attrs) return self.typeErrorExpected("attrs", left);
+        if (right.discriminant != .attrs) return self.typeErrorExpected("attrs", right);
+        return Value.attrs(try self.mergeAttrLiteralObjects(left.asObjectId(), right.asObjectId()));
+    }
+
+    fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: types.ObjectId) anyerror!types.ObjectId {
+        const left = try self.heap.getAttrs(left_id);
+        const right = try self.heap.getAttrs(right_id);
+
+        var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left.len + right.len);
+        defer merged.deinit(self.allocator);
+
+        var left_i: usize = 0;
+        var right_i: usize = 0;
+        while (left_i < left.len and right_i < right.len) {
+            const l = left[left_i];
+            const r = right[right_i];
+            if (l.name < r.name) {
+                merged.appendAssumeCapacity(l);
+                left_i += 1;
+            } else if (l.name > r.name) {
+                merged.appendAssumeCapacity(r);
+                right_i += 1;
+            } else {
+                const value = try self.mergeAttrLiteralValue(l.value, r.value);
+                merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
+                left_i += 1;
+                right_i += 1;
+            }
+        }
+        while (left_i < left.len) : (left_i += 1) {
+            merged.appendAssumeCapacity(left[left_i]);
+        }
+        while (right_i < right.len) : (right_i += 1) {
+            merged.appendAssumeCapacity(right[right_i]);
+        }
+
+        return self.heap.addAttrs(merged.items);
+    }
+
+    fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Value {
+        const left_forced = try self.forceValue(left);
+        const right_forced = try self.forceValue(right);
+        if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
+            return Value.attrs(try self.mergeAttrLiteralObjects(left_forced.asObjectId(), right_forced.asObjectId()));
+        }
+        return error.DuplicateAttribute;
     }
 
     fn concatLists(self: *VM, left: Value, right: Value) !Value {

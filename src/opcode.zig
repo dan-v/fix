@@ -85,6 +85,9 @@ pub const OpCode = enum(u8) {
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     build_list,
+    /// Merge two attrsets as parts of one attrset literal, recursively rejecting
+    /// duplicate leaf attributes.
+    merge_attrs_strict,
     /// Merge two attrsets, with right-hand keys overriding left-hand keys.
     merge_attrs,
     /// Concatenate two lists.

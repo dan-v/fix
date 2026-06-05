@@ -988,7 +988,7 @@ pub const Compiler = struct {
             try self.compileDynamicAttrName(entry);
             try self.compileDynamicAttrValueThunk(entry);
             try self.emitOpU16(.build_attrs, 1);
-            try self.emitOp(.merge_attrs);
+            try self.emitOp(.merge_attrs_strict);
         }
     }
 
@@ -1023,7 +1023,7 @@ pub const Compiler = struct {
             try self.compileDynamicAttrName(entry);
             try self.compileDynamicAttrValueThunk(entry);
             try self.emitOpU16(.build_attrs, 1);
-            try self.emitOp(.merge_attrs);
+            try self.emitOp(.merge_attrs_strict);
         }
 
         self.endScope();
@@ -1236,15 +1236,19 @@ pub const Compiler = struct {
     fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {
         std.debug.assert(leaf.expr.tag == .attr_set);
         const attr_set = leaf.expr.data.attr_set;
-        const leaf_entries = try self.attrEntryViews(attr_set.entries);
-        defer self.allocator.free(leaf_entries);
 
-        const merged = try self.allocator.alloc(AttrEntryView, leaf_entries.len + tails.len);
+        const merged = try self.allocator.alloc(Node.AttrSetEntry, attr_set.entries.len + tails.len);
         defer self.allocator.free(merged);
-        @memcpy(merged[0..leaf_entries.len], leaf_entries);
-        @memcpy(merged[leaf_entries.len..], tails);
+        @memcpy(merged[0..attr_set.entries.len], attr_set.entries);
+        for (tails, merged[attr_set.entries.len..]) |tail, *entry| {
+            entry.* = .{
+                .path = @constCast(tail.path),
+                .expr = @constCast(tail.expr),
+                .inherit_outer = tail.inherit_outer,
+            };
+        }
 
-        try self.compileAttrEntriesThunk(merged, attr_set.recursive);
+        try self.compileNodeAttrEntriesThunk(merged, attr_set.recursive);
     }
 
     fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {

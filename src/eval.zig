@@ -962,6 +962,26 @@ test "evaluate dynamic attr paths with static tails" {
     const dynamic_tail = try renderForTest("let x = \"a\"; y = \"b\"; in ({ ${x}.${y} = 2; }).a.b");
     defer std.testing.allocator.free(dynamic_tail);
     try std.testing.expectEqualStrings("2", dynamic_tail);
+
+    const static_prefix = try renderForTest("let name = \"LD_LIBRARY_PATH\"; in { env.${name} = \"x\"; }.env.LD_LIBRARY_PATH");
+    defer std.testing.allocator.free(static_prefix);
+    try std.testing.expectEqualStrings("\"x\"", static_prefix);
+
+    const static_prefix_tail = try renderForTest("let x = \"c\"; y = \"d\"; in { a.b.${x}.${y}.e = 3; }.a.b.c.d.e");
+    defer std.testing.allocator.free(static_prefix_tail);
+    try std.testing.expectEqualStrings("3", static_prefix_tail);
+
+    const merged_static_prefix = try renderForTest("let x = \"b\"; in builtins.attrNames { a.${x} = 1; a.c = 2; }.a");
+    defer std.testing.allocator.free(merged_static_prefix);
+    try std.testing.expectEqualStrings("[ \"b\" \"c\" ]", merged_static_prefix);
+
+    const merged_dynamic_root = try renderForTest("builtins.attrNames { ${\"a\"}.b = 1; a.c = 2; }.a");
+    defer std.testing.allocator.free(merged_dynamic_root);
+    try std.testing.expectEqualStrings("[ \"b\" \"c\" ]", merged_dynamic_root);
+
+    try std.testing.expectError(error.DuplicateAttribute, renderForTest("{ ${\"a\"} = 1; a = 2; } ? a"));
+    try std.testing.expectError(error.DuplicateAttribute, renderForTest("{ ${\"a\"}.b = 1; a.b = 2; } ? a"));
+    try std.testing.expectError(error.DuplicateAttribute, renderForTest("let x = \"b\"; in { a.${x} = 1; a.b = 2; }.a"));
 }
 
 test "evaluate attrset function parameters past byte local slots" {

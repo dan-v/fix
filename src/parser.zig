@@ -38,6 +38,7 @@ const AttrDeclaration = struct {
     path: []Node.Atom,
     dynamic_name: ?*Node = null,
     tail_dynamic_name: ?*Node = null,
+    static_prefix_len: ?usize = null,
 };
 
 const Rule = struct {
@@ -524,15 +525,37 @@ pub const Parser = struct {
                 _ = self.match(.semicolon); // optional
             }
 
-            const expr = self.expression() catch {
+            var expr = self.expression() catch {
                 self.synchronizeAttrSetEntry();
                 continue;
             };
 
+            var path = declaration.path;
+            var dynamic_name = declaration.dynamic_name;
+            var tail_dynamic_name = declaration.tail_dynamic_name;
+            if (declaration.static_prefix_len) |prefix_len| {
+                const nested_entries = try arena_allocator.alloc(Node.AttrSetEntry, 1);
+                nested_entries[0] = .{
+                    .path = declaration.path[prefix_len..],
+                    .dynamic_name = dynamic_name,
+                    .tail_dynamic_name = tail_dynamic_name,
+                    .expr = expr,
+                };
+                expr = try self.arena.createNode(.attr_set, .{
+                    .attr_set = .{
+                        .entries = nested_entries,
+                        .recursive = false,
+                    },
+                });
+                path = declaration.path[0..prefix_len];
+                dynamic_name = null;
+                tail_dynamic_name = null;
+            }
+
             try entries.append(arena_allocator, .{
-                .path = declaration.path,
-                .dynamic_name = declaration.dynamic_name,
-                .tail_dynamic_name = declaration.tail_dynamic_name,
+                .path = path,
+                .dynamic_name = dynamic_name,
+                .tail_dynamic_name = tail_dynamic_name,
                 .expr = expr,
             });
 
@@ -628,7 +651,54 @@ pub const Parser = struct {
             return .{ .path = path, .dynamic_name = name, .tail_dynamic_name = tail_dynamic_name };
         }
 
-        return .{ .path = try self.attrDeclarationPath(allocator) };
+        return self.staticAttrDeclaration(allocator);
+    }
+
+    fn staticAttrDeclaration(self: *Parser, allocator: std.mem.Allocator) !AttrDeclaration {
+        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        errdefer segments.deinit(allocator);
+
+        while (true) {
+            if (self.matchAttrName()) {
+                try segments.append(allocator, .{
+                    .offset = self.previous.offset,
+                    .len = self.previous.len,
+                });
+            } else {
+                self.reportError("Expected attribute name.");
+                return error.ParseError;
+            }
+
+            if (!self.match(.dot)) break;
+            if (!self.match(.dollar_curly)) continue;
+
+            const prefix_len = segments.items.len;
+            const dynamic_name = try self.expression();
+            _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+            var tail_dynamic_name: ?*Node = null;
+            if (self.match(.dot)) {
+                if (self.match(.dollar_curly)) {
+                    tail_dynamic_name = try self.expression();
+                    _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+                    if (self.match(.dot)) {
+                        const suffix = try self.attrDeclarationPath(allocator);
+                        try segments.appendSlice(allocator, suffix);
+                    }
+                } else {
+                    const suffix = try self.attrDeclarationPath(allocator);
+                    try segments.appendSlice(allocator, suffix);
+                }
+            }
+
+            return .{
+                .path = try segments.toOwnedSlice(allocator),
+                .dynamic_name = dynamic_name,
+                .tail_dynamic_name = tail_dynamic_name,
+                .static_prefix_len = prefix_len,
+            };
+        }
+
+        return .{ .path = try segments.toOwnedSlice(allocator) };
     }
 
     fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
