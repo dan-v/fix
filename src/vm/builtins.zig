@@ -2575,7 +2575,7 @@ fn structuredAttrsJson(
         if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
         if (!first) try out.append(self.allocator, ',');
         first = false;
-        try appendJsonString(self, &out, name);
+        try appendJsonString(self, &out, self.intern.get(entry.name));
         try out.append(self.allocator, ':');
         try appendStructuredJsonValue(self, &out, entry.value, inputs, owned_strings, &seen);
     }
