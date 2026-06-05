@@ -191,6 +191,9 @@ test "end-to-end: ambient builtins" {
     const shadowed = try ev.evaluate("let map = 7; in map");
     try std.testing.expectEqual(@as(i64, 7), shadowed.asInt());
 
+    const fetchurl_shadowed = try ev.evaluate("with { fetchurl = \"pkg\"; }; fetchurl");
+    try std.testing.expectEqualStrings("pkg", ev.intern.get(fetchurl_shadowed.asInternId()));
+
     const version = try ev.evaluate("nixVersion");
     try std.testing.expectEqual(value.ValueType.string, version.discriminant);
 

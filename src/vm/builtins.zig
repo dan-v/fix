@@ -1455,20 +1455,26 @@ fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
     const name_value = try self.forceValue(name_arg);
     if (!isStringLike(name_value)) return error.TypeError;
 
-    const name = self.intern.get(try stringTextInternId(self, name_value));
-    try validateStorePathName(name);
+    const name_id = try stringTextInternId(self, name_value);
+    try validateStorePathName(self.intern.get(name_id));
 
     const contents_value = try coerceStringContextValue(self, contents_arg);
-    const contents = self.intern.get(try stringTextInternId(self, contents_value));
-    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer refs.deinit(self.allocator);
+    const contents_id = try stringTextInternId(self, contents_value);
+    var ref_ids: std.ArrayListUnmanaged(InternId) = .empty;
+    defer ref_ids.deinit(self.allocator);
     for (try contextEntriesForValue(self, contents_value)) |entry| {
         const ref = self.intern.get(entry.name);
         if (std.mem.endsWith(u8, ref, ".drv")) return error.DerivationReferenceInToFile;
-        try refs.append(self.allocator, ref);
+        try ref_ids.append(self.allocator, entry.name);
     }
 
-    const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs.items);
+    const refs = try self.allocator.alloc([]const u8, ref_ids.items.len);
+    defer self.allocator.free(refs);
+    for (ref_ids.items, refs) |ref_id, *ref| ref.* = self.intern.get(ref_id);
+
+    const name = self.intern.get(name_id);
+    const contents = self.intern.get(contents_id);
+    const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs);
     defer self.allocator.free(path);
     return contextStringWithPath(self, try self.intern.intern(path));
 }

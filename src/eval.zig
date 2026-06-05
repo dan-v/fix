@@ -2213,6 +2213,13 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(core_fetchurl_hash_precedence);
     try std.testing.expectEqualStrings("\"/nix/store/kwm524zjlnnq4yfhhmb5r14f2wxf8a2j-bash-5.3.tar.gz\"", core_fetchurl_hash_precedence);
 
+    const to_file_churns_intern_table = try renderForTest(
+        \\builtins.unsafeDiscardStringContext (builtins.toFile "payload.txt"
+        \\  (builtins.concatStringsSep "" (builtins.genList (n: builtins.toString n) 3000)))
+    );
+    defer std.testing.allocator.free(to_file_churns_intern_table);
+    try std.testing.expect(std.mem.endsWith(u8, to_file_churns_intern_table, "-payload.txt\""));
+
     var missing_hash_algo_ev = try Evaluator.init(std.testing.allocator, 0);
     defer missing_hash_algo_ev.deinit();
     try std.testing.expectError(

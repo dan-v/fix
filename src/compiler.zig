@@ -446,7 +446,7 @@ pub const Compiler = struct {
     }
 
     fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
-        if (builtins.idForName(name)) |id| {
+        if (builtins.ambientIdForName(name)) |id| {
             try self.builder.emitConstant(self.allocator, @import("value.zig").Value.builtin(@intFromEnum(id)));
             return true;
         }

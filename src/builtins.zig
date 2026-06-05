@@ -260,6 +260,14 @@ pub fn idForName(name: []const u8) ?BuiltinId {
     return null;
 }
 
+pub fn ambientIdForName(name: []const u8) ?BuiltinId {
+    const id = idForName(name) orelse return null;
+    return switch (id) {
+        .fetchurl => null,
+        else => id,
+    };
+}
+
 pub fn hasConstant(name: []const u8) bool {
     for (constant_bindings) |candidate| {
         if (std.mem.eql(u8, candidate, name)) return true;
