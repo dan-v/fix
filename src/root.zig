@@ -799,6 +799,46 @@ test "end-to-end: lists and attrs compare structurally" {
     const attrs_not_equal = try ev.evaluate("{ a = 1; } == { a = 2; }");
     try std.testing.expect(!attrs_not_equal.asBool());
 
+    const derivations_equal_by_out_path = try ev.evaluate(
+        \\{
+        \\  type = "derivation";
+        \\  outPath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
+        \\  x = 1;
+        \\} == {
+        \\  type = "derivation";
+        \\  outPath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
+        \\  x = 2;
+        \\}
+    );
+    try std.testing.expect(derivations_equal_by_out_path.asBool());
+
+    const derivations_not_equal_by_out_path = try ev.evaluate(
+        \\{
+        \\  type = "derivation";
+        \\  outPath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
+        \\} == {
+        \\  type = "derivation";
+        \\  outPath = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b";
+        \\}
+    );
+    try std.testing.expect(!derivations_not_equal_by_out_path.asBool());
+
+    const plain_out_path_attrs_stay_structural = try ev.evaluate(
+        \\{
+        \\  outPath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
+        \\  x = 1;
+        \\} == {
+        \\  outPath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a";
+        \\  x = 2;
+        \\}
+    );
+    try std.testing.expect(!plain_out_path_attrs_stay_structural.asBool());
+
+    const derivations_without_out_path_stay_structural = try ev.evaluate(
+        \\{ type = "derivation"; x = 1; } == { type = "derivation"; x = 2; }
+    );
+    try std.testing.expect(!derivations_without_out_path_stay_structural.asBool());
+
     const same_lambda = try ev.evaluate("let f = x: x; in { inherit f; } == { inherit f; }");
     try std.testing.expect(same_lambda.asBool());
 

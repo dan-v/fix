@@ -6,6 +6,11 @@
 
 const std = @import("std");
 const cli = @import("fix-cli");
+const harness = @import("harness");
+
+const CommandResult = harness.CommandResult;
+const optionValue = harness.optionValue;
+const runCommand = harness.runCommand;
 
 const Config = struct {
     seed: ?u64 = null,
@@ -70,8 +75,6 @@ const Template = enum {
 
 const FragmentCorpus = std.ArrayListUnmanaged(Fragment);
 const ShrinkCandidates = std.ArrayListUnmanaged([]const u8);
-const command_stdout_limit = 8 * 1024 * 1024;
-const command_stderr_limit = 1024 * 1024;
 const default_case_count = 64_000;
 const interactive_progress_interval_ns = 250 * std.time.ns_per_ms;
 const log_progress_interval_ns = 5 * std.time.ns_per_s;
@@ -342,19 +345,6 @@ const Outcome = enum {
     nix_accepts_fix_rejects,
     fix_accepts_nix_rejects,
     both_reject,
-};
-
-const CommandResult = struct {
-    ok: bool,
-    comparable: bool = true,
-    timed_out: bool = false,
-    stdout: []u8,
-    stderr: []u8,
-
-    fn deinit(self: CommandResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
-    }
 };
 
 const Classification = struct {
@@ -676,14 +666,6 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
     }
 }
 
-fn optionValue(args: anytype, arg: []const u8, comptime name: []const u8) !?[]const u8 {
-    if (std.mem.eql(u8, arg, name)) return args.next() orelse error.MissingArgument;
-    if (std.mem.startsWith(u8, arg, name) and arg.len > name.len and arg[name.len] == '=') {
-        return arg[name.len + 1 ..];
-    }
-    return null;
-}
-
 fn usage() void {
     std.debug.print(
         \\usage: zig build integration-test -- [options]
@@ -995,15 +977,6 @@ test "generated fragments bind free names during composition" {
     try std.testing.expectEqualStrings("let x = 1; in x", fragment.text);
 }
 
-test "daemon permission errors are not comparable harness results" {
-    try std.testing.expect(environmentCommandFailure("error: cannot connect to socket at '/nix/var/nix/daemon-socket/socket': Operation not permitted"));
-    try std.testing.expect(environmentCommandFailure(
-        \\error: path '/nix/store/example.drv' does not exist in the store
-        \\note: trace involved the following derivations:
-    ));
-    try std.testing.expect(!environmentCommandFailure("error: cannot coerce an integer to a string: 1"));
-}
-
 fn generateWorkerCase(
     allocator: std.mem.Allocator,
     case_space: CaseSpace,
@@ -1196,61 +1169,6 @@ fn classify(
         .outcome = outcome,
         .nix = nix,
         .fix = fix,
-    };
-}
-
-fn runCommand(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    timeout_seconds: u32,
-    argv: []const []const u8,
-) !CommandResult {
-    const result = std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(command_stdout_limit),
-        .stderr_limit = .limited(command_stderr_limit),
-        .timeout = .{ .duration = commandTimeout(timeout_seconds) },
-    }) catch |err| switch (err) {
-        error.Timeout => return .{
-            .ok = false,
-            .comparable = false,
-            .timed_out = true,
-            .stdout = try allocator.dupe(u8, ""),
-            .stderr = try std.fmt.allocPrint(allocator, "command timed out after {}s", .{timeout_seconds}),
-        },
-        error.StreamTooLong => return .{
-            .ok = false,
-            .comparable = false,
-            .stdout = try allocator.dupe(u8, ""),
-            .stderr = try allocator.dupe(u8, "output exceeded integration harness limit"),
-        },
-        else => return err,
-    };
-
-    const ok = switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-
-    return .{
-        .ok = ok,
-        .comparable = ok or !environmentCommandFailure(result.stderr),
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
-}
-
-fn environmentCommandFailure(stderr: []const u8) bool {
-    if (std.mem.indexOf(u8, stderr, "/nix/var/nix/daemon-socket/socket") != null and
-        std.mem.indexOf(u8, stderr, "Operation not permitted") != null) return true;
-    return std.mem.indexOf(u8, stderr, "does not exist in the store") != null and
-        std.mem.indexOf(u8, stderr, "trace involved the following derivations") != null;
-}
-
-fn commandTimeout(seconds: u32) std.Io.Clock.Duration {
-    return .{
-        .raw = std.Io.Duration.fromSeconds(@intCast(seconds)),
-        .clock = .awake,
     };
 }
 

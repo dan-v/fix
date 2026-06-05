@@ -818,6 +818,8 @@ pub const VM = struct {
 
         const a_entries = try self.heap.getAttrs(a.asObjectId());
         const b_entries = try self.heap.getAttrs(b.asObjectId());
+        if (try self.derivationAttrsEqual(a_entries, b_entries, seen)) |equal| return equal;
+
         if (a_entries.len != b_entries.len) return false;
 
         for (a_entries, b_entries) |a_entry, b_entry| {
@@ -825,6 +827,56 @@ pub const VM = struct {
             if (!try self.valuesEqualSeen(a_entry.value, b_entry.value, seen)) return false;
         }
         return true;
+    }
+
+    fn derivationAttrsEqual(
+        self: *VM,
+        a_entries: []const heap_mod.AttrEntry,
+        b_entries: []const heap_mod.AttrEntry,
+        seen: *std.ArrayListUnmanaged(EqualityPair),
+    ) !?bool {
+        const type_name = try self.intern.intern("type");
+        const derivation_type = try self.intern.intern("derivation");
+
+        if (!try self.attrsHaveDerivationType(a_entries, type_name, derivation_type)) return null;
+        if (!try self.attrsHaveDerivationType(b_entries, type_name, derivation_type)) return null;
+
+        const out_path_name = try self.intern.intern("outPath");
+        const a_out_path = attrValue(a_entries, out_path_name) orelse return null;
+        const b_out_path = attrValue(b_entries, out_path_name) orelse return null;
+
+        return try self.valuesEqualSeen(a_out_path, b_out_path, seen);
+    }
+
+    fn attrsHaveDerivationType(
+        self: *VM,
+        entries: []const heap_mod.AttrEntry,
+        type_name: InternId,
+        derivation_type: InternId,
+    ) !bool {
+        const type_value = attrValue(entries, type_name) orelse return false;
+        const forced = try self.forceValue(type_value);
+        if (!isStringComparable(forced)) return false;
+        const text_id = try self.stringTextInternId(try self.stringLikeValue(forced));
+        return text_id == derivation_type;
+    }
+
+    fn attrValue(entries: []const heap_mod.AttrEntry, name: InternId) ?Value {
+        var lo: usize = 0;
+        var hi: usize = entries.len;
+
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const entry = entries[mid];
+            if (entry.name == name) return entry.value;
+            if (entry.name < name) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        return null;
     }
 
     fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) !bool {
