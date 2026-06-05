@@ -1039,6 +1039,15 @@ test "end-to-end: assert and implication" {
 
     const false_case = try ev.evaluate("true -> false");
     try std.testing.expect(!false_case.asBool());
+
+    const right_assoc = try ev.evaluate("false -> false -> builtins.throw \"unreachable\"");
+    try std.testing.expect(right_assoc.asBool());
+
+    const implication_precedence = try ev.evaluate("true || false -> false");
+    try std.testing.expect(!implication_precedence.asBool());
+
+    const nixpkgs_shape = try ev.evaluate("let testing = false; stable = false; in testing -> !stable -> builtins.throw \"unreachable\"");
+    try std.testing.expect(nixpkgs_shape.asBool());
 }
 
 const std = @import("std");

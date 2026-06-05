@@ -17,6 +17,7 @@ const Precedence = enum(u8) {
     none,
     assignment, // = (in let)
     pipe, // |>
+    impl, // ->
     or_, // ||
     and_, // &&
     eq, // == !=
@@ -175,7 +176,7 @@ pub const Parser = struct {
             .kw_or => return .{ .prefix = null, .infix = attrOr, .prec = .primary },
             .double_slash => return .{ .prefix = null, .infix = binary, .prec = .update },
             .double_plus => return .{ .prefix = null, .infix = binary, .prec = .concat },
-            .arrow => return .{ .prefix = null, .infix = binary, .prec = .or_ },
+            .arrow => return .{ .prefix = null, .infix = binary, .prec = .impl },
             .dot => return .{ .prefix = null, .infix = dotAccess, .prec = .primary },
             .question_mark => return .{ .prefix = null, .infix = hasAttr, .prec = .cmp },
             else => return .{ .prefix = null, .infix = null, .prec = .none },
@@ -973,7 +974,11 @@ pub const Parser = struct {
         };
 
         const r = rule(self.previous.type);
-        const right = try self.parsePrecedence(@enumFromInt(@intFromEnum(r.prec) + 1));
+        const right_prec: Precedence = if (self.previous.type == .arrow)
+            r.prec
+        else
+            @enumFromInt(@intFromEnum(r.prec) + 1);
+        const right = try self.parsePrecedence(right_prec);
 
         return self.makeBinary(op, left, right);
     }
@@ -1136,6 +1141,34 @@ test "parser applies boolean operator precedence" {
     try std.testing.expectEqual(NodeTag.binary_op, node.data.binary.left.tag);
     try std.testing.expectEqual(ast.BinaryOp.and_, node.data.binary.left.data.binary.op);
     try std.testing.expectEqual(NodeTag.bool_true, node.data.binary.right.tag);
+}
+
+test "parser treats implication as right associative" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "a -> b -> c");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.impl, node.data.binary.op);
+    try std.testing.expectEqual(NodeTag.identifier, node.data.binary.left.tag);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.binary.right.tag);
+    try std.testing.expectEqual(ast.BinaryOp.impl, node.data.binary.right.data.binary.op);
+}
+
+test "parser gives implication lower precedence than boolean or" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "true || false -> false");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.impl, node.data.binary.op);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.binary.left.tag);
+    try std.testing.expectEqual(ast.BinaryOp.or_, node.data.binary.left.data.binary.op);
+    try std.testing.expectEqual(NodeTag.bool_false, node.data.binary.right.tag);
 }
 
 test "parser recognizes identifier lambda" {
