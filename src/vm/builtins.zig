@@ -2882,12 +2882,9 @@ fn builtinPath(self: anytype, arg: Value) !Value {
         store_name = self.intern.get(try stringTextInternId(self, name));
     }
 
-    var fingerprint: std.ArrayListUnmanaged(u8) = .empty;
-    defer fingerprint.deinit(self.allocator);
-    try fingerprint.appendSlice(self.allocator, "path\n");
-    try appendPathFingerprint(self, path, &fingerprint);
-
-    return contextStringWithPath(self, try storeLikePath(self, store_name, fingerprint.items));
+    const store_path = try source_paths.storePathForSourceName(self.allocator, self.files, self.derivations.store_dir, path, store_name);
+    defer self.allocator.free(store_path);
+    return contextStringWithPath(self, try self.intern.intern(store_path));
 }
 
 fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {

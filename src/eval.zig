@@ -2356,6 +2356,8 @@ test "evaluate path construction builtins" {
     defer std.testing.allocator.free(store_source);
     const path_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
     defer std.testing.allocator.free(path_source);
+    const path_value_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.unsafeDiscardStringContext (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
+    defer std.testing.allocator.free(path_value_source);
     const path_prefix_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.toJSON (builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }}))", .{file_path});
     defer std.testing.allocator.free(path_prefix_source);
     const path_append_store_context_source = try std.fmt.allocPrint(std.testing.allocator, "/foo + builtins.substring 0 11 (builtins.path {{ path = \"{s}\"; name = \"imported\"; }})", .{file_path});
@@ -2379,6 +2381,9 @@ test "evaluate path construction builtins" {
 
     const path = try ev.evaluate(path_source);
     try std.testing.expect(path.asBool());
+
+    const path_value = try ev.evaluate(path_value_source);
+    try std.testing.expectEqualStrings("/nix/store/375nsbsr3gvzlfpmnviljghr7racpq67-imported", ev.intern.get(path_value.asInternId()));
 
     const path_prefix = try ev.evaluate(path_prefix_source);
     try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix.asInternId()));

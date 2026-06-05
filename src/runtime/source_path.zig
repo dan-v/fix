@@ -15,9 +15,19 @@ pub fn storePathForSource(
     if (!std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     if (isStoreRootPath(path, store_dir)) return allocator.dupe(u8, path);
 
+    return storePathForSourceName(allocator, files, store_dir, path, path_ops.baseName(path));
+}
+
+pub fn storePathForSourceName(
+    allocator: std.mem.Allocator,
+    files: *FileCache,
+    store_dir: []const u8,
+    path: []const u8,
+    name: []const u8,
+) ![]u8 {
     const hash = try nar.hashPath(allocator, files, path);
     defer allocator.free(hash);
-    return derivation.sourcePath(allocator, store_dir, path_ops.baseName(path), hash);
+    return derivation.sourcePath(allocator, store_dir, name, hash);
 }
 
 pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
