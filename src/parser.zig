@@ -39,6 +39,7 @@ const AttrDeclaration = struct {
     dynamic_name: ?*Node = null,
     tail_dynamic_name: ?*Node = null,
     static_prefix_len: ?usize = null,
+    dynamic_suffix: ?*AttrDeclaration = null,
 };
 
 const Rule = struct {
@@ -533,6 +534,9 @@ pub const Parser = struct {
             var path = declaration.path;
             var dynamic_name = declaration.dynamic_name;
             var tail_dynamic_name = declaration.tail_dynamic_name;
+            if (declaration.dynamic_suffix) |suffix| {
+                expr = try self.wrapAttrDeclarationExpr(arena_allocator, suffix.*, expr);
+            }
             if (declaration.static_prefix_len) |prefix_len| {
                 const nested_entries = try arena_allocator.alloc(Node.AttrSetEntry, 1);
                 nested_entries[0] = .{
@@ -568,6 +572,49 @@ pub const Parser = struct {
             .attr_set = .{
                 .entries = try entries.toOwnedSlice(arena_allocator),
                 .recursive = recursive,
+            },
+        });
+    }
+
+    fn wrapAttrDeclarationExpr(self: *Parser, allocator: std.mem.Allocator, declaration: AttrDeclaration, expr: *Node) !*Node {
+        var wrapped_expr = expr;
+        if (declaration.dynamic_suffix) |suffix| {
+            wrapped_expr = try self.wrapAttrDeclarationExpr(allocator, suffix.*, wrapped_expr);
+        }
+
+        var path = declaration.path;
+        var dynamic_name = declaration.dynamic_name;
+        var tail_dynamic_name = declaration.tail_dynamic_name;
+        if (declaration.static_prefix_len) |prefix_len| {
+            const nested_entries = try allocator.alloc(Node.AttrSetEntry, 1);
+            nested_entries[0] = .{
+                .path = declaration.path[prefix_len..],
+                .dynamic_name = dynamic_name,
+                .tail_dynamic_name = tail_dynamic_name,
+                .expr = wrapped_expr,
+            };
+            wrapped_expr = try self.arena.createNode(.attr_set, .{
+                .attr_set = .{
+                    .entries = nested_entries,
+                    .recursive = false,
+                },
+            });
+            path = declaration.path[0..prefix_len];
+            dynamic_name = null;
+            tail_dynamic_name = null;
+        }
+
+        const entries = try allocator.alloc(Node.AttrSetEntry, 1);
+        entries[0] = .{
+            .path = path,
+            .dynamic_name = dynamic_name,
+            .tail_dynamic_name = tail_dynamic_name,
+            .expr = wrapped_expr,
+        };
+        return self.arena.createNode(.attr_set, .{
+            .attr_set = .{
+                .entries = entries,
+                .recursive = false,
             },
         });
     }
@@ -628,7 +675,7 @@ pub const Parser = struct {
         segments[0] = name;
         return self.arena.createNode(.attr_path, .{
             .attr_path = .{
-                .root = source,
+                .root = try ast.cloneNode(self.arena, source),
                 .segments = segments,
             },
         });
@@ -638,17 +685,13 @@ pub const Parser = struct {
         if (self.match(.dollar_curly)) {
             const name = try self.expression();
             _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-            var tail_dynamic_name: ?*Node = null;
-            const path = if (self.match(.dot)) path: {
-                if (self.match(.dollar_curly)) {
-                    tail_dynamic_name = try self.expression();
-                    _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-                    if (self.match(.dot)) break :path try self.attrDeclarationPath(allocator);
-                    break :path try self.arena.allocSlice(Node.Atom, 0);
-                }
-                break :path try self.attrDeclarationPath(allocator);
-            } else try self.arena.allocSlice(Node.Atom, 0);
-            return .{ .path = path, .dynamic_name = name, .tail_dynamic_name = tail_dynamic_name };
+            const path = try self.arena.allocSlice(Node.Atom, 0);
+            if (self.match(.dot)) {
+                const suffix = try allocator.create(AttrDeclaration);
+                suffix.* = try self.attrDeclaration(allocator);
+                return .{ .path = path, .dynamic_name = name, .dynamic_suffix = suffix };
+            }
+            return .{ .path = path, .dynamic_name = name };
         }
 
         return self.staticAttrDeclaration(allocator);
@@ -672,29 +715,23 @@ pub const Parser = struct {
             if (!self.match(.dot)) break;
             if (!self.match(.dollar_curly)) continue;
 
-            const prefix_len = segments.items.len;
             const dynamic_name = try self.expression();
             _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-            var tail_dynamic_name: ?*Node = null;
+            const dynamic_path = try self.arena.allocSlice(Node.Atom, 0);
+            const dynamic_declaration = try allocator.create(AttrDeclaration);
+            dynamic_declaration.* = .{
+                .path = dynamic_path,
+                .dynamic_name = dynamic_name,
+            };
             if (self.match(.dot)) {
-                if (self.match(.dollar_curly)) {
-                    tail_dynamic_name = try self.expression();
-                    _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-                    if (self.match(.dot)) {
-                        const suffix = try self.attrDeclarationPath(allocator);
-                        try segments.appendSlice(allocator, suffix);
-                    }
-                } else {
-                    const suffix = try self.attrDeclarationPath(allocator);
-                    try segments.appendSlice(allocator, suffix);
-                }
+                const suffix = try allocator.create(AttrDeclaration);
+                suffix.* = try self.attrDeclaration(allocator);
+                dynamic_declaration.dynamic_suffix = suffix;
             }
 
             return .{
                 .path = try segments.toOwnedSlice(allocator),
-                .dynamic_name = dynamic_name,
-                .tail_dynamic_name = tail_dynamic_name,
-                .static_prefix_len = prefix_len,
+                .dynamic_suffix = dynamic_declaration,
             };
         }
 
@@ -1012,37 +1049,45 @@ pub const Parser = struct {
     }
 
     fn hasAttr(self: *Parser, left: *Node) !*Node {
-        if (self.match(.dollar_curly)) {
-            const name = try self.expression();
-            _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-            return self.arena.createNode(.has_attr_dynamic, .{
-                .has_attr_dynamic = .{
-                    .root = left,
-                    .name = name,
-                },
-            });
-        }
-
         const arena_allocator = self.arena.allocator();
-        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        var static_segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        var mixed_segments: std.ArrayListUnmanaged(Node.HasAttrMixedSegment) = .empty;
+        var has_dynamic = false;
 
         while (true) {
-            if (!self.matchAttrName()) {
+            if (self.match(.dollar_curly)) {
+                has_dynamic = true;
+                const name = try self.expression();
+                _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+                try mixed_segments.append(arena_allocator, .{ .dynamic = name });
+            } else if (self.matchAttrName()) {
+                const atom = Node.Atom{
+                    .offset = self.previous.offset,
+                    .len = self.previous.len,
+                };
+                try static_segments.append(arena_allocator, atom);
+                try mixed_segments.append(arena_allocator, .{ .static = atom });
+            } else {
                 self.reportError("Expected attribute name after '?'.");
                 return error.ParseError;
             }
-            try segments.append(arena_allocator, .{
-                .offset = self.previous.offset,
-                .len = self.previous.len,
-            });
 
             if (!self.match(.dot)) break;
+        }
+
+        if (has_dynamic) {
+            return self.arena.createNode(.has_attr_mixed, .{
+                .has_attr_mixed = .{
+                    .root = left,
+                    .segments = try mixed_segments.toOwnedSlice(arena_allocator),
+                },
+            });
         }
 
         return self.arena.createNode(.has_attr, .{
             .has_attr = .{
                 .root = left,
-                .segments = try segments.toOwnedSlice(arena_allocator),
+                .segments = try static_segments.toOwnedSlice(arena_allocator),
             },
         });
     }
@@ -1320,6 +1365,17 @@ test "parser recognizes has-attr operator" {
 
     try std.testing.expectEqual(NodeTag.has_attr, node.tag);
     try std.testing.expectEqual(@as(usize, 2), node.data.has_attr.segments.len);
+}
+
+test "parser recognizes mixed dynamic has-attr operator" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ a.b = 1; } ? a.${key}.c");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.has_attr_mixed, node.tag);
+    try std.testing.expectEqual(@as(usize, 3), node.data.has_attr_mixed.segments.len);
 }
 
 test "parser rejects unparenthesized expression forms in lists" {

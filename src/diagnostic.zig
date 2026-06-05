@@ -15,6 +15,8 @@ pub const Diagnostic = struct {
     len: u32,
     token_type: ?TokenType,
     message: []const u8,
+    source: ?[]const u8 = null,
+    source_path: ?[]const u8 = null,
 };
 
 pub const LineSpan = struct {
@@ -136,44 +138,39 @@ pub fn writeAllWithOptions(writer: *std.Io.Writer, source: []const u8, diagnosti
 }
 
 fn writeOne(writer: *std.Io.Writer, source: []const u8, diagnostic: Diagnostic, options: RenderOptions) !void {
+    const diagnostic_source = diagnostic.source orelse source;
     switch (diagnostic.severity) {
         .err => switch (diagnostic.kind) {
             .parse => {
                 try style(writer, options, .error_label);
                 try writer.writeAll("error");
                 try reset(writer, options);
-                try writer.print(": parse error at {d}:{d}: {s}\n", .{
-                    diagnostic.line,
-                    diagnostic.column,
-                    diagnostic.message,
-                });
+                try writer.writeAll(": parse error at ");
+                try writeLocation(writer, diagnostic);
+                try writer.print(": {s}\n", .{diagnostic.message});
             },
             .compile => {
                 try style(writer, options, .error_label);
                 try writer.writeAll("error");
                 try reset(writer, options);
-                try writer.print(": {s} at {d}:{d}\n", .{
-                    diagnostic.message,
-                    diagnostic.line,
-                    diagnostic.column,
-                });
+                try writer.print(": {s} at ", .{diagnostic.message});
+                try writeLocation(writer, diagnostic);
+                try writer.writeByte('\n');
             },
         },
         .note => {
             try style(writer, options, .note_label);
             try writer.writeAll("note");
             try reset(writer, options);
-            try writer.print(": {s} at {d}:{d}\n", .{
-                diagnostic.message,
-                diagnostic.line,
-                diagnostic.column,
-            });
+            try writer.print(": {s} at ", .{diagnostic.message});
+            try writeLocation(writer, diagnostic);
+            try writer.writeByte('\n');
         },
     }
 
-    const source_line = lineSpan(source, diagnostic.offset);
+    const source_line = lineSpan(diagnostic_source, diagnostic.offset);
     try style(writer, options, .gutter);
-    try writer.print("{d: >4} | {s}\n", .{ diagnostic.line, source[source_line.start..source_line.end] });
+    try writer.print("{d: >4} | {s}\n", .{ diagnostic.line, diagnostic_source[source_line.start..source_line.end] });
     try writer.writeAll("     | ");
     try reset(writer, options);
     try writeSpaces(writer, diagnostic.column - 1);
@@ -189,13 +186,21 @@ fn writeOne(writer: *std.Io.Writer, source: []const u8, diagnostic: Diagnostic, 
     if (diagnostic.token_type == null or diagnostic.token_type.? != .eof) {
         const start: usize = @intCast(diagnostic.offset);
         const len: usize = @intCast(diagnostic.len);
-        if (start <= source.len and len <= source.len - start) {
+        if (start <= diagnostic_source.len and len <= diagnostic_source.len - start) {
             try style(writer, options, .near);
-            try writer.print(" near `{s}`", .{source[start .. start + len]});
+            try writer.print(" near `{s}`", .{diagnostic_source[start .. start + len]});
             try reset(writer, options);
         }
     }
     try writer.writeByte('\n');
+}
+
+fn writeLocation(writer: *std.Io.Writer, diagnostic: Diagnostic) !void {
+    if (diagnostic.source_path) |path| {
+        try writer.print("{s}:{d}:{d}", .{ path, diagnostic.line, diagnostic.column });
+    } else {
+        try writer.print("{d}:{d}", .{ diagnostic.line, diagnostic.column });
+    }
 }
 
 fn writeSpaces(writer: *std.Io.Writer, count: u32) !void {

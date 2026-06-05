@@ -180,13 +180,26 @@ pub const Scanner = struct {
         while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
             self.pos += 1;
         }
-        // Float if dot followed by digit.
-        if (self.pos < self.source.len and self.source[self.pos] == '.' and
-            self.pos + 1 < self.source.len and isDigit(self.source[self.pos + 1]))
-        {
+        if (self.pos < self.source.len and self.source[self.pos] == '.') {
             self.pos += 1; // consume '.'
             while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
                 self.pos += 1;
+            }
+            if (self.pos < self.source.len and (self.source[self.pos] == 'e' or self.source[self.pos] == 'E')) {
+                const exponent_start = self.pos;
+                var exponent_pos = self.pos + 1;
+                if (exponent_pos < self.source.len and (self.source[exponent_pos] == '+' or self.source[exponent_pos] == '-')) {
+                    exponent_pos += 1;
+                }
+                const digits_start = exponent_pos;
+                while (exponent_pos < self.source.len and isDigit(self.source[exponent_pos])) {
+                    exponent_pos += 1;
+                }
+                if (exponent_pos > digits_start) {
+                    self.pos = @intCast(exponent_pos);
+                } else {
+                    self.pos = exponent_start;
+                }
             }
             return self.makeToken(.float_val, start, self.pos - start);
         }
@@ -301,6 +314,16 @@ test "scanner recognizes lambda colon" {
 
     try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
     try std.testing.expectEqual(TokenType.colon, scanner.next().type);
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes Nix float exponent forms" {
+    var scanner = Scanner.init("5.0e-2 1.E+2 1e2");
+
+    try std.testing.expectEqual(TokenType.float_val, scanner.next().type);
+    try std.testing.expectEqual(TokenType.float_val, scanner.next().type);
+    try std.testing.expectEqual(TokenType.integer, scanner.next().type);
     try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
 }

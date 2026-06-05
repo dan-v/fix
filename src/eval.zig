@@ -46,6 +46,8 @@ pub const Evaluator = struct {
     progress: ?eval_progress.Sink,
     worker_count: u8,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    owned_diagnostic_messages: std.ArrayListUnmanaged([]u8),
+    owned_diagnostic_paths: std.ArrayListUnmanaged([]u8),
     trace: EvalTrace,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
@@ -77,13 +79,18 @@ pub const Evaluator = struct {
             .progress = null,
             .worker_count = worker_count,
             .diagnostics = .empty,
+            .owned_diagnostic_messages = .empty,
+            .owned_diagnostic_paths = .empty,
             .trace = EvalTrace.init(allocator),
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
         if (self.base_path) |path| self.allocator.free(path);
+        self.clearDiagnostics();
         self.trace.deinit();
+        self.owned_diagnostic_paths.deinit(self.allocator);
+        self.owned_diagnostic_messages.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
         var imports_iter = self.imports.iterator();
         while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
@@ -177,13 +184,36 @@ pub const Evaluator = struct {
     }
 
     fn clearDiagnostics(self: *Evaluator) void {
+        for (self.owned_diagnostic_messages.items) |message| {
+            self.allocator.free(message);
+        }
+        for (self.owned_diagnostic_paths.items) |path| {
+            self.allocator.free(path);
+        }
+        self.owned_diagnostic_messages.clearRetainingCapacity();
+        self.owned_diagnostic_paths.clearRetainingCapacity();
         self.diagnostics.clearRetainingCapacity();
         self.trace.clear();
     }
 
-    fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic) !void {
+    fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
         self.clearDiagnostics();
-        try self.diagnostics.appendSlice(self.allocator, diagnostics);
+        try self.diagnostics.ensureUnusedCapacity(self.allocator, diagnostics.len);
+        try self.owned_diagnostic_messages.ensureUnusedCapacity(self.allocator, diagnostics.len);
+        try self.owned_diagnostic_paths.ensureUnusedCapacity(self.allocator, diagnostics.len);
+        for (diagnostics) |diag| {
+            var copy = diag;
+            const message = try self.allocator.dupe(u8, diag.message);
+            self.owned_diagnostic_messages.appendAssumeCapacity(message);
+            copy.message = message;
+            copy.source = diag.source orelse source;
+            if (diag.source_path orelse source_path) |path| {
+                const owned_path = try self.allocator.dupe(u8, path);
+                self.owned_diagnostic_paths.appendAssumeCapacity(owned_path);
+                copy.source_path = owned_path;
+            }
+            self.diagnostics.appendAssumeCapacity(copy);
+        }
     }
 
     /// Compile source text into bytecode and evaluate it.
@@ -214,7 +244,7 @@ pub const Evaluator = struct {
             self.progressBegin(.parse, subject);
             defer self.progressEnd(.parse, subject);
             break :blk parser.parse() catch {
-                try self.copyDiagnostics(parser.diagnostics.items);
+                try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
                 return error.ParseError;
             };
         };
@@ -238,7 +268,7 @@ pub const Evaluator = struct {
             self.progressBegin(.compile, subject);
             defer self.progressEnd(.compile, subject);
             compiler.compileWithScope(ast_node, scope) catch |err| {
-                try self.copyDiagnostics(compiler.diagnostics.items);
+                try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 if (preserveCompileError(err)) return err;
                 return error.CompileError;
             };
@@ -2800,6 +2830,10 @@ test "evaluate function metadata builtins" {
     defer std.testing.allocator.free(pos);
     try std.testing.expectEqualStrings("null", pos);
 
+    const expr_cur_pos = try renderForTest("let __curPos = 7; in __curPos");
+    defer std.testing.allocator.free(expr_cur_pos);
+    try std.testing.expectEqualStrings("null", expr_cur_pos);
+
     const imported_pos = try renderForTestFromCurrentPath("builtins.toJSON (builtins.unsafeGetAttrPos \"value\" (import ./test/fuzz-corpus/imported.nix))");
     defer std.testing.allocator.free(imported_pos);
 
@@ -2812,6 +2846,16 @@ test "evaluate function metadata builtins" {
     );
     defer std.testing.allocator.free(expected_imported_pos);
     try std.testing.expectEqualStrings(expected_imported_pos, imported_pos);
+
+    const cur_pos = try renderForTestFromCurrentPath("builtins.toJSON (import ./test/curpos.nix)");
+    defer std.testing.allocator.free(cur_pos);
+    const expected_cur_pos = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"{{\\\"column\\\":12,\\\"file\\\":\\\"{s}/test/curpos.nix\\\",\\\"line\\\":2}}\"",
+        .{cwd},
+    );
+    defer std.testing.allocator.free(expected_cur_pos);
+    try std.testing.expectEqualStrings(expected_cur_pos, cur_pos);
 }
 
 test "evaluate foldl' builtin" {
@@ -2884,7 +2928,7 @@ test "evaluate exposes undefined variable diagnostics" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
     try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
     try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
-    try std.testing.expectEqualStrings("undefined variable", diagnostics[0].message);
+    try std.testing.expectEqualStrings("undefined variable 'x'", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 8), diagnostics[0].offset);
     try std.testing.expectEqual(@as(u32, 9), diagnostics[0].column);
 }

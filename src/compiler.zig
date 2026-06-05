@@ -57,6 +57,8 @@ const AttrEntryGroup = struct {
     name_id: InternId,
     leaf: ?AttrEntryView = null,
     duplicate_leaf: ?AttrEntryView = null,
+    leaves: []AttrEntryView = &.{},
+    leaf_count: usize = 0,
     first_nested: ?AttrEntryView = null,
     tails: []AttrEntryView = &.{},
     tail_count: usize = 0,
@@ -64,9 +66,11 @@ const AttrEntryGroup = struct {
 
 const AttrEntryGroups = struct {
     groups: []AttrEntryGroup = &.{},
+    leaves: []AttrEntryView = &.{},
     tails: []AttrEntryView = &.{},
 
     fn deinit(self: *AttrEntryGroups, allocator: std.mem.Allocator) void {
+        allocator.free(self.leaves);
         allocator.free(self.tails);
         allocator.free(self.groups);
         self.* = .{};
@@ -92,6 +96,7 @@ pub const Compiler = struct {
     captures: std.ArrayListUnmanaged(Capture),
     with_scopes: std.ArrayListUnmanaged(WithScope),
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    owned_diagnostic_messages: std.ArrayListUnmanaged([]u8),
     line_index: diagnostic.LineIndex,
     line_index_ready: bool,
     parent: ?*Compiler,
@@ -119,6 +124,7 @@ pub const Compiler = struct {
             .captures = .empty,
             .with_scopes = .empty,
             .diagnostics = .empty,
+            .owned_diagnostic_messages = .empty,
             .line_index = .empty,
             .line_index_ready = false,
             .parent = null,
@@ -129,6 +135,10 @@ pub const Compiler = struct {
     }
 
     pub fn deinit(self: *Compiler) void {
+        for (self.owned_diagnostic_messages.items) |message| {
+            self.allocator.free(message);
+        }
+        self.owned_diagnostic_messages.deinit(self.allocator);
         self.with_scopes.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
@@ -199,6 +209,7 @@ pub const Compiler = struct {
             .attr_or => try self.compileAttrOr(node),
             .has_attr => try self.compileHasAttr(node),
             .has_attr_dynamic => try self.compileHasAttrDynamic(node),
+            .has_attr_mixed => try self.compileHasAttrMixed(node),
             .list => try self.compileList(node),
             .parens => try self.compileNode(node.data.parens),
         }
@@ -458,7 +469,9 @@ pub const Compiler = struct {
 
     fn compileIdent(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-        if (self.resolveLocal(span)) |slot| {
+        if (std.mem.eql(u8, span, "__curPos")) {
+            try self.compileCurPos(node.data.atom);
+        } else if (self.resolveLocal(span)) |slot| {
             try self.emitGetLocal(slot);
         } else if (try self.resolveCapture(span)) |slot| {
             try self.emitOpU16(.get_upvalue, slot);
@@ -469,9 +482,32 @@ pub const Compiler = struct {
         } else if (try self.emitWithLookup(span)) {
             return;
         } else {
-            try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "undefined variable");
+            const message = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{span});
+            try self.owned_diagnostic_messages.append(self.allocator, message);
+            try self.reportCompileError(node.data.atom.offset, node.data.atom.len, message);
             return error.UndefinedVariable;
         }
+    }
+
+    fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
+        if (self.source_path == null) {
+            try self.emitOp(.push_null);
+            return;
+        }
+
+        const file_id = try self.intern.intern("file");
+        const line_id = try self.intern.intern("line");
+        const column_id = try self.intern.intern("column");
+        const source_path_id = try self.sourceFileId();
+        const position = try self.sourcePositionForOffset(atom.offset);
+
+        try self.emitAttrNameId(file_id);
+        try self.builder.emitConstant(self.allocator, Value.string(source_path_id));
+        try self.emitAttrNameId(line_id);
+        try self.builder.emitConstant(self.allocator, Value.int(position.line));
+        try self.emitAttrNameId(column_id);
+        try self.builder.emitConstant(self.allocator, Value.int(position.column));
+        try self.emitOpU16(.build_attrs, 3);
     }
 
     fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
@@ -605,7 +641,7 @@ pub const Compiler = struct {
         const param_id = try self.intern.intern(param_name);
         _ = try child.declareLocal(param_name, param_id);
         child.compileNode(lambda.body) catch |err| {
-            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            try self.absorbChildDiagnostics(&child);
             return err;
         };
         try child.emitOp(.ret);
@@ -687,7 +723,7 @@ pub const Compiler = struct {
         }
 
         child.compileNode(lambda.body) catch |err| {
-            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            try self.absorbChildDiagnostics(&child);
             return err;
         };
         try child.emitOp(.ret);
@@ -809,11 +845,12 @@ pub const Compiler = struct {
                 try self.reportDuplicateAttribute(tails[0].path[0], root_leaf.path[0]);
                 return error.DuplicateAttribute;
             }
-            return self.compileExtendedAttrSetLiteralThunk(.{
+            const leaves = [_]AttrEntryView{.{
                 .path = root_leaf.path,
                 .expr = root_leaf.expr,
                 .inherit_outer = root_leaf.inherit_outer,
-            }, tails);
+            }};
+            return self.compileExtendedAttrSetLiteralThunk(&leaves, tails);
         }
 
         return self.compileAttrEntriesThunk(tails, true);
@@ -848,6 +885,13 @@ pub const Compiler = struct {
         });
     }
 
+    fn absorbChildDiagnostics(self: *Compiler, child: *Compiler) !void {
+        try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+        child.diagnostics.clearRetainingCapacity();
+        try self.owned_diagnostic_messages.appendSlice(self.allocator, child.owned_diagnostic_messages.items);
+        child.owned_diagnostic_messages.clearRetainingCapacity();
+    }
+
     fn compileThunk(self: *Compiler, expr: *const Node) !void {
         var child_builder = try ChunkBuilder.init(self.allocator);
         defer child_builder.deinit(self.allocator);
@@ -866,7 +910,7 @@ pub const Compiler = struct {
         defer child.deinit();
 
         child.compileNode(expr) catch |err| {
-            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            try self.absorbChildDiagnostics(&child);
             return err;
         };
         try child.emitOp(.ret);
@@ -877,6 +921,14 @@ pub const Compiler = struct {
         try self.emitCaptures(child.captures.items);
         try self.emitClosure(child_id, try captureCount(child.captures.items.len));
         try self.emitOp(.make_thunk);
+    }
+
+    fn compileStringAtomThunk(self: *Compiler, atom: Node.Atom) !void {
+        var node = Node{
+            .tag = .string,
+            .data = .{ .atom = atom },
+        };
+        try self.compileThunk(&node);
     }
 
     fn emitCaptures(self: *Compiler, captures: []const Capture) !void {
@@ -1095,7 +1147,7 @@ pub const Compiler = struct {
         defer child.deinit();
 
         child.compileMixedAttrSet(entries, recursive) catch |err| {
-            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            try self.absorbChildDiagnostics(&child);
             return err;
         };
         try child.emitOp(.ret);
@@ -1148,11 +1200,6 @@ pub const Compiler = struct {
         positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
         group: AttrEntryGroup,
     ) anyerror!void {
-        if (group.duplicate_leaf) |duplicate| {
-            try self.reportDuplicateAttribute(duplicate.path[0], group.leaf.?.path[0]);
-            return error.DuplicateAttribute;
-        }
-
         const leaf = group.leaf;
         if (leaf == null) {
             try self.emitAttrNameId(group.name_id);
@@ -1161,13 +1208,17 @@ pub const Compiler = struct {
             return;
         }
 
-        if (group.tails.len > 0) {
-            if (leaf.?.expr.tag != .attr_set) {
-                try self.reportDuplicateAttribute(group.first_nested.?.path[0], leaf.?.path[0]);
+        if (group.leaf_count > 1 or group.tails.len > 0) {
+            const duplicate = if (leaf.?.expr.tag != .attr_set)
+                group.duplicate_leaf orelse group.first_nested
+            else
+                self.nonAttrSetDuplicateLeaf(group);
+            if (duplicate) |entry| {
+                try self.reportDuplicateAttribute(entry.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
             }
             try self.emitAttrNameId(group.name_id);
-            try self.compileExtendedAttrSetLiteralThunk(leaf.?, group.tails);
+            try self.compileExtendedAttrSetLiteralThunk(group.leaves, group.tails);
             try self.appendAttrPosition(positions, group.first, group.name_id);
             return;
         }
@@ -1189,10 +1240,6 @@ pub const Compiler = struct {
     fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
         for (groups) |group| {
             const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
-            if (group.duplicate_leaf) |duplicate| {
-                try self.reportDuplicateAttribute(duplicate.path[0], group.leaf.?.path[0]);
-                return error.DuplicateAttribute;
-            }
             const leaf = group.leaf;
             if (leaf == null) {
                 try self.compileAttrEntriesThunk(group.tails, false);
@@ -1200,12 +1247,16 @@ pub const Compiler = struct {
                 continue;
             }
 
-            if (group.tails.len > 0) {
-                if (leaf.?.expr.tag != .attr_set) {
-                    try self.reportDuplicateAttribute(group.first_nested.?.path[0], leaf.?.path[0]);
+            if (group.leaf_count > 1 or group.tails.len > 0) {
+                const duplicate = if (leaf.?.expr.tag != .attr_set)
+                    group.duplicate_leaf orelse group.first_nested
+                else
+                    self.nonAttrSetDuplicateLeaf(group);
+                if (duplicate) |entry| {
+                    try self.reportDuplicateAttribute(entry.path[0], leaf.?.path[0]);
                     return error.DuplicateAttribute;
                 }
-                try self.compileExtendedAttrSetLiteralThunk(leaf.?, group.tails);
+                try self.compileExtendedAttrSetLiteralThunk(group.leaves, group.tails);
                 try self.emitSetCellLocal(slot);
                 continue;
             }
@@ -1233,14 +1284,27 @@ pub const Compiler = struct {
         try self.emitBuildAttrs(@intCast(groups.len), positions.items);
     }
 
-    fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {
-        std.debug.assert(leaf.expr.tag == .attr_set);
-        const attr_set = leaf.expr.data.attr_set;
+    fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {
+        std.debug.assert(leaves.len > 0);
+        std.debug.assert(leaves[0].expr.tag == .attr_set);
+        const first_attr_set = leaves[0].expr.data.attr_set;
 
-        const merged = try self.allocator.alloc(Node.AttrSetEntry, attr_set.entries.len + tails.len);
+        var merged_count: usize = tails.len;
+        for (leaves) |leaf| {
+            std.debug.assert(leaf.expr.tag == .attr_set);
+            merged_count += leaf.expr.data.attr_set.entries.len;
+        }
+
+        const merged = try self.allocator.alloc(Node.AttrSetEntry, merged_count);
         defer self.allocator.free(merged);
-        @memcpy(merged[0..attr_set.entries.len], attr_set.entries);
-        for (tails, merged[attr_set.entries.len..]) |tail, *entry| {
+
+        var index: usize = 0;
+        for (leaves) |leaf| {
+            const attr_set = leaf.expr.data.attr_set;
+            @memcpy(merged[index .. index + attr_set.entries.len], attr_set.entries);
+            index += attr_set.entries.len;
+        }
+        for (tails, merged[index..]) |tail, *entry| {
             entry.* = .{
                 .path = @constCast(tail.path),
                 .expr = @constCast(tail.expr),
@@ -1248,7 +1312,16 @@ pub const Compiler = struct {
             };
         }
 
-        try self.compileNodeAttrEntriesThunk(merged, attr_set.recursive);
+        try self.compileNodeAttrEntriesThunk(merged, first_attr_set.recursive);
+    }
+
+    fn nonAttrSetDuplicateLeaf(self: *Compiler, group: AttrEntryGroup) ?AttrEntryView {
+        _ = self;
+        if (group.leaves.len <= 1) return null;
+        for (group.leaves[1..]) |leaf| {
+            if (leaf.expr.tag != .attr_set) return leaf;
+        }
+        return null;
     }
 
     fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
@@ -1269,7 +1342,7 @@ pub const Compiler = struct {
         defer child.deinit();
 
         child.compileAttrEntries(entries, recursive) catch |err| {
-            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            try self.absorbChildDiagnostics(&child);
             return err;
         };
         try child.emitOp(.ret);
@@ -1298,6 +1371,7 @@ pub const Compiler = struct {
         var groups_list: std.ArrayListUnmanaged(AttrEntryGroup) = .empty;
         errdefer groups_list.deinit(self.allocator);
 
+        var total_leaves: usize = 0;
         var total_tails: usize = 0;
         for (entries) |entry| {
             if (entry.path.len == 0) return error.InvalidAttributePath;
@@ -1316,6 +1390,8 @@ pub const Compiler = struct {
 
             const group = &groups_list.items[index];
             if (entry.path.len == 1) {
+                group.leaf_count += 1;
+                total_leaves += 1;
                 if (group.leaf == null) {
                     group.leaf = entry;
                 } else if (group.duplicate_leaf == null) {
@@ -1331,8 +1407,18 @@ pub const Compiler = struct {
         var groups = try groups_list.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(groups);
 
+        const leaves = try self.allocator.alloc(AttrEntryView, total_leaves);
+        errdefer self.allocator.free(leaves);
         const tails = try self.allocator.alloc(AttrEntryView, total_tails);
         errdefer self.allocator.free(tails);
+
+        var leaf_start: usize = 0;
+        for (groups) |*group| {
+            const leaf_end = leaf_start + group.leaf_count;
+            group.leaves = leaves[leaf_start..leaf_end];
+            group.leaf_count = 0;
+            leaf_start = leaf_end;
+        }
 
         var tail_start: usize = 0;
         for (groups) |*group| {
@@ -1343,9 +1429,13 @@ pub const Compiler = struct {
         }
 
         for (entries) |entry| {
-            if (entry.path.len <= 1) continue;
             const index = group_index.get(self.attrSegmentSpan(entry.path[0])).?;
             const group = &groups[index];
+            if (entry.path.len == 1) {
+                group.leaves[group.leaf_count] = entry;
+                group.leaf_count += 1;
+                continue;
+            }
             group.tails[group.tail_count] = .{
                 .path = entry.path[1..],
                 .expr = entry.expr,
@@ -1354,7 +1444,7 @@ pub const Compiler = struct {
             group.tail_count += 1;
         }
 
-        return .{ .groups = groups, .tails = tails };
+        return .{ .groups = groups, .leaves = leaves, .tails = tails };
     }
 
     fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
@@ -1427,7 +1517,7 @@ pub const Compiler = struct {
             if (dynamic.root.tag == .attr_path) {
                 const root_path = dynamic.root.data.attr_path;
                 try self.compileNode(root_path.root);
-                try self.compileNode(dynamic.name);
+                try self.compileThunk(dynamic.name);
                 try self.compileThunk(attr_or.default);
                 var wide = false;
                 for (root_path.segments) |seg| {
@@ -1444,7 +1534,7 @@ pub const Compiler = struct {
                 return;
             }
             try self.compileNode(dynamic.root);
-            try self.compileNode(dynamic.name);
+            try self.compileThunk(dynamic.name);
             try self.compileThunk(attr_or.default);
             try self.emitOp(.get_attr_dynamic_or);
             return;
@@ -1456,7 +1546,7 @@ pub const Compiler = struct {
             var dynamic_count: usize = 0;
             for (apath.segments) |seg| {
                 if (self.attrSegmentHasInterpolation(seg)) {
-                    try self.compileStringAtom(seg);
+                    try self.compileStringAtomThunk(seg);
                     dynamic_count += 1;
                 }
             }
@@ -1501,6 +1591,28 @@ pub const Compiler = struct {
     fn compileHasAttr(self: *Compiler, node: *const Node) !void {
         const has_attr = node.data.has_attr;
         try self.compileNode(has_attr.root);
+        if (self.hasAttrSegmentsHaveInterpolation(has_attr.segments)) {
+            var dynamic_count: usize = 0;
+            for (has_attr.segments) |seg| {
+                if (self.attrSegmentHasInterpolation(seg)) {
+                    try self.compileStringAtomThunk(seg);
+                    dynamic_count += 1;
+                }
+            }
+            try self.emitOp(.has_attr_path_mixed);
+            try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
+            try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+            for (has_attr.segments) |seg| {
+                if (self.attrSegmentHasInterpolation(seg)) {
+                    try self.builder.writeByte(self.allocator, 1);
+                } else {
+                    try self.builder.writeByte(self.allocator, 0);
+                    try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(seg)));
+                }
+            }
+            return;
+        }
+
         var wide = false;
         for (has_attr.segments) |seg| {
             const name_span = self.attrSegmentSpan(seg);
@@ -1520,6 +1632,50 @@ pub const Compiler = struct {
         try self.compileNode(dynamic.root);
         try self.compileNode(dynamic.name);
         try self.emitOp(.has_attr_dynamic);
+    }
+
+    fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
+        const has_attr = node.data.has_attr_mixed;
+        try self.compileNode(has_attr.root);
+        var dynamic_count: usize = 0;
+        for (has_attr.segments) |segment| {
+            switch (segment) {
+                .static => |atom| {
+                    if (self.attrSegmentHasInterpolation(atom)) {
+                        try self.compileStringAtomThunk(atom);
+                        dynamic_count += 1;
+                    }
+                },
+                .dynamic => |name| {
+                    try self.compileThunk(name);
+                    dynamic_count += 1;
+                },
+            }
+        }
+
+        try self.emitOp(.has_attr_path_mixed);
+        try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
+        try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+        for (has_attr.segments) |segment| {
+            switch (segment) {
+                .static => |atom| {
+                    if (self.attrSegmentHasInterpolation(atom)) {
+                        try self.builder.writeByte(self.allocator, 1);
+                    } else {
+                        try self.builder.writeByte(self.allocator, 0);
+                        try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(atom)));
+                    }
+                },
+                .dynamic => try self.builder.writeByte(self.allocator, 1),
+            }
+        }
+    }
+
+    fn hasAttrSegmentsHaveInterpolation(self: *Compiler, segments: []const Node.Atom) bool {
+        for (segments) |segment| {
+            if (self.attrSegmentHasInterpolation(segment)) return true;
+        }
+        return false;
     }
 
     fn compileList(self: *Compiler, node: *const Node) !void {
@@ -1802,6 +1958,7 @@ fn nodeSourceSpan(node: *const Node) ?Node.Atom {
         .attr_or => combineNodeSpans(node.data.attr_or.attr_path, node.data.attr_or.default),
         .has_attr => hasAttrSourceSpan(node.data.has_attr),
         .has_attr_dynamic => combineNodeSpans(node.data.has_attr_dynamic.root, node.data.has_attr_dynamic.name),
+        .has_attr_mixed => hasAttrMixedSourceSpan(node.data.has_attr_mixed),
         .list => listSourceSpan(node.data.list),
         .parens => nodeSourceSpan(node.data.parens),
     };
@@ -1868,6 +2025,17 @@ fn attrPathSourceSpan(attr_path: Node.AttrPath) ?Node.Atom {
 fn hasAttrSourceSpan(has_attr: Node.HasAttr) ?Node.Atom {
     var span = nodeSourceSpan(has_attr.root);
     for (has_attr.segments) |segment| span = combineAtoms(span, segment);
+    return span;
+}
+
+fn hasAttrMixedSourceSpan(has_attr: Node.HasAttrMixed) ?Node.Atom {
+    var span = nodeSourceSpan(has_attr.root);
+    for (has_attr.segments) |segment| {
+        span = switch (segment) {
+            .static => |atom| combineAtoms(span, atom),
+            .dynamic => |node| combineAtoms(span, nodeSourceSpan(node)),
+        };
+    }
     return span;
 }
 
@@ -1961,6 +2129,15 @@ fn offsetNode(node: *Node, offset: u32) void {
         .has_attr_dynamic => {
             offsetNode(node.data.has_attr_dynamic.root, offset);
             offsetNode(node.data.has_attr_dynamic.name, offset);
+        },
+        .has_attr_mixed => {
+            offsetNode(node.data.has_attr_mixed.root, offset);
+            for (node.data.has_attr_mixed.segments) |*segment| {
+                switch (segment.*) {
+                    .static => |*atom| atom.offset += offset,
+                    .dynamic => |dynamic| offsetNode(dynamic, offset),
+                }
+            }
         },
         .list => {
             for (node.data.list.items) |item| {

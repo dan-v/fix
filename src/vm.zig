@@ -626,10 +626,9 @@ pub const VM = struct {
                     const names_start = frame.ip;
                     frame.ip += @as(usize, segment_count) * 2;
                     const default_val = self.pop();
-                    const name_val = try self.forceValue(self.pop());
-                    if (name_val.discriminant != .string) return error.TypeError;
+                    const name_val = self.pop();
                     const attrs_val = self.pop();
-                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val.asInternId(), default_val, code[names_start..frame.ip], false);
+                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val, default_val, code[names_start..frame.ip], false);
                     try self.push(result);
                 },
                 .get_attr_path_dynamic_or_long => {
@@ -638,10 +637,9 @@ pub const VM = struct {
                     const names_start = frame.ip;
                     frame.ip += @as(usize, segment_count) * 4;
                     const default_val = self.pop();
-                    const name_val = try self.forceValue(self.pop());
-                    if (name_val.discriminant != .string) return error.TypeError;
+                    const name_val = self.pop();
                     const attrs_val = self.pop();
-                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val.asInternId(), default_val, code[names_start..frame.ip], true);
+                    const result = try self.getAttrPathDynamicOrValue(attrs_val, name_val, default_val, code[names_start..frame.ip], true);
                     try self.push(result);
                 },
                 .get_attr_path_or => {
@@ -680,14 +678,12 @@ pub const VM = struct {
                         }
                     }
                     const default_val = self.pop();
-                    const dynamic_names = try self.allocator.alloc(InternId, dynamic_count);
+                    const dynamic_names = try self.allocator.alloc(Value, dynamic_count);
                     defer self.allocator.free(dynamic_names);
                     var dynamic_i: usize = dynamic_count;
                     while (dynamic_i > 0) {
                         dynamic_i -= 1;
-                        const name_val = try self.forceValue(self.pop());
-                        if (name_val.discriminant != .string) return error.TypeError;
-                        dynamic_names[dynamic_i] = name_val.asInternId();
+                        dynamic_names[dynamic_i] = self.pop();
                     }
                     const attrs_val = self.pop();
                     const result = try self.getAttrPathMixedOrValue(attrs_val, dynamic_names, default_val, code[segments_start..frame.ip], segment_count);
@@ -724,6 +720,31 @@ pub const VM = struct {
                         };
                         try self.push(Value.boolVal(present));
                     }
+                },
+                .has_attr_path_mixed => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const dynamic_count = code[frame.ip];
+                    frame.ip += 1;
+                    const segments_start = frame.ip;
+                    for (0..segment_count) |_| {
+                        const tag = code[frame.ip];
+                        frame.ip += 1;
+                        switch (tag) {
+                            0 => frame.ip += 4,
+                            1 => {},
+                            else => return error.InvalidBytecode,
+                        }
+                    }
+                    const dynamic_names = try self.allocator.alloc(Value, dynamic_count);
+                    defer self.allocator.free(dynamic_names);
+                    var dynamic_i: usize = dynamic_count;
+                    while (dynamic_i > 0) {
+                        dynamic_i -= 1;
+                        dynamic_names[dynamic_i] = self.pop();
+                    }
+                    const attrs_val = self.pop();
+                    try self.push(Value.boolVal(try self.hasAttrPathMixed(attrs_val, dynamic_names, code[segments_start..frame.ip], segment_count)));
                 },
                 .validate_attrs => {
                     const allow_extra = code[frame.ip] != 0;
@@ -1573,7 +1594,7 @@ pub const VM = struct {
         return current;
     }
 
-    fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: InternId, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
+    fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
         var current = try self.forceValue(attrs_val);
         var offset: usize = 0;
         const stride: usize = if (wide) 4 else 2;
@@ -1586,32 +1607,36 @@ pub const VM = struct {
             };
             current = try self.forceValue(current);
         }
+        const name_val = try self.forceValue(dynamic_name);
+        if (name_val.discriminant != .string) return error.TypeError;
         if (current.discriminant != .attrs) return self.forceValue(default_val);
-        const result = self.heap.getAttrValue(current.asObjectId(), dynamic_name) catch |err| switch (err) {
+        const result = self.heap.getAttrValue(current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
             error.MissingAttribute => return self.forceValue(default_val),
             else => return err,
         };
         return self.forceValue(result);
     }
 
-    fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const InternId, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
+    fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const Value, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
         var current = try self.forceValue(attrs_val);
         var offset: usize = 0;
         var dynamic_i: usize = 0;
         for (0..segment_count) |_| {
-            if (current.discriminant != .attrs) return self.forceValue(default_val);
             const tag = encoded_segments[offset];
             offset += 1;
             const name_id: InternId = switch (tag) {
                 0 => name: {
+                    if (current.discriminant != .attrs) return self.forceValue(default_val);
                     const id = readU32(encoded_segments, offset);
                     offset += 4;
                     break :name id;
                 },
                 1 => name: {
-                    const id = dynamic_names[dynamic_i];
+                    const name_val = try self.forceValue(dynamic_names[dynamic_i]);
+                    if (name_val.discriminant != .string) return error.TypeError;
                     dynamic_i += 1;
-                    break :name id;
+                    if (current.discriminant != .attrs) return self.forceValue(default_val);
+                    break :name name_val.asInternId();
                 },
                 else => return error.InvalidBytecode,
             };
@@ -1636,6 +1661,39 @@ pub const VM = struct {
                 else => return err,
             };
             if (offset + stride >= encoded_names.len) return true;
+            current = try self.forceValue(attr);
+        }
+        return false;
+    }
+
+    fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Value, encoded_segments: []const u8, segment_count: usize) !bool {
+        var current = try self.forceValue(attrs_val);
+        var offset: usize = 0;
+        var dynamic_i: usize = 0;
+        for (0..segment_count) |segment_index| {
+            const tag = encoded_segments[offset];
+            offset += 1;
+            const name_id: InternId = switch (tag) {
+                0 => name: {
+                    if (current.discriminant != .attrs) return false;
+                    const id = readU32(encoded_segments, offset);
+                    offset += 4;
+                    break :name id;
+                },
+                1 => name: {
+                    const name_val = try self.forceValue(dynamic_names[dynamic_i]);
+                    if (name_val.discriminant != .string) return error.TypeError;
+                    dynamic_i += 1;
+                    if (current.discriminant != .attrs) return false;
+                    break :name name_val.asInternId();
+                },
+                else => return error.InvalidBytecode,
+            };
+            const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => return false,
+                else => return err,
+            };
+            if (segment_index + 1 == segment_count) return true;
             current = try self.forceValue(attr);
         }
         return false;

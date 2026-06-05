@@ -60,6 +60,9 @@ test "end-to-end: float arithmetic" {
     const nested = try ev.evaluate("(1.5 + 2) * 2");
     try std.testing.expectEqual(@as(f64, 7.0), nested.asFloat());
 
+    const exponent = try ev.evaluate("5.0e-2 + 1.E+2");
+    try std.testing.expectEqual(@as(f64, 100.05), exponent.asFloat());
+
     const runtime_add = try ev.evaluate("let x = 1.5; in x + 2");
     try std.testing.expectEqual(@as(f64, 3.5), runtime_add.asFloat());
 
@@ -135,6 +138,12 @@ test "end-to-end: string interpolation" {
 
     const bound = try ev.evaluate("let x = \"b\"; in \"a${x}c\"");
     try std.testing.expectEqualStrings("abc", ev.intern.get(bound.asInternId()));
+
+    const inherit_source = try ev.evaluate(
+        \\let cfg = { host = "127.0.0.1"; port = 5000; threads = 8; };
+        \\in "${({ inherit (cfg) host port threads; }).host}"
+    );
+    try std.testing.expectEqualStrings("127.0.0.1", ev.intern.get(inherit_source.asInternId()));
 
     try std.testing.expectError(error.TypeError, ev.evaluate("\"a${1}c\""));
 }
@@ -270,6 +279,18 @@ test "end-to-end: dynamic attribute selection" {
     const has_dynamic = try ev.evaluate("let key = \"x\"; in { x = 1; } ? ${key}");
     try std.testing.expect(has_dynamic.asBool());
 
+    const has_dynamic_tail = try ev.evaluate("let key = \"b\"; in { a.b = 1; } ? a.${key}");
+    try std.testing.expect(has_dynamic_tail.asBool());
+
+    const has_dynamic_head = try ev.evaluate("let key = \"a\"; in { a.b = 1; } ? ${key}.b");
+    try std.testing.expect(has_dynamic_head.asBool());
+
+    const has_dynamic_missing_prefix = try ev.evaluate("let key = throw \"unused\"; in {} ? a.${key}");
+    try std.testing.expect(!has_dynamic_missing_prefix.asBool());
+
+    const has_interpolated_string = try ev.evaluate("let key = \"x\"; in { x = 1; } ? \"${key}\"");
+    try std.testing.expect(has_interpolated_string.asBool());
+
     const quoted_interpolation = try ev.evaluate("let key = \"x\"; in { x = 1; }.\"${key}\"");
     try std.testing.expectEqual(@as(i64, 1), quoted_interpolation.asInt());
 }
@@ -324,12 +345,12 @@ test "end-to-end: undefined variables are rejected with source diagnostics" {
 
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("x"));
     try std.testing.expectEqual(@as(usize, 1), ev.getDiagnostics().len);
-    try std.testing.expectEqualStrings("undefined variable", ev.getDiagnostics()[0].message);
+    try std.testing.expectEqualStrings("undefined variable 'x'", ev.getDiagnostics()[0].message);
     try std.testing.expectEqual(@as(u32, 0), ev.getDiagnostics()[0].offset);
 
     try std.testing.expectError(error.UndefinedVariable, ev.evaluate("{ inherit x; }"));
     try std.testing.expectEqual(@as(usize, 1), ev.getDiagnostics().len);
-    try std.testing.expectEqualStrings("undefined variable", ev.getDiagnostics()[0].message);
+    try std.testing.expectEqualStrings("undefined variable 'x'", ev.getDiagnostics()[0].message);
     try std.testing.expectEqual(@as(u32, 10), ev.getDiagnostics()[0].offset);
 }
 
@@ -559,6 +580,12 @@ test "end-to-end: nested attribute declarations" {
     const quoted = try ev.evaluate("({ a.\"b\" = 3; }).a.b");
     try std.testing.expectEqual(@as(i64, 3), quoted.asInt());
 
+    const dynamic_head_decl = try ev.evaluate("let iface = \"eth0\"; network = \"1111::/64\"; in ({ ${iface}.rules.${network} = 7; }).eth0.rules.\"1111::/64\"");
+    try std.testing.expectEqual(@as(i64, 7), dynamic_head_decl.asInt());
+
+    const alternating_dynamic_decl = try ev.evaluate("let x = \"b\"; y = \"d\"; in ({ a.${x}.c.${y}.e = 9; }).a.b.c.d.e");
+    try std.testing.expectEqual(@as(i64, 9), alternating_dynamic_decl.asInt());
+
     const lazy = try ev.evaluate("({ a.b = 1; a.c = 1 / 0; }).a.b");
     try std.testing.expectEqual(@as(i64, 1), lazy.asInt());
 
@@ -574,8 +601,19 @@ test "end-to-end: nested attribute declarations" {
     const rec_scope = try ev.evaluate("({ a = rec { x = y; }; a.y = 1; }).a.x");
     try std.testing.expectEqual(@as(i64, 1), rec_scope.asInt());
 
+    const duplicate_empty_attrset = try ev.evaluate("({ groups = { video = { }; audio = { }; video = { }; }; }).groups ? video");
+    try std.testing.expect(duplicate_empty_attrset.asBool());
+
+    const duplicate_attrset_merge = try ev.evaluate("({ a = { x = 1; }; a = { y = 2; }; }).a.y");
+    try std.testing.expectEqual(@as(i64, 2), duplicate_attrset_merge.asInt());
+
+    const duplicate_rec_scope = try ev.evaluate("({ a = rec { x = y; }; a = { y = 1; }; }).a.x");
+    try std.testing.expectEqual(@as(i64, 1), duplicate_rec_scope.asInt());
+
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a.b = 2; }"));
     try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = { }; }"));
+    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = { x = 1; }; a = { x = 1; }; }"));
 }
 
 test "end-to-end: attrset update operator" {
@@ -613,6 +651,9 @@ test "end-to-end: attr path or defaults" {
 
     const dynamic_missing_mid = try ev.evaluate("let key = \"b\"; in ({}).a.${key} or 2");
     try std.testing.expectEqual(@as(i64, 2), dynamic_missing_mid.asInt());
+
+    const dynamic_missing_mid_lazy = try ev.evaluate("let key = throw \"unused\"; in ({}).a.${key} or 2");
+    try std.testing.expectEqual(@as(i64, 2), dynamic_missing_mid_lazy.asInt());
 
     const interpolated_present = try ev.evaluate("({ \"15\" = [ 1 2 ]; }.\"${\"15\"}\" or [ ])");
     try std.testing.expectEqual(@as(usize, 2), (try ev.heap.getList(interpolated_present.asObjectId())).len);

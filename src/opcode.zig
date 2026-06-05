@@ -167,6 +167,11 @@ pub const OpCode = enum(u8) {
     /// Test whether a runtime string attribute exists.
     /// Stack layout before: [attrs, name].
     has_attr_dynamic,
+    /// Test whether an attribute path containing static and runtime string
+    /// segments exists without forcing the final value.
+    /// Operand: same segment stream as get_attr_path_mixed_or.
+    /// Stack layout before: [attrs, dynamic_name_thunk...].
+    has_attr_path_mixed,
     /// Validate an attrset function argument.
     /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
     /// Stack layout before: [attrs].
