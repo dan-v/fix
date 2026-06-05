@@ -14,3 +14,4 @@ err.txt
 out.txt
 *.log
 *.tmp
+perf.data*

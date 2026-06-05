@@ -51,6 +51,28 @@ const AttrEntryView = struct {
     inherit_outer: bool = false,
 };
 
+const AttrEntryGroup = struct {
+    first: Node.Atom,
+    name: []const u8,
+    name_id: InternId,
+    leaf: ?AttrEntryView = null,
+    duplicate_leaf: ?AttrEntryView = null,
+    first_nested: ?AttrEntryView = null,
+    tails: []AttrEntryView = &.{},
+    tail_count: usize = 0,
+};
+
+const AttrEntryGroups = struct {
+    groups: []AttrEntryGroup = &.{},
+    tails: []AttrEntryView = &.{},
+
+    fn deinit(self: *AttrEntryGroups, allocator: std.mem.Allocator) void {
+        allocator.free(self.tails);
+        allocator.free(self.groups);
+        self.* = .{};
+    }
+};
+
 const ContainerValueOptions = struct {
     raw_identifier: bool = false,
 };
@@ -957,22 +979,15 @@ pub const Compiler = struct {
         const views = try self.attrEntryViews(static_entries);
         defer self.allocator.free(views);
 
+        var grouped = try self.attrEntryGroups(views);
+        defer grouped.deinit(self.allocator);
+
         self.beginScope();
+        errdefer self.endScope();
 
-        for (views, 0..) |entry, index| {
-            if (entry.path.len == 0) return error.InvalidAttributePath;
-            if (self.firstSegmentSeen(views[0..index], entry.path[0])) continue;
-
-            const name_span = self.attrSegmentSpan(entry.path[0]);
-            const name_id = try self.intern.intern(name_span);
-            try self.emitOp(.push_null);
-            try self.emitOp(.make_cell);
-            const slot = try self.declareLocal(name_span, name_id);
-            try self.emitOpByte(.set_local, @intCast(slot));
-        }
-
-        try self.compileRecursiveAttrCells(views);
-        try self.emitRecursiveAttrObject(views);
+        try self.declareRecursiveAttrLocals(grouped.groups);
+        try self.compileRecursiveAttrCells(grouped.groups);
+        try self.emitRecursiveAttrObject(grouped.groups);
 
         for (entries) |entry| {
             if (!self.isDynamicAttrEntry(entry)) continue;
@@ -1021,100 +1036,95 @@ pub const Compiler = struct {
     }
 
     fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-        var count: u16 = 0;
+        var grouped = try self.attrEntryGroups(entries);
+        defer grouped.deinit(self.allocator);
+
         var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
         defer positions.deinit(self.allocator);
 
-        for (entries, 0..) |entry, index| {
-            if (entry.path.len == 0) return error.InvalidAttributePath;
-            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
-
-            const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
-            if (leaf_count > 1) {
-                try self.reportDuplicateLeafAttribute(entries, entry.path[0]);
-                return error.DuplicateAttribute;
-            }
-            const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
-            if (leaf == null) {
-                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
-                defer self.allocator.free(tails);
-                try self.emitAttrName(entry.path[0]);
-                try self.compileAttrEntriesThunk(tails, false);
-                try self.appendAttrPosition(&positions, entry.path[0]);
-                count += 1;
-                continue;
-            }
-
-            if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
-                if (leaf.?.expr.tag != .attr_set) {
-                    try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
-                    return error.DuplicateAttribute;
-                }
-                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
-                defer self.allocator.free(tails);
-                try self.emitAttrName(entry.path[0]);
-                try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
-                try self.appendAttrPosition(&positions, entry.path[0]);
-                count += 1;
-                continue;
-            }
-            try self.emitAttrName(entry.path[0]);
-            try self.compileContainerValue(leaf.?.expr, .{ .raw_identifier = true });
-            try self.appendAttrPosition(&positions, entry.path[0]);
-            count += 1;
+        for (grouped.groups) |group| {
+            try self.compilePlainAttrGroup(&positions, group);
         }
 
-        try self.emitBuildAttrs(count, positions.items);
+        try self.emitBuildAttrs(@intCast(grouped.groups.len), positions.items);
     }
 
     fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
+        var grouped = try self.attrEntryGroups(entries);
+        defer grouped.deinit(self.allocator);
+
         self.beginScope();
+        errdefer self.endScope();
 
-        for (entries, 0..) |entry, index| {
-            if (entry.path.len == 0) return error.InvalidAttributePath;
-            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
-
-            const name_span = self.attrSegmentSpan(entry.path[0]);
-            const name_id = try self.intern.intern(name_span);
-            try self.emitOp(.push_null);
-            try self.emitOp(.make_cell);
-            const slot = try self.declareLocal(name_span, name_id);
-            try self.emitOpByte(.set_local, @intCast(slot));
-        }
-
-        try self.compileRecursiveAttrCells(entries);
-        try self.emitRecursiveAttrObject(entries);
+        try self.declareRecursiveAttrLocals(grouped.groups);
+        try self.compileRecursiveAttrCells(grouped.groups);
+        try self.emitRecursiveAttrObject(grouped.groups);
         self.endScope();
     }
 
-    fn compileRecursiveAttrCells(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-        for (entries, 0..) |entry, index| {
-            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
+    fn compilePlainAttrGroup(
+        self: *Compiler,
+        positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
+        group: AttrEntryGroup,
+    ) anyerror!void {
+        if (group.duplicate_leaf) |duplicate| {
+            try self.reportDuplicateAttribute(duplicate.path[0], group.leaf.?.path[0]);
+            return error.DuplicateAttribute;
+        }
 
-            const name_span = self.attrSegmentSpan(entry.path[0]);
-            const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
-            const leaf_count = self.leafCountForFirstSegment(entries, entry.path[0]);
-            if (leaf_count > 1) {
-                try self.reportDuplicateLeafAttribute(entries, entry.path[0]);
+        const leaf = group.leaf;
+        if (leaf == null) {
+            try self.emitAttrNameId(group.name_id);
+            try self.compileAttrEntriesThunk(group.tails, false);
+            try self.appendAttrPosition(positions, group.first, group.name_id);
+            return;
+        }
+
+        if (group.tails.len > 0) {
+            if (leaf.?.expr.tag != .attr_set) {
+                try self.reportDuplicateAttribute(group.first_nested.?.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
             }
-            const leaf = if (leaf_count == 1) self.uniqueLeafForFirstSegment(entries, entry.path[0]).? else null;
+            try self.emitAttrNameId(group.name_id);
+            try self.compileExtendedAttrSetLiteralThunk(leaf.?, group.tails);
+            try self.appendAttrPosition(positions, group.first, group.name_id);
+            return;
+        }
+
+        try self.emitAttrNameId(group.name_id);
+        try self.compileContainerValue(leaf.?.expr, .{ .raw_identifier = true });
+        try self.appendAttrPosition(positions, group.first, group.name_id);
+    }
+
+    fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+        for (groups) |group| {
+            try self.emitOp(.push_null);
+            try self.emitOp(.make_cell);
+            const slot = try self.declareLocal(group.name, group.name_id);
+            try self.emitOpByte(.set_local, @intCast(slot));
+        }
+    }
+
+    fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+        for (groups) |group| {
+            const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
+            if (group.duplicate_leaf) |duplicate| {
+                try self.reportDuplicateAttribute(duplicate.path[0], group.leaf.?.path[0]);
+                return error.DuplicateAttribute;
+            }
+            const leaf = group.leaf;
             if (leaf == null) {
-                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
-                defer self.allocator.free(tails);
-                try self.compileAttrEntriesThunk(tails, false);
+                try self.compileAttrEntriesThunk(group.tails, false);
                 try self.emitOpByte(.set_cell_local, @intCast(slot));
                 continue;
             }
 
-            if (self.hasNestedForFirstSegment(entries, entry.path[0])) {
+            if (group.tails.len > 0) {
                 if (leaf.?.expr.tag != .attr_set) {
-                    try self.reportDuplicateLeafAndNestedAttribute(entries, leaf.?, entry.path[0]);
+                    try self.reportDuplicateAttribute(group.first_nested.?.path[0], leaf.?.path[0]);
                     return error.DuplicateAttribute;
                 }
-                const tails = try self.tailEntriesForFirstSegment(entries, entry.path[0]);
-                defer self.allocator.free(tails);
-                try self.compileExtendedAttrSetLiteralThunk(leaf.?, tails);
+                try self.compileExtendedAttrSetLiteralThunk(leaf.?, group.tails);
                 try self.emitOpByte(.set_cell_local, @intCast(slot));
                 continue;
             }
@@ -1127,23 +1137,19 @@ pub const Compiler = struct {
         }
     }
 
-    fn emitRecursiveAttrObject(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-        var count: u16 = 0;
+    fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
         var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
         defer positions.deinit(self.allocator);
 
-        for (entries, 0..) |entry, index| {
-            if (self.firstSegmentSeen(entries[0..index], entry.path[0])) continue;
-            try self.emitAttrName(entry.path[0]);
+        for (groups) |group| {
+            try self.emitAttrNameId(group.name_id);
 
-            const name_span = self.attrSegmentSpan(entry.path[0]);
-            const slot = self.resolveLocal(name_span) orelse return error.UndefinedVariable;
+            const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
             try self.emitOpByte(.capture_local, @intCast(slot));
-            try self.appendAttrPosition(&positions, entry.path[0]);
-            count += 1;
+            try self.appendAttrPosition(&positions, group.first, group.name_id);
         }
 
-        try self.emitBuildAttrs(count, positions.items);
+        try self.emitBuildAttrs(@intCast(groups.len), positions.items);
     }
 
     fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaf: AttrEntryView, tails: []const AttrEntryView) !void {
@@ -1200,48 +1206,70 @@ pub const Compiler = struct {
         return views;
     }
 
-    fn tailEntriesForFirstSegment(self: *Compiler, entries: []const AttrEntryView, first: Node.Atom) ![]AttrEntryView {
-        var count: usize = 0;
-        for (entries) |entry| {
-            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) count += 1;
-        }
+    fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGroups {
+        var group_index: std.StringHashMapUnmanaged(usize) = .empty;
+        defer group_index.deinit(self.allocator);
 
-        const tails = try self.allocator.alloc(AttrEntryView, count);
-        var i: usize = 0;
-        for (entries) |entry| {
-            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) {
-                tails[i] = .{ .path = entry.path[1..], .expr = entry.expr, .inherit_outer = entry.inherit_outer };
-                i += 1;
-            }
-        }
-        return tails;
-    }
+        var groups_list: std.ArrayListUnmanaged(AttrEntryGroup) = .empty;
+        errdefer groups_list.deinit(self.allocator);
 
-    fn reportDuplicateLeafAttribute(self: *Compiler, entries: []const AttrEntryView, first: Node.Atom) !void {
-        var first_leaf: ?Node.Atom = null;
+        var total_tails: usize = 0;
         for (entries) |entry| {
-            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) {
-                if (first_leaf) |original| {
-                    try self.reportDuplicateAttribute(entry.path[0], original);
-                    return;
+            if (entry.path.len == 0) return error.InvalidAttributePath;
+
+            const name = self.attrSegmentSpan(entry.path[0]);
+            const index = group_index.get(name) orelse blk: {
+                const new_index = groups_list.items.len;
+                try groups_list.append(self.allocator, .{
+                    .first = entry.path[0],
+                    .name = name,
+                    .name_id = try self.intern.intern(name),
+                });
+                try group_index.put(self.allocator, name, new_index);
+                break :blk new_index;
+            };
+
+            const group = &groups_list.items[index];
+            if (entry.path.len == 1) {
+                if (group.leaf == null) {
+                    group.leaf = entry;
+                } else if (group.duplicate_leaf == null) {
+                    group.duplicate_leaf = entry;
                 }
-                first_leaf = entry.path[0];
+            } else {
+                if (group.first_nested == null) group.first_nested = entry;
+                group.tail_count += 1;
+                total_tails += 1;
             }
         }
-    }
 
-    fn reportDuplicateLeafAndNestedAttribute(
-        self: *Compiler,
-        entries: []const AttrEntryView,
-        leaf: AttrEntryView,
-        first: Node.Atom,
-    ) !void {
-        for (entries) |entry| {
-            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) {
-                try self.reportDuplicateAttribute(entry.path[0], leaf.path[0]);
-                return;
-            }
+        var groups = try groups_list.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(groups);
+
+        const tails = try self.allocator.alloc(AttrEntryView, total_tails);
+        errdefer self.allocator.free(tails);
+
+        var tail_start: usize = 0;
+        for (groups) |*group| {
+            const tail_end = tail_start + group.tail_count;
+            group.tails = tails[tail_start..tail_end];
+            group.tail_count = 0;
+            tail_start = tail_end;
         }
+
+        for (entries) |entry| {
+            if (entry.path.len <= 1) continue;
+            const index = group_index.get(self.attrSegmentSpan(entry.path[0])).?;
+            const group = &groups[index];
+            group.tails[group.tail_count] = .{
+                .path = entry.path[1..],
+                .expr = entry.expr,
+                .inherit_outer = entry.inherit_outer,
+            };
+            group.tail_count += 1;
+        }
+
+        return .{ .groups = groups, .tails = tails };
     }
 
     fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
@@ -1249,46 +1277,11 @@ pub const Compiler = struct {
         try self.reportCompileNote(original.offset, original.len, "first attribute defined here");
     }
 
-    fn firstSegmentSeen(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) bool {
-        for (entries) |entry| {
-            if (entry.path.len > 0 and self.attrSegmentsEqual(entry.path[0], first)) return true;
-        }
-        return false;
-    }
-
-    fn uniqueLeafForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) ?AttrEntryView {
-        var found: ?AttrEntryView = null;
-        for (entries) |entry| {
-            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) {
-                if (found != null) return null;
-                found = entry;
-            }
-        }
-        return found;
-    }
-
-    fn leafCountForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) usize {
-        var count: usize = 0;
-        for (entries) |entry| {
-            if (entry.path.len == 1 and self.attrSegmentsEqual(entry.path[0], first)) count += 1;
-        }
-        return count;
-    }
-
-    fn hasNestedForFirstSegment(self: *const Compiler, entries: []const AttrEntryView, first: Node.Atom) bool {
-        for (entries) |entry| {
-            if (entry.path.len > 1 and self.attrSegmentsEqual(entry.path[0], first)) return true;
-        }
-        return false;
-    }
-
     fn attrSegmentsEqual(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
         return std.mem.eql(u8, self.attrSegmentSpan(a), self.attrSegmentSpan(b));
     }
 
-    fn emitAttrName(self: *Compiler, atom: Node.Atom) !void {
-        const name_span = self.attrSegmentSpan(atom);
-        const name_id = try self.intern.intern(name_span);
+    fn emitAttrNameId(self: *Compiler, name_id: InternId) !void {
         const name_val = @import("value.zig").Value.string(name_id);
         try self.builder.emitConstant(self.allocator, name_val);
     }
@@ -1297,11 +1290,12 @@ pub const Compiler = struct {
         self: *Compiler,
         positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
         atom: Node.Atom,
+        name_id: InternId,
     ) !void {
         _ = self.source_path orelse return;
         const position = try self.sourcePositionForOffset(atom.offset);
         try positions.append(self.allocator, .{
-            .name = try self.intern.intern(self.attrSegmentSpan(atom)),
+            .name = name_id,
             .pos = .{
                 .file = try self.sourceFileId(),
                 .line = position.line,
@@ -1581,6 +1575,19 @@ pub const Compiler = struct {
             if (std.mem.eql(u8, local.name, name)) {
                 return local.slot;
             }
+        }
+        return null;
+    }
+
+    fn resolveLocalId(self: *const Compiler, name_id: InternId) ?u16 {
+        var i: usize = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = self.locals.items[i];
+            if (self.skip_local_slot) |skip| {
+                if (local.slot == skip) continue;
+            }
+            if (local.name_id == name_id) return local.slot;
         }
         return null;
     }
