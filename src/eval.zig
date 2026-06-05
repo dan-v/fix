@@ -21,6 +21,7 @@ const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
 const eval_trace = @import("eval_trace.zig");
+const eval_progress = @import("eval_progress.zig");
 const path_ops = @import("runtime/paths.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
@@ -42,6 +43,7 @@ pub const Evaluator = struct {
     builtins_value: ?Value,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
+    progress: ?eval_progress.Sink,
     worker_count: u8,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
     trace: EvalTrace,
@@ -72,6 +74,7 @@ pub const Evaluator = struct {
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
+            .progress = null,
             .worker_count = worker_count,
             .diagnostics = .empty,
             .trace = EvalTrace.init(allocator),
@@ -129,6 +132,10 @@ pub const Evaluator = struct {
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
         self.env_map = env_map;
+    }
+
+    pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
+        self.progress = progress;
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -194,15 +201,22 @@ pub const Evaluator = struct {
         source_path: ?[]const u8,
         scope: ?Value,
     ) !Value {
+        const subject = source_path orelse "expression";
+
         // 1. Parse into AST.
         var arena = @import("ast.zig").AstArena.init(self.allocator);
         defer arena.deinit();
 
         var parser = parser_mod.Parser.init(self.allocator, &arena, source);
         defer parser.deinit();
-        const ast_node = parser.parse() catch {
-            try self.copyDiagnostics(parser.diagnostics.items);
-            return error.ParseError;
+
+        const ast_node = blk: {
+            self.progressBegin(.parse, subject);
+            defer self.progressEnd(.parse, subject);
+            break :blk parser.parse() catch {
+                try self.copyDiagnostics(parser.diagnostics.items);
+                return error.ParseError;
+            };
         };
 
         // 2. Compile AST to bytecode.
@@ -220,11 +234,15 @@ pub const Evaluator = struct {
         compiler.source_path = source_path;
         defer compiler.deinit();
 
-        compiler.compileWithScope(ast_node, scope) catch |err| {
-            try self.copyDiagnostics(compiler.diagnostics.items);
-            if (preserveCompileError(err)) return err;
-            return error.CompileError;
-        };
+        {
+            self.progressBegin(.compile, subject);
+            defer self.progressEnd(.compile, subject);
+            compiler.compileWithScope(ast_node, scope) catch |err| {
+                try self.copyDiagnostics(compiler.diagnostics.items);
+                if (preserveCompileError(err)) return err;
+                return error.CompileError;
+            };
+        }
 
         // Add return + halt.
         try builder.writeOp(self.allocator, .ret);
@@ -237,6 +255,8 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0);
         defer vm.deinit();
 
+        self.progressBegin(.evaluate, subject);
+        defer self.progressEnd(.evaluate, subject);
         return vm.eval(chunk_id);
     }
 
@@ -251,6 +271,7 @@ pub const Evaluator = struct {
             &self.derivations,
             &self.scheduler,
             &self.trace,
+            self.progress,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,
@@ -258,6 +279,8 @@ pub const Evaluator = struct {
     }
 
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.progressBegin(.render, "result");
+        defer self.progressEnd(.render, "result");
         self.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
@@ -266,6 +289,8 @@ pub const Evaluator = struct {
     }
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.progressBegin(.render, "result");
+        defer self.progressEnd(.render, "result");
         self.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
@@ -336,6 +361,9 @@ pub const Evaluator = struct {
         defer self.allocator.free(stable_path);
 
         if (self.imports.get(stable_path)) |value| return value;
+        self.progressBegin(.import, stable_path);
+        defer self.progressEnd(.import, stable_path);
+
         const progress_key = try self.beginImport(stable_path);
         defer self.endImport(progress_key);
 
@@ -361,6 +389,9 @@ pub const Evaluator = struct {
     fn scopedImportResolvedPath(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
+
+        self.progressBegin(.import, stable_path);
+        defer self.progressEnd(.import, stable_path);
 
         const progress_key = try self.beginImport(stable_path);
         defer self.endImport(progress_key);
@@ -497,6 +528,9 @@ pub const Evaluator = struct {
     }
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
+        self.progressBegin(.render, "result");
+        defer self.progressEnd(.render, "result");
+
         var printer = ValuePrinter{
             .ev = self,
             .writer = writer,
@@ -521,6 +555,18 @@ pub const Evaluator = struct {
             }
         }
         try writer.writeByte('"');
+    }
+
+    fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (self.progress) |progress| progress.begin(stage, subject);
+    }
+
+    fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (self.progress) |progress| progress.end(stage, subject);
+    }
+
+    pub fn progressInstant(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (self.progress) |progress| progress.instant(stage, subject);
     }
 };
 

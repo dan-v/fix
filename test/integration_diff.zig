@@ -5,6 +5,7 @@
 //! means.
 
 const std = @import("std");
+const cli = @import("fix-cli");
 
 const Config = struct {
     seed: ?u64 = null,
@@ -106,8 +107,8 @@ const WorkStats = struct {
         return .{
             .worker_count = self.worker_count,
             .claimed = claimed,
-            .in_flight = saturatedSub(claimed, completed),
-            .remaining = saturatedSub(total, claimed),
+            .in_flight = cli.saturatedSub(claimed, completed),
+            .remaining = cli.saturatedSub(total, claimed),
         };
     }
 };
@@ -127,19 +128,19 @@ const Reporter = struct {
 
     fn init(io: std.Io, env: *const std.process.Environ.Map) Reporter {
         const now = nowNs(io);
-        const interactive = interactiveOutput(io, env);
+        const interactive = cli.stderrInteractive(io, env);
         return .{
             .io = io,
             .interactive = interactive,
-            .use_color = autoColor(interactive, env),
+            .use_color = cli.autoColor(interactive, env),
             .started_ns = now,
             .next_progress_ns = now + progressInterval(interactive),
         };
     }
 
     fn printRepro(self: Reporter, config: Config, seed: u64, worker_count: usize, total_jobs: usize) void {
-        const dim = if (self.use_color) "\x1b[2m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const dim = cli.styleCode(self.use_color, .dim);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print(
             "{s}integration-diff:{s} zig build integration-test -- --seed={} --jobs={} --min-depth={} --max-depth={} --cases={} --corpus={s} --failures={s} --fix-bin={s} --nix-bin={s}",
             .{
@@ -177,10 +178,10 @@ const Reporter = struct {
         const elapsed_s = @as(u64, @intCast(@max(@divTrunc(elapsed_ns, std.time.ns_per_s), 0)));
         const rate = casesPerSecond(completed, elapsed_ns);
         const eta_s = etaSeconds(total - completed, rate);
-        const percent_x10 = percentTenths(completed, total);
-        const skip_permille = permille(self.skipped_count, completed);
+        const percent_x10 = cli.percentTenths(completed, total);
+        const skip_permille = cli.permille(self.skipped_count, completed);
         const work_snapshot = if (self.work_stats) |stats| stats.snapshot(completed, total) else null;
-        const spinner = spinnerFrame(elapsed_ns);
+        const spinner = cli.spinnerFrame(elapsed_ns);
 
         if (self.interactive) {
             self.printDashboard(spinner, completed, total, percent_x10, skip_permille, rate, eta_s, elapsed_s, work_snapshot);
@@ -204,9 +205,9 @@ const Reporter = struct {
     ) void {
         if (self.drew_progress) std.debug.print("\x1b[{}F", .{progress_dashboard_lines});
 
-        const reset = if (self.use_color) "\x1b[0m" else "";
-        const dim = if (self.use_color) "\x1b[2m" else "";
-        const status_color = if (self.use_color) if (self.found_count == 0) "\x1b[32m" else "\x1b[31m" else "";
+        const reset = cli.resetCode(self.use_color);
+        const dim = cli.styleCode(self.use_color, .dim);
+        const status_color = cli.styleCode(self.use_color, if (self.found_count == 0) .success else .error_label);
         const status = if (self.found_count == 0) "RUN" else "FAIL";
 
         std.debug.print("\x1b[2K{s}integration-diff{s} {s}{s}{s} {c} ", .{ dim, reset, status_color, status, reset, spinner });
@@ -214,9 +215,9 @@ const Reporter = struct {
         std.debug.print(" {}.{}%  {}/{}\n", .{ percent_x10 / 10, percent_x10 % 10, completed, total });
 
         std.debug.print("\x1b[2K  rate {}/s  eta ", .{rate});
-        printDuration(eta_s);
+        cli.printDuration(eta_s);
         std.debug.print("  elapsed ", .{});
-        printDuration(elapsed_s);
+        cli.printDuration(elapsed_s);
         std.debug.print("  skipped {}.{}% ({})  timed out {}  found {}\n", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
 
         std.debug.print("\x1b[2K  work ", .{});
@@ -244,9 +245,9 @@ const Reporter = struct {
             "integration-diff: {c} {}.{}% {}/{} rate {}/s eta ",
             .{ spinner, percent_x10 / 10, percent_x10 % 10, completed, total, rate },
         );
-        printDuration(eta_s);
+        cli.printDuration(eta_s);
         std.debug.print(" elapsed ", .{});
-        printDuration(elapsed_s);
+        cli.printDuration(elapsed_s);
         std.debug.print(" skipped {}.{}% ({}) timeout {} found {}", .{ skip_permille / 10, skip_permille % 10, self.skipped_count, self.timeout_count, self.found_count });
         if (work_snapshot) |snapshot| {
             std.debug.print(" work ", .{});
@@ -256,20 +257,7 @@ const Reporter = struct {
     }
 
     fn printProgressBar(self: Reporter, completed: usize, total: usize) void {
-        const filled = if (total == 0) progress_bar_width else @min(progress_bar_width, completed * progress_bar_width / total);
-        const fill_color = if (self.use_color) if (self.found_count == 0) "\x1b[32m" else "\x1b[31m" else "";
-        const dim = if (self.use_color) "\x1b[2m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
-
-        std.debug.print("[", .{});
-        var i: usize = 0;
-        while (i < progress_bar_width) : (i += 1) {
-            if (i == 0 and filled != 0) std.debug.print("{s}", .{fill_color});
-            if (i == filled and filled != progress_bar_width) std.debug.print("{s}{s}", .{ reset, dim });
-            const char: u8 = if (i < filled) '#' else '-';
-            std.debug.print("{c}", .{char});
-        }
-        std.debug.print("{s}]", .{reset});
+        cli.printProgressBar(self.use_color, completed, total, progress_bar_width, if (self.found_count == 0) .success else .error_label);
     }
 
     fn printWork(self: Reporter, snapshot: WorkSnapshot) void {
@@ -297,8 +285,8 @@ const Reporter = struct {
 
     fn commandError(self: *Reporter, seed: u64, iteration: usize, err: anyerror, expr: []const u8) void {
         self.clearProgress();
-        const red = if (self.use_color) "\x1b[31m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const red = cli.styleCode(self.use_color, .error_label);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print(
             "{s}integration-diff: command failed{s} at seed {} iteration {}: {s}\n",
             .{ red, reset, seed, iteration, @errorName(err) },
@@ -308,8 +296,8 @@ const Reporter = struct {
 
     fn saveError(self: *Reporter, seed: u64, iteration: usize, err: anyerror) void {
         self.clearProgress();
-        const red = if (self.use_color) "\x1b[31m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const red = cli.styleCode(self.use_color, .error_label);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print(
             "{s}integration-diff: failed to save mismatch{s} at seed {} iteration {}: {s}\n",
             .{ red, reset, seed, iteration, @errorName(err) },
@@ -319,8 +307,8 @@ const Reporter = struct {
     fn mismatch(self: *Reporter, outcome: Outcome, seed: u64, iteration: usize, failure_dir: []const u8, expr: []const u8) void {
         self.clearProgress();
         self.found_count += 1;
-        const red = if (self.use_color) "\x1b[31m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const red = cli.styleCode(self.use_color, .error_label);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print(
             "{s}integration-diff: found {s}{s} at seed {} iteration {}; saved under {s}\n",
             .{ red, @tagName(outcome), reset, seed, iteration, failure_dir },
@@ -330,11 +318,8 @@ const Reporter = struct {
 
     fn finish(self: *Reporter, total: usize) void {
         self.clearProgress();
-        const color = if (self.use_color)
-            if (self.found_count == 0) "\x1b[32m" else "\x1b[31m"
-        else
-            "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const color = cli.styleCode(self.use_color, if (self.found_count == 0) .success else .error_label);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print(
             "{s}integration-diff: found={} checked={} skipped={} timed_out={} cases={}{s}\n",
             .{ color, self.found_count, self.checked_count, self.skipped_count, self.timeout_count, total, reset },
@@ -342,8 +327,8 @@ const Reporter = struct {
     }
 
     fn corpusError(self: Reporter, comptime fmt: []const u8, args: anytype) void {
-        const red = if (self.use_color) "\x1b[31m" else "";
-        const reset = if (self.use_color) "\x1b[0m" else "";
+        const red = cli.styleCode(self.use_color, .error_label);
+        const reset = cli.resetCode(self.use_color);
         std.debug.print("{s}integration-diff: ", .{red});
         std.debug.print(fmt, args);
         std.debug.print("{s}\n", .{reset});
@@ -737,19 +722,6 @@ fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).toNanoseconds();
 }
 
-fn interactiveOutput(io: std.Io, env: *const std.process.Environ.Map) bool {
-    if (env.get("TERM")) |term| {
-        if (std.mem.eql(u8, term, "dumb")) return false;
-    }
-    return std.Io.File.stderr().isTty(io) catch false;
-}
-
-fn autoColor(interactive: bool, env: *const std.process.Environ.Map) bool {
-    if (!interactive) return false;
-    if (env.get("NO_COLOR")) |_| return false;
-    return true;
-}
-
 fn progressInterval(interactive: bool) i96 {
     return if (interactive) interactive_progress_interval_ns else log_progress_interval_ns;
 }
@@ -762,39 +734,6 @@ fn casesPerSecond(completed: usize, elapsed_ns: i96) u64 {
 fn etaSeconds(remaining: usize, rate: u64) u64 {
     if (rate == 0) return 0;
     return @intCast((remaining + rate - 1) / rate);
-}
-
-fn percentTenths(completed: usize, total: usize) usize {
-    if (total == 0) return 1000;
-    return completed * 1000 / total;
-}
-
-fn permille(part: usize, whole: usize) usize {
-    if (whole == 0) return 0;
-    return part * 1000 / whole;
-}
-
-fn saturatedSub(lhs: usize, rhs: usize) usize {
-    return if (lhs > rhs) lhs - rhs else 0;
-}
-
-fn spinnerFrame(elapsed_ns: i96) u8 {
-    const frames = [_]u8{ '|', '/', '-', '\\' };
-    const tick: usize = @intCast(@divTrunc(@max(elapsed_ns, 0), interactive_progress_interval_ns));
-    return frames[tick % frames.len];
-}
-
-fn printDuration(seconds: u64) void {
-    const hours = seconds / 3600;
-    const minutes = (seconds / 60) % 60;
-    const secs = seconds % 60;
-    if (hours != 0) {
-        std.debug.print("{}h{}m", .{ hours, minutes });
-    } else if (minutes != 0) {
-        std.debug.print("{}m{}s", .{ minutes, secs });
-    } else {
-        std.debug.print("{}s", .{secs});
-    }
 }
 
 fn printWorkText(snapshot: WorkSnapshot, use_color: bool) void {
@@ -811,14 +750,14 @@ fn printWorkText(snapshot: WorkSnapshot, use_color: bool) void {
         else
             .starved;
 
-    const color = if (use_color) switch (state) {
-        .saturated => "\x1b[32m",
-        .active => "\x1b[33m",
-        .starved => "\x1b[31m",
-        .draining => "\x1b[33m",
-        .done => "\x1b[32m",
-    } else "";
-    const reset = if (use_color) "\x1b[0m" else "";
+    const color = cli.styleCode(use_color, switch (state) {
+        .saturated => .success,
+        .active => .warning,
+        .starved => .error_label,
+        .draining => .warning,
+        .done => .success,
+    });
+    const reset = cli.resetCode(use_color);
 
     std.debug.print("{s}{s}{s} workers {}/{} claimed {} remaining {}", .{
         color,

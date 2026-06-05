@@ -2,9 +2,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const cli = @import("cli.zig");
 const eval = @import("eval.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const diagnostic = @import("diagnostic.zig");
+const repl_line = @import("repl_line.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 const Value = @import("value.zig").Value;
@@ -28,6 +30,8 @@ const usage =
     \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
     \\  --no-color             disable color diagnostics
+    \\  --progress[=when]      show evaluation progress on stderr: auto, always, never
+    \\  --no-progress          disable evaluation progress
     \\  -h, --help             show this help
     \\
 ;
@@ -38,12 +42,6 @@ const OutputFormat = enum {
     xml,
 };
 
-const ColorMode = enum {
-    auto,
-    always,
-    never,
-};
-
 const SourceArg = union(enum) {
     expr: []const u8,
     file: []const u8,
@@ -51,7 +49,8 @@ const SourceArg = union(enum) {
 
 const Options = struct {
     output: OutputFormat = .nix,
-    color: ColorMode = .auto,
+    color: cli.When = .auto,
+    progress: cli.When = .auto,
     show_trace: bool = false,
     derivation_debug: derivation_debug.Options = .{},
     repl: bool = false,
@@ -91,7 +90,8 @@ pub fn main(init: std.process.Init) !void {
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
-    const use_color = shouldColor(options.color, init.io, init.environ_map);
+    const use_color = cli.shouldColor(options.color, init.io, init.environ_map);
+    const show_progress = cli.shouldProgress(options.progress, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
 
     if (options.repl) {
@@ -99,7 +99,12 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("error: --repl does not take an expression or file\n\n{s}", .{usage});
             std.process.exit(1);
         }
-        try runRepl(init.io, options, use_color, &ev);
+        var progress = cli.EvalProgress.init(init.io, show_progress);
+        var repl_ok = false;
+        defer progress.deinit(repl_ok);
+        ev.setProgressSink(progress.sink());
+        try runRepl(allocator, init.io, options, use_color, &ev);
+        repl_ok = true;
         return;
     }
 
@@ -113,7 +118,13 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    if (!try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, options.derivation_debug, &ev, source.text)) {
+    var progress = cli.EvalProgress.init(init.io, show_progress);
+    errdefer progress.deinit(false);
+    ev.setProgressSink(progress.sink());
+
+    const ok = try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, options.derivation_debug, &ev, source.text);
+    progress.deinit(ok);
+    if (!ok) {
         std.process.exit(1);
     }
 }
@@ -149,10 +160,11 @@ fn writeEvalFailure(
     err: anyerror,
 ) !void {
     if (ev.getDiagnostics().len > 0) {
-        var stderr_buffer: [1024]u8 = undefined;
-        var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
-        try diagnostic.writeAllWithOptions(&stderr.interface, source, ev.getDiagnostics(), .{ .color = use_color });
-        try stderr.interface.flush();
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr = try cli.lockStderr(io, &stderr_buffer);
+        defer stderr.deinit();
+        try diagnostic.writeAllWithOptions(stderr.writer(), source, ev.getDiagnostics(), .{ .color = use_color });
+        try stderr.flush();
     } else {
         try writeEvaluationError(io, use_color, show_trace, ev, source, err);
     }
@@ -209,9 +221,15 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
         } else if (std.mem.eql(u8, arg, "--color")) {
             options.color = .always;
         } else if (std.mem.startsWith(u8, arg, "--color=")) {
-            options.color = parseColorMode(arg["--color=".len..]) orelse return error.InvalidColorMode;
+            options.color = cli.parseWhen(arg["--color=".len..]) orelse return error.InvalidColorMode;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             options.color = .never;
+        } else if (std.mem.eql(u8, arg, "--progress")) {
+            options.progress = .always;
+        } else if (std.mem.startsWith(u8, arg, "--progress=")) {
+            options.progress = cli.parseWhen(arg["--progress=".len..]) orelse return error.InvalidProgressMode;
+        } else if (std.mem.eql(u8, arg, "--no-progress")) {
+            options.progress = .never;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -236,36 +254,14 @@ fn optionErrorMessage(err: anyerror) []const u8 {
         error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
+        error.InvalidProgressMode => "expected --progress to be auto, always, or never",
         error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };
 }
 
-fn parseColorMode(text: []const u8) ?ColorMode {
-    if (std.mem.eql(u8, text, "auto")) return .auto;
-    if (std.mem.eql(u8, text, "always")) return .always;
-    if (std.mem.eql(u8, text, "never")) return .never;
-    return null;
-}
-
-fn shouldColor(mode: ColorMode, io: std.Io, env: *const std.process.Environ.Map) bool {
-    return switch (mode) {
-        .always => true,
-        .never => false,
-        .auto => autoColor(io, env),
-    };
-}
-
-fn autoColor(io: std.Io, env: *const std.process.Environ.Map) bool {
-    if (env.get("NO_COLOR")) |_| return false;
-    if (env.get("TERM")) |term| {
-        if (std.mem.eql(u8, term, "dumb")) return false;
-    }
-    return std.Io.File.stderr().isTty(io) catch false;
-}
-
-fn runRepl(io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
+fn runRepl(allocator: std.mem.Allocator, io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
     const interactive = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
 
     var stdin_buffer: [64 * 1024]u8 = undefined;
@@ -279,25 +275,33 @@ fn runRepl(io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void 
         try stdout.interface.flush();
     }
 
-    while (true) {
-        if (interactive) {
-            if (use_color) try stdout.interface.writeAll("\x1b[1;34m");
-            try stdout.interface.writeAll("fix> ");
-            if (use_color) try stdout.interface.writeAll("\x1b[0m");
-            try stdout.interface.flush();
-        }
+    var history = repl_line.History.init(allocator);
+    defer history.deinit();
+    var raw_editor = interactive;
 
-        const raw_line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => {
-                try writeReplInputError(io, use_color, "input line is too long");
-                _ = stdin.interface.discardDelimiterInclusive('\n') catch {};
-                continue;
-            },
-            else => return err,
+    while (true) {
+        var owned_line: ?[]u8 = null;
+        const line = if (raw_editor) line: {
+            const maybe_line = repl_line.readInteractiveAlloc(allocator, io, "fix> ", use_color, &history) catch |err| switch (err) {
+                error.UnsupportedTerminal => {
+                    raw_editor = false;
+                    break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
+                },
+                else => return err,
+            };
+            owned_line = maybe_line orelse break;
+            break :line owned_line.?;
+        } else line: {
+            break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
         };
-        const line = raw_line orelse break;
+        defer if (owned_line) |owned| allocator.free(owned);
+
         const source = std.mem.trim(u8, line, " \t\r");
         if (source.len == 0) continue;
+
+        if (!raw_editor) {
+            try history.add(source);
+        }
 
         if (std.mem.eql(u8, source, ":q") or
             std.mem.eql(u8, source, ":quit") or
@@ -315,6 +319,31 @@ fn runRepl(io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void 
     }
 }
 
+fn readCanonicalReplLine(
+    io: std.Io,
+    use_color: bool,
+    interactive: bool,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !?[]const u8 {
+    if (interactive) {
+        try cli.style(stdout, use_color, .trace_label);
+        try stdout.writeAll("fix> ");
+        try cli.reset(stdout, use_color);
+        try stdout.flush();
+    }
+
+    const raw_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => {
+            try writeReplInputError(io, use_color, "input line is too long");
+            _ = stdin.discardDelimiterInclusive('\n') catch {};
+            return "";
+        },
+        else => return err,
+    };
+    return raw_line;
+}
+
 fn writeReplHelp(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\:help   show commands
@@ -326,31 +355,28 @@ fn writeReplHelp(writer: *std.Io.Writer) !void {
 
 fn writeReplInputError(io: std.Io, use_color: bool, message: []const u8) !void {
     var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
-    try traceStyle(&stderr.interface, use_color, .error_label);
-    try stderr.interface.writeAll("error");
-    try traceReset(&stderr.interface, use_color);
-    try stderr.interface.print(": {s}\n", .{message});
-    try stderr.interface.flush();
+    var stderr = try cli.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    const writer = stderr.writer();
+    try cli.style(writer, use_color, .error_label);
+    try writer.writeAll("error");
+    try cli.reset(writer, use_color);
+    try writer.print(": {s}\n", .{message});
+    try stderr.flush();
 }
-
-const TraceStyle = enum {
-    error_label,
-    trace_label,
-    dim,
-};
 
 const default_trace_limit = 8;
 
 fn writeEvaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
-    const writer = &stderr.interface;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = try cli.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    const writer = stderr.writer();
     const trace = ev.getTrace();
 
-    try traceStyle(writer, use_color, .error_label);
+    try cli.style(writer, use_color, .error_label);
     try writer.writeAll("error");
-    try traceReset(writer, use_color);
+    try cli.reset(writer, use_color);
     if (trace.message) |message| {
         try writer.print(": {s}\n", .{message});
     } else {
@@ -358,7 +384,7 @@ fn writeEvaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Eval
     }
 
     try writeTraceFrames(writer, use_color, show_trace, ev, source, trace.frames.items);
-    try writer.flush();
+    try stderr.flush();
 }
 
 fn writeTraceFrames(
@@ -371,9 +397,9 @@ fn writeTraceFrames(
 ) !void {
     if (frames.len == 0) return;
 
-    try traceStyle(writer, use_color, .dim);
+    try cli.style(writer, use_color, .dim);
     try writer.writeAll("\ntrace:\n");
-    try traceReset(writer, use_color);
+    try cli.reset(writer, use_color);
 
     if (show_trace or frames.len <= default_trace_limit) {
         for (frames) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
@@ -384,9 +410,9 @@ fn writeTraceFrames(
     const tail_count = default_trace_limit - head_count;
     for (frames[0..head_count]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
 
-    try traceStyle(writer, use_color, .dim);
+    try cli.style(writer, use_color, .dim);
     try writer.print("  ... {d} frames omitted; use --show-trace to show all\n", .{frames.len - default_trace_limit});
-    try traceReset(writer, use_color);
+    try cli.reset(writer, use_color);
 
     for (frames[frames.len - tail_count ..]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
 }
@@ -406,9 +432,9 @@ fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, sour
     }
 
     try writer.writeAll("  ");
-    try traceStyle(writer, use_color, .trace_label);
+    try cli.style(writer, use_color, .trace_label);
     try writer.writeAll("while evaluating");
-    try traceReset(writer, use_color);
+    try cli.reset(writer, use_color);
     try writer.print(": {s}\n", .{frame.message});
 }
 
@@ -417,17 +443,4 @@ fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) 
         return ev.readSourceFile(path) catch null;
     }
     return source;
-}
-
-fn traceStyle(writer: *std.Io.Writer, use_color: bool, style: TraceStyle) !void {
-    if (!use_color) return;
-    try writer.writeAll(switch (style) {
-        .error_label => "\x1b[1;31m",
-        .trace_label => "\x1b[36m",
-        .dim => "\x1b[2m",
-    });
-}
-
-fn traceReset(writer: *std.Io.Writer, use_color: bool) !void {
-    if (use_color) try writer.writeAll("\x1b[0m");
 }

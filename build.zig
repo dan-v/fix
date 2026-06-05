@@ -41,6 +41,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -95,6 +101,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/integration_diff.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fix-cli", .module = cli_mod },
+            },
         }),
     });
 
@@ -165,6 +174,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/integration_diff.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fix-cli", .module = cli_mod },
+            },
         }),
     });
     const run_integration_diff_tests = b.addRunArtifact(integration_diff_tests);

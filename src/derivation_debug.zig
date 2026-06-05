@@ -1,4 +1,5 @@
 const std = @import("std");
+const cli = @import("cli.zig");
 const derivation = @import("derivation.zig");
 
 pub const Mode = enum {
@@ -33,24 +34,25 @@ pub fn write(
 ) !void {
     if (!options.enabled()) return;
 
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
-    const writer = &stderr.interface;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr = try cli.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    const writer = stderr.writer();
 
     var shown: usize = 0;
     for (records) |record| {
         if (matches(record, options)) shown += 1;
     }
 
-    try style(writer, use_color, .heading);
+    try cli.style(writer, use_color, .heading);
     try writer.writeAll("derivation debug");
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
     try writer.print(": {d} shown / {d} captured", .{ shown, records.len });
     try writeSelectors(writer, use_color, options);
     try writer.writeByte('\n');
 
     if (shown == 0) {
-        try writer.flush();
+        try stderr.flush();
         return;
     }
 
@@ -60,17 +62,17 @@ pub fn write(
         display_index += 1;
         try writeRecord(writer, use_color, allocator, options.mode, display_index, record);
     }
-    try writer.flush();
+    try stderr.flush();
 }
 
 fn writeSelectors(writer: *std.Io.Writer, use_color: bool, options: Options) !void {
     if (options.filter == null and options.name == null and options.drv_path == null) return;
 
-    try style(writer, use_color, .dim);
+    try cli.style(writer, use_color, .dim);
     if (options.filter) |filter| try writer.print("  filter={s}", .{filter});
     if (options.name) |name| try writer.print("  name={s}", .{name});
     if (options.drv_path) |drv_path| try writer.print("  drv={s}", .{drv_path});
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
 }
 
 fn matches(record: derivation.DebugRecord, options: Options) bool {
@@ -110,12 +112,12 @@ fn writeRecord(
     record: derivation.DebugRecord,
 ) !void {
     try writer.writeByte('\n');
-    try style(writer, use_color, .dim);
+    try cli.style(writer, use_color, .dim);
     try writer.print("[{d}] ", .{index});
-    try reset(writer, use_color);
-    try style(writer, use_color, .name);
+    try cli.reset(writer, use_color);
+    try cli.style(writer, use_color, .name);
     try writer.writeAll(record.name);
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
     try writer.writeByte('\n');
 
     try writeField(writer, use_color, "drvPath", record.drv_path, .path);
@@ -152,25 +154,25 @@ const FieldKind = enum {
 
 fn writeField(writer: *std.Io.Writer, use_color: bool, label: []const u8, value: []const u8, kind: FieldKind) !void {
     try writer.writeAll("  ");
-    try style(writer, use_color, .label);
+    try cli.style(writer, use_color, .label);
     try writer.print("{s}", .{label});
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
     try writer.writeAll(": ");
     switch (kind) {
         .plain => {},
-        .path => try style(writer, use_color, .path),
-        .hash => try style(writer, use_color, .hash),
+        .path => try cli.style(writer, use_color, .path),
+        .hash => try cli.style(writer, use_color, .hash),
     }
     try writer.writeAll(value);
-    if (kind != .plain) try reset(writer, use_color);
+    if (kind != .plain) try cli.reset(writer, use_color);
     try writer.writeByte('\n');
 }
 
 fn writeHashField(writer: *std.Io.Writer, use_color: bool, label: []const u8, hash_modulo: derivation.HashModulo) !void {
     try writer.writeAll("  ");
-    try style(writer, use_color, .label);
+    try cli.style(writer, use_color, .label);
     try writer.print("{s}", .{label});
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
     try writer.writeAll(": ");
     try writeHashModulo(writer, use_color, hash_modulo);
     try writer.writeByte('\n');
@@ -179,21 +181,21 @@ fn writeHashField(writer: *std.Io.Writer, use_color: bool, label: []const u8, ha
 fn writeHashModulo(writer: *std.Io.Writer, use_color: bool, hash_modulo: derivation.HashModulo) !void {
     switch (hash_modulo) {
         .drv => |hash| {
-            try style(writer, use_color, .hash);
+            try cli.style(writer, use_color, .hash);
             try writer.writeAll(hash);
-            try reset(writer, use_color);
+            try cli.reset(writer, use_color);
         },
         .outputs => |outputs| {
             try writer.writeAll("outputs");
             for (outputs) |output| {
                 try writer.writeAll(" ");
-                try style(writer, use_color, .label);
+                try cli.style(writer, use_color, .label);
                 try writer.writeAll(output.output);
-                try reset(writer, use_color);
+                try cli.reset(writer, use_color);
                 try writer.writeAll("=");
-                try style(writer, use_color, .hash);
+                try cli.style(writer, use_color, .hash);
                 try writer.writeAll(output.hash);
-                try reset(writer, use_color);
+                try cli.reset(writer, use_color);
             }
         },
     }
@@ -221,13 +223,13 @@ fn writeOutputs(
 
     for (sorted) |output| {
         try writer.writeAll("    ");
-        try style(writer, use_color, .label);
+        try cli.style(writer, use_color, .label);
         try writer.writeAll(output.name);
-        try reset(writer, use_color);
+        try cli.reset(writer, use_color);
         try writer.writeAll(" -> ");
-        try style(writer, use_color, .path);
+        try cli.style(writer, use_color, .path);
         try writer.writeAll(output.path);
-        try reset(writer, use_color);
+        try cli.reset(writer, use_color);
         if (output.hash_algo.len != 0 or output.hash.len != 0) {
             try writer.print("  hash {s}:{s}", .{ output.hash_algo, output.hash });
         }
@@ -258,7 +260,7 @@ fn writeStringListSection(
 
     for (sorted) |value| {
         try writer.writeAll("    ");
-        try writeMaybePath(writer, use_color, value);
+        try cli.writeMaybePath(writer, use_color, value);
         try writer.writeByte('\n');
     }
 }
@@ -286,7 +288,7 @@ fn writeInputDrvSection(
 
     for (sorted) |input| {
         try writer.writeAll("    ");
-        try writeMaybePath(writer, use_color, input.path);
+        try cli.writeMaybePath(writer, use_color, input.path);
         try writer.writeAll(" [");
         for (input.outputs, 0..) |output, output_index| {
             if (output_index != 0) try writer.writeAll(" ");
@@ -318,9 +320,9 @@ fn writeEnvSection(
 
     for (sorted) |entry| {
         try writer.writeAll("    ");
-        try style(writer, use_color, .label);
+        try cli.style(writer, use_color, .label);
         try writer.writeAll(entry.name);
-        try reset(writer, use_color);
+        try cli.reset(writer, use_color);
         try writer.writeAll(" = ");
         try writeStringValue(writer, use_color, entry.value);
     }
@@ -343,9 +345,9 @@ fn writeHashModuloStep(
         try writeBlock(writer, use_color, "hash-modulo ATerm", aterm);
     } else {
         try writer.writeAll("    ");
-        try style(writer, use_color, .dim);
+        try cli.style(writer, use_color, .dim);
         try writer.writeAll("fixed-output derivation: no ATerm hash-modulo text\n");
-        try reset(writer, use_color);
+        try cli.reset(writer, use_color);
     }
 }
 
@@ -365,7 +367,7 @@ fn writeBlock(writer: *std.Io.Writer, use_color: bool, title: []const u8, text: 
 
 fn writeStringValue(writer: *std.Io.Writer, use_color: bool, value: []const u8) !void {
     if (std.mem.indexOfScalar(u8, value, '\n') == null) {
-        try writeMaybePath(writer, use_color, value);
+        try cli.writeMaybePath(writer, use_color, value);
         try writer.writeByte('\n');
         return;
     }
@@ -379,49 +381,15 @@ fn writeStringValue(writer: *std.Io.Writer, use_color: bool, value: []const u8) 
     }
 }
 
-fn writeMaybePath(writer: *std.Io.Writer, use_color: bool, value: []const u8) !void {
-    const is_path = std.mem.startsWith(u8, value, "/nix/store/") or std.mem.endsWith(u8, value, ".drv");
-    if (is_path) try style(writer, use_color, .path);
-    try writer.writeAll(value);
-    if (is_path) try reset(writer, use_color);
-}
-
 fn writeSection(writer: *std.Io.Writer, use_color: bool, title: []const u8) !void {
-    try style(writer, use_color, .section);
+    try cli.style(writer, use_color, .section);
     try writer.print("  {s}\n", .{title});
-    try reset(writer, use_color);
+    try cli.reset(writer, use_color);
 }
 
 fn writeEmpty(writer: *std.Io.Writer, use_color: bool) !void {
     try writer.writeAll("    ");
-    try style(writer, use_color, .dim);
+    try cli.style(writer, use_color, .dim);
     try writer.writeAll("(none)\n");
-    try reset(writer, use_color);
-}
-
-const Style = enum {
-    heading,
-    section,
-    label,
-    name,
-    path,
-    hash,
-    dim,
-};
-
-fn style(writer: *std.Io.Writer, use_color: bool, value: Style) !void {
-    if (!use_color) return;
-    try writer.writeAll(switch (value) {
-        .heading => "\x1b[1;35m",
-        .section => "\x1b[1;36m",
-        .label => "\x1b[36m",
-        .name => "\x1b[1m",
-        .path => "\x1b[32m",
-        .hash => "\x1b[33m",
-        .dim => "\x1b[2m",
-    });
-}
-
-fn reset(writer: *std.Io.Writer, use_color: bool) !void {
-    if (use_color) try writer.writeAll("\x1b[0m");
+    try cli.reset(writer, use_color);
 }

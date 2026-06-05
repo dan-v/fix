@@ -492,11 +492,8 @@ pub fn writeLazyXmlValue(self: anytype, writer: *std.Io.Writer, value: Value) !v
 }
 
 fn writeXmlDocument(self: anytype, writer: *std.Io.Writer, value: Value) !void {
-    var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
-    defer seen.deinit(self.allocator);
-
     try writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
-    try writeXmlValue(self, writer, value, 1, &seen);
+    try writeXmlValue(self, writer, value, 1);
     try writer.writeAll("</expr>\n");
 }
 
@@ -505,7 +502,6 @@ fn writeXmlValue(
     writer: *std.Io.Writer,
     value: Value,
     depth: usize,
-    seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) anyerror!void {
     const maybe_forced = try xmlVisibleValue(self, value);
     const forced = maybe_forced orelse {
@@ -536,8 +532,8 @@ fn writeXmlValue(
             try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
             try writer.writeAll("\" />\n");
         },
-        .list => try writeXmlList(self, writer, forced.asObjectId(), depth, seen),
-        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, seen),
+        .list => try writeXmlList(self, writer, forced.asObjectId(), depth),
+        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth),
         .closure, .builtin, .builtin_closure => try writer.writeAll("<function />\n"),
         .thunk, .cell => unreachable,
     }
@@ -563,13 +559,9 @@ fn writeXmlList(
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
-    seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) !void {
-    if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
     try writer.writeAll("<list>\n");
-    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1, seen);
+    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1);
     try writeXmlIndent(writer, depth);
     try writer.writeAll("</list>\n");
 }
@@ -579,11 +571,7 @@ fn writeXmlAttrs(
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
-    seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) !void {
-    if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
-    defer _ = seen.pop();
-
     const sorted = try sortedAttrEntries(self, Value.attrs(id));
     defer self.allocator.free(sorted);
 
@@ -593,7 +581,7 @@ fn writeXmlAttrs(
         try writer.writeAll("<attr name=\"");
         try writeXmlEscaped(writer, self.intern.get(entry.name));
         try writer.writeAll("\">\n");
-        try writeXmlValue(self, writer, entry.value, depth + 2, seen);
+        try writeXmlValue(self, writer, entry.value, depth + 2);
         try writeXmlIndent(writer, depth + 1);
         try writer.writeAll("</attr>\n");
     }
@@ -2335,11 +2323,15 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     const name_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
     const drv_name_id = try stringTextInternId(self, name_value);
+    const drv_name = self.intern.get(drv_name_id);
+
+    if (self.progress) |progress| progress.begin(.derivation, drv_name);
+    defer if (self.progress) |progress| progress.end(.derivation, drv_name);
 
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
 
-    var normalized = try normalizeDerivation(self, attrs_id, self.intern.get(drv_name_id), output_names);
+    var normalized = try normalizeDerivation(self, attrs_id, drv_name, output_names);
     defer normalized.deinit(self.allocator);
     const computed = try normalized.drv.computePaths(self.allocator, self.derivations.resolver());
     defer self.allocator.free(computed.drv_path);

@@ -33,6 +33,7 @@ const numeric = @import("runtime/numeric.zig");
 const source_paths = @import("runtime/source_path.zig");
 const vm_builtins = @import("vm/builtins.zig");
 const eval_trace = @import("eval_trace.zig");
+const eval_progress = @import("eval_progress.zig");
 const diagnostic = @import("diagnostic.zig");
 
 /// A single call frame.
@@ -76,6 +77,8 @@ pub const VM = struct {
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
     trace: ?*eval_trace.Trace,
+    /// Evaluator-owned progress sink.
+    progress: ?eval_progress.Sink,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -99,6 +102,7 @@ pub const VM = struct {
         derivations: *DerivationStore,
         scheduler: *Scheduler,
         trace: ?*eval_trace.Trace,
+        progress: ?eval_progress.Sink,
         import_host: ?ImportHost,
         builtins: Value,
         worker_id: u8,
@@ -119,6 +123,7 @@ pub const VM = struct {
             .derivations = derivations,
             .scheduler = scheduler,
             .trace = trace,
+            .progress = progress,
             .import_host = import_host,
             .builtins = builtins,
             .worker_id = worker_id,
