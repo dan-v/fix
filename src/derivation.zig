@@ -647,10 +647,10 @@ pub fn drvPathName(allocator: std.mem.Allocator, drv_name: []const u8) ![]u8 {
 }
 
 pub fn hashToBase16(allocator: std.mem.Allocator, expected_algo: []const u8, text: []const u8) ![]u8 {
-    const body = if (std.mem.indexOfScalar(u8, text, '-')) |dash| blk: {
-        const algo = text[0..dash];
+    const body = if (hashAlgorithmSeparator(text)) |separator| blk: {
+        const algo = text[0..separator];
         if (!std.mem.eql(u8, algo, expected_algo)) return error.InvalidHashAlgorithm;
-        break :blk text[dash + 1 ..];
+        break :blk text[separator + 1 ..];
     } else text;
 
     if (isHex(body)) {
@@ -694,6 +694,14 @@ fn base64LooseDecode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+pub fn hashAlgorithmSeparator(text: []const u8) ?usize {
+    const dash = std.mem.indexOfScalar(u8, text, '-');
+    const colon = std.mem.indexOfScalar(u8, text, ':');
+    if (dash == null) return colon;
+    if (colon == null) return dash;
+    return @min(dash.?, colon.?);
 }
 
 fn base64Value(char: u8) ?u32 {
@@ -1239,4 +1247,8 @@ test "output hash parser accepts SRI base64 and Nix base32" {
     const nix32 = try hashToBase16(std.testing.allocator, "sha1", "s8l8ca4j8fb6d94205514xd6wf9b57ng");
     defer std.testing.allocator.free(nix32);
     try std.testing.expectEqualStrings("cf9eb292e3a675124a0182a466964392288628d2", nix32);
+
+    const colon_prefixed_nix32 = try hashToBase16(std.testing.allocator, "sha1", "sha1:s8l8ca4j8fb6d94205514xd6wf9b57ng");
+    defer std.testing.allocator.free(colon_prefixed_nix32);
+    try std.testing.expectEqualStrings("cf9eb292e3a675124a0182a466964392288628d2", colon_prefixed_nix32);
 }

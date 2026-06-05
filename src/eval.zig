@@ -2438,6 +2438,21 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(fixed_null_hash_algo);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/v7fhk503far527r9d9sk8dh2w6c7h695-src\\\",\\\"/nix/store/v1bh6bzphg5c2dc9ck7wdd3g1p6g19vd-src\\\"]\"", fixed_null_hash_algo);
 
+    const fixed_colon_hash_algo = try renderForTest(
+        \\let
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256:12g3fcym8184py66fgwahpb9q05dm9r9rbhh4l50yd62gkmifc93";
+        \\    outputHashAlgo = null;
+        \\    outputHashMode = "recursive";
+        \\  };
+        \\in builtins.toJSON [ pkg.drvPath pkg.outPath ]
+    );
+    defer std.testing.allocator.free(fixed_colon_hash_algo);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/v9ighzbjzplkqd9yhp384g44kafzhafp-pkg.drv\\\",\\\"/nix/store/ghq7kh9qwy7jvf05nmzjh3dlyv6b4cv7-pkg\\\"]\"", fixed_colon_hash_algo);
+
     const fixed_missing_hash_algo = try renderForTest(
         \\let
         \\  dep = builtins.derivation {

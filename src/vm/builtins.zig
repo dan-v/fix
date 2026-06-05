@@ -2483,9 +2483,9 @@ fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []cons
     if (isPlainString(forced_algo)) return self.intern.get(try stringTextInternId(self, forced_algo));
     if (forced_algo.discriminant != .null) return error.TypeError;
 
-    const dash = std.mem.indexOfScalar(u8, hash_text, '-') orelse return error.InvalidHashAlgorithm;
-    if (dash == 0) return error.InvalidHashAlgorithm;
-    return hash_text[0..dash];
+    const separator = derivation.hashAlgorithmSeparator(hash_text) orelse return error.InvalidHashAlgorithm;
+    if (separator == 0) return error.InvalidHashAlgorithm;
+    return hash_text[0..separator];
 }
 
 fn derivationArgs(
