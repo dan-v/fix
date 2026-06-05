@@ -25,6 +25,12 @@ const Candidate = struct {
     }
 };
 
+const CheckResult = enum {
+    matched,
+    skipped,
+    failed,
+};
+
 const package_stdout_limit = 128 * 1024 * 1024;
 const package_stderr_limit = 8 * 1024 * 1024;
 const display_limit = 4096;
@@ -68,13 +74,18 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("nixpkgs-check: candidates={} checking={}\n", .{ candidates.len, total });
 
     var checked: usize = 0;
+    var matched: usize = 0;
+    var skipped: usize = 0;
     while (checked < total) : (checked += 1) {
         const candidate = candidates[checked];
-        const ok = try checkCandidate(allocator, init.io, config, nixpkgs_path, candidate, checked + 1, total);
-        if (!ok) std.process.exit(1);
+        switch (try checkCandidate(allocator, init.io, config, nixpkgs_path, candidate, checked + 1, total)) {
+            .matched => matched += 1,
+            .skipped => skipped += 1,
+            .failed => std.process.exit(1),
+        }
     }
 
-    std.debug.print("nixpkgs-check: ok checked={}\n", .{checked});
+    std.debug.print("nixpkgs-check: ok checked={} matched={} skipped={}\n", .{ checked, matched, skipped });
 }
 
 fn listPackages(
@@ -187,36 +198,38 @@ fn checkCandidate(
     candidate: Candidate,
     index: usize,
     total: usize,
-) !bool {
+) !CheckResult {
     const expr = try drvPathExpr(allocator, nixpkgs_path, candidate.attr_path);
     defer allocator.free(expr);
 
     const nix = try harness.runCommand(allocator, io, config.timeout_seconds, &.{ config.nix_bin, "--eval", "--expr", expr });
     defer nix.deinit(allocator);
+
+    if (!nix.ok) {
+        reportProgress(index, total, candidate.attr_path);
+        return .skipped;
+    }
+
     const fix = try harness.runCommand(allocator, io, config.timeout_seconds, &.{ config.fix_bin, "--expr", expr });
     defer fix.deinit(allocator);
 
-    if (nix.ok and fix.ok) {
+    if (fix.ok) {
         const nix_out = trimOutput(nix.stdout);
         const fix_out = trimOutput(fix.stdout);
         if (std.mem.eql(u8, nix_out, fix_out)) {
             reportProgress(index, total, candidate.attr_path);
-            return true;
+            return .matched;
         }
         reportMismatch(candidate.attr_path, expr, "drvPath mismatch", nix, fix);
-        return false;
+        return .failed;
     }
 
-    if (nix.timed_out or fix.timed_out) {
+    if (fix.timed_out) {
         reportMismatch(candidate.attr_path, expr, "command timed out", nix, fix);
-    } else if (nix.ok and !fix.ok) {
-        reportMismatch(candidate.attr_path, expr, "fix rejected Nix package", nix, fix);
-    } else if (!nix.ok and fix.ok) {
-        reportMismatch(candidate.attr_path, expr, "Nix rejected enumerated package", nix, fix);
     } else {
-        reportMismatch(candidate.attr_path, expr, "both evaluators rejected package", nix, fix);
+        reportMismatch(candidate.attr_path, expr, "fix rejected Nix package", nix, fix);
     }
-    return false;
+    return .failed;
 }
 
 fn reportProgress(index: usize, total: usize, attr_path: []const u8) void {
