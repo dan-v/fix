@@ -150,6 +150,15 @@ test "end-to-end: nested interpolation in strings" {
 
     const nested_attr = try ev.evaluate("\"a${{ x = { y = \"b\"; }; }.x.y}c\"");
     try std.testing.expectEqualStrings("abc", ev.intern.get(nested_attr.asInternId()));
+
+    const escaped_interpolation = try ev.evaluate("let x = \"X\"; in \"a$${x}b\"");
+    try std.testing.expectEqualStrings("a$${x}b", ev.intern.get(escaped_interpolation.asInternId()));
+
+    const odd_dollar_run_interpolates = try ev.evaluate("let x = \"X\"; in \"a$$${x}b\"");
+    try std.testing.expectEqualStrings("a$$Xb", ev.intern.get(odd_dollar_run_interpolates.asInternId()));
+
+    const even_dollar_run_escapes = try ev.evaluate("let x = \"X\"; in \"a$$$${x}b\"");
+    try std.testing.expectEqualStrings("a$$$${x}b", ev.intern.get(even_dollar_run_escapes.asInternId()));
 }
 
 test "end-to-end: indented strings" {
@@ -177,6 +186,15 @@ test "end-to-end: indented strings" {
 
     const escaped = try ev.evaluate("'' ''${ ''' ''\\n ''");
     try std.testing.expectEqualStrings("${ '' \n", ev.intern.get(escaped.asInternId()));
+
+    const escaped_interpolation = try ev.evaluate("let x = \"X\"; in ''a$${x}b''");
+    try std.testing.expectEqualStrings("a$${x}b", ev.intern.get(escaped_interpolation.asInternId()));
+
+    const odd_dollar_run_interpolates = try ev.evaluate("let x = \"X\"; in ''a$$${x}b''");
+    try std.testing.expectEqualStrings("a$$Xb", ev.intern.get(odd_dollar_run_interpolates.asInternId()));
+
+    const even_dollar_run_escapes = try ev.evaluate("let x = \"X\"; in ''a$$$${x}b''");
+    try std.testing.expectEqualStrings("a$$$${x}b", ev.intern.get(even_dollar_run_escapes.asInternId()));
 }
 
 test "end-to-end: ambient builtins" {

@@ -95,11 +95,11 @@ fn scanDoubleQuoted(source: []const u8, start: usize) ?usize {
             '"' => return i + 1,
             '\\' => i += if (i + 1 < source.len) 2 else 1,
             '$' => {
-                if (i + 1 < source.len and source[i + 1] == '{') {
-                    const end = findInterpolationEnd(source, i + 2) orelse return null;
+                const run_start = i;
+                while (i < source.len and source[i] == '$') i += 1;
+                if (i < source.len and source[i] == '{' and (i - run_start) % 2 == 1) {
+                    const end = findInterpolationEnd(source, i + 1) orelse return null;
                     i = end + 1;
-                } else {
-                    i += 1;
                 }
             },
             else => i += 1,
@@ -112,9 +112,13 @@ fn scanIndented(source: []const u8, start: usize) ?usize {
     if (start + 1 >= source.len or source[start] != '\'' or source[start + 1] != '\'') return null;
     var i = start + 2;
     while (i < source.len) {
-        if (source[i] == '$' and i + 1 < source.len and source[i + 1] == '{') {
-            const end = findInterpolationEnd(source, i + 2) orelse return null;
-            i = end + 1;
+        if (source[i] == '$') {
+            const run_start = i;
+            while (i < source.len and source[i] == '$') i += 1;
+            if (i < source.len and source[i] == '{' and (i - run_start) % 2 == 1) {
+                const end = findInterpolationEnd(source, i + 1) orelse return null;
+                i = end + 1;
+            }
             continue;
         }
 
@@ -186,9 +190,14 @@ fn parseDoubleQuoted(
             i += if (i + 1 < body_end) 2 else 1;
             continue;
         }
-        if (source[i] == '$' and i + 1 < body_end and source[i + 1] == '{') {
-            try appendDoubleText(allocator, source[cursor..i], parts);
-            const expr_start = i + 2;
+        if (source[i] == '$') {
+            const run_start = i;
+            while (i < body_end and source[i] == '$') i += 1;
+            if (i >= body_end or source[i] != '{' or (i - run_start) % 2 == 0) continue;
+
+            const interpolation_start = i - 1;
+            try appendDoubleText(allocator, source[cursor..interpolation_start], parts);
+            const expr_start = i + 1;
             const expr_end = findInterpolationEnd(source, expr_start) orelse return error.InvalidStringLiteral;
             try parts.append(allocator, .{ .interpolation = .{
                 .start = @intCast(expr_start),
@@ -258,11 +267,24 @@ fn parseIndented(
             continue;
         }
 
-        if (source[i] == '$' and i + 1 < body_end and source[i + 1] == '{') {
+        if (source[i] == '$') {
+            const run_start = i;
+            while (i < body_end and source[i] == '$') i += 1;
+            if (i >= body_end or source[i] != '{' or (i - run_start) % 2 == 0) {
+                for (source[run_start..i]) |byte| {
+                    try appendIndentedByte(allocator, &text, &state, byte);
+                }
+                continue;
+            }
+
+            const interpolation_start = i - 1;
+            for (source[run_start..interpolation_start]) |byte| {
+                try appendIndentedByte(allocator, &text, &state, byte);
+            }
             try flushOwnedText(allocator, &text, parts);
             state.noteNonIndent();
 
-            const expr_start = i + 2;
+            const expr_start = i + 1;
             const expr_end = findInterpolationEnd(source, expr_start) orelse return error.InvalidStringLiteral;
             try parts.append(allocator, .{ .interpolation = .{
                 .start = @intCast(expr_start),
