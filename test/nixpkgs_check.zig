@@ -10,6 +10,7 @@ const harness = @import("harness");
 const Config = struct {
     nixpkgs: ?[]const u8 = null,
     selector: ?[]const u8 = null,
+    skip: usize = 0,
     limit: usize = 0,
     fix_bin: []const u8 = "zig-out/bin/fix",
     nix_bin: []const u8 = "nix-instantiate",
@@ -70,15 +71,19 @@ pub fn main(init: std.process.Init) !void {
 
     std.mem.sort(Candidate, candidates, {}, lessThanCandidate);
 
-    const total = if (config.limit == 0) candidates.len else @min(config.limit, candidates.len);
-    std.debug.print("nixpkgs-check: candidates={} checking={}\n", .{ candidates.len, total });
+    const window = checkWindow(candidates.len, config.skip, config.limit);
+    if (window.total == 0) {
+        std.debug.print("nixpkgs-check: no package candidates after --skip/--limit\n", .{});
+        std.process.exit(1);
+    }
+    std.debug.print("nixpkgs-check: candidates={} skip={} checking={}\n", .{ candidates.len, window.start, window.total });
 
     var checked: usize = 0;
     var matched: usize = 0;
     var skipped: usize = 0;
-    while (checked < total) : (checked += 1) {
-        const candidate = candidates[checked];
-        switch (try checkCandidate(allocator, init.io, config, nixpkgs_path, candidate, checked + 1, total)) {
+    while (checked < window.total) : (checked += 1) {
+        const candidate = candidates[window.start + checked];
+        switch (try checkCandidate(allocator, init.io, config, nixpkgs_path, candidate, checked + 1, window.total)) {
             .matched => matched += 1,
             .skipped => skipped += 1,
             .failed => std.process.exit(1),
@@ -188,6 +193,18 @@ fn freeCandidates(allocator: std.mem.Allocator, candidates: []Candidate) void {
 
 fn lessThanCandidate(_: void, lhs: Candidate, rhs: Candidate) bool {
     return std.mem.lessThan(u8, lhs.attr_path, rhs.attr_path);
+}
+
+const CheckWindow = struct {
+    start: usize,
+    total: usize,
+};
+
+fn checkWindow(candidate_count: usize, skip: usize, limit: usize) CheckWindow {
+    const start = @min(skip, candidate_count);
+    const available = candidate_count - start;
+    const total = if (limit == 0) available else @min(limit, available);
+    return .{ .start = start, .total = total };
 }
 
 fn checkCandidate(
@@ -341,6 +358,8 @@ fn parseArgs(config: *Config, init: std.process.Init) !void {
             config.nixpkgs = value;
         } else if (try harness.optionValue(&args, arg, "--selector")) |value| {
             config.selector = value;
+        } else if (try harness.optionValue(&args, arg, "--skip")) |value| {
+            config.skip = try std.fmt.parseInt(usize, value, 10);
         } else if (try harness.optionValue(&args, arg, "--limit")) |value| {
             config.limit = try std.fmt.parseInt(usize, value, 10);
         } else if (try harness.optionValue(&args, arg, "--fix-bin")) |value| {
@@ -369,6 +388,7 @@ fn usage() void {
         \\options:
         \\  --nixpkgs PATH      nixpkgs path for nix-env/import (default: pinned ./npins)
         \\  --selector TEXT     optional nix-env selector, such as hello
+        \\  --skip N            skip the first N sorted candidates
         \\  --limit N           stop after N candidates; 0 means all
         \\  --fix-bin PATH      fix executable (default: zig-out/bin/fix)
         \\  --nix-bin PATH      nix-instantiate executable
@@ -382,4 +402,11 @@ test "drvPath expression quotes attr path components" {
     const expr = try drvPathExpr(std.testing.allocator, "<nixpkgs>", "haskellPackages.hello");
     defer std.testing.allocator.free(expr);
     try std.testing.expect(std.mem.indexOf(u8, expr, "pkgs.\"haskellPackages\".\"hello\".drvPath") != null);
+}
+
+test "check window applies skip before limit" {
+    try std.testing.expectEqual(CheckWindow{ .start = 0, .total = 10 }, checkWindow(10, 0, 0));
+    try std.testing.expectEqual(CheckWindow{ .start = 3, .total = 7 }, checkWindow(10, 3, 0));
+    try std.testing.expectEqual(CheckWindow{ .start = 3, .total = 4 }, checkWindow(10, 3, 4));
+    try std.testing.expectEqual(CheckWindow{ .start = 10, .total = 0 }, checkWindow(10, 12, 4));
 }
