@@ -920,6 +920,14 @@ test "evaluate matches Nix toString bool and null semantics" {
     const null_output = try renderForTest("builtins.toString null");
     defer std.testing.allocator.free(null_output);
     try std.testing.expectEqualStrings("\"\"", null_output);
+
+    const nested_empty_list = try renderForTest("builtins.toString [ \"a\" [ ] \"b\" ]");
+    defer std.testing.allocator.free(nested_empty_list);
+    try std.testing.expectEqualStrings("\"a b\"", nested_empty_list);
+
+    const nested_empty_string = try renderForTest("builtins.toString [ \"a\" [ \"\" ] \"b\" ]");
+    defer std.testing.allocator.free(nested_empty_string);
+    try std.testing.expectEqualStrings("\"a  b\"", nested_empty_string);
 }
 
 test "evaluate decodes common string escapes" {
@@ -2686,13 +2694,14 @@ test "evaluate minimal derivation builtins" {
         \\in builtins.toJSON {
         \\  drvPathLength = builtins.stringLength (mk "x").drvPath;
         \\  listStringSame = (mk [ 1 true null ]).outPath == (mk "1  ").outPath;
+        \\  emptyListElementSame = (mk [ "a" [ ] "b" ]).outPath == (mk "a b").outPath;
         \\  metaSame = (mkMeta 1).outPath == (mkMeta 2).outPath;
         \\  structuredIntStringSame = (mkStructured 1).outPath == (mkStructured "1").outPath;
         \\  unstructuredIntStringSame = (mk 1).outPath == (mk "1").outPath;
         \\}
     );
     defer std.testing.allocator.free(semantic_paths);
-    try std.testing.expectEqualStrings("\"{\\\"drvPathLength\\\":51,\\\"listStringSame\\\":false,\\\"metaSame\\\":false,\\\"structuredIntStringSame\\\":false,\\\"unstructuredIntStringSame\\\":true}\"", semantic_paths);
+    try std.testing.expectEqualStrings("\"{\\\"drvPathLength\\\":51,\\\"emptyListElementSame\\\":true,\\\"listStringSame\\\":false,\\\"metaSame\\\":false,\\\"structuredIntStringSame\\\":false,\\\"unstructuredIntStringSame\\\":true}\"", semantic_paths);
 
     const structured_ignore_nulls_reintern = try renderForTest(
         \\let

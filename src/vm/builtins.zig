@@ -3377,9 +3377,13 @@ fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
 
-    for (try self.heap.getList(list_id), 0..) |item, i| {
-        if (i > 0) try out.append(self.allocator, ' ');
-        const item_value = try coerceToStringValue(self, item);
+    var first = true;
+    for (try self.heap.getList(list_id)) |item| {
+        const forced = try self.forceValue(item);
+        if (try skipEmptyListStringItem(self, forced)) continue;
+        if (!first) try out.append(self.allocator, ' ');
+        first = false;
+        const item_value = try coerceToStringValue(self, forced);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
         for (try contextEntriesForValue(self, item_value)) |entry| {
@@ -3390,6 +3394,10 @@ fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
     const text_id = try self.intern.intern(out.items);
     if (context.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
+}
+
+fn skipEmptyListStringItem(self: anytype, value: Value) !bool {
+    return value.discriminant == .list and (try self.heap.getList(value.asObjectId())).len == 0;
 }
 
 fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
@@ -3439,9 +3447,13 @@ fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
 
-    for (try self.heap.getList(list_id), 0..) |item, i| {
-        if (i > 0) try out.append(self.allocator, ' ');
-        const item_value = try coerceDerivationStringValue(self, item);
+    var first = true;
+    for (try self.heap.getList(list_id)) |item| {
+        const forced = try self.forceValue(item);
+        if (try skipEmptyListStringItem(self, forced)) continue;
+        if (!first) try out.append(self.allocator, ' ');
+        first = false;
+        const item_value = try coerceDerivationStringValue(self, forced);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
         for (try contextEntriesForValue(self, item_value)) |entry| {
