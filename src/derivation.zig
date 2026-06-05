@@ -63,6 +63,53 @@ pub const HashModuloView = union(enum) {
     outputs: []const OutputHash,
 };
 
+pub const DebugHashModuloStep = struct {
+    mask_outputs: bool,
+    inputs: []DrvInput,
+    aterm: ?[]u8,
+    hash_modulo: HashModulo,
+
+    pub fn deinit(self: DebugHashModuloStep, allocator: std.mem.Allocator) void {
+        freeDrvInputsDeep(allocator, self.inputs);
+        if (self.aterm) |aterm| allocator.free(aterm);
+        self.hash_modulo.deinit(allocator);
+    }
+};
+
+pub const DebugRecord = struct {
+    name: []u8,
+    drv_path: []u8,
+    system: []u8,
+    builder: []u8,
+    args: []const []const u8,
+    outputs: []DrvOutput,
+    input_drvs: []DrvInput,
+    input_srcs: []const []const u8,
+    env: []EnvVar,
+    drv_aterm: []u8,
+    drv_text_hash: []u8,
+    drv_text_references: []const []const u8,
+    output_hash: DebugHashModuloStep,
+    dependency_hash: DebugHashModuloStep,
+
+    pub fn deinit(self: DebugRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.drv_path);
+        allocator.free(self.system);
+        allocator.free(self.builder);
+        freeStringListDeep(allocator, self.args);
+        freeDrvOutputsDeep(allocator, self.outputs);
+        freeDrvInputsDeep(allocator, self.input_drvs);
+        freeStringListDeep(allocator, self.input_srcs);
+        freeEnvVarsDeep(allocator, self.env);
+        allocator.free(self.drv_aterm);
+        allocator.free(self.drv_text_hash);
+        freeStringListDeep(allocator, self.drv_text_references);
+        self.output_hash.deinit(allocator);
+        self.dependency_hash.deinit(allocator);
+    }
+};
+
 pub const HashModuloResolver = struct {
     store_dir: []const u8,
     context: *anyopaque,
@@ -77,6 +124,8 @@ pub const DerivationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
     records: std.StringHashMapUnmanaged(Record) = .empty,
+    debug_enabled: bool = false,
+    debug_records: std.ArrayListUnmanaged(DebugRecord) = .empty,
 
     const Record = struct {
         hash_modulo: HashModulo,
@@ -94,12 +143,28 @@ pub const DerivationStore = struct {
     }
 
     pub fn deinit(self: *DerivationStore) void {
+        self.clearDebugRecords();
+        self.debug_records.deinit(self.allocator);
         var it = self.records.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.records.deinit(self.allocator);
+    }
+
+    pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {
+        self.debug_enabled = enabled;
+        if (!enabled) self.clearDebugRecords();
+    }
+
+    pub fn clearDebugRecords(self: *DerivationStore) void {
+        for (self.debug_records.items) |debug_record| debug_record.deinit(self.allocator);
+        self.debug_records.clearRetainingCapacity();
+    }
+
+    pub fn debugRecords(self: *const DerivationStore) []const DebugRecord {
+        return self.debug_records.items;
     }
 
     pub fn resolver(self: *DerivationStore) HashModuloResolver {
@@ -126,6 +191,13 @@ pub const DerivationStore = struct {
         const key = try self.allocator.dupe(u8, drv_path);
         errdefer self.allocator.free(key);
         try self.records.put(self.allocator, key, value);
+    }
+
+    pub fn recordDebug(self: *DerivationStore, drv: *const Drv, computed: ComputedPaths) !void {
+        if (!self.debug_enabled) return;
+        var debug_record = try debugRecordFromDrv(self.allocator, drv, computed.drv_path, self.resolver());
+        errdefer debug_record.deinit(self.allocator);
+        try self.debug_records.append(self.allocator, debug_record);
     }
 
     pub fn outputNames(self: *DerivationStore, drv_path: []const u8) ?[]const []const u8 {
@@ -542,6 +614,16 @@ fn textStorePath(
     return storePathFromInnerDigest(allocator, store_dir, ty.items, digest, name);
 }
 
+pub fn textPath(
+    allocator: std.mem.Allocator,
+    store_dir: []const u8,
+    name: []const u8,
+    text: []const u8,
+    refs: []const []const u8,
+) ![]u8 {
+    return textStorePath(allocator, store_dir, name, text, refs);
+}
+
 fn storePathFromInnerDigest(
     allocator: std.mem.Allocator,
     store_dir: []const u8,
@@ -621,6 +703,207 @@ fn base64Value(char: u8) ?u32 {
     if (char == '+') return 62;
     if (char == '/') return 63;
     return null;
+}
+
+fn debugRecordFromDrv(
+    allocator: std.mem.Allocator,
+    drv: *const Drv,
+    drv_path: []const u8,
+    resolver: HashModuloResolver,
+) !DebugRecord {
+    var record: DebugRecord = undefined;
+
+    record.name = try allocator.dupe(u8, drv.name);
+    errdefer allocator.free(record.name);
+    record.drv_path = try allocator.dupe(u8, drv_path);
+    errdefer allocator.free(record.drv_path);
+    record.system = try allocator.dupe(u8, drv.system);
+    errdefer allocator.free(record.system);
+    record.builder = try allocator.dupe(u8, drv.builder);
+    errdefer allocator.free(record.builder);
+    record.args = try cloneStringListDeep(allocator, drv.args);
+    errdefer freeStringListDeep(allocator, record.args);
+    record.outputs = try cloneDrvOutputsDeep(allocator, drv.outputs);
+    errdefer freeDrvOutputsDeep(allocator, record.outputs);
+    record.input_drvs = try cloneDrvInputsDeep(allocator, drv.input_drvs);
+    errdefer freeDrvInputsDeep(allocator, record.input_drvs);
+    record.input_srcs = try cloneStringListDeep(allocator, drv.input_srcs);
+    errdefer freeStringListDeep(allocator, record.input_srcs);
+    record.env = try cloneEnvVarsDeep(allocator, drv.env);
+    errdefer freeEnvVarsDeep(allocator, record.env);
+
+    record.drv_aterm = try drv.toATerm(allocator, false, null);
+    errdefer allocator.free(record.drv_aterm);
+    record.drv_text_hash = try sha256Hex(allocator, record.drv_aterm);
+    errdefer allocator.free(record.drv_text_hash);
+
+    const references = try drv.textReferences(allocator);
+    defer allocator.free(references);
+    record.drv_text_references = try cloneStringListDeep(allocator, references);
+    errdefer freeStringListDeep(allocator, record.drv_text_references);
+
+    record.output_hash = try debugHashModuloStep(allocator, drv, resolver, true);
+    errdefer record.output_hash.deinit(allocator);
+    record.dependency_hash = try debugHashModuloStep(allocator, drv, resolver, false);
+    errdefer record.dependency_hash.deinit(allocator);
+
+    return record;
+}
+
+fn debugHashModuloStep(
+    allocator: std.mem.Allocator,
+    drv: *const Drv,
+    resolver: HashModuloResolver,
+    mask_outputs: bool,
+) !DebugHashModuloStep {
+    if (drv.isFixedOutput()) {
+        const inputs = try allocator.alloc(DrvInput, 0);
+        errdefer allocator.free(inputs);
+        const hash_modulo = try drv.hashModulo(allocator, resolver, mask_outputs);
+        errdefer hash_modulo.deinit(allocator);
+        return .{
+            .mask_outputs = mask_outputs,
+            .inputs = inputs,
+            .aterm = null,
+            .hash_modulo = hash_modulo,
+        };
+    }
+
+    const borrowed_inputs = try drv.hashModuloInputs(allocator, resolver);
+    defer freeHashModuloInputs(allocator, borrowed_inputs);
+
+    const inputs = try cloneDrvInputsDeep(allocator, borrowed_inputs);
+    errdefer freeDrvInputsDeep(allocator, inputs);
+    const aterm = try drv.toATerm(allocator, mask_outputs, borrowed_inputs);
+    errdefer allocator.free(aterm);
+    const hash = try sha256Hex(allocator, aterm);
+    errdefer allocator.free(hash);
+
+    return .{
+        .mask_outputs = mask_outputs,
+        .inputs = inputs,
+        .aterm = aterm,
+        .hash_modulo = .{ .drv = hash },
+    };
+}
+
+fn cloneStringListDeep(allocator: std.mem.Allocator, strings: []const []const u8) ![]const []const u8 {
+    const cloned = try allocator.alloc([]const u8, strings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |string| allocator.free(string);
+        allocator.free(cloned);
+    }
+    for (strings, cloned) |string, *dest| {
+        dest.* = try allocator.dupe(u8, string);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn freeStringListDeep(allocator: std.mem.Allocator, strings: []const []const u8) void {
+    for (strings) |string| allocator.free(string);
+    allocator.free(strings);
+}
+
+fn cloneDrvOutputsDeep(allocator: std.mem.Allocator, outputs: []const DrvOutput) ![]DrvOutput {
+    const cloned = try allocator.alloc(DrvOutput, outputs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |output| {
+            allocator.free(output.name);
+            allocator.free(output.path);
+            allocator.free(output.hash_algo);
+            allocator.free(output.hash);
+        }
+        allocator.free(cloned);
+    }
+    for (outputs, cloned) |output, *dest| {
+        dest.* = .{
+            .name = try allocator.dupe(u8, output.name),
+            .path = undefined,
+            .hash_algo = undefined,
+            .hash = undefined,
+        };
+        errdefer allocator.free(dest.name);
+        dest.path = try allocator.dupe(u8, output.path);
+        errdefer allocator.free(dest.path);
+        dest.hash_algo = try allocator.dupe(u8, output.hash_algo);
+        errdefer allocator.free(dest.hash_algo);
+        dest.hash = try allocator.dupe(u8, output.hash);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn freeDrvOutputsDeep(allocator: std.mem.Allocator, outputs: []const DrvOutput) void {
+    for (outputs) |output| {
+        allocator.free(output.name);
+        allocator.free(output.path);
+        allocator.free(output.hash_algo);
+        allocator.free(output.hash);
+    }
+    allocator.free(outputs);
+}
+
+fn cloneDrvInputsDeep(allocator: std.mem.Allocator, inputs: []const DrvInput) ![]DrvInput {
+    const cloned = try allocator.alloc(DrvInput, inputs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |input| {
+            allocator.free(input.path);
+            freeStringListDeep(allocator, input.outputs);
+        }
+        allocator.free(cloned);
+    }
+    for (inputs, cloned) |input, *dest| {
+        dest.* = .{
+            .path = try allocator.dupe(u8, input.path),
+            .outputs = undefined,
+        };
+        errdefer allocator.free(dest.path);
+        dest.outputs = try cloneStringListDeep(allocator, input.outputs);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn freeDrvInputsDeep(allocator: std.mem.Allocator, inputs: []const DrvInput) void {
+    for (inputs) |input| {
+        allocator.free(input.path);
+        freeStringListDeep(allocator, input.outputs);
+    }
+    allocator.free(inputs);
+}
+
+fn cloneEnvVarsDeep(allocator: std.mem.Allocator, env: []const EnvVar) ![]EnvVar {
+    const cloned = try allocator.alloc(EnvVar, env.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.value);
+        }
+        allocator.free(cloned);
+    }
+    for (env, cloned) |entry, *dest| {
+        dest.* = .{
+            .name = try allocator.dupe(u8, entry.name),
+            .value = undefined,
+        };
+        errdefer allocator.free(dest.name);
+        dest.value = try allocator.dupe(u8, entry.value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn freeEnvVarsDeep(allocator: std.mem.Allocator, env: []const EnvVar) void {
+    for (env) |entry| {
+        allocator.free(entry.name);
+        allocator.free(entry.value);
+    }
+    allocator.free(env);
 }
 
 fn cloneHashModulo(allocator: std.mem.Allocator, hash_modulo: HashModuloView) !HashModulo {

@@ -1501,13 +1501,35 @@ fn builtinToPath(self: anytype, arg: Value) !Value {
 
 fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
     const name_value = try self.forceValue(name_arg);
-    const contents_value = try self.forceValue(contents_arg);
-    if (!isStringLike(name_value) or !isStringLike(contents_value)) return error.TypeError;
+    if (!isStringLike(name_value)) return error.TypeError;
 
     const name = self.intern.get(try stringTextInternId(self, name_value));
+    try validateStorePathName(name);
+
+    const contents_value = try coerceStringContextValue(self, contents_arg);
     const contents = self.intern.get(try stringTextInternId(self, contents_value));
-    const path_id = try storeLikePath(self, name, contents);
-    return contextStringWithPath(self, path_id);
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer refs.deinit(self.allocator);
+    for (try contextEntriesForValue(self, contents_value)) |entry| {
+        const ref = self.intern.get(entry.name);
+        if (std.mem.endsWith(u8, ref, ".drv")) return error.DerivationReferenceInToFile;
+        try refs.append(self.allocator, ref);
+    }
+
+    const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs.items);
+    defer self.allocator.free(path);
+    return contextStringWithPath(self, try self.intern.intern(path));
+}
+
+fn validateStorePathName(name: []const u8) !void {
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidStorePathName;
+    for (name) |char| {
+        if (std.ascii.isAlphanumeric(char)) continue;
+        switch (char) {
+            '+', '-', '.', '_', '?', '=' => continue,
+            else => return error.InvalidStorePathName,
+        }
+    }
 }
 
 fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
@@ -2177,7 +2199,11 @@ fn storeLikePath(self: anytype, name: []const u8, fingerprint: []const u8) !Inte
 
 fn builtinPlaceholder(self: anytype, arg: Value) !Value {
     const output = try stringArg(self, arg);
-    const text = try std.fmt.allocPrint(self.allocator, "/nix/store/placeholder-{s}", .{output});
+    const fingerprint = try std.fmt.allocPrint(self.allocator, "nix-output:{s}", .{output});
+    defer self.allocator.free(fingerprint);
+    const hash = try nix_hash.hashBytesNixBase32(self.allocator, "sha256", fingerprint);
+    defer self.allocator.free(hash);
+    const text = try std.fmt.allocPrint(self.allocator, "/{s}", .{hash});
     defer self.allocator.free(text);
     return Value.string(try self.intern.intern(text));
 }
@@ -2319,6 +2345,7 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     defer self.allocator.free(computed.drv_path);
     defer computed.hash_modulo.deinit(self.allocator);
     try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
+    try self.derivations.recordDebug(&normalized.drv, computed);
 
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);
@@ -2406,7 +2433,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
     errdefer env.deinit(self.allocator);
     const original_attrs = try self.heap.getAttrs(attrs_id);
     if (structured) {
-        const json = try structuredAttrsJson(self, attrs_id, output_names.names, ignore_nulls, &inputs, &owned_strings);
+        const json = try structuredAttrsJson(self, attrs_id, output_names.names, output_names.explicit, ignore_nulls, &inputs, &owned_strings);
         try owned_strings.append(self.allocator, json);
         try env.append(self.allocator, .{ .name = "__json", .value = json });
     } else {
@@ -2568,6 +2595,7 @@ fn structuredAttrsJson(
     self: anytype,
     attrs_id: ObjectId,
     outputs: []const InternId,
+    explicit_outputs: bool,
     ignore_nulls: bool,
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
@@ -2586,7 +2614,7 @@ fn structuredAttrsJson(
         if (std.mem.eql(u8, name, "__structuredAttrs")) continue;
         if (std.mem.eql(u8, name, "__ignoreNulls")) continue;
         if (std.mem.eql(u8, name, "args")) continue;
-        if (std.mem.eql(u8, name, "outputs")) continue;
+        if (std.mem.eql(u8, name, "outputs") and !explicit_outputs) continue;
         if (isDerivationSyntheticAttr(self, name, outputs)) continue;
         if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
         if (!first) try out.append(self.allocator, ',');
@@ -2764,22 +2792,6 @@ fn contextOutputs(
 ) ![]const []const u8 {
     const attrs = try self.forceValue(value);
     if (attrs.discriminant != .attrs) return error.TypeError;
-    if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
-        const list = try self.forceValue(outputs_value);
-        if (list.discriminant != .list) return error.TypeError;
-        const items = try self.heap.getList(list.asObjectId());
-        const outputs = try self.allocator.alloc([]const u8, items.len);
-        errdefer self.allocator.free(outputs);
-        for (items, outputs) |item, *output| {
-            const item_value = try self.forceValue(item);
-            if (!isPlainString(item_value)) return error.TypeError;
-            output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
-        }
-        return outputs;
-    } else |err| switch (err) {
-        error.MissingAttribute => {},
-        else => return err,
-    }
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("allOutputs"))) |all_outputs_value| {
         const all_outputs = try self.forceValue(all_outputs_value);
         if (!all_outputs.isBool()) return error.TypeError;
@@ -2792,6 +2804,22 @@ fn contextOutputs(
             }
             return outputs;
         }
+    } else |err| switch (err) {
+        error.MissingAttribute => {},
+        else => return err,
+    }
+    if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
+        const list = try self.forceValue(outputs_value);
+        if (list.discriminant != .list) return error.TypeError;
+        const items = try self.heap.getList(list.asObjectId());
+        const outputs = try self.allocator.alloc([]const u8, items.len);
+        errdefer self.allocator.free(outputs);
+        for (items, outputs) |item, *output| {
+            const item_value = try self.forceValue(item);
+            if (!isPlainString(item_value)) return error.TypeError;
+            output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
+        }
+        return outputs;
     } else |err| switch (err) {
         error.MissingAttribute => {},
         else => return err,
@@ -3187,9 +3215,73 @@ fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
     const left_forced = try self.forceValue(left);
     const right_forced = try self.forceValue(right);
     if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
-        return Value.attrs(try self.heap.addMergedAttrs(left_forced.asObjectId(), right_forced.asObjectId()));
+        return Value.attrs(try mergeContextAttrs(self, left_forced.asObjectId(), right_forced.asObjectId()));
     }
     return right;
+}
+
+fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+    const left = try self.heap.getAttrs(left_id);
+    const right = try self.heap.getAttrs(right_id);
+
+    var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left.len + right.len);
+    defer merged.deinit(self.allocator);
+
+    var left_i: usize = 0;
+    var right_i: usize = 0;
+    while (left_i < left.len and right_i < right.len) {
+        const l = left[left_i];
+        const r = right[right_i];
+        if (l.name < r.name) {
+            merged.appendAssumeCapacity(l);
+            left_i += 1;
+        } else if (l.name > r.name) {
+            merged.appendAssumeCapacity(r);
+            right_i += 1;
+        } else {
+            const value = try mergeContextAttrValue(self, l.name, l.value, r.value);
+            merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
+            left_i += 1;
+            right_i += 1;
+        }
+    }
+    while (left_i < left.len) : (left_i += 1) {
+        merged.appendAssumeCapacity(left[left_i]);
+    }
+    while (right_i < right.len) : (right_i += 1) {
+        merged.appendAssumeCapacity(right[right_i]);
+    }
+
+    return self.heap.addAttrs(merged.items);
+}
+
+fn mergeContextAttrValue(self: anytype, name: InternId, left: Value, right: Value) !Value {
+    if (name == try self.intern.intern("outputs")) return mergeContextOutputs(self, left, right);
+    return right;
+}
+
+fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
+    const left_list = try self.forceValue(left);
+    const right_list = try self.forceValue(right);
+    if (left_list.discriminant != .list or right_list.discriminant != .list) return error.TypeError;
+
+    var outputs: std.ArrayListUnmanaged(Value) = .empty;
+    defer outputs.deinit(self.allocator);
+
+    for (try self.heap.getList(left_list.asObjectId())) |item| try appendUniqueContextOutput(self, &outputs, item);
+    for (try self.heap.getList(right_list.asObjectId())) |item| try appendUniqueContextOutput(self, &outputs, item);
+
+    return Value.list(try self.heap.addList(outputs.items));
+}
+
+fn appendUniqueContextOutput(self: anytype, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
+    const value = try self.forceValue(item);
+    if (!isPlainString(value)) return error.TypeError;
+    const text = try stringTextInternId(self, value);
+    for (outputs.items) |existing| {
+        if (try stringTextInternId(self, existing) == text) return;
+    }
+    try outputs.append(self.allocator, Value.string(text));
 }
 
 fn pathContextValue(self: anytype) !Value {

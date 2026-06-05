@@ -627,6 +627,35 @@ pub const VM = struct {
                     const result = try self.getAttrPathOrValue(attrs_val, default_val, code[names_start..frame.ip], true);
                     try self.push(result);
                 },
+                .get_attr_path_mixed_or => {
+                    const segment_count = code[frame.ip];
+                    frame.ip += 1;
+                    const dynamic_count = code[frame.ip];
+                    frame.ip += 1;
+                    const segments_start = frame.ip;
+                    for (0..segment_count) |_| {
+                        const tag = code[frame.ip];
+                        frame.ip += 1;
+                        switch (tag) {
+                            0 => frame.ip += 4,
+                            1 => {},
+                            else => return error.InvalidBytecode,
+                        }
+                    }
+                    const default_val = self.pop();
+                    const dynamic_names = try self.allocator.alloc(InternId, dynamic_count);
+                    defer self.allocator.free(dynamic_names);
+                    var dynamic_i: usize = dynamic_count;
+                    while (dynamic_i > 0) {
+                        dynamic_i -= 1;
+                        const name_val = try self.forceValue(self.pop());
+                        if (name_val.discriminant != .string) return error.TypeError;
+                        dynamic_names[dynamic_i] = name_val.asInternId();
+                    }
+                    const attrs_val = self.pop();
+                    const result = try self.getAttrPathMixedOrValue(attrs_val, dynamic_names, default_val, code[segments_start..frame.ip], segment_count);
+                    try self.push(result);
+                },
                 .has_attr_path => {
                     const segment_count = code[frame.ip];
                     frame.ip += 1;
@@ -983,6 +1012,10 @@ pub const VM = struct {
         };
     }
 
+    fn isPlainString(value: Value) bool {
+        return value.discriminant == .string or value.discriminant == .string_context;
+    }
+
     fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
         const to_string_id = try self.intern.intern("__toString");
         if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
@@ -1109,9 +1142,73 @@ pub const VM = struct {
         const left_forced = try self.forceValue(left);
         const right_forced = try self.forceValue(right);
         if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
-            return Value.attrs(try self.heap.addMergedAttrs(left_forced.asObjectId(), right_forced.asObjectId()));
+            return Value.attrs(try self.mergeContextAttrs(left_forced.asObjectId(), right_forced.asObjectId()));
         }
         return right;
+    }
+
+    fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+        const left = try self.heap.getAttrs(left_id);
+        const right = try self.heap.getAttrs(right_id);
+
+        var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left.len + right.len);
+        defer merged.deinit(self.allocator);
+
+        var left_i: usize = 0;
+        var right_i: usize = 0;
+        while (left_i < left.len and right_i < right.len) {
+            const l = left[left_i];
+            const r = right[right_i];
+            if (l.name < r.name) {
+                merged.appendAssumeCapacity(l);
+                left_i += 1;
+            } else if (l.name > r.name) {
+                merged.appendAssumeCapacity(r);
+                right_i += 1;
+            } else {
+                const value = try self.mergeContextAttrValue(l.name, l.value, r.value);
+                merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
+                left_i += 1;
+                right_i += 1;
+            }
+        }
+        while (left_i < left.len) : (left_i += 1) {
+            merged.appendAssumeCapacity(left[left_i]);
+        }
+        while (right_i < right.len) : (right_i += 1) {
+            merged.appendAssumeCapacity(right[right_i]);
+        }
+
+        return self.heap.addAttrs(merged.items);
+    }
+
+    fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Value) !Value {
+        if (name == try self.intern.intern("outputs")) return self.mergeContextOutputs(left, right);
+        return right;
+    }
+
+    fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
+        const left_list = try self.forceValue(left);
+        const right_list = try self.forceValue(right);
+        if (left_list.discriminant != .list or right_list.discriminant != .list) return error.TypeError;
+
+        var outputs: std.ArrayListUnmanaged(Value) = .empty;
+        defer outputs.deinit(self.allocator);
+
+        for (try self.heap.getList(left_list.asObjectId())) |item| try self.appendUniqueContextOutput(&outputs, item);
+        for (try self.heap.getList(right_list.asObjectId())) |item| try self.appendUniqueContextOutput(&outputs, item);
+
+        return Value.list(try self.heap.addList(outputs.items));
+    }
+
+    fn appendUniqueContextOutput(self: *VM, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
+        const value = try self.forceValue(item);
+        if (!isPlainString(value)) return error.TypeError;
+        const text = try self.stringTextInternId(value);
+        for (outputs.items) |existing| {
+            if (try self.stringTextInternId(existing) == text) return;
+        }
+        try outputs.append(self.allocator, Value.string(text));
     }
 
     fn pathContextValue(self: *VM) !Value {
@@ -1318,6 +1415,36 @@ pub const VM = struct {
             else => return err,
         };
         return self.forceValue(result);
+    }
+
+    fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const InternId, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
+        var current = try self.forceValue(attrs_val);
+        var offset: usize = 0;
+        var dynamic_i: usize = 0;
+        for (0..segment_count) |_| {
+            if (current.discriminant != .attrs) return self.forceValue(default_val);
+            const tag = encoded_segments[offset];
+            offset += 1;
+            const name_id: InternId = switch (tag) {
+                0 => name: {
+                    const id = readU32(encoded_segments, offset);
+                    offset += 4;
+                    break :name id;
+                },
+                1 => name: {
+                    const id = dynamic_names[dynamic_i];
+                    dynamic_i += 1;
+                    break :name id;
+                },
+                else => return error.InvalidBytecode,
+            };
+            current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+                error.MissingAttribute => return self.forceValue(default_val),
+                else => return err,
+            };
+            current = try self.forceValue(current);
+        }
+        return current;
     }
 
     fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide: bool) !bool {

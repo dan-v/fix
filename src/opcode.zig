@@ -139,6 +139,13 @@ pub const OpCode = enum(u8) {
     /// Wide-intern-id form of get_attr_path_or.
     /// Operand: 1-byte segment count, then that many 4-byte InternIds.
     get_attr_path_or_long,
+    /// Select an attribute path containing static and runtime string segments
+    /// with a lazy default if any segment is missing.
+    /// Operand: 1-byte segment count, 1-byte dynamic segment count, then for
+    /// each segment a 1-byte tag: 0 followed by 4-byte InternId for static,
+    /// 1 for the next runtime string from the stack.
+    /// Stack layout before: [attrs, dynamic_name..., default_thunk].
+    get_attr_path_mixed_or,
     /// Test whether an attribute path exists without forcing the final value.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs].

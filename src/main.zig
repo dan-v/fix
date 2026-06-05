@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const eval = @import("eval.zig");
+const derivation_debug = @import("derivation_debug.zig");
 const diagnostic = @import("diagnostic.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
@@ -16,6 +17,14 @@ const usage =
     \\  -e, --expr EXPR        evaluate expression text
     \\  --json                 write the evaluated value as JSON
     \\  --xml                  write the evaluated value as XML
+    \\  --debug-derivations[=MODE]
+    \\                         write derivation debug records to stderr: summary, full
+    \\  --debug-derivation-filter TEXT
+    \\                         only show derivations whose name/path/input mentions TEXT
+    \\  --debug-derivation-name NAME
+    \\                         only show derivations with exactly NAME
+    \\  --debug-derivation-drv PATH
+    \\                         only show the derivation with exactly PATH
     \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
     \\  --no-color             disable color diagnostics
@@ -44,6 +53,7 @@ const Options = struct {
     output: OutputFormat = .nix,
     color: ColorMode = .auto,
     show_trace: bool = false,
+    derivation_debug: derivation_debug.Options = .{},
     repl: bool = false,
     source: ?SourceArg = null,
 
@@ -77,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
@@ -102,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    if (!try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, &ev, source.text)) {
+    if (!try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, options.derivation_debug, &ev, source.text)) {
         std.process.exit(1);
     }
 }
@@ -112,6 +123,7 @@ fn evaluateAndWrite(
     output: OutputFormat,
     use_color: bool,
     show_trace: bool,
+    debug_options: derivation_debug.Options,
     ev: *Evaluator,
     source: []const u8,
 ) !bool {
@@ -124,6 +136,7 @@ fn evaluateAndWrite(
         try writeEvaluationError(io, use_color, show_trace, ev, source, err);
         return false;
     };
+    try derivation_debug.write(io, use_color, ev.allocator, debug_options, ev.derivationDebugRecords());
     return true;
 }
 
@@ -181,6 +194,16 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
             options.output = .json;
         } else if (std.mem.eql(u8, arg, "--xml")) {
             options.output = .xml;
+        } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
+            options.derivation_debug.mode = .summary;
+        } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
+            options.derivation_debug.mode = derivation_debug.parseMode(arg["--debug-derivations=".len..]) orelse return error.InvalidDerivationDebugMode;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-filter")) {
+            options.derivation_debug.filter = args_iter.next() orelse return error.MissingDerivationDebugFilter;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-name")) {
+            options.derivation_debug.name = args_iter.next() orelse return error.MissingDerivationDebugName;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-drv")) {
+            options.derivation_debug.drv_path = args_iter.next() orelse return error.MissingDerivationDebugDrv;
         } else if (std.mem.eql(u8, arg, "--show-trace")) {
             options.show_trace = true;
         } else if (std.mem.eql(u8, arg, "--color")) {
@@ -208,8 +231,12 @@ fn optionErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.MissingExpression => "missing expression after -e or --expr",
         error.MissingPath => "missing path after --file",
+        error.MissingDerivationDebugFilter => "missing text after --debug-derivation-filter",
+        error.MissingDerivationDebugName => "missing name after --debug-derivation-name",
+        error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
+        error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };
@@ -284,7 +311,7 @@ fn runRepl(io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void 
             continue;
         }
 
-        _ = try evaluateAndWrite(io, options.output, use_color, options.show_trace, ev, source);
+        _ = try evaluateAndWrite(io, options.output, use_color, options.show_trace, options.derivation_debug, ev, source);
     }
 }
 

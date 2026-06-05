@@ -14,6 +14,7 @@ const ObjectHeap = @import("heap.zig").ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
+const derivation = @import("derivation.zig");
 const Value = @import("value.zig").Value;
 const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
@@ -106,6 +107,14 @@ pub const Evaluator = struct {
         return &self.trace;
     }
 
+    pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
+        self.derivations.setDebugEnabled(enabled);
+    }
+
+    pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
+        return self.derivations.debugRecords();
+    }
+
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
@@ -174,6 +183,7 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         self.clearDiagnostics();
+        self.derivations.clearDebugRecords();
         return self.evaluateSource(source, self.base_path, null, null);
     }
 
@@ -373,20 +383,23 @@ pub const Evaluator = struct {
         \\  name ? baseNameOf url,
         \\  url,
         \\  hash ? "",
-        \\  sha256 ? hash,
+        \\  sha256 ? "",
         \\  executable ? false,
         \\  ...
         \\}:
+        \\let
+        \\  outputHash = if hash != "" then hash else sha256;
+        \\in
         \\derivation {
         \\  inherit name url executable;
         \\  urls = [ url ];
         \\  builder = "builtin:fetchurl";
         \\  system = "builtin";
-        \\  outputHash = sha256;
-        \\  outputHashAlgo = "sha256";
-        \\  outputHashMode = "flat";
+        \\  inherit outputHash;
+        \\  outputHashAlgo = if hash != "" then null else "sha256";
+        \\  outputHashMode = if executable then "recursive" else "flat";
         \\  preferLocalBuild = true;
-        \\  impureEnvVars = [ ];
+        \\  impureEnvVars = [ "http_proxy" "https_proxy" "ftp_proxy" "all_proxy" "no_proxy" ];
         \\  unpack = false;
         \\}
         ;
@@ -1739,12 +1752,33 @@ test "evaluate string builtins" {
     const replaced = try renderForTest("builtins.replaceStrings [ \"ab\" \"d\" ] [ \"X\" \"Y\" ] \"abcd\"");
     defer std.testing.allocator.free(replaced);
     try std.testing.expectEqualStrings("\"XcY\"", replaced);
+
+    const to_file = try renderForTest("builtins.toFile \"x\" \"hello\"");
+    defer std.testing.allocator.free(to_file);
+    try std.testing.expectEqualStrings("\"/nix/store/4g4g9i669dl63abpww0djbl2jxl6bwiz-x\"", to_file);
+
+    try std.testing.expectError(error.InvalidStorePathName, renderForTest("builtins.toFile \"x y\" \"hello\""));
+    try std.testing.expectError(
+        error.DerivationReferenceInToFile,
+        renderForTest(
+            \\let d = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
+            \\in builtins.toFile "x" "${d}"
+        ),
+    );
 }
 
 test "evaluate hash builtins" {
     const hash_string = try renderForTest("builtins.hashString \"sha256\" \"abc\"");
     defer std.testing.allocator.free(hash_string);
     try std.testing.expectEqualStrings("\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"", hash_string);
+
+    const placeholder_out = try renderForTest("builtins.placeholder \"out\"");
+    defer std.testing.allocator.free(placeholder_out);
+    try std.testing.expectEqualStrings("\"/1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9\"", placeholder_out);
+
+    const placeholder_dev = try renderForTest("builtins.placeholder \"dev\"");
+    defer std.testing.allocator.free(placeholder_dev);
+    try std.testing.expectEqualStrings("\"/02qcpld1y6xhs5gz9bchpxaw0xdhmsp5dv88lh25r2ss44kh8dxz\"", placeholder_dev);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1935,6 +1969,24 @@ test "evaluate string context builtins" {
     );
     defer std.testing.allocator.free(appended);
     try std.testing.expectEqualStrings("true", appended);
+
+    const merged_outputs = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "bin" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  ctx = builtins.getContext "${dep.bin}${dep.out}";
+        \\in builtins.concatStringsSep "," ((builtins.getAttr (builtins.unsafeDiscardStringContext dep.drvPath) ctx).outputs)
+    );
+    defer std.testing.allocator.free(merged_outputs);
+    try std.testing.expectEqualStrings("\"bin,out\"", merged_outputs);
+
+    const merged_output_drv_path = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "bin" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  pkg = builtins.derivation { name = "pkg"; system = "x86_64-linux"; builder = "/bin/sh"; text = "${dep.bin}${dep.out}"; };
+        \\in pkg.drvPath
+    );
+    defer std.testing.allocator.free(merged_output_drv_path);
+    try std.testing.expectEqualStrings("\"/nix/store/8yjj0xh9r8937p4mv51iwnrl62jjx08p-pkg.drv\"", merged_output_drv_path);
 }
 
 test "evaluate minimal derivation builtins" {
@@ -2064,6 +2116,17 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(fixed_null_hash_algo);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/v7fhk503far527r9d9sk8dh2w6c7h695-src\\\",\\\"/nix/store/v1bh6bzphg5c2dc9ck7wdd3g1p6g19vd-src\\\"]\"", fixed_null_hash_algo);
 
+    const core_fetchurl_hash_precedence = try renderForTest(
+        \\(import <nix/fetchurl.nix> {
+        \\  name = "bash-5.3.tar.gz";
+        \\  url = "https://ftpmirror.gnu.org/bash/bash-5.3.tar.gz";
+        \\  hash = "sha256-DVzYaWX4aaJs9k9Lcb57lvkKO6iz104n6OnZ1VUPMbo=";
+        \\  sha256 = "";
+        \\}).outPath
+    );
+    defer std.testing.allocator.free(core_fetchurl_hash_precedence);
+    try std.testing.expectEqualStrings("\"/nix/store/kwm524zjlnnq4yfhhmb5r14f2wxf8a2j-bash-5.3.tar.gz\"", core_fetchurl_hash_precedence);
+
     var missing_hash_algo_ev = try Evaluator.init(std.testing.allocator, 0);
     defer missing_hash_algo_ev.deinit();
     try std.testing.expectError(
@@ -2112,6 +2175,21 @@ test "evaluate minimal derivation builtins" {
     );
     defer std.testing.allocator.free(structured_derivation_input);
     try std.testing.expectEqualStrings("true", structured_derivation_input);
+
+    const structured_explicit_outputs = try renderForTest(
+        \\let
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg-structured";
+        \\    outputs = [ "out" "debug" ];
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    __structuredAttrs = true;
+        \\    env = { A = 1; };
+        \\  };
+        \\in builtins.toJSON [ pkg.drvPath pkg.outPath pkg.debug.outPath ]
+    );
+    defer std.testing.allocator.free(structured_explicit_outputs);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/5nkc970vb573fs2ppl4vflsymcrri8dn-pkg-structured.drv\\\",\\\"/nix/store/j9jfd9axp7wyhrx9mg088db3iw19dkyw-pkg-structured\\\",\\\"/nix/store/470amnhnd10jpqrh3im85xr0bicjb8rm-pkg-structured-debug\\\"]\"", structured_explicit_outputs);
 
     var recursive_structured_ev = try Evaluator.init(std.testing.allocator, 0);
     defer recursive_structured_ev.deinit();

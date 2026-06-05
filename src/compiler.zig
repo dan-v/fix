@@ -1366,6 +1366,30 @@ pub const Compiler = struct {
         }
 
         const apath = attr_or.attr_path.data.attr_path;
+        if (self.attrPathHasInterpolation(apath)) {
+            try self.compileNode(apath.root);
+            var dynamic_count: usize = 0;
+            for (apath.segments) |seg| {
+                if (self.attrSegmentHasInterpolation(seg)) {
+                    try self.compileStringAtom(seg);
+                    dynamic_count += 1;
+                }
+            }
+            try self.compileThunk(attr_or.default);
+            try self.emitOp(.get_attr_path_mixed_or);
+            try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
+            try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+            for (apath.segments) |seg| {
+                if (self.attrSegmentHasInterpolation(seg)) {
+                    try self.builder.writeByte(self.allocator, 1);
+                } else {
+                    try self.builder.writeByte(self.allocator, 0);
+                    try self.builder.writeU32(self.allocator, try self.intern.intern(self.attrSegmentSpan(seg)));
+                }
+            }
+            return;
+        }
+
         try self.compileNode(apath.root);
         try self.compileThunk(attr_or.default);
         var wide = false;
@@ -1380,6 +1404,13 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name_span);
             try self.writeInternId(name_id, wide);
         }
+    }
+
+    fn attrPathHasInterpolation(self: *Compiler, path: Node.AttrPath) bool {
+        for (path.segments) |seg| {
+            if (self.attrSegmentHasInterpolation(seg)) return true;
+        }
+        return false;
     }
 
     fn compileHasAttr(self: *Compiler, node: *const Node) !void {

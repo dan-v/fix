@@ -582,6 +582,18 @@ test "end-to-end: attr path or defaults" {
     const dynamic_missing_mid = try ev.evaluate("let key = \"b\"; in ({}).a.${key} or 2");
     try std.testing.expectEqual(@as(i64, 2), dynamic_missing_mid.asInt());
 
+    const interpolated_present = try ev.evaluate("({ \"15\" = [ 1 2 ]; }.\"${\"15\"}\" or [ ])");
+    try std.testing.expectEqual(@as(usize, 2), (try ev.heap.getList(interpolated_present.asObjectId())).len);
+
+    const interpolated_concat = try ev.evaluate("[ 0 ] ++ ({ \"15\" = [ 1 2 ]; }.\"${\"15\"}\" or [ ])");
+    try std.testing.expectEqual(@as(usize, 3), (try ev.heap.getList(interpolated_concat.asObjectId())).len);
+
+    const interpolated_nested = try ev.evaluate("let key = \"b\"; in ({ a.b.c = 1; }).a.\"${key}\".c or 2");
+    try std.testing.expectEqual(@as(i64, 1), interpolated_nested.asInt());
+
+    const interpolated_missing_mid = try ev.evaluate("let key = \"b\"; in ({}).a.\"${key}\".c or 2");
+    try std.testing.expectEqual(@as(i64, 2), interpolated_missing_mid.asInt());
+
     const concat_defaults = try ev.evaluate("let m = { require = [ 9 ]; }; in m.require or [ 1 ] ++ m.imports or [ 3 ]");
     try std.testing.expectEqual(@as(usize, 2), (try ev.heap.getList(concat_defaults.asObjectId())).len);
 
@@ -618,13 +630,13 @@ test "end-to-end: builtins.toFile returns store-like string" {
     var ev = try Evaluator.init(alloc, 0);
     defer ev.deinit();
 
-    const file_value = try ev.evaluate("builtins.toFile \"x y\" \"hello\"");
+    const file_value = try ev.evaluate("builtins.toFile \"x\" \"hello\"");
     try std.testing.expectEqual(value.ValueType.string_context, file_value.discriminant);
     const string = try ev.heap.getContextString(file_value.asObjectId());
     const text = ev.intern.get(string.text);
-    try std.testing.expect(std.mem.startsWith(u8, text, "/nix/store/"));
-    try std.testing.expect(std.mem.endsWith(u8, text, "-x-y"));
+    try std.testing.expectEqualStrings("/nix/store/4g4g9i669dl63abpww0djbl2jxl6bwiz-x", text);
 
+    try std.testing.expectError(error.InvalidStorePathName, ev.evaluate("builtins.toFile \"x y\" \"hello\""));
     try std.testing.expectError(error.TypeError, ev.evaluate("builtins.toFile \"x\" 1"));
 }
 
