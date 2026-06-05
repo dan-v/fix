@@ -477,9 +477,7 @@ fn builtinToXML(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
-    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
-    defer seen.deinit(self.allocator);
-    try forceDeep(self, arg, &seen);
+    try self.forceDeep(arg);
     try writeXmlDocument(self, &out.writer, try self.forceValue(arg));
 
     const text = try out.toOwnedSlice();
@@ -1081,42 +1079,8 @@ fn builtinSeq(self: anytype, first: Value, second: Value) !Value {
 }
 
 fn builtinDeepSeq(self: anytype, first: Value, second: Value) !Value {
-    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
-    defer seen.deinit(self.allocator);
-    try forceDeep(self, first, &seen);
+    try self.forceDeep(first);
     return self.forceValue(second);
-}
-
-const SeenDeepKind = enum { list, attrs };
-
-const SeenDeepObject = struct {
-    kind: SeenDeepKind,
-    id: ObjectId,
-};
-
-fn forceDeep(self: anytype, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
-    const forced = try self.forceValue(value);
-    switch (forced.discriminant) {
-        .list => {
-            const id = forced.asObjectId();
-            if (!try enterDeep(self, .list, id, seen)) return;
-            for (try self.heap.getList(id)) |item| try forceDeep(self, item, seen);
-        },
-        .attrs => {
-            const id = forced.asObjectId();
-            if (!try enterDeep(self, .attrs, id, seen)) return;
-            for (try self.heap.getAttrs(id)) |entry| try forceDeep(self, entry.value, seen);
-        },
-        else => {},
-    }
-}
-
-fn enterDeep(self: anytype, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenDeepObject)) !bool {
-    for (seen.items) |item| {
-        if (item.kind == kind and item.id == id) return false;
-    }
-    try seen.append(self.allocator, .{ .kind = kind, .id = id });
-    return true;
 }
 
 fn builtinAll(self: anytype, pred_arg: Value, list_arg: Value) !Value {

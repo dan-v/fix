@@ -19,6 +19,7 @@ const usage =
     \\  -e, --expr EXPR        evaluate expression text
     \\  --json                 write the evaluated value as JSON
     \\  --xml                  write the evaluated value as XML
+    \\  --strict               recursively force attr values and list items before writing
     \\  --debug-derivations[=MODE]
     \\                         write derivation debug records to stderr: summary, full
     \\  --debug-derivation-filter TEXT
@@ -42,6 +43,11 @@ const OutputFormat = enum {
     xml,
 };
 
+const EvaluationMode = struct {
+    output: OutputFormat = .nix,
+    strict: bool = false,
+};
+
 const SourceArg = union(enum) {
     expr: []const u8,
     file: []const u8,
@@ -49,6 +55,7 @@ const SourceArg = union(enum) {
 
 const Options = struct {
     output: OutputFormat = .nix,
+    strict: bool = false,
     color: cli.When = .auto,
     progress: cli.When = .auto,
     show_trace: bool = false,
@@ -59,6 +66,13 @@ const Options = struct {
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
         self.source = source;
+    }
+
+    fn evaluationMode(self: Options) EvaluationMode {
+        return .{
+            .output = self.output,
+            .strict = self.strict,
+        };
     }
 };
 
@@ -122,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
     errdefer progress.deinit(false);
     ev.setProgressSink(progress.sink());
 
-    const ok = try evaluateAndWrite(init.io, options.output, use_color, options.show_trace, options.derivation_debug, &ev, source.text);
+    const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
     if (!ok) {
         std.process.exit(1);
@@ -131,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn evaluateAndWrite(
     io: std.Io,
-    output: OutputFormat,
+    mode: EvaluationMode,
     use_color: bool,
     show_trace: bool,
     debug_options: derivation_debug.Options,
@@ -143,7 +157,7 @@ fn evaluateAndWrite(
         return false;
     };
 
-    writeResult(io, output, ev, result) catch |err| {
+    writeResult(io, mode, ev, result) catch |err| {
         try writeEvaluationError(io, use_color, show_trace, ev, source, err);
         return false;
     };
@@ -170,15 +184,17 @@ fn writeEvalFailure(
     }
 }
 
-fn writeResult(io: std.Io, output: OutputFormat, ev: *Evaluator, result: Value) !void {
+fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) !void {
+    if (mode.strict) try ev.forceDeep(result);
+
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    switch (output) {
+    switch (mode.output) {
         .nix => try ev.writeValue(&stdout.interface, result),
         .json => try ev.writeJsonValue(&stdout.interface, result),
         .xml => try ev.writeXmlValue(&stdout.interface, result),
     }
-    if (output != .xml) try stdout.interface.writeByte('\n');
+    if (mode.output != .xml) try stdout.interface.writeByte('\n');
     try stdout.interface.flush();
 }
 
@@ -206,6 +222,8 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
             options.output = .json;
         } else if (std.mem.eql(u8, arg, "--xml")) {
             options.output = .xml;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            options.strict = true;
         } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
             options.derivation_debug.mode = .summary;
         } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
@@ -315,7 +333,7 @@ fn runRepl(allocator: std.mem.Allocator, io: std.Io, options: Options, use_color
             continue;
         }
 
-        _ = try evaluateAndWrite(io, options.output, use_color, options.show_trace, options.derivation_debug, ev, source);
+        _ = try evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source);
     }
 }
 

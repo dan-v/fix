@@ -306,6 +306,16 @@ pub const Evaluator = struct {
         return vm.forceValue(value);
     }
 
+    pub fn forceDeep(self: *Evaluator, value: Value) !void {
+        self.progressBegin(.render, "strict result");
+        defer self.progressEnd(.render, "strict result");
+        self.trace.clear();
+        var vm = try self.initVm(0);
+        defer vm.deinit();
+
+        try vm.forceDeep(value);
+    }
+
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return self.importPath(path);
@@ -761,6 +771,20 @@ fn renderForTest(source: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn renderStrictForTest(source: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluate(source);
+    try ev.forceDeep(result);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
 fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
@@ -796,6 +820,22 @@ test "writeValue prints lazy containers without forcing contents" {
     const attrs_output = try renderForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
     defer std.testing.allocator.free(attrs_output);
     try std.testing.expectEqualStrings("{ a = 1; b = ...; c = \"x\"; }", attrs_output);
+}
+
+test "forceDeep recursively evaluates lazy containers" {
+    const output = try renderStrictForTest("{ a = 1; b = [ 2 ]; c = \"x\"; }");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("{ a = 1; b = [ 2 ]; c = \"x\"; }", output);
+
+    try std.testing.expectError(error.DivisionByZero, renderStrictForTest("{ a = 1; b = 1 / 0; }"));
+}
+
+test "forceDeep handles recursive containers without hiding recursive thunks" {
+    const repeated = try renderStrictForTest("let x = rec { a = x; }; in x");
+    defer std.testing.allocator.free(repeated);
+    try std.testing.expectEqualStrings("{ a = ...; }", repeated);
+
+    try std.testing.expectError(error.RecursiveThunk, renderStrictForTest("rec { a = a; b = 1; }"));
 }
 
 test "writeValue prints recursive attrsets without looping" {

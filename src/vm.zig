@@ -901,6 +901,44 @@ pub const VM = struct {
         };
     }
 
+    pub fn forceDeep(self: *VM, value: Value) !void {
+        var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
+        defer seen.deinit(self.allocator);
+        try self.forceDeepInner(value, &seen);
+    }
+
+    const SeenDeepKind = enum { list, attrs };
+
+    const SeenDeepObject = struct {
+        kind: SeenDeepKind,
+        id: ObjectId,
+    };
+
+    fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
+        const forced = try self.forceValue(value);
+        switch (forced.discriminant) {
+            .list => {
+                const id = forced.asObjectId();
+                if (!try self.enterDeep(.list, id, seen)) return;
+                for (try self.heap.getList(id)) |item| try self.forceDeepInner(item, seen);
+            },
+            .attrs => {
+                const id = forced.asObjectId();
+                if (!try self.enterDeep(.attrs, id, seen)) return;
+                for (try self.heap.getAttrs(id)) |entry| try self.forceDeepInner(entry.value, seen);
+            },
+            else => {},
+        }
+    }
+
+    fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenDeepObject)) !bool {
+        for (seen.items) |item| {
+            if (item.kind == kind and item.id == id) return false;
+        }
+        try seen.append(self.allocator, .{ .kind = kind, .id = id });
+        return true;
+    }
+
     fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
         const thunk_id = thunk_val.asObjectId();
         var closure: Value = undefined;
