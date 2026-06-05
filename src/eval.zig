@@ -1342,9 +1342,39 @@ test "evaluate filterSource builtin through file cache" {
     ev.setFileIo(std.testing.io);
 
     const filtered = try ev.evaluate(source);
-    try std.testing.expectEqual(.string, filtered.discriminant);
-    try std.testing.expect(std.mem.startsWith(u8, ev.intern.get(filtered.asInternId()), "/nix/store/"));
-    try std.testing.expect(std.mem.endsWith(u8, ev.intern.get(filtered.asInternId()), &tmp.sub_path));
+    try std.testing.expectEqual(.string_context, filtered.discriminant);
+    const filtered_string = try ev.heap.getContextString(filtered.asObjectId());
+    const filtered_path = ev.intern.get(filtered_string.text);
+    try std.testing.expect(std.mem.startsWith(u8, filtered_path, "/nix/store/"));
+    try std.testing.expect(std.mem.endsWith(u8, filtered_path, &tmp.sub_path));
+    try std.testing.expectEqual(@as(usize, 1), filtered_string.context.len);
+    try std.testing.expectEqual(filtered_string.text, filtered_string.context[0].name);
+
+    ev.setDerivationDebug(true);
+    const drv_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\let
+        \\  src = builtins.filterSource
+        \\    (path: type:
+        \\      if builtins.baseNameOf path == "boom.txt"
+        \\      then builtins.throw "descended into rejected directory"
+        \\      else builtins.baseNameOf path != "skip")
+        \\    {s};
+        \\in (builtins.derivation {{
+        \\  name = "uses-filter-source";
+        \\  system = "x86_64-linux";
+        \\  builder = "/bin/sh";
+        \\  preHook = src;
+        \\}}).drvPath
+    ,
+        .{dir_path},
+    );
+    defer std.testing.allocator.free(drv_source);
+    _ = try ev.evaluate(drv_source);
+    const records = ev.derivationDebugRecords();
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(usize, 1), records[0].input_srcs.len);
+    try std.testing.expectEqualStrings(filtered_path, records[0].input_srcs[0]);
 
     const called_source = try std.fmt.allocPrint(
         std.testing.allocator,

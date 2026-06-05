@@ -11,6 +11,7 @@ const fetch_cache = @import("../fetch_cache.zig");
 const builtins_mod = @import("../builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const derivation = @import("../derivation.zig");
+const nar = @import("../runtime/nar.zig");
 const numeric = @import("../runtime/numeric.zig");
 const path_ops = @import("../runtime/paths.zig");
 const source_paths = @import("../runtime/source_path.zig");
@@ -1496,20 +1497,25 @@ fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
     const root = try self.allocator.dupe(u8, root_arg);
     defer self.allocator.free(root);
 
-    var fingerprint: std.ArrayListUnmanaged(u8) = .empty;
-    defer fingerprint.deinit(self.allocator);
-    try fingerprint.appendSlice(self.allocator, "filterSource\n");
-    try fingerprint.appendSlice(self.allocator, root);
-    try fingerprint.append(self.allocator, '\n');
+    const Context = struct {
+        vm: @TypeOf(self),
+        pred: Value,
 
-    const root_kind = try self.files.fileType(root);
-    try fingerprint.appendSlice(self.allocator, root_kind.nixTypeName());
-    try fingerprint.append(self.allocator, '\n');
-    if (root_kind == .directory) {
-        try appendFilteredTreeFingerprint(self, pred, root, &fingerprint);
-    }
+        fn accept(context: *anyopaque, path: []const u8, kind: file_cache.FileCache.FileKind) anyerror!bool {
+            const ctx: *@This() = @ptrCast(@alignCast(context));
+            return filterSourceAccepts(ctx.vm, ctx.pred, path, kind);
+        }
+    };
+    var context: Context = .{ .vm = self, .pred = pred };
 
-    return Value.string(try storeLikePath(self, path_ops.baseName(root), fingerprint.items));
+    const hash = try nar.hashPathFiltered(self.allocator, self.files, root, .{
+        .context = &context,
+        .accept = Context.accept,
+    });
+    defer self.allocator.free(hash);
+    const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, path_ops.baseName(root), hash);
+    defer self.allocator.free(store_path);
+    return contextStringWithPath(self, try self.intern.intern(store_path));
 }
 
 const FetchGitSpec = struct {
@@ -2066,66 +2072,6 @@ fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool 
     return forced.discriminant == .bool_true;
 }
 
-fn appendPathFingerprint(
-    self: anytype,
-    path: []const u8,
-    fingerprint: *std.ArrayListUnmanaged(u8),
-) !void {
-    const kind = try self.files.fileType(path);
-    try fingerprint.appendSlice(self.allocator, path);
-    try fingerprint.append(self.allocator, 0);
-    try fingerprint.appendSlice(self.allocator, kind.nixTypeName());
-    try fingerprint.append(self.allocator, '\n');
-
-    switch (kind) {
-        .regular => {
-            const contents = try self.files.readFile(path);
-            try fingerprint.appendSlice(self.allocator, contents);
-            try fingerprint.append(self.allocator, '\n');
-        },
-        .directory => {
-            const entries = try self.files.readDir(path);
-            const sorted = try self.allocator.dupe(file_cache.FileCache.DirEntry, entries);
-            defer self.allocator.free(sorted);
-            std.mem.sort(file_cache.FileCache.DirEntry, sorted, {}, dirEntryNameLessThan);
-
-            for (sorted) |entry| {
-                const child_path = try std.fs.path.join(self.allocator, &.{ path, entry.name });
-                defer self.allocator.free(child_path);
-                try appendPathFingerprint(self, child_path, fingerprint);
-            }
-        },
-        .symlink, .unknown => {},
-    }
-}
-
-fn appendFilteredTreeFingerprint(
-    self: anytype,
-    pred: Value,
-    dir_path: []const u8,
-    fingerprint: *std.ArrayListUnmanaged(u8),
-) !void {
-    const entries = try self.files.readDir(dir_path);
-    const sorted = try self.allocator.dupe(file_cache.FileCache.DirEntry, entries);
-    defer self.allocator.free(sorted);
-    std.mem.sort(file_cache.FileCache.DirEntry, sorted, {}, dirEntryNameLessThan);
-
-    for (sorted) |entry| {
-        const child_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
-        defer self.allocator.free(child_path);
-
-        if (!try filterSourceAccepts(self, pred, child_path, entry.kind)) continue;
-        try fingerprint.appendSlice(self.allocator, child_path);
-        try fingerprint.append(self.allocator, 0);
-        try fingerprint.appendSlice(self.allocator, entry.kind.nixTypeName());
-        try fingerprint.append(self.allocator, '\n');
-
-        if (entry.kind == .directory) {
-            try appendFilteredTreeFingerprint(self, pred, child_path, fingerprint);
-        }
-    }
-}
-
 fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
     const path_value = Value.string(try self.intern.intern(path));
     const kind_value = Value.string(try self.intern.intern(kind.nixTypeName()));
@@ -2137,22 +2083,6 @@ fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_
 
 fn dirEntryNameLessThan(_: void, left: file_cache.FileCache.DirEntry, right: file_cache.FileCache.DirEntry) bool {
     return std.mem.lessThan(u8, left.name, right.name);
-}
-
-fn storeLikePath(self: anytype, name: []const u8, fingerprint: []const u8) !InternId {
-    const digest = try nix_hash.hashBytes(self.allocator, "sha256", fingerprint);
-    defer self.allocator.free(digest);
-
-    const clean_name = try self.allocator.alloc(u8, name.len);
-    defer self.allocator.free(clean_name);
-    for (name, clean_name) |c, *out| {
-        out.* = if (c == '/' or c == 0 or std.ascii.isWhitespace(c)) '-' else c;
-    }
-
-    const hash_len = @min(@as(usize, 32), digest.len);
-    const path = try std.fmt.allocPrint(self.allocator, "/nix/store/{s}-{s}", .{ digest[0..hash_len], clean_name });
-    defer self.allocator.free(path);
-    return self.intern.intern(path);
 }
 
 fn builtinPlaceholder(self: anytype, arg: Value) !Value {

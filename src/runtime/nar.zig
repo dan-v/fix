@@ -3,12 +3,21 @@
 const std = @import("std");
 const FileCache = @import("../file_cache.zig").FileCache;
 
+pub const Filter = struct {
+    context: *anyopaque,
+    accept: *const fn (context: *anyopaque, path: []const u8, kind: FileCache.FileKind) anyerror!bool,
+};
+
 pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![]u8 {
+    return hashPathFiltered(allocator, files, path, null);
+}
+
+pub fn hashPathFiltered(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     try appendString(allocator, &out, "nix-archive-1");
-    try appendNode(allocator, files, &out, path);
+    try appendNode(allocator, files, &out, path, filter);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(out.items, &digest, .{});
@@ -16,7 +25,7 @@ pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u
     return allocator.dupe(u8, &encoded);
 }
 
-fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8) !void {
+fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8, filter: ?Filter) !void {
     try appendString(allocator, out, "(");
     switch (try files.fileType(path)) {
         .regular => {
@@ -35,14 +44,17 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
             const entries = try sortedDirEntries(allocator, try files.readDir(path));
             defer allocator.free(entries);
             for (entries) |entry| {
+                const child = try std.fs.path.join(allocator, &.{ path, entry.name });
+                defer allocator.free(child);
+                if (filter) |f| {
+                    if (!try f.accept(f.context, child, entry.kind)) continue;
+                }
                 try appendString(allocator, out, "entry");
                 try appendString(allocator, out, "(");
                 try appendString(allocator, out, "name");
                 try appendString(allocator, out, entry.name);
                 try appendString(allocator, out, "node");
-                const child = try std.fs.path.join(allocator, &.{ path, entry.name });
-                defer allocator.free(child);
-                try appendNode(allocator, files, out, child);
+                try appendNode(allocator, files, out, child, filter);
                 try appendString(allocator, out, ")");
             }
         },
