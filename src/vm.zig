@@ -307,6 +307,13 @@ pub const VM = struct {
                     const val = try self.forceValue(raw);
                     try self.push(val);
                 },
+                .get_local_long => {
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const raw = self.stack.items[frame.frame_base + slot];
+                    const val = try self.forceValue(raw);
+                    try self.push(val);
+                },
 
                 .capture_local => {
                     const slot = code[frame.ip];
@@ -314,10 +321,16 @@ pub const VM = struct {
                     const val = self.stack.items[frame.frame_base + slot];
                     try self.push(val);
                 },
+                .capture_local_long => {
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const val = self.stack.items[frame.frame_base + slot];
+                    try self.push(val);
+                },
 
                 .capture_upvalue => {
-                    const slot = code[frame.ip];
-                    frame.ip += 1;
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
                     const closure_id = frame.closure_id orelse return error.MissingClosure;
                     const closure = try self.getClosureById(closure_id);
                     try self.push(closure.upvalues[slot]);
@@ -326,6 +339,12 @@ pub const VM = struct {
                 .set_local => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
+                    const val = self.pop();
+                    self.setStack(frame.frame_base + slot, val);
+                },
+                .set_local_long => {
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
                     const val = self.pop();
                     self.setStack(frame.frame_base + slot, val);
                 },
@@ -338,10 +357,18 @@ pub const VM = struct {
                     if (cell_val.discriminant != .cell) return error.TypeError;
                     try self.heap.setCellValue(cell_val.asObjectId(), val);
                 },
+                .set_cell_local_long => {
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const val = self.pop();
+                    const cell_val = self.stack.items[frame.frame_base + slot];
+                    if (cell_val.discriminant != .cell) return error.TypeError;
+                    try self.heap.setCellValue(cell_val.asObjectId(), val);
+                },
 
                 .get_upvalue => {
-                    const slot = code[frame.ip];
-                    frame.ip += 1;
+                    const slot = readU16(code, frame.ip);
+                    frame.ip += 2;
                     const closure_id = frame.closure_id orelse return error.MissingClosure;
                     const closure = try self.getClosureById(closure_id);
                     const val = try self.forceValue(closure.upvalues[slot]);
@@ -448,13 +475,13 @@ pub const VM = struct {
 
                 // ---- control flow ----
                 .jump => {
-                    const offset: u16 = readU16(code, frame.ip);
-                    frame.ip += 2;
+                    const offset = readU32(code, frame.ip);
+                    frame.ip += 4;
                     frame.ip += @as(usize, offset);
                 },
                 .jump_if_false => {
-                    const offset: u16 = readU16(code, frame.ip);
-                    frame.ip += 2;
+                    const offset = readU32(code, frame.ip);
+                    frame.ip += 4;
                     const cond = self.stack.items[self.sp - 1];
                     if (!try self.expectBool(cond)) {
                         frame.ip += @as(usize, offset);
@@ -525,15 +552,15 @@ pub const VM = struct {
                 .closure => {
                     const ch_id: u16 = readU16(code, frame.ip);
                     frame.ip += 2;
-                    const upvalue_count = code[frame.ip];
-                    frame.ip += 1;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
                     try self.makeClosure(ch_id, upvalue_count);
                 },
                 .closure_long => {
                     const ch_id: ChunkId = readU32(code, frame.ip);
                     frame.ip += 4;
-                    const upvalue_count = code[frame.ip];
-                    frame.ip += 1;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
                     try self.makeClosure(ch_id, upvalue_count);
                 },
 
@@ -1319,7 +1346,7 @@ pub const VM = struct {
         return self.heap.getClosure(closure_id);
     }
 
-    fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u8) !void {
+    fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
         const start = self.sp - upvalue_count;
         const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
         self.sp = start;

@@ -954,6 +954,70 @@ test "evaluate attrset function defaults ellipsis and binding" {
     try std.testing.expectError(error.UnexpectedAttribute, ev.evaluate("({ x }: x) { x = 1; y = 2; }"));
 }
 
+test "evaluate dynamic attr paths with static tails" {
+    const output = try renderForTest("let x = \"a\"; in ({ ${x}.b = 1; }).a.b");
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("1", output);
+
+    const dynamic_tail = try renderForTest("let x = \"a\"; y = \"b\"; in ({ ${x}.${y} = 2; }).a.b");
+    defer std.testing.allocator.free(dynamic_tail);
+    try std.testing.expectEqualStrings("2", dynamic_tail);
+}
+
+test "evaluate attrset function parameters past byte local slots" {
+    var expr: std.ArrayListUnmanaged(u8) = .empty;
+    defer expr.deinit(std.testing.allocator);
+
+    try expr.appendSlice(std.testing.allocator, "({ ");
+    for (0..270) |index| {
+        var buf: [64]u8 = undefined;
+        const param = try std.fmt.bufPrint(&buf, "p{d} ? {d}, ", .{ index, index });
+        try expr.appendSlice(std.testing.allocator, param);
+    }
+    try expr.appendSlice(std.testing.allocator, "result ? p269 }: result) { }");
+
+    const output = try renderForTest(expr.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("269", output);
+}
+
+test "evaluate closures with more than byte upvalues" {
+    var expr: std.ArrayListUnmanaged(u8) = .empty;
+    defer expr.deinit(std.testing.allocator);
+
+    try expr.appendSlice(std.testing.allocator, "({ ");
+    for (0..260) |index| {
+        var buf: [64]u8 = undefined;
+        const param = try std.fmt.bufPrint(&buf, "p{d} ? 1, ", .{index});
+        try expr.appendSlice(std.testing.allocator, param);
+    }
+    try expr.appendSlice(std.testing.allocator, "}: (x: ");
+    for (0..260) |index| {
+        if (index != 0) try expr.appendSlice(std.testing.allocator, " + ");
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "p{d}", .{index});
+        try expr.appendSlice(std.testing.allocator, name);
+    }
+    try expr.appendSlice(std.testing.allocator, ") 0) { }");
+
+    const output = try renderForTest(expr.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("260", output);
+}
+
+test "evaluate jumps past u16 bytecode offsets" {
+    var expr: std.ArrayListUnmanaged(u8) = .empty;
+    defer expr.deinit(std.testing.allocator);
+
+    try expr.appendSlice(std.testing.allocator, "assert true; builtins.length [ ");
+    for (0..24_000) |_| try expr.appendSlice(std.testing.allocator, "0 ");
+    try expr.appendSlice(std.testing.allocator, "]");
+
+    const output = try renderForTest(expr.items);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqualStrings("24000", output);
+}
+
 test "evaluate small unary builtins" {
     const is_float = try renderForTest("builtins.isFloat 1.5");
     defer std.testing.allocator.free(is_float);
@@ -1389,6 +1453,43 @@ test "evaluate filterSource builtin through file cache" {
     );
     defer std.testing.allocator.free(called_source);
     try std.testing.expectError(error.NixThrow, ev.evaluate(called_source));
+
+    const path_filter_called_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\builtins.path {{
+        \\  path = {s};
+        \\  name = "filtered-source";
+        \\  filter = path: type:
+        \\    if builtins.baseNameOf path == "keep.txt"
+        \\    then builtins.throw "predicate called"
+        \\    else true;
+        \\}}
+    ,
+        .{dir_path},
+    );
+    defer std.testing.allocator.free(path_filter_called_source);
+    try std.testing.expectError(error.NixThrow, ev.evaluate(path_filter_called_source));
+
+    const path_filter_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\builtins.path {{
+        \\  path = {s};
+        \\  name = "filtered-source";
+        \\  filter = path: type:
+        \\    if builtins.baseNameOf path == "boom.txt"
+        \\    then builtins.throw "descended into rejected directory"
+        \\    else builtins.baseNameOf path != "skip";
+        \\}}
+    ,
+        .{dir_path},
+    );
+    defer std.testing.allocator.free(path_filter_source);
+    const filtered_path_value = try ev.evaluate(path_filter_source);
+    try std.testing.expectEqual(.string_context, filtered_path_value.discriminant);
+    const filtered_path_string = try ev.heap.getContextString(filtered_path_value.asObjectId());
+    const builtins_path_filtered_path = ev.intern.get(filtered_path_string.text);
+    try std.testing.expect(std.mem.startsWith(u8, builtins_path_filtered_path, "/nix/store/"));
+    try std.testing.expect(std.mem.endsWith(u8, builtins_path_filtered_path, "-filtered-source"));
 }
 
 test "evaluate fetchGit builtin for local repository" {
@@ -2253,6 +2354,26 @@ test "evaluate minimal derivation builtins" {
     );
     defer std.testing.allocator.free(fixed_null_hash_algo);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/v7fhk503far527r9d9sk8dh2w6c7h695-src\\\",\\\"/nix/store/v1bh6bzphg5c2dc9ck7wdd3g1p6g19vd-src\\\"]\"", fixed_null_hash_algo);
+
+    const fixed_missing_hash_algo = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation {
+        \\    name = "dep";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        \\    outputHashMode = "recursive";
+        \\  };
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    inherit dep;
+        \\  };
+        \\in builtins.toJSON [ dep.outPath pkg.outPath ]
+    );
+    defer std.testing.allocator.free(fixed_missing_hash_algo);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/dpj2vjfs0xvw3hrsasy8lz0aj4fi2ny3-dep\\\",\\\"/nix/store/bqg55j90nmj4nf913dsdh0v8zyicwdz7-pkg\\\"]\"", fixed_missing_hash_algo);
 
     const core_fetchurl_hash_precedence = try renderForTest(
         \\(import <nix/fetchurl.nix> {

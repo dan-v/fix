@@ -155,7 +155,7 @@ pub const Compiler = struct {
 
         const scope_slot = try self.declareLocal("", try self.intern.intern(""));
         try self.builder.emitConstant(self.allocator, scope_value);
-        try self.emitOpByte(.set_local, @intCast(scope_slot));
+        try self.emitSetLocal(scope_slot);
         try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
 
         try self.compileNode(node);
@@ -230,6 +230,11 @@ pub const Compiler = struct {
         try self.builder.writeU16(self.allocator, val);
     }
 
+    fn emitOpU32(self: *Compiler, op: OpCode, val: u32) !void {
+        try self.emitOp(op);
+        try self.builder.writeU32(self.allocator, val);
+    }
+
     fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
         if (positions.len == 0) {
             try self.emitOpU16(.build_attrs, count);
@@ -251,6 +256,30 @@ pub const Compiler = struct {
         try self.builder.writeByte(self.allocator, val);
     }
 
+    fn emitLocalOp(self: *Compiler, short_op: OpCode, long_op: OpCode, slot: u16) !void {
+        if (slot <= std.math.maxInt(u8)) {
+            try self.emitOpByte(short_op, @intCast(slot));
+        } else {
+            try self.emitOpU16(long_op, slot);
+        }
+    }
+
+    fn emitGetLocal(self: *Compiler, slot: u16) !void {
+        try self.emitLocalOp(.get_local, .get_local_long, slot);
+    }
+
+    fn emitCaptureLocal(self: *Compiler, slot: u16) !void {
+        try self.emitLocalOp(.capture_local, .capture_local_long, slot);
+    }
+
+    fn emitSetLocal(self: *Compiler, slot: u16) !void {
+        try self.emitLocalOp(.set_local, .set_local_long, slot);
+    }
+
+    fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
+        try self.emitLocalOp(.set_cell_local, .set_cell_local_long, slot);
+    }
+
     fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: InternId) !void {
         if (id <= std.math.maxInt(u16)) {
             try self.emitOpU16(short_op, @intCast(id));
@@ -268,14 +297,14 @@ pub const Compiler = struct {
         }
     }
 
-    fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u8) !void {
+    fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u16) !void {
         if (chunk_id <= std.math.maxInt(u16)) {
             try self.emitOpU16(.closure, @intCast(chunk_id));
         } else {
             try self.emitOp(.closure_long);
             try self.builder.writeU32(self.allocator, chunk_id);
         }
-        try self.builder.writeByte(self.allocator, upvalue_count);
+        try self.builder.writeU16(self.allocator, upvalue_count);
     }
 
     // ---- atom compilers ----
@@ -430,9 +459,9 @@ pub const Compiler = struct {
     fn compileIdent(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
         if (self.resolveLocal(span)) |slot| {
-            try self.emitOpByte(.get_local, @intCast(slot));
+            try self.emitGetLocal(slot);
         } else if (try self.resolveCapture(span)) |slot| {
-            try self.emitOpByte(.get_upvalue, slot);
+            try self.emitOpU16(.get_upvalue, slot);
         } else if (std.mem.eql(u8, span, "builtins")) {
             try self.emitOp(.push_builtins);
         } else if (try self.emitAmbientBuiltin(span)) {
@@ -496,7 +525,7 @@ pub const Compiler = struct {
         try self.compileNode(left);
 
         const end_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
         try self.compileNode(right);
@@ -507,10 +536,10 @@ pub const Compiler = struct {
         try self.compileNode(left);
 
         const false_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOpU32(.jump_if_false, 0);
 
         const end_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump, 0);
+        try self.emitOpU32(.jump, 0);
 
         self.patchJump(false_jump, self.builder.code.items.len);
         try self.emitOp(.pop);
@@ -523,12 +552,12 @@ pub const Compiler = struct {
         try self.compileNode(left);
 
         const false_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
         try self.compileNode(right);
         const end_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump, 0);
+        try self.emitOpU32(.jump, 0);
 
         self.patchJump(false_jump, self.builder.code.items.len);
         try self.emitOp(.pop);
@@ -585,7 +614,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
     }
 
     fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
@@ -612,8 +641,8 @@ pub const Compiler = struct {
             const name = self.source[bind_name.offset .. bind_name.offset + bind_name.len];
             const name_id = try self.intern.intern(name);
             const slot = try child.declareLocal(name, name_id);
-            try child.emitOpByte(.capture_local, @intCast(arg_slot));
-            try child.emitOpByte(.set_local, @intCast(slot));
+            try child.emitCaptureLocal(arg_slot);
+            try child.emitSetLocal(slot);
         }
 
         var wide_params = false;
@@ -622,7 +651,7 @@ pub const Compiler = struct {
             if (try self.intern.intern(name) > std.math.maxInt(u16)) wide_params = true;
         }
 
-        try child.emitOpByte(.get_local, @intCast(arg_slot));
+        try child.emitGetLocal(arg_slot);
         try child.emitOp(if (wide_params) .validate_attrs_long else .validate_attrs);
         try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
         try child.builder.writeU16(child.allocator, @intCast(lambda.params.len));
@@ -646,7 +675,7 @@ pub const Compiler = struct {
             try child.emitOp(.push_null);
             try child.emitOp(.make_cell);
             const slot = try child.declareLocal(name, name_id);
-            try child.emitOpByte(.set_local, @intCast(slot));
+            try child.emitSetLocal(slot);
         }
 
         for (lambda.params) |param| {
@@ -654,7 +683,7 @@ pub const Compiler = struct {
             const name_id = try self.intern.intern(name);
             const slot = child.resolveLocal(name) orelse return error.UndefinedVariable;
             try child.compileAttrParamThunk(arg_slot, name_id, param.default);
-            try child.emitOpByte(.set_cell_local, @intCast(slot));
+            try child.emitSetCellLocal(slot);
         }
 
         child.compileNode(lambda.body) catch |err| {
@@ -667,7 +696,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
     }
 
     fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
@@ -688,7 +717,7 @@ pub const Compiler = struct {
         defer child.deinit();
 
         _ = try child.addCapture("\x00args", .local, arg_slot);
-        try child.emitOpByte(.get_upvalue, 0);
+        try child.emitOpU16(.get_upvalue, 0);
         if (default) |default_expr| {
             try child.compileThunk(default_expr);
             try child.emitOp(if (name_id > std.math.maxInt(u16)) .get_attr_path_or_long else .get_attr_path_or);
@@ -703,7 +732,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
@@ -719,7 +748,7 @@ pub const Compiler = struct {
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
             const slot = try self.declareLocal(name, name_id);
-            try self.emitOpByte(.set_local, @intCast(slot));
+            try self.emitSetLocal(slot);
         }
 
         for (let_in.bindings, 0..) |binding, index| {
@@ -727,7 +756,7 @@ pub const Compiler = struct {
             const name = self.attrSegmentSpan(binding.path[0]);
             const slot = self.resolveLocal(name) orelse return error.UndefinedVariable;
             try self.compileLetRootBinding(let_in.bindings, binding.path[0], slot);
-            try self.emitOpByte(.set_cell_local, @intCast(slot));
+            try self.emitSetCellLocal(slot);
         }
 
         try self.compileNode(let_in.body);
@@ -846,15 +875,15 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
     fn emitCaptures(self: *Compiler, captures: []const Capture) !void {
         for (captures) |capture| {
             switch (capture.kind) {
-                .local => try self.emitOpByte(.capture_local, @intCast(capture.index)),
-                .upvalue => try self.emitOpByte(.capture_upvalue, @intCast(capture.index)),
+                .local => try self.emitCaptureLocal(capture.index),
+                .upvalue => try self.emitOpU16(.capture_upvalue, capture.index),
             }
         }
     }
@@ -866,12 +895,12 @@ pub const Compiler = struct {
 
         // Emit placeholder for jump_if_false
         const jump_pos = self.builder.code.items.len;
-        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
         try self.compileNode(ife.then_branch);
         const jump_over_pos = self.builder.code.items.len;
-        try self.emitOpU16(.jump, 0);
+        try self.emitOpU32(.jump, 0);
 
         // Patch jump_if_false target
         self.patchJump(jump_pos, self.builder.code.items.len);
@@ -889,12 +918,12 @@ pub const Compiler = struct {
         try self.compileNode(assert_node.cond);
 
         const fail_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump_if_false, 0);
+        try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
         try self.compileNode(assert_node.body);
         const end_jump = self.builder.code.items.len;
-        try self.emitOpU16(.jump, 0);
+        try self.emitOpU32(.jump, 0);
 
         self.patchJump(fail_jump, self.builder.code.items.len);
         try self.emitOp(.pop);
@@ -910,7 +939,7 @@ pub const Compiler = struct {
 
         const scope_slot = try self.declareLocal("", try self.intern.intern(""));
         try self.compileThunk(with_node.attr_set);
-        try self.emitOpByte(.set_local, @intCast(scope_slot));
+        try self.emitSetLocal(scope_slot);
         try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
 
         try self.compileNode(with_node.body);
@@ -957,7 +986,7 @@ pub const Compiler = struct {
         for (entries) |entry| {
             if (!self.isDynamicAttrEntry(entry)) continue;
             try self.compileDynamicAttrName(entry);
-            try self.compileThunk(entry.expr);
+            try self.compileDynamicAttrValueThunk(entry);
             try self.emitOpU16(.build_attrs, 1);
             try self.emitOp(.merge_attrs);
         }
@@ -992,7 +1021,7 @@ pub const Compiler = struct {
         for (entries) |entry| {
             if (!self.isDynamicAttrEntry(entry)) continue;
             try self.compileDynamicAttrName(entry);
-            try self.compileThunk(entry.expr);
+            try self.compileDynamicAttrValueThunk(entry);
             try self.emitOpU16(.build_attrs, 1);
             try self.emitOp(.merge_attrs);
         }
@@ -1025,6 +1054,58 @@ pub const Compiler = struct {
             return self.compileStringAtom(entry.path[0]);
         }
         return error.InvalidAttributePath;
+    }
+
+    fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void {
+        if (entry.tail_dynamic_name) |tail_dynamic_name| {
+            const nested = [_]Node.AttrSetEntry{
+                .{
+                    .path = entry.path,
+                    .dynamic_name = tail_dynamic_name,
+                    .expr = entry.expr,
+                    .inherit_outer = entry.inherit_outer,
+                },
+            };
+            return self.compileNodeAttrEntriesThunk(&nested, false);
+        }
+
+        if (entry.dynamic_name == null or entry.path.len == 0) return self.compileThunk(entry.expr);
+
+        const views = [_]AttrEntryView{
+            .{ .path = entry.path, .expr = entry.expr, .inherit_outer = entry.inherit_outer },
+        };
+        try self.compileAttrEntriesThunk(&views, false);
+    }
+
+    fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
+        var child_builder = try ChunkBuilder.init(self.allocator);
+        defer child_builder.deinit(self.allocator);
+
+        var child = Compiler.init(
+            self.allocator,
+            &child_builder,
+            self.registry,
+            self.source,
+            self.intern,
+        );
+        child.parent = self;
+        child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
+        defer child.deinit();
+
+        child.compileMixedAttrSet(entries, recursive) catch |err| {
+            try self.diagnostics.appendSlice(self.allocator, child.diagnostics.items);
+            return err;
+        };
+        try child.emitOp(.ret);
+        try child.emitOp(.halt);
+
+        const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+        const child_id = try self.registry.register(child_chunk);
+        try self.emitCaptures(child.captures.items);
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitOp(.make_thunk);
     }
 
     fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
@@ -1101,7 +1182,7 @@ pub const Compiler = struct {
             try self.emitOp(.push_null);
             try self.emitOp(.make_cell);
             const slot = try self.declareLocal(group.name, group.name_id);
-            try self.emitOpByte(.set_local, @intCast(slot));
+            try self.emitSetLocal(slot);
         }
     }
 
@@ -1115,7 +1196,7 @@ pub const Compiler = struct {
             const leaf = group.leaf;
             if (leaf == null) {
                 try self.compileAttrEntriesThunk(group.tails, false);
-                try self.emitOpByte(.set_cell_local, @intCast(slot));
+                try self.emitSetCellLocal(slot);
                 continue;
             }
 
@@ -1125,7 +1206,7 @@ pub const Compiler = struct {
                     return error.DuplicateAttribute;
                 }
                 try self.compileExtendedAttrSetLiteralThunk(leaf.?, group.tails);
-                try self.emitOpByte(.set_cell_local, @intCast(slot));
+                try self.emitSetCellLocal(slot);
                 continue;
             }
             const previous_skip = self.skip_local_slot;
@@ -1133,7 +1214,7 @@ pub const Compiler = struct {
             const compile_result = self.compileContainerValue(leaf.?.expr, .{});
             self.skip_local_slot = previous_skip;
             try compile_result;
-            try self.emitOpByte(.set_cell_local, @intCast(slot));
+            try self.emitSetCellLocal(slot);
         }
     }
 
@@ -1145,7 +1226,7 @@ pub const Compiler = struct {
             try self.emitAttrNameId(group.name_id);
 
             const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
-            try self.emitOpByte(.capture_local, @intCast(slot));
+            try self.emitCaptureLocal(slot);
             try self.appendAttrPosition(&positions, group.first, group.name_id);
         }
 
@@ -1193,7 +1274,7 @@ pub const Compiler = struct {
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
         try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, @intCast(child.captures.items.len));
+        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
         try self.emitOp(.make_thunk);
     }
 
@@ -1482,11 +1563,11 @@ pub const Compiler = struct {
     fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
         if (self.resolveLocal(span)) |slot| {
-            try self.emitOpByte(.capture_local, @intCast(slot));
+            try self.emitCaptureLocal(slot);
             return true;
         }
         if (try self.resolveCapture(span)) |slot| {
-            try self.emitOpByte(.capture_upvalue, slot);
+            try self.emitOpU16(.capture_upvalue, slot);
             return true;
         }
         return false;
@@ -1514,8 +1595,8 @@ pub const Compiler = struct {
 
         for (scopes.items) |scope| {
             switch (scope.kind) {
-                .local => try self.emitOpByte(.capture_local, @intCast(scope.index)),
-                .upvalue => try self.emitOpByte(.capture_upvalue, @intCast(scope.index)),
+                .local => try self.emitCaptureLocal(scope.index),
+                .upvalue => try self.emitOpU16(.capture_upvalue, scope.index),
             }
         }
 
@@ -1547,10 +1628,12 @@ pub const Compiler = struct {
 
     fn patchJump(self: *Compiler, instruction_offset: usize, target_offset: usize) void {
         const operand_offset = instruction_offset + 1;
-        const next_instruction = instruction_offset + 3;
-        const relative: u16 = @intCast(target_offset - next_instruction);
+        const next_instruction = instruction_offset + 5;
+        const relative: u32 = @intCast(target_offset - next_instruction);
         self.builder.code.items[operand_offset] = @truncate(relative);
         self.builder.code.items[operand_offset + 1] = @truncate(relative >> 8);
+        self.builder.code.items[operand_offset + 2] = @truncate(relative >> 16);
+        self.builder.code.items[operand_offset + 3] = @truncate(relative >> 24);
     }
 
     fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
@@ -1623,7 +1706,7 @@ pub const Compiler = struct {
         return null;
     }
 
-    fn resolveCapture(self: *Compiler, name: []const u8) !?u8 {
+    fn resolveCapture(self: *Compiler, name: []const u8) !?u16 {
         const parent = self.parent orelse return null;
         if (parent.resolveLocal(name)) |parent_slot| {
             return try self.addCapture(name, .local, parent_slot);
@@ -1634,13 +1717,14 @@ pub const Compiler = struct {
         return null;
     }
 
-    fn addCapture(self: *Compiler, name: []const u8, kind: Capture.Kind, capture_index: u16) !u8 {
+    fn addCapture(self: *Compiler, name: []const u8, kind: Capture.Kind, capture_index: u16) !u16 {
         for (self.captures.items, 0..) |capture, existing_index| {
             if (capture.kind == kind and capture.index == capture_index and std.mem.eql(u8, capture.name, name)) {
                 return @intCast(existing_index);
             }
         }
 
+        if (self.captures.items.len > std.math.maxInt(u16)) return error.TooManyCaptures;
         try self.captures.append(self.allocator, .{
             .name = name,
             .kind = kind,
@@ -1663,6 +1747,11 @@ pub const Compiler = struct {
         return &self.line_index;
     }
 };
+
+fn captureCount(count: usize) !u16 {
+    if (count > std.math.maxInt(u16)) return error.TooManyCaptures;
+    return @intCast(count);
+}
 
 fn nodeMayEvaluateToFloat(node: *const Node) bool {
     return switch (node.tag) {
@@ -1760,6 +1849,7 @@ fn attrSetSourceSpan(attr_set: Node.AttrSet) ?Node.Atom {
     for (attr_set.entries) |entry| {
         for (entry.path) |segment| span = combineAtoms(span, segment);
         if (entry.dynamic_name) |dynamic_name| span = combineAtoms(span, nodeSourceSpan(dynamic_name));
+        if (entry.tail_dynamic_name) |dynamic_name| span = combineAtoms(span, nodeSourceSpan(dynamic_name));
         span = combineAtoms(span, nodeSourceSpan(entry.expr));
     }
     return span;
@@ -1840,6 +1930,7 @@ fn offsetNode(node: *Node, offset: u32) void {
                     segment.offset += offset;
                 }
                 if (entry.dynamic_name) |dynamic_name| offsetNode(dynamic_name, offset);
+                if (entry.tail_dynamic_name) |dynamic_name| offsetNode(dynamic_name, offset);
                 offsetNode(entry.expr, offset);
             }
         },

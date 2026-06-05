@@ -2418,9 +2418,13 @@ fn derivationIgnoreNulls(self: anytype, attrs_id: ObjectId) !bool {
 }
 
 fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []const u8) ![]const u8 {
-    const algo_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashAlgo")));
-    if (isPlainString(algo_value)) return self.intern.get(try stringTextInternId(self, algo_value));
-    if (algo_value.discriminant != .null) return error.TypeError;
+    const algo_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashAlgo")) catch |err| switch (err) {
+        error.MissingAttribute => Value.null_val,
+        else => return err,
+    };
+    const forced_algo = try self.forceValue(algo_value);
+    if (isPlainString(forced_algo)) return self.intern.get(try stringTextInternId(self, forced_algo));
+    if (forced_algo.discriminant != .null) return error.TypeError;
 
     const dash = std.mem.indexOfScalar(u8, hash_text, '-') orelse return error.InvalidHashAlgorithm;
     if (dash == 0) return error.InvalidHashAlgorithm;
@@ -2801,9 +2805,10 @@ fn builtinStorePath(self: anytype, arg: Value) !Value {
 fn builtinPath(self: anytype, arg: Value) !Value {
     const attrs = try self.forceValue(arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
+    const attrs_id = attrs.asObjectId();
 
     const path_id = try self.intern.intern("path");
-    const path_value = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), path_id));
+    const path_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, path_id));
     const path = switch (path_value.discriminant) {
         .path, .string, .string_context => self.intern.get(try stringTextInternId(self, path_value)),
         else => return error.TypeError,
@@ -2811,7 +2816,7 @@ fn builtinPath(self: anytype, arg: Value) !Value {
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
 
     const name_id = try self.intern.intern("name");
-    const name_value = self.heap.getAttrValue(attrs.asObjectId(), name_id) catch |err| switch (err) {
+    const name_value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
         error.MissingAttribute => Value.null_val,
         else => return err,
     };
@@ -2822,7 +2827,33 @@ fn builtinPath(self: anytype, arg: Value) !Value {
         store_name = self.intern.get(try stringTextInternId(self, name));
     }
 
-    const store_path = try source_paths.storePathForSourceName(self.allocator, self.files, self.derivations.store_dir, path, store_name);
+    const filter_id = try self.intern.intern("filter");
+    const filter_value = self.heap.getAttrValue(attrs_id, filter_id) catch |err| switch (err) {
+        error.MissingAttribute => Value.null_val,
+        else => return err,
+    };
+
+    const store_path = if (filter_value.discriminant == .null)
+        try source_paths.storePathForSourceName(self.allocator, self.files, self.derivations.store_dir, path, store_name)
+    else filtered: {
+        const pred = try self.forceValue(filter_value);
+        const Context = struct {
+            vm: @TypeOf(self),
+            pred: Value,
+
+            fn accept(context: *anyopaque, candidate: []const u8, kind: file_cache.FileCache.FileKind) anyerror!bool {
+                const ctx: *@This() = @ptrCast(@alignCast(context));
+                return filterSourceAccepts(ctx.vm, ctx.pred, candidate, kind);
+            }
+        };
+        var context: Context = .{ .vm = self, .pred = pred };
+        const hash = try nar.hashPathFiltered(self.allocator, self.files, path, .{
+            .context = &context,
+            .accept = Context.accept,
+        });
+        defer self.allocator.free(hash);
+        break :filtered try derivation.sourcePath(self.allocator, self.derivations.store_dir, store_name, hash);
+    };
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));
 }

@@ -23,15 +23,23 @@ pub const OpCode = enum(u8) {
     // ---- locals ----
     /// Push local variable at offset (operand: 1-byte offset from frame base).
     get_local,
+    /// Push local variable at offset (operand: 2-byte offset from frame base).
+    get_local_long,
     /// Push local variable without forcing lazy cells (operand: 1-byte offset).
     capture_local,
-    /// Push captured upvalue without forcing lazy cells (operand: 1-byte offset).
+    /// Push local variable without forcing lazy cells (operand: 2-byte offset).
+    capture_local_long,
+    /// Push captured upvalue without forcing lazy cells (operand: 2-byte index).
     capture_upvalue,
     /// Set local variable at offset, popping from stack.
     set_local,
+    /// Set local variable at offset, popping from stack (operand: 2-byte offset).
+    set_local_long,
     /// Set the value inside a local cell, popping from stack.
     set_cell_local,
-    /// Push captured upvalue at offset (operand: 1-byte closure upvalue index).
+    /// Set the value inside a local cell (operand: 2-byte offset).
+    set_cell_local_long,
+    /// Push captured upvalue at offset (operand: 2-byte closure upvalue index).
     get_upvalue,
 
     // ---- arithmetic ----
@@ -58,9 +66,9 @@ pub const OpCode = enum(u8) {
     not,
 
     // ---- control flow ----
-    /// Relative jump forward (operand: 2-byte signed offset).
+    /// Relative jump forward (operand: 4-byte unsigned offset).
     jump,
-    /// Jump forward if top of stack is truthy (operand: 2-byte signed offset).
+    /// Jump forward if top of stack is false (operand: 4-byte unsigned offset).
     jump_if_false,
     /// Raise an assertion failure.
     fail_assertion,
@@ -92,11 +100,11 @@ pub const OpCode = enum(u8) {
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.
-    /// Operand: 2-byte ChunkId, 1-byte upvalue count.
+    /// Operand: 2-byte ChunkId, 2-byte upvalue count.
     /// Upvalues are the top N values on the stack, popped.
     closure,
     /// Create a closure whose chunk id does not fit in the short form.
-    /// Operand: 4-byte ChunkId, 1-byte upvalue count.
+    /// Operand: 4-byte ChunkId, 2-byte upvalue count.
     closure_long,
 
     // ---- calls ----

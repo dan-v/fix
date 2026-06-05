@@ -37,6 +37,7 @@ const InfixFn = *const fn (p: *Parser, left: *Node) anyerror!*Node;
 const AttrDeclaration = struct {
     path: []Node.Atom,
     dynamic_name: ?*Node = null,
+    tail_dynamic_name: ?*Node = null,
 };
 
 const Rule = struct {
@@ -531,6 +532,7 @@ pub const Parser = struct {
             try entries.append(arena_allocator, .{
                 .path = declaration.path,
                 .dynamic_name = declaration.dynamic_name,
+                .tail_dynamic_name = declaration.tail_dynamic_name,
                 .expr = expr,
             });
 
@@ -613,7 +615,17 @@ pub const Parser = struct {
         if (self.match(.dollar_curly)) {
             const name = try self.expression();
             _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
-            return .{ .path = try self.arena.allocSlice(Node.Atom, 0), .dynamic_name = name };
+            var tail_dynamic_name: ?*Node = null;
+            const path = if (self.match(.dot)) path: {
+                if (self.match(.dollar_curly)) {
+                    tail_dynamic_name = try self.expression();
+                    _ = try self.expect(.right_brace, "Expected '}' after dynamic attribute name.");
+                    if (self.match(.dot)) break :path try self.attrDeclarationPath(allocator);
+                    break :path try self.arena.allocSlice(Node.Atom, 0);
+                }
+                break :path try self.attrDeclarationPath(allocator);
+            } else try self.arena.allocSlice(Node.Atom, 0);
+            return .{ .path = path, .dynamic_name = name, .tail_dynamic_name = tail_dynamic_name };
         }
 
         return .{ .path = try self.attrDeclarationPath(allocator) };
