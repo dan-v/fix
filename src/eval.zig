@@ -2494,6 +2494,21 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(fixed_unpadded_sri_hash);
     try std.testing.expectEqualStrings("\"[\\\"/nix/store/5n8j4sk7pl5fb7bxifx44wbgqynr0xan-p.drv\\\",\\\"/nix/store/aikg27wbvlrblwb21vhqd6k6lqk31nxr-p\\\"]\"", fixed_unpadded_sri_hash);
 
+    const fixed_empty_hash_algo_sri = try renderForTest(
+        \\let
+        \\  pkg = builtins.derivation {
+        \\    name = "empty-algo-sri";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    outputHash = "sha256-4Y/RQQeN4VTpig8ZyxUpVHwzN8W8ciTBCkSzND8SMbs=";
+        \\    outputHashAlgo = "";
+        \\    outputHashMode = "flat";
+        \\  };
+        \\in builtins.toJSON [ pkg.drvPath pkg.outPath ]
+    );
+    defer std.testing.allocator.free(fixed_empty_hash_algo_sri);
+    try std.testing.expectEqualStrings("\"[\\\"/nix/store/srzzssay8777dg3ifm829wbfqvylx4i8-empty-algo-sri.drv\\\",\\\"/nix/store/gmy97hacw4bpawimq98pjrldf5qv0fhw-empty-algo-sri\\\"]\"", fixed_empty_hash_algo_sri);
+
     const fixed_missing_hash_algo = try renderForTest(
         \\let
         \\  dep = builtins.derivation {

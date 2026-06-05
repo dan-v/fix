@@ -2480,8 +2480,10 @@ fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []cons
         else => return err,
     };
     const forced_algo = try self.forceValue(algo_value);
-    if (isPlainString(forced_algo)) return self.intern.get(try stringTextInternId(self, forced_algo));
-    if (forced_algo.discriminant != .null) return error.TypeError;
+    if (isPlainString(forced_algo)) {
+        const algo = self.intern.get(try stringTextInternId(self, forced_algo));
+        if (algo.len != 0) return algo;
+    } else if (forced_algo.discriminant != .null) return error.TypeError;
 
     const separator = derivation.hashAlgorithmSeparator(hash_text) orelse return error.InvalidHashAlgorithm;
     if (separator == 0) return error.InvalidHashAlgorithm;
