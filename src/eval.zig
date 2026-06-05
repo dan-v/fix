@@ -1970,6 +1970,32 @@ test "evaluate string builtins" {
     defer std.testing.allocator.free(replaced);
     try std.testing.expectEqualStrings("\"XcY\"", replaced);
 
+    const replace_preserves_used_context = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  result = builtins.replaceStrings [ "@x@" ] [ (builtins.toJSON [ "${dep.dev}/include" "${dep.out}/lib" ]) ] "value @x@";
+        \\  ctx = builtins.getContext result;
+        \\in builtins.concatStringsSep "," ((builtins.getAttr (builtins.unsafeDiscardStringContext dep.drvPath) ctx).outputs)
+    );
+    defer std.testing.allocator.free(replace_preserves_used_context);
+    try std.testing.expectEqualStrings("\"dev,out\"", replace_preserves_used_context);
+
+    const replace_ignores_unused_context = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\in builtins.hasContext (builtins.replaceStrings [ "x" ] [ "${dep}" ] "abc")
+    );
+    defer std.testing.allocator.free(replace_ignores_unused_context);
+    try std.testing.expectEqualStrings("false", replace_ignores_unused_context);
+
+    const replace_keeps_input_context = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\in builtins.hasContext (builtins.replaceStrings [ (builtins.unsafeDiscardStringContext dep.outPath) ] [ "removed" ] "${dep.out}")
+    );
+    defer std.testing.allocator.free(replace_keeps_input_context);
+    try std.testing.expectEqualStrings("true", replace_keeps_input_context);
+
     const to_file = try renderForTest("builtins.toFile \"x\" \"hello\"");
     defer std.testing.allocator.free(to_file);
     try std.testing.expectEqualStrings("\"/nix/store/4g4g9i669dl63abpww0djbl2jxl6bwiz-x\"", to_file);
@@ -2047,6 +2073,15 @@ test "evaluate JSON builtins" {
     const to_string_json = try renderForTest("builtins.toJSON { __toString = self: self.name; name = \"pkg\"; }");
     defer std.testing.allocator.free(to_string_json);
     try std.testing.expectEqualStrings("\"\\\"pkg\\\"\"", to_string_json);
+
+    const json_preserves_string_context = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  ctx = builtins.getContext (builtins.toJSON [ "${dep.dev}/include" "${dep.out}/lib" ]);
+        \\in builtins.concatStringsSep "," ((builtins.getAttr (builtins.unsafeDiscardStringContext dep.drvPath) ctx).outputs)
+    );
+    defer std.testing.allocator.free(json_preserves_string_context);
+    try std.testing.expectEqualStrings("\"dev,out\"", json_preserves_string_context);
 }
 
 test "evaluate XML builtin" {
@@ -2204,6 +2239,34 @@ test "evaluate string context builtins" {
     );
     defer std.testing.allocator.free(merged_output_drv_path);
     try std.testing.expectEqualStrings("\"/nix/store/8yjj0xh9r8937p4mv51iwnrl62jjx08p-pkg.drv\"", merged_output_drv_path);
+
+    const json_context_drv_path = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    text = builtins.toJSON [ "${dep.dev}/include" "${dep.out}/lib" ];
+        \\  };
+        \\in pkg.drvPath
+    );
+    defer std.testing.allocator.free(json_context_drv_path);
+    try std.testing.expectEqualStrings("\"/nix/store/ls6lgnv49ck6xbl68m7pgabhy8mn90ss-pkg.drv\"", json_context_drv_path);
+
+    const replace_json_context_drv_path = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    text = builtins.replaceStrings [ "@x@" ] [ (builtins.toJSON [ "${dep.dev}/include" "${dep.out}/lib" ]) ] "value @x@";
+        \\  };
+        \\in pkg.drvPath
+    );
+    defer std.testing.allocator.free(replace_json_context_drv_path);
+    try std.testing.expectEqualStrings("\"/nix/store/kbi5xhbc0747awhah1yjsn6qpsbq62mg-pkg.drv\"", replace_json_context_drv_path);
 }
 
 test "evaluate minimal derivation builtins" {
@@ -2566,10 +2629,14 @@ test "evaluate path construction builtins" {
     try std.testing.expectEqualStrings("/nix/store/375nsbsr3gvzlfpmnviljghr7racpq67-imported", ev.intern.get(path_value.asInternId()));
 
     const path_prefix = try ev.evaluate(path_prefix_source);
-    try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix.asInternId()));
+    try std.testing.expectEqual(.string_context, path_prefix.discriminant);
+    const path_prefix_string = try ev.heap.getContextString(path_prefix.asObjectId());
+    try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix_string.text));
 
     const literal_paths = try ev.evaluate(literal_path_source);
-    const literal_paths_text = ev.intern.get(literal_paths.asInternId());
+    try std.testing.expectEqual(.string_context, literal_paths.discriminant);
+    const literal_paths_string = try ev.heap.getContextString(literal_paths.asObjectId());
+    const literal_paths_text = ev.intern.get(literal_paths_string.text);
     try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, cwd) != null);
     try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, "/nix/store/") != null);
     try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, "-build.zig") != null);

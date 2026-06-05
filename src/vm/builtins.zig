@@ -353,23 +353,34 @@ fn builtinToJSON(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
-    try writeJsonValueWithPathMode(self, &out.writer, arg, .source);
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+
+    try writeJsonValueWithPathMode(self, &out.writer, arg, .source, &context);
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
-    return Value.string(try self.intern.intern(text));
+    const text_id = try self.intern.intern(text);
+    if (context.items.len == 0) return Value.string(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
 pub fn writeJsonValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
-    try writeJsonValueWithPathMode(self, writer, value, .raw);
+    try writeJsonValueWithPathMode(self, writer, value, .raw, null);
 }
 
 const JsonPathMode = enum { raw, source };
 
-fn writeJsonValueWithPathMode(self: anytype, writer: *std.Io.Writer, value: Value, path_mode: JsonPathMode) !void {
+fn writeJsonValueWithPathMode(
+    self: anytype,
+    writer: *std.Io.Writer,
+    value: Value,
+    path_mode: JsonPathMode,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) !void {
     var seen: std.ArrayListUnmanaged(SeenJsonObject) = .empty;
     defer seen.deinit(self.allocator);
 
-    try writeJsonValueInner(self, writer, value, &seen, path_mode);
+    try writeJsonValueInner(self, writer, value, &seen, path_mode, context);
 }
 
 const SeenJsonKind = enum { list, attrs };
@@ -379,7 +390,14 @@ const SeenJsonObject = struct {
     id: ObjectId,
 };
 
-fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) anyerror!void {
+fn writeJsonValueInner(
+    self: anytype,
+    writer: *std.Io.Writer,
+    value: Value,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+    path_mode: JsonPathMode,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) anyerror!void {
     const forced = try self.forceValue(value);
     switch (forced.discriminant) {
         .null => try writer.writeAll("null"),
@@ -387,27 +405,40 @@ fn writeJsonValueInner(self: anytype, writer: *std.Io.Writer, value: Value, seen
         .bool_true => try writer.writeAll("true"),
         .int => try writer.print("{}", .{forced.asInt()}),
         .float => try writer.print("{d}", .{forced.asFloat()}),
-        .string, .string_context => try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, forced)), .{}, writer),
+        .string, .string_context => try writeJsonStringValue(self, writer, forced, context),
         .path => {
-            const text = switch (path_mode) {
-                .raw => self.intern.get(forced.asInternId()),
-                .source => blk: {
+            switch (path_mode) {
+                .raw => try std.json.Stringify.encodeJsonString(self.intern.get(forced.asInternId()), .{}, writer),
+                .source => {
                     const string_value = try sourcePathStringValue(self, forced.asInternId());
-                    break :blk self.intern.get(try stringTextInternId(self, string_value));
+                    try writeJsonStringValue(self, writer, string_value, context);
                 },
-            };
-            try std.json.Stringify.encodeJsonString(text, .{}, writer);
+            }
         },
-        .list => try writeJsonList(self, writer, forced.asObjectId(), seen, path_mode),
+        .list => try writeJsonList(self, writer, forced.asObjectId(), seen, path_mode, context),
         .attrs => {
             if (try jsonAttrsStringValue(self, forced, path_mode)) |string_value| {
-                try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, string_value)), .{}, writer);
+                try writeJsonStringValue(self, writer, string_value, context);
             } else {
-                try writeJsonAttrs(self, writer, forced.asObjectId(), seen, path_mode);
+                try writeJsonAttrs(self, writer, forced.asObjectId(), seen, path_mode, context);
             }
         },
         .closure, .builtin, .builtin_closure => return error.TypeError,
         .thunk, .cell => unreachable,
+    }
+}
+
+fn writeJsonStringValue(
+    self: anytype,
+    writer: *std.Io.Writer,
+    value: Value,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) !void {
+    try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, value)), .{}, writer);
+    if (context) |entries| {
+        for (try contextEntriesForValue(self, value)) |entry| {
+            try appendContextEntry(self, entries, entry.name, entry.value);
+        }
     }
 }
 
@@ -437,19 +468,33 @@ fn jsonAttrsStringValue(self: anytype, attrs: Value, path_mode: JsonPathMode) !?
     }
 }
 
-fn writeJsonList(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) !void {
+fn writeJsonList(
+    self: anytype,
+    writer: *std.Io.Writer,
+    id: ObjectId,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+    path_mode: JsonPathMode,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) !void {
     if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
     try writer.writeByte('[');
     for (try self.heap.getList(id), 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeJsonValueInner(self, writer, item, seen, path_mode);
+        try writeJsonValueInner(self, writer, item, seen, path_mode, context);
     }
     try writer.writeByte(']');
 }
 
-fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject), path_mode: JsonPathMode) !void {
+fn writeJsonAttrs(
+    self: anytype,
+    writer: *std.Io.Writer,
+    id: ObjectId,
+    seen: *std.ArrayListUnmanaged(SeenJsonObject),
+    path_mode: JsonPathMode,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) !void {
     if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
@@ -461,7 +506,7 @@ fn writeJsonAttrs(self: anytype, writer: *std.Io.Writer, id: ObjectId, seen: *st
         if (i > 0) try writer.writeByte(',');
         try std.json.Stringify.encodeJsonString(self.intern.get(entry.name), .{}, writer);
         try writer.writeByte(':');
-        try writeJsonValueInner(self, writer, entry.value, seen, path_mode);
+        try writeJsonValueInner(self, writer, entry.value, seen, path_mode, context);
     }
     try writer.writeByte('}');
 }
@@ -1300,21 +1345,31 @@ fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg:
 fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
     const from_ids = try stringListInternIdsArg(self, from_arg);
     defer self.allocator.free(from_ids);
-    const to_ids = try stringListInternIdsArg(self, to_arg);
-    defer self.allocator.free(to_ids);
+    const to_values = try stringListValuesArg(self, to_arg);
+    defer self.allocator.free(to_values);
     const input_value = try self.forceValue(string_arg);
-    if (from_ids.len != to_ids.len or !isPlainString(input_value)) return error.TypeError;
+    if (from_ids.len != to_values.len or !isPlainString(input_value)) return error.TypeError;
 
     const input = self.intern.get(try stringTextInternId(self, input_value));
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
+
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+    for (try contextEntriesForValue(self, input_value)) |entry| {
+        try appendContextEntry(self, &context, entry.name, entry.value);
+    }
 
     var index: usize = 0;
     while (index < input.len) {
         if (firstReplacementIdAt(self, input[index..], from_ids)) |replacement_index| {
             const needle = self.intern.get(from_ids[replacement_index]);
             if (needle.len == 0) return error.TypeError;
-            try out.appendSlice(self.allocator, self.intern.get(to_ids[replacement_index]));
+            const replacement = to_values[replacement_index];
+            try out.appendSlice(self.allocator, self.intern.get(try stringTextInternId(self, replacement)));
+            for (try contextEntriesForValue(self, replacement)) |entry| {
+                try appendContextEntry(self, &context, entry.name, entry.value);
+            }
             index += needle.len;
         } else {
             try out.append(self.allocator, input[index]);
@@ -1322,7 +1377,9 @@ fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_a
         }
     }
 
-    return Value.string(try self.intern.intern(out.items));
+    const text_id = try self.intern.intern(out.items);
+    if (context.items.len == 0) return Value.string(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
 fn builtinThrow(self: anytype, message_arg: Value) !Value {
@@ -3253,6 +3310,21 @@ fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
         id.* = try stringTextInternId(self, value);
     }
     return ids;
+}
+
+fn stringListValuesArg(self: anytype, arg: Value) ![]Value {
+    const list = try self.forceValue(arg);
+    if (list.discriminant != .list) return error.TypeError;
+
+    const items = try self.heap.getList(list.asObjectId());
+    const values = try self.allocator.alloc(Value, items.len);
+    errdefer self.allocator.free(values);
+    for (items, values) |item, *dest| {
+        const value = try self.forceValue(item);
+        if (!isPlainString(value)) return error.TypeError;
+        dest.* = value;
+    }
+    return values;
 }
 
 fn builtinToString(self: anytype, arg: Value) !Value {
