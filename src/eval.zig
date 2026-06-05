@@ -2173,6 +2173,15 @@ test "evaluate XML builtin" {
     const escaped = try renderForTest("builtins.toXML \"a<&\\\"b\"");
     defer std.testing.allocator.free(escaped);
     try std.testing.expect(std.mem.indexOf(u8, escaped, "a&lt;&amp;&quot;b") != null);
+
+    const xml_preserves_string_context = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  ctx = builtins.getContext (builtins.toXML [ "${dep.dev}/include" "${dep.out}/lib" ]);
+        \\in builtins.concatStringsSep "," ((builtins.getAttr (builtins.unsafeDiscardStringContext dep.drvPath) ctx).outputs)
+    );
+    defer std.testing.allocator.free(xml_preserves_string_context);
+    try std.testing.expectEqualStrings("\"dev,out\"", xml_preserves_string_context);
 }
 
 test "evaluate TOML builtin" {
@@ -2350,6 +2359,20 @@ test "evaluate string context builtins" {
     );
     defer std.testing.allocator.free(replace_json_context_drv_path);
     try std.testing.expectEqualStrings("\"/nix/store/kbi5xhbc0747awhah1yjsn6qpsbq62mg-pkg.drv\"", replace_json_context_drv_path);
+
+    const xml_context_drv_path = try renderForTest(
+        \\let
+        \\  dep = builtins.derivation { name = "dep"; outputs = [ "out" "dev" ]; system = "x86_64-linux"; builder = "/bin/sh"; };
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    text = builtins.toXML [ "${dep.dev}/include" "${dep.out}/lib" ];
+        \\  };
+        \\in pkg.drvPath
+    );
+    defer std.testing.allocator.free(xml_context_drv_path);
+    try std.testing.expectEqualStrings("\"/nix/store/xmzlcawiq24yfhr33qs49i0p54czwsc3-pkg.drv\"", xml_context_drv_path);
 }
 
 test "evaluate minimal derivation builtins" {

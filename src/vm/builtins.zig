@@ -523,21 +523,31 @@ fn builtinToXML(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
 
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+
     try self.forceDeep(arg);
-    try writeXmlDocument(self, &out.writer, try self.forceValue(arg));
+    try writeXmlDocument(self, &out.writer, try self.forceValue(arg), &context);
 
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
-    return Value.string(try self.intern.intern(text));
+    const text_id = try self.intern.intern(text);
+    if (context.items.len == 0) return Value.string(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
 pub fn writeLazyXmlValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
-    try writeXmlDocument(self, writer, try self.forceValue(value));
+    try writeXmlDocument(self, writer, try self.forceValue(value), null);
 }
 
-fn writeXmlDocument(self: anytype, writer: *std.Io.Writer, value: Value) !void {
+fn writeXmlDocument(
+    self: anytype,
+    writer: *std.Io.Writer,
+    value: Value,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
+) !void {
     try writer.writeAll("<?xml version='1.0' encoding='utf-8'?>\n<expr>\n");
-    try writeXmlValue(self, writer, value, 1);
+    try writeXmlValue(self, writer, value, 1, context);
     try writer.writeAll("</expr>\n");
 }
 
@@ -546,6 +556,7 @@ fn writeXmlValue(
     writer: *std.Io.Writer,
     value: Value,
     depth: usize,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) anyerror!void {
     const maybe_forced = try xmlVisibleValue(self, value);
     const forced = maybe_forced orelse {
@@ -570,14 +581,19 @@ fn writeXmlValue(
             try writer.writeAll("<string value=\"");
             try writeXmlEscaped(writer, self.intern.get(try stringTextInternId(self, forced)));
             try writer.writeAll("\" />\n");
+            if (context) |entries| {
+                for (try contextEntriesForValue(self, forced)) |entry| {
+                    try appendContextEntry(self, entries, entry.name, entry.value);
+                }
+            }
         },
         .path => {
             try writer.writeAll("<path value=\"");
             try writeXmlEscaped(writer, self.intern.get(forced.asInternId()));
             try writer.writeAll("\" />\n");
         },
-        .list => try writeXmlList(self, writer, forced.asObjectId(), depth),
-        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth),
+        .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context),
+        .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context),
         .closure, .builtin, .builtin_closure => try writer.writeAll("<function />\n"),
         .thunk, .cell => unreachable,
     }
@@ -603,9 +619,10 @@ fn writeXmlList(
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
     try writer.writeAll("<list>\n");
-    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1);
+    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1, context);
     try writeXmlIndent(writer, depth);
     try writer.writeAll("</list>\n");
 }
@@ -615,6 +632,7 @@ fn writeXmlAttrs(
     writer: *std.Io.Writer,
     id: ObjectId,
     depth: usize,
+    context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
     const sorted = try sortedAttrEntries(self, Value.attrs(id));
     defer self.allocator.free(sorted);
@@ -625,7 +643,7 @@ fn writeXmlAttrs(
         try writer.writeAll("<attr name=\"");
         try writeXmlEscaped(writer, self.intern.get(entry.name));
         try writer.writeAll("\">\n");
-        try writeXmlValue(self, writer, entry.value, depth + 2);
+        try writeXmlValue(self, writer, entry.value, depth + 2, context);
         try writeXmlIndent(writer, depth + 1);
         try writer.writeAll("</attr>\n");
     }
