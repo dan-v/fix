@@ -89,6 +89,11 @@ pub const Scheduler = struct {
     shutdown_flag: std.atomic.Value(bool),
     next_victim: std.atomic.Value(u32),
     started: std.atomic.Value(bool),
+    /// Total tasks currently pending across all helper queues. Used to
+    /// (a) skip submissions when the backlog already saturates helpers
+    /// and (b) skip futex_wake syscalls when at least one helper has
+    /// work to do and is therefore not parked.
+    pending_tasks: std.atomic.Value(u32),
 
     /// `total_worker_count` includes the main thread (worker 0). The
     /// scheduler manages `total_worker_count - 1` helpers.
@@ -120,6 +125,7 @@ pub const Scheduler = struct {
             .shutdown_flag = .init(false),
             .next_victim = .init(0),
             .started = .init(false),
+            .pending_tasks = .init(0),
         };
     }
 
@@ -175,12 +181,23 @@ pub const Scheduler = struct {
     /// Returns false if all helper queues are full or no helpers exist.
     pub fn submit(self: *Scheduler, task: Task) bool {
         if (self.helper_count == 0) return false;
+        // Bound queued work. Past this, the cost of pushing+waking exceeds
+        // any speculative win — the helpers can't drain the backlog fast
+        // enough, and the main thread just pays mutex/futex overhead.
+        const cap: u32 = @as(u32, self.helper_count) * 16;
+        if (self.pending_tasks.load(.monotonic) >= cap) return false;
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.helper_count);
         var i: u8 = 0;
         while (i < self.helper_count) : (i += 1) {
             const idx = (start_idx + i) % self.helper_count;
             if (self.queues[idx].push(task)) {
-                self.wakeHelper(idx);
+                // Wake only when the queue might have been idle.
+                // `fetchAdd` returns the previous count; if it was zero,
+                // helpers are likely parked and need a futex_wake. Past
+                // zero, at least one helper is already draining work and
+                // will pick up our task without a syscall.
+                const prev = self.pending_tasks.fetchAdd(1, .release);
+                if (prev == 0) self.wakeHelper(idx);
                 return true;
             }
         }
@@ -189,7 +206,9 @@ pub const Scheduler = struct {
 
     /// Helper-side: pop from own queue.
     pub fn pop(self: *Scheduler, helper_idx: u8) ?Task {
-        return self.queues[helper_idx].pop();
+        const task = self.queues[helper_idx].pop() orelse return null;
+        _ = self.pending_tasks.fetchSub(1, .monotonic);
+        return task;
     }
 
     /// Helper-side: try to steal from any other helper.
@@ -200,7 +219,10 @@ pub const Scheduler = struct {
         while (i < self.helper_count) : (i += 1) {
             const idx = (start_idx + i) % self.helper_count;
             if (idx == my_idx) continue;
-            if (self.queues[idx].steal()) |task| return task;
+            if (self.queues[idx].steal()) |task| {
+                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                return task;
+            }
         }
         return null;
     }

@@ -86,6 +86,11 @@ pub const WaitOutcome = union(enum) {
 /// futex on the `state` word — no per-waiter list, so threads that hit
 /// `.busy` and want to wait don't need to allocate or register anything.
 ///
+/// `parked` records whether any thread has registered to be woken on
+/// state change. Resolve/reset/blackhole only invoke futex_wake when
+/// `parked` is set; in the common case (no contention) the syscall is
+/// skipped entirely.
+///
 /// `demanded` distinguishes a thunk that was resolved because a real
 /// caller observed it from one that was only resolved by speculative
 /// pre-forcing. Lazy renderers (XML lazy mode) treat the latter as
@@ -93,6 +98,7 @@ pub const WaitOutcome = union(enum) {
 pub const Thunk = struct {
     state: std.atomic.Value(u32),
     claimer: std.atomic.Value(u8),
+    parked: std.atomic.Value(u8),
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
     result: Value,
@@ -101,6 +107,7 @@ pub const Thunk = struct {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
+            .parked = .init(0),
             .demanded = .init(0),
             .target = .{ .closure = closure },
             .result = Value.null_val,
@@ -111,6 +118,7 @@ pub const Thunk = struct {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
+            .parked = .init(0),
             .demanded = .init(0),
             .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
             .result = Value.null_val,
@@ -163,7 +171,28 @@ pub const Thunk = struct {
     /// the caller should do next. No allocation; uses futex on the state
     /// word directly.
     pub fn waitFor(self: *Thunk) WaitOutcome {
-        const evaluating_raw = @as(u32, @intFromEnum(ThunkState.evaluating));
+        // Spin briefly before parking. Most thunks evaluate in well under a
+        // microsecond — that's faster than a futex_wait round trip. Only
+        // park if the helper is genuinely slow.
+        const SPIN_BUDGET: u32 = 1024;
+        var spins: u32 = 0;
+        while (spins < SPIN_BUDGET) : (spins += 1) {
+            switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
+                .resolved => return .{ .resolved = self.result },
+                .blackhole => return .blackhole,
+                .unresolved => return .retry,
+                .evaluating => {},
+            }
+            std.atomic.spinLoopHint();
+        }
+
+        // Announce that we are about to park so resolve() will issue a
+        // futex_wake. The order matters: set the flag, then recheck state.
+        // If resolve fires between flag and recheck, recheck sees `.resolved`
+        // and we skip the syscall. If we set the flag and then park while
+        // state is still `.evaluating`, resolve will observe the flag and
+        // wake us.
+        self.parked.store(1, .release);
         switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
             .resolved => return .{ .resolved = self.result },
             .blackhole => return .blackhole,
@@ -171,6 +200,7 @@ pub const Thunk = struct {
             .evaluating => {},
         }
 
+        const evaluating_raw = @as(u32, @intFromEnum(ThunkState.evaluating));
         switch (builtin.os.tag) {
             .linux => {
                 _ = std.os.linux.futex_4arg(
@@ -180,10 +210,7 @@ pub const Thunk = struct {
                     null,
                 );
             },
-            else => {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
-            },
+            else => std.Thread.yield() catch {},
         }
 
         return switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
@@ -219,6 +246,10 @@ pub const Thunk = struct {
     }
 
     fn wakeAll(self: *Thunk) void {
+        // Fast path: nobody has registered to be woken. Skip the futex
+        // syscall entirely. The most common case (uncontended thunks
+        // resolved by the worker that claimed them) hits this branch.
+        if (self.parked.load(.acquire) == 0) return;
         switch (builtin.os.tag) {
             .linux => {
                 _ = std.os.linux.futex_3arg(
