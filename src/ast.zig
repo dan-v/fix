@@ -67,6 +67,7 @@ pub const UnaryOp = enum(u8) {
 pub const Node = struct {
     tag: NodeTag,
     data: Data,
+    span: ?Atom,
 
     pub const Data = union {
         // Atoms store byte offsets into source.
@@ -229,7 +230,7 @@ pub const AstArena = struct {
 
     pub fn createNode(self: *AstArena, tag: NodeTag, data: Node.Data) !*Node {
         const node = try self.allocator().create(Node);
-        node.* = .{ .tag = tag, .data = data };
+        node.* = .{ .tag = tag, .data = data, .span = nodeSourceSpan(tag, data) };
         return node;
     }
 
@@ -237,6 +238,114 @@ pub const AstArena = struct {
         return self.allocator().alloc(T, len);
     }
 };
+
+fn nodeSourceSpan(tag: NodeTag, data: Node.Data) ?Node.Atom {
+    return switch (tag) {
+        .integer,
+        .float_val,
+        .string,
+        .path,
+        .search_path,
+        .identifier,
+        .bool_true,
+        .bool_false,
+        .null,
+        => data.atom,
+
+        .unary_op => data.unary.expr.span,
+        .binary_op => combineAtoms(data.binary.left.span, data.binary.right.span),
+        .apply => combineAtoms(data.apply.func.span, data.apply.arg.span),
+        .lambda => combineAtoms(
+            .{ .offset = data.lambda.param_offset, .len = data.lambda.param_len },
+            data.lambda.body.span,
+        ),
+        .lambda_attrs => lambdaAttrsSourceSpan(data.lambda_attrs),
+        .let_in => letSourceSpan(data.let_in),
+        .if_else => combineAtoms(data.if_else.cond.span, combineAtoms(data.if_else.then_branch.span, data.if_else.else_branch.span)),
+        .assert => combineAtoms(data.assert.cond.span, data.assert.body.span),
+        .with_expr => combineAtoms(data.with_expr.attr_set.span, data.with_expr.body.span),
+        .attr_set => attrSetSourceSpan(data.attr_set),
+        .attr_path => attrPathSourceSpan(data.attr_path),
+        .attr_dynamic => combineAtoms(data.attr_dynamic.root.span, data.attr_dynamic.name.span),
+        .attr_or => combineAtoms(data.attr_or.attr_path.span, data.attr_or.default.span),
+        .has_attr => hasAttrSourceSpan(data.has_attr),
+        .has_attr_dynamic => combineAtoms(data.has_attr_dynamic.root.span, data.has_attr_dynamic.name.span),
+        .has_attr_mixed => hasAttrMixedSourceSpan(data.has_attr_mixed),
+        .list => listSourceSpan(data.list),
+        .parens => data.parens.span,
+    };
+}
+
+fn combineAtoms(left: ?Node.Atom, right: ?Node.Atom) ?Node.Atom {
+    if (left == null) return right;
+    if (right == null) return left;
+
+    const a = left.?;
+    const b = right.?;
+    const start = @min(a.offset, b.offset);
+    const end = @max(a.offset + a.len, b.offset + b.len);
+    return .{ .offset = start, .len = end - start };
+}
+
+fn lambdaAttrsSourceSpan(lambda: Node.LambdaAttrs) ?Node.Atom {
+    var span = lambda.body.span;
+    if (lambda.bind_name) |bind_name| span = combineAtoms(span, bind_name);
+    for (lambda.params) |param| {
+        span = combineAtoms(span, param.name);
+        if (param.default) |default| span = combineAtoms(span, default.span);
+    }
+    return span;
+}
+
+fn letSourceSpan(let_in: Node.LetIn) ?Node.Atom {
+    var span = let_in.body.span;
+    for (let_in.bindings) |binding| {
+        span = combineAtoms(span, .{ .offset = binding.name_offset, .len = binding.name_len });
+        for (binding.path) |segment| span = combineAtoms(span, segment);
+        span = combineAtoms(span, binding.expr.span);
+    }
+    return span;
+}
+
+fn attrSetSourceSpan(attr_set: Node.AttrSet) ?Node.Atom {
+    var span: ?Node.Atom = null;
+    for (attr_set.entries) |entry| {
+        for (entry.path) |segment| span = combineAtoms(span, segment);
+        if (entry.dynamic_name) |dynamic_name| span = combineAtoms(span, dynamic_name.span);
+        if (entry.tail_dynamic_name) |dynamic_name| span = combineAtoms(span, dynamic_name.span);
+        span = combineAtoms(span, entry.expr.span);
+    }
+    return span;
+}
+
+fn attrPathSourceSpan(attr_path: Node.AttrPath) ?Node.Atom {
+    var span = attr_path.root.span;
+    for (attr_path.segments) |segment| span = combineAtoms(span, segment);
+    return span;
+}
+
+fn hasAttrSourceSpan(has_attr: Node.HasAttr) ?Node.Atom {
+    var span = has_attr.root.span;
+    for (has_attr.segments) |segment| span = combineAtoms(span, segment);
+    return span;
+}
+
+fn hasAttrMixedSourceSpan(has_attr: Node.HasAttrMixed) ?Node.Atom {
+    var span = has_attr.root.span;
+    for (has_attr.segments) |segment| {
+        span = switch (segment) {
+            .static => |atom| combineAtoms(span, atom),
+            .dynamic => |node| combineAtoms(span, node.span),
+        };
+    }
+    return span;
+}
+
+fn listSourceSpan(list: Node.List) ?Node.Atom {
+    var span: ?Node.Atom = null;
+    for (list.items) |item| span = combineAtoms(span, item.span);
+    return span;
+}
 
 pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
     return switch (node.tag) {
