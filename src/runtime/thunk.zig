@@ -174,7 +174,7 @@ pub const Thunk = struct {
         // Spin briefly before parking. Most thunks evaluate in well under a
         // microsecond — that's faster than a futex_wait round trip. Only
         // park if the helper is genuinely slow.
-        const SPIN_BUDGET: u32 = 1024;
+        const SPIN_BUDGET: u32 = 128;
         var spins: u32 = 0;
         while (spins < SPIN_BUDGET) : (spins += 1) {
             switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
