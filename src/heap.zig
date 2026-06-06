@@ -444,6 +444,12 @@ pub const ObjectHeap = struct {
         return self.add(.{ .thunk = thunk });
     }
 
+    pub fn addBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
+        const range = try self.appendValues(upvalues);
+        errdefer self.rollbackValues(range);
+        return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.valueSlice(range)) });
+    }
+
     pub fn addCell(self: *ObjectHeap, cell: Cell) !ObjectId {
         return self.add(.{ .cell = cell });
     }

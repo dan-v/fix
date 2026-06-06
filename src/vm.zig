@@ -23,7 +23,9 @@ const chunk = @import("chunk.zig");
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
 const InternTable = @import("intern.zig").InternTable;
-const Thunk = @import("thunk.zig").Thunk;
+const thunk_mod = @import("thunk.zig");
+const Thunk = thunk_mod.Thunk;
+const ThunkTarget = thunk_mod.ThunkTarget;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const heap_mod = @import("heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
@@ -53,8 +55,8 @@ pub const Frame = struct {
     frame_base: u32,
     /// Number of locals in this frame (for cleanup).
     local_count: u32,
-    /// Closure currently executing, used for captured upvalue loads.
-    closure_id: ?ObjectId,
+    /// Upvalues for the closure or direct thunk currently executing.
+    upvalues: ?[]const Value,
 };
 
 pub const ImportHost = struct {
@@ -237,7 +239,7 @@ pub const VM = struct {
 
     // ---- frame management ----
 
-    fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) !void {
+    fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) !void {
         if (self.frames.items.len >= types.MAX_FRAMES) return error.FrameOverflow;
         if (arg_count > ch.local_count) return error.InvalidCallFrame;
         const frame_base = self.sp - arg_count;
@@ -261,7 +263,7 @@ pub const VM = struct {
             .ip = 0,
             .frame_base = frame_base,
             .local_count = ch.local_count,
-            .closure_id = closure_id,
+            .upvalues = upvalues,
         };
     }
 
@@ -360,9 +362,8 @@ pub const VM = struct {
                 .capture_upvalue => {
                     const slot = readU16(code, frame.ip);
                     frame.ip += 2;
-                    const closure_id = frame.closure_id orelse return error.MissingClosure;
-                    const closure = try self.getClosureById(closure_id);
-                    try self.push(closure.upvalues[slot]);
+                    const upvalues = frame.upvalues orelse return error.MissingClosure;
+                    try self.push(upvalues[slot]);
                 },
 
                 .set_local => {
@@ -398,9 +399,8 @@ pub const VM = struct {
                 .get_upvalue => {
                     const slot = readU16(code, frame.ip);
                     frame.ip += 2;
-                    const closure_id = frame.closure_id orelse return error.MissingClosure;
-                    const closure = try self.getClosureById(closure_id);
-                    const val = try self.forceValue(closure.upvalues[slot]);
+                    const upvalues = frame.upvalues orelse return error.MissingClosure;
+                    const val = try self.forceValue(upvalues[slot]);
                     try self.push(val);
                 },
 
@@ -618,6 +618,28 @@ pub const VM = struct {
                     const descriptors = code[frame.ip .. frame.ip + descriptor_len];
                     frame.ip += descriptor_len;
                     try self.makeClosureFromCaptures(ch_id, descriptors, frame);
+                },
+                .thunk_captures => {
+                    const ch_id: u16 = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const descriptor_len = @as(usize, upvalue_count) * 3;
+                    if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
+                    const descriptors = code[frame.ip .. frame.ip + descriptor_len];
+                    frame.ip += descriptor_len;
+                    try self.makeBytecodeThunkFromCaptures(ch_id, descriptors, frame);
+                },
+                .thunk_captures_long => {
+                    const ch_id: ChunkId = readU32(code, frame.ip);
+                    frame.ip += 4;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const descriptor_len = @as(usize, upvalue_count) * 3;
+                    if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
+                    const descriptors = code[frame.ip .. frame.ip + descriptor_len];
+                    frame.ip += descriptor_len;
+                    try self.makeBytecodeThunkFromCaptures(ch_id, descriptors, frame);
                 },
 
                 // ---- calls ----
@@ -1136,15 +1158,15 @@ pub const VM = struct {
 
     fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
         const thunk_id = thunk_val.asObjectId();
-        var closure: Value = undefined;
+        var target: ThunkTarget = undefined;
         const claimed = try self.heap.getThunk(thunk_id);
         switch (claimed.tryClaim()) {
             .already_resolved => return claimed.result,
-            .claimed => closure = claimed.closure,
+            .claimed => target = claimed.target,
             .busy => return error.RecursiveThunk,
         }
 
-        const result = self.evalThunkClosure(closure) catch |err| {
+        const result = self.evalThunkTarget(target) catch |err| {
             const failed = try self.heap.getThunk(thunk_id);
             failed.reset();
             return err;
@@ -1154,13 +1176,23 @@ pub const VM = struct {
         return result;
     }
 
+    fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
+        return switch (target) {
+            .closure => |closure| self.evalThunkClosure(closure),
+            .bytecode => |bytecode| blk: {
+                const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
+                break :blk self.runIsolatedFrame(ch, 0, bytecode.upvalues);
+            },
+        };
+    }
+
     fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
         switch (closure_val.discriminant) {
             .closure => {
                 const closure_id = closure_val.asObjectId();
                 const closure = try self.getClosureById(closure_id);
                 const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-                return self.runIsolatedFrame(ch, 0, closure_id);
+                return self.runIsolatedFrame(ch, 0, closure.upvalues);
             },
             .builtin_closure => {
                 const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());
@@ -1532,12 +1564,12 @@ pub const VM = struct {
         try self.push(Value.closure(id));
     }
 
-    fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+    fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const Frame) !u16 {
         const upvalue_count = descriptors.len / 3;
         const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
         if (upvalue_count > @as(usize, stack_cap - self.sp)) return error.StackOverflow;
 
-        var current_closure: ?Closure = null;
+        var current_upvalues: ?[]const Value = null;
         var out_index = self.sp;
         var i: usize = 0;
         while (i < descriptors.len) : (i += 3) {
@@ -1545,11 +1577,10 @@ pub const VM = struct {
             const captured = switch (descriptors[i]) {
                 0 => self.stack.items[frame.frame_base + capture_index],
                 1 => value: {
-                    if (current_closure == null) {
-                        const closure_id = frame.closure_id orelse return error.MissingClosure;
-                        current_closure = try self.getClosureById(closure_id);
+                    if (current_upvalues == null) {
+                        current_upvalues = frame.upvalues orelse return error.MissingClosure;
                     }
-                    break :value current_closure.?.upvalues[capture_index];
+                    break :value current_upvalues.?[capture_index];
                 },
                 else => return error.InvalidBytecode,
             };
@@ -1558,7 +1589,23 @@ pub const VM = struct {
         }
 
         self.sp = out_index;
-        try self.makeClosure(chunk_id, @intCast(upvalue_count));
+        return @intCast(upvalue_count);
+    }
+
+    fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+        const upvalue_count = try self.stageCaptureDescriptors(descriptors, frame);
+        try self.makeClosure(chunk_id, upvalue_count);
+    }
+
+    fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+        const start = self.sp;
+        _ = try self.stageCaptureDescriptors(descriptors, frame);
+        const id = self.heap.addBytecodeThunk(chunk_id, self.stack.items[start..self.sp]) catch |err| {
+            self.sp = start;
+            return err;
+        };
+        self.sp = start;
+        try self.push(Value.thunk(id));
     }
 
     // ---- calls ----
@@ -1569,7 +1616,7 @@ pub const VM = struct {
             const closure = try self.getClosureById(closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             try self.push(arg); // arg is first local
-            try self.pushFrame(ch, 1, closure_id);
+            try self.pushFrame(ch, 1, closure.upvalues);
         } else if (callee.discriminant == .builtin) {
             try self.push(try self.applyBuiltin(callee.asBuiltinId(), &.{arg}));
         } else if (callee.discriminant == .builtin_closure) {
@@ -1588,7 +1635,7 @@ pub const VM = struct {
                     const closure_id = current.asObjectId();
                     const closure = try self.getClosureById(closure_id);
                     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-                    try self.replaceCurrentFrame(ch, arg, closure_id);
+                    try self.replaceCurrentFrame(ch, arg, closure.upvalues);
                     return;
                 },
                 .builtin => {
@@ -1605,7 +1652,7 @@ pub const VM = struct {
         }
     }
 
-    fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, closure_id: ObjectId) !void {
+    fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []const Value) !void {
         if (ch.local_count == 0) return error.InvalidCallFrame;
 
         const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
@@ -1628,7 +1675,7 @@ pub const VM = struct {
             .ip = 0,
             .frame_base = frame_base,
             .local_count = ch.local_count,
-            .closure_id = closure_id,
+            .upvalues = upvalues,
         };
     }
 
@@ -1638,7 +1685,7 @@ pub const VM = struct {
             const closure = try self.getClosureById(closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
             try self.push(arg);
-            return self.runIsolatedFrame(ch, 1, closure_id);
+            return self.runIsolatedFrame(ch, 1, closure.upvalues);
         }
         if (callee.discriminant == .builtin) {
             return self.applyBuiltin(callee.asBuiltinId(), &.{arg});
@@ -1653,10 +1700,10 @@ pub const VM = struct {
         return self.notCallableError(callee);
     }
 
-    fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, closure_id: ?ObjectId) anyerror!Value {
+    fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
         const stop_depth = self.frames.items.len;
         const base_sp = self.sp - arg_count;
-        self.pushFrame(ch, arg_count, closure_id) catch |err| {
+        self.pushFrame(ch, arg_count, upvalues) catch |err| {
             self.sp = base_sp;
             return err;
         };

@@ -330,7 +330,23 @@ pub const Compiler = struct {
             try self.builder.writeU32(self.allocator, chunk_id);
         }
         try self.builder.writeU16(self.allocator, upvalue_count);
+        try self.emitCaptureDescriptors(captures);
+    }
 
+    fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+        const upvalue_count = try captureCount(captures.len);
+
+        if (chunk_id <= std.math.maxInt(u16)) {
+            try self.emitOpU16(.thunk_captures, @intCast(chunk_id));
+        } else {
+            try self.emitOp(.thunk_captures_long);
+            try self.builder.writeU32(self.allocator, chunk_id);
+        }
+        try self.builder.writeU16(self.allocator, upvalue_count);
+        try self.emitCaptureDescriptors(captures);
+    }
+
+    fn emitCaptureDescriptors(self: *Compiler, captures: []const Capture) !void {
         for (captures) |capture| {
             try self.builder.writeByte(self.allocator, switch (capture.kind) {
                 .local => 0,
@@ -823,8 +839,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitClosureWithCaptures(child_id, child.captures.items);
-        try self.emitOp(.make_thunk);
+        try self.emitThunkWithCaptures(child_id, child.captures.items);
     }
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
@@ -985,8 +1000,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitClosureWithCaptures(child_id, child.captures.items);
-        try self.emitOp(.make_thunk);
+        try self.emitThunkWithCaptures(child_id, child.captures.items);
     }
 
     fn compileStringAtomThunk(self: *Compiler, atom: Node.Atom) !void {
@@ -1268,8 +1282,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitClosureWithCaptures(child_id, child.captures.items);
-        try self.emitOp(.make_thunk);
+        try self.emitThunkWithCaptures(child_id, child.captures.items);
     }
 
     fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
@@ -1569,8 +1582,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitClosureWithCaptures(child_id, child.captures.items);
-        try self.emitOp(.make_thunk);
+        try self.emitThunkWithCaptures(child_id, child.captures.items);
     }
 
     fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {

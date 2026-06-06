@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ForceResult = types.ForceResult;
+const ChunkId = types.ChunkId;
 
 pub const ThunkState = enum(u8) {
     unresolved = 0,
@@ -27,19 +28,37 @@ pub const Cell = struct {
     value: Value,
 };
 
+pub const BytecodeThunk = struct {
+    chunk_id: ChunkId,
+    upvalues: []const Value,
+};
+
+pub const ThunkTarget = union(enum) {
+    closure: Value,
+    bytecode: BytecodeThunk,
+};
+
 /// A thunk is heap-allocated and shared across threads via atomic operations.
 pub const Thunk = struct {
     /// Atomic state.
     state: std.atomic.Value(u8),
-    /// Zero-argument closure to execute when forcing.
-    closure: Value,
+    /// Suspended computation to execute when forcing.
+    target: ThunkTarget,
     /// The resolved value (valid when state == .resolved).
     result: Value,
 
     pub fn init(closure: Value) Thunk {
         return .{
             .state = std.atomic.Value(u8).init(@intFromEnum(ThunkState.unresolved)),
-            .closure = closure,
+            .target = .{ .closure = closure },
+            .result = Value.null_val,
+        };
+    }
+
+    pub fn initBytecode(chunk_id: ChunkId, upvalues: []const Value) Thunk {
+        return .{
+            .state = std.atomic.Value(u8).init(@intFromEnum(ThunkState.unresolved)),
+            .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
             .result = Value.null_val,
         };
     }

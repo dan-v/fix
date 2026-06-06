@@ -116,6 +116,12 @@ pub const OpCode = enum(u8) {
     /// Wide-chunk-id form of closure_captures.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
     closure_captures_long,
+    /// Create a thunk directly from a chunk and inline capture descriptors.
+    /// Operand: 2-byte ChunkId, 2-byte count, then repeated descriptors.
+    thunk_captures,
+    /// Wide-chunk-id form of thunk_captures.
+    /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
+    thunk_captures_long,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
