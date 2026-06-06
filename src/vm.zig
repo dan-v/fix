@@ -872,7 +872,7 @@ pub const VM = struct {
         }
 
         if (isStringComparable(va) and isStringComparable(vb)) {
-            return (try self.stringTextInternId(va)) == (try self.stringTextInternId(vb));
+            return self.stringTextInternIdsEqual(va, vb);
         }
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
@@ -1249,6 +1249,13 @@ pub const VM = struct {
         };
     }
 
+    fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
+        if (left.discriminant != .string_context and right.discriminant != .string_context) {
+            return left.asInternId() == right.asInternId();
+        }
+        return (try self.stringTextInternId(left)) == (try self.stringTextInternId(right));
+    }
+
     fn isPlainString(value: Value) bool {
         return value.discriminant == .string or value.discriminant == .string_context;
     }
@@ -1449,7 +1456,7 @@ pub const VM = struct {
         if (!isPlainString(value)) return error.TypeError;
         const text = try self.stringTextInternId(value);
         for (outputs.items) |existing| {
-            if (try self.stringTextInternId(existing) == text) return;
+            if (existing.asInternId() == text) return;
         }
         try outputs.append(self.allocator, Value.string(text));
     }
