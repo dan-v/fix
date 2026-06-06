@@ -254,7 +254,7 @@ pub const Compiler = struct {
         }
 
         try self.emitOpU16(.build_attrs_with_pos, count);
-        try self.builder.writeU16(self.allocator, @intCast(positions.len));
+        try self.builder.writeU16(self.allocator, try u16Count(positions.len));
         for (positions) |position| {
             try self.builder.writeU32(self.allocator, position.name);
             try self.builder.writeU32(self.allocator, position.pos.file);
@@ -360,14 +360,20 @@ pub const Compiler = struct {
 
     fn compileInt(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-        const val = std.fmt.parseInt(i64, span, 10) catch 0;
+        const val = std.fmt.parseInt(i64, span, 10) catch {
+            try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "invalid integer literal");
+            return error.InvalidNumber;
+        };
         const v = @import("value.zig").Value.int(val);
         try self.builder.emitConstant(self.allocator, v);
     }
 
     fn compileFloat(self: *Compiler, node: *const Node) !void {
         const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-        const val = std.fmt.parseFloat(f64, span) catch 0.0;
+        const val = std.fmt.parseFloat(f64, span) catch {
+            try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "invalid float literal");
+            return error.InvalidNumber;
+        };
         const v = @import("value.zig").Value.float(val);
         try self.builder.emitConstant(self.allocator, v);
     }
@@ -422,7 +428,10 @@ pub const Compiler = struct {
 
         var parser = @import("parser.zig").Parser.init(self.allocator, &arena, expr_source);
         defer parser.deinit();
-        const expr = try parser.parse();
+        const expr = parser.parse() catch |err| {
+            try self.absorbParserDiagnostics(parser.diagnostics.items, source_offset);
+            return err;
+        };
         offsetNode(expr, source_offset);
         try self.compileNode(expr);
     }
@@ -763,7 +772,8 @@ pub const Compiler = struct {
         try child.emitGetLocal(arg_slot);
         try child.emitOp(if (wide_params) .validate_attrs_long else .validate_attrs);
         try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
-        try child.builder.writeU16(child.allocator, @intCast(lambda.params.len));
+        const param_count = try self.requireU16At(lambda.params.len, diagnosticAtom(node), "too many function parameters");
+        try child.builder.writeU16(child.allocator, param_count);
         var function_args: std.ArrayListUnmanaged(@import("heap.zig").AttrEntry) = .empty;
         defer function_args.deinit(self.allocator);
         try function_args.ensureTotalCapacity(self.allocator, lambda.params.len);
@@ -965,6 +975,37 @@ pub const Compiler = struct {
             .token_type = null,
             .message = message,
         });
+    }
+
+    fn absorbParserDiagnostics(self: *Compiler, diagnostics: []const Diagnostic, source_offset: u32) !void {
+        try self.diagnostics.ensureUnusedCapacity(self.allocator, diagnostics.len);
+        for (diagnostics) |diag| {
+            const offset = source_offset + diag.offset;
+            const position = try self.sourcePositionForOffset(offset);
+            var copy = diag;
+            copy.offset = offset;
+            copy.line = position.line;
+            copy.column = position.column;
+            copy.source = null;
+            copy.source_path = null;
+            self.diagnostics.appendAssumeCapacity(copy);
+        }
+    }
+
+    fn requireU16At(self: *Compiler, count: usize, atom: Node.Atom, message: []const u8) !u16 {
+        if (count > std.math.maxInt(u16)) {
+            try self.reportCompileError(atom.offset, atom.len, message);
+            return error.BytecodeOperandTooLarge;
+        }
+        return @intCast(count);
+    }
+
+    fn requireU8At(self: *Compiler, count: usize, atom: Node.Atom, message: []const u8) !u8 {
+        if (count > std.math.maxInt(u8)) {
+            try self.reportCompileError(atom.offset, atom.len, message);
+            return error.BytecodeOperandTooLarge;
+        }
+        return @intCast(count);
     }
 
     fn absorbChildDiagnostics(self: *Compiler, child: *Compiler) !void {
@@ -1399,7 +1440,8 @@ pub const Compiler = struct {
             try self.compilePlainAttrGroup(&positions, group);
         }
 
-        try self.emitBuildAttrs(@intCast(grouped.groups.len), positions.items);
+        const count = try self.requireU16At(grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
+        try self.emitBuildAttrs(count, positions.items);
     }
 
     fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
@@ -1501,7 +1543,8 @@ pub const Compiler = struct {
             try self.appendAttrPosition(&positions, group.first, group.name_id);
         }
 
-        try self.emitBuildAttrs(@intCast(groups.len), positions.items);
+        const count = try self.requireU16At(groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
+        try self.emitBuildAttrs(count, positions.items);
     }
 
     fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {
@@ -1757,7 +1800,7 @@ pub const Compiler = struct {
                     if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
                 }
                 try self.emitOp(if (wide) .get_attr_path_dynamic_or_long else .get_attr_path_dynamic_or);
-                try self.builder.writeByte(self.allocator, @intCast(root_path.segments.len));
+                try self.builder.writeByte(self.allocator, try self.requireU8At(root_path.segments.len, attrPathDiagnosticAtom(root_path), "attribute path has too many segments"));
                 for (root_path.segments) |seg| {
                     const name_id = try self.attrSegmentNameId(seg);
                     try self.writeInternId(name_id, wide);
@@ -1783,8 +1826,8 @@ pub const Compiler = struct {
             }
             try self.compileThunk(attr_or.default);
             try self.emitOp(.get_attr_path_mixed_or);
-            try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
-            try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+            try self.builder.writeByte(self.allocator, try self.requireU8At(apath.segments.len, attrPathDiagnosticAtom(apath), "attribute path has too many segments"));
+            try self.builder.writeByte(self.allocator, try self.requireU8At(dynamic_count, attrPathDiagnosticAtom(apath), "attribute path has too many dynamic segments"));
             for (apath.segments) |seg| {
                 if (self.attrSegmentHasInterpolation(seg)) {
                     try self.builder.writeByte(self.allocator, 1);
@@ -1803,7 +1846,7 @@ pub const Compiler = struct {
             if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
         }
         try self.emitOp(if (wide) .get_attr_path_or_long else .get_attr_path_or);
-        try self.builder.writeByte(self.allocator, @intCast(apath.segments.len));
+        try self.builder.writeByte(self.allocator, try self.requireU8At(apath.segments.len, attrPathDiagnosticAtom(apath), "attribute path has too many segments"));
         for (apath.segments) |seg| {
             const name_id = try self.attrSegmentNameId(seg);
             try self.writeInternId(name_id, wide);
@@ -1829,8 +1872,8 @@ pub const Compiler = struct {
                 }
             }
             try self.emitOp(.has_attr_path_mixed);
-            try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
-            try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+            try self.builder.writeByte(self.allocator, try self.requireU8At(has_attr.segments.len, hasAttrDiagnosticAtom(has_attr), "attribute path has too many segments"));
+            try self.builder.writeByte(self.allocator, try self.requireU8At(dynamic_count, hasAttrDiagnosticAtom(has_attr), "attribute path has too many dynamic segments"));
             for (has_attr.segments) |seg| {
                 if (self.attrSegmentHasInterpolation(seg)) {
                     try self.builder.writeByte(self.allocator, 1);
@@ -1847,7 +1890,7 @@ pub const Compiler = struct {
             if (try self.attrSegmentNameId(seg) > std.math.maxInt(u16)) wide = true;
         }
         try self.emitOp(if (wide) .has_attr_path_long else .has_attr_path);
-        try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
+        try self.builder.writeByte(self.allocator, try self.requireU8At(has_attr.segments.len, hasAttrDiagnosticAtom(has_attr), "attribute path has too many segments"));
         for (has_attr.segments) |seg| {
             const name_id = try self.attrSegmentNameId(seg);
             try self.writeInternId(name_id, wide);
@@ -1881,8 +1924,8 @@ pub const Compiler = struct {
         }
 
         try self.emitOp(.has_attr_path_mixed);
-        try self.builder.writeByte(self.allocator, @intCast(has_attr.segments.len));
-        try self.builder.writeByte(self.allocator, @intCast(dynamic_count));
+        try self.builder.writeByte(self.allocator, try self.requireU8At(has_attr.segments.len, hasAttrMixedDiagnosticAtom(has_attr), "attribute path has too many segments"));
+        try self.builder.writeByte(self.allocator, try self.requireU8At(dynamic_count, hasAttrMixedDiagnosticAtom(has_attr), "attribute path has too many dynamic segments"));
         for (has_attr.segments) |segment| {
             switch (segment) {
                 .static => |atom| {
@@ -1910,7 +1953,7 @@ pub const Compiler = struct {
         for (list.items) |item| {
             try self.compileContainerValue(item, .{ .raw_identifier = true });
         }
-        try self.emitOpU16(.build_list, @intCast(list.items.len));
+        try self.emitOpU16(.build_list, try self.requireU16At(list.items.len, diagnosticAtom(node), "too many list items"));
     }
 
     fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {
@@ -2084,6 +2127,7 @@ pub const Compiler = struct {
     }
 
     fn declareLocal(self: *Compiler, name: []const u8, name_id: InternId) !u16 {
+        if (self.slot_count == std.math.maxInt(u16)) return error.TooManyLocals;
         const slot = self.slot_count;
         self.slot_count += 1;
         errdefer self.slot_count -= 1;
@@ -2169,6 +2213,44 @@ pub const Compiler = struct {
 fn captureCount(count: usize) !u16 {
     if (count > std.math.maxInt(u16)) return error.TooManyCaptures;
     return @intCast(count);
+}
+
+fn u16Count(count: usize) !u16 {
+    if (count > std.math.maxInt(u16)) return error.BytecodeOperandTooLarge;
+    return @intCast(count);
+}
+
+fn diagnosticAtom(node: *const Node) Node.Atom {
+    return node.span orelse .{ .offset = 0, .len = 1 };
+}
+
+fn attrEntriesDiagnosticAtom(entries: []const AttrEntryView) Node.Atom {
+    if (entries.len == 0) return .{ .offset = 0, .len = 1 };
+    if (entries[0].path.len == 0) return diagnosticAtom(entries[0].expr);
+    return entries[0].path[0];
+}
+
+fn attrGroupsDiagnosticAtom(groups: []const AttrEntryGroup) Node.Atom {
+    if (groups.len == 0) return .{ .offset = 0, .len = 1 };
+    return groups[0].first;
+}
+
+fn attrPathDiagnosticAtom(path: Node.AttrPath) Node.Atom {
+    if (path.segments.len == 0) return diagnosticAtom(path.root);
+    return path.segments[0];
+}
+
+fn hasAttrDiagnosticAtom(path: Node.HasAttr) Node.Atom {
+    if (path.segments.len == 0) return diagnosticAtom(path.root);
+    return path.segments[0];
+}
+
+fn hasAttrMixedDiagnosticAtom(path: Node.HasAttrMixed) Node.Atom {
+    if (path.segments.len == 0) return diagnosticAtom(path.root);
+    return switch (path.segments[0]) {
+        .static => |atom| atom,
+        .dynamic => |node| diagnosticAtom(node),
+    };
 }
 
 fn nodeMayEvaluateToFloat(node: *const Node) bool {

@@ -536,6 +536,9 @@ pub const Evaluator = struct {
         return switch (err) {
             error.DuplicateAttribute,
             error.DuplicateBinding,
+            error.BytecodeOperandTooLarge,
+            error.InvalidNumber,
+            error.ParseError,
             error.UndefinedVariable,
             => true,
             else => false,
@@ -3053,6 +3056,31 @@ test "evaluate exposes undefined variable diagnostics" {
     try std.testing.expectEqualStrings("undefined variable 'x'", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 8), diagnostics[0].offset);
     try std.testing.expectEqual(@as(u32, 9), diagnostics[0].column);
+}
+
+test "evaluate exposes invalid numeric literal diagnostics" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.InvalidNumber, ev.evaluate("9223372036854775808"));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("invalid integer literal", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 0), diagnostics[0].offset);
+}
+
+test "evaluate exposes interpolation parse diagnostics" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(error.ParseError, ev.evaluate("\"${$}\""));
+    const diagnostics = ev.getDiagnostics();
+    try std.testing.expect(diagnostics.len >= 1);
+    try std.testing.expectEqual(Diagnostic.Kind.parse, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("Invalid token.", diagnostics[0].message);
+    try std.testing.expectEqual(@as(u32, 3), diagnostics[0].offset);
+    try std.testing.expectEqual(@as(u32, 4), diagnostics[0].column);
 }
 
 test "evaluate records runtime error message and expression trace" {

@@ -100,6 +100,7 @@ pub const ChunkBuilder = struct {
 
     /// Add a constant to the pool and return its index.
     pub fn addConstant(self: *ChunkBuilder, allocator: std.mem.Allocator, val: Value) !ConstIdx {
+        if (self.constants.items.len > std.math.maxInt(ConstIdx)) return error.TooManyConstants;
         try self.constants.append(allocator, val);
         return @intCast(self.constants.items.len - 1);
     }
