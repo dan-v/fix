@@ -1099,23 +1099,20 @@ pub const VM = struct {
 
     pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
         return switch (value.discriminant) {
-            .thunk, .cell => try self.forceLazyValue(value),
+            .thunk => try self.forceThunkFallible(value),
+            .cell => try self.forceCellValue(value),
             else => value,
         };
     }
 
-    noinline fn forceLazyValue(self: *VM, value: Value) anyerror!Value {
-        return switch (value.discriminant) {
-            .thunk => try self.forceThunkFallible(value),
-            .cell => {
-                const cell_id = value.asObjectId();
-                const raw = try self.heap.getCellValue(cell_id);
-                const forced = try self.forceValue(raw);
-                try self.heap.setCellValue(cell_id, forced);
-                return forced;
-            },
-            else => unreachable,
-        };
+    fn forceCellValue(self: *VM, value: Value) anyerror!Value {
+        const cell_id = value.asObjectId();
+        const raw = try self.heap.getCellValue(cell_id);
+        const forced = try self.forceValue(raw);
+        if (raw.discriminant == .thunk or raw.discriminant == .cell) {
+            try self.heap.setCellValue(cell_id, forced);
+        }
+        return forced;
     }
 
     pub fn forceDeep(self: *VM, value: Value) !void {
