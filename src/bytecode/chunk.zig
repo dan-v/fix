@@ -4,17 +4,17 @@
 //! in a global table, enabling cheap interning and cross-thread referencing.
 
 const std = @import("std");
-const types = @import("types.zig");
-const bytecode = @import("bytecode.zig");
+const types = @import("../types.zig");
+const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
-const Value = @import("value.zig").Value;
-const AttrEntry = @import("heap.zig").AttrEntry;
+const Value = @import("../value.zig").Value;
+const AttrEntry = @import("../heap.zig").AttrEntry;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
 pub const Chunk = struct {
     pub const SourceSpan = struct {
-        file: ?@import("types.zig").InternId,
+        file: ?@import("../types.zig").InternId,
         offset: u32,
         len: u32,
         line: u32,
@@ -87,12 +87,12 @@ pub const ChunkBuilder = struct {
 
     /// Write a two-byte operand (little-endian).
     pub fn writeU16(self: *ChunkBuilder, allocator: std.mem.Allocator, val: u16) !void {
-        try bytecode.writeU16(&self.code, allocator, val);
+        try encoding.writeU16(&self.code, allocator, val);
     }
 
     /// Write a four-byte operand (little-endian).
     pub fn writeU32(self: *ChunkBuilder, allocator: std.mem.Allocator, val: u32) !void {
-        try bytecode.writeU32(&self.code, allocator, val);
+        try encoding.writeU32(&self.code, allocator, val);
     }
 
     /// Add a constant to the pool and return its index.

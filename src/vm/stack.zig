@@ -2,7 +2,7 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
-const chunk = @import("../chunk.zig");
+const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 
 const VM = vm_mod.VM;

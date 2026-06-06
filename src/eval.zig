@@ -5,10 +5,11 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const opcode = @import("opcode.zig");
+const bytecode = @import("bytecode.zig");
+const opcode = bytecode.opcode;
 const InternTable = @import("intern.zig").InternTable;
-const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
-const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
+const ChunkRegistry = bytecode.ChunkRegistry;
+const ChunkBuilder = bytecode.ChunkBuilder;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
