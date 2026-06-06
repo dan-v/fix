@@ -31,8 +31,12 @@ pub const InternTable = struct {
     lookup: std.HashMapUnmanaged(u64, InternId, LookupCtx, std.hash_map.default_max_load_percentage),
 
     const LookupCtx = struct {
-        pub fn hash(_: @This(), key: u64) u64 { return key; }
-        pub fn eql(_: @This(), a: u64, b: u64) bool { return a == b; }
+        pub fn hash(_: @This(), key: u64) u64 {
+            return key;
+        }
+        pub fn eql(_: @This(), a: u64, b: u64) bool {
+            return a == b;
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
@@ -123,11 +127,6 @@ pub const InternTable = struct {
     }
 
     fn hashString(s: []const u8) u64 {
-        var h: u64 = 14695981039346656037;
-        for (s) |c| {
-            h ^= c;
-            h *%= 1099511628211;
-        }
-        return h;
+        return std.hash.Wyhash.hash(0, s);
     }
 };
