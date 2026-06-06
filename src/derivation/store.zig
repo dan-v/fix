@@ -1,5 +1,5 @@
 const std = @import("std");
-const debug = @import("debug.zig");
+const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
 
@@ -89,9 +89,9 @@ pub const DerivationStore = struct {
 
     pub fn recordDebug(self: *DerivationStore, drv: *const Drv, computed: ComputedPaths) !void {
         if (!self.debug_enabled) return;
-        var debug_record = try debug.debugRecordFromDrv(self.allocator, drv, computed.drv_path, self.resolver());
-        errdefer debug_record.deinit(self.allocator);
-        try self.debug_records.append(self.allocator, debug_record);
+        var new_record = try debug_record_mod.debugRecordFromDrv(self.allocator, drv, computed.drv_path, self.resolver());
+        errdefer new_record.deinit(self.allocator);
+        try self.debug_records.append(self.allocator, new_record);
     }
 
     pub fn outputNames(self: *DerivationStore, drv_path: []const u8) ?[]const []const u8 {
