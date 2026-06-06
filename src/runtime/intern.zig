@@ -3,14 +3,15 @@
 //! Thread safety:
 //!   - `get(id)` is lock-free. The id-indexed `entries` and `data` are
 //!     `StableSegments` whose backing pages are never relocated.
-//!   - `intern(s)` serializes on `lookup_mu`. The critical section is one
-//!     adapter-hash, one adapter-eql, and (on miss) appends to entries and
-//!     data plus a hashmap put.
+//!   - `intern(s)` shards on the input hash. Each shard holds its own
+//!     lookup map and `SpinMutex`. Concurrent interns of strings that
+//!     hash to different shards proceed in parallel.
 //!
-//! Hash-collision correctness: the lookup map stores `InternId` keys and
-//! uses an adapter context whose `eql(string, id)` compares the input
-//! string against the bytes stored under that id. Two distinct strings
-//! that happen to share a Wyhash output coexist as separate entries.
+//! Hash-collision correctness: each shard's lookup map stores `InternId`
+//! keys and uses an adapter context whose `eql(string, id)` compares the
+//! input string against the bytes stored under that id. Two distinct
+//! strings that happen to share a Wyhash output coexist as separate
+//! entries (in the same shard).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -26,48 +27,63 @@ const Entry = struct {
 const EntryStore = stable.StableSegments(Entry, .{ .first_segment_size = 256 });
 const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
 
+const SHARD_COUNT: u32 = 16;
+const SHARD_MASK: u64 = SHARD_COUNT - 1;
+
+fn hashString(s: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, s);
+}
+
+const Lookup = std.HashMapUnmanaged(InternId, void, IdContext, std.hash_map.default_max_load_percentage);
+
+/// Context for storing `InternId` keys whose hash and equality dispatch
+/// through the owning table so we can re-derive the bytes.
+const IdContext = struct {
+    table: *const InternTable,
+
+    pub fn hash(self: IdContext, id: InternId) u64 {
+        return hashString(self.table.get(id));
+    }
+    pub fn eql(self: IdContext, a: InternId, b: InternId) bool {
+        if (a == b) return true;
+        return std.mem.eql(u8, self.table.get(a), self.table.get(b));
+    }
+};
+
+/// Adapter used by `getOrPutAdapted` so lookups by `[]const u8` use the
+/// caller's bytes but storage uses `InternId`.
+const StringAdapter = struct {
+    table: *const InternTable,
+
+    pub fn hash(_: StringAdapter, key: []const u8) u64 {
+        return hashString(key);
+    }
+    pub fn eql(self: StringAdapter, key: []const u8, id: InternId) bool {
+        const stored = self.table.get(id);
+        return stored.len == key.len and std.mem.eql(u8, stored, key);
+    }
+};
+
+const Shard = struct {
+    lookup: Lookup = .empty,
+    mu: stable.SpinMutex = .{},
+};
+
 pub const InternTable = struct {
     allocator: std.mem.Allocator,
     entries: EntryStore,
     data: ByteStore,
-    lookup: std.HashMapUnmanaged(InternId, void, IdContext, std.hash_map.default_max_load_percentage),
-    lookup_mu: stable.SpinMutex,
-
-    /// Context for storing `InternId` keys whose hash and equality dispatch
-    /// through the owning table so we can re-derive the bytes.
-    const IdContext = struct {
-        table: *const InternTable,
-
-        pub fn hash(self: IdContext, id: InternId) u64 {
-            return hashString(self.table.get(id));
-        }
-        pub fn eql(self: IdContext, a: InternId, b: InternId) bool {
-            if (a == b) return true;
-            return std.mem.eql(u8, self.table.get(a), self.table.get(b));
-        }
-    };
-
-    /// Adapter used by `getOrPutAdapted` so lookups by `[]const u8` use the
-    /// caller's bytes but storage uses `InternId`.
-    const StringAdapter = struct {
-        table: *const InternTable,
-
-        pub fn hash(_: StringAdapter, key: []const u8) u64 {
-            return hashString(key);
-        }
-        pub fn eql(self: StringAdapter, key: []const u8, id: InternId) bool {
-            const stored = self.table.get(id);
-            return stored.len == key.len and std.mem.eql(u8, stored, key);
-        }
-    };
+    /// Per-shard lookup maps; intern() picks a shard by the low bits of
+    /// the input's hash. `entries` and `data` remain global so that ids
+    /// stay dense and `get()` doesn't need to know the shard.
+    shards: [SHARD_COUNT]Shard,
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
         var table: InternTable = .{
             .allocator = allocator,
             .entries = .empty,
             .data = .empty,
-            .lookup = .empty,
-            .lookup_mu = .{},
+            .shards = [_]Shard{.{}} ** SHARD_COUNT,
         };
         // Reserve id 0 as the empty string so `id == 0` is a valid "no string"
         // sentinel that `get` can resolve without touching the segments.
@@ -77,26 +93,26 @@ pub const InternTable = struct {
     }
 
     pub fn deinit(self: *InternTable) void {
-        self.lookup.deinit(self.allocator);
+        for (&self.shards) |*s| s.lookup.deinit(self.allocator);
         self.data.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }
 
     pub fn intern(self: *InternTable, s: []const u8) !InternId {
-        // The lookup map is the only structure shared between concurrent
-        // interns; hold the mutex across the whole getOrPut to keep the
-        // happens-before chain clean.
-        self.lookup_mu.lock();
-        defer self.lookup_mu.unlock();
+        const h = hashString(s);
+        const shard = &self.shards[h & SHARD_MASK];
+
+        shard.mu.lock();
+        defer shard.mu.unlock();
 
         const adapter = StringAdapter{ .table = self };
         const ctx = IdContext{ .table = self };
-        const gop = try self.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
+        const gop = try shard.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
         if (gop.found_existing) return gop.key_ptr.*;
 
-        // Append bytes, then the entry. errdefer would rewind the byte
-        // reservation; the entry append happens last so a failure between
-        // can be cleaned up by `data.rollback`.
+        // Append bytes, then the entry. The byte rollback handles failure
+        // mid-allocation; entry append happens last so its failure leaves
+        // the byte storage to be cleaned up by the errdefer.
         const new_id = blk: {
             const data_range = try self.data.reserve(self.allocator, @intCast(s.len));
             errdefer self.data.rollback(data_range);
@@ -123,10 +139,6 @@ pub const InternTable = struct {
 
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {
         return a == b;
-    }
-
-    fn hashString(s: []const u8) u64 {
-        return std.hash.Wyhash.hash(0, s);
     }
 };
 
@@ -156,9 +168,6 @@ test "intern: distinguishes hash-colliding inputs" {
     var table = try InternTable.init(std.testing.allocator);
     defer table.deinit();
 
-    // We can't easily produce a Wyhash collision, but we can force the
-    // adapter eql path by interning many strings and verifying each
-    // re-interns to its own id.
     const inputs = [_][]const u8{ "a", "b", "ab", "ba", "abc", "abcd" };
     var ids: [inputs.len]InternId = undefined;
     for (inputs, 0..) |s, i| ids[i] = try table.intern(s);
@@ -205,8 +214,6 @@ test "intern: concurrent inserts dedupe correctly" {
     }
     for (&threads) |t| t.join();
 
-    // No assertions on count (the random alphabet decides); just verify
-    // every id maps to a string and re-interning yields the same id.
     var id: InternId = 1;
     while (id < table.entries.count()) : (id += 1) {
         const s = table.get(id);
