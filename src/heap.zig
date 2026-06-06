@@ -151,7 +151,11 @@ pub const ObjectHeap = struct {
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
-        return self.addWithMeta(object, .none);
+        const id = self.object_count;
+        try self.ensureObjectPage(id);
+        self.heapObjectSlot(id).* = .{ .payload = object, .meta = .none };
+        self.object_count += 1;
+        return id;
     }
 
     pub fn addWithMeta(self: *ObjectHeap, object: Object, meta: ObjectMeta) !ObjectId {
