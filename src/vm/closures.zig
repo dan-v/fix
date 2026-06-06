@@ -26,7 +26,7 @@ pub fn getClosureById(self: *VM, closure_id: ObjectId) !Closure {
 
 pub fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
     const start = self.sp - upvalue_count;
-    const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
+    const id = try self.heap.addClosure(chunk_id, self.stack[start..self.sp]);
     self.sp = start;
     try stack.push(self, Value.closure(id));
 }
@@ -42,7 +42,7 @@ pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const
     while (i < descriptors.len) : (i += 3) {
         const capture_index = readU16(descriptors, i + 1);
         const captured = switch (descriptors[i]) {
-            0 => self.stack.items[frame.frame_base + capture_index],
+            0 => self.stack[frame.frame_base + capture_index],
             1 => value: {
                 if (current_upvalues == null) {
                     current_upvalues = frame.upvalues orelse return error.MissingClosure;
@@ -51,7 +51,7 @@ pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const
             },
             else => return error.InvalidBytecode,
         };
-        self.stack.items[out_index] = captured;
+        self.stack[out_index] = captured;
         out_index += 1;
     }
 
@@ -68,7 +68,7 @@ pub fn fillCaptureValues(self: *VM, descriptors: []const u8, frame: *const Frame
     while (i < descriptors.len) : (i += 3) {
         const capture_index = readU16(descriptors, i + 1);
         out[out_index] = switch (descriptors[i]) {
-            0 => self.stack.items[frame.frame_base + capture_index],
+            0 => self.stack[frame.frame_base + capture_index],
             1 => value: {
                 if (current_upvalues == null) {
                     current_upvalues = frame.upvalues orelse return error.MissingClosure;
@@ -93,6 +93,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
     committed = true;
+    _ = self.scheduler.submit(.{ .force_thunk = id });
     try stack.push(self, Value.thunk(id));
 }
 
@@ -148,14 +149,14 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []
     const frame_base = frame.frame_base;
     const arg_end = frame_base + 1;
     if (arg_end > stack_cap) return error.StackOverflow;
-    self.stack.items[frame_base] = arg;
+    self.stack[frame_base] = arg;
 
     const reserved = @as(u32, ch.local_count) - 1;
     if (reserved > stack_cap - arg_end) return error.StackOverflow;
     const new_sp = arg_end + reserved;
     const arg_end_idx: usize = @intCast(arg_end);
     const new_sp_idx: usize = @intCast(new_sp);
-    @memset(self.stack.items[arg_end_idx..new_sp_idx], Value.null_val);
+    @memset(self.stack[arg_end_idx..new_sp_idx], Value.null_val);
     self.sp = new_sp;
 
     frame.* = .{
@@ -190,7 +191,7 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
 
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
     const run_mod = @import("run.zig");
-    const stop_depth = self.frames.items.len;
+    const stop_depth = self.frames_len;
     const base_sp = self.sp - arg_count;
     stack.pushFrame(self, ch, arg_count, upvalues) catch |err| {
         self.sp = base_sp;
@@ -198,7 +199,7 @@ pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?
     };
     return run_mod.runUntil(self, stop_depth) catch |err| {
         errors.captureErrorTrace(self, err) catch {};
-        self.frames.shrinkRetainingCapacity(stop_depth);
+        self.frames_len = stop_depth;
         self.sp = base_sp;
         return err;
     };

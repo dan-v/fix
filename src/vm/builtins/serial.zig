@@ -292,6 +292,10 @@ fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
     const thunk = try self.heap.getThunk(id);
     const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
     if (state != .resolved) return null;
+    // Speculation can resolve a thunk before any real observer touches it.
+    // Lazy XML treats those as still unevaluated so speculation stays
+    // invisible — the rendered output matches the no-helper case.
+    if (!thunk.isDemanded()) return null;
     return xmlVisibleValue(self, thunk.result);
 }
 

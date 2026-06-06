@@ -120,6 +120,15 @@ pub const Compiler = struct {
         }
     }
 
+    /// Compile `node` (optionally in an ambient scope) and emit the
+    /// terminating `ret`/`halt` instructions. After this returns, the
+    /// builder holds a complete chunk ready for `ChunkBuilder.finish`.
+    pub fn compileAndFinish(self: *Compiler, node: *const Node, scope_value: ?Value) !void {
+        try self.compileWithScope(node, scope_value);
+        try self.builder.writeOp(self.allocator, .ret);
+        try self.builder.writeOp(self.allocator, .halt);
+    }
+
     pub fn compileAmbientScope(self: *Compiler, node: *const Node, scope_value: Value) !void {
         scope.beginScope(self);
 

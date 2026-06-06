@@ -15,21 +15,37 @@ const VM = vm_mod.VM;
 // ---- thunk management ----
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
-    return forceThunkFallible(self, thunk_val);
+    return forceThunkImpl(self, thunk_val, true);
 }
 
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
+    return forceValueImpl(self, value, true);
+}
+
+/// Speculative force: evaluate the value (resolving thunks/cells) without
+/// marking thunks as demanded. Used by scheduler helpers — if no real
+/// caller later observes the thunk, lazy renderers will still treat it
+/// as unevaluated.
+pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
+    return forceValueImpl(self, value, false);
+}
+
+pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
     return switch (value.discriminant) {
-        .thunk => try forceThunkFallible(self, value),
-        .cell => try forceCellValue(self, value),
+        .thunk => try forceThunkImpl(self, value, demand),
+        .cell => try forceCellImpl(self, value, demand),
         else => value,
     };
 }
 
 pub fn forceCellValue(self: *VM, value: Value) anyerror!Value {
+    return forceCellImpl(self, value, true);
+}
+
+fn forceCellImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
     const cell_id = value.asObjectId();
     const raw = try self.heap.getCellValue(cell_id);
-    const forced = try forceValue(self, raw);
+    const forced = try forceValueImpl(self, raw, demand);
     if (raw.discriminant == .thunk or raw.discriminant == .cell) {
         try self.heap.setCellValue(cell_id, forced);
     }
@@ -75,23 +91,42 @@ pub fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayLi
 }
 
 pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
-    const thunk_id = thunk_val.asObjectId();
-    var target: ThunkTarget = undefined;
-    const claimed = try self.heap.getThunk(thunk_id);
-    switch (claimed.tryClaim()) {
-        .already_resolved => return claimed.result,
-        .claimed => target = claimed.target,
-        .busy => return error.RecursiveThunk,
-    }
+    return forceThunkImpl(self, thunk_val, true);
+}
 
-    const result = evalThunkTarget(self, target) catch |err| {
-        const failed = try self.heap.getThunk(thunk_id);
-        failed.reset();
-        return err;
-    };
-    const resolved = try self.heap.getThunk(thunk_id);
-    resolved.resolve(result);
-    return result;
+pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
+    const thunk_id = thunk_val.asObjectId();
+    const thunk = try self.heap.getThunk(thunk_id);
+
+    while (true) {
+        switch (thunk.tryForce(self.worker_id)) {
+            .already_resolved => |v| {
+                if (demand) thunk.markDemanded();
+                return v;
+            },
+            .blackhole => return error.RecursiveThunk,
+            .claimed => {
+                // We own this thunk now; compute and publish (or fail and reset).
+                const result = evalThunkTarget(self, thunk.target) catch |err| {
+                    thunk.reset();
+                    return err;
+                };
+                thunk.resolve(result);
+                if (demand) thunk.markDemanded();
+                return result;
+            },
+            .busy => {
+                switch (thunk.waitFor()) {
+                    .resolved => |v| {
+                        if (demand) thunk.markDemanded();
+                        return v;
+                    },
+                    .blackhole => return error.RecursiveThunk,
+                    .retry => continue,
+                }
+            },
+        }
+    }
 }
 
 pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
@@ -122,10 +157,11 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
+    _ = self.scheduler.submit(.{ .force_thunk = id });
     return Value.thunk(id);
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {
-    const id = try self.heap.addCell(.{ .value = val });
+    const id = try self.heap.addCell(thunk_mod.Cell.init(val));
     return Value.cell(id);
 }

@@ -6,11 +6,19 @@
 //! semantics or VM call sites.
 
 const std = @import("std");
+const stable = @import("runtime/stable_segments.zig");
 
 pub const FileCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
     entries: std.StringHashMapUnmanaged(Entry),
+    /// Single coarse mutex around the hashmap, IO, and Entry mutations.
+    /// File I/O is rare relative to thunk forcing and pointer-invalidation
+    /// on concurrent insert would corrupt borrowed entry pointers; a finer
+    /// lock would need to either pin entries (StableSegments-style) or
+    /// repeat the lookup after each I/O step. We use a blocking mutex so
+    /// contending workers park instead of burning cores during the I/O.
+    mu: stable.BlockingMutex = .{},
 
     const max_read_bytes = 128 * 1024 * 1024;
 
@@ -67,6 +75,8 @@ pub const FileCache = struct {
     }
 
     pub fn pathExists(self: *FileCache, path: []const u8) !bool {
+        self.mu.lock();
+        defer self.mu.unlock();
         var entry = try self.entryFor(path);
         if (entry.exists_known) return entry.exists;
 
@@ -86,6 +96,8 @@ pub const FileCache = struct {
     }
 
     pub fn readFile(self: *FileCache, path: []const u8) ![]const u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
         var entry = try self.entryFor(path);
         if (entry.contents) |contents| return contents;
 
@@ -106,6 +118,8 @@ pub const FileCache = struct {
     }
 
     pub fn fileType(self: *FileCache, path: []const u8) !FileKind {
+        self.mu.lock();
+        defer self.mu.unlock();
         var entry = try self.entryFor(path);
         if (entry.kind) |kind| return kind;
 
@@ -126,6 +140,8 @@ pub const FileCache = struct {
     }
 
     pub fn isExecutable(self: *FileCache, path: []const u8) !bool {
+        self.mu.lock();
+        defer self.mu.unlock();
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
         const stat = try std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false });
@@ -133,6 +149,8 @@ pub const FileCache = struct {
     }
 
     pub fn readLink(self: *FileCache, path: []const u8) ![]u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -141,6 +159,8 @@ pub const FileCache = struct {
     }
 
     pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
+        self.mu.lock();
+        defer self.mu.unlock();
         var entry = try self.entryFor(path);
         if (entry.dir_entries) |entries| return entries;
 

@@ -174,10 +174,14 @@ pub const Value = extern struct {
         return self.discriminant == .int;
     }
 
-    // ---- equality (structural, for memoization) ----
+    // ---- identity equality ----
+    //
+    // These compare by tag + payload bits. For scalar tags this matches
+    // semantic equality; for object tags (list, attrs, closure, thunk, …)
+    // it is *identity* equality on the heap ObjectId. Structural equality
+    // requires heap access; see `vm/equality.zig`.
 
-    pub fn memoEq(self: Value, other: Value, intern_table: anytype) bool {
-        _ = intern_table;
+    pub fn idEq(self: Value, other: Value) bool {
         if (self.discriminant != other.discriminant) return false;
         return switch (self.discriminant) {
             .null, .bool_false, .bool_true => true,
@@ -188,7 +192,7 @@ pub const Value = extern struct {
         };
     }
 
-    pub fn hash(self: Value) u64 {
+    pub fn idHash(self: Value) u64 {
         return switch (self.discriminant) {
             .null => 0,
             .bool_false => 1,
@@ -196,8 +200,7 @@ pub const Value = extern struct {
             .int => @bitCast(self.asInt()),
             .float => @bitCast(self.asFloat()),
             .string, .path => @as(u64, self.asInternId()) *% 31,
-            .list => self.payload *% 31,
-            .attrs => self.payload *% 31,
+            .list, .attrs => self.payload *% 31,
             .closure, .thunk, .cell, .builtin, .builtin_closure, .string_context => self.payload,
         };
     }

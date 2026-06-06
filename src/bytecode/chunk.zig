@@ -9,6 +9,7 @@ const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("../runtime/value.zig").Value;
 const AttrEntry = @import("../runtime/heap.zig").AttrEntry;
+const stable = @import("../runtime/stable_segments.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -144,21 +145,28 @@ pub const ChunkBuilder = struct {
 
 /// Global chunk registry. Chunks are stored here and referenced by ChunkId.
 /// This is the "program" that the VM executes.
+///
+/// Thread safety:
+///   - `get(id)` is lock-free.
+///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
+    const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
+
     allocator: std.mem.Allocator,
-    chunks: std.ArrayListUnmanaged(*Chunk),
-    mutex: std.atomic.Mutex,
+    chunks: Store,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         return .{
             .allocator = allocator,
             .chunks = .empty,
-            .mutex = .unlocked,
         };
     }
 
     pub fn deinit(self: *ChunkRegistry) void {
-        for (self.chunks.items) |chunk| {
+        var id: u32 = 0;
+        const total = self.chunks.count();
+        while (id < total) : (id += 1) {
+            const chunk = self.chunks.get(id).*;
             chunk.deinit(self.allocator);
             self.allocator.destroy(chunk);
         }
@@ -172,17 +180,11 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
-
-        while (!std.atomic.Mutex.tryLock(&self.mutex)) {
-            std.atomic.spinLoopHint();
-        }
-        defer std.atomic.Mutex.unlock(&self.mutex);
-        try self.chunks.append(self.allocator, stored);
-        return @intCast(self.chunks.items.len - 1);
+        return try self.chunks.append(self.allocator, stored);
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
-        if (id >= self.chunks.items.len) return null;
-        return self.chunks.items[id];
+        if (id >= self.chunks.count()) return null;
+        return self.chunks.get(id).*;
     }
 };

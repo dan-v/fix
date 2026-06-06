@@ -159,8 +159,8 @@ pub fn attrValue(entries: []const heap_mod.AttrEntry, name: InternId) ?Value {
 
 pub fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) !bool {
     for (seen.items) |pair| {
-        if ((pair.left.memoEq(left, self.intern) and pair.right.memoEq(right, self.intern)) or
-            (pair.left.memoEq(right, self.intern) and pair.right.memoEq(left, self.intern)))
+        if ((pair.left.idEq(left) and pair.right.idEq(right)) or
+            (pair.left.idEq(right) and pair.right.idEq(left)))
         {
             return true;
         }

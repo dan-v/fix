@@ -4,6 +4,7 @@
 
 pub const types = @import("runtime/types.zig");
 pub const value = @import("runtime/value.zig");
+pub const stable_segments = @import("runtime/stable_segments.zig");
 pub const token = @import("token.zig");
 pub const scanner = @import("scanner.zig");
 pub const string_syntax = @import("string_syntax.zig");
@@ -29,4 +30,5 @@ pub const Value = value.Value;
 
 test {
     _ = @import("root/tests.zig");
+    _ = stable_segments;
 }

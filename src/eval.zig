@@ -27,8 +27,77 @@ const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
 const eval_trace = @import("eval/trace.zig");
 const eval_progress = @import("eval/progress.zig");
+const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
+const stable_segments_mod = @import("runtime/stable_segments.zig");
+
+/// Per-thread worker id. Helper threads set this in `helperLoop`; the
+/// main thread leaves it at 0. Used as the `claimer` value on
+/// `ImportEntry` so cycle detection and contention handling can tell
+/// "me again" from "another thread".
+threadlocal var current_worker_id: u8 = 0;
+
+/// Per-thread linked list of in-progress *scoped* import paths. Scoped
+/// imports are not deduplicated through `ImportEntry` (each call has a
+/// distinct scope value), so cycle detection for them remains thread-local.
+const ImportFrame = struct {
+    path: []const u8,
+    next: ?*const ImportFrame,
+};
+threadlocal var scoped_import_stack_top: ?*const ImportFrame = null;
+
+fn checkScopedImportCycle(path: []const u8) !void {
+    var cursor = scoped_import_stack_top;
+    while (cursor) |node| {
+        if (std.mem.eql(u8, node.path, path)) return error.ImportCycle;
+        cursor = node.next;
+    }
+}
+
+const INVALID_CLAIMER: u8 = 0xFF;
+
+/// Per-path import deduplication entry. The first thread to claim
+/// (cmpxchg state from unresolved → evaluating) does the work; others
+/// either wait (main thread) or bail (helper threads, to avoid deadlock
+/// with the main thread holding a contended thunk).
+const ImportEntry = struct {
+    const STATE_UNRESOLVED: u32 = 0;
+    const STATE_EVALUATING: u32 = 1;
+    const STATE_RESOLVED: u32 = 2;
+    const STATE_FAILED: u32 = 3;
+
+    state: std.atomic.Value(u32) = .init(STATE_UNRESOLVED),
+    claimer: std.atomic.Value(u8) = .init(INVALID_CLAIMER),
+    result: Value = Value.null_val,
+
+    fn waitForChange(self: *ImportEntry, from: u32) void {
+        switch (@import("builtin").os.tag) {
+            .linux => {
+                _ = std.os.linux.futex_4arg(
+                    @ptrCast(&self.state),
+                    .{ .cmd = .WAIT, .private = true },
+                    from,
+                    null,
+                );
+            },
+            else => std.Thread.yield() catch {},
+        }
+    }
+
+    fn wakeAll(self: *ImportEntry) void {
+        switch (@import("builtin").os.tag) {
+            .linux => {
+                _ = std.os.linux.futex_3arg(
+                    @ptrCast(&self.state),
+                    .{ .cmd = .WAKE, .private = true },
+                    std.math.maxInt(i32),
+                );
+            },
+            else => {},
+        }
+    }
+};
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
@@ -42,22 +111,29 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
-    imports: std.StringHashMapUnmanaged(Value),
-    imports_in_progress: std.StringHashMapUnmanaged(void),
+    imports: std.StringHashMapUnmanaged(*ImportEntry),
+    imports_mu: stable_segments_mod.SpinMutex,
     search_paths: []SearchPathEntry,
-    runtime_arena: std.heap.ArenaAllocator,
+    /// One arena per worker. Each VM allocates its stack, frames, and
+    /// per-opcode scratch through its worker's arena so workers never share
+    /// a non-thread-safe allocator.
+    worker_arenas: []std.heap.ArenaAllocator,
     builtins_value: ?Value,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
     worker_count: u8,
-    diagnostics: std.ArrayListUnmanaged(Diagnostic),
-    owned_diagnostic_messages: std.ArrayListUnmanaged([]u8),
-    owned_diagnostic_paths: std.ArrayListUnmanaged([]u8),
-    trace: EvalTrace,
+    /// Per-evaluation state (diagnostics + trace + string arena). Cleared
+    /// at the start of each `evaluate()`; helpers writing diagnostics from
+    /// import error paths serialize on `run.mu`.
+    run: Run,
     vm_opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
-    pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
+    pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
+        // Always run at least one worker — the main evaluator thread itself
+        // owns worker id 0 even when no scheduler helpers are requested.
+        const worker_count: u8 = @max(requested_worker_count, 1);
+
         var scheduler = try Scheduler.init(allocator, worker_count);
         errdefer scheduler.deinit();
 
@@ -66,6 +142,10 @@ pub const Evaluator = struct {
 
         var registry = try ChunkRegistry.init(allocator);
         errdefer registry.deinit();
+
+        const arenas = try allocator.alloc(std.heap.ArenaAllocator, worker_count);
+        errdefer allocator.free(arenas);
+        for (arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(allocator);
 
         return .{
             .allocator = allocator,
@@ -77,53 +157,50 @@ pub const Evaluator = struct {
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
             .imports = .empty,
-            .imports_in_progress = .empty,
+            .imports_mu = .{},
             .search_paths = &.{},
-            .runtime_arena = std.heap.ArenaAllocator.init(allocator),
+            .worker_arenas = arenas,
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
             .progress = null,
             .worker_count = worker_count,
-            .diagnostics = .empty,
-            .owned_diagnostic_messages = .empty,
-            .owned_diagnostic_paths = .empty,
-            .trace = EvalTrace.init(allocator),
+            .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
+        // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
+        // them down (which joins on `defer vm.deinit()` inside helperLoop)
+        // before freeing the arenas they borrow from.
+        self.scheduler.deinit();
         if (self.base_path) |path| self.allocator.free(path);
-        self.clearDiagnostics();
-        self.trace.deinit();
-        self.owned_diagnostic_paths.deinit(self.allocator);
-        self.owned_diagnostic_messages.deinit(self.allocator);
-        self.diagnostics.deinit(self.allocator);
+        self.run.deinit();
         var imports_iter = self.imports.iterator();
-        while (imports_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
+        while (imports_iter.next()) |kv| {
+            self.allocator.free(kv.key_ptr.*);
+            self.allocator.destroy(kv.value_ptr.*);
+        }
         self.imports.deinit(self.allocator);
-        var progress_iter = self.imports_in_progress.iterator();
-        while (progress_iter.next()) |kv| self.allocator.free(kv.key_ptr.*);
-        self.imports_in_progress.deinit(self.allocator);
         self.freeSearchPaths();
         self.fetchers.deinit();
         self.derivations.deinit();
         self.files.deinit();
         self.heap.deinit();
-        self.runtime_arena.deinit();
-        self.scheduler.deinit();
+        for (self.worker_arenas) |*arena| arena.deinit();
+        self.allocator.free(self.worker_arenas);
         self.registry.deinit();
         self.intern.deinit();
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
-        return self.diagnostics.items;
+        return self.run.diagnosticsView();
     }
 
     pub fn getTrace(self: *const Evaluator) *const EvalTrace {
-        return &self.trace;
+        return self.run.traceView();
     }
 
     pub fn setDerivationDebug(self: *Evaluator, enabled: bool) void {
@@ -193,41 +270,17 @@ pub const Evaluator = struct {
     }
 
     fn clearDiagnostics(self: *Evaluator) void {
-        for (self.owned_diagnostic_messages.items) |message| {
-            self.allocator.free(message);
-        }
-        for (self.owned_diagnostic_paths.items) |path| {
-            self.allocator.free(path);
-        }
-        self.owned_diagnostic_messages.clearRetainingCapacity();
-        self.owned_diagnostic_paths.clearRetainingCapacity();
-        self.diagnostics.clearRetainingCapacity();
-        self.trace.clear();
+        self.run.clear();
     }
 
     fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
-        self.clearDiagnostics();
-        try self.diagnostics.ensureUnusedCapacity(self.allocator, diagnostics.len);
-        try self.owned_diagnostic_messages.ensureUnusedCapacity(self.allocator, diagnostics.len);
-        try self.owned_diagnostic_paths.ensureUnusedCapacity(self.allocator, diagnostics.len);
-        for (diagnostics) |diag| {
-            var copy = diag;
-            const message = try self.allocator.dupe(u8, diag.message);
-            self.owned_diagnostic_messages.appendAssumeCapacity(message);
-            copy.message = message;
-            copy.source = diag.source orelse source;
-            if (diag.source_path orelse source_path) |path| {
-                const owned_path = try self.allocator.dupe(u8, path);
-                self.owned_diagnostic_paths.appendAssumeCapacity(owned_path);
-                copy.source_path = owned_path;
-            }
-            self.diagnostics.appendAssumeCapacity(copy);
-        }
+        try self.run.replaceDiagnostics(diagnostics, source, source_path);
     }
 
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+        try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
         return self.evaluateSource(source, self.base_path, null, null);
@@ -276,16 +329,11 @@ pub const Evaluator = struct {
         {
             self.progressBegin(.compile, subject);
             defer self.progressEnd(.compile, subject);
-            compiler.compileWithScope(ast_node, scope) catch |err| {
+            compiler.compileAndFinish(ast_node, scope) catch |err| {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
-                if (preserveCompileError(err)) return err;
-                return error.CompileError;
+                return err;
             };
         }
-
-        // Add return + halt.
-        try builder.writeOp(self.allocator, .ret);
-        try builder.writeOp(self.allocator, .halt);
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registry.register(chunk);
@@ -301,7 +349,7 @@ pub const Evaluator = struct {
 
     fn initVm(self: *Evaluator, worker_id: u8) !VM {
         return VM.init(
-            self.runtime_arena.allocator(),
+            self.worker_arenas[worker_id].allocator(),
             &self.registry,
             &self.intern,
             &self.heap,
@@ -309,7 +357,7 @@ pub const Evaluator = struct {
             &self.fetchers,
             &self.derivations,
             &self.scheduler,
-            &self.trace,
+            &self.run.trace,
             self.progress,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
@@ -321,7 +369,7 @@ pub const Evaluator = struct {
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
         defer self.progressEnd(.render, "result");
-        self.trace.clear();
+        self.run.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
 
@@ -331,7 +379,7 @@ pub const Evaluator = struct {
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
         defer self.progressEnd(.render, "result");
-        self.trace.clear();
+        self.run.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
 
@@ -339,7 +387,7 @@ pub const Evaluator = struct {
     }
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
-        self.trace.clear();
+        self.run.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
 
@@ -349,7 +397,7 @@ pub const Evaluator = struct {
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         self.progressBegin(.render, "strict result");
         defer self.progressEnd(.render, "strict result");
-        self.trace.clear();
+        self.run.trace.clear();
         var vm = try self.initVm(0);
         defer vm.deinit();
 
@@ -407,15 +455,58 @@ pub const Evaluator = struct {
     }
 
     fn importResolvedPath(self: *Evaluator, path: []const u8) anyerror!Value {
+        const entry = try self.lookupOrCreateImportEntry(path);
+        return self.forceImportEntry(path, entry);
+    }
+
+    fn forceImportEntry(self: *Evaluator, path: []const u8, entry: *ImportEntry) anyerror!Value {
+        const me = current_worker_id;
+        while (true) {
+            const state = entry.state.load(.acquire);
+            switch (state) {
+                ImportEntry.STATE_RESOLVED => return entry.result,
+                ImportEntry.STATE_FAILED => return error.ImportFailed,
+                ImportEntry.STATE_EVALUATING => {
+                    const claimer = entry.claimer.load(.acquire);
+                    if (claimer == me) return error.ImportCycle;
+                    // Helpers don't wait on contended imports. The main thread
+                    // may be holding a thunk whose force chain leads back to
+                    // us; bailing avoids the cycle and lets a real-demand
+                    // force retry later.
+                    if (me != 0) return error.ImportContended;
+                    entry.waitForChange(ImportEntry.STATE_EVALUATING);
+                },
+                ImportEntry.STATE_UNRESOLVED => {
+                    if (entry.state.cmpxchgWeak(
+                        ImportEntry.STATE_UNRESOLVED,
+                        ImportEntry.STATE_EVALUATING,
+                        .acquire,
+                        .monotonic,
+                    )) |_| continue;
+                    entry.claimer.store(me, .release);
+                    const value = self.compileImportPath(path) catch |err| {
+                        entry.state.store(ImportEntry.STATE_FAILED, .release);
+                        entry.wakeAll();
+                        return err;
+                    };
+                    entry.result = value;
+                    entry.state.store(ImportEntry.STATE_RESOLVED, .release);
+                    entry.wakeAll();
+                    return value;
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    /// Internal: do the actual file read + evaluate work for an import.
+    /// Caller has already claimed the `ImportEntry` for `path`.
+    fn compileImportPath(self: *Evaluator, path: []const u8) anyerror!Value {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
-        if (self.imports.get(stable_path)) |value| return value;
         self.progressBegin(.import, stable_path);
         defer self.progressEnd(.import, stable_path);
-
-        const progress_key = try self.beginImport(stable_path);
-        defer self.endImport(progress_key);
 
         const source = if (corepkgsSource(stable_path)) |core_source|
             core_source
@@ -425,9 +516,22 @@ pub const Evaluator = struct {
                 else => return err,
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        const value = try self.evaluateSource(source, source_base, stable_path, null);
-        try self.cacheImportValue(stable_path, value);
-        return value;
+        return self.evaluateSource(source, source_base, stable_path, null);
+    }
+
+    fn lookupOrCreateImportEntry(self: *Evaluator, path: []const u8) !*ImportEntry {
+        self.imports_mu.lock();
+        defer self.imports_mu.unlock();
+
+        if (self.imports.get(path)) |entry| return entry;
+
+        const key = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(key);
+        const entry = try self.allocator.create(ImportEntry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{};
+        try self.imports.put(self.allocator, key, entry);
+        return entry;
     }
 
     fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8) !Value {
@@ -440,11 +544,13 @@ pub const Evaluator = struct {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
+        try checkScopedImportCycle(stable_path);
+        var frame: ImportFrame = .{ .path = stable_path, .next = scoped_import_stack_top };
+        scoped_import_stack_top = &frame;
+        defer scoped_import_stack_top = frame.next;
+
         self.progressBegin(.import, stable_path);
         defer self.progressEnd(.import, stable_path);
-
-        const progress_key = try self.beginImport(stable_path);
-        defer self.endImport(progress_key);
 
         const source = if (corepkgsSource(stable_path)) |core_source|
             core_source
@@ -490,37 +596,13 @@ pub const Evaluator = struct {
         const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
         defer self.allocator.free(default_path);
 
-        const value = try self.importResolvedPath(default_path);
-        try self.cacheImportValue(path, value);
-        return value;
+        return self.importResolvedPath(default_path);
     }
 
     fn scopedImportDirectory(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
         const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
         defer self.allocator.free(default_path);
         return self.scopedImportResolvedPath(scope, default_path);
-    }
-
-    fn cacheImportValue(self: *Evaluator, path: []const u8, value: Value) !void {
-        if (self.imports.contains(path)) return;
-
-        const key = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(key);
-        try self.imports.put(self.allocator, key, value);
-    }
-
-    fn beginImport(self: *Evaluator, path: []const u8) ![]u8 {
-        if (self.imports_in_progress.contains(path)) return error.ImportCycle;
-
-        const key = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(key);
-        try self.imports_in_progress.put(self.allocator, key, {});
-        return key;
-    }
-
-    fn endImport(self: *Evaluator, key: []u8) void {
-        _ = self.imports_in_progress.remove(key);
-        self.allocator.free(key);
     }
 
     fn ensureBuiltins(self: *Evaluator) !Value {
@@ -534,19 +616,6 @@ pub const Evaluator = struct {
         const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);
         self.builtins_value = value;
         return value;
-    }
-
-    fn preserveCompileError(err: anyerror) bool {
-        return switch (err) {
-            error.DuplicateAttribute,
-            error.DuplicateBinding,
-            error.BytecodeOperandTooLarge,
-            error.InvalidNumber,
-            error.ParseError,
-            error.UndefinedVariable,
-            => true,
-            else => false,
-        };
     }
 
     const ResolvedHostPath = struct {
@@ -599,6 +668,30 @@ pub const Evaluator = struct {
         if (self.progress) |progress| progress.instant(stage, subject);
     }
 };
+
+/// Helper worker loop. Each helper owns a VM bound to worker_id = helper_idx + 1
+/// and processes speculative `force_thunk` tasks until the scheduler signals
+/// shutdown. Errors during speculation are swallowed — the thunk's own
+/// `reset()` is invoked by force.forceThunkFallible on failure, so a future
+/// genuine force will retry and surface the error to its real caller.
+fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
+    current_worker_id = helper_idx + 1;
+    var vm = ev.initVm(helper_idx + 1) catch return;
+    defer vm.deinit();
+
+    while (!sched.isShutdown()) {
+        const task = sched.pop(helper_idx) orelse sched.stealAny(helper_idx) orelse {
+            sched.parkHelper(helper_idx);
+            continue;
+        };
+        switch (task) {
+            .force_thunk => |thunk_id| {
+                const thunk_val = Value.thunk(thunk_id);
+                _ = vm_force.forceValueSpeculative(&vm, thunk_val) catch {};
+            },
+        }
+    }
+}
 
 const OpcodeCountEntry = struct {
     op: opcode.OpCode,

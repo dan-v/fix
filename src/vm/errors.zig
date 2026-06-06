@@ -12,10 +12,10 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
     if (trace.captured_stack) return;
 
     var previous: ?chunk.Chunk.SourceSpan = null;
-    var i = self.frames.items.len;
+    var i: usize = self.frames_len;
     while (i > 0) {
         i -= 1;
-        const frame = self.frames.items[i];
+        const frame = self.frames[i];
         const span = sourceSpanForFrame(frame) orelse continue;
         if (previous) |prev| {
             if (sameSourceSpan(prev, span)) continue;

@@ -446,7 +446,7 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
     });
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("builtins"),
-        .value = Value.attrs(heap.object_count),
+        .value = Value.attrs(heap.objects.count()),
     });
 
     return Value.attrs(try heap.addAttrs(entries.items));

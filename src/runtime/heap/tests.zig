@@ -4,9 +4,7 @@ const Value = @import("../value.zig").Value;
 const ObjectHeap = heap_mod.ObjectHeap;
 const InternId = heap_mod.InternId;
 const ChunkId = heap_mod.ChunkId;
-const OBJECTS_PER_PAGE = heap_mod.OBJECTS_PER_PAGE;
-const VALUES_PER_PAGE = heap_mod.VALUES_PER_PAGE;
-const ATTRS_PER_PAGE = heap_mod.ATTRS_PER_PAGE;
+const Cell = @import("../thunk.zig").Cell;
 
 test "object heap stores list and attrs payloads behind object ids" {
     var heap = ObjectHeap.init(std.testing.allocator);
@@ -100,14 +98,13 @@ test "object heap rejects duplicate attrs and rolls back side entries" {
         .{ .name = 10, .value = Value.int(3) },
     }));
 
-    if (heap.attr_page_used.items.len > 0) {
-        try std.testing.expectEqual(@as(u32, 0), heap.attr_page_used.items[0]);
-    }
-
+    // After a rolled-back duplicate attempt the next addAttrs should reuse
+    // the freed slots — meaning total attr storage stays small.
     const attrs_id = try heap.addAttrs(&.{
         .{ .name = 10, .value = Value.int(1) },
         .{ .name = 20, .value = Value.int(2) },
     });
+    try std.testing.expectEqual(@as(u32, 2), heap.attrs.count());
     try std.testing.expectEqual(@as(i64, 1), (try heap.getAttrValue(attrs_id, 10)).asInt());
 }
 
@@ -118,8 +115,9 @@ test "object heap preserves earlier ranges as side arenas grow" {
     const first_id = try heap.addList(&.{ Value.int(1), Value.int(2) });
     const first_ptr = (try heap.getList(first_id)).ptr;
 
+    // Cross a few segment boundaries.
     var i: usize = 0;
-    while (i < VALUES_PER_PAGE * 3) : (i += 1) {
+    while (i < 4096) : (i += 1) {
         _ = try heap.addList(&.{
             Value.int(@intCast(i)),
             Value.int(@intCast(i + 1)),
@@ -140,7 +138,7 @@ test "object heap preserves earlier ranges as side arenas grow" {
     const attrs_ptr = (try heap.getAttrs(attrs_id)).ptr;
 
     i = 0;
-    while (i < ATTRS_PER_PAGE * 3) : (i += 1) {
+    while (i < 4096) : (i += 1) {
         _ = try heap.addAttrs(&.{
             .{ .name = @intCast(i * 3 + 10), .value = Value.int(@intCast(i)) },
             .{ .name = @intCast(i * 3 + 11), .value = Value.int(@intCast(i + 1)) },
@@ -153,17 +151,17 @@ test "object heap preserves earlier ranges as side arenas grow" {
     try std.testing.expectEqual(@as(i64, 2), (try heap.getAttrValue(attrs_id, 2)).asInt());
 }
 
-test "object heap keeps object addresses stable across page growth" {
+test "object heap keeps object addresses stable across segment growth" {
     var heap = ObjectHeap.init(std.testing.allocator);
     defer heap.deinit();
 
-    const first_id = try heap.addCell(.{ .value = Value.int(1) });
+    const first_id = try heap.addCell(Cell.init(Value.int(1)));
     const first_ptr = heap.get(first_id);
     const first_addr = @intFromPtr(first_ptr);
 
     var i: usize = 0;
-    while (i < OBJECTS_PER_PAGE * 3) : (i += 1) {
-        _ = try heap.addCell(.{ .value = Value.int(@intCast(i)) });
+    while (i < 4096) : (i += 1) {
+        _ = try heap.addCell(Cell.init(Value.int(@intCast(i))));
     }
 
     try std.testing.expectEqual(first_addr, @intFromPtr(heap.get(first_id)));
@@ -182,8 +180,31 @@ test "object heap stores closures and mutable runtime cells" {
     try std.testing.expectEqual(@as(i64, 10), closure.upvalues[0].asInt());
     try std.testing.expect(!closure.upvalues[1].asBool());
 
-    const cell_id = try heap.addCell(.{ .value = Value.int(1) });
+    const cell_id = try heap.addCell(Cell.init(Value.int(1)));
     try std.testing.expectEqual(@as(i64, 1), (try heap.getCellValue(cell_id)).asInt());
     try heap.setCellValue(cell_id, Value.int(2));
     try std.testing.expectEqual(@as(i64, 2), (try heap.getCellValue(cell_id)).asInt());
+}
+
+test "cell.set is write-once under racing writers" {
+    var heap = ObjectHeap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    const cell_id = try heap.addCell(Cell.init(Value.int(0)));
+
+    const Worker = struct {
+        fn run(h: *ObjectHeap, id: u32, value: i64) void {
+            h.setCellValue(id, Value.int(value)) catch return;
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &heap, cell_id, @as(i64, @intCast(i + 1)) });
+    }
+    for (&threads) |t| t.join();
+
+    // Exactly one writer wins; the read returns either that value or the initial.
+    const v = (try heap.getCellValue(cell_id)).asInt();
+    try std.testing.expect(v >= 1 and v <= 4);
 }

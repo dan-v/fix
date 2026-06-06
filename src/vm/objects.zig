@@ -15,7 +15,7 @@ const VM = vm_mod.VM;
 pub fn buildAttrs(self: *VM, count: u16) !void {
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
-    const id = try self.heap.addAttrsFromStackPairs(self.stack.items[start..self.sp]);
+    const id = try self.heap.addAttrsFromStackPairs(self.stack[start..self.sp]);
     self.sp = start;
     try stack.push(self, Value.attrs(id));
 }
@@ -23,14 +23,14 @@ pub fn buildAttrs(self: *VM, count: u16) !void {
 pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
-    const id = try self.heap.addAttrsFromStackPairsWithPositions(self.stack.items[start..self.sp], positions);
+    const id = try self.heap.addAttrsFromStackPairsWithPositions(self.stack[start..self.sp], positions);
     self.sp = start;
     try stack.push(self, Value.attrs(id));
 }
 
 pub fn buildList(self: *VM, count: u16) !void {
     const start = self.sp - count;
-    const id = try self.heap.addList(self.stack.items[start..self.sp]);
+    const id = try self.heap.addList(self.stack[start..self.sp]);
     self.sp = start;
     try stack.push(self, Value.list(id));
 }

@@ -97,12 +97,15 @@ pub const VM = struct {
     /// This VM's worker index.
     worker_id: u8,
 
-    /// The value stack.
-    stack: std.ArrayListUnmanaged(Value),
-    /// Stack pointer (index into stack.items for next push).
+    /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
+    /// logical length.
+    stack: []Value,
+    /// Stack pointer — index of the next push slot.
     sp: u32,
-    /// Call frames.
-    frames: std.ArrayListUnmanaged(Frame),
+    /// Call frames. Fixed capacity = MAX_FRAMES; `frames_len` is the
+    /// logical count.
+    frames: []Frame,
+    frames_len: u32,
     opcode_counts: OpcodeProfileState,
     opcode_profile_sink: OpcodeProfileSink,
 
@@ -122,12 +125,11 @@ pub const VM = struct {
         worker_id: u8,
         opcode_profile_sink: OpcodeProfileSink,
     ) !VM {
-        var value_stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP);
-        value_stack.items.len = types.VM_STACK_CAP;
-        errdefer value_stack.deinit(allocator);
+        const value_stack = try allocator.alloc(Value, types.VM_STACK_CAP);
+        errdefer allocator.free(value_stack);
 
-        var frames = try std.ArrayListUnmanaged(Frame).initCapacity(allocator, types.MAX_FRAMES);
-        errdefer frames.deinit(allocator);
+        const frames = try allocator.alloc(Frame, types.MAX_FRAMES);
+        errdefer allocator.free(frames);
 
         return .{
             .allocator = allocator,
@@ -146,6 +148,7 @@ pub const VM = struct {
             .stack = value_stack,
             .sp = 0,
             .frames = frames,
+            .frames_len = 0,
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
         };
@@ -153,8 +156,8 @@ pub const VM = struct {
 
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
-        self.stack.deinit(self.allocator);
-        self.frames.deinit(self.allocator);
+        self.allocator.free(self.stack);
+        self.allocator.free(self.frames);
     }
 
     /// Evaluate a chunk and return its result.

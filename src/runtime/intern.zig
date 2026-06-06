@@ -1,125 +1,124 @@
 //! Interned strings for fast comparison and small value representation.
+//!
+//! Thread safety:
+//!   - `get(id)` is lock-free. The id-indexed `entries` and `data` are
+//!     `StableSegments` whose backing pages are never relocated.
+//!   - `intern(s)` serializes on `lookup_mu`. The critical section is one
+//!     adapter-hash, one adapter-eql, and (on miss) appends to entries and
+//!     data plus a hashmap put.
+//!
+//! Hash-collision correctness: the lookup map stores `InternId` keys and
+//! uses an adapter context whose `eql(string, id)` compares the input
+//! string against the bytes stored under that id. Two distinct strings
+//! that happen to share a Wyhash output coexist as separate entries.
 
 const std = @import("std");
 const types = @import("types.zig");
+const stable = @import("stable_segments.zig");
 const InternId = types.InternId;
 
 const Entry = struct {
-    key: InternId,
-    len: u32,
+    segment: u32,
     offset: u32,
+    len: u32,
 };
 
-test "intern accepts slices borrowed from intern storage" {
-    var table = try InternTable.init(std.testing.allocator);
-    defer table.deinit();
-
-    const path_id = try table.intern("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source/file.txt");
-    table.data.shrinkAndFree(std.testing.allocator, table.data.items.len);
-
-    const path = table.get(path_id);
-    const base = path[path.len - "file.txt".len ..];
-    const base_id = try table.intern(base);
-    try std.testing.expectEqualStrings("file.txt", table.get(base_id));
-}
+const EntryStore = stable.StableSegments(Entry, .{ .first_segment_size = 256 });
+const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
 
 pub const InternTable = struct {
     allocator: std.mem.Allocator,
-    mutex: std.atomic.Mutex,
-    data: std.ArrayListUnmanaged(u8),
-    entries: std.ArrayListUnmanaged(Entry),
-    lookup: std.HashMapUnmanaged(u64, InternId, LookupCtx, std.hash_map.default_max_load_percentage),
+    entries: EntryStore,
+    data: ByteStore,
+    lookup: std.HashMapUnmanaged(InternId, void, IdContext, std.hash_map.default_max_load_percentage),
+    lookup_mu: stable.SpinMutex,
 
-    const LookupCtx = struct {
-        pub fn hash(_: @This(), key: u64) u64 {
-            return key;
+    /// Context for storing `InternId` keys whose hash and equality dispatch
+    /// through the owning table so we can re-derive the bytes.
+    const IdContext = struct {
+        table: *const InternTable,
+
+        pub fn hash(self: IdContext, id: InternId) u64 {
+            return hashString(self.table.get(id));
         }
-        pub fn eql(_: @This(), a: u64, b: u64) bool {
-            return a == b;
+        pub fn eql(self: IdContext, a: InternId, b: InternId) bool {
+            if (a == b) return true;
+            return std.mem.eql(u8, self.table.get(a), self.table.get(b));
+        }
+    };
+
+    /// Adapter used by `getOrPutAdapted` so lookups by `[]const u8` use the
+    /// caller's bytes but storage uses `InternId`.
+    const StringAdapter = struct {
+        table: *const InternTable,
+
+        pub fn hash(_: StringAdapter, key: []const u8) u64 {
+            return hashString(key);
+        }
+        pub fn eql(self: StringAdapter, key: []const u8, id: InternId) bool {
+            const stored = self.table.get(id);
+            return stored.len == key.len and std.mem.eql(u8, stored, key);
         }
     };
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
-        var table = InternTable{
+        var table: InternTable = .{
             .allocator = allocator,
-            .mutex = .unlocked,
-            .data = .empty,
             .entries = .empty,
+            .data = .empty,
             .lookup = .empty,
+            .lookup_mu = .{},
         };
-        try table.entries.append(allocator, .{ .key = 0, .len = 0, .offset = 0 });
+        // Reserve id 0 as the empty string so `id == 0` is a valid "no string"
+        // sentinel that `get` can resolve without touching the segments.
+        const empty_id = try table.intern("");
+        std.debug.assert(empty_id == 0);
         return table;
     }
 
     pub fn deinit(self: *InternTable) void {
+        self.lookup.deinit(self.allocator);
         self.data.deinit(self.allocator);
         self.entries.deinit(self.allocator);
-        self.lookup.deinit(self.allocator);
     }
 
     pub fn intern(self: *InternTable, s: []const u8) !InternId {
-        const hash = hashString(s);
+        // The lookup map is the only structure shared between concurrent
+        // interns; hold the mutex across the whole getOrPut to keep the
+        // happens-before chain clean.
+        self.lookup_mu.lock();
+        defer self.lookup_mu.unlock();
 
-        // Lock-free read path — check if already present.
-        if (self.lookup.get(hash)) |id| {
-            const entry = self.entries.items[id];
-            const stored = self.data.items[entry.offset..][0..entry.len];
-            if (stored.len == s.len and std.mem.eql(u8, stored, s)) {
-                return id;
-            }
-        }
+        const adapter = StringAdapter{ .table = self };
+        const ctx = IdContext{ .table = self };
+        const gop = try self.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
+        if (gop.found_existing) return gop.key_ptr.*;
 
-        // Locked insertion path.
-        while (!std.atomic.Mutex.tryLock(&self.mutex)) {
-            std.atomic.spinLoopHint();
-        }
-        defer std.atomic.Mutex.unlock(&self.mutex);
+        // Append bytes, then the entry. errdefer would rewind the byte
+        // reservation; the entry append happens last so a failure between
+        // can be cleaned up by `data.rollback`.
+        const new_id = blk: {
+            const data_range = try self.data.reserve(self.allocator, @intCast(s.len));
+            errdefer self.data.rollback(data_range);
+            @memcpy(self.data.sliceMut(data_range), s);
 
-        // Double-check after acquiring lock.
-        if (self.lookup.get(hash)) |id| {
-            const entry = self.entries.items[id];
-            const stored = self.data.items[entry.offset..][0..entry.len];
-            if (stored.len == s.len and std.mem.eql(u8, stored, s)) {
-                return id;
-            }
-        }
+            const entry: Entry = .{
+                .segment = data_range.segment,
+                .offset = data_range.offset,
+                .len = data_range.len,
+            };
+            break :blk try self.entries.append(self.allocator, entry);
+        };
 
-        const source_offset = self.dataOffset(s);
-        try self.data.ensureUnusedCapacity(self.allocator, s.len);
-
-        const source = if (source_offset) |offset|
-            self.data.items[offset..][0..s.len]
-        else
-            s;
-        const offset: u32 = @intCast(self.data.items.len);
-        self.data.appendSliceAssumeCapacity(source);
-
-        const id: InternId = @intCast(self.entries.items.len);
-        try self.entries.append(self.allocator, .{
-            .key = id,
-            .len = @intCast(s.len),
-            .offset = offset,
-        });
-
-        try self.lookup.put(self.allocator, hash, id);
-        return id;
+        gop.key_ptr.* = new_id;
+        return new_id;
     }
 
     pub fn get(self: *const InternTable, id: InternId) []const u8 {
-        if (id == 0 or id >= self.entries.items.len) return "";
-        const entry = self.entries.items[id];
-        return self.data.items[entry.offset..][0..entry.len];
-    }
-
-    fn dataOffset(self: *const InternTable, s: []const u8) ?usize {
-        if (s.len == 0 or self.data.items.len == 0) return null;
-
-        const data_start = @intFromPtr(self.data.items.ptr);
-        const data_end = data_start + self.data.items.len;
-        const slice_start = @intFromPtr(s.ptr);
-        const slice_end = slice_start + s.len;
-        if (slice_start < data_start or slice_end > data_end) return null;
-        return slice_start - data_start;
+        if (id == 0 or id >= self.entries.count()) return "";
+        const entry = self.entries.get(id).*;
+        if (entry.len == 0) return "";
+        return self.data.slice(.{ .segment = entry.segment, .offset = entry.offset, .len = entry.len });
     }
 
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {
@@ -130,3 +129,88 @@ pub const InternTable = struct {
         return std.hash.Wyhash.hash(0, s);
     }
 };
+
+test "intern: round-trips and dedupes" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const a = try table.intern("hello");
+    const b = try table.intern("world");
+    const a2 = try table.intern("hello");
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(a, a2);
+    try std.testing.expectEqualStrings("hello", table.get(a));
+    try std.testing.expectEqualStrings("world", table.get(b));
+}
+
+test "intern: id 0 is empty sentinel" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    try std.testing.expectEqualStrings("", table.get(0));
+    const empty_id = try table.intern("");
+    try std.testing.expectEqual(@as(InternId, 0), empty_id);
+}
+
+test "intern: distinguishes hash-colliding inputs" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    // We can't easily produce a Wyhash collision, but we can force the
+    // adapter eql path by interning many strings and verifying each
+    // re-interns to its own id.
+    const inputs = [_][]const u8{ "a", "b", "ab", "ba", "abc", "abcd" };
+    var ids: [inputs.len]InternId = undefined;
+    for (inputs, 0..) |s, i| ids[i] = try table.intern(s);
+    for (inputs, 0..) |s, i| {
+        try std.testing.expectEqualStrings(s, table.get(ids[i]));
+        try std.testing.expectEqual(ids[i], try table.intern(s));
+    }
+}
+
+test "intern: get is safe for slices borrowed from previous interns" {
+    var table = try InternTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const path_id = try table.intern("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source/file.txt");
+    const path = table.get(path_id);
+    const base = path[path.len - "file.txt".len ..];
+    const base_id = try table.intern(base);
+    try std.testing.expectEqualStrings("file.txt", table.get(base_id));
+}
+
+test "intern: concurrent inserts dedupe correctly" {
+    const allocator = std.testing.allocator;
+    var table = try InternTable.init(allocator);
+    defer table.deinit();
+
+    const Worker = struct {
+        fn run(tbl: *InternTable, seed: u64, count: u32) void {
+            var rng = std.Random.DefaultPrng.init(seed);
+            const r = rng.random();
+            var buf: [16]u8 = undefined;
+            var i: u32 = 0;
+            while (i < count) : (i += 1) {
+                const n = r.intRangeAtMost(usize, 1, buf.len);
+                // Pick from a small alphabet so workers collide on the same strings.
+                for (buf[0..n]) |*b| b.* = 'a' + @as(u8, r.intRangeAtMost(u4, 0, 7));
+                _ = tbl.intern(buf[0..n]) catch return;
+            }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &table, @as(u64, @intCast(i)) +% 1, @as(u32, 500) });
+    }
+    for (&threads) |t| t.join();
+
+    // No assertions on count (the random alphabet decides); just verify
+    // every id maps to a string and re-interning yields the same id.
+    var id: InternId = 1;
+    while (id < table.entries.count()) : (id += 1) {
+        const s = table.get(id);
+        const again = try table.intern(s);
+        try std.testing.expectEqual(id, again);
+    }
+}

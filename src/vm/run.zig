@@ -59,14 +59,14 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             .get_local => {
                 const slot = code[frame.ip];
                 frame.ip += 1;
-                const raw = self.stack.items[frame.frame_base + slot];
+                const raw = self.stack[frame.frame_base + slot];
                 const val = try force.forceValue(self, raw);
                 try stack.push(self, val);
             },
             .get_local_long => {
                 const slot = readU16(code, frame.ip);
                 frame.ip += 2;
-                const raw = self.stack.items[frame.frame_base + slot];
+                const raw = self.stack[frame.frame_base + slot];
                 const val = try force.forceValue(self, raw);
                 try stack.push(self, val);
             },
@@ -74,13 +74,13 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             .capture_local => {
                 const slot = code[frame.ip];
                 frame.ip += 1;
-                const val = self.stack.items[frame.frame_base + slot];
+                const val = self.stack[frame.frame_base + slot];
                 try stack.push(self, val);
             },
             .capture_local_long => {
                 const slot = readU16(code, frame.ip);
                 frame.ip += 2;
-                const val = self.stack.items[frame.frame_base + slot];
+                const val = self.stack[frame.frame_base + slot];
                 try stack.push(self, val);
             },
 
@@ -108,7 +108,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 const slot = code[frame.ip];
                 frame.ip += 1;
                 const val = stack.pop(self);
-                const cell_val = self.stack.items[frame.frame_base + slot];
+                const cell_val = self.stack[frame.frame_base + slot];
                 if (cell_val.discriminant != .cell) return error.TypeError;
                 try self.heap.setCellValue(cell_val.asObjectId(), val);
             },
@@ -116,7 +116,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 const slot = readU16(code, frame.ip);
                 frame.ip += 2;
                 const val = stack.pop(self);
-                const cell_val = self.stack.items[frame.frame_base + slot];
+                const cell_val = self.stack[frame.frame_base + slot];
                 if (cell_val.discriminant != .cell) return error.TypeError;
                 try self.heap.setCellValue(cell_val.asObjectId(), val);
             },
@@ -231,7 +231,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             .jump_if_false => {
                 const offset = readU32(code, frame.ip);
                 frame.ip += 4;
-                const cond = self.stack.items[self.sp - 1];
+                const cond = self.stack[self.sp - 1];
                 if (!try expectBool(self, cond)) {
                     frame.ip += @as(usize, offset);
                 }
@@ -578,7 +578,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             .ret => {
                 const result = stack.pop(self);
                 const finished_frame = stack.popFrame(self);
-                if (self.frames.items.len == stop_depth) {
+                if (self.frames_len == stop_depth) {
                     self.sp = finished_frame.frame_base;
                     return result;
                 }

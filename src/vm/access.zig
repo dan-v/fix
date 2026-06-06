@@ -187,7 +187,7 @@ pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_nam
 pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
     const stack = @import("stack.zig");
     const start = self.sp - scope_count;
-    const scopes = self.stack.items[start..self.sp];
+    const scopes = self.stack[start..self.sp];
 
     for (scopes) |scope| {
         const attrs_val = try force.forceValue(self, scope);
