@@ -2031,6 +2031,18 @@ test "evaluate string builtins" {
 
     try std.testing.expectError(error.TypeError, renderForTest("builtins.concatStringsSep \",\" [ 1 ]"));
 
+    const list_string_empty_lists = try renderForTest(
+        \\builtins.toJSON [
+        \\  (builtins.toString [ [ ] "a" "b" ])
+        \\  (builtins.toString [ "a" [ ] "b" ])
+        \\  (builtins.toString [ "a" "b" [ ] ])
+        \\  (builtins.toString [ "a" [ ] [ ] ])
+        \\  (builtins.toString [ "" [ ] ])
+        \\]
+    );
+    defer std.testing.allocator.free(list_string_empty_lists);
+    try std.testing.expectEqualStrings("\"[\\\"a b\\\",\\\"a b\\\",\\\"a b \\\",\\\"a \\\",\\\" \\\"]\"", list_string_empty_lists);
+
     const substring = try renderForTest("builtins.substring 1 2 \"abcd\"");
     defer std.testing.allocator.free(substring);
     try std.testing.expectEqualStrings("\"bc\"", substring);
@@ -2373,6 +2385,19 @@ test "evaluate string context builtins" {
     );
     defer std.testing.allocator.free(xml_context_drv_path);
     try std.testing.expectEqualStrings("\"/nix/store/xmzlcawiq24yfhr33qs49i0p54czwsc3-pkg.drv\"", xml_context_drv_path);
+
+    const derivation_list_trailing_empty_drv_path = try renderForTest(
+        \\let
+        \\  pkg = builtins.derivation {
+        \\    name = "pkg2";
+        \\    system = "x86_64-linux";
+        \\    builder = "/bin/sh";
+        \\    x = [ "a" "b" [ ] ];
+        \\  };
+        \\in pkg.drvPath
+    );
+    defer std.testing.allocator.free(derivation_list_trailing_empty_drv_path);
+    try std.testing.expectEqualStrings("\"/nix/store/riqzq8wvpskgpp5azvvdypvy22impx7s-pkg2.drv\"", derivation_list_trailing_empty_drv_path);
 }
 
 test "evaluate minimal derivation builtins" {

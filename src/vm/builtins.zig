@@ -3396,11 +3396,16 @@ fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
     defer context.deinit(self.allocator);
 
     var first = true;
+    var trailing_empty_list = false;
     for (try self.heap.getList(list_id)) |item| {
         const forced = try self.forceValue(item);
-        if (try skipEmptyListStringItem(self, forced)) continue;
+        if (try isEmptyListStringItem(self, forced)) {
+            if (!first) trailing_empty_list = true;
+            continue;
+        }
         if (!first) try out.append(self.allocator, ' ');
         first = false;
+        trailing_empty_list = false;
         const item_value = try coerceToStringValue(self, forced);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
@@ -3408,13 +3413,14 @@ fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
             try appendContextEntry(self, &context, entry.name, entry.value);
         }
     }
+    if (trailing_empty_list) try out.append(self.allocator, ' ');
 
     const text_id = try self.intern.intern(out.items);
     if (context.items.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
-fn skipEmptyListStringItem(self: anytype, value: Value) !bool {
+fn isEmptyListStringItem(self: anytype, value: Value) !bool {
     return value.discriminant == .list and (try self.heap.getList(value.asObjectId())).len == 0;
 }
 
@@ -3466,11 +3472,16 @@ fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
     defer context.deinit(self.allocator);
 
     var first = true;
+    var trailing_empty_list = false;
     for (try self.heap.getList(list_id)) |item| {
         const forced = try self.forceValue(item);
-        if (try skipEmptyListStringItem(self, forced)) continue;
+        if (try isEmptyListStringItem(self, forced)) {
+            if (!first) trailing_empty_list = true;
+            continue;
+        }
         if (!first) try out.append(self.allocator, ' ');
         first = false;
+        trailing_empty_list = false;
         const item_value = try coerceDerivationStringValue(self, forced);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
@@ -3478,6 +3489,7 @@ fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
             try appendContextEntry(self, &context, entry.name, entry.value);
         }
     }
+    if (trailing_empty_list) try out.append(self.allocator, ' ');
 
     const text_id = try self.intern.intern(out.items);
     if (context.items.len == 0) return Value.string(text_id);
