@@ -280,6 +280,11 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+        // Build the builtins attrset on the main thread before any helpers
+        // can race on it. `buildAttrSet` predicts the next ObjectId for
+        // the self-reference `builtins.builtins`; that prediction is only
+        // safe when no other thread is allocating objects.
+        _ = try self.ensureBuiltins();
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();

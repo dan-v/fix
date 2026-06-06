@@ -81,6 +81,16 @@ pub const DerivationStore = struct {
     }
 
     pub fn record(self: *DerivationStore, drv_path: []const u8, hash_modulo: HashModuloView, outputs: []const DrvOutput) !void {
+        // Fast path: another thread already recorded this drv_path. Drv paths
+        // are content-addressed by their inputs, so two records for the same
+        // path must carry equal hash_modulos — overwriting would invalidate
+        // any HashModuloView still in flight on another worker.
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.records.contains(drv_path)) return;
+        }
+
         const value: Record = blk: {
             const cloned_hash_modulo = try cloneHashModulo(self.allocator, hash_modulo);
             errdefer cloned_hash_modulo.deinit(self.allocator);
@@ -91,14 +101,14 @@ pub const DerivationStore = struct {
                 .outputs = cloned_outputs,
             };
         };
-        errdefer value.deinit(self.allocator);
 
         self.mu.lock();
         defer self.mu.unlock();
 
-        if (self.records.getPtr(drv_path)) |old| {
-            old.deinit(self.allocator);
-            old.* = value;
+        // Recheck under the lock — a racing recorder may have landed between
+        // the optimistic check and now.
+        if (self.records.contains(drv_path)) {
+            value.deinit(self.allocator);
             return;
         }
         const key = try self.allocator.dupe(u8, drv_path);
