@@ -220,17 +220,30 @@ pub const VM = struct {
         if (arg_count > ch.local_count) return error.InvalidCallFrame;
         const frame_base = self.sp - arg_count;
         const reserved = @as(u32, ch.local_count) - arg_count;
-        var i: u32 = 0;
-        while (i < reserved) : (i += 1) {
-            try self.push(Value.null_val);
+
+        // Stack and frame buffers are preallocated in init; reserve hot-path
+        // slots directly instead of re-entering ArrayList growth checks.
+        const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+        if (reserved > stack_cap - self.sp) return error.StackOverflow;
+        const start = self.sp;
+        const new_sp = start + reserved;
+        const start_idx: usize = @intCast(start);
+        const new_sp_idx: usize = @intCast(new_sp);
+        if (new_sp_idx > self.stack.items.len) {
+            self.stack.items.len = new_sp_idx;
         }
-        try self.frames.append(self.allocator, .{
+        @memset(self.stack.items[start_idx..new_sp_idx], Value.null_val);
+        self.sp = new_sp;
+
+        const frame_index = self.frames.items.len;
+        self.frames.items.len = frame_index + 1;
+        self.frames.items[frame_index] = .{
             .chunk_ptr = ch,
             .ip = 0,
             .frame_base = frame_base,
             .local_count = ch.local_count,
             .closure_id = closure_id,
-        });
+        };
     }
 
     fn popFrame(self: *VM) Frame {
@@ -244,14 +257,13 @@ pub const VM = struct {
     // ---- stack ops ----
 
     fn push(self: *VM, val: Value) !void {
-        if (self.sp >= self.stack.items.len) {
-            if (self.stack.items.len >= types.VM_STACK_CAP) return error.StackOverflow;
-            try self.stack.append(self.allocator, val);
-            self.sp = @intCast(self.stack.items.len);
-        } else {
-            self.stack.items[self.sp] = val;
-            self.sp += 1;
+        if (@as(usize, self.sp) >= types.VM_STACK_CAP) return error.StackOverflow;
+        const index: usize = @intCast(self.sp);
+        if (index >= self.stack.items.len) {
+            self.stack.items.len = index + 1;
         }
+        self.stack.items[index] = val;
+        self.sp += 1;
     }
 
     fn pop(self: *VM) Value {
@@ -860,7 +872,7 @@ pub const VM = struct {
         }
 
         if (isStringComparable(va) and isStringComparable(vb)) {
-            return (try self.stringTextInternId(try self.stringLikeValue(va))) == (try self.stringTextInternId(try self.stringLikeValue(vb)));
+            return (try self.stringTextInternId(va)) == (try self.stringTextInternId(vb));
         }
         if (va.discriminant != vb.discriminant) return false;
         return switch (va.discriminant) {
@@ -937,7 +949,7 @@ pub const VM = struct {
         const type_value = attrValue(entries, type_name) orelse return false;
         const forced = try self.forceValue(type_value);
         if (!isStringComparable(forced)) return false;
-        const text_id = try self.stringTextInternId(try self.stringLikeValue(forced));
+        const text_id = try self.stringTextInternId(forced);
         return text_id == derivation_type;
     }
 
