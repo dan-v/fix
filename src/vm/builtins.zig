@@ -3133,16 +3133,26 @@ fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !Valu
     const right = try self.forceValue(right_arg);
     if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
 
-    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    const left_entries = try self.heap.getAttrs(left.asObjectId());
+    const right_entries = try self.heap.getAttrs(right.asObjectId());
+
+    var entries = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, @min(left_entries.len, right_entries.len));
     defer entries.deinit(self.allocator);
 
-    const right_entries = try self.heap.getAttrs(right.asObjectId());
-    for (right_entries) |entry| {
-        _ = self.heap.getAttrValue(left.asObjectId(), entry.name) catch |err| switch (err) {
-            error.MissingAttribute => continue,
-            else => return err,
-        };
-        try entries.append(self.allocator, entry);
+    var left_i: usize = 0;
+    var right_i: usize = 0;
+    while (left_i < left_entries.len and right_i < right_entries.len) {
+        const left_entry = left_entries[left_i];
+        const right_entry = right_entries[right_i];
+        if (left_entry.name < right_entry.name) {
+            left_i += 1;
+        } else if (left_entry.name > right_entry.name) {
+            right_i += 1;
+        } else {
+            entries.appendAssumeCapacity(right_entry);
+            left_i += 1;
+            right_i += 1;
+        }
     }
 
     return Value.attrs(try self.heap.addAttrs(entries.items));
