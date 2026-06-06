@@ -823,6 +823,12 @@ pub const VM = struct {
         if (items.len == 0) return false;
 
         const forced_needle = try self.forceValue(needle);
+        return self.valueSliceContainsForcedValue(forced_needle, items);
+    }
+
+    pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, items: []const Value) anyerror!bool {
+        if (items.len == 0) return false;
+
         var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
         defer seen.deinit(self.allocator);
 

@@ -1046,9 +1046,7 @@ fn genericClosureAppend(
     const forced = try self.forceValue(item);
     if (forced.discriminant != .attrs) return error.TypeError;
     const key = try self.forceValue(try self.heap.getAttrValue(forced.asObjectId(), try self.intern.intern("key")));
-    for (keys.items) |seen| {
-        if (try self.valuesEqual(seen, key)) return;
-    }
+    if (try self.valueSliceContainsForcedValue(key, keys.items)) return;
     try keys.append(self.allocator, key);
     try result.append(self.allocator, item);
 }
