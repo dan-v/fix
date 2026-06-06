@@ -16,6 +16,9 @@ pub fn build(b: *std.Build) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    const profile = b.option(bool, "profile", "Keep symbols and frame pointers for profiling") orelse false;
+    const strip: ?bool = if (profile) false else null;
+    const omit_frame_pointer: ?bool = if (profile) false else null;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -39,17 +42,24 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
     });
 
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
     });
     const harness_mod = b.createModule(.{
         .root_source_file = b.path("test/harness.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -81,6 +91,8 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
@@ -106,6 +118,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/integration_diff.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .imports = &.{
                 .{ .name = "fix-cli", .module = cli_mod },
                 .{ .name = "harness", .module = harness_mod },
@@ -119,6 +133,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/nixpkgs_check.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .imports = &.{
                 .{ .name = "harness", .module = harness_mod },
             },
@@ -200,6 +216,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/integration_diff.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .imports = &.{
                 .{ .name = "fix-cli", .module = cli_mod },
                 .{ .name = "harness", .module = harness_mod },
@@ -213,6 +231,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("test/nixpkgs_check.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .omit_frame_pointer = omit_frame_pointer,
             .imports = &.{
                 .{ .name = "harness", .module = harness_mod },
             },
