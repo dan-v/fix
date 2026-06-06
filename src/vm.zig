@@ -597,6 +597,28 @@ pub const VM = struct {
                     frame.ip += 2;
                     try self.makeClosure(ch_id, upvalue_count);
                 },
+                .closure_captures => {
+                    const ch_id: u16 = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const descriptor_len = @as(usize, upvalue_count) * 3;
+                    if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
+                    const descriptors = code[frame.ip .. frame.ip + descriptor_len];
+                    frame.ip += descriptor_len;
+                    try self.makeClosureFromCaptures(ch_id, descriptors, frame);
+                },
+                .closure_captures_long => {
+                    const ch_id: ChunkId = readU32(code, frame.ip);
+                    frame.ip += 4;
+                    const upvalue_count = readU16(code, frame.ip);
+                    frame.ip += 2;
+                    const descriptor_len = @as(usize, upvalue_count) * 3;
+                    if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
+                    const descriptors = code[frame.ip .. frame.ip + descriptor_len];
+                    frame.ip += descriptor_len;
+                    try self.makeClosureFromCaptures(ch_id, descriptors, frame);
+                },
 
                 // ---- calls ----
                 .call => {
@@ -1508,6 +1530,35 @@ pub const VM = struct {
         const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
         self.sp = start;
         try self.push(Value.closure(id));
+    }
+
+    fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+        const upvalue_count = descriptors.len / 3;
+        const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+        if (upvalue_count > @as(usize, stack_cap - self.sp)) return error.StackOverflow;
+
+        var current_closure: ?Closure = null;
+        var out_index = self.sp;
+        var i: usize = 0;
+        while (i < descriptors.len) : (i += 3) {
+            const capture_index = readU16(descriptors, i + 1);
+            const captured = switch (descriptors[i]) {
+                0 => self.stack.items[frame.frame_base + capture_index],
+                1 => value: {
+                    if (current_closure == null) {
+                        const closure_id = frame.closure_id orelse return error.MissingClosure;
+                        current_closure = try self.getClosureById(closure_id);
+                    }
+                    break :value current_closure.?.upvalues[capture_index];
+                },
+                else => return error.InvalidBytecode,
+            };
+            self.stack.items[out_index] = captured;
+            out_index += 1;
+        }
+
+        self.sp = out_index;
+        try self.makeClosure(chunk_id, @intCast(upvalue_count));
     }
 
     // ---- calls ----

@@ -109,6 +109,13 @@ pub const OpCode = enum(u8) {
     /// Create a closure whose chunk id does not fit in the short form.
     /// Operand: 4-byte ChunkId, 2-byte upvalue count.
     closure_long,
+    /// Create a closure and fill upvalues from inline capture descriptors.
+    /// Operand: 2-byte ChunkId, 2-byte count, then repeated
+    /// 1-byte kind (0=local, 1=upvalue), 2-byte index.
+    closure_captures,
+    /// Wide-chunk-id form of closure_captures.
+    /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
+    closure_captures_long,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.

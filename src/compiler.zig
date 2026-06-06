@@ -319,6 +319,27 @@ pub const Compiler = struct {
         try self.builder.writeU16(self.allocator, upvalue_count);
     }
 
+    fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+        if (captures.len == 0) return self.emitClosure(chunk_id, 0);
+        const upvalue_count = try captureCount(captures.len);
+
+        if (chunk_id <= std.math.maxInt(u16)) {
+            try self.emitOpU16(.closure_captures, @intCast(chunk_id));
+        } else {
+            try self.emitOp(.closure_captures_long);
+            try self.builder.writeU32(self.allocator, chunk_id);
+        }
+        try self.builder.writeU16(self.allocator, upvalue_count);
+
+        for (captures) |capture| {
+            try self.builder.writeByte(self.allocator, switch (capture.kind) {
+                .local => 0,
+                .upvalue => 1,
+            });
+            try self.builder.writeU16(self.allocator, capture.index);
+        }
+    }
+
     // ---- atom compilers ----
 
     fn compileInt(self: *Compiler, node: *const Node) !void {
@@ -686,8 +707,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
     }
 
     fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
@@ -768,8 +788,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
     }
 
     fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
@@ -804,8 +823,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
         try self.emitOp(.make_thunk);
     }
 
@@ -967,8 +985,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
         try self.emitOp(.make_thunk);
     }
 
@@ -979,15 +996,6 @@ pub const Compiler = struct {
             .span = atom,
         };
         try self.compileThunk(&node);
-    }
-
-    fn emitCaptures(self: *Compiler, captures: []const Capture) !void {
-        for (captures) |capture| {
-            switch (capture.kind) {
-                .local => try self.emitCaptureLocal(capture.index),
-                .upvalue => try self.emitOpU16(.capture_upvalue, capture.index),
-            }
-        }
     }
 
     fn compileIfElse(self: *Compiler, node: *const Node) !void {
@@ -1260,8 +1268,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
         try self.emitOp(.make_thunk);
     }
 
@@ -1562,8 +1569,7 @@ pub const Compiler = struct {
 
         const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
         const child_id = try self.registry.register(child_chunk);
-        try self.emitCaptures(child.captures.items);
-        try self.emitClosure(child_id, try captureCount(child.captures.items.len));
+        try self.emitClosureWithCaptures(child_id, child.captures.items);
         try self.emitOp(.make_thunk);
     }
 
