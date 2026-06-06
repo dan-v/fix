@@ -445,18 +445,18 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
         .value = try buildNixPathValue(intern, heap, nix_path),
     });
     // Self-reference: `builtins.builtins` points back at the attrset we're
-    // about to add. We predict its ObjectId as the heap's current object
-    // count, since `addAttrs` immediately below allocates exactly one new
-    // object. This is single-threaded-only — `Evaluator.evaluate` calls
-    // `ensureBuiltins` on the main thread before `scheduler.start`, so no
-    // helper can interleave object allocations between this prediction and
-    // the addAttrs call.
+    // about to add. Reserve an object slot up front, embed its id in the
+    // entries, then fill the slot once we have the AttrRange. This is
+    // single-threaded — `Evaluator.evaluate` calls `ensureBuiltins` before
+    // `scheduler.start` — so no other thread can observe the in-flight slot.
+    const self_id = try heap.reserveObjectSlot();
     entries.appendAssumeCapacity(.{
         .name = try intern.intern("builtins"),
-        .value = Value.attrs(heap.objects.count()),
+        .value = Value.attrs(self_id),
     });
-
-    return Value.attrs(try heap.addAttrs(entries.items));
+    const attr_range = try heap.prepareAttrsRange(entries.items);
+    heap.fillObjectSlot(self_id, .{ .attrs = attr_range }, .none);
+    return Value.attrs(self_id);
 }
 
 fn builtinEntry(intern: *InternTable, binding: BuiltinBinding) !AttrEntry {

@@ -117,6 +117,7 @@ const HeapObject = struct {
 /// The `objects` store is still global so that `objects.count()` reflects
 /// the next ObjectId assigned — `buildAttrSet` predicts that id to
 /// construct the `builtins.builtins` self-reference.
+const OBJECT_CHUNK_SIZE: u32 = 256;
 const VALUE_CHUNK_SIZE: u32 = 1024;
 const ATTR_CHUNK_SIZE: u32 = 512;
 const ATTR_POS_CHUNK_SIZE: u32 = 256;
@@ -140,6 +141,7 @@ const LocalChunk = struct {
 };
 
 pub const HeapLocal = struct {
+    object: LocalChunk = .{},
     value: LocalChunk = .{},
     attr: LocalChunk = .{},
     attr_pos: LocalChunk = .{},
@@ -229,11 +231,43 @@ pub const ObjectHeap = struct {
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
-        return self.objects.append(self.allocator, .{ .payload = object, .meta = .none });
+        const id = try self.reserveObjectSlot();
+        self.fillObjectSlot(id, object, .none);
+        return id;
     }
 
     pub fn addWithMeta(self: *ObjectHeap, object: Object, meta: ObjectMeta) !ObjectId {
-        return self.objects.append(self.allocator, .{ .payload = object, .meta = meta });
+        const id = try self.reserveObjectSlot();
+        self.fillObjectSlot(id, object, meta);
+        return id;
+    }
+
+    /// Reserve an object slot and return its ObjectId without filling
+    /// payload. The slot's contents are undefined until `fillObjectSlot`
+    /// is called. The ID is only valid to expose once the slot has been
+    /// filled — concurrent readers reaching the slot before that would
+    /// see garbage. Currently used only at build-time for the
+    /// `builtins.builtins` self-reference, where no other thread can
+    /// observe the in-flight slot.
+    pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
+        const local = self.currentLocal();
+        const chunk = &local.object;
+        if (chunk.cursor < chunk.end) {
+            const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
+            chunk.cursor += 1;
+            return id;
+        }
+        const refilled = try self.objects.reserve(self.allocator, OBJECT_CHUNK_SIZE);
+        chunk.segment = refilled.segment;
+        chunk.cursor = refilled.offset;
+        chunk.end = refilled.offset + refilled.len;
+        const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
+        chunk.cursor += 1;
+        return id;
+    }
+
+    pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object, meta: ObjectMeta) void {
+        self.objects.getMut(id).* = .{ .payload = object, .meta = meta };
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
@@ -367,11 +401,19 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
+        const range = try self.prepareAttrsRange(entries);
+        return self.add(.{ .attrs = range });
+    }
+
+    /// Allocate + sort + dedup an AttrRange without wrapping it in an
+    /// object slot. Used by reserve+fill flows where the caller wants
+    /// to compute the final attrs payload before publishing the
+    /// containing slot's id.
+    pub fn prepareAttrsRange(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.appendAttrEntries(entries);
-        errdefer self.attrs.rollback(range);
         self.sortAttrs(range);
         try self.rejectDuplicateAttrs(range);
-        return self.add(.{ .attrs = range });
+        return range;
     }
 
     pub fn addAttrsWithPositions(

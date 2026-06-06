@@ -249,7 +249,7 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return .{ .segment = @intCast(seg), .offset = offset, .len = 1 };
         }
 
-        fn globalIdOf(segment: u32, offset: u32) u32 {
+        pub fn globalIdOf(segment: u32, offset: u32) u32 {
             return segmentStart(segment) + offset;
         }
 
