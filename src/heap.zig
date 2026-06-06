@@ -68,6 +68,13 @@ pub const ContextString = struct {
     context: []const AttrEntry,
 };
 
+pub const PendingBytecodeThunk = struct {
+    chunk_id: ChunkId,
+    page: u32,
+    start: u32,
+    len: u32,
+};
+
 const BuiltinClosureObject = struct {
     builtin_id: u16,
     args: ValueRange,
@@ -450,6 +457,30 @@ pub const ObjectHeap = struct {
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.valueSlice(range)) });
     }
 
+    pub fn beginBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalue_count: usize) !PendingBytecodeThunk {
+        const range = try self.reserveValues(upvalue_count);
+        return .{
+            .chunk_id = chunk_id,
+            .page = range.page,
+            .start = range.start,
+            .len = range.len,
+        };
+    }
+
+    pub fn pendingBytecodeThunkUpvalues(self: *ObjectHeap, pending: PendingBytecodeThunk) []Value {
+        return self.valueSliceMut(pendingBytecodeThunkRange(pending));
+    }
+
+    pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
+        const range = pendingBytecodeThunkRange(pending);
+        errdefer self.rollbackValues(range);
+        return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.valueSlice(range)) });
+    }
+
+    pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {
+        self.rollbackValues(pendingBytecodeThunkRange(pending));
+    }
+
     pub fn addCell(self: *ObjectHeap, cell: Cell) !ObjectId {
         return self.add(.{ .cell = cell });
     }
@@ -484,6 +515,14 @@ pub const ObjectHeap = struct {
         const start: usize = range.start;
         const end = start + range.len;
         return self.value_pages.items[@intCast(range.page)][start..end];
+    }
+
+    fn pendingBytecodeThunkRange(pending: PendingBytecodeThunk) ValueRange {
+        return .{
+            .page = pending.page,
+            .start = pending.start,
+            .len = pending.len,
+        };
     }
 
     fn attrSlice(self: *const ObjectHeap, range: AttrRange) []const AttrEntry {

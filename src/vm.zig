@@ -1589,19 +1589,40 @@ pub const VM = struct {
         return @intCast(upvalue_count);
     }
 
+    fn fillCaptureValues(self: *VM, descriptors: []const u8, frame: *const Frame, out: []Value) !void {
+        std.debug.assert(out.len == descriptors.len / 3);
+
+        var current_upvalues: ?[]const Value = null;
+        var out_index: usize = 0;
+        var i: usize = 0;
+        while (i < descriptors.len) : (i += 3) {
+            const capture_index = readU16(descriptors, i + 1);
+            out[out_index] = switch (descriptors[i]) {
+                0 => self.stack.items[frame.frame_base + capture_index],
+                1 => value: {
+                    if (current_upvalues == null) {
+                        current_upvalues = frame.upvalues orelse return error.MissingClosure;
+                    }
+                    break :value current_upvalues.?[capture_index];
+                },
+                else => return error.InvalidBytecode,
+            };
+            out_index += 1;
+        }
+    }
+
     fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
         const upvalue_count = try self.stageCaptureDescriptors(descriptors, frame);
         try self.makeClosure(chunk_id, upvalue_count);
     }
 
     fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-        const start = self.sp;
-        _ = try self.stageCaptureDescriptors(descriptors, frame);
-        const id = self.heap.addBytecodeThunk(chunk_id, self.stack.items[start..self.sp]) catch |err| {
-            self.sp = start;
-            return err;
-        };
-        self.sp = start;
+        const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
+        var committed = false;
+        errdefer if (!committed) self.heap.rollbackBytecodeThunk(pending);
+        try self.fillCaptureValues(descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
+        const id = try self.heap.commitBytecodeThunk(pending);
+        committed = true;
         try self.push(Value.thunk(id));
     }
 
