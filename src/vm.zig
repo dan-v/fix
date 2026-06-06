@@ -1036,7 +1036,14 @@ pub const VM = struct {
         return self.forceThunkFallible(thunk_val);
     }
 
-    pub fn forceValue(self: *VM, value: Value) anyerror!Value {
+    pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
+        return switch (value.discriminant) {
+            .thunk, .cell => try self.forceLazyValue(value),
+            else => value,
+        };
+    }
+
+    noinline fn forceLazyValue(self: *VM, value: Value) anyerror!Value {
         return switch (value.discriminant) {
             .thunk => try self.forceThunkFallible(value),
             .cell => {
@@ -1046,7 +1053,7 @@ pub const VM = struct {
                 try self.heap.setCellValue(cell_id, forced);
                 return forced;
             },
-            else => value,
+            else => unreachable,
         };
     }
 
