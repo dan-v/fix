@@ -819,6 +819,20 @@ pub const VM = struct {
         return self.valuesEqualSeen(a, b, &seen);
     }
 
+    pub fn listContainsValue(self: *VM, needle: Value, items: []const Value) anyerror!bool {
+        if (items.len == 0) return false;
+
+        const forced_needle = try self.forceValue(needle);
+        var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
+        defer seen.deinit(self.allocator);
+
+        for (items) |item| {
+            seen.clearRetainingCapacity();
+            if (try self.valuesEqualSeenForcedLeft(forced_needle, item, &seen)) return true;
+        }
+        return false;
+    }
+
     const EqualityPair = struct {
         left: Value,
         right: Value,
@@ -826,8 +840,15 @@ pub const VM = struct {
 
     fn valuesEqualSeen(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
         const va = try self.forceValue(a);
-        const vb = try self.forceValue(b);
+        return self.valuesEqualSeenForcedLeft(va, b, seen);
+    }
 
+    fn valuesEqualSeenForcedLeft(self: *VM, va: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+        const vb = try self.forceValue(b);
+        return self.valuesEqualForced(va, vb, seen);
+    }
+
+    fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
         if (numeric.isNumeric(va) and numeric.isNumeric(vb)) {
             return try numeric.toFloat(va) == try numeric.toFloat(vb);
         }

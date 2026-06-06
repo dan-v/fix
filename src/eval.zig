@@ -1295,6 +1295,10 @@ test "evaluate elem builtin" {
     const short_circuit = try renderForTest("builtins.elem 1 [ 1 (1 / 0) ]");
     defer std.testing.allocator.free(short_circuit);
     try std.testing.expectEqualStrings("true", short_circuit);
+
+    const empty_list_lazy_needle = try renderForTest("builtins.elem (builtins.throw \"needle\") [ ]");
+    defer std.testing.allocator.free(empty_list_lazy_needle);
+    try std.testing.expectEqualStrings("false", empty_list_lazy_needle);
 }
 
 test "evaluate seq builtin" {

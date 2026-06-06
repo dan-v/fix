@@ -1131,10 +1131,7 @@ fn builtinElem(self: anytype, needle: Value, list_arg: Value) !Value {
     if (list.discriminant != .list) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
-    for (items) |item| {
-        if (try self.valuesEqual(needle, item)) return Value.boolVal(true);
-    }
-    return Value.boolVal(false);
+    return Value.boolVal(try self.listContainsValue(needle, items));
 }
 
 fn builtinSeq(self: anytype, first: Value, second: Value) !Value {
