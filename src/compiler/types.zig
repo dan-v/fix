@@ -1,0 +1,67 @@
+const std = @import("std");
+const ast = @import("../ast.zig");
+const base_types = @import("../types.zig");
+
+const InternId = base_types.InternId;
+const Node = ast.Node;
+
+/// A local variable tracked during compilation.
+pub const Local = struct {
+    name: []const u8,
+    name_id: InternId,
+    depth: u8,
+    /// Index from frame base on the stack.
+    slot: u16,
+};
+
+pub const Capture = struct {
+    pub const Kind = enum { local, upvalue };
+
+    name: []const u8,
+    kind: Kind,
+    index: u16,
+};
+
+pub const WithScope = struct {
+    kind: Capture.Kind,
+    index: u16,
+};
+
+pub const AttrEntryView = struct {
+    path: []const Node.Atom,
+    expr: *const Node,
+    inherit_outer: bool = false,
+};
+
+pub const AttrEntryGroup = struct {
+    first: Node.Atom,
+    name: []const u8,
+    name_id: InternId,
+    leaf: ?AttrEntryView = null,
+    duplicate_leaf: ?AttrEntryView = null,
+    leaves: []AttrEntryView = &.{},
+    leaf_count: usize = 0,
+    first_nested: ?AttrEntryView = null,
+    tails: []AttrEntryView = &.{},
+    tail_count: usize = 0,
+};
+
+pub const AttrEntryGroups = struct {
+    groups: []AttrEntryGroup = &.{},
+    leaves: []AttrEntryView = &.{},
+    tails: []AttrEntryView = &.{},
+
+    pub fn deinit(self: *AttrEntryGroups, allocator: std.mem.Allocator) void {
+        allocator.free(self.leaves);
+        allocator.free(self.tails);
+        for (self.groups) |group| allocator.free(group.name);
+        allocator.free(self.groups);
+        self.* = .{};
+    }
+};
+
+pub const ContainerValueOptions = struct {
+    raw_identifier: bool = false,
+};
+
+pub const with_capture_name = "\x00with";
