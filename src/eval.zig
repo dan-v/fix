@@ -362,8 +362,14 @@ pub const Evaluator = struct {
             &self.fetchers,
             &self.derivations,
             &self.scheduler,
-            &self.run.trace,
-            self.progress,
+            // Helpers (worker_id != 0) don't write to the shared trace or
+            // emit progress events. Both are observable side effects of
+            // *real* evaluation — speculative force must stay invisible to
+            // them. `std.Progress.Node.start` in particular asserts a
+            // single-writer invariant on the parent slot which speculation
+            // would violate.
+            if (worker_id == 0) &self.run.trace else null,
+            if (worker_id == 0) self.progress else null,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,
