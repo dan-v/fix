@@ -9,6 +9,7 @@ pub const scanner = @import("scanner.zig");
 pub const string_syntax = @import("string_syntax.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
+pub const bytecode = @import("bytecode.zig");
 pub const opcode = @import("opcode.zig");
 pub const chunk = @import("chunk.zig");
 pub const heap = @import("heap.zig");

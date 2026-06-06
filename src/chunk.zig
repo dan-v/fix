@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const bytecode = @import("bytecode.zig");
 const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("value.zig").Value;
 const AttrEntry = @import("heap.zig").AttrEntry;
@@ -86,16 +87,12 @@ pub const ChunkBuilder = struct {
 
     /// Write a two-byte operand (little-endian).
     pub fn writeU16(self: *ChunkBuilder, allocator: std.mem.Allocator, val: u16) !void {
-        try self.code.append(allocator, @truncate(val));
-        try self.code.append(allocator, @truncate(val >> 8));
+        try bytecode.writeU16(&self.code, allocator, val);
     }
 
     /// Write a four-byte operand (little-endian).
     pub fn writeU32(self: *ChunkBuilder, allocator: std.mem.Allocator, val: u32) !void {
-        try self.code.append(allocator, @truncate(val));
-        try self.code.append(allocator, @truncate(val >> 8));
-        try self.code.append(allocator, @truncate(val >> 16));
-        try self.code.append(allocator, @truncate(val >> 24));
+        try bytecode.writeU32(&self.code, allocator, val);
     }
 
     /// Add a constant to the pool and return its index.

@@ -16,6 +16,7 @@ const Value = @import("value.zig").Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
+const bytecode_mod = @import("bytecode.zig");
 const opcode = @import("opcode.zig");
 const OpCode = opcode.OpCode;
 const build_options = @import("build_options");
@@ -736,8 +737,8 @@ pub const VM = struct {
                         const tag = code[frame.ip];
                         frame.ip += 1;
                         switch (tag) {
-                            0 => frame.ip += 4,
-                            1 => {},
+                            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => frame.ip += 4,
+                            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
                             else => return error.InvalidBytecode,
                         }
                     }
@@ -795,8 +796,8 @@ pub const VM = struct {
                         const tag = code[frame.ip];
                         frame.ip += 1;
                         switch (tag) {
-                            0 => frame.ip += 4,
-                            1 => {},
+                            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => frame.ip += 4,
+                            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
                             else => return error.InvalidBytecode,
                         }
                     }
@@ -1860,13 +1861,13 @@ pub const VM = struct {
             const tag = encoded_segments[offset];
             offset += 1;
             const name_id: InternId = switch (tag) {
-                0 => name: {
+                @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => name: {
                     if (current.discriminant != .attrs) return self.forceValue(default_val);
                     const id = readU32(encoded_segments, offset);
                     offset += 4;
                     break :name id;
                 },
-                1 => name: {
+                @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                     const name_val = try self.forceValue(dynamic_names[dynamic_i]);
                     if (name_val.discriminant != .string) return error.TypeError;
                     dynamic_i += 1;
@@ -1909,13 +1910,13 @@ pub const VM = struct {
             const tag = encoded_segments[offset];
             offset += 1;
             const name_id: InternId = switch (tag) {
-                0 => name: {
+                @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => name: {
                     if (current.discriminant != .attrs) return false;
                     const id = readU32(encoded_segments, offset);
                     offset += 4;
                     break :name id;
                 },
-                1 => name: {
+                @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                     const name_val = try self.forceValue(dynamic_names[dynamic_i]);
                     if (name_val.discriminant != .string) return error.TypeError;
                     dynamic_i += 1;
@@ -1982,16 +1983,13 @@ pub const VM = struct {
 // ---- free functions (don't take self) ----
 
 fn readU16(code: []const u8, ip: usize) u16 {
-    return @as(u16, code[ip]) | (@as(u16, code[ip + 1]) << 8);
+    return bytecode_mod.readU16(code, ip);
 }
 
 fn readU32(code: []const u8, ip: usize) u32 {
-    return @as(u32, code[ip]) |
-        (@as(u32, code[ip + 1]) << 8) |
-        (@as(u32, code[ip + 2]) << 16) |
-        (@as(u32, code[ip + 3]) << 24);
+    return bytecode_mod.readU32(code, ip);
 }
 
 fn readInternId(code: []const u8, ip: usize, wide: bool) InternId {
-    return if (wide) readU32(code, ip) else @intCast(readU16(code, ip));
+    return bytecode_mod.readInternId(code, ip, wide);
 }
