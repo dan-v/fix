@@ -1,7 +1,7 @@
 //! Evaluation error messages and Nix-style error contexts.
 
 const std = @import("std");
-const diagnostic = @import("diagnostic.zig");
+const diagnostic = @import("../diagnostic.zig");
 
 pub const Trace = struct {
     pub const Frame = struct {

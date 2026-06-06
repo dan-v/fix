@@ -4,7 +4,7 @@
 //! formatting primitives. Evaluation progress itself is backed by `std.Progress`.
 
 const std = @import("std");
-const eval_progress = @import("eval_progress.zig");
+const eval_progress = @import("eval/progress.zig");
 
 pub const When = enum {
     auto,

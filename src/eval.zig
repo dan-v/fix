@@ -12,6 +12,8 @@ const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
+const vm_force = @import("vm/force.zig");
+const vm_builtins = @import("vm/builtins.zig");
 const ObjectHeap = @import("heap.zig").ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
@@ -22,8 +24,8 @@ const ThunkState = @import("thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
-const eval_trace = @import("eval_trace.zig");
-const eval_progress = @import("eval_progress.zig");
+const eval_trace = @import("eval/trace.zig");
+const eval_progress = @import("eval/progress.zig");
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
 
@@ -322,7 +324,7 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0);
         defer vm.deinit();
 
-        try vm.writeJsonValue(writer, value);
+        try vm_builtins.writeJsonValue(&vm, writer, value);
     }
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
@@ -332,7 +334,7 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0);
         defer vm.deinit();
 
-        try vm.writeXmlValue(writer, value);
+        try vm_builtins.writeLazyXmlValue(&vm, writer, value);
     }
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
@@ -340,7 +342,7 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0);
         defer vm.deinit();
 
-        return vm.forceValue(value);
+        return vm_force.forceValue(&vm, value);
     }
 
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
@@ -350,7 +352,7 @@ pub const Evaluator = struct {
         var vm = try self.initVm(0);
         defer vm.deinit();
 
-        try vm.forceDeep(value);
+        try vm_force.forceDeep(&vm, value);
     }
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
