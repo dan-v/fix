@@ -108,6 +108,7 @@ pub const VM = struct {
         worker_id: u8,
     ) !VM {
         var stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP);
+        stack.items.len = types.VM_STACK_CAP;
         errdefer stack.deinit(allocator);
 
         var frames = try std.ArrayListUnmanaged(Frame).initCapacity(allocator, types.MAX_FRAMES);
@@ -229,9 +230,6 @@ pub const VM = struct {
         const new_sp = start + reserved;
         const start_idx: usize = @intCast(start);
         const new_sp_idx: usize = @intCast(new_sp);
-        if (new_sp_idx > self.stack.items.len) {
-            self.stack.items.len = new_sp_idx;
-        }
         @memset(self.stack.items[start_idx..new_sp_idx], Value.null_val);
         self.sp = new_sp;
 
@@ -259,9 +257,6 @@ pub const VM = struct {
     fn push(self: *VM, val: Value) !void {
         if (@as(usize, self.sp) >= types.VM_STACK_CAP) return error.StackOverflow;
         const index: usize = @intCast(self.sp);
-        if (index >= self.stack.items.len) {
-            self.stack.items.len = index + 1;
-        }
         self.stack.items[index] = val;
         self.sp += 1;
     }
@@ -1545,9 +1540,6 @@ pub const VM = struct {
         const frame_base = frame.frame_base;
         const arg_end = frame_base + 1;
         if (arg_end > stack_cap) return error.StackOverflow;
-        if (@as(usize, arg_end) > self.stack.items.len) {
-            self.stack.items.len = @intCast(arg_end);
-        }
         self.stack.items[frame_base] = arg;
 
         const reserved = @as(u32, ch.local_count) - 1;
@@ -1555,9 +1547,6 @@ pub const VM = struct {
         const new_sp = arg_end + reserved;
         const arg_end_idx: usize = @intCast(arg_end);
         const new_sp_idx: usize = @intCast(new_sp);
-        if (new_sp_idx > self.stack.items.len) {
-            self.stack.items.len = new_sp_idx;
-        }
         @memset(self.stack.items[arg_end_idx..new_sp_idx], Value.null_val);
         self.sp = new_sp;
 
