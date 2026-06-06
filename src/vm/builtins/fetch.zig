@@ -12,11 +12,17 @@ const path_ops = @import("../../runtime/paths.zig");
 const source_paths = @import("../../runtime/source_path.zig");
 const collections = @import("collections.zig");
 const strings = @import("strings.zig");
+const string_context = @import("string_context.zig");
+const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
+const vm_equality = @import("../equality.zig");
+const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
 const attrEntryNameIndex = collections.attrEntryNameIndex;
 const coerceStringContextValue = strings.coerceStringContextValue;
-const contextEntriesForValue = strings.contextEntriesForValue;
-const contextStringWithPath = strings.contextStringWithPath;
+const contextEntriesForValue = string_context.contextEntriesForValue;
+const contextStringWithPath = string_context.contextStringWithPath;
 const isPlainString = strings.isPlainString;
 const isStringLike = strings.isStringLike;
 const pathArg = strings.pathArg;
@@ -32,7 +38,7 @@ pub fn builtinGetEnv(self: anytype, name_arg: Value) !Value {
 }
 
 pub fn builtinToPath(self: anytype, arg: Value) !Value {
-    const value = try self.forceValue(arg);
+    const value = try vm_force.forceValue(self, arg);
     const text_id: InternId = switch (value.discriminant) {
         .path, .string, .string_context => try stringTextInternId(self, value),
         else => return error.TypeError,
@@ -43,7 +49,7 @@ pub fn builtinToPath(self: anytype, arg: Value) !Value {
 }
 
 pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value {
-    const name_value = try self.forceValue(name_arg);
+    const name_value = try vm_force.forceValue(self, name_arg);
     if (!isStringLike(name_value)) return error.TypeError;
 
     const name_id = try stringTextInternId(self, name_value);
@@ -82,7 +88,7 @@ fn validateStorePathName(name: []const u8) !void {
 }
 
 pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
-    const pred = try self.forceValue(pred_arg);
+    const pred = try vm_force.forceValue(self, pred_arg);
     const root_arg = try pathArg(self, path_arg);
     const root = try self.allocator.dupe(u8, root_arg);
     defer self.allocator.free(root);
@@ -175,7 +181,7 @@ fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
 }
 
 fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
-    const value = try self.forceValue(arg);
+    const value = try vm_force.forceValue(self, arg);
     if (value.discriminant != .attrs) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
@@ -235,7 +241,7 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
 }
 
 fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
-    const value = try self.forceValue(arg);
+    const value = try vm_force.forceValue(self, arg);
     if (value.discriminant != .attrs) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
@@ -300,7 +306,7 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
 }
 
 fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
-    const value = try self.forceValue(arg);
+    const value = try vm_force.forceValue(self, arg);
     if (value.discriminant != .attrs) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
@@ -368,7 +374,7 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
 }
 
 pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
-    const attrs = try self.forceValue(arg);
+    const attrs = try vm_force.forceValue(self, arg);
     if (attrs.discriminant == .path) {
         const path = self.intern.get(attrs.asInternId());
         const nar_hash = try self.fetchers.sourceHash(path, "");
@@ -457,17 +463,17 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     defer self.allocator.free(flake_path);
 
     const host = self.import_host orelse return error.ImportUnavailable;
-    const flake_value = try self.forceValue(try host.import_value(host.context, flake_path));
+    const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path));
     if (flake_value.discriminant != .attrs) return error.TypeError;
 
     const outputs_id = try self.intern.intern("outputs");
-    const outputs_func = try self.forceValue(try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
+    const outputs_func = try vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
     const self_input = try flakeSelfInput(self, source_info);
     const inputs_entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("self"), .value = self_input },
     };
     const inputs = Value.attrs(try self.heap.addAttrs(&inputs_entries));
-    const outputs = try self.forceValue(try self.callValue(outputs_func, inputs));
+    const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, inputs));
     if (outputs.discriminant != .attrs) return error.TypeError;
 
     return flakeResultValue(self, source_info, inputs, outputs);
@@ -554,7 +560,7 @@ pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
 }
 
 pub fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
-    const attrs = try self.forceValue(arg);
+    const attrs = try vm_force.forceValue(self, arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
     const type_value = try requiredStringAttr(self, attrs.asObjectId(), "type");
@@ -629,7 +635,7 @@ fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {
 
 fn dupPathAttr(self: anytype, attrs_id: ObjectId, name: []const u8) ![]u8 {
     const name_id = try self.intern.intern(name);
-    const value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
+    const value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     return switch (value.discriminant) {
         .path, .string, .string_context => self.allocator.dupe(u8, self.intern.get(try stringTextInternId(self, value))),
         else => error.TypeError,
@@ -642,7 +648,7 @@ fn optionalStringAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?[]u
         error.MissingAttribute => return null,
         else => return err,
     };
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     if (!isPlainString(forced)) return error.TypeError;
     return try self.allocator.dupe(u8, self.intern.get(try stringTextInternId(self, forced)));
 }
@@ -657,7 +663,7 @@ fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool 
         error.MissingAttribute => return null,
         else => return err,
     };
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     if (forced.discriminant != .bool_true and forced.discriminant != .bool_false) return error.TypeError;
     return forced.discriminant == .bool_true;
 }
@@ -665,8 +671,8 @@ fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool 
 pub fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
     const path_value = Value.string(try self.intern.intern(path));
     const kind_value = Value.string(try self.intern.intern(kind.nixTypeName()));
-    const partial = try self.callValue(pred, path_value);
-    const result = try self.forceValue(try self.callValue(partial, kind_value));
+    const partial = try vm_closures.callValue(self, pred, path_value);
+    const result = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, kind_value));
     if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
     return result.discriminant == .bool_true;
 }

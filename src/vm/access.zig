@@ -3,27 +3,14 @@ const vm_mod = @import("../vm.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const InternId = types.InternId;
-const ChunkId = types.ChunkId;
-const ObjectId = types.ObjectId;
 const bytecode_mod = @import("../bytecode.zig");
-const opcode = @import("../opcode.zig");
-const OpCode = opcode.OpCode;
-const chunk = @import("../chunk.zig");
-const Chunk = chunk.Chunk;
-const thunk_mod = @import("../thunk.zig");
-const Thunk = thunk_mod.Thunk;
-const ThunkTarget = thunk_mod.ThunkTarget;
-const heap_mod = @import("../heap.zig");
-const Closure = heap_mod.Closure;
-const numeric = @import("../runtime/numeric.zig");
-const source_paths = @import("../runtime/source_path.zig");
+
+const closures = @import("closures.zig");
+const force = @import("force.zig");
+const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
-const diagnostic = @import("../diagnostic.zig");
 
 const VM = vm_mod.VM;
-const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
-const readU16 = vm_mod.readU16;
 const readU32 = vm_mod.readU32;
 const readInternId = vm_mod.readInternId;
 
@@ -33,7 +20,7 @@ pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
         error.MissingAttribute => return error.NotCallable,
         else => return err,
     };
-    return self.callValue(try self.forceValue(functor), callee);
+    return closures.callValue(self, try force.forceValue(self, functor), callee);
 }
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
@@ -46,56 +33,56 @@ pub fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
     if (closure.args.len + 1 > args.len) return error.TooManyArguments;
     @memcpy(args[0..closure.args.len], closure.args);
     args[closure.args.len] = arg;
-    return self.applyBuiltin(closure.builtin_id, args[0 .. closure.args.len + 1]);
+    return applyBuiltin(self, closure.builtin_id, args[0 .. closure.args.len + 1]);
 }
 
 pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
-    const attrs = try self.forceValue(attrs_val);
-    if (attrs.discriminant != .attrs) return self.typeErrorExpected("attrs", attrs);
-    return self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name_id));
+    const attrs = try force.forceValue(self, attrs_val);
+    if (attrs.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", attrs);
+    return force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name_id));
 }
 
 pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
-    var current = try self.forceValue(attrs_val);
+    var current = try force.forceValue(self, attrs_val);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
-        if (current.discriminant != .attrs) return self.forceValue(default_val);
+        if (current.discriminant != .attrs) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
         current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
-            error.MissingAttribute => return self.forceValue(default_val),
+            error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
-        current = try self.forceValue(current);
+        current = try force.forceValue(self, current);
     }
     return current;
 }
 
 pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
-    var current = try self.forceValue(attrs_val);
+    var current = try force.forceValue(self, attrs_val);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
-        if (current.discriminant != .attrs) return self.forceValue(default_val);
+        if (current.discriminant != .attrs) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
         current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
-            error.MissingAttribute => return self.forceValue(default_val),
+            error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
-        current = try self.forceValue(current);
+        current = try force.forceValue(self, current);
     }
-    const name_val = try self.forceValue(dynamic_name);
+    const name_val = try force.forceValue(self, dynamic_name);
     if (name_val.discriminant != .string) return error.TypeError;
-    if (current.discriminant != .attrs) return self.forceValue(default_val);
+    if (current.discriminant != .attrs) return force.forceValue(self, default_val);
     const result = self.heap.getAttrValue(current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
-        error.MissingAttribute => return self.forceValue(default_val),
+        error.MissingAttribute => return force.forceValue(self, default_val),
         else => return err,
     };
-    return self.forceValue(result);
+    return force.forceValue(self, result);
 }
 
 pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const Value, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
-    var current = try self.forceValue(attrs_val);
+    var current = try force.forceValue(self, attrs_val);
     var offset: usize = 0;
     var dynamic_i: usize = 0;
     for (0..segment_count) |_| {
@@ -103,31 +90,31 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
         offset += 1;
         const name_id: InternId = switch (tag) {
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => name: {
-                if (current.discriminant != .attrs) return self.forceValue(default_val);
+                if (current.discriminant != .attrs) return force.forceValue(self, default_val);
                 const id = readU32(encoded_segments, offset);
                 offset += 4;
                 break :name id;
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
-                const name_val = try self.forceValue(dynamic_names[dynamic_i]);
+                const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
                 if (name_val.discriminant != .string) return error.TypeError;
                 dynamic_i += 1;
-                if (current.discriminant != .attrs) return self.forceValue(default_val);
+                if (current.discriminant != .attrs) return force.forceValue(self, default_val);
                 break :name name_val.asInternId();
             },
             else => return error.InvalidBytecode,
         };
         current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
-            error.MissingAttribute => return self.forceValue(default_val),
+            error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
-        current = try self.forceValue(current);
+        current = try force.forceValue(self, current);
     }
     return current;
 }
 
 pub fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide: bool) !bool {
-    var current = try self.forceValue(attrs_val);
+    var current = try force.forceValue(self, attrs_val);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
@@ -138,13 +125,13 @@ pub fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide:
             else => return err,
         };
         if (offset + stride >= encoded_names.len) return true;
-        current = try self.forceValue(attr);
+        current = try force.forceValue(self, attr);
     }
     return false;
 }
 
 pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Value, encoded_segments: []const u8, segment_count: usize) !bool {
-    var current = try self.forceValue(attrs_val);
+    var current = try force.forceValue(self, attrs_val);
     var offset: usize = 0;
     var dynamic_i: usize = 0;
     for (0..segment_count) |segment_index| {
@@ -158,7 +145,7 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
                 break :name id;
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
-                const name_val = try self.forceValue(dynamic_names[dynamic_i]);
+                const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
                 if (name_val.discriminant != .string) return error.TypeError;
                 dynamic_i += 1;
                 if (current.discriminant != .attrs) return false;
@@ -171,14 +158,14 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
             else => return err,
         };
         if (segment_index + 1 == segment_count) return true;
-        current = try self.forceValue(attr);
+        current = try force.forceValue(self, attr);
     }
     return false;
 }
 
 pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8, wide: bool) !void {
-    const value = try self.forceValue(attrs_val);
-    if (value.discriminant != .attrs) return self.typeErrorExpected("attrs", value);
+    const value = try force.forceValue(self, attrs_val);
+    if (value.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", value);
     if (allow_extra) return;
 
     const entries = try self.heap.getAttrs(value.asObjectId());
@@ -198,11 +185,12 @@ pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_nam
 }
 
 pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
+    const stack = @import("stack.zig");
     const start = self.sp - scope_count;
     const scopes = self.stack.items[start..self.sp];
 
     for (scopes) |scope| {
-        const attrs_val = try self.forceValue(scope);
+        const attrs_val = try force.forceValue(self, scope);
         if (attrs_val.discriminant != .attrs) return error.TypeError;
 
         const attr_val = self.heap.getAttrValue(attrs_val.asObjectId(), name_id) catch |err| switch (err) {
@@ -210,9 +198,9 @@ pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
             else => return err,
         };
 
-        const result = try self.forceValue(attr_val);
+        const result = try force.forceValue(self, attr_val);
         self.sp = start;
-        try self.push(result);
+        try stack.push(self, result);
         return;
     }
 

@@ -2,41 +2,26 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
-const InternId = types.InternId;
-const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const bytecode_mod = @import("../bytecode.zig");
-const opcode = @import("../opcode.zig");
-const OpCode = opcode.OpCode;
-const chunk = @import("../chunk.zig");
-const Chunk = chunk.Chunk;
 const thunk_mod = @import("../thunk.zig");
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
-const heap_mod = @import("../heap.zig");
-const Closure = heap_mod.Closure;
-const numeric = @import("../runtime/numeric.zig");
-const source_paths = @import("../runtime/source_path.zig");
-const vm_builtins = @import("builtins.zig");
-const diagnostic = @import("../diagnostic.zig");
+
+const access = @import("access.zig");
+const closures = @import("closures.zig");
 
 const VM = vm_mod.VM;
-const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
-const readU16 = vm_mod.readU16;
-const readU32 = vm_mod.readU32;
-const readInternId = vm_mod.readInternId;
 
 // ---- thunk management ----
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
-    return self.forceThunkFallible(thunk_val);
+    return forceThunkFallible(self, thunk_val);
 }
 
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
     return switch (value.discriminant) {
-        .thunk => try self.forceThunkFallible(value),
-        .cell => try self.forceCellValue(value),
+        .thunk => try forceThunkFallible(self, value),
+        .cell => try forceCellValue(self, value),
         else => value,
     };
 }
@@ -44,7 +29,7 @@ pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
 pub fn forceCellValue(self: *VM, value: Value) anyerror!Value {
     const cell_id = value.asObjectId();
     const raw = try self.heap.getCellValue(cell_id);
-    const forced = try self.forceValue(raw);
+    const forced = try forceValue(self, raw);
     if (raw.discriminant == .thunk or raw.discriminant == .cell) {
         try self.heap.setCellValue(cell_id, forced);
     }
@@ -54,7 +39,7 @@ pub fn forceCellValue(self: *VM, value: Value) anyerror!Value {
 pub fn forceDeep(self: *VM, value: Value) !void {
     var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
     defer seen.deinit(self.allocator);
-    try self.forceDeepInner(value, &seen);
+    try forceDeepInner(self, value, &seen);
 }
 
 pub const SeenDeepKind = enum { list, attrs };
@@ -65,17 +50,17 @@ pub const SeenDeepObject = struct {
 };
 
 pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
-    const forced = try self.forceValue(value);
+    const forced = try forceValue(self, value);
     switch (forced.discriminant) {
         .list => {
             const id = forced.asObjectId();
-            if (!try self.enterDeep(.list, id, seen)) return;
-            for (try self.heap.getList(id)) |item| try self.forceDeepInner(item, seen);
+            if (!try enterDeep(self, .list, id, seen)) return;
+            for (try self.heap.getList(id)) |item| try forceDeepInner(self, item, seen);
         },
         .attrs => {
             const id = forced.asObjectId();
-            if (!try self.enterDeep(.attrs, id, seen)) return;
-            for (try self.heap.getAttrs(id)) |entry| try self.forceDeepInner(entry.value, seen);
+            if (!try enterDeep(self, .attrs, id, seen)) return;
+            for (try self.heap.getAttrs(id)) |entry| try forceDeepInner(self, entry.value, seen);
         },
         else => {},
     }
@@ -99,7 +84,7 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
         .busy => return error.RecursiveThunk,
     }
 
-    const result = self.evalThunkTarget(target) catch |err| {
+    const result = evalThunkTarget(self, target) catch |err| {
         const failed = try self.heap.getThunk(thunk_id);
         failed.reset();
         return err;
@@ -111,10 +96,10 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 
 pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
     return switch (target) {
-        .closure => |closure| self.evalThunkClosure(closure),
+        .closure => |closure| evalThunkClosure(self, closure),
         .bytecode => |bytecode| blk: {
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
-            break :blk self.runIsolatedFrame(ch, 0, bytecode.upvalues);
+            break :blk closures.runIsolatedFrame(self, ch, 0, bytecode.upvalues);
         },
     };
 }
@@ -123,13 +108,13 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
     switch (closure_val.discriminant) {
         .closure => {
             const closure_id = closure_val.asObjectId();
-            const closure = try self.getClosureById(closure_id);
+            const closure = try closures.getClosureById(self, closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-            return self.runIsolatedFrame(ch, 0, closure.upvalues);
+            return closures.runIsolatedFrame(self, ch, 0, closure.upvalues);
         },
         .builtin_closure => {
             const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());
-            return self.applyBuiltin(closure.builtin_id, closure.args);
+            return access.applyBuiltin(self, closure.builtin_id, closure.args);
         },
         else => return error.NotCallable,
     }

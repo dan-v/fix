@@ -1,0 +1,48 @@
+const std = @import("std");
+const compiler_mod = @import("../compiler.zig");
+const ast = @import("../ast.zig");
+const chunk = @import("../chunk.zig");
+const emit = @import("emit.zig");
+const diagnostics = @import("diagnostics.zig");
+
+const Compiler = compiler_mod.Compiler;
+const Node = compiler_mod.Node;
+const ChunkBuilder = chunk.ChunkBuilder;
+
+pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
+    var child_builder = try ChunkBuilder.init(self.allocator);
+    defer child_builder.deinit(self.allocator);
+
+    var child = Compiler.init(
+        self.allocator,
+        &child_builder,
+        self.registry,
+        self.source,
+        self.intern,
+    );
+    child.parent = self;
+    child.base_path = self.base_path;
+    child.source_path = self.source_path;
+    child.source_file_id = self.source_file_id;
+    defer child.deinit();
+
+    child.compileNode(expr) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
+        return err;
+    };
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
+
+    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_id = try self.registry.register(child_chunk);
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
+}
+
+pub fn compileStringAtomThunk(self: *Compiler, atom: Node.Atom) !void {
+    var node = Node{
+        .tag = .string,
+        .data = .{ .atom = atom },
+        .span = atom,
+    };
+    try compileThunk(self, &node);
+}

@@ -3,41 +3,25 @@ const vm_mod = @import("../vm.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const InternId = types.InternId;
-const ChunkId = types.ChunkId;
-const ObjectId = types.ObjectId;
-const bytecode_mod = @import("../bytecode.zig");
-const opcode = @import("../opcode.zig");
-const OpCode = opcode.OpCode;
-const chunk = @import("../chunk.zig");
-const Chunk = chunk.Chunk;
-const thunk_mod = @import("../thunk.zig");
-const Thunk = thunk_mod.Thunk;
-const ThunkTarget = thunk_mod.ThunkTarget;
 const heap_mod = @import("../heap.zig");
-const Closure = heap_mod.Closure;
 const numeric = @import("../runtime/numeric.zig");
-const source_paths = @import("../runtime/source_path.zig");
-const vm_builtins = @import("builtins.zig");
-const diagnostic = @import("../diagnostic.zig");
+
+const force = @import("force.zig");
+const strings = @import("strings.zig");
 
 const VM = vm_mod.VM;
-const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
-const readU16 = vm_mod.readU16;
-const readU32 = vm_mod.readU32;
-const readInternId = vm_mod.readInternId;
 
 pub fn valuesEqual(self: *VM, a: Value, b: Value) anyerror!bool {
     var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
     defer seen.deinit(self.allocator);
-    return self.valuesEqualSeen(a, b, &seen);
+    return valuesEqualSeen(self, a, b, &seen);
 }
 
 pub fn listContainsValue(self: *VM, needle: Value, items: []const Value) anyerror!bool {
     if (items.len == 0) return false;
 
-    const forced_needle = try self.forceValue(needle);
-    return self.valueSliceContainsForcedValue(forced_needle, items);
+    const forced_needle = try force.forceValue(self, needle);
+    return valueSliceContainsForcedValue(self, forced_needle, items);
 }
 
 pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, items: []const Value) anyerror!bool {
@@ -48,7 +32,7 @@ pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, items: []c
 
     for (items) |item| {
         seen.clearRetainingCapacity();
-        if (try self.valuesEqualSeenForcedLeft(forced_needle, item, &seen)) return true;
+        if (try valuesEqualSeenForcedLeft(self, forced_needle, item, &seen)) return true;
     }
     return false;
 }
@@ -59,13 +43,13 @@ pub const EqualityPair = struct {
 };
 
 pub fn valuesEqualSeen(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
-    const va = try self.forceValue(a);
-    return self.valuesEqualSeenForcedLeft(va, b, seen);
+    const va = try force.forceValue(self, a);
+    return valuesEqualSeenForcedLeft(self, va, b, seen);
 }
 
 pub fn valuesEqualSeenForcedLeft(self: *VM, va: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
-    const vb = try self.forceValue(b);
-    return self.valuesEqualForced(va, vb, seen);
+    const vb = try force.forceValue(self, b);
+    return valuesEqualForced(self, va, vb, seen);
 }
 
 pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
@@ -74,15 +58,15 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUn
     }
 
     if (isStringComparable(va) and isStringComparable(vb)) {
-        return self.stringTextInternIdsEqual(va, vb);
+        return strings.stringTextInternIdsEqual(self, va, vb);
     }
     if (va.discriminant != vb.discriminant) return false;
     return switch (va.discriminant) {
         .null, .bool_false, .bool_true => true,
         .int => va.asInt() == vb.asInt(),
         .float => va.asFloat() == vb.asFloat(),
-        .list => try self.listsEqual(va, vb, seen),
-        .attrs => try self.attrsEqual(va, vb, seen),
+        .list => try listsEqual(self, va, vb, seen),
+        .attrs => try attrsEqual(self, va, vb, seen),
         .closure => va.asObjectId() == vb.asObjectId(),
         .builtin => va.asBuiltinId() == vb.asBuiltinId(),
         .builtin_closure => va.asObjectId() == vb.asObjectId(),
@@ -94,31 +78,31 @@ pub const CompareResult = enum { lt, eq, gt };
 
 pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
     if (a.asObjectId() == b.asObjectId()) return true;
-    if (try self.equalityPairSeen(a, b, seen)) return true;
+    if (try equalityPairSeen(self, a, b, seen)) return true;
 
     const a_items = try self.heap.getList(a.asObjectId());
     const b_items = try self.heap.getList(b.asObjectId());
     if (a_items.len != b_items.len) return false;
 
     for (a_items, b_items) |a_item, b_item| {
-        if (!try self.valuesEqualSeen(a_item, b_item, seen)) return false;
+        if (!try valuesEqualSeen(self, a_item, b_item, seen)) return false;
     }
     return true;
 }
 
 pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
     if (a.asObjectId() == b.asObjectId()) return true;
-    if (try self.equalityPairSeen(a, b, seen)) return true;
+    if (try equalityPairSeen(self, a, b, seen)) return true;
 
     const a_entries = try self.heap.getAttrs(a.asObjectId());
     const b_entries = try self.heap.getAttrs(b.asObjectId());
-    if (try self.derivationAttrsEqual(a_entries, b_entries, seen)) |equal| return equal;
+    if (try derivationAttrsEqual(self, a_entries, b_entries, seen)) |equal| return equal;
 
     if (a_entries.len != b_entries.len) return false;
 
     for (a_entries, b_entries) |a_entry, b_entry| {
         if (a_entry.name != b_entry.name) return false;
-        if (!try self.valuesEqualSeen(a_entry.value, b_entry.value, seen)) return false;
+        if (!try valuesEqualSeen(self, a_entry.value, b_entry.value, seen)) return false;
     }
     return true;
 }
@@ -132,14 +116,14 @@ pub fn derivationAttrsEqual(
     const type_name = try self.intern.intern("type");
     const derivation_type = try self.intern.intern("derivation");
 
-    if (!try self.attrsHaveDerivationType(a_entries, type_name, derivation_type)) return null;
-    if (!try self.attrsHaveDerivationType(b_entries, type_name, derivation_type)) return null;
+    if (!try attrsHaveDerivationType(self, a_entries, type_name, derivation_type)) return null;
+    if (!try attrsHaveDerivationType(self, b_entries, type_name, derivation_type)) return null;
 
     const out_path_name = try self.intern.intern("outPath");
     const a_out_path = attrValue(a_entries, out_path_name) orelse return null;
     const b_out_path = attrValue(b_entries, out_path_name) orelse return null;
 
-    return try self.valuesEqualSeen(a_out_path, b_out_path, seen);
+    return try valuesEqualSeen(self, a_out_path, b_out_path, seen);
 }
 
 pub fn attrsHaveDerivationType(
@@ -149,9 +133,9 @@ pub fn attrsHaveDerivationType(
     derivation_type: InternId,
 ) !bool {
     const type_value = attrValue(entries, type_name) orelse return false;
-    const forced = try self.forceValue(type_value);
+    const forced = try force.forceValue(self, type_value);
     if (!isStringComparable(forced)) return false;
-    const text_id = try self.stringTextInternId(forced);
+    const text_id = try strings.stringTextInternId(self, forced);
     return text_id == derivation_type;
 }
 
@@ -186,8 +170,8 @@ pub fn equalityPairSeen(self: *VM, left: Value, right: Value, seen: *std.ArrayLi
 }
 
 pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
-    const va = try self.forceValue(a);
-    const vb = try self.forceValue(b);
+    const va = try force.forceValue(self, a);
+    const vb = try force.forceValue(self, b);
 
     switch (va.discriminant) {
         .int => {
@@ -213,7 +197,7 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
         },
         .string, .path, .string_context => {
             if (!isStringComparable(vb) or vb.discriminant != va.discriminant) return error.TypeError;
-            return switch (std.mem.order(u8, self.intern.get(try self.stringTextInternId(va)), self.intern.get(try self.stringTextInternId(vb)))) {
+            return switch (std.mem.order(u8, self.intern.get(try strings.stringTextInternId(self, va)), self.intern.get(try strings.stringTextInternId(self, vb)))) {
                 .lt => .lt,
                 .eq => .eq,
                 .gt => .gt,

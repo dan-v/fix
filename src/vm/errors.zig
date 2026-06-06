@@ -1,31 +1,10 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../types.zig");
-const Value = @import("../value.zig").Value;
-const InternId = types.InternId;
-const ChunkId = types.ChunkId;
-const ObjectId = types.ObjectId;
-const bytecode_mod = @import("../bytecode.zig");
-const opcode = @import("../opcode.zig");
-const OpCode = opcode.OpCode;
 const chunk = @import("../chunk.zig");
-const Chunk = chunk.Chunk;
-const thunk_mod = @import("../thunk.zig");
-const Thunk = thunk_mod.Thunk;
-const ThunkTarget = thunk_mod.ThunkTarget;
-const heap_mod = @import("../heap.zig");
-const Closure = heap_mod.Closure;
-const numeric = @import("../runtime/numeric.zig");
-const source_paths = @import("../runtime/source_path.zig");
-const vm_builtins = @import("builtins.zig");
 const diagnostic = @import("../diagnostic.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
-const readU16 = vm_mod.readU16;
-const readU32 = vm_mod.readU32;
-const readInternId = vm_mod.readInternId;
 
 pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
     const trace = self.trace orelse return;

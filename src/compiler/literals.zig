@@ -10,6 +10,10 @@ const string_syntax = @import("../string_syntax.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const OpCode = @import("../opcode.zig").OpCode;
+const emit = @import("emit.zig");
+const scope = @import("scope.zig");
+const diagnostics = @import("diagnostics.zig");
+const attrs = @import("attrs.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -22,18 +26,7 @@ const AttrEntryGroups = compiler_mod.AttrEntryGroups;
 const ContainerValueOptions = compiler_mod.ContainerValueOptions;
 const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
-const attrEntriesDiagnosticAtom = compiler_mod.attrEntriesDiagnosticAtom;
-const attrGroupsDiagnosticAtom = compiler_mod.attrGroupsDiagnosticAtom;
-const attrPathDiagnosticAtom = compiler_mod.attrPathDiagnosticAtom;
-const captureCount = compiler_mod.captureCount;
-const diagnosticAtom = compiler_mod.diagnosticAtom;
-const hasAttrDiagnosticAtom = compiler_mod.hasAttrDiagnosticAtom;
-const hasAttrMixedDiagnosticAtom = compiler_mod.hasAttrMixedDiagnosticAtom;
-const nodeMayEvaluateToFloat = compiler_mod.nodeMayEvaluateToFloat;
-const nodeSourceSpan = compiler_mod.nodeSourceSpan;
-const offsetNode = compiler_mod.offsetNode;
-const u16Count = compiler_mod.u16Count;
-const unwrapParens = compiler_mod.unwrapParens;
+const offsetNode = ast.offsetNode;
 
 pub const ResolvedPath = struct {
     text: []const u8,
@@ -43,7 +36,7 @@ pub const ResolvedPath = struct {
 pub fn compileInt(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     const val = std.fmt.parseInt(i64, span, 10) catch {
-        try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "invalid integer literal");
+        try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid integer literal");
         return error.InvalidNumber;
     };
     try self.builder.emitConstant(self.allocator, Value.int(val));
@@ -52,7 +45,7 @@ pub fn compileInt(self: *Compiler, node: *const Node) !void {
 pub fn compileFloat(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     const val = std.fmt.parseFloat(f64, span) catch {
-        try self.reportCompileError(node.data.atom.offset, node.data.atom.len, "invalid float literal");
+        try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid float literal");
         return error.InvalidNumber;
     };
     const v = Value.float(val);
@@ -60,7 +53,7 @@ pub fn compileFloat(self: *Compiler, node: *const Node) !void {
 }
 
 pub fn compileString(self: *Compiler, node: *const Node) !void {
-    try self.compileStringAtom(node.data.atom);
+    try compileStringAtom(self, node.data.atom);
 }
 
 pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
@@ -74,15 +67,15 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     var have_value = false;
     for (parsed.parts) |part| {
         switch (part) {
-            .text => |text| try self.emitStringPart(text.bytes, &have_value),
+            .text => |text| try emitStringPart(self, text.bytes, &have_value),
             .interpolation => |span| {
                 if (!have_value) {
                     const empty_id = try self.intern.intern("");
                     try self.builder.emitConstant(self.allocator, Value.string(empty_id));
                     have_value = true;
                 }
-                try self.compileInterpolatedExpr(self.source[span.start..span.end], span.start);
-                try self.emitOp(.add_int);
+                try compileInterpolatedExpr(self, self.source[span.start..span.end], span.start);
+                try emit.emitOp(self, .add_int);
                 have_value = true;
             },
         }
@@ -99,7 +92,7 @@ pub fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !voi
 
     const id = try self.intern.intern(part);
     try self.builder.emitConstant(self.allocator, Value.string(id));
-    if (have_value.*) try self.emitOp(.add_int);
+    if (have_value.*) try emit.emitOp(self, .add_int);
     have_value.* = true;
 }
 
@@ -110,7 +103,7 @@ pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_
     var parser = @import("../parser.zig").Parser.init(self.allocator, &arena, expr_source);
     defer parser.deinit();
     const expr = parser.parse() catch |err| {
-        try self.absorbParserDiagnostics(parser.diagnostics.items, source_offset);
+        try diagnostics.absorbParserDiagnostics(self, parser.diagnostics.items, source_offset);
         return err;
     };
     offsetNode(expr, source_offset);
@@ -119,9 +112,9 @@ pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_
 
 pub fn compilePath(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-    if (std.mem.indexOf(u8, span, "${") != null) return self.compileInterpolatedPath(span, node.data.atom.offset);
+    if (std.mem.indexOf(u8, span, "${") != null) return compileInterpolatedPath(self, span, node.data.atom.offset);
 
-    const path = try self.resolvePathLiteral(span);
+    const path = try resolvePathLiteral(self, span);
     defer if (path.owned) self.allocator.free(path.text);
     const id = try self.intern.intern(path.text);
     const v = Value.path(id);
@@ -134,24 +127,24 @@ pub fn compileInterpolatedPath(self: *Compiler, span: []const u8, source_offset:
 
     while (std.mem.indexOf(u8, span[cursor..], "${")) |relative_start| {
         const interp_start = cursor + relative_start;
-        try self.emitPathPart(span[cursor..interp_start], &have_value);
+        try emitPathPart(self, span[cursor..interp_start], &have_value);
 
         const expr_start = interp_start + 2;
         const expr_end = string_syntax.findInterpolationEnd(span, expr_start) orelse return error.InvalidPathLiteral;
-        try self.compileInterpolatedExpr(span[expr_start..expr_end], source_offset + @as(u32, @intCast(expr_start)));
-        if (have_value) try self.emitOp(.add_int);
+        try compileInterpolatedExpr(self, span[expr_start..expr_end], source_offset + @as(u32, @intCast(expr_start)));
+        if (have_value) try emit.emitOp(self, .add_int);
         have_value = true;
         cursor = expr_end + 1;
     }
 
-    try self.emitPathPart(span[cursor..], &have_value);
+    try emitPathPart(self, span[cursor..], &have_value);
     if (!have_value) return error.InvalidPathLiteral;
 }
 
 pub fn emitPathPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
     if (part.len == 0) return;
     if (!have_value.*) {
-        const path = try self.resolvePathLiteralPreserveTrailingSlash(part);
+        const path = try resolvePathLiteralPreserveTrailingSlash(self, part);
         defer if (path.owned) self.allocator.free(path.text);
         const id = try self.intern.intern(path.text);
         try self.builder.emitConstant(self.allocator, Value.path(id));
@@ -159,14 +152,14 @@ pub fn emitPathPart(self: *Compiler, part: []const u8, have_value: *bool) !void 
         return;
     }
 
-    try self.emitStringPart(part, have_value);
+    try emitStringPart(self, part, have_value);
 }
 
 pub fn compileSearchPath(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (span.len < 2) return error.InvalidSearchPath;
     const id = try self.intern.intern(span[1 .. span.len - 1]);
-    try self.emitInternOp(.find_file, .find_file_long, id);
+    try emit.emitInternOp(self, .find_file, .find_file_long, id);
 }
 
 pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
@@ -185,7 +178,7 @@ pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
 }
 
 pub fn resolvePathLiteralPreserveTrailingSlash(self: *Compiler, span: []const u8) !ResolvedPath {
-    const resolved = try self.resolvePathLiteral(span);
+    const resolved = try resolvePathLiteral(self, span);
     if (!std.mem.endsWith(u8, span, "/") or std.mem.endsWith(u8, resolved.text, "/")) return resolved;
 
     const text = try std.fmt.allocPrint(self.allocator, "{s}/", .{resolved.text});
@@ -196,44 +189,44 @@ pub fn resolvePathLiteralPreserveTrailingSlash(self: *Compiler, span: []const u8
 pub fn compileIdent(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (std.mem.eql(u8, span, "__curPos")) {
-        try self.compileCurPos(node.data.atom);
-    } else if (self.resolveLocal(span)) |slot| {
-        try self.emitGetLocal(slot);
-    } else if (try self.resolveCapture(span)) |slot| {
-        try self.emitOpU16(.get_upvalue, slot);
+        try compileCurPos(self, node.data.atom);
+    } else if (scope.resolveLocal(self, span)) |slot| {
+        try emit.emitGetLocal(self, slot);
+    } else if (try scope.resolveCapture(self, span)) |slot| {
+        try emit.emitOpU16(self, .get_upvalue, slot);
     } else if (std.mem.eql(u8, span, "builtins")) {
-        try self.emitOp(.push_builtins);
-    } else if (try self.emitAmbientBuiltin(span)) {
+        try emit.emitOp(self, .push_builtins);
+    } else if (try emitAmbientBuiltin(self, span)) {
         return;
-    } else if (try self.emitWithLookup(span)) {
+    } else if (try scope.emitWithLookup(self, span)) {
         return;
     } else {
         const message = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{span});
         try self.owned_diagnostic_messages.append(self.allocator, message);
-        try self.reportCompileError(node.data.atom.offset, node.data.atom.len, message);
+        try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, message);
         return error.UndefinedVariable;
     }
 }
 
 pub fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
     if (self.source_path == null) {
-        try self.emitOp(.push_null);
+        try emit.emitOp(self, .push_null);
         return;
     }
 
     const file_id = try self.intern.intern("file");
     const line_id = try self.intern.intern("line");
     const column_id = try self.intern.intern("column");
-    const source_path_id = try self.sourceFileId();
-    const position = try self.sourcePositionForOffset(atom.offset);
+    const source_path_id = try attrs.sourceFileId(self);
+    const position = try diagnostics.sourcePositionForOffset(self, atom.offset);
 
-    try self.emitAttrNameId(file_id);
+    try attrs.emitAttrNameId(self, file_id);
     try self.builder.emitConstant(self.allocator, Value.string(source_path_id));
-    try self.emitAttrNameId(line_id);
+    try attrs.emitAttrNameId(self, line_id);
     try self.builder.emitConstant(self.allocator, Value.int(position.line));
-    try self.emitAttrNameId(column_id);
+    try attrs.emitAttrNameId(self, column_id);
     try self.builder.emitConstant(self.allocator, Value.int(position.column));
-    try self.emitOpU16(.build_attrs, 3);
+    try emit.emitOpU16(self, .build_attrs, 3);
 }
 
 pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
@@ -243,8 +236,8 @@ pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
     }
 
     if (builtins.hasConstant(name)) {
-        try self.emitOp(.push_builtins);
-        try self.emitInternOp(.get_attr, .get_attr_long, try self.intern.intern(name));
+        try emit.emitOp(self, .push_builtins);
+        try emit.emitInternOp(self, .get_attr, .get_attr_long, try self.intern.intern(name));
         return true;
     }
 

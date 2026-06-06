@@ -9,11 +9,17 @@ const toml = @import("../../runtime/toml.zig");
 const ThunkState = @import("../../thunk.zig").ThunkState;
 const collections = @import("collections.zig");
 const strings = @import("strings.zig");
+const string_context = @import("string_context.zig");
+const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
+const vm_equality = @import("../equality.zig");
+const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
-const appendContextEntry = strings.appendContextEntry;
+const appendContextEntry = string_context.appendContextEntry;
 const coerceAttrsToStringValue = strings.coerceAttrsToStringValue;
 const coerceStringContextValue = strings.coerceStringContextValue;
-const contextEntriesForValue = strings.contextEntriesForValue;
+const contextEntriesForValue = string_context.contextEntriesForValue;
 const isPlainString = strings.isPlainString;
 const sourcePathStringValue = strings.sourcePathStringValue;
 const stringArg = strings.stringArg;
@@ -69,7 +75,7 @@ fn writeJsonValueInner(
     path_mode: JsonPathMode,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) anyerror!void {
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     switch (forced.discriminant) {
         .null => try writer.writeAll("null"),
         .bool_false => try writer.writeAll("false"),
@@ -201,8 +207,8 @@ pub fn builtinToXML(self: anytype, arg: Value) !Value {
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
 
-    try self.forceDeep(arg);
-    try writeXmlDocument(self, &out.writer, try self.forceValue(arg), &context);
+    try vm_force.forceDeep(self, arg);
+    try writeXmlDocument(self, &out.writer, try vm_force.forceValue(self, arg), &context);
 
     const text = try out.toOwnedSlice();
     defer self.allocator.free(text);
@@ -212,7 +218,7 @@ pub fn builtinToXML(self: anytype, arg: Value) !Value {
 }
 
 pub fn writeLazyXmlValue(self: anytype, writer: *std.Io.Writer, value: Value) !void {
-    try writeXmlDocument(self, writer, try self.forceValue(value), null);
+    try writeXmlDocument(self, writer, try vm_force.forceValue(self, value), null);
 }
 
 fn writeXmlDocument(
@@ -427,8 +433,8 @@ fn attrsFromToml(self: anytype, table: *toml.Table) !Value {
 }
 
 pub fn builtinCompareVersions(self: anytype, left_arg: Value, right_arg: Value) !Value {
-    const left_value = try self.forceValue(left_arg);
-    const right_value = try self.forceValue(right_arg);
+    const left_value = try vm_force.forceValue(self, left_arg);
+    const right_value = try vm_force.forceValue(self, right_arg);
     if (!isPlainString(left_value) or !isPlainString(right_value)) return error.TypeError;
     const left = self.intern.get(try stringTextInternId(self, left_value));
     const right = self.intern.get(try stringTextInternId(self, right_value));
@@ -449,8 +455,8 @@ pub fn builtinSplitVersion(self: anytype, arg: Value) !Value {
 }
 
 pub fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
-    const pattern_value = try self.forceValue(regex_arg);
-    const text_value = try self.forceValue(text_arg);
+    const pattern_value = try vm_force.forceValue(self, regex_arg);
+    const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
     const pattern_text = self.intern.get(try stringTextInternId(self, pattern_value));
     const text = self.intern.get(try stringTextInternId(self, text_value));
@@ -464,8 +470,8 @@ pub fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
 }
 
 pub fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
-    const pattern_value = try self.forceValue(regex_arg);
-    const text_value = try self.forceValue(text_arg);
+    const pattern_value = try vm_force.forceValue(self, regex_arg);
+    const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
     const pattern_text = self.intern.get(try stringTextInternId(self, pattern_value));
     const text = self.intern.get(try stringTextInternId(self, text_value));

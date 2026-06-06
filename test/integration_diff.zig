@@ -1,8 +1,7 @@
-//! Differential integration runner for fix.
+//! Integration diff fuzz harness.
 //!
-//! The generator deliberately avoids owning a second Nix grammar. It combines a
-//! corpus of real expressions, then asks real Nix and fix what each candidate
-//! means.
+//! Generates random nix expressions and runs both nix-instantiate and `fix`
+//! against them, classifying mismatches and saving reproducers.
 
 const std = @import("std");
 const cli = @import("fix-cli");
@@ -10,6 +9,8 @@ const harness = @import("harness");
 const generator = @import("integration_diff/generator.zig");
 const reporter_mod = @import("integration_diff/reporter.zig");
 const xml = @import("integration_diff/xml.zig");
+const queue = @import("integration_diff/queue.zig");
+const failure_writer = @import("integration_diff/failure_writer.zig");
 
 const CommandResult = harness.CommandResult;
 const CaseSpace = generator.CaseSpace;
@@ -19,8 +20,10 @@ const Reporter = reporter_mod.Reporter;
 const WorkStats = reporter_mod.WorkStats;
 const optionValue = harness.optionValue;
 const runCommand = harness.runCommand;
+const JobResult = queue.JobResult;
+const ResultQueue = queue.ResultQueue;
 
-const Config = struct {
+pub const Config = struct {
     seed: ?u64 = null,
     corpus_dir: []const u8 = "test/fuzz-corpus",
     failure_dir: []const u8 = "",
@@ -36,12 +39,11 @@ const Config = struct {
     dump_skipped_path: ?[]const u8 = null,
 };
 
-const ShrinkCandidates = std.ArrayListUnmanaged([]const u8);
 const default_case_count = 64_000;
 const result_queue_per_worker = 8;
 const result_queue_min = 128;
 
-const Outcome = enum {
+pub const Outcome = enum {
     skipped,
     both_ok_same,
     both_ok_different,
@@ -50,12 +52,12 @@ const Outcome = enum {
     both_reject,
 };
 
-const Classification = struct {
+pub const Classification = struct {
     outcome: Outcome,
     nix: CommandResult,
     fix: CommandResult,
 
-    fn deinit(self: Classification, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: Classification, allocator: std.mem.Allocator) void {
         self.nix.deinit(allocator);
         self.fix.deinit(allocator);
     }
@@ -142,58 +144,6 @@ pub fn main(init: std.process.Init) !void {
     try runHarness(allocator, init.io, &config, case_space, worker_count, total_jobs, &reporter);
 }
 
-const JobResult = struct {
-    index: usize,
-    seed: u64,
-    iteration: usize,
-    expr: []u8,
-    classification: ?Classification = null,
-    err: ?anyerror = null,
-    skipped: bool = false,
-
-    fn deinit(self: *JobResult, allocator: std.mem.Allocator) void {
-        if (self.classification) |classification| classification.deinit(allocator);
-        allocator.free(self.expr);
-    }
-};
-
-fn BlockingQueue(comptime T: type) type {
-    return struct {
-        queue: std.Io.TypeErasedQueue,
-
-        const Self = @This();
-
-        fn init(storage: []T) Self {
-            return .{
-                .queue = .init(std.mem.sliceAsBytes(storage)),
-            };
-        }
-
-        fn put(self: *Self, io: std.Io, item: T) !void {
-            var copy = item;
-            const bytes = std.mem.asBytes(&copy);
-            const written = try self.queue.putUncancelable(io, bytes, bytes.len);
-            if (written != bytes.len) return error.ShortQueueWrite;
-        }
-
-        fn get(self: *Self, io: std.Io) !?T {
-            var item: T = undefined;
-            const bytes = std.mem.asBytes(&item);
-            const read = self.queue.getUncancelable(io, bytes, bytes.len) catch |err| switch (err) {
-                error.Closed => return null,
-            };
-            if (read != bytes.len) return error.ShortQueueRead;
-            return item;
-        }
-
-        fn close(self: *Self, io: std.Io) void {
-            self.queue.close(io);
-        }
-    };
-}
-
-const ResultQueue = BlockingQueue(JobResult);
-
 const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -213,7 +163,7 @@ fn runHarness(
     total_jobs: usize,
     reporter: *Reporter,
 ) !void {
-    const result_queue_len = queueCapacity(worker_count, total_jobs, result_queue_per_worker, result_queue_min);
+    const result_queue_len = queue.queueCapacity(worker_count, total_jobs, result_queue_per_worker, result_queue_min);
 
     const result_storage = try allocator.alloc(JobResult, result_queue_len);
     defer allocator.free(result_storage);
@@ -260,9 +210,10 @@ fn runHarness(
             }
             if (classification.interesting()) {
                 found_mismatch = true;
-                reportInteresting(
+                failure_writer.reportInteresting(
                     allocator,
                     io,
+                    classify,
                     config,
                     mutable_result.seed,
                     mutable_result.iteration,
@@ -319,11 +270,6 @@ fn workerMain(context: *WorkerContext) void {
             std.debug.panic("integration-diff result queue failed: {s}", .{@errorName(err)});
         };
     }
-}
-
-fn queueCapacity(worker_count: usize, total_jobs: usize, per_worker: usize, minimum: usize) usize {
-    const scaled = std.math.mul(usize, worker_count, per_worker) catch total_jobs;
-    return @min(total_jobs, @max(@max(scaled, minimum), 1));
 }
 
 fn parseArgs(config: *Config, init: std.process.Init) !void {
@@ -434,230 +380,6 @@ fn classify(
         .nix = nix,
         .fix = fix,
     };
-}
-
-fn shrinkInteresting(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: *const Config,
-    expr: []const u8,
-    target: Outcome,
-) ![]u8 {
-    var current = try allocator.dupe(u8, expr);
-    errdefer allocator.free(current);
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-
-        var candidates: ShrinkCandidates = .empty;
-        defer {
-            for (candidates.items) |candidate| allocator.free(candidate);
-            candidates.deinit(allocator);
-        }
-        try shrinkCandidates(allocator, current, &candidates);
-
-        for (candidates.items) |candidate| {
-            if (candidate.len == 0 or candidate.len >= current.len) continue;
-            var c = try classify(allocator, io, config, candidate);
-            defer c.deinit(allocator);
-            if (c.outcome == target) {
-                allocator.free(current);
-                current = try allocator.dupe(u8, candidate);
-                changed = true;
-                break;
-            }
-        }
-    }
-
-    return current;
-}
-
-fn shrinkCandidates(allocator: std.mem.Allocator, expr: []const u8, out: *ShrinkCandidates) !void {
-    const constants = [_][]const u8{ "1", "true", "false", "null", "[]", "{}" };
-    for (constants) |constant| try out.append(allocator, try allocator.dupe(u8, constant));
-
-    const trimmed = std.mem.trim(u8, expr, " \t\r\n");
-    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')' and balanced(trimmed[1 .. trimmed.len - 1])) {
-        try out.append(allocator, try allocator.dupe(u8, trimmed[1 .. trimmed.len - 1]));
-    }
-
-    var i: usize = 0;
-    while (i < expr.len) : (i += 1) {
-        if (expr[i] != '(' and expr[i] != '[' and expr[i] != '{') continue;
-        if (matchingClose(expr[i])) |close| {
-            if (findMatching(expr, i, close)) |end| {
-                try out.append(allocator, try std.mem.concat(allocator, u8, &.{ expr[0..i], "1", expr[end + 1 ..] }));
-            }
-        }
-    }
-}
-
-fn matchingClose(open: u8) ?u8 {
-    return switch (open) {
-        '(' => ')',
-        '[' => ']',
-        '{' => '}',
-        else => null,
-    };
-}
-
-fn findMatching(expr: []const u8, start: usize, close: u8) ?usize {
-    var depth: usize = 0;
-    var in_string = false;
-    var i = start;
-    while (i < expr.len) : (i += 1) {
-        const c = expr[i];
-        if (in_string) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_string = true;
-        } else if (c == expr[start]) {
-            depth += 1;
-        } else if (c == close) {
-            depth -= 1;
-            if (depth == 0) return i;
-        }
-    }
-    return null;
-}
-
-fn balanced(expr: []const u8) bool {
-    var parens: isize = 0;
-    var brackets: isize = 0;
-    var braces: isize = 0;
-    var in_string = false;
-
-    var i: usize = 0;
-    while (i < expr.len) : (i += 1) {
-        const c = expr[i];
-        if (in_string) {
-            if (c == '\\') {
-                i += 1;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        switch (c) {
-            '"' => in_string = true,
-            '(' => parens += 1,
-            ')' => parens -= 1,
-            '[' => brackets += 1,
-            ']' => brackets -= 1,
-            '{' => braces += 1,
-            '}' => braces -= 1,
-            else => {},
-        }
-        if (parens < 0 or brackets < 0 or braces < 0) return false;
-    }
-    return !in_string and parens == 0 and brackets == 0 and braces == 0;
-}
-
-fn reportInteresting(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: *const Config,
-    seed: u64,
-    iteration: usize,
-    expr: []const u8,
-    classification: *const Classification,
-    reporter: *Reporter,
-) !void {
-    if (!config.shrink) {
-        try saveAndPrintFailure(allocator, io, config, seed, iteration, expr, classification.*, reporter);
-        return;
-    }
-
-    const saved_expr = try shrinkInteresting(allocator, io, config, expr, classification.outcome);
-    defer allocator.free(saved_expr);
-
-    var saved_classification = try classify(allocator, io, config, saved_expr);
-    defer saved_classification.deinit(allocator);
-
-    try saveAndPrintFailure(allocator, io, config, seed, iteration, saved_expr, saved_classification, reporter);
-}
-
-fn saveAndPrintFailure(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: *const Config,
-    seed: u64,
-    iteration: usize,
-    expr: []const u8,
-    classification: Classification,
-    reporter: *Reporter,
-) !void {
-    try saveFailure(allocator, io, config, seed, iteration, expr, classification);
-    reporter.mismatch(classification.outcome, seed, iteration, config.failure_dir, expr);
-}
-
-fn saveFailure(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    config: *const Config,
-    seed: u64,
-    iteration: usize,
-    expr: []const u8,
-    classification: Classification,
-) !void {
-    try std.Io.Dir.cwd().createDirPath(io, config.failure_dir);
-
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/case-{d}-{d}-{s}", .{
-        config.failure_dir,
-        seed,
-        iteration,
-        @tagName(classification.outcome),
-    });
-    defer allocator.free(prefix);
-
-    const expr_path = try std.fmt.allocPrint(allocator, "{s}.nix", .{prefix});
-    defer allocator.free(expr_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = expr_path, .data = expr });
-
-    const report = try std.fmt.allocPrint(allocator,
-        \\outcome: {s}
-        \\seed: {d}
-        \\iteration: {d}
-        \\
-        \\expression:
-        \\{s}
-        \\
-        \\nix ok: {}
-        \\nix stdout:
-        \\{s}
-        \\nix stderr:
-        \\{s}
-        \\
-        \\fix ok: {}
-        \\fix stdout:
-        \\{s}
-        \\fix stderr:
-        \\{s}
-        \\
-    , .{
-        @tagName(classification.outcome),
-        seed,
-        iteration,
-        expr,
-        classification.nix.ok,
-        classification.nix.stdout,
-        classification.nix.stderr,
-        classification.fix.ok,
-        classification.fix.stdout,
-        classification.fix.stderr,
-    });
-    defer allocator.free(report);
-
-    const report_path = try std.fmt.allocPrint(allocator, "{s}.txt", .{prefix});
-    defer allocator.free(report_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = report_path, .data = report });
 }
 
 test {

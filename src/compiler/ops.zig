@@ -10,6 +10,13 @@ const string_syntax = @import("../string_syntax.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const OpCode = @import("../opcode.zig").OpCode;
+const emit = @import("emit.zig");
+const scope = @import("scope.zig");
+const thunks = @import("thunks.zig");
+const diagnostics = @import("diagnostics.zig");
+const attrs = @import("attrs.zig");
+const access = @import("access.zig");
+const control = @import("control.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -23,25 +30,17 @@ const ContainerValueOptions = compiler_mod.ContainerValueOptions;
 const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const ChunkBuilder = chunk.ChunkBuilder;
-const attrEntriesDiagnosticAtom = compiler_mod.attrEntriesDiagnosticAtom;
-const attrGroupsDiagnosticAtom = compiler_mod.attrGroupsDiagnosticAtom;
-const attrPathDiagnosticAtom = compiler_mod.attrPathDiagnosticAtom;
-const captureCount = compiler_mod.captureCount;
-const diagnosticAtom = compiler_mod.diagnosticAtom;
-const hasAttrDiagnosticAtom = compiler_mod.hasAttrDiagnosticAtom;
-const hasAttrMixedDiagnosticAtom = compiler_mod.hasAttrMixedDiagnosticAtom;
-const nodeMayEvaluateToFloat = compiler_mod.nodeMayEvaluateToFloat;
-const nodeSourceSpan = compiler_mod.nodeSourceSpan;
-const offsetNode = compiler_mod.offsetNode;
-const u16Count = compiler_mod.u16Count;
-const unwrapParens = compiler_mod.unwrapParens;
+const diagnostic_atom = @import("diagnostic_atom.zig");
+const diagnosticAtom = diagnostic_atom.diagnosticAtom;
+const nodeMayEvaluateToFloat = ast.nodeMayEvaluateToFloat;
+const unwrapParens = ast.unwrapParens;
 
 pub fn compileBinary(self: *Compiler, node: *const Node) !void {
     const bin = node.data.binary;
     switch (bin.op) {
-        .and_ => return self.compileAnd(bin.left, bin.right),
-        .or_ => return self.compileOr(bin.left, bin.right),
-        .impl => return self.compileImpl(bin.left, bin.right),
+        .and_ => return compileAnd(self, bin.left, bin.right),
+        .or_ => return compileOr(self, bin.left, bin.right),
+        .impl => return compileImpl(self, bin.left, bin.right),
         else => {},
     }
 
@@ -49,20 +48,20 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
     try self.compileNode(bin.right);
 
     switch (bin.op) {
-        .add => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .add_float else .add_int),
-        .sub => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .sub_float else .sub_int),
-        .mul => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .mul_float else .mul_int),
-        .div => try self.emitOp(if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .div_float else .div_int),
-        .eq => try self.emitOp(.eq),
-        .neq => try self.emitOp(.neq),
-        .lt => try self.emitOp(.lt),
-        .lte => try self.emitOp(.lte),
-        .gt => try self.emitOp(.gt),
-        .gte => try self.emitOp(.gte),
+        .add => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .add_float else .add_int),
+        .sub => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .sub_float else .sub_int),
+        .mul => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .mul_float else .mul_int),
+        .div => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .div_float else .div_int),
+        .eq => try emit.emitOp(self, .eq),
+        .neq => try emit.emitOp(self, .neq),
+        .lt => try emit.emitOp(self, .lt),
+        .lte => try emit.emitOp(self, .lte),
+        .gt => try emit.emitOp(self, .gt),
+        .gte => try emit.emitOp(self, .gte),
         .and_, .or_ => unreachable,
-        .update => try self.emitOp(.merge_attrs),
+        .update => try emit.emitOp(self, .merge_attrs),
         .impl => unreachable,
-        .concat => try self.emitOp(.concat_lists),
+        .concat => try emit.emitOp(self, .concat_lists),
     }
 }
 
@@ -70,58 +69,58 @@ pub fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void 
     try self.compileNode(left);
 
     const end_jump = self.builder.code.items.len;
-    try self.emitOpU32(.jump_if_false, 0);
-    try self.emitOp(.pop);
+    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOp(self, .pop);
 
     try self.compileNode(right);
-    self.patchJump(end_jump, self.builder.code.items.len);
+    emit.patchJump(self, end_jump, self.builder.code.items.len);
 }
 
 pub fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
-    try self.emitOpU32(.jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_if_false, 0);
 
     const end_jump = self.builder.code.items.len;
-    try self.emitOpU32(.jump, 0);
+    try emit.emitOpU32(self, .jump, 0);
 
-    self.patchJump(false_jump, self.builder.code.items.len);
-    try self.emitOp(.pop);
+    emit.patchJump(self, false_jump, self.builder.code.items.len);
+    try emit.emitOp(self, .pop);
 
     try self.compileNode(right);
-    self.patchJump(end_jump, self.builder.code.items.len);
+    emit.patchJump(self, end_jump, self.builder.code.items.len);
 }
 
 pub fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
-    try self.emitOpU32(.jump_if_false, 0);
-    try self.emitOp(.pop);
+    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOp(self, .pop);
 
     try self.compileNode(right);
     const end_jump = self.builder.code.items.len;
-    try self.emitOpU32(.jump, 0);
+    try emit.emitOpU32(self, .jump, 0);
 
-    self.patchJump(false_jump, self.builder.code.items.len);
-    try self.emitOp(.pop);
-    try self.emitOp(.push_true);
+    emit.patchJump(self, false_jump, self.builder.code.items.len);
+    try emit.emitOp(self, .pop);
+    try emit.emitOp(self, .push_true);
 
-    self.patchJump(end_jump, self.builder.code.items.len);
+    emit.patchJump(self, end_jump, self.builder.code.items.len);
 }
 
 pub fn compileUnary(self: *Compiler, node: *const Node) !void {
     const un = node.data.unary;
     try self.compileNode(un.expr);
     switch (un.op) {
-        .negate => try self.emitOp(.negate_int),
-        .not => try self.emitOp(.not),
+        .negate => try emit.emitOp(self, .negate_int),
+        .not => try emit.emitOp(self, .not),
     }
 }
 
 pub fn compileApply(self: *Compiler, node: *const Node) !void {
-    try self.compileApplyWithOp(node, .call);
+    try compileApplyWithOp(self, node, .call);
 }
 
 pub fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
@@ -133,9 +132,9 @@ pub fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
 
     {
         const start = self.builder.code.items.len;
-        try self.compileTailNodeImpl(unwrapped);
+        try compileTailNodeImpl(self, unwrapped);
         const end = self.builder.code.items.len;
-        if (try self.sourceSpanForNode(node)) |span| {
+        if (try diagnostics.sourceSpanForNode(self, node)) |span| {
             try self.builder.addSourceMapEntry(self.allocator, start, end, span);
         }
         return;
@@ -144,11 +143,11 @@ pub fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
 
 pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
     switch (node.tag) {
-        .apply => try self.compileApplyWithOp(node, .tail_call),
-        .if_else => try self.compileIfElseTail(node),
-        .let_in => try self.compileLetInWithTailBody(node),
-        .assert => try self.compileAssertTail(node),
-        .with_expr => try self.compileWithTail(node),
+        .apply => try compileApplyWithOp(self, node, .tail_call),
+        .if_else => try control.compileIfElseTail(self, node),
+        .let_in => try compileLetInWithTailBody(self, node),
+        .assert => try control.compileAssertTail(self, node),
+        .with_expr => try control.compileWithTail(self, node),
         else => unreachable,
     }
 }
@@ -156,8 +155,8 @@ pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
     const ap = node.data.apply;
     try self.compileNode(ap.func);
-    try self.compileContainerValue(ap.arg, .{});
-    try self.emitOp(op);
+    try access.compileContainerValue(self, ap.arg, .{});
+    try emit.emitOp(self, op);
 }
 
 pub fn compileLambda(self: *Compiler, node: *const Node) !void {
@@ -181,17 +180,17 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     defer child.deinit();
 
     const param_id = try self.intern.intern(param_name);
-    _ = try child.declareLocal(param_name, param_id);
-    child.compileTailExpression(lambda.body) catch |err| {
-        try self.absorbChildDiagnostics(&child);
+    _ = try scope.declareLocal(&child, param_name, param_id);
+    compileTailExpression(&child, lambda.body) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try child.emitOp(.ret);
-    try child.emitOp(.halt);
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try self.emitClosureWithCaptures(child_id, child.captures.items);
+    try emit.emitClosureWithCaptures(self, child_id, child.captures.items);
 }
 
 pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
@@ -213,13 +212,13 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     child.source_file_id = self.source_file_id;
     defer child.deinit();
 
-    const arg_slot = try child.declareLocal("\x00args", try self.intern.intern("\x00args"));
+    const arg_slot = try scope.declareLocal(&child, "\x00args", try self.intern.intern("\x00args"));
     if (lambda.bind_name) |bind_name| {
         const name = self.source[bind_name.offset .. bind_name.offset + bind_name.len];
         const name_id = try self.intern.intern(name);
-        const slot = try child.declareLocal(name, name_id);
-        try child.emitCaptureLocal(arg_slot);
-        try child.emitSetLocal(slot);
+        const slot = try scope.declareLocal(&child, name, name_id);
+        try emit.emitCaptureLocal(&child, arg_slot);
+        try emit.emitSetLocal(&child, slot);
     }
 
     var wide_params = false;
@@ -228,10 +227,10 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         if (try self.intern.intern(name) > std.math.maxInt(u16)) wide_params = true;
     }
 
-    try child.emitGetLocal(arg_slot);
-    try child.emitOp(if (wide_params) .validate_attrs_long else .validate_attrs);
+    try emit.emitGetLocal(&child, arg_slot);
+    try emit.emitOp(&child, if (wide_params) .validate_attrs_long else .validate_attrs);
     try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
-    const param_count = try self.requireU16At(lambda.params.len, diagnosticAtom(node), "too many function parameters");
+    const param_count = try diagnostics.requireU16At(self, lambda.params.len, diagnosticAtom(node), "too many function parameters");
     try child.builder.writeU16(child.allocator, param_count);
     var function_args: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer function_args.deinit(self.allocator);
@@ -239,7 +238,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     for (lambda.params) |param| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
-        try child.writeInternId(name_id, wide_params);
+        try emit.writeInternId(&child, name_id, wide_params);
         function_args.appendAssumeCapacity(.{
             .name = name_id,
             .value = Value.boolVal(param.default != null),
@@ -250,30 +249,30 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     for (lambda.params) |param| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
-        try child.emitOp(.push_null);
-        try child.emitOp(.make_cell);
-        const slot = try child.declareLocal(name, name_id);
-        try child.emitSetLocal(slot);
+        try emit.emitOp(&child, .push_null);
+        try emit.emitOp(&child, .make_cell);
+        const slot = try scope.declareLocal(&child, name, name_id);
+        try emit.emitSetLocal(&child, slot);
     }
 
     for (lambda.params) |param| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
-        const slot = child.resolveLocal(name) orelse return error.UndefinedVariable;
-        try child.compileAttrParamThunk(arg_slot, name_id, param.default);
-        try child.emitSetCellLocal(slot);
+        const slot = scope.resolveLocal(&child, name) orelse return error.UndefinedVariable;
+        try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
+        try emit.emitSetCellLocal(&child, slot);
     }
 
-    child.compileTailExpression(lambda.body) catch |err| {
-        try self.absorbChildDiagnostics(&child);
+    compileTailExpression(&child, lambda.body) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try child.emitOp(.ret);
-    try child.emitOp(.halt);
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try self.emitClosureWithCaptures(child_id, child.captures.items);
+    try emit.emitClosureWithCaptures(self, child_id, child.captures.items);
 }
 
 pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
@@ -293,62 +292,62 @@ pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, 
     child.source_file_id = self.source_file_id;
     defer child.deinit();
 
-    _ = try child.addCapture("\x00args", .local, arg_slot);
-    try child.emitOpU16(.get_upvalue, 0);
+    _ = try scope.addCapture(&child, "\x00args", .local, arg_slot);
+    try emit.emitOpU16(&child, .get_upvalue, 0);
     if (default) |default_expr| {
-        try child.compileThunk(default_expr);
-        try child.emitOp(if (name_id > std.math.maxInt(u16)) .get_attr_path_or_long else .get_attr_path_or);
+        try thunks.compileThunk(&child, default_expr);
+        try emit.emitOp(&child, if (name_id > std.math.maxInt(u16)) .get_attr_path_or_long else .get_attr_path_or);
         try child.builder.writeByte(child.allocator, 1);
-        try child.writeInternId(name_id, name_id > std.math.maxInt(u16));
+        try emit.writeInternId(&child, name_id, name_id > std.math.maxInt(u16));
     } else {
-        try child.emitInternOp(.get_attr, .get_attr_long, name_id);
+        try emit.emitInternOp(&child, .get_attr, .get_attr_long, name_id);
     }
-    try child.emitOp(.ret);
-    try child.emitOp(.halt);
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try self.emitThunkWithCaptures(child_id, child.captures.items);
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
 pub fn compileLetIn(self: *Compiler, node: *const Node) !void {
-    try self.compileLetInBody(node, false);
+    try compileLetInBody(self, node, false);
 }
 
 pub fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!void {
-    try self.compileLetInBody(node, true);
+    try compileLetInBody(self, node, true);
 }
 
 pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
     const let_in = node.data.let_in;
 
-    self.beginScope();
+    scope.beginScope(self);
 
     for (let_in.bindings, 0..) |binding, index| {
-        if (self.bindingRootSeen(let_in.bindings[0..index], binding.path[0])) continue;
-        const name = self.attrSegmentSpan(binding.path[0]);
+        if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const name_id = try self.intern.intern(name);
-        try self.emitOp(.push_null);
-        try self.emitOp(.make_cell);
-        const slot = try self.declareLocal(name, name_id);
-        try self.emitSetLocal(slot);
+        try emit.emitOp(self, .push_null);
+        try emit.emitOp(self, .make_cell);
+        const slot = try scope.declareLocal(self, name, name_id);
+        try emit.emitSetLocal(self, slot);
     }
 
     for (let_in.bindings, 0..) |binding, index| {
-        if (self.bindingRootSeen(let_in.bindings[0..index], binding.path[0])) continue;
-        const name = self.attrSegmentSpan(binding.path[0]);
-        const slot = self.resolveLocal(name) orelse return error.UndefinedVariable;
-        try self.compileLetRootBinding(let_in.bindings, binding.path[0], slot);
-        try self.emitSetCellLocal(slot);
+        if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
+        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot);
+        try emit.emitSetCellLocal(self, slot);
     }
 
     if (tail_body) {
-        try self.compileTailExpression(let_in.body);
+        try compileTailExpression(self, let_in.body);
     } else {
         try self.compileNode(let_in.body);
     }
 
-    self.endScope();
+    scope.endScope(self);
 }
 
 pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16) !void {
@@ -356,11 +355,11 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
     var tail_count: usize = 0;
 
     for (bindings) |binding| {
-        if (!self.attrSegmentsEqual(binding.path[0], root)) continue;
+        if (!attrs.attrSegmentsEqual(self, binding.path[0], root)) continue;
         if (binding.path.len == 1) {
             if (leaf) |previous| {
-                try self.reportCompileError(binding.name_offset, binding.name_len, "duplicate let binding");
-                try self.reportCompileNote(previous.name_offset, previous.name_len, "first binding defined here");
+                try diagnostics.reportCompileError(self, binding.name_offset, binding.name_len, "duplicate let binding");
+                try diagnostics.reportCompileNote(self, previous.name_offset, previous.name_len, "first binding defined here");
                 return error.DuplicateBinding;
             }
             leaf = binding;
@@ -373,7 +372,7 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
         const binding = leaf orelse return error.UndefinedVariable;
         const previous_skip = self.skip_local_slot;
         if (binding.inherit_outer) self.skip_local_slot = slot;
-        const compile_result = self.compileContainerValue(binding.expr, .{});
+        const compile_result = access.compileContainerValue(self, binding.expr, .{});
         self.skip_local_slot = previous_skip;
         return compile_result;
     }
@@ -382,7 +381,7 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
     defer self.allocator.free(tails);
     var i: usize = 0;
     for (bindings) |binding| {
-        if (!self.attrSegmentsEqual(binding.path[0], root) or binding.path.len == 1) continue;
+        if (!attrs.attrSegmentsEqual(self, binding.path[0], root) or binding.path.len == 1) continue;
         tails[i] = .{
             .path = binding.path[1..],
             .expr = binding.expr,
@@ -393,7 +392,7 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
 
     if (leaf) |root_leaf| {
         if (root_leaf.expr.tag != .attr_set) {
-            try self.reportDuplicateAttribute(tails[0].path[0], root_leaf.path[0]);
+            try attrs.reportDuplicateAttribute(self, tails[0].path[0], root_leaf.path[0]);
             return error.DuplicateAttribute;
         }
         const leaves = [_]AttrEntryView{.{
@@ -401,15 +400,15 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
             .expr = root_leaf.expr,
             .inherit_outer = root_leaf.inherit_outer,
         }};
-        return self.compileExtendedAttrSetLiteralThunk(&leaves, tails);
+        return attrs.compileExtendedAttrSetLiteralThunk(self, &leaves, tails);
     }
 
-    return self.compileAttrEntriesThunk(tails, true);
+    return attrs.compileAttrEntriesThunk(self, tails, true);
 }
 
 pub fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
     for (bindings) |binding| {
-        if (binding.path.len > 0 and self.attrSegmentsEqual(binding.path[0], root)) return true;
+        if (binding.path.len > 0 and attrs.attrSegmentsEqual(self, binding.path[0], root)) return true;
     }
     return false;
 }

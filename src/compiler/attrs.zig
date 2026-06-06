@@ -10,6 +10,12 @@ const string_syntax = @import("../string_syntax.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
 const OpCode = @import("../opcode.zig").OpCode;
+const emit = @import("emit.zig");
+const scope = @import("scope.zig");
+const thunks = @import("thunks.zig");
+const diagnostics = @import("diagnostics.zig");
+const literals = @import("literals.zig");
+const access = @import("access.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -23,103 +29,94 @@ const ContainerValueOptions = compiler_mod.ContainerValueOptions;
 const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const ChunkBuilder = chunk.ChunkBuilder;
-const attrEntriesDiagnosticAtom = compiler_mod.attrEntriesDiagnosticAtom;
-const attrGroupsDiagnosticAtom = compiler_mod.attrGroupsDiagnosticAtom;
-const attrPathDiagnosticAtom = compiler_mod.attrPathDiagnosticAtom;
-const captureCount = compiler_mod.captureCount;
-const diagnosticAtom = compiler_mod.diagnosticAtom;
-const hasAttrDiagnosticAtom = compiler_mod.hasAttrDiagnosticAtom;
-const hasAttrMixedDiagnosticAtom = compiler_mod.hasAttrMixedDiagnosticAtom;
-const nodeMayEvaluateToFloat = compiler_mod.nodeMayEvaluateToFloat;
-const nodeSourceSpan = compiler_mod.nodeSourceSpan;
-const offsetNode = compiler_mod.offsetNode;
-const u16Count = compiler_mod.u16Count;
-const unwrapParens = compiler_mod.unwrapParens;
+const diagnostic_atom = @import("diagnostic_atom.zig");
+const attrEntriesDiagnosticAtom = diagnostic_atom.attrEntriesDiagnosticAtom;
+const attrGroupsDiagnosticAtom = diagnostic_atom.attrGroupsDiagnosticAtom;
 
 pub fn compileAttrSet(self: *Compiler, node: *const Node) !void {
     const aset = node.data.attr_set;
-    if (self.hasDynamicAttrEntries(aset.entries)) {
-        return self.compileMixedAttrSet(aset.entries, aset.recursive);
+    if (hasDynamicAttrEntries(self, aset.entries)) {
+        return compileMixedAttrSet(self, aset.entries, aset.recursive);
     }
 
-    const entries = try self.attrEntryViews(aset.entries);
+    const entries = try attrEntryViews(self, aset.entries);
     defer self.allocator.free(entries);
 
-    try self.compileAttrEntries(entries, aset.recursive);
+    try compileAttrEntries(self, entries, aset.recursive);
 }
 
 pub fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
-    if (recursive) return self.compileMixedRecursiveAttrSet(entries);
+    if (recursive) return compileMixedRecursiveAttrSet(self, entries);
 
-    const static_count = self.staticAttrEntryCount(entries);
+    const static_count = staticAttrEntryCount(self, entries);
     if (static_count > 0) {
         const static_entries = try self.allocator.alloc(Node.AttrSetEntry, static_count);
         defer self.allocator.free(static_entries);
 
         var i: usize = 0;
         for (entries) |entry| {
-            if (!self.isDynamicAttrEntry(entry)) {
+            if (!isDynamicAttrEntry(self, entry)) {
                 static_entries[i] = entry;
                 i += 1;
             }
         }
 
-        const views = try self.attrEntryViews(static_entries);
+        const views = try attrEntryViews(self, static_entries);
         defer self.allocator.free(views);
-        try self.compileAttrEntries(views, false);
+        try compileAttrEntries(self, views, false);
     } else {
-        try self.emitOpU16(.build_attrs, 0);
+        try emit.emitOpU16(self, .build_attrs, 0);
     }
 
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntry(entry)) continue;
-        try self.compileDynamicAttrName(entry);
-        try self.compileDynamicAttrValueThunk(entry);
-        try self.emitOpU16(.build_attrs, 1);
-        try self.emitOp(.merge_attrs_strict);
+        if (!isDynamicAttrEntry(self, entry)) continue;
+        try compileDynamicAttrName(self, entry);
+        try compileDynamicAttrValueThunk(self, entry);
+        try emit.emitOpU16(self, .build_attrs, 1);
+        try emit.emitOp(self, .merge_attrs_strict);
     }
 }
 
 pub fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry) !void {
-    const static_count = self.staticAttrEntryCount(entries);
+    const static_count = staticAttrEntryCount(self, entries);
     const static_entries = try self.allocator.alloc(Node.AttrSetEntry, static_count);
     defer self.allocator.free(static_entries);
 
     var static_i: usize = 0;
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntry(entry)) {
+        if (!isDynamicAttrEntry(self, entry)) {
             static_entries[static_i] = entry;
             static_i += 1;
         }
     }
 
-    const views = try self.attrEntryViews(static_entries);
+    const views = try attrEntryViews(self, static_entries);
     defer self.allocator.free(views);
 
-    var grouped = try self.attrEntryGroups(views);
+    var grouped = try attrEntryGroups(self, views);
     defer grouped.deinit(self.allocator);
 
-    self.beginScope();
-    errdefer self.endScope();
+    scope.beginScope(self);
+    errdefer scope.endScope(self);
 
-    try self.declareRecursiveAttrLocals(grouped.groups);
-    try self.compileRecursiveAttrCells(grouped.groups);
-    try self.emitRecursiveAttrObject(grouped.groups);
+    try declareRecursiveAttrLocals(self, grouped.groups);
+    try compileRecursiveAttrCells(self, grouped.groups);
+    try emitRecursiveAttrObject(self, grouped.groups);
 
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntry(entry)) continue;
-        try self.compileDynamicAttrName(entry);
-        try self.compileDynamicAttrValueThunk(entry);
-        try self.emitOpU16(.build_attrs, 1);
-        try self.emitOp(.merge_attrs_strict);
+        if (!isDynamicAttrEntry(self, entry)) continue;
+        try compileDynamicAttrName(self, entry);
+        try compileDynamicAttrValueThunk(self, entry);
+        try emit.emitOpU16(self, .build_attrs, 1);
+        try emit.emitOp(self, .merge_attrs_strict);
     }
 
-    self.endScope();
+    scope.endScope(self);
 }
 
 pub fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
     for (entries) |entry| {
-        if (self.isDynamicAttrEntry(entry)) return true;
+        if (isDynamicAttrEntry(self, entry)) return true;
     }
     return false;
 }
@@ -127,41 +124,41 @@ pub fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSe
 pub fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSetEntry) usize {
     var count: usize = 0;
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntry(entry)) count += 1;
+        if (!isDynamicAttrEntry(self, entry)) count += 1;
     }
     return count;
 }
 
 pub fn isDynamicAttrEntry(self: *const Compiler, entry: Node.AttrSetEntry) bool {
-    return entry.dynamic_name != null or (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0]));
+    return entry.dynamic_name != null or (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0]));
 }
 
 pub fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
     if (entry.dynamic_name) |name| return self.compileNode(name);
-    if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
-        return self.compileStringAtom(entry.path[0]);
+    if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
+        return literals.compileStringAtom(self, entry.path[0]);
     }
     return error.InvalidAttributePath;
 }
 
 pub fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void {
     if (entry.dynamic_name) |_| {
-        if (entry.path.len == 0) return self.compileThunk(entry.expr);
+        if (entry.path.len == 0) return thunks.compileThunk(self, entry.expr);
 
         const views = [_]AttrEntryView{
             .{ .path = entry.path, .expr = entry.expr, .inherit_outer = entry.inherit_outer },
         };
-        try self.compileAttrEntriesThunk(&views, false);
+        try compileAttrEntriesThunk(self, &views, false);
         return;
     }
 
-    if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
-        if (entry.path.len == 1) return self.compileThunk(entry.expr);
+    if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
+        if (entry.path.len == 1) return thunks.compileThunk(self, entry.expr);
 
         const views = [_]AttrEntryView{
             .{ .path = entry.path[1..], .expr = entry.expr, .inherit_outer = entry.inherit_outer },
         };
-        try self.compileAttrEntriesThunk(&views, false);
+        try compileAttrEntriesThunk(self, &views, false);
         return;
     }
 
@@ -185,97 +182,97 @@ pub fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSe
     child.source_file_id = self.source_file_id;
     defer child.deinit();
 
-    child.compileMixedAttrSet(entries, recursive) catch |err| {
-        try self.absorbChildDiagnostics(&child);
+    compileMixedAttrSet(&child, entries, recursive) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try child.emitOp(.ret);
-    try child.emitOp(.halt);
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try self.emitThunkWithCaptures(child_id, child.captures.items);
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
 pub fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
-    if (self.hasDynamicAttrEntryViews(entries)) {
-        return self.compileMixedAttrEntryViews(entries, recursive);
+    if (hasDynamicAttrEntryViews(self, entries)) {
+        return compileMixedAttrEntryViews(self, entries, recursive);
     }
 
     if (recursive) {
-        try self.compileRecursiveAttrEntries(entries);
+        try compileRecursiveAttrEntries(self, entries);
     } else {
-        try self.compilePlainAttrEntries(entries);
+        try compilePlainAttrEntries(self, entries);
     }
 }
 
 pub fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, recursive: bool) !void {
-    if (recursive) return self.compileMixedRecursiveAttrEntryViews(entries);
+    if (recursive) return compileMixedRecursiveAttrEntryViews(self, entries);
 
-    const static_count = self.staticAttrEntryViewCount(entries);
+    const static_count = staticAttrEntryViewCount(self, entries);
     if (static_count > 0) {
         const static_entries = try self.allocator.alloc(AttrEntryView, static_count);
         defer self.allocator.free(static_entries);
 
         var i: usize = 0;
         for (entries) |entry| {
-            if (!self.isDynamicAttrEntryView(entry)) {
+            if (!isDynamicAttrEntryView(self, entry)) {
                 static_entries[i] = entry;
                 i += 1;
             }
         }
 
-        try self.compileAttrEntries(static_entries, false);
+        try compileAttrEntries(self, static_entries, false);
     } else {
-        try self.emitOpU16(.build_attrs, 0);
+        try emit.emitOpU16(self, .build_attrs, 0);
     }
 
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntryView(entry)) continue;
-        try self.compileDynamicAttrViewName(entry);
-        try self.compileDynamicAttrViewValueThunk(entry);
-        try self.emitOpU16(.build_attrs, 1);
-        try self.emitOp(.merge_attrs_strict);
+        if (!isDynamicAttrEntryView(self, entry)) continue;
+        try compileDynamicAttrViewName(self, entry);
+        try compileDynamicAttrViewValueThunk(self, entry);
+        try emit.emitOpU16(self, .build_attrs, 1);
+        try emit.emitOp(self, .merge_attrs_strict);
     }
 }
 
 pub fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEntryView) !void {
-    const static_count = self.staticAttrEntryViewCount(entries);
+    const static_count = staticAttrEntryViewCount(self, entries);
     const static_entries = try self.allocator.alloc(AttrEntryView, static_count);
     defer self.allocator.free(static_entries);
 
     var static_i: usize = 0;
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntryView(entry)) {
+        if (!isDynamicAttrEntryView(self, entry)) {
             static_entries[static_i] = entry;
             static_i += 1;
         }
     }
 
-    var grouped = try self.attrEntryGroups(static_entries);
+    var grouped = try attrEntryGroups(self, static_entries);
     defer grouped.deinit(self.allocator);
 
-    self.beginScope();
-    errdefer self.endScope();
+    scope.beginScope(self);
+    errdefer scope.endScope(self);
 
-    try self.declareRecursiveAttrLocals(grouped.groups);
-    try self.compileRecursiveAttrCells(grouped.groups);
-    try self.emitRecursiveAttrObject(grouped.groups);
+    try declareRecursiveAttrLocals(self, grouped.groups);
+    try compileRecursiveAttrCells(self, grouped.groups);
+    try emitRecursiveAttrObject(self, grouped.groups);
 
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntryView(entry)) continue;
-        try self.compileDynamicAttrViewName(entry);
-        try self.compileDynamicAttrViewValueThunk(entry);
-        try self.emitOpU16(.build_attrs, 1);
-        try self.emitOp(.merge_attrs_strict);
+        if (!isDynamicAttrEntryView(self, entry)) continue;
+        try compileDynamicAttrViewName(self, entry);
+        try compileDynamicAttrViewValueThunk(self, entry);
+        try emit.emitOpU16(self, .build_attrs, 1);
+        try emit.emitOp(self, .merge_attrs_strict);
     }
 
-    self.endScope();
+    scope.endScope(self);
 }
 
 pub fn hasDynamicAttrEntryViews(self: *const Compiler, entries: []const AttrEntryView) bool {
     for (entries) |entry| {
-        if (self.isDynamicAttrEntryView(entry)) return true;
+        if (isDynamicAttrEntryView(self, entry)) return true;
     }
     return false;
 }
@@ -283,24 +280,24 @@ pub fn hasDynamicAttrEntryViews(self: *const Compiler, entries: []const AttrEntr
 pub fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntryView) usize {
     var count: usize = 0;
     for (entries) |entry| {
-        if (!self.isDynamicAttrEntryView(entry)) count += 1;
+        if (!isDynamicAttrEntryView(self, entry)) count += 1;
     }
     return count;
 }
 
 pub fn isDynamicAttrEntryView(self: *const Compiler, entry: AttrEntryView) bool {
-    return entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0]);
+    return entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0]);
 }
 
 pub fn compileDynamicAttrViewName(self: *Compiler, entry: AttrEntryView) !void {
-    if (entry.path.len > 0 and self.attrSegmentHasInterpolation(entry.path[0])) {
-        return self.compileStringAtom(entry.path[0]);
+    if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
+        return literals.compileStringAtom(self, entry.path[0]);
     }
     return error.InvalidAttributePath;
 }
 
 pub fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void {
-    if (entry.path.len == 1) return self.compileThunk(entry.expr);
+    if (entry.path.len == 1) return thunks.compileThunk(self, entry.expr);
 
     const views = [_]AttrEntryView{
         .{
@@ -309,35 +306,35 @@ pub fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !
             .inherit_outer = entry.inherit_outer,
         },
     };
-    try self.compileAttrEntriesThunk(&views, false);
+    try compileAttrEntriesThunk(self, &views, false);
 }
 
 pub fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-    var grouped = try self.attrEntryGroups(entries);
+    var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
 
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
     for (grouped.groups) |group| {
-        try self.compilePlainAttrGroup(&positions, group);
+        try compilePlainAttrGroup(self, &positions, group);
     }
 
-    const count = try self.requireU16At(grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
-    try self.emitBuildAttrs(count, positions.items);
+    const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
+    try emit.emitBuildAttrs(self, count, positions.items);
 }
 
 pub fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
-    var grouped = try self.attrEntryGroups(entries);
+    var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
 
-    self.beginScope();
-    errdefer self.endScope();
+    scope.beginScope(self);
+    errdefer scope.endScope(self);
 
-    try self.declareRecursiveAttrLocals(grouped.groups);
-    try self.compileRecursiveAttrCells(grouped.groups);
-    try self.emitRecursiveAttrObject(grouped.groups);
-    self.endScope();
+    try declareRecursiveAttrLocals(self, grouped.groups);
+    try compileRecursiveAttrCells(self, grouped.groups);
+    try emitRecursiveAttrObject(self, grouped.groups);
+    scope.endScope(self);
 }
 
 pub fn compilePlainAttrGroup(
@@ -347,9 +344,9 @@ pub fn compilePlainAttrGroup(
 ) anyerror!void {
     const leaf = group.leaf;
     if (leaf == null) {
-        try self.emitAttrNameId(group.name_id);
-        try self.compileAttrEntriesThunk(group.tails, false);
-        try self.appendAttrPosition(positions, group.first, group.name_id);
+        try emitAttrNameId(self, group.name_id);
+        try compileAttrEntriesThunk(self, group.tails, false);
+        try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
     }
 
@@ -357,38 +354,38 @@ pub fn compilePlainAttrGroup(
         const duplicate = if (leaf.?.expr.tag != .attr_set)
             group.duplicate_leaf orelse group.first_nested
         else
-            self.nonAttrSetDuplicateLeaf(group);
+            nonAttrSetDuplicateLeaf(self, group);
         if (duplicate) |entry| {
-            try self.reportDuplicateAttribute(entry.path[0], leaf.?.path[0]);
+            try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
             return error.DuplicateAttribute;
         }
-        try self.emitAttrNameId(group.name_id);
-        try self.compileExtendedAttrSetLiteralThunk(group.leaves, group.tails);
-        try self.appendAttrPosition(positions, group.first, group.name_id);
+        try emitAttrNameId(self, group.name_id);
+        try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
+        try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
     }
 
-    try self.emitAttrNameId(group.name_id);
-    try self.compileContainerValue(leaf.?.expr, .{ .raw_identifier = true });
-    try self.appendAttrPosition(positions, group.first, group.name_id);
+    try emitAttrNameId(self, group.name_id);
+    try access.compileContainerValue(self, leaf.?.expr, .{ .raw_identifier = true });
+    try appendAttrPosition(self, positions, group.first, group.name_id);
 }
 
 pub fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     for (groups) |group| {
-        try self.emitOp(.push_null);
-        try self.emitOp(.make_cell);
-        const slot = try self.declareLocal(group.name, group.name_id);
-        try self.emitSetLocal(slot);
+        try emit.emitOp(self, .push_null);
+        try emit.emitOp(self, .make_cell);
+        const slot = try scope.declareLocal(self, group.name, group.name_id);
+        try emit.emitSetLocal(self, slot);
     }
 }
 
 pub fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     for (groups) |group| {
-        const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
+        const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
         const leaf = group.leaf;
         if (leaf == null) {
-            try self.compileAttrEntriesThunk(group.tails, false);
-            try self.emitSetCellLocal(slot);
+            try compileAttrEntriesThunk(self, group.tails, false);
+            try emit.emitSetCellLocal(self, slot);
             continue;
         }
 
@@ -396,21 +393,21 @@ pub fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup
             const duplicate = if (leaf.?.expr.tag != .attr_set)
                 group.duplicate_leaf orelse group.first_nested
             else
-                self.nonAttrSetDuplicateLeaf(group);
+                nonAttrSetDuplicateLeaf(self, group);
             if (duplicate) |entry| {
-                try self.reportDuplicateAttribute(entry.path[0], leaf.?.path[0]);
+                try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
             }
-            try self.compileExtendedAttrSetLiteralThunk(group.leaves, group.tails);
-            try self.emitSetCellLocal(slot);
+            try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
+            try emit.emitSetCellLocal(self, slot);
             continue;
         }
         const previous_skip = self.skip_local_slot;
         if (leaf.?.inherit_outer) self.skip_local_slot = slot;
-        const compile_result = self.compileContainerValue(leaf.?.expr, .{});
+        const compile_result = access.compileContainerValue(self, leaf.?.expr, .{});
         self.skip_local_slot = previous_skip;
         try compile_result;
-        try self.emitSetCellLocal(slot);
+        try emit.emitSetCellLocal(self, slot);
     }
 }
 
@@ -419,15 +416,15 @@ pub fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) 
     defer positions.deinit(self.allocator);
 
     for (groups) |group| {
-        try self.emitAttrNameId(group.name_id);
+        try emitAttrNameId(self, group.name_id);
 
-        const slot = self.resolveLocalId(group.name_id) orelse return error.UndefinedVariable;
-        try self.emitCaptureLocal(slot);
-        try self.appendAttrPosition(&positions, group.first, group.name_id);
+        const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
+        try emit.emitCaptureLocal(self, slot);
+        try appendAttrPosition(self, &positions, group.first, group.name_id);
     }
 
-    const count = try self.requireU16At(groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
-    try self.emitBuildAttrs(count, positions.items);
+    const count = try diagnostics.requireU16At(self, groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
+    try emit.emitBuildAttrs(self, count, positions.items);
 }
 
 pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {
@@ -458,7 +455,7 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
         };
     }
 
-    try self.compileNodeAttrEntriesThunk(merged, first_attr_set.recursive);
+    try compileNodeAttrEntriesThunk(self, merged, first_attr_set.recursive);
 }
 
 pub fn nonAttrSetDuplicateLeaf(self: *Compiler, group: AttrEntryGroup) ?AttrEntryView {
@@ -487,16 +484,16 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
     child.source_file_id = self.source_file_id;
     defer child.deinit();
 
-    child.compileAttrEntries(entries, recursive) catch |err| {
-        try self.absorbChildDiagnostics(&child);
+    compileAttrEntries(&child, entries, recursive) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try child.emitOp(.ret);
-    try child.emitOp(.halt);
+    try emit.emitOp(&child, .ret);
+    try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try self.emitThunkWithCaptures(child_id, child.captures.items);
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
 pub fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {
@@ -524,7 +521,7 @@ pub fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEnt
     for (entries) |entry| {
         if (entry.path.len == 0) return error.InvalidAttributePath;
 
-        var name: ?[]u8 = try self.attrSegmentNameAlloc(entry.path[0]);
+        var name: ?[]u8 = try attrSegmentNameAlloc(self, entry.path[0]);
         errdefer if (name) |owned| self.allocator.free(owned);
         const name_id = try self.intern.intern(name.?);
         const index = group_index.get(name_id) orelse blk: {
@@ -588,7 +585,7 @@ pub fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEnt
     }
 
     for (entries) |entry| {
-        const name_id = try self.attrSegmentNameId(entry.path[0]);
+        const name_id = try attrSegmentNameId(self, entry.path[0]);
         const index = group_index.get(name_id).?;
         const group = &groups[index];
         if (entry.path.len == 1) {
@@ -608,12 +605,12 @@ pub fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEnt
 }
 
 pub fn reportDuplicateAttribute(self: *Compiler, duplicate: Node.Atom, original: Node.Atom) !void {
-    try self.reportCompileError(duplicate.offset, duplicate.len, "duplicate attribute");
-    try self.reportCompileNote(original.offset, original.len, "first attribute defined here");
+    try diagnostics.reportCompileError(self, duplicate.offset, duplicate.len, "duplicate attribute");
+    try diagnostics.reportCompileNote(self, original.offset, original.len, "first attribute defined here");
 }
 
 pub fn attrSegmentsEqual(self: *const Compiler, a: Node.Atom, b: Node.Atom) bool {
-    return std.mem.eql(u8, self.attrSegmentSpan(a), self.attrSegmentSpan(b));
+    return std.mem.eql(u8, attrSegmentSpan(self, a), attrSegmentSpan(self, b));
 }
 
 pub fn emitAttrNameId(self: *Compiler, name_id: InternId) !void {
@@ -628,11 +625,11 @@ pub fn appendAttrPosition(
     name_id: InternId,
 ) !void {
     _ = self.source_path orelse return;
-    const position = try self.sourcePositionForOffset(atom.offset);
+    const position = try diagnostics.sourcePositionForOffset(self, atom.offset);
     try positions.append(self.allocator, .{
         .name = name_id,
         .pos = .{
-            .file = try self.sourceFileId(),
+            .file = try sourceFileId(self),
             .line = position.line,
             .column = position.column,
         },
@@ -645,4 +642,48 @@ pub fn sourceFileId(self: *Compiler) !InternId {
     const id = try self.intern.intern(path);
     self.source_file_id = id;
     return id;
+}
+
+pub fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
+    const span = self.source[atom.offset .. atom.offset + atom.len];
+    if (span.len >= 2 and span[0] == '"' and span[span.len - 1] == '"') {
+        return span[1 .. span.len - 1];
+    }
+    return span;
+}
+
+pub fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
+    const name = try attrSegmentNameAlloc(self, atom);
+    defer self.allocator.free(name);
+    return self.intern.intern(name);
+}
+
+pub fn attrSegmentNameAlloc(self: *Compiler, atom: Node.Atom) ![]u8 {
+    const span = self.source[atom.offset .. atom.offset + atom.len];
+    if (string_syntax.kindAt(self.source, atom.offset) == null) {
+        return self.allocator.dupe(u8, span);
+    }
+
+    const parsed = try string_syntax.parseLiteral(self.allocator, self.source, .{
+        .start = atom.offset,
+        .end = atom.offset + atom.len,
+    });
+    defer parsed.deinit();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+
+    for (parsed.parts) |part| {
+        switch (part) {
+            .text => |text| try out.appendSlice(self.allocator, text.bytes),
+            .interpolation => return error.InvalidAttributePath,
+        }
+    }
+
+    return out.toOwnedSlice(self.allocator);
+}
+
+pub fn attrSegmentHasInterpolation(self: *const Compiler, atom: Node.Atom) bool {
+    const span = self.source[atom.offset .. atom.offset + atom.len];
+    return string_syntax.kindAt(self.source, atom.offset) != null and std.mem.indexOf(u8, span, "${") != null;
 }

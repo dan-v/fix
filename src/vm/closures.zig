@@ -2,30 +2,21 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("../types.zig");
 const Value = @import("../value.zig").Value;
-const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const bytecode_mod = @import("../bytecode.zig");
-const opcode = @import("../opcode.zig");
-const OpCode = opcode.OpCode;
 const chunk = @import("../chunk.zig");
 const Chunk = chunk.Chunk;
-const thunk_mod = @import("../thunk.zig");
-const Thunk = thunk_mod.Thunk;
-const ThunkTarget = thunk_mod.ThunkTarget;
 const heap_mod = @import("../heap.zig");
 const Closure = heap_mod.Closure;
-const numeric = @import("../runtime/numeric.zig");
-const source_paths = @import("../runtime/source_path.zig");
-const vm_builtins = @import("builtins.zig");
-const diagnostic = @import("../diagnostic.zig");
+
+const access = @import("access.zig");
+const errors = @import("errors.zig");
+const stack = @import("stack.zig");
+const trace = @import("trace.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
-const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
 const readU16 = vm_mod.readU16;
-const readU32 = vm_mod.readU32;
-const readInternId = vm_mod.readInternId;
 
 // ---- closures ----
 
@@ -37,7 +28,7 @@ pub fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
     const start = self.sp - upvalue_count;
     const id = try self.heap.addClosure(chunk_id, self.stack.items[start..self.sp]);
     self.sp = start;
-    try self.push(Value.closure(id));
+    try stack.push(self, Value.closure(id));
 }
 
 pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const Frame) !u16 {
@@ -91,18 +82,18 @@ pub fn fillCaptureValues(self: *VM, descriptors: []const u8, frame: *const Frame
 }
 
 pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-    const upvalue_count = try self.stageCaptureDescriptors(descriptors, frame);
-    try self.makeClosure(chunk_id, upvalue_count);
+    const upvalue_count = try stageCaptureDescriptors(self, descriptors, frame);
+    try makeClosure(self, chunk_id, upvalue_count);
 }
 
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
     const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
     var committed = false;
     errdefer if (!committed) self.heap.rollbackBytecodeThunk(pending);
-    try self.fillCaptureValues(descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
+    try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
     committed = true;
-    try self.push(Value.thunk(id));
+    try stack.push(self, Value.thunk(id));
 }
 
 // ---- calls ----
@@ -110,18 +101,18 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     if (callee.discriminant == .closure) {
         const closure_id = callee.asObjectId();
-        const closure = try self.getClosureById(closure_id);
+        const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-        try self.push(arg); // arg is first local
-        try self.pushFrame(ch, 1, closure.upvalues);
+        try stack.push(self, arg); // arg is first local
+        try stack.pushFrame(self, ch, 1, closure.upvalues);
     } else if (callee.discriminant == .builtin) {
-        try self.push(try self.applyBuiltin(callee.asBuiltinId(), &.{arg}));
+        try stack.push(self, try access.applyBuiltin(self, callee.asBuiltinId(), &.{arg}));
     } else if (callee.discriminant == .builtin_closure) {
-        try self.push(try self.applyBuiltinClosure(callee, arg));
+        try stack.push(self, try access.applyBuiltinClosure(self, callee, arg));
     } else if (callee.discriminant == .attrs) {
-        const callable = try self.callAttrFunctor(callee);
-        try self.doCall(callable, arg);
-    } else return self.notCallableError(callee);
+        const callable = try access.callAttrFunctor(self, callee);
+        try doCall(self, callable, arg);
+    } else return trace.notCallableError(self, callee);
 }
 
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
@@ -130,21 +121,21 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
         switch (current.discriminant) {
             .closure => {
                 const closure_id = current.asObjectId();
-                const closure = try self.getClosureById(closure_id);
+                const closure = try getClosureById(self, closure_id);
                 const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-                try self.replaceCurrentFrame(ch, arg, closure.upvalues);
+                try replaceCurrentFrame(self, ch, arg, closure.upvalues);
                 return;
             },
             .builtin => {
-                try self.push(try self.applyBuiltin(current.asBuiltinId(), &.{arg}));
+                try stack.push(self, try access.applyBuiltin(self, current.asBuiltinId(), &.{arg}));
                 return;
             },
             .builtin_closure => {
-                try self.push(try self.applyBuiltinClosure(current, arg));
+                try stack.push(self, try access.applyBuiltinClosure(self, current, arg));
                 return;
             },
-            .attrs => current = try self.callAttrFunctor(current),
-            else => return self.notCallableError(current),
+            .attrs => current = try access.callAttrFunctor(self, current),
+            else => return trace.notCallableError(self, current),
         }
     }
 }
@@ -153,7 +144,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []
     if (ch.local_count == 0) return error.InvalidCallFrame;
 
     const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
-    const frame = self.currentFrame();
+    const frame = stack.currentFrame(self);
     const frame_base = frame.frame_base;
     const arg_end = frame_base + 1;
     if (arg_end > stack_cap) return error.StackOverflow;
@@ -179,33 +170,34 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     if (callee.discriminant == .closure) {
         const closure_id = callee.asObjectId();
-        const closure = try self.getClosureById(closure_id);
+        const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-        try self.push(arg);
-        return self.runIsolatedFrame(ch, 1, closure.upvalues);
+        try stack.push(self, arg);
+        return runIsolatedFrame(self, ch, 1, closure.upvalues);
     }
     if (callee.discriminant == .builtin) {
-        return self.applyBuiltin(callee.asBuiltinId(), &.{arg});
+        return access.applyBuiltin(self, callee.asBuiltinId(), &.{arg});
     }
     if (callee.discriminant == .builtin_closure) {
-        return self.applyBuiltinClosure(callee, arg);
+        return access.applyBuiltinClosure(self, callee, arg);
     }
     if (callee.discriminant == .attrs) {
-        const callable = try self.callAttrFunctor(callee);
-        return self.callValue(callable, arg);
+        const callable = try access.callAttrFunctor(self, callee);
+        return callValue(self, callable, arg);
     }
-    return self.notCallableError(callee);
+    return trace.notCallableError(self, callee);
 }
 
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
+    const run_mod = @import("run.zig");
     const stop_depth = self.frames.items.len;
     const base_sp = self.sp - arg_count;
-    self.pushFrame(ch, arg_count, upvalues) catch |err| {
+    stack.pushFrame(self, ch, arg_count, upvalues) catch |err| {
         self.sp = base_sp;
         return err;
     };
-    return self.runUntil(stop_depth) catch |err| {
-        self.captureErrorTrace(err) catch {};
+    return run_mod.runUntil(self, stop_depth) catch |err| {
+        errors.captureErrorTrace(self, err) catch {};
         self.frames.shrinkRetainingCapacity(stop_depth);
         self.sp = base_sp;
         return err;

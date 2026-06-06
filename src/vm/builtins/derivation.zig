@@ -10,11 +10,17 @@ const collections = @import("collections.zig");
 const serial = @import("serial.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
+const string_context = @import("string_context.zig");
+const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
+const vm_equality = @import("../equality.zig");
+const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
-const allOutputsContextValue = strings.allOutputsContextValue;
-const appendContextEntry = strings.appendContextEntry;
+const allOutputsContextValue = string_context.allOutputsContextValue;
+const appendContextEntry = string_context.appendContextEntry;
 const coerceDerivationStringValue = strings.coerceDerivationStringValue;
-const contextEntriesForValue = strings.contextEntriesForValue;
+const contextEntriesForValue = string_context.contextEntriesForValue;
 const makeBuiltinThunk = shared.makeBuiltinThunk;
 const jsonAttrsSourceStringValue = serial.jsonAttrsSourceStringValue;
 const isPlainString = strings.isPlainString;
@@ -41,7 +47,7 @@ fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *std.A
 pub const DerivationMode = enum { lazy, strict };
 
 pub fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value {
-    const attrs = try self.forceValue(arg);
+    const attrs = try vm_force.forceValue(self, arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
     if (mode == .lazy) return buildLazyDerivationValue(self, attrs.asObjectId());
@@ -49,8 +55,8 @@ pub fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value
 }
 
 pub fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Value) !Value {
-    const attrs = try self.forceValue(attrs_arg);
-    const name = try self.forceValue(name_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
+    const name = try vm_force.forceValue(self, name_arg);
     if (attrs.discriminant != .attrs or !isPlainString(name)) return error.TypeError;
 
     const name_id = try stringTextInternId(self, name);
@@ -141,14 +147,14 @@ fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
         error.MissingAttribute => return false,
         else => return err,
     };
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     if (!forced.isBool()) return error.TypeError;
     return forced.asBool();
 }
 
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     const name_id = try self.intern.intern("name");
-    const name_value = try self.forceValue(try self.heap.getAttrValue(attrs_id, name_id));
+    const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
     const drv_name_id = try stringTextInternId(self, name_value);
     const drv_name = self.intern.get(drv_name_id);
@@ -262,7 +268,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
-            if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
+            if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).discriminant == .null) continue;
             if (isDerivationOutputAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
                 if (output_names.explicit) {
@@ -314,14 +320,14 @@ fn applyFixedOutputAttrs(
         else => return err,
     };
     if (outputs.len != 1) return error.InvalidDerivationOutput;
-    const hash_forced = try self.forceValue(hash_value);
+    const hash_forced = try vm_force.forceValue(self, hash_value);
     if (!isPlainString(hash_forced)) return error.TypeError;
     const mode = blk: {
         const mode_value = self.heap.getAttrValue(attrs_id, try self.intern.intern("outputHashMode")) catch |err| switch (err) {
             error.MissingAttribute => break :blk "flat",
             else => return err,
         };
-        const forced = try self.forceValue(mode_value);
+        const forced = try vm_force.forceValue(self, mode_value);
         if (!isPlainString(forced)) return error.TypeError;
         break :blk self.intern.get(try stringTextInternId(self, forced));
     };
@@ -347,7 +353,7 @@ fn derivationIgnoreNulls(self: anytype, attrs_id: ObjectId) !bool {
         error.MissingAttribute => return false,
         else => return err,
     };
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     if (!forced.isBool()) return error.TypeError;
     return forced.asBool();
 }
@@ -357,7 +363,7 @@ fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []cons
         error.MissingAttribute => Value.null_val,
         else => return err,
     };
-    const forced_algo = try self.forceValue(algo_value);
+    const forced_algo = try vm_force.forceValue(self, algo_value);
     if (isPlainString(forced_algo)) {
         const algo = self.intern.get(try stringTextInternId(self, forced_algo));
         if (algo.len != 0) return algo;
@@ -378,7 +384,7 @@ fn derivationArgs(
         error.MissingAttribute => return self.allocator.alloc([]const u8, 0),
         else => return err,
     };
-    const list = try self.forceValue(args_value);
+    const list = try vm_force.forceValue(self, args_value);
     if (list.discriminant != .list) return error.TypeError;
     const items = try self.heap.getList(list.asObjectId());
     const args = try self.allocator.alloc([]const u8, items.len);
@@ -449,7 +455,7 @@ fn structuredAttrsJson(
         if (std.mem.eql(u8, name, "args")) continue;
         if (std.mem.eql(u8, name, "outputs") and !explicit_outputs) continue;
         if (isDerivationOutputAttr(self, name, outputs)) continue;
-        if (ignore_nulls and (try self.forceValue(entry.value)).discriminant == .null) continue;
+        if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).discriminant == .null) continue;
         if (!first) try out.append(self.allocator, ',');
         first = false;
         try appendJsonString(self, &out, self.intern.get(entry.name));
@@ -468,7 +474,7 @@ fn appendStructuredJsonValue(
     owned_strings: *std.ArrayListUnmanaged([]u8),
     seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) !void {
-    const forced = try self.forceValue(value);
+    const forced = try vm_force.forceValue(self, value);
     switch (forced.discriminant) {
         .null => try out.appendSlice(self.allocator, "null"),
         .bool_false => try out.appendSlice(self.allocator, "false"),
@@ -627,10 +633,10 @@ fn contextOutputs(
     value: Value,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const []const u8 {
-    const attrs = try self.forceValue(value);
+    const attrs = try vm_force.forceValue(self, value);
     if (attrs.discriminant != .attrs) return error.TypeError;
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("allOutputs"))) |all_outputs_value| {
-        const all_outputs = try self.forceValue(all_outputs_value);
+        const all_outputs = try vm_force.forceValue(self, all_outputs_value);
         if (!all_outputs.isBool()) return error.TypeError;
         if (all_outputs.asBool()) {
             const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
@@ -646,13 +652,13 @@ fn contextOutputs(
         else => return err,
     }
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
-        const list = try self.forceValue(outputs_value);
+        const list = try vm_force.forceValue(self, outputs_value);
         if (list.discriminant != .list) return error.TypeError;
         const items = try self.heap.getList(list.asObjectId());
         const outputs = try self.allocator.alloc([]const u8, items.len);
         errdefer self.allocator.free(outputs);
         for (items, outputs) |item, *output| {
-            const item_value = try self.forceValue(item);
+            const item_value = try vm_force.forceValue(self, item);
             if (!isPlainString(item_value)) return error.TypeError;
             output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
         }
@@ -717,7 +723,7 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
         else => return err,
     };
 
-    const outputs_list = try self.forceValue(outputs_value);
+    const outputs_list = try vm_force.forceValue(self, outputs_value);
     if (outputs_list.discriminant != .list) return error.TypeError;
     const items = try self.heap.getList(outputs_list.asObjectId());
     if (items.len == 0) return error.InvalidDerivationOutput;
@@ -725,7 +731,7 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
     const names = try self.allocator.alloc(InternId, items.len);
     errdefer self.allocator.free(names);
     for (items, names) |item, *name| {
-        const value = try self.forceValue(item);
+        const value = try vm_force.forceValue(self, item);
         if (!isPlainString(value)) return error.TypeError;
         name.* = try stringTextInternId(self, value);
         if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;

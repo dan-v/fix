@@ -6,6 +6,11 @@ const ObjectId = types.ObjectId;
 const heap_mod = @import("../../heap.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
+const vm_force = @import("../force.zig");
+const vm_strings = @import("../strings.zig");
+const vm_equality = @import("../equality.zig");
+const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
 const makeBuiltinThunk = shared.makeBuiltinThunk;
 const isCallable = strings.isCallable;
@@ -14,15 +19,15 @@ const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
 
 pub fn builtinCatAttrs(self: anytype, name_arg: Value, list_arg: Value) !Value {
-    const name = try self.forceValue(name_arg);
-    const list = try self.forceValue(list_arg);
+    const name = try vm_force.forceValue(self, name_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (!isPlainString(name) or list.discriminant != .list) return error.TypeError;
 
     var values: std.ArrayListUnmanaged(Value) = .empty;
     defer values.deinit(self.allocator);
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const attrs = try self.forceValue(item);
+        const attrs = try vm_force.forceValue(self, item);
         if (attrs.discriminant != .attrs) return error.TypeError;
         const value = self.heap.getAttrValue(attrs.asObjectId(), try stringTextInternId(self, name)) catch |err| switch (err) {
             error.MissingAttribute => continue,
@@ -35,8 +40,8 @@ pub fn builtinCatAttrs(self: anytype, name_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Value {
-    const func = try self.forceValue(func_arg);
-    const list = try self.forceValue(list_arg);
+    const func = try vm_force.forceValue(self, func_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     const Group = struct {
@@ -50,7 +55,7 @@ pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Val
     }
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const attrs = try self.forceValue(item);
+        const attrs = try vm_force.forceValue(self, item);
         if (attrs.discriminant != .attrs) return error.TypeError;
 
         for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
@@ -75,8 +80,8 @@ pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Val
 }
 
 pub fn builtinZipAttrsValue(self: anytype, func_arg: Value, name_arg: Value, values_arg: Value) !Value {
-    const partial = try self.callValue(func_arg, name_arg);
-    return self.callValue(partial, values_arg);
+    const partial = try vm_closures.callValue(self, func_arg, name_arg);
+    return vm_closures.callValue(self, partial, values_arg);
 }
 
 pub fn attrEntryNameIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize {
@@ -94,8 +99,8 @@ pub fn groupIndex(groups: anytype, name: InternId) ?usize {
 }
 
 pub fn callComparator(self: anytype, cmp: Value, left: Value, right: Value) !bool {
-    const partial = try self.callValue(cmp, left);
-    const result = try self.forceValue(try self.callValue(partial, right));
+    const partial = try vm_closures.callValue(self, cmp, left);
+    const result = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, right));
     if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
     return result.discriminant == .bool_true;
 }
@@ -107,10 +112,10 @@ pub fn genericClosureAppend(
     result: *std.ArrayListUnmanaged(Value),
     keys: *std.ArrayListUnmanaged(Value),
 ) !void {
-    const forced = try self.forceValue(item);
+    const forced = try vm_force.forceValue(self, item);
     if (forced.discriminant != .attrs) return error.TypeError;
-    const key = try self.forceValue(try self.heap.getAttrValue(forced.asObjectId(), key_name));
-    if (try self.valueSliceContainsForcedValue(key, keys.items)) return;
+    const key = try vm_force.forceValue(self, try self.heap.getAttrValue(forced.asObjectId(), key_name));
+    if (try vm_equality.valueSliceContainsForcedValue(self, key, keys.items)) return;
     try keys.append(self.allocator, key);
     try result.append(self.allocator, item);
 }
@@ -142,7 +147,7 @@ pub fn builtinAttrValues(self: anytype, arg: Value) !Value {
 }
 
 pub fn sortedAttrEntries(self: anytype, arg: Value) ![]heap_mod.AttrEntry {
-    const value = try self.forceValue(arg);
+    const value = try vm_force.forceValue(self, arg);
     if (value.discriminant != .attrs) return error.TypeError;
 
     const entries = try self.heap.getAttrs(value.asObjectId());
@@ -157,8 +162,8 @@ pub fn sortedAttrEntries(self: anytype, arg: Value) ![]heap_mod.AttrEntry {
 }
 
 pub fn builtinHasAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
-    const name = try self.forceValue(name_arg);
-    const attrs = try self.forceValue(attrs_arg);
+    const name = try vm_force.forceValue(self, name_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
     if (name.discriminant != .string or attrs.discriminant != .attrs) return error.TypeError;
 
     _ = self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()) catch |err| switch (err) {
@@ -169,50 +174,50 @@ pub fn builtinHasAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
 }
 
 pub fn builtinGetAttr(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
-    const name = try self.forceValue(name_arg);
-    const attrs = try self.forceValue(attrs_arg);
+    const name = try vm_force.forceValue(self, name_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
     if (name.discriminant != .string or attrs.discriminant != .attrs) return error.TypeError;
 
-    return self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()));
+    return vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name.asInternId()));
 }
 
 pub fn builtinElemAt(self: anytype, list_arg: Value, index_arg: Value) !Value {
-    const list = try self.forceValue(list_arg);
-    const index = try self.forceValue(index_arg);
+    const list = try vm_force.forceValue(self, list_arg);
+    const index = try vm_force.forceValue(self, index_arg);
     if (list.discriminant != .list or index.discriminant != .int) return error.TypeError;
     if (index.asInt() < 0) return error.IndexOutOfBounds;
 
     const items = try self.heap.getList(list.asObjectId());
     const i: usize = @intCast(index.asInt());
     if (i >= items.len) return error.IndexOutOfBounds;
-    return self.forceValue(items[i]);
+    return vm_force.forceValue(self, items[i]);
 }
 
 pub fn builtinElem(self: anytype, needle: Value, list_arg: Value) !Value {
-    const list = try self.forceValue(list_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
-    return Value.boolVal(try self.listContainsValue(needle, items));
+    return Value.boolVal(try vm_equality.listContainsValue(self, needle, items));
 }
 
 pub fn builtinSeq(self: anytype, first: Value, second: Value) !Value {
-    _ = try self.forceValue(first);
-    return self.forceValue(second);
+    _ = try vm_force.forceValue(self, first);
+    return vm_force.forceValue(self, second);
 }
 
 pub fn builtinDeepSeq(self: anytype, first: Value, second: Value) !Value {
-    try self.forceDeep(first);
-    return self.forceValue(second);
+    try vm_force.forceDeep(self, first);
+    return vm_force.forceValue(self, second);
 }
 
 pub fn builtinAll(self: anytype, pred_arg: Value, list_arg: Value) !Value {
-    const pred = try self.forceValue(pred_arg);
-    const list = try self.forceValue(list_arg);
+    const pred = try vm_force.forceValue(self, pred_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const result = try self.forceValue(try self.callValue(pred, item));
+        const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_false) return Value.boolVal(false);
     }
@@ -220,12 +225,12 @@ pub fn builtinAll(self: anytype, pred_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinAny(self: anytype, pred_arg: Value, list_arg: Value) !Value {
-    const pred = try self.forceValue(pred_arg);
-    const list = try self.forceValue(list_arg);
+    const pred = try vm_force.forceValue(self, pred_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const result = try self.forceValue(try self.callValue(pred, item));
+        const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_true) return Value.boolVal(true);
     }
@@ -233,15 +238,15 @@ pub fn builtinAny(self: anytype, pred_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
-    const pred = try self.forceValue(pred_arg);
-    const list = try self.forceValue(list_arg);
+    const pred = try vm_force.forceValue(self, pred_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const result = try self.forceValue(try self.callValue(pred, item));
+        const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_true) try out.append(self.allocator, item);
     }
@@ -250,9 +255,9 @@ pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
-    const func = try self.forceValue(fn_arg);
+    const func = try vm_force.forceValue(self, fn_arg);
     if (!try isCallable(self, func)) return error.NotCallable;
-    const list = try self.forceValue(list_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
@@ -266,20 +271,20 @@ pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinMapValue(self: anytype, func_arg: Value, item_arg: Value) !Value {
-    const func = try self.forceValue(func_arg);
-    return self.callValue(func, item_arg);
+    const func = try vm_force.forceValue(self, func_arg);
+    return vm_closures.callValue(self, func, item_arg);
 }
 
 pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
-    const func = try self.forceValue(fn_arg);
-    const list = try self.forceValue(list_arg);
+    const func = try vm_force.forceValue(self, fn_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const mapped = try self.forceValue(try self.callValue(func, item));
+        const mapped = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (mapped.discriminant != .list) return error.TypeError;
         try out.appendSlice(self.allocator, try self.heap.getList(mapped.asObjectId()));
     }
@@ -287,7 +292,7 @@ pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
-    const attrs = try self.forceValue(attrs_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
     const attr_entries = try self.heap.getAttrs(attrs.asObjectId());
@@ -304,14 +309,14 @@ pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
 }
 
 pub fn builtinMapAttrValue(self: anytype, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
-    const func = try self.forceValue(func_arg);
-    const partial = try self.callValue(func, name_arg);
-    return self.callValue(partial, value_arg);
+    const func = try vm_force.forceValue(self, func_arg);
+    const partial = try vm_closures.callValue(self, func, name_arg);
+    return vm_closures.callValue(self, partial, value_arg);
 }
 
 pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
-    const func = try self.forceValue(fn_arg);
-    const count = try self.forceValue(count_arg);
+    const func = try vm_force.forceValue(self, fn_arg);
+    const count = try vm_force.forceValue(self, count_arg);
     if (count.discriminant != .int or count.asInt() < 0) return error.TypeError;
 
     const len: usize = @intCast(count.asInt());
@@ -325,8 +330,8 @@ pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
 }
 
 pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
-    const cmp = try self.forceValue(cmp_arg);
-    const list = try self.forceValue(list_arg);
+    const cmp = try vm_force.forceValue(self, cmp_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
@@ -345,8 +350,8 @@ pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value {
-    const pred = try self.forceValue(pred_arg);
-    const list = try self.forceValue(list_arg);
+    const pred = try vm_force.forceValue(self, pred_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     var right: std.ArrayListUnmanaged(Value) = .empty;
@@ -355,7 +360,7 @@ pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value 
     defer wrong.deinit(self.allocator);
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const result = try self.forceValue(try self.callValue(pred, item));
+        const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_true) {
             try right.append(self.allocator, item);
@@ -372,8 +377,8 @@ pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value 
 }
 
 pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
-    const func = try self.forceValue(fn_arg);
-    const list = try self.forceValue(list_arg);
+    const func = try vm_force.forceValue(self, fn_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     const Group = struct {
@@ -387,7 +392,7 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     }
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const key = try self.forceValue(try self.callValue(func, item));
+        const key = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!isPlainString(key)) return error.TypeError;
         const key_id = try stringTextInternId(self, key);
         const index = groupIndex(groups.items, key_id) orelse blk: {
@@ -409,11 +414,11 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
 }
 
 pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
-    const attrs = try self.forceValue(arg);
+    const attrs = try vm_force.forceValue(self, arg);
     if (attrs.discriminant != .attrs) return error.TypeError;
 
-    const start_set = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("startSet")));
-    const operator = try self.forceValue(try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("operator")));
+    const start_set = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("startSet")));
+    const operator = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("operator")));
     if (start_set.discriminant != .list) return error.TypeError;
 
     var result: std.ArrayListUnmanaged(Value) = .empty;
@@ -428,7 +433,7 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
 
     var index: usize = 0;
     while (index < result.items.len) : (index += 1) {
-        const produced = try self.forceValue(try self.callValue(operator, result.items[index]));
+        const produced = try vm_force.forceValue(self, try vm_closures.callValue(self, operator, result.items[index]));
         if (produced.discriminant != .list) return error.TypeError;
         for (try self.heap.getList(produced.asObjectId())) |item| {
             try genericClosureAppend(self, key_name, item, &result, &keys);
@@ -439,7 +444,7 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
 }
 
 pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
-    const func = try self.forceValue(arg);
+    const func = try vm_force.forceValue(self, arg);
     if (func.discriminant == .builtin or func.discriminant == .builtin_closure) {
         return Value.attrs(try self.heap.addAttrs(&.{}));
     }
@@ -451,8 +456,8 @@ pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
 }
 
 pub fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value) !Value {
-    const name = try self.forceValue(name_arg);
-    const attrs = try self.forceValue(attrs_arg);
+    const name = try vm_force.forceValue(self, name_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
     if (!isPlainString(name) or attrs.discriminant != .attrs) return error.TypeError;
     const object_id = attrs.asObjectId();
     const name_id = try stringTextInternId(self, name);
@@ -480,22 +485,22 @@ pub fn builtinUnsafeGetAttrPos(self: anytype, name_arg: Value, attrs_arg: Value)
 }
 
 pub fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
-    const op = try self.forceValue(op_arg);
-    var acc = try self.forceValue(nul_arg);
-    const list = try self.forceValue(list_arg);
+    const op = try vm_force.forceValue(self, op_arg);
+    var acc = try vm_force.forceValue(self, nul_arg);
+    const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
     for (try self.heap.getList(list.asObjectId())) |item| {
-        const partial = try self.callValue(op, acc);
-        acc = try self.forceValue(try self.callValue(partial, item));
+        const partial = try vm_closures.callValue(self, op, acc);
+        acc = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, item));
     }
 
     return acc;
 }
 
 pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Value {
-    const attrs = try self.forceValue(attrs_arg);
-    const names = try self.forceValue(names_arg);
+    const attrs = try vm_force.forceValue(self, attrs_arg);
+    const names = try vm_force.forceValue(self, names_arg);
     if (attrs.discriminant != .attrs or names.discriminant != .list) return error.TypeError;
 
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -512,8 +517,8 @@ pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Va
 }
 
 pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !Value {
-    const left = try self.forceValue(left_arg);
-    const right = try self.forceValue(right_arg);
+    const left = try vm_force.forceValue(self, left_arg);
+    const right = try vm_force.forceValue(self, right_arg);
     if (left.discriminant != .attrs or right.discriminant != .attrs) return error.TypeError;
 
     const left_entries = try self.heap.getAttrs(left.asObjectId());
@@ -544,7 +549,7 @@ pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !
 pub fn stringListContainsIntern(self: anytype, list_id: ObjectId, needle: InternId) !bool {
     const items = try self.heap.getList(list_id);
     for (items) |item| {
-        const value = try self.forceValue(item);
+        const value = try vm_force.forceValue(self, item);
         if (!isPlainString(value)) return error.TypeError;
         if (try stringTextInternId(self, value) == needle) return true;
     }
