@@ -1221,18 +1221,6 @@ pub const Compiler = struct {
     }
 
     fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void {
-        if (entry.tail_dynamic_name) |tail_dynamic_name| {
-            const nested = [_]Node.AttrSetEntry{
-                .{
-                    .path = entry.path,
-                    .dynamic_name = tail_dynamic_name,
-                    .expr = entry.expr,
-                    .inherit_outer = entry.inherit_outer,
-                },
-            };
-            return self.compileNodeAttrEntriesThunk(&nested, false);
-        }
-
         if (entry.dynamic_name) |_| {
             if (entry.path.len == 0) return self.compileThunk(entry.expr);
 
@@ -2265,7 +2253,6 @@ fn offsetNode(node: *Node, offset: u32) void {
                     segment.offset += offset;
                 }
                 if (entry.dynamic_name) |dynamic_name| offsetNode(dynamic_name, offset);
-                if (entry.tail_dynamic_name) |dynamic_name| offsetNode(dynamic_name, offset);
                 offsetNode(entry.expr, offset);
             }
         },

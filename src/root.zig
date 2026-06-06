@@ -13,7 +13,6 @@ pub const opcode = @import("opcode.zig");
 pub const chunk = @import("chunk.zig");
 pub const heap = @import("heap.zig");
 pub const compiler = @import("compiler.zig");
-pub const env = @import("env.zig");
 pub const intern = @import("intern.zig");
 pub const thunk = @import("thunk.zig");
 pub const scheduler = @import("scheduler.zig");

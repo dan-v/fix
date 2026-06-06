@@ -38,7 +38,6 @@ const InfixFn = *const fn (p: *Parser, left: *Node) anyerror!*Node;
 const AttrDeclaration = struct {
     path: []Node.Atom,
     dynamic_name: ?*Node = null,
-    tail_dynamic_name: ?*Node = null,
     static_prefix_len: ?usize = null,
     dynamic_suffix: ?*AttrDeclaration = null,
 };
@@ -84,10 +83,6 @@ pub const Parser = struct {
         }
         if (self.had_error) return error.ParseError;
         return node;
-    }
-
-    pub fn parseFile(self: *Parser) !*Node {
-        return self.parse();
     }
 
     // ---- token stream ----
@@ -534,7 +529,6 @@ pub const Parser = struct {
 
             var path = declaration.path;
             var dynamic_name = declaration.dynamic_name;
-            var tail_dynamic_name = declaration.tail_dynamic_name;
             if (declaration.dynamic_suffix) |suffix| {
                 expr = try self.wrapAttrDeclarationExpr(arena_allocator, suffix.*, expr);
             }
@@ -543,7 +537,6 @@ pub const Parser = struct {
                 nested_entries[0] = .{
                     .path = declaration.path[prefix_len..],
                     .dynamic_name = dynamic_name,
-                    .tail_dynamic_name = tail_dynamic_name,
                     .expr = expr,
                 };
                 expr = try self.arena.createNode(.attr_set, .{
@@ -554,13 +547,11 @@ pub const Parser = struct {
                 });
                 path = declaration.path[0..prefix_len];
                 dynamic_name = null;
-                tail_dynamic_name = null;
             }
 
             try entries.append(arena_allocator, .{
                 .path = path,
                 .dynamic_name = dynamic_name,
-                .tail_dynamic_name = tail_dynamic_name,
                 .expr = expr,
             });
 
@@ -585,13 +576,11 @@ pub const Parser = struct {
 
         var path = declaration.path;
         var dynamic_name = declaration.dynamic_name;
-        var tail_dynamic_name = declaration.tail_dynamic_name;
         if (declaration.static_prefix_len) |prefix_len| {
             const nested_entries = try allocator.alloc(Node.AttrSetEntry, 1);
             nested_entries[0] = .{
                 .path = declaration.path[prefix_len..],
                 .dynamic_name = dynamic_name,
-                .tail_dynamic_name = tail_dynamic_name,
                 .expr = wrapped_expr,
             };
             wrapped_expr = try self.arena.createNode(.attr_set, .{
@@ -602,14 +591,12 @@ pub const Parser = struct {
             });
             path = declaration.path[0..prefix_len];
             dynamic_name = null;
-            tail_dynamic_name = null;
         }
 
         const entries = try allocator.alloc(Node.AttrSetEntry, 1);
         entries[0] = .{
             .path = path,
             .dynamic_name = dynamic_name,
-            .tail_dynamic_name = tail_dynamic_name,
             .expr = wrapped_expr,
         };
         return self.arena.createNode(.attr_set, .{
@@ -737,26 +724,6 @@ pub const Parser = struct {
         }
 
         return .{ .path = try segments.toOwnedSlice(allocator) };
-    }
-
-    fn attrDeclarationPath(self: *Parser, allocator: std.mem.Allocator) ![]Node.Atom {
-        var segments: std.ArrayListUnmanaged(Node.Atom) = .empty;
-
-        while (true) {
-            if (self.matchAttrName()) {
-                try segments.append(allocator, .{
-                    .offset = self.previous.offset,
-                    .len = self.previous.len,
-                });
-            } else {
-                self.reportError("Expected attribute name.");
-                return error.ParseError;
-            }
-
-            if (!self.match(.dot)) break;
-        }
-
-        return segments.toOwnedSlice(allocator);
     }
 
     fn list(self: *Parser) !*Node {

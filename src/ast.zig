@@ -164,7 +164,6 @@ pub const Node = struct {
     pub const AttrSetEntry = struct {
         path: []Atom,
         dynamic_name: ?*Node = null,
-        tail_dynamic_name: ?*Node = null,
         expr: *Node,
         inherit_outer: bool = false,
     };
@@ -312,7 +311,6 @@ fn attrSetSourceSpan(attr_set: Node.AttrSet) ?Node.Atom {
     for (attr_set.entries) |entry| {
         for (entry.path) |segment| span = combineAtoms(span, segment);
         if (entry.dynamic_name) |dynamic_name| span = combineAtoms(span, dynamic_name.span);
-        if (entry.tail_dynamic_name) |dynamic_name| span = combineAtoms(span, dynamic_name.span);
         span = combineAtoms(span, entry.expr.span);
     }
     return span;
@@ -481,7 +479,6 @@ fn cloneAttrSetEntries(arena: *AstArena, entries: []const Node.AttrSetEntry) any
         dest.* = .{
             .path = try cloneAtoms(arena, entry.path),
             .dynamic_name = if (entry.dynamic_name) |name| try cloneNode(arena, name) else null,
-            .tail_dynamic_name = if (entry.tail_dynamic_name) |name| try cloneNode(arena, name) else null,
             .expr = try cloneNode(arena, entry.expr),
             .inherit_outer = entry.inherit_outer,
         };

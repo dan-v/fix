@@ -326,11 +326,6 @@ pub const VM = struct {
                     _ = self.pop();
                 },
 
-                .dup => {
-                    const t = self.stack.items[self.sp - 1];
-                    try self.push(t);
-                },
-
                 .get_local => {
                     const slot = code[frame.ip];
                     frame.ip += 1;
@@ -457,11 +452,6 @@ pub const VM = struct {
                     const a = self.pop();
                     try self.push(Value.float(try numeric.toFloat(a) / try numeric.toFloat(b)));
                 },
-                .negate_float => {
-                    const a = self.pop();
-                    try self.push(Value.float(-try numeric.toFloat(a)));
-                },
-
                 // ---- comparison ----
                 .eq => {
                     const b = self.pop();
@@ -654,10 +644,6 @@ pub const VM = struct {
                     try self.doTailCall(callee, arg);
                 },
                 // ---- thunks ----
-                .make_thunk => {
-                    const closure = self.pop();
-                    try self.push(try self.makeThunk(closure));
-                },
                 .make_cell => {
                     const val = self.pop();
                     try self.push(try self.makeCell(val));

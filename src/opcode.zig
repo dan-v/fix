@@ -17,9 +17,6 @@ pub const OpCode = enum(u8) {
 
     /// Discard top of stack.
     pop,
-    /// Duplicate top of stack.
-    dup,
-
     // ---- locals ----
     /// Push local variable at offset (operand: 1-byte offset from frame base).
     get_local,
@@ -52,7 +49,6 @@ pub const OpCode = enum(u8) {
     sub_float,
     mul_float,
     div_float,
-    negate_float,
 
     // ---- comparison ----
     eq,
@@ -133,8 +129,6 @@ pub const OpCode = enum(u8) {
     tail_call,
 
     // ---- thunks ----
-    /// Wrap the top-of-stack zero-argument closure into a lazy thunk.
-    make_thunk,
     /// Wrap the top-of-stack value in a mutable lazy cell.
     make_cell,
 
