@@ -4,10 +4,10 @@
 //! the worker threads that execute bytecode.
 
 const std = @import("std");
-const types = @import("types.zig");
+const types = @import("runtime/types.zig");
 const bytecode = @import("bytecode.zig");
 const opcode = bytecode.opcode;
-const InternTable = @import("intern.zig").InternTable;
+const InternTable = @import("runtime/intern.zig").InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
 const Scheduler = @import("scheduler.zig").Scheduler;
@@ -15,13 +15,13 @@ const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
 const vm_builtins = @import("vm/builtins.zig");
-const ObjectHeap = @import("heap.zig").ObjectHeap;
+const ObjectHeap = @import("runtime/heap.zig").ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
 const derivation = @import("derivation.zig");
-const Value = @import("value.zig").Value;
-const ThunkState = @import("thunk.zig").ThunkState;
+const Value = @import("runtime/value.zig").Value;
+const ThunkState = @import("runtime/thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");

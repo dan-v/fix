@@ -1,12 +1,12 @@
 const std = @import("std");
-const heap_mod = @import("../heap.zig");
-const InternTable = @import("../intern.zig").InternTable;
-const Value = @import("../value.zig").Value;
+const heap_mod = @import("../runtime/heap.zig");
+const InternTable = @import("../runtime/intern.zig").InternTable;
+const Value = @import("../runtime/value.zig").Value;
 const types = @import("types.zig");
 
 const AttrEntry = heap_mod.AttrEntry;
 const ObjectHeap = heap_mod.ObjectHeap;
-const InternId = @import("../types.zig").InternId;
+const InternId = @import("../runtime/types.zig").InternId;
 const Output = types.Output;
 const Spec = types.Spec;
 

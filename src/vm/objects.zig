@@ -1,8 +1,8 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../types.zig");
-const Value = @import("../value.zig").Value;
-const heap_mod = @import("../heap.zig");
+const types = @import("../runtime/types.zig");
+const Value = @import("../runtime/value.zig").Value;
+const heap_mod = @import("../runtime/heap.zig");
 
 const force = @import("force.zig");
 const stack = @import("stack.zig");

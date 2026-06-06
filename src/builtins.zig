@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const InternTable = @import("intern.zig").InternTable;
-const heap_mod = @import("heap.zig");
+const InternTable = @import("runtime/intern.zig").InternTable;
+const heap_mod = @import("runtime/heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const AttrEntry = heap_mod.AttrEntry;
-const Value = @import("value.zig").Value;
+const Value = @import("runtime/value.zig").Value;
 
 pub const NixPathEntry = struct {
     prefix: []const u8,

@@ -1,6 +1,6 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const Value = @import("../value.zig").Value;
+const Value = @import("../runtime/value.zig").Value;
 
 const VM = vm_mod.VM;
 

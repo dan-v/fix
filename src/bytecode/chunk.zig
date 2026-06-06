@@ -4,17 +4,17 @@
 //! in a global table, enabling cheap interning and cross-thread referencing.
 
 const std = @import("std");
-const types = @import("../types.zig");
+const types = @import("../runtime/types.zig");
 const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
-const Value = @import("../value.zig").Value;
-const AttrEntry = @import("../heap.zig").AttrEntry;
+const Value = @import("../runtime/value.zig").Value;
+const AttrEntry = @import("../runtime/heap.zig").AttrEntry;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
 pub const Chunk = struct {
     pub const SourceSpan = struct {
-        file: ?@import("../types.zig").InternId,
+        file: ?@import("../runtime/types.zig").InternId,
         offset: u32,
         len: u32,
         line: u32,

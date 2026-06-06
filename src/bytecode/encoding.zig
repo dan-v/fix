@@ -1,7 +1,7 @@
 //! Shared bytecode operand encoding helpers.
 
 const std = @import("std");
-const types = @import("../types.zig");
+const types = @import("../runtime/types.zig");
 
 pub const MixedAttrSegmentTag = enum(u8) {
     static = 0,

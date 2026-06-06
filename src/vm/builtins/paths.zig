@@ -1,5 +1,5 @@
 const std = @import("std");
-const Value = @import("../../value.zig").Value;
+const Value = @import("../../runtime/value.zig").Value;
 const file_cache = @import("../../file_cache.zig");
 const derivation = @import("../../derivation.zig");
 const nar = @import("../../runtime/nar.zig");

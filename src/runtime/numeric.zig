@@ -1,7 +1,7 @@
 //! Numeric operations shared by bytecode opcodes and builtins.
 
 const std = @import("std");
-const Value = @import("../value.zig").Value;
+const Value = @import("value.zig").Value;
 
 pub fn isNumeric(value: Value) bool {
     return value.discriminant == .int or value.discriminant == .float;

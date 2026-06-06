@@ -1,6 +1,6 @@
 //! Builtin dispatch and builtin implementations for the bytecode VM.
 
-const Value = @import("../value.zig").Value;
+const Value = @import("../runtime/value.zig").Value;
 const builtins_mod = @import("../builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const shared = @import("builtins/shared.zig");

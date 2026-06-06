@@ -1,6 +1,6 @@
 const std = @import("std");
 const ast = @import("../ast.zig");
-const base_types = @import("../types.zig");
+const base_types = @import("../runtime/types.zig");
 
 const InternId = base_types.InternId;
 const Node = ast.Node;

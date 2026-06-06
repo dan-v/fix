@@ -1,4 +1,4 @@
-const Value = @import("../../value.zig").Value;
+const Value = @import("../../runtime/value.zig").Value;
 const nix_hash = @import("../../runtime/hash.zig");
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");

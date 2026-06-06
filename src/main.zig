@@ -9,7 +9,7 @@ const diagnostic = @import("diagnostic.zig");
 const repl_line = @import("cli/repl.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
-const Value = @import("value.zig").Value;
+const Value = @import("runtime/value.zig").Value;
 
 const usage =
     \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)

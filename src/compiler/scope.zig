@@ -1,6 +1,6 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const types = @import("../types.zig");
+const types = @import("../runtime/types.zig");
 const emit = @import("emit.zig");
 
 const Compiler = compiler_mod.Compiler;

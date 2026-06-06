@@ -10,8 +10,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("types.zig");
-const Thunk = @import("thunk.zig").Thunk;
+const types = @import("runtime/types.zig");
+const Thunk = @import("runtime/thunk.zig").Thunk;
 
 pub const Continuation = struct {
     context: *anyopaque,
@@ -220,7 +220,7 @@ test "scheduler queues thunk tasks" {
     var scheduler = try Scheduler.init(std.testing.allocator, 1);
     defer scheduler.deinit();
 
-    var thunk = Thunk.init(@import("value.zig").Value.null_val);
+    var thunk = Thunk.init(@import("runtime/value.zig").Value.null_val);
     try std.testing.expect(scheduler.submitThunkTo(0, &thunk));
 
     const task = scheduler.pop(0).?;

@@ -1,9 +1,9 @@
 //! Nix value rendering for Evaluator.writeValue.
 
 const std = @import("std");
-const types = @import("../types.zig");
-const Value = @import("../value.zig").Value;
-const ThunkState = @import("../thunk.zig").ThunkState;
+const types = @import("../runtime/types.zig");
+const Value = @import("../runtime/value.zig").Value;
+const ThunkState = @import("../runtime/thunk.zig").ThunkState;
 
 pub fn writeValue(ev: anytype, writer: *std.Io.Writer, value: Value) !void {
     var printer = ValuePrinter(@TypeOf(ev)){

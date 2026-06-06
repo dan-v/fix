@@ -27,10 +27,10 @@ const OpCode = bytecode.OpCode;
 const chunk = bytecode.chunk;
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
-const types = @import("types.zig");
+const types = @import("runtime/types.zig");
 const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
-const Value = @import("value.zig").Value;
+const Value = @import("runtime/value.zig").Value;
 
 const InternId = types.InternId;
 
@@ -48,7 +48,7 @@ pub const Compiler = struct {
     builder: *ChunkBuilder,
     registry: *ChunkRegistry,
     source: []const u8,
-    intern: *@import("intern.zig").InternTable,
+    intern: *@import("runtime/intern.zig").InternTable,
     base_path: ?[]const u8,
     source_path: ?[]const u8,
     source_file_id: ?InternId,
@@ -69,7 +69,7 @@ pub const Compiler = struct {
         builder: *ChunkBuilder,
         registry: *ChunkRegistry,
         source: []const u8,
-        intern: *@import("intern.zig").InternTable,
+        intern: *@import("runtime/intern.zig").InternTable,
     ) Compiler {
         return .{
             .allocator = allocator,

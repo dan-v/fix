@@ -11,8 +11,8 @@
 //!   - Atomic thunk integration for lazy evaluation
 
 const std = @import("std");
-const types = @import("types.zig");
-const Value = @import("value.zig").Value;
+const types = @import("runtime/types.zig");
+const Value = @import("runtime/value.zig").Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const bytecode_mod = @import("bytecode.zig");
@@ -21,9 +21,9 @@ const build_options = @import("build_options");
 const chunk = bytecode_mod.chunk;
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
-const InternTable = @import("intern.zig").InternTable;
+const InternTable = @import("runtime/intern.zig").InternTable;
 const Scheduler = @import("scheduler.zig").Scheduler;
-const heap_mod = @import("heap.zig");
+const heap_mod = @import("runtime/heap.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;

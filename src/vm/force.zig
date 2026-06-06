@@ -1,9 +1,9 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../types.zig");
-const Value = @import("../value.zig").Value;
+const types = @import("../runtime/types.zig");
+const Value = @import("../runtime/value.zig").Value;
 const ObjectId = types.ObjectId;
-const thunk_mod = @import("../thunk.zig");
+const thunk_mod = @import("../runtime/thunk.zig");
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 
