@@ -170,13 +170,16 @@ const Editor = struct {
             'H' => self.cursor = 0,
             'F' => self.cursor = self.buffer.items.len,
             '1', '7' => {
-                if ((readByte() catch 0) == '~') self.cursor = 0;
+                const terminator = readByte() catch return;
+                if (terminator == '~') self.cursor = 0;
             },
             '4', '8' => {
-                if ((readByte() catch 0) == '~') self.cursor = self.buffer.items.len;
+                const terminator = readByte() catch return;
+                if (terminator == '~') self.cursor = self.buffer.items.len;
             },
             '3' => {
-                if ((readByte() catch 0) == '~') try self.deleteAtCursor();
+                const terminator = readByte() catch return;
+                if (terminator == '~') try self.deleteAtCursor();
             },
             else => {},
         }
