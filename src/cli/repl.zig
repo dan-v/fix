@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const cli = @import("cli.zig");
+const cli = @import("../cli.zig");
 
 pub const History = struct {
     allocator: std.mem.Allocator,
