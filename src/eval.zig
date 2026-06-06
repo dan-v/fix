@@ -32,11 +32,7 @@ const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
 const stable_segments_mod = @import("runtime/stable_segments.zig");
 
-/// Per-thread worker id. Helper threads set this in `helperLoop`; the
-/// main thread leaves it at 0. Used as the `claimer` value on
-/// `ImportEntry` so cycle detection and contention handling can tell
-/// "me again" from "another thread".
-threadlocal var current_worker_id: u8 = 0;
+const worker_id_mod = @import("runtime/worker_id.zig");
 
 /// Per-thread linked list of in-progress *scoped* import paths. Scoped
 /// imports are not deduplicated through `ImportEntry` (each call has a
@@ -152,7 +148,7 @@ pub const Evaluator = struct {
             .intern = intern,
             .registry = registry,
             .scheduler = scheduler,
-            .heap = ObjectHeap.init(allocator),
+            .heap = try ObjectHeap.init(allocator, worker_count),
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
@@ -471,7 +467,7 @@ pub const Evaluator = struct {
     }
 
     fn forceImportEntry(self: *Evaluator, path: []const u8, entry: *ImportEntry) anyerror!Value {
-        const me = current_worker_id;
+        const me = worker_id_mod.current;
         while (true) {
             const state = entry.state.load(.acquire);
             switch (state) {
@@ -686,7 +682,7 @@ pub const Evaluator = struct {
 /// `reset()` is invoked by force.forceThunkFallible on failure, so a future
 /// genuine force will retry and surface the error to its real caller.
 fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
-    current_worker_id = helper_idx + 1;
+    worker_id_mod.current = helper_idx + 1;
     var vm = ev.initVm(helper_idx + 1) catch return;
     defer vm.deinit();
 

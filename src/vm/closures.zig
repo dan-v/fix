@@ -93,8 +93,22 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
     committed = true;
-    _ = self.scheduler.submit(.{ .force_thunk = id });
+    if (shouldSpeculate(self, chunk_id)) {
+        _ = self.scheduler.submit(.{ .force_thunk = id });
+    }
     try stack.push(self, Value.thunk(id));
+}
+
+/// Speculation pays off only when the thunk's body is long enough that a
+/// helper finishing it ahead of the main thread saves more time than the
+/// submit + scheduler overhead costs. Tiny chunks (one or two opcodes)
+/// would just generate noise; the main thread can force them faster than
+/// it takes to push the task and a helper to pop it.
+const SPECULATION_MIN_CODE_BYTES: usize = 256;
+
+inline fn shouldSpeculate(self: *VM, chunk_id: ChunkId) bool {
+    const ch = self.registry.get(chunk_id) orelse return false;
+    return ch.code.len >= SPECULATION_MIN_CODE_BYTES;
 }
 
 // ---- calls ----

@@ -157,8 +157,23 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
-    _ = self.scheduler.submit(.{ .force_thunk = id });
+    if (shouldSpeculateClosure(self, closure)) {
+        _ = self.scheduler.submit(.{ .force_thunk = id });
+    }
     return Value.thunk(id);
+}
+
+const SPECULATION_MIN_CODE_BYTES: usize = 256;
+
+inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
+    // Only Nix-level closures with a meaningfully-sized body warrant the
+    // submit overhead. Builtin / builtin_closure thunks are typically a
+    // single dispatched call — main can force them faster than the
+    // scheduler dance.
+    if (closure.discriminant != .closure) return false;
+    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
+    const ch = self.registry.get(c.chunk_id) orelse return false;
+    return ch.code.len >= SPECULATION_MIN_CODE_BYTES;
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {

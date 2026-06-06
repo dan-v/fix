@@ -18,6 +18,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const stable = @import("stable_segments.zig");
+const worker_id_mod = @import("worker_id.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
 const Cell = @import("thunk.zig").Cell;
@@ -106,28 +107,125 @@ const HeapObject = struct {
     meta: ObjectMeta = .none,
 };
 
+/// Per-worker thread-local allocation buffer. Each worker reserves a
+/// chunk of slots from the global stores under their mutex once, then
+/// hands them out lock-free for subsequent ops until the chunk is used.
+/// This keeps the hot path off the global mutex on workloads that
+/// allocate many small ranges (lists, attrsets, closure upvalues).
+///
+/// We only TLAB the range-typed stores (values, attrs, attr_positions).
+/// The `objects` store is still global so that `objects.count()` reflects
+/// the next ObjectId assigned — `buildAttrSet` predicts that id to
+/// construct the `builtins.builtins` self-reference.
+const VALUE_CHUNK_SIZE: u32 = 1024;
+const ATTR_CHUNK_SIZE: u32 = 512;
+const ATTR_POS_CHUNK_SIZE: u32 = 256;
+
+const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
+
+const LocalChunk = struct {
+    segment: u32 = 0,
+    cursor: u32 = 0,
+    end: u32 = 0,
+
+    fn fits(self: LocalChunk, n: u32) bool {
+        return self.cursor + n <= self.end;
+    }
+
+    fn take(self: *LocalChunk, n: u32) LocalSlice {
+        const r: LocalSlice = .{ .segment = self.segment, .offset = self.cursor, .len = n };
+        self.cursor += n;
+        return r;
+    }
+};
+
+pub const HeapLocal = struct {
+    value: LocalChunk = .{},
+    attr: LocalChunk = .{},
+    attr_pos: LocalChunk = .{},
+};
+
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     objects: ObjectStore,
     values: ValueStore,
     attrs: AttrStore,
     attr_positions: AttrPosStore,
+    /// One entry per worker (including the main thread). Indexed by
+    /// `worker_id_mod.current`.
+    worker_locals: []HeapLocal,
 
-    pub fn init(allocator: std.mem.Allocator) ObjectHeap {
+    pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
+        const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
+        for (locals) |*l| l.* = .{};
         return .{
             .allocator = allocator,
             .objects = .empty,
             .values = .empty,
             .attrs = .empty,
             .attr_positions = .empty,
+            .worker_locals = locals,
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.objects.deinit(self.allocator);
+    }
+
+    inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
+        return &self.worker_locals[worker_id_mod.current];
+    }
+
+    fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
+        const local = self.currentLocal();
+        const chunk = &local.value;
+        if (chunk.fits(n)) {
+            const r = chunk.take(n);
+            return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        }
+        if (n > VALUE_CHUNK_SIZE) return self.values.reserve(self.allocator, n);
+        const refilled = try self.values.reserve(self.allocator, VALUE_CHUNK_SIZE);
+        chunk.segment = refilled.segment;
+        chunk.cursor = refilled.offset;
+        chunk.end = refilled.offset + refilled.len;
+        const r = chunk.take(n);
+        return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+    }
+
+    fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
+        const local = self.currentLocal();
+        const chunk = &local.attr;
+        if (chunk.fits(n)) {
+            const r = chunk.take(n);
+            return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        }
+        if (n > ATTR_CHUNK_SIZE) return self.attrs.reserve(self.allocator, n);
+        const refilled = try self.attrs.reserve(self.allocator, ATTR_CHUNK_SIZE);
+        chunk.segment = refilled.segment;
+        chunk.cursor = refilled.offset;
+        chunk.end = refilled.offset + refilled.len;
+        const r = chunk.take(n);
+        return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+    }
+
+    fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
+        const local = self.currentLocal();
+        const chunk = &local.attr_pos;
+        if (chunk.fits(n)) {
+            const r = chunk.take(n);
+            return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        }
+        if (n > ATTR_POS_CHUNK_SIZE) return self.attr_positions.reserve(self.allocator, n);
+        const refilled = try self.attr_positions.reserve(self.allocator, ATTR_POS_CHUNK_SIZE);
+        chunk.segment = refilled.segment;
+        chunk.cursor = refilled.offset;
+        chunk.end = refilled.offset + refilled.len;
+        const r = chunk.take(n);
+        return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
@@ -252,8 +350,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
-        const range = try self.values.reserve(self.allocator, @intCast(items.len));
-        errdefer self.values.rollback(range);
+        const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
         return self.add(.{ .list = range });
     }
@@ -262,8 +359,7 @@ pub const ObjectHeap = struct {
         const left = try self.getList(left_id);
         const right = try self.getList(right_id);
 
-        const range = try self.values.reserve(self.allocator, @intCast(left.len + right.len));
-        errdefer self.values.rollback(range);
+        const range = try self.reserveValuesLocal(@intCast(left.len + right.len));
         const dst = self.values.sliceMut(range);
         @memcpy(dst[0..left.len], left);
         @memcpy(dst[left.len..], right);
@@ -362,8 +458,7 @@ pub const ObjectHeap = struct {
             }
         }
 
-        const range = try self.attrs.reserve(self.allocator, count);
-        errdefer self.attrs.rollback(range);
+        const range = try self.reserveAttrsLocal(count);
         const entries = self.attrs.sliceMut(range);
 
         var i: usize = 0;
@@ -417,7 +512,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn beginBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalue_count: usize) !PendingBytecodeThunk {
-        const range = try self.values.reserve(self.allocator, @intCast(upvalue_count));
+        const range = try self.reserveValuesLocal(@intCast(upvalue_count));
         return .{
             .chunk_id = chunk_id,
             .range = range,
@@ -442,19 +537,19 @@ pub const ObjectHeap = struct {
     }
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {
-        const range = try self.values.reserve(self.allocator, @intCast(items.len));
+        const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
         return range;
     }
 
     fn appendAttrEntries(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
-        const range = try self.attrs.reserve(self.allocator, @intCast(entries.len));
+        const range = try self.reserveAttrsLocal(@intCast(entries.len));
         @memcpy(self.attrs.sliceMut(range), entries);
         return range;
     }
 
     fn appendAttrPositions(self: *ObjectHeap, positions: []const AttrPosEntry) !AttrPosRange {
-        const range = try self.attr_positions.reserve(self.allocator, @intCast(positions.len));
+        const range = try self.reserveAttrPositionsLocal(@intCast(positions.len));
         @memcpy(self.attr_positions.sliceMut(range), positions);
         return range;
     }
