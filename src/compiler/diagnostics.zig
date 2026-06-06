@@ -76,7 +76,7 @@ pub fn sourcePositionForOffset(self: *Compiler, offset: u32) !diagnostic.SourceP
     return index.positionForOffset(offset);
 }
 
-pub fn ensureLineIndex(self: *Compiler) !*const diagnostic.LineIndex {
+pub fn ensureLineIndex(self: *Compiler) !*diagnostic.LineIndex {
     if (self.parent) |parent| return ensureLineIndex(parent);
     if (!self.line_index_ready) {
         self.line_index = try diagnostic.LineIndex.init(self.allocator, self.source);

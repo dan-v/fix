@@ -32,6 +32,12 @@ pub const SourcePosition = struct {
 pub const LineIndex = struct {
     source_len: usize = 0,
     line_starts: []const u32 = &.{},
+    /// Cache of the last lookup. The compiler walks nodes in source order,
+    /// so most queries hit a line at or just after the previous query. The
+    /// cache turns the binary search into an O(1) check in the common case.
+    cache_line: u32 = 0,
+    cache_line_start: u32 = 0,
+    cache_line_end: u32 = 0,
 
     pub const empty: LineIndex = .{};
 
@@ -45,13 +51,19 @@ pub const LineIndex = struct {
         line_starts.appendAssumeCapacity(0);
         for (source, 0..) |byte, i| {
             if (byte == '\n') {
-                try line_starts.append(allocator, @intCast(i + 1));
+                line_starts.appendAssumeCapacity(@intCast(i + 1));
             }
         }
 
+        const first_line_end: u32 = if (line_starts.items.len > 1) line_starts.items[1] else @intCast(source.len);
+        const owned = try line_starts.toOwnedSlice(allocator);
+
         return .{
             .source_len = source.len,
-            .line_starts = try line_starts.toOwnedSlice(allocator),
+            .line_starts = owned,
+            .cache_line = 0,
+            .cache_line_start = 0,
+            .cache_line_end = first_line_end,
         };
     }
 
@@ -60,15 +72,34 @@ pub const LineIndex = struct {
         self.* = .empty;
     }
 
-    pub fn positionForOffset(self: *const LineIndex, offset: u32) SourcePosition {
+    pub fn positionForOffset(self: *LineIndex, offset: u32) SourcePosition {
         std.debug.assert(self.line_starts.len > 0);
 
-        const target = @min(@as(usize, @intCast(offset)), self.source_len);
-        const line_index = self.lineIndexForTarget(target);
-        const line_start: usize = @intCast(self.line_starts[line_index]);
+        const target_usize = @min(@as(usize, @intCast(offset)), self.source_len);
+        const target: u32 = @intCast(target_usize);
+
+        // Cache hit: still on the same line as the previous query.
+        if (target >= self.cache_line_start and target < self.cache_line_end) {
+            return .{
+                .line = self.cache_line + 1,
+                .column = target - self.cache_line_start + 1,
+            };
+        }
+
+        const line_index = self.lineIndexForTarget(target_usize);
+        const line_start = self.line_starts[line_index];
+        const line_end: u32 = if (line_index + 1 < self.line_starts.len)
+            self.line_starts[line_index + 1]
+        else
+            @intCast(self.source_len);
+
+        self.cache_line = @intCast(line_index);
+        self.cache_line_start = line_start;
+        self.cache_line_end = line_end;
+
         return .{
-            .line = @intCast(line_index + 1),
-            .column = @intCast(target - line_start + 1),
+            .line = @as(u32, @intCast(line_index)) + 1,
+            .column = target - line_start + 1,
         };
     }
 
