@@ -101,7 +101,7 @@ fn writeJsonValueInner(
             }
         },
         .closure, .builtin, .builtin_closure => return error.TypeError,
-        .thunk, .cell => unreachable,
+        .thunk => unreachable,
     }
 }
 
@@ -276,14 +276,13 @@ fn writeXmlValue(
         .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context),
         .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context),
         .closure, .builtin, .builtin_closure => try writer.writeAll("<function />\n"),
-        .thunk, .cell => unreachable,
+        .thunk => unreachable,
     }
 }
 
 fn xmlVisibleValue(self: anytype, value: Value) anyerror!?Value {
     return switch (value.discriminant) {
         .thunk => xmlThunkValue(self, value.asObjectId()),
-        .cell => xmlVisibleValue(self, try self.heap.getCellValue(value.asObjectId())),
         else => value,
     };
 }

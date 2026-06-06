@@ -34,7 +34,7 @@ pub fn builtinTypeOf(self: anytype, arg: Value) !Value {
         .list => "list",
         .attrs => "set",
         .closure, .builtin, .builtin_closure => "lambda",
-        .thunk, .cell => unreachable,
+        .thunk => unreachable,
     };
     return Value.string(try self.intern.intern(name));
 }

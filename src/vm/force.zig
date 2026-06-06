@@ -22,8 +22,8 @@ pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
     return forceValueImpl(self, value, true);
 }
 
-/// Speculative force: evaluate the value (resolving thunks/cells) without
-/// marking thunks as demanded. Used by scheduler helpers — if no real
+/// Speculative force: evaluate the value (resolving thunks) without
+/// marking them as demanded. Used by scheduler helpers — if no real
 /// caller later observes the thunk, lazy renderers will still treat it
 /// as unevaluated.
 pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
@@ -33,23 +33,8 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
     return switch (value.discriminant) {
         .thunk => try forceThunkImpl(self, value, demand),
-        .cell => try forceCellImpl(self, value, demand),
         else => value,
     };
-}
-
-pub fn forceCellValue(self: *VM, value: Value) anyerror!Value {
-    return forceCellImpl(self, value, true);
-}
-
-fn forceCellImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
-    const cell_id = value.asObjectId();
-    const raw = try self.heap.getCellValue(cell_id);
-    const forced = try forceValueImpl(self, raw, demand);
-    if (raw.discriminant == .thunk or raw.discriminant == .cell) {
-        try self.heap.setCellValue(cell_id, forced);
-    }
-    return forced;
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
@@ -136,6 +121,7 @@ pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
             break :blk closures.runIsolatedFrame(self, ch, 0, bytecode.upvalues);
         },
+        .pass_through => |v| forceValueImpl(self, v, true),
     };
 }
 
@@ -177,6 +163,8 @@ inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {
-    const id = try self.heap.addCell(thunk_mod.Cell.init(val));
-    return Value.cell(id);
+    // "Cell" is just a pass-through thunk: the underlying value gets forced
+    // and the result memoized in the thunk's resolved slot.
+    const id = try self.heap.addThunk(Thunk.initPassThrough(val));
+    return Value.thunk(id);
 }

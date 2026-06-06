@@ -20,11 +20,10 @@ pub const ValueType = enum(u8) {
     attrs = 8, // payload is ObjectId
     closure = 9, // payload is ObjectId
     thunk = 10, // payload is ObjectId
-    cell = 11, // payload is ObjectId
-    builtin = 12, // payload is builtin id
-    builtin_closure = 13, // payload is ObjectId
-    string_context = 14, // payload is ObjectId
-    // reserved 15..255 for future extensions
+    builtin = 11, // payload is builtin id
+    builtin_closure = 12, // payload is ObjectId
+    string_context = 13, // payload is ObjectId
+    // reserved 14..255 for future extensions
 };
 
 pub const Value = extern struct {
@@ -98,13 +97,6 @@ pub const Value = extern struct {
     pub fn thunk(id: ObjectId) Value {
         return .{
             .discriminant = .thunk,
-            .payload = id,
-        };
-    }
-
-    pub fn cell(id: ObjectId) Value {
-        return .{
-            .discriminant = .cell,
             .payload = id,
         };
     }
@@ -188,7 +180,7 @@ pub const Value = extern struct {
             .int => self.asInt() == other.asInt(),
             .float => self.asFloat() == other.asFloat(),
             .string, .path => self.asInternId() == other.asInternId(),
-            .list, .attrs, .closure, .thunk, .cell, .builtin, .builtin_closure, .string_context => self.payload == other.payload,
+            .list, .attrs, .closure, .thunk, .builtin, .builtin_closure, .string_context => self.payload == other.payload,
         };
     }
 
@@ -201,7 +193,7 @@ pub const Value = extern struct {
             .float => @bitCast(self.asFloat()),
             .string, .path => @as(u64, self.asInternId()) *% 31,
             .list, .attrs => self.payload *% 31,
-            .closure, .thunk, .cell, .builtin, .builtin_closure, .string_context => self.payload,
+            .closure, .thunk, .builtin, .builtin_closure, .string_context => self.payload,
         };
     }
 
@@ -221,7 +213,6 @@ pub const Value = extern struct {
             .attrs => try writer.writeAll("{...}"),
             .closure => try writer.writeAll("<closure>"),
             .thunk => try writer.writeAll("<thunk>"),
-            .cell => try writer.writeAll("<cell>"),
             .builtin => try writer.writeAll("<builtin>"),
             .builtin_closure => try writer.writeAll("<builtin-closure>"),
             .string_context => try writer.writeAll("<string-context>"),

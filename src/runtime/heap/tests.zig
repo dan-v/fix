@@ -4,7 +4,7 @@ const Value = @import("../value.zig").Value;
 const ObjectHeap = heap_mod.ObjectHeap;
 const InternId = heap_mod.InternId;
 const ChunkId = heap_mod.ChunkId;
-const Cell = @import("../thunk.zig").Cell;
+const Thunk = @import("../thunk.zig").Thunk;
 
 test "object heap stores list and attrs payloads behind object ids" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
@@ -153,21 +153,19 @@ test "object heap keeps object addresses stable across segment growth" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
 
-    const first_id = try heap.addCell(Cell.init(Value.int(1)));
+    const first_id = try heap.addThunk(Thunk.initPassThrough(Value.int(1)));
     const first_ptr = heap.get(first_id);
     const first_addr = @intFromPtr(first_ptr);
 
     var i: usize = 0;
     while (i < 4096) : (i += 1) {
-        _ = try heap.addCell(Cell.init(Value.int(@intCast(i))));
+        _ = try heap.addThunk(Thunk.initPassThrough(Value.int(@intCast(i))));
     }
 
     try std.testing.expectEqual(first_addr, @intFromPtr(heap.get(first_id)));
-    try heap.setCellValue(first_id, Value.int(99));
-    try std.testing.expectEqual(@as(i64, 99), (try heap.getCellValue(first_id)).asInt());
 }
 
-test "object heap stores closures and mutable runtime cells" {
+test "object heap stores closures" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
 
@@ -177,32 +175,5 @@ test "object heap stores closures and mutable runtime cells" {
     try std.testing.expectEqual(@as(usize, 2), closure.upvalues.len);
     try std.testing.expectEqual(@as(i64, 10), closure.upvalues[0].asInt());
     try std.testing.expect(!closure.upvalues[1].asBool());
-
-    const cell_id = try heap.addCell(Cell.init(Value.int(1)));
-    try std.testing.expectEqual(@as(i64, 1), (try heap.getCellValue(cell_id)).asInt());
-    try heap.setCellValue(cell_id, Value.int(2));
-    try std.testing.expectEqual(@as(i64, 2), (try heap.getCellValue(cell_id)).asInt());
 }
 
-test "cell.set is write-once under racing writers" {
-    var heap = try ObjectHeap.init(std.testing.allocator, 1);
-    defer heap.deinit();
-
-    const cell_id = try heap.addCell(Cell.init(Value.int(0)));
-
-    const Worker = struct {
-        fn run(h: *ObjectHeap, id: u32, value: i64) void {
-            h.setCellValue(id, Value.int(value)) catch return;
-        }
-    };
-
-    var threads: [4]std.Thread = undefined;
-    for (&threads, 0..) |*t, i| {
-        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &heap, cell_id, @as(i64, @intCast(i + 1)) });
-    }
-    for (&threads) |t| t.join();
-
-    // Exactly one writer wins; the read returns either that value or the initial.
-    const v = (try heap.getCellValue(cell_id)).asInt();
-    try std.testing.expect(v >= 1 and v <= 4);
-}

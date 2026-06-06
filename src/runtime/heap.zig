@@ -10,7 +10,6 @@
 //!     on the store's internal `SpinMutex`.
 //!   - Mutation of object payloads is restricted to two cases:
 //!       * Atomic ops on `*Thunk` state (via `getThunk` -> CAS / release-store).
-//!       * `Cell.set` write-once via cmpxchg (see runtime/thunk.zig).
 //!   - The union tag of an object slot is fixed at creation and never changes,
 //!     so concurrent readers can pattern-match without synchronization once
 //!     they have a published ObjectId.
@@ -21,7 +20,6 @@ const stable = @import("stable_segments.zig");
 const worker_id_mod = @import("worker_id.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
-const Cell = @import("thunk.zig").Cell;
 
 pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
@@ -93,7 +91,6 @@ pub const Object = union(enum) {
     closure: ClosureObject,
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
-    cell: Cell,
     context_string: ContextStringObject,
 };
 
@@ -369,20 +366,6 @@ pub const ObjectHeap = struct {
         };
     }
 
-    pub fn getCellValue(self: *const ObjectHeap, id: ObjectId) !Value {
-        return switch (self.getConst(id).*) {
-            .cell => |cell| cell.read(),
-            else => error.InvalidObjectType,
-        };
-    }
-
-    pub fn setCellValue(self: *ObjectHeap, id: ObjectId, value: Value) !void {
-        switch (self.get(id).*) {
-            .cell => |*cell| cell.set(value),
-            else => return error.InvalidObjectType,
-        }
-    }
-
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
         const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
@@ -572,10 +555,6 @@ pub const ObjectHeap = struct {
 
     pub fn rollbackBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) void {
         self.values.rollback(pending.range);
-    }
-
-    pub fn addCell(self: *ObjectHeap, cell: Cell) !ObjectId {
-        return self.add(.{ .cell = cell });
     }
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {

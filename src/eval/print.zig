@@ -39,7 +39,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         writer: *std.Io.Writer,
         seen: std.ArrayListUnmanaged(SeenObject),
 
-        const SeenKind = enum { list, attrs, thunk, cell };
+        const SeenKind = enum { list, attrs, thunk };
 
         const SeenObject = struct {
             kind: SeenKind,
@@ -63,7 +63,6 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 .attrs => try self.writeAttrs(value.asObjectId()),
                 .closure => try self.writer.writeAll("<closure>"),
                 .thunk => try self.writeThunk(value.asObjectId()),
-                .cell => try self.writeCell(value.asObjectId()),
                 .builtin => try self.writer.writeAll("<builtin>"),
                 .builtin_closure => try self.writer.writeAll("<builtin-closure>"),
             }
@@ -156,22 +155,17 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
 
             const thunk = try self.ev.heap.getThunk(id);
             const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
-            if (state != .resolved) {
-                try self.writer.writeAll("...");
+            if (state == .resolved) {
+                try self.write(thunk.result);
                 return;
             }
-
-            try self.write(thunk.result);
-        }
-
-        fn writeCell(self: *Self, id: types.ObjectId) !void {
-            if (!try self.enter(.cell, id)) {
-                try self.writer.writeAll("...");
-                return;
+            // Pass-through (cell-like) thunks hold a value that hasn't been
+            // forced yet. Render the wrapped value rather than an opaque
+            // `...`, matching how cells used to render their `initial`.
+            switch (thunk.target) {
+                .pass_through => |v| try self.write(v),
+                else => try self.writer.writeAll("..."),
             }
-            defer self.leave();
-
-            try self.write(try self.ev.heap.getCellValue(id));
         }
 
         fn writeAttrName(self: *Self, name: []const u8) !void {

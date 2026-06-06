@@ -47,7 +47,6 @@ pub fn valueTypeName(self: *VM, value: Value) []const u8 {
         .attrs => "attrs",
         .closure, .builtin, .builtin_closure => "function",
         .thunk => "thunk",
-        .cell => "cell",
         .string_context => "string",
     };
 }

@@ -70,7 +70,7 @@ pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUn
         .closure => va.asObjectId() == vb.asObjectId(),
         .builtin => va.asBuiltinId() == vb.asBuiltinId(),
         .builtin_closure => va.asObjectId() == vb.asObjectId(),
-        .string, .path, .string_context, .thunk, .cell => unreachable,
+        .string, .path, .string_context, .thunk => unreachable,
     };
 }
 

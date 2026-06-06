@@ -518,7 +518,7 @@ fn appendStructuredJsonValue(
             try out.append(self.allocator, '}');
         },
         .closure, .builtin, .builtin_closure => return error.TypeError,
-        .thunk, .cell => unreachable,
+        .thunk => unreachable,
     }
 }
 

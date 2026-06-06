@@ -109,16 +109,21 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 frame.ip += 1;
                 const val = stack.pop(self);
                 const cell_val = self.stack[frame.frame_base + slot];
-                if (cell_val.discriminant != .cell) return error.TypeError;
-                try self.heap.setCellValue(cell_val.asObjectId(), val);
+                if (cell_val.discriminant != .thunk) return error.TypeError;
+                const thunk = try self.heap.getThunk(cell_val.asObjectId());
+                // The compiler initializes cells as pass-through thunks
+                // wrapping `null` and then sets them to their real RHS here.
+                // Update the wrapped value so the first force evaluates it.
+                thunk.target = .{ .pass_through = val };
             },
             .set_cell_local_long => {
                 const slot = readU16(code, frame.ip);
                 frame.ip += 2;
                 const val = stack.pop(self);
                 const cell_val = self.stack[frame.frame_base + slot];
-                if (cell_val.discriminant != .cell) return error.TypeError;
-                try self.heap.setCellValue(cell_val.asObjectId(), val);
+                if (cell_val.discriminant != .thunk) return error.TypeError;
+                const thunk = try self.heap.getThunk(cell_val.asObjectId());
+                thunk.target = .{ .pass_through = val };
             },
 
             .get_upvalue => {

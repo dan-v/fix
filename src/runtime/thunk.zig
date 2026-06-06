@@ -32,39 +32,22 @@ pub const ThunkState = enum(u32) {
 
 pub const INVALID_CLAIMER: u8 = 0xFF;
 
-pub const Cell = struct {
-    initial: Value,
-    forced: Value = Value.null_val,
-    state: std.atomic.Value(u8) = .init(0),
-
-    pub const STATE_INITIAL: u8 = 0;
-    pub const STATE_WRITING: u8 = 1;
-    pub const STATE_FORCED: u8 = 2;
-
-    pub fn init(initial: Value) Cell {
-        return .{ .initial = initial };
-    }
-
-    pub fn read(self: *const Cell) Value {
-        return if (self.state.load(.acquire) == STATE_FORCED) self.forced else self.initial;
-    }
-
-    pub fn set(self: *Cell, value: Value) void {
-        const prev = self.state.cmpxchgStrong(STATE_INITIAL, STATE_WRITING, .acquire, .monotonic);
-        if (prev != null) return;
-        self.forced = value;
-        self.state.store(STATE_FORCED, .release);
-    }
-};
-
 pub const BytecodeThunk = struct {
     chunk_id: ChunkId,
     upvalues: []const Value,
 };
 
+/// What a thunk evaluates when forced.
+///
+///   - `.closure` and `.bytecode` are computed targets: forcing invokes
+///     bytecode or a builtin and the result is stored.
+///   - `.pass_through` is a memoization wrapper: the underlying Value is
+///     forced and the result becomes the thunk's resolved value. This is
+///     how the compiler models recursive let-binding cells.
 pub const ThunkTarget = union(enum) {
     closure: Value,
     bytecode: BytecodeThunk,
+    pass_through: Value,
 };
 
 pub const ForceOutcome = union(enum) {
@@ -121,6 +104,20 @@ pub const Thunk = struct {
             .parked = .init(0),
             .demanded = .init(0),
             .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
+            .result = Value.null_val,
+        };
+    }
+
+    /// A "cell" thunk: holds a Value to be forced lazily. The cell pattern
+    /// (used by the compiler for recursive let bindings) is just a thunk
+    /// whose target is a wrapped Value.
+    pub fn initPassThrough(value: Value) Thunk {
+        return .{
+            .state = .init(@intFromEnum(ThunkState.unresolved)),
+            .claimer = .init(INVALID_CLAIMER),
+            .parked = .init(0),
+            .demanded = .init(0),
+            .target = .{ .pass_through = value },
             .result = Value.null_val,
         };
     }
