@@ -616,10 +616,43 @@ pub const Compiler = struct {
     }
 
     fn compileApply(self: *Compiler, node: *const Node) !void {
+        try self.compileApplyWithOp(node, .call);
+    }
+
+    fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
+        const unwrapped = unwrapParens(node);
+        switch (unwrapped.tag) {
+            .apply, .if_else, .let_in, .assert, .with_expr => {},
+            else => return self.compileNode(node),
+        }
+
+        {
+            const start = self.builder.code.items.len;
+            try self.compileTailNodeImpl(unwrapped);
+            const end = self.builder.code.items.len;
+            if (try self.sourceSpanForNode(node)) |span| {
+                try self.builder.addSourceMapEntry(self.allocator, start, end, span);
+            }
+            return;
+        }
+    }
+
+    fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
+        switch (node.tag) {
+            .apply => try self.compileApplyWithOp(node, .tail_call),
+            .if_else => try self.compileIfElseTail(node),
+            .let_in => try self.compileLetInWithTailBody(node),
+            .assert => try self.compileAssertTail(node),
+            .with_expr => try self.compileWithTail(node),
+            else => unreachable,
+        }
+    }
+
+    fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
         const ap = node.data.apply;
         try self.compileNode(ap.func);
         try self.compileContainerValue(ap.arg, .{});
-        try self.emitOp(.call);
+        try self.emitOp(op);
     }
 
     fn compileLambda(self: *Compiler, node: *const Node) !void {
@@ -644,7 +677,7 @@ pub const Compiler = struct {
 
         const param_id = try self.intern.intern(param_name);
         _ = try child.declareLocal(param_name, param_id);
-        child.compileNode(lambda.body) catch |err| {
+        child.compileTailExpression(lambda.body) catch |err| {
             try self.absorbChildDiagnostics(&child);
             return err;
         };
@@ -726,7 +759,7 @@ pub const Compiler = struct {
             try child.emitSetCellLocal(slot);
         }
 
-        child.compileNode(lambda.body) catch |err| {
+        child.compileTailExpression(lambda.body) catch |err| {
             try self.absorbChildDiagnostics(&child);
             return err;
         };
@@ -777,6 +810,14 @@ pub const Compiler = struct {
     }
 
     fn compileLetIn(self: *Compiler, node: *const Node) !void {
+        try self.compileLetInBody(node, false);
+    }
+
+    fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!void {
+        try self.compileLetInBody(node, true);
+    }
+
+    fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
         const let_in = node.data.let_in;
 
         self.beginScope();
@@ -799,7 +840,11 @@ pub const Compiler = struct {
             try self.emitSetCellLocal(slot);
         }
 
-        try self.compileNode(let_in.body);
+        if (tail_body) {
+            try self.compileTailExpression(let_in.body);
+        } else {
+            try self.compileNode(let_in.body);
+        }
 
         self.endScope();
     }
@@ -946,6 +991,14 @@ pub const Compiler = struct {
     }
 
     fn compileIfElse(self: *Compiler, node: *const Node) !void {
+        try self.compileIfElseBody(node, false);
+    }
+
+    fn compileIfElseTail(self: *Compiler, node: *const Node) anyerror!void {
+        try self.compileIfElseBody(node, true);
+    }
+
+    fn compileIfElseBody(self: *Compiler, node: *const Node, tail_branches: bool) anyerror!void {
         const ife = node.data.if_else;
 
         try self.compileNode(ife.cond);
@@ -955,7 +1008,11 @@ pub const Compiler = struct {
         try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
-        try self.compileNode(ife.then_branch);
+        if (tail_branches) {
+            try self.compileTailExpression(ife.then_branch);
+        } else {
+            try self.compileNode(ife.then_branch);
+        }
         const jump_over_pos = self.builder.code.items.len;
         try self.emitOpU32(.jump, 0);
 
@@ -963,13 +1020,25 @@ pub const Compiler = struct {
         self.patchJump(jump_pos, self.builder.code.items.len);
 
         try self.emitOp(.pop);
-        try self.compileNode(ife.else_branch);
+        if (tail_branches) {
+            try self.compileTailExpression(ife.else_branch);
+        } else {
+            try self.compileNode(ife.else_branch);
+        }
 
         // Patch jump (skip else)
         self.patchJump(jump_over_pos, self.builder.code.items.len);
     }
 
     fn compileAssert(self: *Compiler, node: *const Node) !void {
+        try self.compileAssertBody(node, false);
+    }
+
+    fn compileAssertTail(self: *Compiler, node: *const Node) anyerror!void {
+        try self.compileAssertBody(node, true);
+    }
+
+    fn compileAssertBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
         const assert_node = node.data.assert;
 
         try self.compileNode(assert_node.cond);
@@ -978,7 +1047,11 @@ pub const Compiler = struct {
         try self.emitOpU32(.jump_if_false, 0);
         try self.emitOp(.pop);
 
-        try self.compileNode(assert_node.body);
+        if (tail_body) {
+            try self.compileTailExpression(assert_node.body);
+        } else {
+            try self.compileNode(assert_node.body);
+        }
         const end_jump = self.builder.code.items.len;
         try self.emitOpU32(.jump, 0);
 
@@ -990,6 +1063,14 @@ pub const Compiler = struct {
     }
 
     fn compileWith(self: *Compiler, node: *const Node) !void {
+        try self.compileWithBody(node, false);
+    }
+
+    fn compileWithTail(self: *Compiler, node: *const Node) anyerror!void {
+        try self.compileWithBody(node, true);
+    }
+
+    fn compileWithBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
         const with_node = node.data.with_expr;
 
         self.beginScope();
@@ -999,7 +1080,11 @@ pub const Compiler = struct {
         try self.emitSetLocal(scope_slot);
         try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
 
-        try self.compileNode(with_node.body);
+        if (tail_body) {
+            try self.compileTailExpression(with_node.body);
+        } else {
+            try self.compileNode(with_node.body);
+        }
 
         _ = self.with_scopes.pop();
         self.endScope();

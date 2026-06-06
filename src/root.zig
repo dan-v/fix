@@ -956,6 +956,16 @@ test "end-to-end: single argument lambdas" {
     try std.testing.expectEqual(@as(i64, 42), returned_functor.asInt());
 }
 
+test "end-to-end: tail calls reuse lambda frames" {
+    const alloc = std.testing.allocator;
+
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    const countdown = try ev.evaluate("let f = n: if n == 0 then 42 else f (n - 1); in f 1500");
+    try std.testing.expectEqual(@as(i64, 42), countdown.asInt());
+}
+
 test "end-to-end: builtins.toString" {
     const alloc = std.testing.allocator;
 

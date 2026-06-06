@@ -587,6 +587,11 @@ pub const VM = struct {
                     const callee = self.pop();
                     try self.doCall(callee, arg);
                 },
+                .tail_call => {
+                    const arg = self.pop();
+                    const callee = self.pop();
+                    try self.doTailCall(callee, arg);
+                },
                 // ---- thunks ----
                 .make_thunk => {
                     const closure = self.pop();
@@ -1498,6 +1503,64 @@ pub const VM = struct {
             const callable = try self.callAttrFunctor(callee);
             try self.doCall(callable, arg);
         } else return self.notCallableError(callee);
+    }
+
+    fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
+        var current = callee;
+        while (true) {
+            switch (current.discriminant) {
+                .closure => {
+                    const closure_id = current.asObjectId();
+                    const closure = try self.getClosureById(closure_id);
+                    const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+                    try self.replaceCurrentFrame(ch, arg, closure_id);
+                    return;
+                },
+                .builtin => {
+                    try self.push(try self.applyBuiltin(current.asBuiltinId(), &.{arg}));
+                    return;
+                },
+                .builtin_closure => {
+                    try self.push(try self.applyBuiltinClosure(current, arg));
+                    return;
+                },
+                .attrs => current = try self.callAttrFunctor(current),
+                else => return self.notCallableError(current),
+            }
+        }
+    }
+
+    fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, closure_id: ObjectId) !void {
+        if (ch.local_count == 0) return error.InvalidCallFrame;
+
+        const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+        const frame = self.currentFrame();
+        const frame_base = frame.frame_base;
+        const arg_end = frame_base + 1;
+        if (arg_end > stack_cap) return error.StackOverflow;
+        if (@as(usize, arg_end) > self.stack.items.len) {
+            self.stack.items.len = @intCast(arg_end);
+        }
+        self.stack.items[frame_base] = arg;
+
+        const reserved = @as(u32, ch.local_count) - 1;
+        if (reserved > stack_cap - arg_end) return error.StackOverflow;
+        const new_sp = arg_end + reserved;
+        const arg_end_idx: usize = @intCast(arg_end);
+        const new_sp_idx: usize = @intCast(new_sp);
+        if (new_sp_idx > self.stack.items.len) {
+            self.stack.items.len = new_sp_idx;
+        }
+        @memset(self.stack.items[arg_end_idx..new_sp_idx], Value.null_val);
+        self.sp = new_sp;
+
+        frame.* = .{
+            .chunk_ptr = ch,
+            .ip = 0,
+            .frame_base = frame_base,
+            .local_count = ch.local_count,
+            .closure_id = closure_id,
+        };
     }
 
     pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {

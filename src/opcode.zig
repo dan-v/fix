@@ -115,6 +115,9 @@ pub const OpCode = enum(u8) {
     /// The stack layout before: [closure, arg].
     /// After: [result].
     call,
+    /// Call in tail position. Closure callees reuse the current frame; other
+    /// callees behave like `call` and are followed by the normal `ret`.
+    tail_call,
 
     // ---- thunks ----
     /// Wrap the top-of-stack zero-argument closure into a lazy thunk.
