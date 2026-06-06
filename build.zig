@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
     const profile = b.option(bool, "profile", "Keep symbols and frame pointers for profiling") orelse false;
+    const vm_opcode_profile = b.option(bool, "vm-opcode-profile", "Collect and print VM opcode execution counts") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     // It's also possible to define more custom flags to toggle optional features
@@ -31,6 +32,9 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "vm_opcode_profile", vm_opcode_profile);
+
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -46,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
+    mod.addOptions("build_options", build_options);
 
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
@@ -78,32 +83,35 @@ pub fn build(b: *std.Build) void {
     //
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
+    const exe_mod = b.createModule(.{
+        // b.createModule defines a new module just like b.addModule but,
+        // unlike b.addModule, it does not expose the module to consumers of
+        // this package, which is why in this case we don't have to give it a name.
+        .root_source_file = b.path("src/main.zig"),
+        // Target and optimization levels must be explicitly wired in when
+        // defining an executable or library (in the root module), and you
+        // can also hardcode a specific target for an executable or library
+        // definition if desireable (e.g. firmware for embedded devices).
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+        // List of modules available for import in source files part of the
+        // root module.
+        .imports = &.{
+            // Here "fix" is the name you will use in your source code to
+            // import this module (e.g. `@import("fix")`). The name is
+            // repeated because you are allowed to rename your imports, which
+            // can be extremely useful in case of collisions (which can happen
+            // importing modules from different packages).
+            .{ .name = "fix", .module = mod },
+        },
+    });
+    exe_mod.addOptions("build_options", build_options);
+
     const exe = b.addExecutable(.{
         .name = "fix",
-        .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
-            .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .omit_frame_pointer = omit_frame_pointer,
-            // List of modules available for import in source files part of the
-            // root module.
-            .imports = &.{
-                // Here "fix" is the name you will use in your source code to
-                // import this module (e.g. `@import("fix")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
-                .{ .name = "fix", .module = mod },
-            },
-        }),
+        .root_module = exe_mod,
     });
 
     // This declares intent for the executable to be installed into the

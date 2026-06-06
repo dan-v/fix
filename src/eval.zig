@@ -5,11 +5,13 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const opcode = @import("opcode.zig");
 const InternTable = @import("intern.zig").InternTable;
 const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
 const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
 const Scheduler = @import("scheduler.zig").Scheduler;
-const VM = @import("vm.zig").VM;
+const vm_mod = @import("vm.zig");
+const VM = vm_mod.VM;
 const ObjectHeap = @import("heap.zig").ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
@@ -49,6 +51,7 @@ pub const Evaluator = struct {
     owned_diagnostic_messages: std.ArrayListUnmanaged([]u8),
     owned_diagnostic_paths: std.ArrayListUnmanaged([]u8),
     trace: EvalTrace,
+    vm_opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Evaluator {
         var scheduler = try Scheduler.init(allocator, worker_count);
@@ -82,10 +85,12 @@ pub const Evaluator = struct {
             .owned_diagnostic_messages = .empty,
             .owned_diagnostic_paths = .empty,
             .trace = EvalTrace.init(allocator),
+            .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
         };
     }
 
     pub fn deinit(self: *Evaluator) void {
+        if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         if (self.base_path) |path| self.allocator.free(path);
         self.clearDiagnostics();
         self.trace.deinit();
@@ -305,6 +310,7 @@ pub const Evaluator = struct {
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,
+            if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
         );
     }
 
@@ -609,6 +615,36 @@ pub const Evaluator = struct {
         if (self.progress) |progress| progress.instant(stage, subject);
     }
 };
+
+const OpcodeCountEntry = struct {
+    op: opcode.OpCode,
+    count: u64,
+};
+
+fn printVmOpcodeProfile(counts: *const vm_mod.OpcodeCounts) void {
+    var total: u64 = 0;
+    var entries: [opcode.count]OpcodeCountEntry = undefined;
+    for (counts, &entries, 0..) |count, *entry, i| {
+        total += count;
+        entry.* = .{
+            .op = @enumFromInt(i),
+            .count = count,
+        };
+    }
+
+    std.mem.sort(OpcodeCountEntry, &entries, {}, opcodeCountGreaterThan);
+
+    std.debug.print("fix vm opcode profile: total={d}\n", .{total});
+    for (entries) |entry| {
+        if (entry.count == 0) break;
+        const pct = if (total == 0) 0.0 else (@as(f64, @floatFromInt(entry.count)) * 100.0) / @as(f64, @floatFromInt(total));
+        std.debug.print("  {s}: {d} ({d:.2}%)\n", .{ @tagName(entry.op), entry.count, pct });
+    }
+}
+
+fn opcodeCountGreaterThan(_: void, lhs: OpcodeCountEntry, rhs: OpcodeCountEntry) bool {
+    return lhs.count > rhs.count;
+}
 
 const ValuePrinter = struct {
     ev: *Evaluator,

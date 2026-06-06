@@ -16,7 +16,9 @@ const Value = @import("value.zig").Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const OpCode = @import("opcode.zig").OpCode;
+const opcode = @import("opcode.zig");
+const OpCode = opcode.OpCode;
+const build_options = @import("build_options");
 const chunk = @import("chunk.zig");
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
@@ -35,6 +37,11 @@ const vm_builtins = @import("vm/builtins.zig");
 const eval_trace = @import("eval_trace.zig");
 const eval_progress = @import("eval_progress.zig");
 const diagnostic = @import("diagnostic.zig");
+
+pub const opcode_profile_enabled = build_options.vm_opcode_profile;
+pub const OpcodeCounts = [opcode.count]u64;
+const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
+const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
 
 /// A single call frame.
 pub const Frame = struct {
@@ -91,6 +98,8 @@ pub const VM = struct {
     sp: u32,
     /// Call frames.
     frames: std.ArrayListUnmanaged(Frame),
+    opcode_counts: OpcodeProfileState,
+    opcode_profile_sink: OpcodeProfileSink,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -106,6 +115,7 @@ pub const VM = struct {
         import_host: ?ImportHost,
         builtins: Value,
         worker_id: u8,
+        opcode_profile_sink: OpcodeProfileSink,
     ) !VM {
         var stack = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.VM_STACK_CAP);
         stack.items.len = types.VM_STACK_CAP;
@@ -131,12 +141,23 @@ pub const VM = struct {
             .stack = stack,
             .sp = 0,
             .frames = frames,
+            .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
+            .opcode_profile_sink = opcode_profile_sink,
         };
     }
 
     pub fn deinit(self: *VM) void {
+        if (comptime opcode_profile_enabled) self.flushOpcodeProfile();
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
+    }
+
+    fn flushOpcodeProfile(self: *VM) void {
+        if (comptime opcode_profile_enabled) {
+            for (&self.opcode_profile_sink.*, self.opcode_counts) |*total, count| {
+                total.* += count;
+            }
+        }
     }
 
     // ---- public entry ----
@@ -283,6 +304,7 @@ pub const VM = struct {
             if (frame.ip >= code.len) break;
 
             const op: OpCode = @enumFromInt(code[frame.ip]);
+            if (comptime opcode_profile_enabled) self.opcode_counts[@intFromEnum(op)] += 1;
             frame.ip += 1;
 
             switch (op) {

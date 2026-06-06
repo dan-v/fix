@@ -195,3 +195,5 @@ pub const OpCode = enum(u8) {
     /// Halt execution (top-level done).
     halt,
 };
+
+pub const count = @typeInfo(OpCode).@"enum".fields.len;
