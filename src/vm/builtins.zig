@@ -1039,13 +1039,14 @@ fn callComparator(self: anytype, cmp: Value, left: Value, right: Value) !bool {
 
 fn genericClosureAppend(
     self: anytype,
+    key_name: InternId,
     item: Value,
     result: *std.ArrayListUnmanaged(Value),
     keys: *std.ArrayListUnmanaged(Value),
 ) !void {
     const forced = try self.forceValue(item);
     if (forced.discriminant != .attrs) return error.TypeError;
-    const key = try self.forceValue(try self.heap.getAttrValue(forced.asObjectId(), try self.intern.intern("key")));
+    const key = try self.forceValue(try self.heap.getAttrValue(forced.asObjectId(), key_name));
     if (try self.valueSliceContainsForcedValue(key, keys.items)) return;
     try keys.append(self.allocator, key);
     try result.append(self.allocator, item);
@@ -3034,8 +3035,9 @@ fn builtinGenericClosure(self: anytype, arg: Value) !Value {
     var keys: std.ArrayListUnmanaged(Value) = .empty;
     defer keys.deinit(self.allocator);
 
+    const key_name = try self.intern.intern("key");
     for (try self.heap.getList(start_set.asObjectId())) |item| {
-        try genericClosureAppend(self, item, &result, &keys);
+        try genericClosureAppend(self, key_name, item, &result, &keys);
     }
 
     var index: usize = 0;
@@ -3043,7 +3045,7 @@ fn builtinGenericClosure(self: anytype, arg: Value) !Value {
         const produced = try self.forceValue(try self.callValue(operator, result.items[index]));
         if (produced.discriminant != .list) return error.TypeError;
         for (try self.heap.getList(produced.asObjectId())) |item| {
-            try genericClosureAppend(self, item, &result, &keys);
+            try genericClosureAppend(self, key_name, item, &result, &keys);
         }
     }
 
