@@ -18,8 +18,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const profile = b.option(bool, "profile", "Keep symbols and frame pointers for profiling") orelse false;
     const vm_opcode_profile = b.option(bool, "vm-opcode-profile", "Collect and print VM opcode execution counts") orelse false;
+    const debug_checks_opt = b.option(bool, "debug-checks", "Enable VM dispatch invariant assertions (defaults to Debug builds)");
+    const vm_trace = b.option(bool, "vm-trace", "Enable VM execution tracing (--vm-trace)") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
+    const debug_checks = debug_checks_opt orelse (optimize == .Debug);
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -34,6 +37,8 @@ pub fn build(b: *std.Build) void {
     // module they want to access.
     const build_options = b.addOptions();
     build_options.addOption(bool, "vm_opcode_profile", vm_opcode_profile);
+    build_options.addOption(bool, "debug_checks", debug_checks);
+    build_options.addOption(bool, "vm_trace", vm_trace);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of

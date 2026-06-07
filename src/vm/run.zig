@@ -12,6 +12,7 @@ const numeric = @import("../runtime/numeric.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
+const debug = @import("debug.zig");
 const equality = @import("equality.zig");
 const force = @import("force.zig");
 const objects = @import("objects.zig");
@@ -31,8 +32,10 @@ pub fn run(self: *VM) anyerror!Value {
 
 pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
     while (true) {
+        debug.checkVm(self, "runUntil top");
         var frame = stack.currentFrame(self);
         const code = frame.chunk_ptr.code;
+        debug.checkFrameSync(self, frame, code, "runUntil top");
         if (frame.ip >= code.len) break;
 
         const op: OpCode = @enumFromInt(code[frame.ip]);

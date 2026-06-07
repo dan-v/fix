@@ -10,6 +10,7 @@ const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
 
 const access = @import("access.zig");
+const debug = @import("debug.zig");
 const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
@@ -180,6 +181,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []
         .local_count = ch.local_count,
         .upvalues = upvalues,
     };
+    debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
 }
 
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {

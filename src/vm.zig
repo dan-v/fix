@@ -42,6 +42,7 @@ pub const errors = @import("vm/errors.zig");
 pub const access = @import("vm/access.zig");
 pub const stack = @import("vm/stack.zig");
 pub const trace = @import("vm/trace.zig");
+pub const debug = @import("vm/debug.zig");
 
 pub const opcode_profile_enabled = build_options.vm_opcode_profile;
 pub const OpcodeCounts = [opcode.count]u64;
