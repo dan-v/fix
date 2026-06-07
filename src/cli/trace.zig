@@ -182,6 +182,17 @@ fn runDiff(init: std.process.Init, path_a: []const u8, path_b: []const u8) !u8 {
     var ra = Reader{ .data = data_a, .path = path_a };
     var rb = Reader{ .data = data_b, .path = path_b };
 
+    // Chunk IDs are assigned in registration order. Under parallel
+    // evaluation, helper threads can register chunks in different orders
+    // run-to-run, so the same "Nth-newly-seen chunk in trace A" can have
+    // a different numeric id in trace B. We translate by canonicalizing
+    // each new chunk_id to its first-appearance index so semantically
+    // equivalent traces match.
+    var canon_a: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty;
+    defer canon_a.deinit(allocator);
+    var canon_b: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty;
+    defer canon_b.deinit(allocator);
+
     // We hold a small ring of recent events from each side so we can
     // print context once a divergence is found.
     const CONTEXT: usize = 8;
@@ -221,8 +232,8 @@ fn runDiff(init: std.process.Init, path_a: []const u8, path_b: []const u8) !u8 {
             try writer.flush();
             return 1;
         }
-        const ea = maybe_a.?;
-        const eb = maybe_b.?;
+        const ea = canonicalize(allocator, maybe_a.?, &canon_a) catch return error.OutOfMemory;
+        const eb = canonicalize(allocator, maybe_b.?, &canon_b) catch return error.OutOfMemory;
         if (!eventsEqual(ea, eb)) {
             try writer.print("divergence at step {d}:\n", .{step});
             try writer.writeAll("---- a context ----\n");
@@ -240,6 +251,48 @@ fn runDiff(init: std.process.Init, path_a: []const u8, path_b: []const u8) !u8 {
         appendRing(&ring_b, &ring_b_len, eb);
         step += 1;
     }
+}
+
+/// Translate any chunk_id in the event to its first-appearance index in
+/// this trace. Same code under either run gets the same canonical id.
+fn canonicalize(
+    allocator: std.mem.Allocator,
+    ev: Event,
+    map: *std.AutoArrayHashMapUnmanaged(u32, u32),
+) !Event {
+    return switch (ev) {
+        .op => |e| Event{ .op = .{
+            .seq = e.seq,
+            .worker = e.worker,
+            .frames_len = e.frames_len,
+            .chunk_id = try canonId(allocator, map, e.chunk_id),
+            .ip = e.ip,
+            .opcode = e.opcode,
+            .sp = e.sp,
+        } },
+        .frame_push => |e| Event{ .frame_push = .{
+            .seq = e.seq,
+            .worker = e.worker,
+            .frames_len = e.frames_len,
+            .chunk_id = try canonId(allocator, map, e.chunk_id),
+            .frame_base = e.frame_base,
+        } },
+        .frame_pop => |e| Event{ .frame_pop = .{
+            .seq = e.seq,
+            .worker = e.worker,
+            .frames_len = e.frames_len,
+            .returning_to_chunk = try canonId(allocator, map, e.returning_to_chunk),
+            .returning_to_ip = e.returning_to_ip,
+        } },
+        else => ev,
+    };
+}
+
+fn canonId(allocator: std.mem.Allocator, map: *std.AutoArrayHashMapUnmanaged(u32, u32), id: u32) !u32 {
+    if (id == std.math.maxInt(u32)) return id; // CHUNK_ID_NONE sentinel
+    const gop = try map.getOrPut(allocator, id);
+    if (!gop.found_existing) gop.value_ptr.* = @intCast(map.count() - 1);
+    return gop.value_ptr.*;
 }
 
 fn appendRing(ring: *[8]Event, len: *usize, ev: Event) void {

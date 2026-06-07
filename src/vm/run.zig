@@ -32,10 +32,10 @@ pub fn run(self: *VM) anyerror!Value {
 }
 
 pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
+    var frame = stack.currentFrame(self);
+    var code = frame.chunk_ptr.code;
     while (true) {
         debug.checkVm(self, "runUntil top");
-        var frame = stack.currentFrame(self);
-        const code = frame.chunk_ptr.code;
         debug.checkFrameSync(self, frame, code, "runUntil top");
         if (frame.ip >= code.len) break;
 
@@ -377,11 +377,15 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 const arg = stack.pop(self);
                 const callee = stack.pop(self);
                 try closures.doCall(self, callee, arg);
+                frame = stack.currentFrame(self);
+                code = frame.chunk_ptr.code;
             },
             .tail_call => {
                 const arg = stack.pop(self);
                 const callee = stack.pop(self);
                 try closures.doTailCall(self, callee, arg);
+                frame = stack.currentFrame(self);
+                code = frame.chunk_ptr.code;
             },
             // ---- thunks ----
             .make_cell => {
@@ -417,7 +421,10 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 if (name_val.discriminant != .string) return error.TypeError;
                 const attrs_val = stack.pop(self);
                 const attrs = try force.forceValue(self, attrs_val);
-                if (attrs.discriminant != .attrs) return try force.forceValue(self, default_val);
+                if (attrs.discriminant != .attrs) {
+                    try stack.push(self, try force.forceValue(self, default_val));
+                    continue;
+                }
                 const result = self.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
                     error.MissingAttribute => try force.forceValue(self, default_val),
                     else => return err,
@@ -600,6 +607,8 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 }
                 self.sp = finished_frame.frame_base;
                 try stack.push(self, result);
+                frame = stack.currentFrame(self);
+                code = frame.chunk_ptr.code;
             },
             .halt => {
                 // Stop execution.

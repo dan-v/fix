@@ -69,6 +69,7 @@ const Options = struct {
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
     vm_trace_max_events: u64 = 0,
+    workers: ?u8 = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
@@ -125,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const worker_count: u8 = if (builtin.single_threaded)
+    const worker_count: u8 = options.workers orelse if (builtin.single_threaded)
         1
     else
         @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
@@ -371,6 +372,11 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
         } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
             const text = arg["--vm-trace-max-events=".len..];
             options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            const text = args_iter.next() orelse return error.MissingWorkers;
+            options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
+        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
+            options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
         } else {
             return error.UnknownOption;
         }
@@ -400,6 +406,8 @@ fn optionErrorMessage(err: anyerror) []const u8 {
         error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
         error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
+        error.MissingWorkers => "missing N after --workers",
+        error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };
