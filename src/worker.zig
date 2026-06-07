@@ -42,6 +42,12 @@ const worker_id_mod = @import("runtime/worker_id.zig");
 /// the VM's claimer_id to match the fiber id.
 pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32) anyerror!VM;
 
+/// Number of fibers pre-allocated at Worker.init time. Keeps the
+/// common-case task pickup off the malloc path; the free list still
+/// grows on demand past this if a workload pushes more fibers in
+/// flight than the prewarm count.
+pub const prewarm_fiber_count: u8 = 4;
+
 pub const FiberState = enum(u8) {
     /// Currently running on the CPU, or about to be resumed.
     running,
@@ -113,6 +119,7 @@ pub const Worker = struct {
         init_vm_fn: InitVmFn,
     ) !*Worker {
         const self = try allocator.create(Worker);
+        errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .scheduler = scheduler,
@@ -125,6 +132,24 @@ pub const Worker = struct {
             .ready_head = .init(null),
             .shutdown_requested = .init(0),
         };
+        // Prewarm: allocate a handful of fibers up front so the
+        // common-case task pickup hits the free list instead of the
+        // allocator. Past this count, the free list still grows on
+        // demand when blocking work increases the concurrent in-flight
+        // count.
+        var prewarmed: u8 = 0;
+        errdefer {
+            for (self.fibers.items) |f| {
+                f.inner.deinit(allocator);
+                f.vm.deinit();
+                allocator.destroy(f);
+            }
+            self.fibers.deinit(allocator);
+        }
+        while (prewarmed < prewarm_fiber_count) : (prewarmed += 1) {
+            const f = try self.allocateFiber();
+            self.pushFree(f);
+        }
         return self;
     }
 
@@ -420,7 +445,13 @@ test "Worker basic init/deinit" {
     defer worker.deinit();
 
     try testing.expectEqual(@as(u8, 1), worker.worker_id);
-    try testing.expect(worker.fibers.items.len == 0); // none allocated yet
-    try testing.expect(worker.free_head == null);
+    // Prewarmed fibers: all on the free list, none active yet.
+    try testing.expectEqual(@as(usize, prewarm_fiber_count), worker.fibers.items.len);
+    try testing.expect(worker.free_head != null);
     try testing.expect(worker.ready_head.load(.acquire) == null);
+    for (worker.fibers.items, 0..) |f, i| {
+        try testing.expectEqual(@as(u32, @intCast(i)), f.fiber_id);
+        try testing.expectEqual(thunk_mod.makeClaimer(1, @intCast(i)), f.vm.claimer_id);
+        try testing.expectEqual(FiberState.free, f.state);
+    }
 }

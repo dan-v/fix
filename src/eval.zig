@@ -467,7 +467,7 @@ pub const Evaluator = struct {
     }
 
     fn initVm(self: *Evaluator, worker_id: u8) !VM {
-        return VM.init(
+        var vm = try VM.init(
             self.worker_arenas[worker_id].allocator(),
             &self.registry,
             &self.intern,
@@ -490,6 +490,18 @@ pub const Evaluator = struct {
             worker_id,
             if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
         );
+        // Inherit the surrounding fiber's claim identity if we're inside
+        // one. This covers nested VMs that get created mid-evaluation
+        // (e.g. import bodies, top-level entry's own VM): they must
+        // share the outer fiber's identity so any thunk they claim is
+        // attributed to the fiber, not to the default (worker_id, 0)
+        // which would collide with pool fiber #0's pre-allocated VM
+        // and cause spurious blackholes when fiber #0 runs a task.
+        if (fiber_mod.currentFiber()) |inner| {
+            const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+            vm.claimer_id = wf.vm.claimer_id;
+        }
+        return vm;
     }
 
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
