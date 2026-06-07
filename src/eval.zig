@@ -439,7 +439,7 @@ pub const Evaluator = struct {
         // main thread can yield on a `.busy` thunk; nested invocations
         // (imports, scoped imports) run synchronously on the existing
         // fiber's stack — they share the outer VM's claim identity via
-        // the default `MAIN_THREAD_SLOT` claimer that `initVm` hands out.
+        // default placeholder claimer that `initVm` hands out.
         if (scope == null and source_path == null) {
             self.progressBegin(.evaluate, subject);
             defer self.progressEnd(.evaluate, subject);
@@ -852,7 +852,7 @@ fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
     worker.run();
 }
 
-fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u8) anyerror!VM {
+fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32) anyerror!VM {
     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
     return ev.initVm(worker_id);
 }

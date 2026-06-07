@@ -1,322 +1,257 @@
-//! Helper worker with a fiber pool.
+//! Worker with a per-task fiber pool.
 //!
-//! Replaces the old "one VM per helper thread, synchronously runs each
-//! force_thunk task to completion" model with a pool of fiber slots:
+//! Each helper thread (and the main thread, while it's running an
+//! evaluation) owns a Worker. The Worker owns:
+//!   - A free list of `.finished` fibers ready to be reset for a new task.
+//!   - A ready list of `.suspended` fibers whose blocking thunks have
+//!     resolved (their `wake_fn` pushed them here).
+//!   - The set of all fibers it has ever allocated, for cleanup.
 //!
-//!   - Each slot owns its own `VM` (stack/frames are mutated by the
-//!     fiber body; sharing one VM across fibers would corrupt state).
-//!   - Each slot owns a `Fiber` whose entry loop pulls a task, runs it,
-//!     yields, repeats — or yields mid-task when its evaluation hits a
-//!     `.busy` thunk (see vm/force.zig).
+//! There is *no* fixed pool size. A fresh fiber is allocated on demand
+//! when a task arrives and no free fiber is available. Recycled fibers
+//! are reset (stack pointer rewound to top, new entry/arg installed)
+//! rather than reallocated, so the per-task cost is just a memcpy of
+//! the trampoline address.
 //!
-//! The worker's `run` loop is the scheduler:
-//!   1. Resume any slot whose `resumable` flag was set by a remote
-//!      thunk-resolver (the fiber was waiting on that thunk).
-//!   2. Find an idle slot AND a task; assign the task and resume.
-//!   3. If nothing to do, park on the scheduler's wake word.
+//! Each fiber has its own VM (the bytecode value stack + frames must be
+//! per-fiber; sharing one VM across fibers would corrupt state). Shared
+//! pointers (heap, registry, intern, scheduler) live on the VM but
+//! point at evaluator-owned tables.
 //!
-//! Slot fibers don't migrate between workers. The owning worker is the
-//! only one that ever calls `resume_` on a slot's fiber. Remote
-//! resolvers signal a slot from a different thread, but they only touch
-//! the (atomic) `resumable` flag and the wake word — never the fiber
-//! itself.
+//! Fibers are pinned to their worker — only the worker calls `resume_`.
+//! The wake_fn pushes a remote-resolver's wake into the ready list
+//! atomically (via a SpinMutex) and nudges the worker's wake_word so
+//! it parks for at most one futex round-trip.
 
 const std = @import("std");
 const types = @import("runtime/types.zig");
 const Value = @import("runtime/value.zig").Value;
 const thunk_mod = @import("runtime/thunk.zig");
+const stable = @import("runtime/stable_segments.zig");
 const Scheduler = @import("scheduler.zig").Scheduler;
 const Task = @import("scheduler.zig").Task;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
 const fiber_mod = @import("fiber.zig");
-const Fiber = fiber_mod.Fiber;
+const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime/worker_id.zig");
 
-/// How many fiber slots per worker. Tuning knob: too few and a worker
-/// stalls when all its in-flight fibers are blocked on remote thunks;
-/// too many and per-worker memory (each slot is a VM + a fiber stack)
-/// gets expensive. Four is a reasonable starting point — most blocked
-/// chains are shallow.
-pub const slots_per_worker: u8 = 4;
-
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
-/// initialised for the given (worker_id, slot_idx). The Worker then
-/// patches the VM's claimer_id to match the slot.
-pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, slot_idx: u8) anyerror!VM;
+/// initialised for the given (worker_id, fiber_id). The Worker patches
+/// the VM's claimer_id to match the fiber id.
+pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32) anyerror!VM;
 
-pub const SlotState = enum(u8) {
-    /// Never resumed, or just finished a task. The fiber's entry loop
-    /// is parked at "wait for a task assignment".
-    idle,
-    /// A task has been assigned and the fiber is executing it (either
-    /// actively on the CPU or about to be resumed).
+pub const FiberState = enum(u8) {
+    /// Currently running on the CPU, or about to be resumed.
     running,
-    /// The fiber yielded mid-task because some sub-thunk is `.busy`.
-    /// `waiter` is on that thunk's waiter list.
+    /// Yielded mid-task because a sub-thunk was `.busy`; its waiter is
+    /// enrolled on that thunk's list, awaiting a wake.
     suspended,
+    /// Completed a task; on the free list, available to be reset for a
+    /// new task.
+    free,
 };
 
-pub const FiberSlot = struct {
+/// One in-flight evaluation. Owns a stack, a Context (via InnerFiber),
+/// and a VM. Lives until the Worker is torn down — once allocated, it
+/// is reused via `Fiber.reset` across tasks.
+pub const Fiber = struct {
     worker: *Worker,
-    slot_idx: u8,
-    fiber: Fiber,
+    fiber_id: u32,
+    inner: InnerFiber,
     vm: VM,
-    state: SlotState,
-    /// Task currently assigned to this slot. The fiber's entry loop
-    /// consumes it on resume and nils the field as part of starting.
+    state: FiberState,
+    /// Task currently assigned to this fiber. Read by the fiber's entry
+    /// on first run; nil'd before processing so a recycled fiber sees a
+    /// fresh assignment on its next reset.
     current_task: ?Task,
-    /// Set by a remote thunk-resolver via `wakeImpl`; cleared by the
-    /// worker's main loop when it picks the slot to resume.
-    resumable: std.atomic.Value(u8),
-    /// Embedding for the thunk waiter list. The thunk module sees a
-    /// `Waiter`; `wake_fn` here recovers the slot via `@fieldParentPtr`.
+    /// Linked-list node for ready/free lists. Only one is "active" at a
+    /// time given the fiber state, so we share the link.
+    next_in_list: ?*Fiber,
+    /// Thunk waiter — `wake_fn` recovers the parent via `@fieldParentPtr`
+    /// and enqueues the fiber onto its worker's ready list.
     waiter: thunk_mod.Waiter,
 
     fn wakeImpl(w: *thunk_mod.Waiter) void {
-        const self: *FiberSlot = @fieldParentPtr("waiter", w);
-        self.resumable.store(1, .release);
-        self.worker.nudge();
+        const self: *Fiber = @fieldParentPtr("waiter", w);
+        self.worker.enqueueReady(self);
     }
 };
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     scheduler: *Scheduler,
-    /// 0-based index into the scheduler's per-helper data structures.
-    /// `worker_id = helper_idx + 1` (worker 0 is the main thread).
     helper_idx: u8,
     worker_id: u8,
-    slots: []FiberSlot,
+    init_vm_ctx: *anyopaque,
+    init_vm_fn: InitVmFn,
+
+    /// Every fiber we have ever allocated. Owned by the Worker; freed in
+    /// deinit. Index in this list = fiber_id (stable identity).
+    fibers: std.ArrayList(*Fiber),
+
+    /// LIFO of fibers that have finished their task and are ready to be
+    /// reset for a new one. Only touched by the worker thread itself.
+    free_head: ?*Fiber,
+
+    /// FIFO of fibers whose blocking thunk just resolved. Pushed by
+    /// remote wake_fn calls, popped by the worker's main loop. Protected
+    /// by `ready_mu`.
+    ready_head: ?*Fiber,
+    ready_tail: ?*Fiber,
+    ready_mu: stable.SpinMutex,
+
     shutdown_requested: std.atomic.Value(u8),
 
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
-        /// Index into the scheduler's per-worker bookkeeping (queues +
-        /// wake_words). Helpers pass their helper_idx (0..N-1); the main
-        /// thread passes `scheduler.helper_count` to land on the reserved
-        /// main wake slot.
         helper_idx: u8,
-        /// Stable identity used in thunk claims. Main passes 0; helpers
-        /// pass `helper_idx + 1`. Decoupled from `helper_idx` so the
-        /// main thread can be at the trailing wake slot but still claim
-        /// thunks as worker 0.
         worker_id: u8,
         init_vm_ctx: *anyopaque,
         init_vm_fn: InitVmFn,
     ) !*Worker {
-        // The worker is allocated on the heap so slot pointers back to it
-        // remain stable. Slots store `*Worker` for the nudge path; if the
-        // worker moved we'd dangle.
         const self = try allocator.create(Worker);
-        errdefer allocator.destroy(self);
-
-        const slots = try allocator.alloc(FiberSlot, slots_per_worker);
-        errdefer allocator.free(slots);
-
         self.* = .{
             .allocator = allocator,
             .scheduler = scheduler,
             .helper_idx = helper_idx,
             .worker_id = worker_id,
-            .slots = slots,
+            .init_vm_ctx = init_vm_ctx,
+            .init_vm_fn = init_vm_fn,
+            .fibers = .empty,
+            .free_head = null,
+            .ready_head = null,
+            .ready_tail = null,
+            .ready_mu = .{},
             .shutdown_requested = .init(0),
         };
-
-        // Two-phase slot init: allocate VMs and fibers, then patch the
-        // back-pointers and claimer ids. If init fails mid-stream, we
-        // tear down everything created so far.
-        var initialized: u8 = 0;
-        errdefer {
-            for (slots[0..initialized]) |*s| {
-                s.fiber.deinit(allocator);
-                s.vm.deinit();
-            }
-        }
-        for (slots, 0..) |*s, i| {
-            const slot_idx: u8 = @intCast(i);
-            var vm = try init_vm_fn(init_vm_ctx, self.worker_id, slot_idx);
-            errdefer vm.deinit();
-            vm.claimer_id = thunk_mod.makeClaimer(self.worker_id, slot_idx);
-            const fiber = try Fiber.init(allocator, Fiber.min_stack_bytes, slotEntry, undefined);
-            s.* = .{
-                .worker = self,
-                .slot_idx = slot_idx,
-                .fiber = fiber,
-                .vm = vm,
-                .state = .idle,
-                .current_task = null,
-                .resumable = .init(0),
-                .waiter = .{ .wake_fn = FiberSlot.wakeImpl },
-            };
-            // Bind the fiber's entry argument to the slot pointer now
-            // that the slot lives at a stable address.
-            s.fiber.entry_arg = s;
-            initialized += 1;
-        }
-
         return self;
     }
 
     pub fn deinit(self: *Worker) void {
-        for (self.slots) |*s| {
-            s.fiber.deinit(self.allocator);
-            s.vm.deinit();
+        for (self.fibers.items) |f| {
+            f.inner.deinit(self.allocator);
+            f.vm.deinit();
+            self.allocator.destroy(f);
         }
-        self.allocator.free(self.slots);
+        self.fibers.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
-    /// Set the shutdown flag and nudge so a parked worker wakes to see it.
     pub fn requestShutdown(self: *Worker) void {
         self.shutdown_requested.store(1, .release);
         self.nudge();
     }
 
-    /// Called by remote resolvers (via FiberSlot.wakeImpl) and by the
-    /// scheduler. Sets the wake_word and futex_wakes the worker.
-    pub fn nudge(self: *Worker) void {
+    /// Helper-side park; pairs with `nudge`.
+    fn nudge(self: *Worker) void {
         self.scheduler.wakeHelperPublic(self.helper_idx);
-    }
-
-    /// Run a caller-supplied fiber entry to completion on this worker.
-    ///
-    /// Used by the main thread: the top-level evaluation runs as a fiber
-    /// on a dedicated slot (outside the pool), so when it hits a `.busy`
-    /// thunk it can yield, and the main worker can drive its slot pool
-    /// (steal helper tasks, resume suspended slots) while the top-level
-    /// fiber is parked. When the blocked thunk resolves, the top-level
-    /// fiber becomes resumable and finishes its evaluation.
-    ///
-    /// The dedicated slot uses `slots_per_worker` as its `slot_idx`, so
-    /// its claimer id is distinct from any pool slot's. Its `vm` field
-    /// is unused — the caller's entry constructs its own VM and is
-    /// responsible for setting `vm.claimer_id` accordingly.
-    pub fn runTopLevel(
-        self: *Worker,
-        entry: fiber_mod.EntryFn,
-        arg: *anyopaque,
-    ) !void {
-        var top_slot: FiberSlot = .{
-            .worker = self,
-            .slot_idx = slots_per_worker,
-            .fiber = try Fiber.init(self.allocator, Fiber.min_stack_bytes, entry, arg),
-            .vm = undefined,
-            .state = .running,
-            .current_task = null,
-            .resumable = .init(0),
-            .waiter = .{ .wake_fn = FiberSlot.wakeImpl },
-        };
-        defer top_slot.fiber.deinit(self.allocator);
-
-        while (top_slot.fiber.state != .finished) {
-            // 1. Top-level: first resume from .ready, or resume from
-            // .suspended when its blocker fires.
-            if (top_slot.fiber.state == .ready) {
-                top_slot.fiber.resume_();
-                continue;
-            }
-            if (top_slot.fiber.state == .suspended and top_slot.resumable.swap(0, .acq_rel) != 0) {
-                top_slot.state = .running;
-                top_slot.fiber.resume_();
-                continue;
-            }
-
-            // 2. Drive the pool: resumable slots first, then idle+task.
-            if (self.pickResumableSlot()) |slot| {
-                self.resumeSlot(slot);
-                continue;
-            }
-            if (self.pickIdleSlot()) |slot| {
-                if (self.pickTask()) |task| {
-                    slot.current_task = task;
-                    self.resumeSlot(slot);
-                    continue;
-                }
-            }
-
-            // 3. Nothing actionable yet. Park until a wake arrives.
-            self.scheduler.parkHelper(self.helper_idx);
-        }
-
-        // Top-level fiber finished. Drain any pool slots still suspended
-        // on busy thunks before returning — otherwise their `&waiter`
-        // pointers would dangle on whatever thunk's list they're enrolled
-        // on, and `worker.deinit` would free the slot out from under a
-        // resolver that fires later. We keep helping the pool until every
-        // slot is `.idle` (or `.ready`, meaning it never ran).
-        while (self.anySlotSuspended()) {
-            if (self.pickResumableSlot()) |slot| {
-                self.resumeSlot(slot);
-                continue;
-            }
-            if (self.pickIdleSlot()) |slot| {
-                if (self.pickTask()) |task| {
-                    slot.current_task = task;
-                    self.resumeSlot(slot);
-                    continue;
-                }
-            }
-            self.scheduler.parkHelper(self.helper_idx);
-        }
-    }
-
-    fn anySlotSuspended(self: *Worker) bool {
-        for (self.slots) |*s| {
-            if (s.state == .suspended) return true;
-        }
-        return false;
-    }
-
-    /// Main loop. Drives the slot pool until shutdown.
-    pub fn run(self: *Worker) void {
-        worker_id_mod.current = self.worker_id;
-        while (!self.shouldStop()) {
-            // 1. Resume any slot whose blocking thunk has resolved.
-            if (self.pickResumableSlot()) |slot| {
-                self.resumeSlot(slot);
-                continue;
-            }
-            // 2. Find an idle slot + a pending task; start fresh work.
-            if (self.pickIdleSlot()) |slot| {
-                if (self.pickTask()) |task| {
-                    slot.current_task = task;
-                    self.resumeSlot(slot);
-                    continue;
-                }
-            }
-            // 3. Nothing actionable; park until somebody nudges us.
-            if (self.shouldStop()) break;
-            self.scheduler.parkHelper(self.helper_idx);
-        }
-        // Shutdown: drain the fibers so their stacks deinit cleanly.
-        // Each slot's entry loop checks `shutdown_requested` after yield;
-        // resuming once is enough for it to return.
-        for (self.slots) |*s| {
-            if (s.state == .idle) self.resumeSlot(s);
-        }
     }
 
     fn shouldStop(self: *Worker) bool {
         return self.scheduler.isShutdown() or self.shutdown_requested.load(.acquire) != 0;
     }
 
-    fn pickResumableSlot(self: *Worker) ?*FiberSlot {
-        for (self.slots) |*s| {
-            if (s.state != .suspended) continue;
-            if (s.resumable.swap(0, .acq_rel) == 0) continue;
-            return s;
+    /// Helper main loop. Repeatedly resumes ready fibers, allocates new
+    /// fibers for scheduler tasks, or parks until something happens.
+    pub fn run(self: *Worker) void {
+        worker_id_mod.current = self.worker_id;
+        while (!self.shouldStop()) {
+            if (self.popReady()) |f| {
+                self.runFiber(f);
+                continue;
+            }
+            if (self.pickTask()) |task| {
+                const f = self.acquireFreeFiber() catch |err| {
+                    std.log.err("worker {d} failed to allocate fiber: {s}", .{ self.worker_id, @errorName(err) });
+                    continue;
+                };
+                f.current_task = task;
+                f.inner.reset(slotEntry, @ptrCast(f));
+                f.state = .running;
+                self.runFiber(f);
+                continue;
+            }
+            if (self.shouldStop()) break;
+            self.scheduler.parkHelper(self.helper_idx);
         }
-        return null;
     }
 
-    fn pickIdleSlot(self: *Worker) ?*FiberSlot {
-        for (self.slots) |*s| {
-            if (s.state == .idle) return s;
+    /// Drive a custom one-shot fiber to completion, draining the ready
+    /// list and scheduler tasks while it's suspended. Used by the main
+    /// thread to run the top-level evaluation (or a render/force entry
+    /// point) inside a fiber so its `.busy` collisions yield rather
+    /// than block the OS thread.
+    pub fn runTopLevel(
+        self: *Worker,
+        entry: fiber_mod.EntryFn,
+        arg: *anyopaque,
+    ) !void {
+        worker_id_mod.current = self.worker_id;
+        const top = try self.acquireFreeFiber();
+        top.current_task = null;
+        top.inner.reset(entry, arg);
+        top.state = .running;
+        self.runFiber(top);
+
+        while (top.state != .free) {
+            if (self.popReady()) |f| {
+                self.runFiber(f);
+                continue;
+            }
+            if (self.pickTask()) |task| {
+                const f = try self.acquireFreeFiber();
+                f.current_task = task;
+                f.inner.reset(slotEntry, @ptrCast(f));
+                f.state = .running;
+                self.runFiber(f);
+                continue;
+            }
+            self.scheduler.parkHelper(self.helper_idx);
         }
-        return null;
+
+        // The top fiber has retired to free. Drain any remaining
+        // suspended fibers before returning so their waiter pointers
+        // don't dangle on thunk lists past `deinit`.
+        while (self.anyFiberSuspended()) {
+            if (self.popReady()) |f| {
+                self.runFiber(f);
+                continue;
+            }
+            if (self.pickTask()) |task| {
+                const f = try self.acquireFreeFiber();
+                f.current_task = task;
+                f.inner.reset(slotEntry, @ptrCast(f));
+                f.state = .running;
+                self.runFiber(f);
+                continue;
+            }
+            self.scheduler.parkHelper(self.helper_idx);
+        }
+    }
+
+    /// Resume the fiber and update bookkeeping based on what state it
+    /// returned in. The fiber either yielded (still `.suspended`),
+    /// finished its work (entry returned → reset state to `.free` and
+    /// push onto free list), or in a degenerate case is somehow still
+    /// running (treated as same as suspended; the next wake will hit it).
+    fn runFiber(self: *Worker, f: *Fiber) void {
+        f.inner.resume_();
+        switch (f.inner.state) {
+            .finished => {
+                // Entry returned cleanly. Recycle.
+                f.state = .free;
+                self.pushFree(f);
+            },
+            .suspended => {
+                // Yielded inside the body (force.busy enrolled on a
+                // waiter list). The fiber's state was set to .suspended
+                // by force.zig before yield; we just leave it.
+            },
+            .ready, .running => unreachable,
+        }
     }
 
     fn pickTask(self: *Worker) ?Task {
@@ -325,36 +260,100 @@ pub const Worker = struct {
         return null;
     }
 
-    fn resumeSlot(self: *Worker, slot: *FiberSlot) void {
-        _ = self;
-        slot.state = .running;
-        slot.fiber.resume_();
-        // The fiber either: completed its task (state .idle), suspended
-        // mid-task on a busy thunk (state .suspended), or terminated
-        // entirely (state .idle and shutdown_requested true).
+    /// Pop a fiber from the free list (LIFO — best cache locality), or
+    /// allocate a fresh one if the list is empty. The new fiber has its
+    /// own stack + VM; the caller must `reset` it with the actual entry.
+    fn acquireFreeFiber(self: *Worker) !*Fiber {
+        if (self.free_head) |head| {
+            self.free_head = head.next_in_list;
+            head.next_in_list = null;
+            return head;
+        }
+        return self.allocateFiber();
+    }
+
+    fn allocateFiber(self: *Worker) !*Fiber {
+        const fiber_id: u32 = @intCast(self.fibers.items.len);
+        const f = try self.allocator.create(Fiber);
+        errdefer self.allocator.destroy(f);
+
+        var vm = try self.init_vm_fn(self.init_vm_ctx, self.worker_id, fiber_id);
+        errdefer vm.deinit();
+
+        var inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
+        errdefer inner.deinit(self.allocator);
+
+        f.* = .{
+            .worker = self,
+            .fiber_id = fiber_id,
+            .inner = inner,
+            .vm = vm,
+            .state = .free,
+            .current_task = null,
+            .next_in_list = null,
+            .waiter = .{ .wake_fn = Fiber.wakeImpl },
+        };
+        f.vm.claimer_id = thunk_mod.makeClaimer(self.worker_id, fiber_id);
+
+        try self.fibers.append(self.allocator, f);
+        return f;
+    }
+
+    fn pushFree(self: *Worker, f: *Fiber) void {
+        f.next_in_list = self.free_head;
+        self.free_head = f;
+    }
+
+    /// Push a resumable fiber onto the ready list and nudge the worker.
+    /// Called from the resolver thread (via the fiber's waiter wake_fn).
+    fn enqueueReady(self: *Worker, f: *Fiber) void {
+        self.ready_mu.lock();
+        f.next_in_list = null;
+        if (self.ready_tail) |tail| {
+            tail.next_in_list = f;
+        } else {
+            self.ready_head = f;
+        }
+        self.ready_tail = f;
+        self.ready_mu.unlock();
+        self.nudge();
+    }
+
+    fn popReady(self: *Worker) ?*Fiber {
+        self.ready_mu.lock();
+        defer self.ready_mu.unlock();
+        if (self.ready_head) |head| {
+            self.ready_head = head.next_in_list;
+            if (self.ready_head == null) self.ready_tail = null;
+            head.next_in_list = null;
+            return head;
+        }
+        return null;
+    }
+
+    fn anyFiberSuspended(self: *Worker) bool {
+        for (self.fibers.items) |f| {
+            if (f.state == .suspended) return true;
+        }
+        return false;
     }
 };
 
-/// Fiber entry: an infinite loop pulling tasks from the slot. Yields
-/// when no task is assigned so the worker can wake us up later.
+/// Standard fiber entry: run one task to completion and return.
+/// On entry, the worker has already set `current_task` and reset the
+/// fiber. The fiber's claimer_id was set at allocation; VM stack/frame
+/// state is from the previous task — reset before doing anything.
 fn slotEntry(arg: *anyopaque) void {
-    const slot: *FiberSlot = @ptrCast(@alignCast(arg));
-    while (true) {
-        if (slot.worker.shutdown_requested.load(.acquire) != 0) return;
-        if (slot.current_task) |task| {
-            slot.current_task = null;
-            // Reset the VM's bytecode state so this task starts fresh.
-            slot.vm.sp = 0;
-            slot.vm.frames_len = 0;
-            switch (task) {
-                .force_thunk => |thunk_id| {
-                    const v = Value.thunk(thunk_id);
-                    _ = vm_force.forceValueSpeculative(&slot.vm, v) catch {};
-                },
-            }
-        }
-        slot.state = .idle;
-        Fiber.yield();
+    const f: *Fiber = @ptrCast(@alignCast(arg));
+    f.vm.sp = 0;
+    f.vm.frames_len = 0;
+    const task = f.current_task orelse return;
+    f.current_task = null;
+    switch (task) {
+        .force_thunk => |thunk_id| {
+            const v = Value.thunk(thunk_id);
+            _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
+        },
     }
 }
 
@@ -377,7 +376,7 @@ test "Worker basic init/deinit" {
         arena: std.heap.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
-        fn initVm(ctx: *anyopaque, worker_id: u8, _: u8) anyerror!VM {
+        fn initVm(ctx: *anyopaque, worker_id: u8, _: u32) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return VM.init(
                 self.arena.allocator(),
@@ -424,10 +423,7 @@ test "Worker basic init/deinit" {
     defer worker.deinit();
 
     try testing.expectEqual(@as(u8, 1), worker.worker_id);
-    try testing.expectEqual(@as(usize, slots_per_worker), worker.slots.len);
-    for (worker.slots, 0..) |*s, i| {
-        try testing.expectEqual(@as(u8, @intCast(i)), s.slot_idx);
-        try testing.expectEqual(thunk_mod.makeClaimer(1, @intCast(i)), s.vm.claimer_id);
-        try testing.expectEqual(SlotState.idle, s.state);
-    }
+    try testing.expect(worker.fibers.items.len == 0); // none allocated yet
+    try testing.expect(worker.free_head == null);
+    try testing.expect(worker.ready_head == null);
 }

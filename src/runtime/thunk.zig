@@ -34,21 +34,20 @@ pub const ThunkState = enum(u32) {
 };
 
 /// Identity of whoever is currently claiming a thunk. Packs:
-///   high byte: worker_id (which OS thread)
-///   low byte:  slot index within that worker's fiber pool, or
-///              `MAIN_THREAD_SLOT` if the claimer is the worker's bare
-///              OS-thread stack (not a fiber).
+///   high byte (bits 24..31): worker_id (which OS thread).
+///   low 24 bits (bits 0..23): fiber id within that worker's pool.
 ///
-/// Both fields combined identify a single in-progress force operation,
-/// which is what blackhole detection cares about: same fiber re-entering
-/// its own evaluation = real recursion; different fiber on same worker =
-/// must wait (no spurious blackhole).
-pub const ClaimerId = u16;
-pub const INVALID_CLAIMER: ClaimerId = 0xFFFF;
-pub const MAIN_THREAD_SLOT: u8 = 0xFF;
+/// Combined, they identify a single in-progress force operation, which
+/// is what blackhole detection cares about: same fiber re-entering its
+/// own evaluation = real recursion; different fiber on same worker =
+/// must wait (no spurious blackhole). The 24-bit fiber id gives ~16M
+/// fibers per worker, well past the realistic high-water on any
+/// reasonable workload.
+pub const ClaimerId = u32;
+pub const INVALID_CLAIMER: ClaimerId = std.math.maxInt(ClaimerId);
 
-pub fn makeClaimer(worker_id: u8, slot: u8) ClaimerId {
-    return (@as(ClaimerId, worker_id) << 8) | @as(ClaimerId, slot);
+pub fn makeClaimer(worker_id: u8, fiber_id: u32) ClaimerId {
+    return (@as(ClaimerId, worker_id) << 24) | (fiber_id & 0x00FFFFFF);
 }
 
 /// Lightweight linked-list node used to enroll fibers on a thunk's
@@ -267,7 +266,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
     const Forcer = struct {
         fn run(th: *Thunk, value: i64, ready: *std.atomic.Value(u8), release_now: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(makeClaimer(0, MAIN_THREAD_SLOT))) {
+            switch (th.tryForce(makeClaimer(0, 0))) {
                 .claimed => {},
                 else => return,
             }
@@ -285,7 +284,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
     // Worker 1 sees .busy, enrolls a waiter that flips an atomic flag
     // when the resolver fires.
-    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
         .busy => {},
         else => unreachable,
     }
@@ -305,7 +304,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
     while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
     t.join();
 
-    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
         .already_resolved => |v| try std.testing.expectEqual(@as(i64, 99), v.asInt()),
         else => return error.UnexpectedOutcome,
     }
@@ -313,7 +312,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
 test "thunk: same claimer recursive force returns blackhole" {
     var thunk = Thunk.init(Value.null_val);
-    const me = makeClaimer(0, MAIN_THREAD_SLOT);
+    const me = makeClaimer(0, 0);
 
     switch (thunk.tryForce(me)) {
         .claimed => {},
@@ -407,7 +406,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     const Failer = struct {
         fn run(th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(makeClaimer(0, MAIN_THREAD_SLOT))) {
+            switch (th.tryForce(makeClaimer(0, 0))) {
                 .claimed => {},
                 else => return,
             }
@@ -423,7 +422,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
 
-    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
         .busy => {},
         else => return error.ExpectedBusy,
     }
@@ -446,7 +445,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     // After reset, the thunk is back to .unresolved — a fresh tryForce
     // should claim it.
-    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
         .claimed => {},
         else => return error.ExpectedClaimedAfterReset,
     }

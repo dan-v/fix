@@ -136,6 +136,27 @@ pub const Fiber = struct {
         self.* = undefined;
     }
 
+    /// Rewind the fiber so the next `resume_` starts a fresh invocation
+    /// of `entry(arg)` on the same stack buffer. Used by Worker to
+    /// recycle a `.finished` fiber for a new task without allocating a
+    /// new stack.
+    ///
+    /// Must NOT be called on a fiber in `.running` or `.suspended` —
+    /// that would leak the fiber's call frames and break any waiters
+    /// enrolled on thunks via its slot.
+    pub fn reset(self: *Fiber, entry: EntryFn, arg: *anyopaque) void {
+        std.debug.assert(self.state == .finished or self.state == .ready);
+        const top = @intFromPtr(self.stack.ptr) + self.stack.len;
+        const sp_start = (top - 8) & ~@as(usize, 15);
+        const trampoline_addr_slot: *usize = @ptrFromInt(sp_start);
+        trampoline_addr_slot.* = @intFromPtr(&trampoline);
+        self.ctx = .{ .rsp = sp_start };
+        self.entry = entry;
+        self.entry_arg = arg;
+        self.caller_ctx = null;
+        self.state = .ready;
+    }
+
     /// Switch onto this fiber's stack and run until it yields or finishes.
     /// Returns when the fiber yields or returns from `entry`.
     pub fn resume_(self: *Fiber) void {

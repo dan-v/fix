@@ -104,10 +104,8 @@ pub const VM = struct {
     /// This VM's worker index.
     worker_id: u8,
     /// Identity used when claiming thunks (high byte = worker_id,
-    /// low byte = fiber slot index, or MAIN_THREAD_SLOT for OS-thread).
-    /// Two different fiber slots on the same worker hold distinct
-    /// claimer ids so they can sit on each other's thunks without
-    /// false-recursion errors.
+    /// low 24 bits = fiber id within that worker's pool). Worker
+    /// patches this when binding the VM to a fiber.
     claimer_id: thunk_mod.ClaimerId,
 
     /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
@@ -160,7 +158,7 @@ pub const VM = struct {
             .import_host = import_host,
             .builtins = builtins_value,
             .worker_id = worker_id,
-            .claimer_id = thunk_mod.makeClaimer(worker_id, thunk_mod.MAIN_THREAD_SLOT),
+            .claimer_id = thunk_mod.makeClaimer(worker_id, 0),
             .stack = value_stack,
             .sp = 0,
             .frames = frames,
