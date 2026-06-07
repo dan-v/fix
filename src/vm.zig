@@ -31,6 +31,7 @@ const DerivationStore = @import("derivation.zig").DerivationStore;
 const eval_trace = @import("eval/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
+const thunk_mod = @import("runtime/thunk.zig");
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
@@ -102,6 +103,12 @@ pub const VM = struct {
     builtins: Value,
     /// This VM's worker index.
     worker_id: u8,
+    /// Identity used when claiming thunks (high byte = worker_id,
+    /// low byte = fiber slot index, or MAIN_THREAD_SLOT for OS-thread).
+    /// Two different fiber slots on the same worker hold distinct
+    /// claimer ids so they can sit on each other's thunks without
+    /// false-recursion errors.
+    claimer_id: thunk_mod.ClaimerId,
 
     /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
     /// logical length.
@@ -153,6 +160,7 @@ pub const VM = struct {
             .import_host = import_host,
             .builtins = builtins_value,
             .worker_id = worker_id,
+            .claimer_id = thunk_mod.makeClaimer(worker_id, thunk_mod.MAIN_THREAD_SLOT),
             .stack = value_stack,
             .sp = 0,
             .frames = frames,

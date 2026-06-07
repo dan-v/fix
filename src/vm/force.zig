@@ -110,7 +110,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     const thunk = try self.heap.getThunk(thunk_id);
 
     while (true) {
-        switch (thunk.tryForce(self.worker_id)) {
+        switch (thunk.tryForce(self.claimer_id)) {
             .already_resolved => |v| {
                 if (demand) thunk.markDemanded();
                 return v;

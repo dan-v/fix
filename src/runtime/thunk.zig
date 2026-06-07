@@ -30,7 +30,23 @@ pub const ThunkState = enum(u32) {
     blackhole = 3,
 };
 
-pub const INVALID_CLAIMER: u8 = 0xFF;
+/// Identity of whoever is currently claiming a thunk. Packs:
+///   high byte: worker_id (which OS thread)
+///   low byte:  slot index within that worker's fiber pool, or
+///              `MAIN_THREAD_SLOT` if the claimer is the worker's bare
+///              OS-thread stack (not a fiber).
+///
+/// Both fields combined identify a single in-progress force operation,
+/// which is what blackhole detection cares about: same fiber re-entering
+/// its own evaluation = real recursion; different fiber on same worker =
+/// must wait (no spurious blackhole).
+pub const ClaimerId = u16;
+pub const INVALID_CLAIMER: ClaimerId = 0xFFFF;
+pub const MAIN_THREAD_SLOT: u8 = 0xFF;
+
+pub fn makeClaimer(worker_id: u8, slot: u8) ClaimerId {
+    return (@as(ClaimerId, worker_id) << 8) | @as(ClaimerId, slot);
+}
 
 pub const BytecodeThunk = struct {
     chunk_id: ChunkId,
@@ -80,7 +96,7 @@ pub const WaitOutcome = union(enum) {
 /// "unevaluated" so speculation stays invisible to users.
 pub const Thunk = struct {
     state: std.atomic.Value(u32),
-    claimer: std.atomic.Value(u8),
+    claimer: std.atomic.Value(ClaimerId),
     parked: std.atomic.Value(u8),
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
@@ -130,13 +146,15 @@ pub const Thunk = struct {
         return self.demanded.load(.acquire) != 0;
     }
 
-    /// Try to claim this thunk for evaluation by `worker_id`. Returns:
+    /// Try to claim this thunk for evaluation by `claimer`. Returns:
     ///   - `.already_resolved`: the result is published; read `self.result`.
-    ///   - `.claimed`: this thread has claimed; must compute and call
+    ///   - `.claimed`: this caller has claimed; must compute and call
     ///     `resolve` or `reset`.
-    ///   - `.blackhole`: the same worker is already evaluating; real recursion.
-    ///   - `.busy`: another worker is evaluating; caller must `waitFor`.
-    pub fn tryForce(self: *Thunk, worker_id: u8) ForceOutcome {
+    ///   - `.blackhole`: the SAME claim identity is already evaluating —
+    ///     real recursion (a fiber re-entering itself).
+    ///   - `.busy`: a different claim identity is evaluating; caller must
+    ///     `waitFor` (OS-thread context) or yield (fiber context).
+    pub fn tryForce(self: *Thunk, claimer: ClaimerId) ForceOutcome {
         while (true) {
             const s: ThunkState = @enumFromInt(self.state.load(.acquire));
             switch (s) {
@@ -150,14 +168,14 @@ pub const Thunk = struct {
                         .monotonic,
                     );
                     if (prev == null) {
-                        self.claimer.store(worker_id, .release);
+                        self.claimer.store(claimer, .release);
                         return .claimed;
                     }
                     continue;
                 },
                 .evaluating => {
                     const c = self.claimer.load(.acquire);
-                    if (c == worker_id) return .blackhole;
+                    if (c == claimer) return .blackhole;
                     return .busy;
                 },
             }
@@ -271,7 +289,7 @@ test "thunk: cross-worker force waits for resolution" {
 
     const Forcer = struct {
         fn run(th: *Thunk, value: i64, ready: *std.atomic.Value(u8), release_now: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(0)) {
+            switch (th.tryForce(makeClaimer(0, MAIN_THREAD_SLOT))) {
                 .claimed => {},
                 else => return,
             }
@@ -289,7 +307,7 @@ test "thunk: cross-worker force waits for resolution" {
 
     // Worker 1 starts forcing, sees .busy, waits.
     var saw_busy = false;
-    switch (thunk.tryForce(1)) {
+    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
         .busy => saw_busy = true,
         else => unreachable,
     }
@@ -313,17 +331,37 @@ test "thunk: cross-worker force waits for resolution" {
     }
 }
 
-test "thunk: same-worker recursive force returns blackhole" {
+test "thunk: same claimer recursive force returns blackhole" {
     var thunk = Thunk.init(Value.null_val);
+    const me = makeClaimer(0, MAIN_THREAD_SLOT);
 
-    switch (thunk.tryForce(0)) {
+    switch (thunk.tryForce(me)) {
         .claimed => {},
         else => return error.UnexpectedOutcome,
     }
-    // Re-forcing from the same worker → blackhole.
-    switch (thunk.tryForce(0)) {
+    // Re-forcing from the same claimer → blackhole.
+    switch (thunk.tryForce(me)) {
         .blackhole => {},
         else => return error.ExpectedBlackhole,
+    }
+}
+
+test "thunk: same worker different fibers see .busy, not blackhole" {
+    // The whole point of widening claimer to (worker, slot): two fibers
+    // on the same worker must not falsely report recursion when one
+    // touches a thunk the other claimed.
+    var thunk = Thunk.init(Value.null_val);
+    const slot_a = makeClaimer(0, 0);
+    const slot_b = makeClaimer(0, 1);
+
+    switch (thunk.tryForce(slot_a)) {
+        .claimed => {},
+        else => return error.UnexpectedOutcome,
+    }
+    switch (thunk.tryForce(slot_b)) {
+        .busy => {},
+        .blackhole => return error.UnexpectedBlackhole,
+        else => return error.UnexpectedOutcome,
     }
 }
 
@@ -332,7 +370,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     const Failer = struct {
         fn run(th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(0)) {
+            switch (th.tryForce(makeClaimer(0, MAIN_THREAD_SLOT))) {
                 .claimed => {},
                 else => return,
             }
@@ -348,7 +386,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
 
-    switch (thunk.tryForce(1)) {
+    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
         .busy => {},
         else => return error.ExpectedBusy,
     }
