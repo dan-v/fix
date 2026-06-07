@@ -6,6 +6,7 @@
 pub const opcode = @import("bytecode/opcode.zig");
 pub const encoding = @import("bytecode/encoding.zig");
 pub const chunk = @import("bytecode/chunk.zig");
+pub const disasm = @import("bytecode/disasm.zig");
 
 // Flat re-exports of the public surface.
 pub const OpCode = opcode.OpCode;

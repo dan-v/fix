@@ -7,6 +7,7 @@ const eval = @import("eval.zig");
 const derivation_debug = @import("derivation/debug.zig");
 const diagnostic = @import("diagnostic.zig");
 const repl_line = @import("cli/repl.zig");
+const disasm_cmd = @import("cli/disasm.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 const Value = @import("runtime/value.zig").Value;
@@ -88,7 +89,18 @@ pub fn main(init: std.process.Init) !void {
     };
     _ = prog_name;
 
-    const options = parseOptions(&args_iter) catch |err| {
+    const first_arg = args_iter.next();
+    if (first_arg) |first| {
+        if (std.mem.eql(u8, first, "disasm")) {
+            const code = disasm_cmd.run(init, &args_iter) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.process.exit(code);
+        }
+    }
+
+    const options = parseOptions(&args_iter, first_arg) catch |err| {
         std.debug.print("error: {s}\n\n{s}", .{ optionErrorMessage(err), usage });
         std.process.exit(1);
     };
@@ -212,10 +224,15 @@ fn getSource(
     };
 }
 
-fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
+fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
     var options: Options = .{};
 
-    while (args_iter.next()) |arg| {
+    var carried = first;
+    while (true) {
+        const arg = if (carried) |c| blk: {
+            carried = null;
+            break :blk c;
+        } else (args_iter.next() orelse break);
         if (std.mem.eql(u8, arg, "--repl")) {
             options.repl = true;
         } else if (std.mem.eql(u8, arg, "--json")) {

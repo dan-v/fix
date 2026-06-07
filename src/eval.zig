@@ -10,6 +10,7 @@ const opcode = bytecode.opcode;
 const InternTable = @import("runtime/intern.zig").InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
+const ChunkId = types.ChunkId;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
@@ -271,6 +272,72 @@ pub const Evaluator = struct {
 
     fn copyDiagnostics(self: *Evaluator, diagnostics: []const Diagnostic, source: []const u8, source_path: ?[]const u8) !void {
         try self.run.replaceDiagnostics(diagnostics, source, source_path);
+    }
+
+    /// Parse and compile source text into a registered chunk id. Used by
+    /// debugging tools that want to inspect bytecode without running it.
+    pub fn compileSource(
+        self: *Evaluator,
+        source: []const u8,
+        source_path: ?[]const u8,
+    ) !ChunkId {
+        const subject = source_path orelse "expression";
+
+        var arena = @import("ast.zig").AstArena.init(self.allocator);
+        defer arena.deinit();
+
+        var parser = parser_mod.Parser.init(self.allocator, &arena, source);
+        defer parser.deinit();
+
+        const ast_node = blk: {
+            self.progressBegin(.parse, subject);
+            defer self.progressEnd(.parse, subject);
+            break :blk parser.parse() catch {
+                try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
+                return error.ParseError;
+            };
+        };
+
+        var builder = try ChunkBuilder.init(self.allocator);
+        defer builder.deinit(self.allocator);
+
+        var compiler = @import("compiler.zig").Compiler.init(
+            self.allocator,
+            &builder,
+            &self.registry,
+            source,
+            &self.intern,
+        );
+        compiler.base_path = self.base_path;
+        compiler.source_path = source_path;
+        defer compiler.deinit();
+
+        {
+            self.progressBegin(.compile, subject);
+            defer self.progressEnd(.compile, subject);
+            compiler.compileAndFinish(ast_node, null) catch |err| {
+                try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
+                return err;
+            };
+        }
+
+        const chunk = try builder.finish(self.allocator, compiler.slot_count);
+        return self.registry.register(chunk);
+    }
+
+    /// Read-only access to compiled chunks for tools.
+    pub fn getChunk(self: *const Evaluator, id: ChunkId) ?*const @import("bytecode.zig").Chunk {
+        return self.registry.get(id);
+    }
+
+    /// Read-only access to the intern table for tools.
+    pub fn internTable(self: *const Evaluator) *const InternTable {
+        return &self.intern;
+    }
+
+    /// Read-only access to the chunk registry for tools.
+    pub fn chunkRegistry(self: *const Evaluator) *const ChunkRegistry {
+        return &self.registry;
     }
 
     /// Compile source text into bytecode and evaluate it.
