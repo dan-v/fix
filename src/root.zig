@@ -18,6 +18,7 @@ pub const compiler = @import("compiler.zig");
 pub const intern = @import("runtime/intern.zig");
 pub const thunk = @import("runtime/thunk.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const fiber = @import("fiber.zig");
 pub const file_cache = @import("file_cache.zig");
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");

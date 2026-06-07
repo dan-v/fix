@@ -57,6 +57,13 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", build_options);
 
+    // Fiber stack-switching primitive. The .S file is per-arch; pick one
+    // by the resolved target.
+    switch (target.result.cpu.arch) {
+        .x86_64 => mod.addAssemblyFile(b.path("src/fiber/swap_x86_64.S")),
+        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
+    }
+
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
         .target = target,
