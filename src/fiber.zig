@@ -86,9 +86,12 @@ pub const Fiber = struct {
     /// not outlive the `resume_` call.
     caller_ctx: ?*Context,
 
-    /// Minimum recommended stack size. Anything smaller risks overflowing
-    /// the inner workings of the VM body the fiber runs.
-    pub const min_stack_bytes: usize = 64 * 1024;
+    /// Minimum recommended stack size. The VM's force/eval call chain
+    /// is recursive (forceThunk → evalThunkTarget → runIsolatedFrame →
+    /// dispatch → opcodes that re-force values), and Nix programs can
+    /// produce deep evaluation chains. 1 MiB matches a typical OS-thread
+    /// stack budget; we can shrink later if profiling shows headroom.
+    pub const min_stack_bytes: usize = 1024 * 1024;
 
     /// Allocate a fiber with its own stack and prepare it to invoke
     /// `entry(arg)` on first resume.

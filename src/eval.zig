@@ -34,6 +34,7 @@ const eval_print = @import("eval/print.zig");
 const stable_segments_mod = @import("runtime/stable_segments.zig");
 
 const worker_id_mod = @import("runtime/worker_id.zig");
+const worker_mod = @import("worker.zig");
 
 /// Per-thread linked list of in-progress *scoped* import paths. Scoped
 /// imports are not deduplicated through `ImportEntry` (each call has a
@@ -770,28 +771,27 @@ pub const Evaluator = struct {
     }
 };
 
-/// Helper worker loop. Each helper owns a VM bound to worker_id = helper_idx + 1
-/// and processes speculative `force_thunk` tasks until the scheduler signals
-/// shutdown. Errors during speculation are swallowed — the thunk's own
-/// `reset()` is invoked by force.forceThunkFallible on failure, so a future
-/// genuine force will retry and surface the error to its real caller.
+/// Helper worker loop. Owns a fiber pool of `worker_mod.slots_per_worker`
+/// slots; each slot has its own VM and can be parked mid-evaluation when
+/// it hits a `.busy` thunk. The Worker drives the slot scheduler — see
+/// `worker.zig`. Errors during speculation are swallowed inside the
+/// slot's entry; the thunk's own `reset()` on failure surfaces the
+/// error to a future genuine caller.
 fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
-    worker_id_mod.current = helper_idx + 1;
-    var vm = ev.initVm(helper_idx + 1) catch return;
-    defer vm.deinit();
+    const worker = worker_mod.Worker.init(
+        ev.allocator,
+        sched,
+        helper_idx,
+        ev,
+        initVmForWorkerSlot,
+    ) catch return;
+    defer worker.deinit();
+    worker.run();
+}
 
-    while (!sched.isShutdown()) {
-        const task = sched.pop(helper_idx) orelse sched.stealAny(helper_idx) orelse {
-            sched.parkHelper(helper_idx);
-            continue;
-        };
-        switch (task) {
-            .force_thunk => |thunk_id| {
-                const thunk_val = Value.thunk(thunk_id);
-                _ = vm_force.forceValueSpeculative(&vm, thunk_val) catch {};
-            },
-        }
-    }
+fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u8) anyerror!VM {
+    const ev: *Evaluator = @ptrCast(@alignCast(ctx));
+    return ev.initVm(worker_id);
 }
 
 const OpcodeCountEntry = struct {

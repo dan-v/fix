@@ -6,6 +6,8 @@ const ObjectId = types.ObjectId;
 const thunk_mod = @import("../runtime/thunk.zig");
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
+const fiber_mod = @import("../fiber.zig");
+const worker_mod = @import("../worker.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
@@ -130,6 +132,29 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return result;
             },
             .busy => {
+                // If we're inside a fiber slot, enroll on the thunk's
+                // fiber-waiter list and yield back to our worker so it
+                // can run other fibers while we wait. On resume, the
+                // outer while loop retries `tryForce`, where we'll
+                // observe whichever terminal state the resolver left.
+                //
+                // If we're not in a fiber (OS-thread fallback — the main
+                // evaluator thread, or test scaffolding), fall through
+                // to the synchronous `waitFor`.
+                if (fiber_mod.currentFiber()) |fiber| {
+                    const slot: *worker_mod.FiberSlot = @fieldParentPtr("fiber", fiber);
+                    if (thunk.enrollWaiter(&slot.waiter)) {
+                        // Mark the slot suspended *before* yielding so the
+                        // worker's `pickResumableSlot` finds it when the
+                        // resolver eventually flips `resumable`. Reset on
+                        // resume so the slot's next state is whatever the
+                        // entry loop or another yield sets.
+                        slot.state = .suspended;
+                        fiber_mod.Fiber.yield();
+                        slot.state = .running;
+                    }
+                    continue;
+                }
                 switch (thunk.waitFor()) {
                     .resolved => |v| {
                         if (demand) thunk.markDemanded();
