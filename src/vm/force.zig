@@ -57,14 +57,39 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
         .list => {
             const id = forced.asObjectId();
             if (!try enterDeep(self, .list, id, seen)) return;
-            for (try self.heap.getList(id)) |item| try forceDeepInner(self, item, seen);
+            const items = try self.heap.getList(id);
+            fanOutListShallow(self, items);
+            for (items) |item| try forceDeepInner(self, item, seen);
         },
         .attrs => {
             const id = forced.asObjectId();
             if (!try enterDeep(self, .attrs, id, seen)) return;
-            for (try self.heap.getAttrs(id)) |entry| try forceDeepInner(self, entry.value, seen);
+            const entries = try self.heap.getAttrs(id);
+            fanOutAttrsShallow(self, entries);
+            for (entries) |entry| try forceDeepInner(self, entry.value, seen);
         },
         else => {},
+    }
+}
+
+/// Demand-driven fan-out: urgently submit a shallow force_thunk for every
+/// thunk-typed item to helpers. The caller is about to walk every item
+/// itself, so this is guaranteed work, not speculation — whoever loses
+/// the race (helper or main) sees `.already_resolved` and proceeds. We
+/// stop submitting once a push fails, since `submitUrgent` only returns
+/// false when every helper queue is full and the caller will pick up the
+/// remainder inline.
+fn fanOutListShallow(self: *VM, items: []const Value) void {
+    for (items) |v| {
+        if (v.discriminant != .thunk) continue;
+        if (!self.scheduler.submitUrgent(.{ .force_thunk = v.asObjectId() })) break;
+    }
+}
+
+fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
+    for (entries) |entry| {
+        if (entry.value.discriminant != .thunk) continue;
+        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
     }
 }
 

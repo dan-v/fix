@@ -102,6 +102,8 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
     const heap_stats = ev.heapStats();
     const intern_stats = ev.internStats();
     const reg_stats = ev.chunkStats();
+    const sched_stats = ev.schedulerStats();
+    const helpers = ev.helperCount();
 
     try writer.writeAll("heap\n");
     try writer.print("  objects:          {d}\n", .{heap_stats.objects});
@@ -146,7 +148,39 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         try writer.writeByte('\n');
     }
 
+    try writeSchedulerStats(writer, helpers, sched_stats);
+
     if (top_n > 0) try writeTopInterned(writer, ev, top_n);
+}
+
+fn writeSchedulerStats(writer: *std.Io.Writer, helpers: u8, s: anytype) !void {
+    try writer.writeAll("\nscheduler\n");
+    try writer.print("  helpers:          {d}\n", .{helpers});
+    if (helpers == 0) {
+        try writer.writeAll("  (single-threaded — no parallel submissions to count)\n");
+        return;
+    }
+    try writer.writeAll("  submissions:\n");
+    const spec_total = s.speculative_submitted + s.speculative_rejected;
+    try writer.print("    speculative ok:    {d:>8}\n", .{s.speculative_submitted});
+    try writer.print("    speculative rej:   {d:>8}  ({d:.1}% of attempted)\n", .{
+        s.speculative_rejected,
+        percent(s.speculative_rejected, spec_total),
+    });
+    const urgent_total = s.urgent_submitted + s.urgent_rejected;
+    try writer.print("    urgent ok:         {d:>8}\n", .{s.urgent_submitted});
+    try writer.print("    urgent rej:        {d:>8}  ({d:.1}% of attempted)\n", .{
+        s.urgent_rejected,
+        percent(s.urgent_rejected, urgent_total),
+    });
+    try writer.print("  pops:              {d:>8}  (helper popped own queue)\n", .{s.pops});
+    try writer.print("  steals:            {d:>8}\n", .{s.steals});
+    try writer.print("  parks:             {d:>8}\n", .{s.parks});
+}
+
+fn percent(part: u64, total: u64) f64 {
+    if (total == 0) return 0.0;
+    return @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(total));
 }
 
 fn writeTopInterned(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {

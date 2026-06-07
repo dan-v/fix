@@ -58,3 +58,24 @@ test "parallel: list operations with 4 workers" {
     );
     try std.testing.expectEqual(@as(i64, 10), result.asInt());
 }
+
+test "parallel: forceDeep fans wide attrset out to helpers" {
+    // Constructs an attrset where every value is a thunk whose body is
+    // big enough to make speculation worth it, then strict-forces the
+    // whole tree. The fan-out path in forceDeepInner submits every
+    // child to helpers urgently — `forceDeep` should complete without
+    // hangs or errors regardless of how the work is distributed.
+    const alloc = std.testing.allocator;
+    var ev = try Evaluator.init(alloc, 4);
+    defer ev.deinit();
+
+    const value = try ev.evaluate(
+        \\let
+        \\  heavy = n: builtins.foldl' (a: b: a + b) 0 (builtins.genList (i: i + n) 64);
+        \\in builtins.listToAttrs (builtins.genList (i: {
+        \\  name = "k${toString i}";
+        \\  value = heavy i;
+        \\}) 32)
+    );
+    try ev.forceDeep(value);
+}

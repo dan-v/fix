@@ -358,6 +358,14 @@ pub const Evaluator = struct {
         return self.registry.stats();
     }
 
+    pub fn schedulerStats(self: *const Evaluator) Scheduler.Stats {
+        return self.scheduler.stats();
+    }
+
+    pub fn helperCount(self: *const Evaluator) u8 {
+        return self.scheduler.helper_count;
+    }
+
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
