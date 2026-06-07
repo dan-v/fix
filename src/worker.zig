@@ -154,12 +154,18 @@ pub const Worker = struct {
     }
 
     pub fn deinit(self: *Worker) void {
+        var max_fiber_stack: u64 = 0;
+        var max_vm_sp: u64 = 0;
         for (self.fibers.items) |f| {
+            const stack_used = f.inner.maxStackUsedBytes();
+            if (stack_used > max_fiber_stack) max_fiber_stack = @intCast(stack_used);
+            if (f.vm.sp_high_water > max_vm_sp) max_vm_sp = f.vm.sp_high_water;
             f.inner.deinit(self.allocator);
             f.vm.deinit();
             self.allocator.destroy(f);
         }
         self.fibers.deinit(self.allocator);
+        self.scheduler.reportFiberHighWater(max_fiber_stack, max_vm_sp);
         self.allocator.destroy(self);
     }
 

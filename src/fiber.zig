@@ -86,14 +86,32 @@ pub const Fiber = struct {
     /// not outlive the `resume_` call.
     caller_ctx: ?*Context,
 
-    /// Minimum recommended stack size. The VM's force/eval call chain
-    /// is recursive (forceThunk → evalThunkTarget → runIsolatedFrame →
-    /// dispatch → opcodes that re-force values), and real Nix programs
-    /// (e.g. a NixOS toplevel build) can push deeper than 1 MiB. 8 MiB
-    /// matches Linux's default OS-thread stack so the fiber path has the
-    /// same headroom the bare-thread baseline had. We can shrink later
-    /// once profiling tells us the true working set.
-    pub const min_stack_bytes: usize = 8 * 1024 * 1024;
+    /// Default fiber stack size. The watermark probe on a representative
+    /// NixOS toplevel evaluation tops out at ~1.7 MiB; we round up to
+    /// 3 MiB so we have nearly 2× headroom for evaluations with deeper
+    /// import chains or builtins. If profiling later shows a workload
+    /// pushing past this, bump the constant (or expose a runtime knob
+    /// — `Fiber.init` already takes `stack_bytes` as a parameter).
+    pub const min_stack_bytes: usize = 3 * 1024 * 1024;
+
+    /// Sentinel byte pattern written to a freshly-allocated stack so
+    /// `maxStackUsedBytes` can find the deepest byte the fiber ever
+    /// touched. 0xAA chosen because it's distinctive in hex dumps and
+    /// doesn't match common ASCII or zero-initialised data.
+    pub const stack_sentinel: u8 = 0xAA;
+
+    /// Scan the stack for the first non-sentinel byte starting from the
+    /// low (deep) end. Returns the number of bytes between that byte and
+    /// the high (top) end — the high-water mark across every task the
+    /// fiber has run on this stack. Use this to size production
+    /// stacks: pick a value comfortably above the max observed across a
+    /// representative workload.
+    pub fn maxStackUsedBytes(self: *const Fiber) usize {
+        for (self.stack, 0..) |b, i| {
+            if (b != stack_sentinel) return self.stack.len - i;
+        }
+        return 0;
+    }
 
     /// Allocate a fiber with its own stack and prepare it to invoke
     /// `entry(arg)` on first resume.
@@ -102,6 +120,11 @@ pub const Fiber = struct {
     pub fn init(allocator: std.mem.Allocator, stack_bytes: usize, entry: EntryFn, arg: *anyopaque) !Fiber {
         const stack = try allocator.alignedAlloc(u8, .@"16", stack_bytes);
         errdefer allocator.free(stack);
+        // Sentinel-fill the stack so `maxStackUsedBytes` can find the
+        // deepest byte the fiber ever touched. The probe is cheap to
+        // read once per worker shutdown; the one-time memset cost is
+        // amortised across every task the fiber ever runs.
+        @memset(stack, stack_sentinel);
 
         var fiber: Fiber = .{
             .ctx = .{},

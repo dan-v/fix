@@ -113,6 +113,12 @@ pub const VM = struct {
     stack: []Value,
     /// Stack pointer — index of the next push slot.
     sp: u32,
+    /// Max value of `sp` ever observed on this VM since construction.
+    /// Updated on every push/pushFrame so we can report stack
+    /// high-water for sizing future VM_STACK_CAP defaults. Not reset
+    /// when sp is reset between tasks (so the peak is across all tasks
+    /// this VM has executed).
+    sp_high_water: u32,
     /// Call frames. Fixed capacity = MAX_FRAMES; `frames_len` is the
     /// logical count.
     frames: []Frame,
@@ -161,6 +167,7 @@ pub const VM = struct {
             .claimer_id = thunk_mod.makeClaimer(worker_id, 0),
             .stack = value_stack,
             .sp = 0,
+            .sp_high_water = 0,
             .frames = frames,
             .frames_len = 0,
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},

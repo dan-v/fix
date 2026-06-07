@@ -91,6 +91,13 @@ pub const Scheduler = struct {
         pops: u64,
         steals: u64,
         parks: u64,
+        /// Deepest fiber native stack high-water seen across all workers
+        /// since startup. Use to size `Fiber.min_stack_bytes` against a
+        /// representative workload.
+        max_fiber_stack_used_bytes: u64,
+        /// Deepest VM value-stack sp seen across all workers, in Values.
+        /// Multiply by `@sizeOf(Value)` (= 16) for a byte count.
+        max_vm_sp: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -115,6 +122,8 @@ pub const Scheduler = struct {
     n_pops: std.atomic.Value(u64),
     n_steals: std.atomic.Value(u64),
     n_parks: std.atomic.Value(u64),
+    n_max_fiber_stack: std.atomic.Value(u64),
+    n_max_vm_sp: std.atomic.Value(u64),
 
     /// `total_worker_count` includes the main thread (worker 0). The
     /// scheduler manages `total_worker_count - 1` helpers.
@@ -160,6 +169,8 @@ pub const Scheduler = struct {
             .n_pops = .init(0),
             .n_steals = .init(0),
             .n_parks = .init(0),
+            .n_max_fiber_stack = .init(0),
+            .n_max_vm_sp = .init(0),
         };
     }
 
@@ -172,7 +183,25 @@ pub const Scheduler = struct {
             .pops = self.n_pops.load(.monotonic),
             .steals = self.n_steals.load(.monotonic),
             .parks = self.n_parks.load(.monotonic),
+            .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
+            .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
         };
+    }
+
+    /// Worker shutdown reports the deepest fiber stack and VM sp it
+    /// observed. We monotonically max into the scheduler counters so
+    /// `fix inspect` can show the high-water across the whole eval.
+    pub fn reportFiberHighWater(self: *Scheduler, max_fiber_stack: u64, max_vm_sp: u64) void {
+        atomicMax(&self.n_max_fiber_stack, max_fiber_stack);
+        atomicMax(&self.n_max_vm_sp, max_vm_sp);
+    }
+
+    fn atomicMax(slot: *std.atomic.Value(u64), value: u64) void {
+        while (true) {
+            const current = slot.load(.monotonic);
+            if (value <= current) return;
+            if (slot.cmpxchgWeak(current, value, .monotonic, .monotonic) == null) return;
+        }
     }
 
     pub fn deinit(self: *Scheduler) void {

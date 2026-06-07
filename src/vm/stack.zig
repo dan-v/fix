@@ -24,6 +24,7 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
     const new_sp = start + reserved;
     @memset(self.stack[start..new_sp], Value.null_val);
     self.sp = new_sp;
+    if (new_sp > self.sp_high_water) self.sp_high_water = new_sp;
 
     self.frames[self.frames_len] = .{
         .chunk_ptr = ch,
@@ -52,6 +53,7 @@ pub fn push(self: *VM, val: Value) !void {
     if (@as(usize, self.sp) >= types.VM_STACK_CAP) return error.StackOverflow;
     self.stack[self.sp] = val;
     self.sp += 1;
+    if (self.sp > self.sp_high_water) self.sp_high_water = self.sp;
 }
 
 pub fn pop(self: *VM) Value {
