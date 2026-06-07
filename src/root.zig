@@ -19,6 +19,7 @@ pub const intern = @import("runtime/intern.zig");
 pub const thunk = @import("runtime/thunk.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const fiber = @import("fiber.zig");
+pub const worker = @import("worker.zig");
 pub const file_cache = @import("file_cache.zig");
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
@@ -32,4 +33,6 @@ pub const Value = value.Value;
 test {
     _ = @import("root/tests.zig");
     _ = stable_segments;
+    _ = fiber;
+    _ = worker;
 }

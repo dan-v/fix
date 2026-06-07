@@ -346,6 +346,13 @@ pub const Scheduler = struct {
         return self.shutdown_flag.load(.acquire);
     }
 
+    /// Wake the given helper's wake_word and futex_wake it. Public so
+    /// remote thunk-resolvers (in worker.zig's wake_fn) can nudge a
+    /// helper whose suspended fiber just became resumable.
+    pub fn wakeHelperPublic(self: *Scheduler, helper_idx: u8) void {
+        self.wakeHelper(helper_idx);
+    }
+
     fn wakeHelper(self: *Scheduler, helper_idx: u8) void {
         const word = &self.wake_words[helper_idx];
         word.store(1, .release);

@@ -278,9 +278,12 @@ test "two fibers multiplex on one thread" {
     defer fa.deinit(testing.allocator);
     defer fb.deinit(testing.allocator);
 
-    // Drive each fiber 3 times in interleaved order.
+    // Drive each fiber to completion. The entry body appends then
+    // yields, so we need 4 resumes per fiber: three to append+yield
+    // (states 'A', 'A', 'A' plus a trailing yield), and a fourth to
+    // resume past the yield, fall out of the loop, and let entry return.
     var step: u32 = 0;
-    while (step < 3) : (step += 1) {
+    while (step < 4) : (step += 1) {
         fa.resume_();
         fb.resume_();
     }
