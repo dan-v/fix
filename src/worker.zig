@@ -94,7 +94,16 @@ pub const Worker = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
+        /// Index into the scheduler's per-worker bookkeeping (queues +
+        /// wake_words). Helpers pass their helper_idx (0..N-1); the main
+        /// thread passes `scheduler.helper_count` to land on the reserved
+        /// main wake slot.
         helper_idx: u8,
+        /// Stable identity used in thunk claims. Main passes 0; helpers
+        /// pass `helper_idx + 1`. Decoupled from `helper_idx` so the
+        /// main thread can be at the trailing wake slot but still claim
+        /// thunks as worker 0.
+        worker_id: u8,
         init_vm_ctx: *anyopaque,
         init_vm_fn: InitVmFn,
     ) !*Worker {
@@ -111,7 +120,7 @@ pub const Worker = struct {
             .allocator = allocator,
             .scheduler = scheduler,
             .helper_idx = helper_idx,
-            .worker_id = helper_idx + 1,
+            .worker_id = worker_id,
             .slots = slots,
             .shutdown_requested = .init(0),
         };
@@ -170,6 +179,95 @@ pub const Worker = struct {
     /// scheduler. Sets the wake_word and futex_wakes the worker.
     pub fn nudge(self: *Worker) void {
         self.scheduler.wakeHelperPublic(self.helper_idx);
+    }
+
+    /// Run a caller-supplied fiber entry to completion on this worker.
+    ///
+    /// Used by the main thread: the top-level evaluation runs as a fiber
+    /// on a dedicated slot (outside the pool), so when it hits a `.busy`
+    /// thunk it can yield, and the main worker can drive its slot pool
+    /// (steal helper tasks, resume suspended slots) while the top-level
+    /// fiber is parked. When the blocked thunk resolves, the top-level
+    /// fiber becomes resumable and finishes its evaluation.
+    ///
+    /// The dedicated slot uses `slots_per_worker` as its `slot_idx`, so
+    /// its claimer id is distinct from any pool slot's. Its `vm` field
+    /// is unused — the caller's entry constructs its own VM and is
+    /// responsible for setting `vm.claimer_id` accordingly.
+    pub fn runTopLevel(
+        self: *Worker,
+        entry: fiber_mod.EntryFn,
+        arg: *anyopaque,
+    ) !void {
+        var top_slot: FiberSlot = .{
+            .worker = self,
+            .slot_idx = slots_per_worker,
+            .fiber = try Fiber.init(self.allocator, Fiber.min_stack_bytes, entry, arg),
+            .vm = undefined,
+            .state = .running,
+            .current_task = null,
+            .resumable = .init(0),
+            .waiter = .{ .wake_fn = FiberSlot.wakeImpl },
+        };
+        defer top_slot.fiber.deinit(self.allocator);
+
+        while (top_slot.fiber.state != .finished) {
+            // 1. Top-level: first resume from .ready, or resume from
+            // .suspended when its blocker fires.
+            if (top_slot.fiber.state == .ready) {
+                top_slot.fiber.resume_();
+                continue;
+            }
+            if (top_slot.fiber.state == .suspended and top_slot.resumable.swap(0, .acq_rel) != 0) {
+                top_slot.state = .running;
+                top_slot.fiber.resume_();
+                continue;
+            }
+
+            // 2. Drive the pool: resumable slots first, then idle+task.
+            if (self.pickResumableSlot()) |slot| {
+                self.resumeSlot(slot);
+                continue;
+            }
+            if (self.pickIdleSlot()) |slot| {
+                if (self.pickTask()) |task| {
+                    slot.current_task = task;
+                    self.resumeSlot(slot);
+                    continue;
+                }
+            }
+
+            // 3. Nothing actionable yet. Park until a wake arrives.
+            self.scheduler.parkHelper(self.helper_idx);
+        }
+
+        // Top-level fiber finished. Drain any pool slots still suspended
+        // on busy thunks before returning — otherwise their `&waiter`
+        // pointers would dangle on whatever thunk's list they're enrolled
+        // on, and `worker.deinit` would free the slot out from under a
+        // resolver that fires later. We keep helping the pool until every
+        // slot is `.idle` (or `.ready`, meaning it never ran).
+        while (self.anySlotSuspended()) {
+            if (self.pickResumableSlot()) |slot| {
+                self.resumeSlot(slot);
+                continue;
+            }
+            if (self.pickIdleSlot()) |slot| {
+                if (self.pickTask()) |task| {
+                    slot.current_task = task;
+                    self.resumeSlot(slot);
+                    continue;
+                }
+            }
+            self.scheduler.parkHelper(self.helper_idx);
+        }
+    }
+
+    fn anySlotSuspended(self: *Worker) bool {
+        for (self.slots) |*s| {
+            if (s.state == .suspended) return true;
+        }
+        return false;
     }
 
     /// Main loop. Drives the slot pool until shutdown.
@@ -322,7 +420,7 @@ test "Worker basic init/deinit" {
         ctx.arena.deinit();
     }
 
-    const worker = try Worker.init(testing.allocator, &sched, 0, &ctx, TestCtx.initVm);
+    const worker = try Worker.init(testing.allocator, &sched, 0, 1, &ctx, TestCtx.initVm);
     defer worker.deinit();
 
     try testing.expectEqual(@as(u8, 1), worker.worker_id);

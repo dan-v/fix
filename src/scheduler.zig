@@ -133,7 +133,13 @@ pub const Scheduler = struct {
         const threads = try allocator.alloc(std.Thread, helper_count);
         errdefer allocator.free(threads);
 
-        const wake_words = try allocator.alloc(std.atomic.Value(u32), helper_count);
+        // wake_words has helper_count + 1 entries: indices 0..helper_count-1
+        // are owned by helper threads (same as before), index helper_count is
+        // reserved for the main thread's Worker. This keeps the wake/park
+        // mechanism uniform for everyone — helpers and main both park on a
+        // wake_word, and slot wake_fn signals can route to either by
+        // worker_idx (== helper_idx for helpers, == helper_count for main).
+        const wake_words = try allocator.alloc(std.atomic.Value(u32), helper_count + 1);
         errdefer allocator.free(wake_words);
         for (wake_words) |*w| w.* = .init(0);
 
@@ -271,8 +277,11 @@ pub const Scheduler = struct {
         return false;
     }
 
-    /// Helper-side: pop from own queue.
+    /// Helper-side: pop from own queue. Main worker (helper_idx ==
+    /// helper_count) doesn't own a queue — it pops nothing and steals
+    /// instead.
     pub fn pop(self: *Scheduler, helper_idx: u8) ?Task {
+        if (helper_idx >= self.helper_count) return null;
         const task = self.queues[helper_idx].pop() orelse return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
         _ = self.n_pops.fetchAdd(1, .monotonic);

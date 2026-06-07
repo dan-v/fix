@@ -433,13 +433,46 @@ pub const Evaluator = struct {
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registry.register(chunk);
 
-        // 3. Evaluate via a VM.
+        // 3. Evaluate via a VM. Only the *top-level* eval (called from
+        // `Evaluator.evaluate`) goes through a main-thread fiber so the
+        // main thread can yield on a `.busy` thunk; nested invocations
+        // (imports, scoped imports) run synchronously on the existing
+        // fiber's stack — they share the outer VM's claim identity via
+        // the default `MAIN_THREAD_SLOT` claimer that `initVm` hands out.
+        if (scope == null and source_path == null) {
+            self.progressBegin(.evaluate, subject);
+            defer self.progressEnd(.evaluate, subject);
+            return self.runChunkOnMainWorker(chunk_id);
+        }
         var vm = try self.initVm(0);
         defer vm.deinit();
-
         self.progressBegin(.evaluate, subject);
         defer self.progressEnd(.evaluate, subject);
         return vm.eval(chunk_id);
+    }
+
+    fn runChunkOnMainWorker(self: *Evaluator, chunk_id: ChunkId) !Value {
+        const worker = try worker_mod.Worker.init(
+            self.allocator,
+            &self.scheduler,
+            self.scheduler.helper_count,
+            0,
+            self,
+            initVmForWorkerSlot,
+        );
+        defer worker.deinit();
+
+        var result: Value = Value.null_val;
+        var err_out: ?anyerror = null;
+        var ctx: TopLevelEvalCtx = .{
+            .ev = self,
+            .chunk_id = chunk_id,
+            .result_out = &result,
+            .err_out = &err_out,
+        };
+        try worker.runTopLevel(topLevelEvalEntry, @ptrCast(&ctx));
+        if (err_out) |e| return e;
+        return result;
     }
 
     fn initVm(self: *Evaluator, worker_id: u8) !VM {
@@ -782,6 +815,7 @@ fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
         ev.allocator,
         sched,
         helper_idx,
+        helper_idx + 1,
         ev,
         initVmForWorkerSlot,
     ) catch return;
@@ -792,6 +826,30 @@ fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
 fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u8) anyerror!VM {
     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
     return ev.initVm(worker_id);
+}
+
+const TopLevelEvalCtx = struct {
+    ev: *Evaluator,
+    chunk_id: ChunkId,
+    result_out: *Value,
+    err_out: *?anyerror,
+};
+
+/// Fiber entry for the main thread's top-level evaluation. Runs on the
+/// main worker's dedicated top-level slot — `.busy` thunks yield via
+/// the standard force.zig path, which is exactly the win this whole
+/// refactor was about.
+fn topLevelEvalEntry(arg: *anyopaque) void {
+    const ctx: *TopLevelEvalCtx = @ptrCast(@alignCast(arg));
+    var vm = ctx.ev.initVm(0) catch |e| {
+        ctx.err_out.* = e;
+        return;
+    };
+    defer vm.deinit();
+    ctx.result_out.* = vm.eval(ctx.chunk_id) catch |e| {
+        ctx.err_out.* = e;
+        return;
+    };
 }
 
 const OpcodeCountEntry = struct {
