@@ -379,6 +379,16 @@ fn slotEntry(arg: *anyopaque) void {
     f.current_task = null;
     switch (task) {
         .force_thunk => |thunk_id| {
+            // Speculative work must NOT touch the user-facing error
+            // trace. A speculative `throw` (legitimate in a Nix
+            // expression's branch that wouldn't have been selected by
+            // demand-driven eval) otherwise pollutes the shared trace
+            // and surfaces as the user-visible error message, masking
+            // the actual root cause. Null the VM's trace for the
+            // duration of the speculation and restore on exit.
+            const saved_trace = f.vm.trace;
+            f.vm.trace = null;
+            defer f.vm.trace = saved_trace;
             const v = Value.thunk(thunk_id);
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
         },
