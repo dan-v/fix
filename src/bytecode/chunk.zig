@@ -187,4 +187,57 @@ pub const ChunkRegistry = struct {
         if (id >= self.chunks.count()) return null;
         return self.chunks.get(id).*;
     }
+
+    pub fn count(self: *const ChunkRegistry) u32 {
+        return self.chunks.count();
+    }
+
+    pub const Stats = struct {
+        chunks: u32,
+        code_bytes: u64,
+        const_count: u64,
+        source_map_entries: u64,
+        size_buckets: [6]u32, // <16, <64, <256, <1024, <4096, >=4096
+        max_code_bytes: u32,
+
+        pub fn bucketLabel(index: usize) []const u8 {
+            return switch (index) {
+                0 => "<16",
+                1 => "16-63",
+                2 => "64-255",
+                3 => "256-1023",
+                4 => "1024-4095",
+                5 => ">=4096",
+                else => "?",
+            };
+        }
+    };
+
+    pub fn stats(self: *const ChunkRegistry) Stats {
+        var result: Stats = .{
+            .chunks = self.chunks.count(),
+            .code_bytes = 0,
+            .const_count = 0,
+            .source_map_entries = 0,
+            .size_buckets = [_]u32{0} ** 6,
+            .max_code_bytes = 0,
+        };
+        var id: u32 = 0;
+        while (id < result.chunks) : (id += 1) {
+            const ch = self.chunks.get(id).*;
+            const len: u32 = @intCast(ch.code.len);
+            result.code_bytes += len;
+            result.const_count += ch.constants.len;
+            result.source_map_entries += ch.source_map.len;
+            if (len > result.max_code_bytes) result.max_code_bytes = len;
+            const bucket: usize = if (len < 16) 0
+                else if (len < 64) 1
+                else if (len < 256) 2
+                else if (len < 1024) 3
+                else if (len < 4096) 4
+                else 5;
+            result.size_buckets[bucket] += 1;
+        }
+        return result;
+    }
 };

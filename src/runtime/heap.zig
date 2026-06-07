@@ -175,6 +175,92 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
+    pub const Stats = struct {
+        objects: u32,
+        values: u32,
+        attrs: u32,
+        attr_positions: u32,
+        variant_counts: [6]u32,
+        thunk_states: [4]u32,
+
+        pub fn variantName(index: usize) []const u8 {
+            return switch (index) {
+                0 => "list",
+                1 => "attrs",
+                2 => "closure",
+                3 => "builtin_closure",
+                4 => "thunk",
+                5 => "context_string",
+                else => "?",
+            };
+        }
+
+        pub fn thunkStateName(index: usize) []const u8 {
+            return switch (index) {
+                0 => "unresolved",
+                1 => "evaluating",
+                2 => "resolved",
+                3 => "blackhole",
+                else => "?",
+            };
+        }
+    };
+
+    /// Aggregate runtime stats. Safe only when there are no concurrent
+    /// writers — the inspector calls this once evaluation has finished.
+    pub fn stats(self: *const ObjectHeap) Stats {
+        var result: Stats = .{
+            .objects = self.objects.count(),
+            .values = self.values.count(),
+            .attrs = self.attrs.count(),
+            .attr_positions = self.attr_positions.count(),
+            .variant_counts = [_]u32{0} ** 6,
+            .thunk_states = [_]u32{0} ** 4,
+        };
+
+        // Per-worker TLABs reserve OBJECT_CHUNK_SIZE slots from the global
+        // store but fill them one at a time. Slots between `cursor` and
+        // `end` are reserved but unfilled — their payload union is
+        // undefined memory. Skip those IDs when walking.
+        var unfilled_starts: [256]u32 = undefined;
+        var unfilled_ends: [256]u32 = undefined;
+        var unfilled_count: usize = 0;
+        for (self.worker_locals) |local| {
+            if (local.object.cursor >= local.object.end) continue;
+            if (unfilled_count >= unfilled_starts.len) break;
+            unfilled_starts[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.cursor);
+            unfilled_ends[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.end);
+            unfilled_count += 1;
+        }
+
+        var id: u32 = 0;
+        const total = result.objects;
+        scan: while (id < total) : (id += 1) {
+            for (unfilled_starts[0..unfilled_count], unfilled_ends[0..unfilled_count]) |s, e| {
+                if (id >= s and id < e) {
+                    id = e - 1; // skip ahead; loop's id += 1 lands at e
+                    continue :scan;
+                }
+            }
+            const obj = self.objects.get(id);
+            const v_index: usize = switch (obj.payload) {
+                .list => 0,
+                .attrs => 1,
+                .closure => 2,
+                .builtin_closure => 3,
+                .thunk => |t| blk: {
+                    const state = t.state.load(.acquire);
+                    const s_index: usize = @intCast(@min(state, 3));
+                    result.thunk_states[s_index] += 1;
+                    break :blk 4;
+                },
+                .context_string => 5,
+            };
+            result.variant_counts[v_index] += 1;
+        }
+        return result;
+    }
+
     inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
         return &self.worker_locals[worker_id_mod.current];
     }

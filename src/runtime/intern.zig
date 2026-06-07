@@ -137,6 +137,39 @@ pub const InternTable = struct {
         return self.data.slice(.{ .segment = entry.segment, .offset = entry.offset, .len = entry.len });
     }
 
+    pub const Stats = struct {
+        entries: u32,
+        data_bytes: u32,
+        shard_counts: [SHARD_COUNT]u32,
+
+        pub fn shardImbalance(self: Stats) f64 {
+            if (self.entries == 0) return 0;
+            const ideal = @as(f64, @floatFromInt(self.entries)) / @as(f64, @floatFromInt(SHARD_COUNT));
+            var max: u32 = 0;
+            for (self.shard_counts) |c| max = @max(max, c);
+            return @as(f64, @floatFromInt(max)) / @max(ideal, 1.0);
+        }
+    };
+
+    pub fn stats(self: *const InternTable) Stats {
+        var result: Stats = .{
+            .entries = self.entries.count(),
+            .data_bytes = self.data.count(),
+            .shard_counts = [_]u32{0} ** SHARD_COUNT,
+        };
+        for (&self.shards, 0..) |*shard, i| {
+            // Reading the shard's count is racy under concurrent intern,
+            // but inspect runs after evaluation finishes when there are no
+            // active writers.
+            result.shard_counts[i] = @intCast(shard.lookup.count());
+        }
+        return result;
+    }
+
+    pub fn shardCount() u32 {
+        return SHARD_COUNT;
+    }
+
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {
         return a == b;
     }

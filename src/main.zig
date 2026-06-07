@@ -8,6 +8,7 @@ const derivation_debug = @import("derivation/debug.zig");
 const diagnostic = @import("diagnostic.zig");
 const repl_line = @import("cli/repl.zig");
 const disasm_cmd = @import("cli/disasm.zig");
+const inspect_cmd = @import("cli/inspect.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 const Value = @import("runtime/value.zig").Value;
@@ -93,6 +94,13 @@ pub fn main(init: std.process.Init) !void {
     if (first_arg) |first| {
         if (std.mem.eql(u8, first, "disasm")) {
             const code = disasm_cmd.run(init, &args_iter) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.process.exit(code);
+        }
+        if (std.mem.eql(u8, first, "inspect")) {
+            const code = inspect_cmd.run(init, &args_iter) catch |err| {
                 std.debug.print("error: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };

@@ -340,6 +340,18 @@ pub const Evaluator = struct {
         return &self.registry;
     }
 
+    pub fn heapStats(self: *const Evaluator) ObjectHeap.Stats {
+        return self.heap.stats();
+    }
+
+    pub fn internStats(self: *const Evaluator) InternTable.Stats {
+        return self.intern.stats();
+    }
+
+    pub fn chunkStats(self: *const Evaluator) ChunkRegistry.Stats {
+        return self.registry.stats();
+    }
+
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
