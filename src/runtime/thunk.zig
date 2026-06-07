@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
+const stable = @import("stable_segments.zig");
 
 /// `state` is a u32 so we can `futex_wait` / `futex_wake` directly on it.
 /// The low byte encodes the lifecycle (ThunkState); the rest is zero.
@@ -47,6 +48,20 @@ pub const MAIN_THREAD_SLOT: u8 = 0xFF;
 pub fn makeClaimer(worker_id: u8, slot: u8) ClaimerId {
     return (@as(ClaimerId, worker_id) << 8) | @as(ClaimerId, slot);
 }
+
+/// Lightweight linked-list node used to enroll fibers on a thunk's
+/// waiter list. The thunk owns the list; the embedding struct (a
+/// FiberSlot in worker.zig) supplies `wake_fn`, which is invoked when
+/// the thunk resolves/resets/blackholes. `wake_fn` typically marks
+/// the parent slot resumable and nudges its owning worker.
+///
+/// Embedders use `@fieldParentPtr("waiter", w)` inside `wake_fn` to
+/// recover the parent. The Thunk module is intentionally agnostic
+/// about what the parent is — it just walks pointers.
+pub const Waiter = struct {
+    next: ?*Waiter = null,
+    wake_fn: *const fn (*Waiter) void,
+};
 
 pub const BytecodeThunk = struct {
     chunk_id: ChunkId,
@@ -101,6 +116,11 @@ pub const Thunk = struct {
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
     result: Value,
+    /// Singly-linked list of fibers parked on this thunk. Manipulated
+    /// only under `waiters_mu`. Empty in the common (uncontended) case
+    /// where the claimer resolves before any other fiber tries to force.
+    waiters_head: ?*Waiter,
+    waiters_mu: stable.SpinMutex,
 
     pub fn init(closure: Value) Thunk {
         return .{
@@ -108,6 +128,8 @@ pub const Thunk = struct {
             .claimer = .init(INVALID_CLAIMER),
             .parked = .init(0),
             .demanded = .init(0),
+            .waiters_head = null,
+            .waiters_mu = .{},
             .target = .{ .closure = closure },
             .result = Value.null_val,
         };
@@ -119,6 +141,8 @@ pub const Thunk = struct {
             .claimer = .init(INVALID_CLAIMER),
             .parked = .init(0),
             .demanded = .init(0),
+            .waiters_head = null,
+            .waiters_mu = .{},
             .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
             .result = Value.null_val,
         };
@@ -133,6 +157,8 @@ pub const Thunk = struct {
             .claimer = .init(INVALID_CLAIMER),
             .parked = .init(0),
             .demanded = .init(0),
+            .waiters_head = null,
+            .waiters_mu = .{},
             .target = .{ .pass_through = value },
             .result = Value.null_val,
         };
@@ -235,12 +261,32 @@ pub const Thunk = struct {
         };
     }
 
+    /// Enroll a fiber waiter on this thunk. Returns true if the waiter
+    /// was added to the list (caller should yield and wait for `wake_fn`).
+    /// Returns false if the thunk left `.evaluating` between the caller's
+    /// `tryForce` and now — caller should re-loop `tryForce` instead.
+    ///
+    /// Ordering: we re-check `state` under the lock so that any caller
+    /// that observes `.evaluating` and enrolls is guaranteed to be drained
+    /// by the resolver, which takes the same lock after publishing the
+    /// new state.
+    pub fn enrollWaiter(self: *Thunk, waiter: *Waiter) bool {
+        self.waiters_mu.lock();
+        defer self.waiters_mu.unlock();
+        const s: ThunkState = @enumFromInt(self.state.load(.acquire));
+        if (s != .evaluating) return false;
+        waiter.next = self.waiters_head;
+        self.waiters_head = waiter;
+        return true;
+    }
+
     /// Publish `value` as the result and wake all parked waiters.
     pub fn resolve(self: *Thunk, value: Value) void {
         self.result = value;
         self.claimer.store(INVALID_CLAIMER, .release);
         self.state.store(@intFromEnum(ThunkState.resolved), .release);
         self.wakeAll();
+        self.wakeFiberWaiters();
     }
 
     /// Mark a failed evaluation as retryable. Wakes waiters so they can
@@ -250,6 +296,7 @@ pub const Thunk = struct {
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.unresolved), .release);
         self.wakeAll();
+        self.wakeFiberWaiters();
     }
 
     /// Mark this thunk as a blackhole. Wakes waiters so they observe the
@@ -258,6 +305,23 @@ pub const Thunk = struct {
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.blackhole), .release);
         self.wakeAll();
+        self.wakeFiberWaiters();
+    }
+
+    /// Drain the waiter list under the lock, then call each waiter's
+    /// `wake_fn` outside the lock so a slow wake doesn't block other
+    /// resolvers waiting to drain their own (different) thunks' lists.
+    fn wakeFiberWaiters(self: *Thunk) void {
+        self.waiters_mu.lock();
+        var head = self.waiters_head;
+        self.waiters_head = null;
+        self.waiters_mu.unlock();
+        while (head) |w| {
+            const next = w.next;
+            w.next = null;
+            w.wake_fn(w);
+            head = next;
+        }
     }
 
     fn wakeAll(self: *Thunk) void {
@@ -344,6 +408,63 @@ test "thunk: same claimer recursive force returns blackhole" {
         .blackhole => {},
         else => return error.ExpectedBlackhole,
     }
+}
+
+test "thunk: enrollWaiter adds to list and resolve drains it" {
+    var thunk = Thunk.init(Value.null_val);
+
+    const me = makeClaimer(0, 0);
+    const other = makeClaimer(0, 1);
+
+    // Claim as slot 0.
+    switch (thunk.tryForce(me)) {
+        .claimed => {},
+        else => return error.UnexpectedOutcome,
+    }
+    // Slot 1 hits .busy and enrolls.
+    switch (thunk.tryForce(other)) {
+        .busy => {},
+        else => return error.UnexpectedOutcome,
+    }
+
+    var woken: std.atomic.Value(u32) = .init(0);
+    const W = struct {
+        waiter: Waiter,
+        woken: *std.atomic.Value(u32),
+        fn wake(w: *Waiter) void {
+            const self: *@This() = @fieldParentPtr("waiter", w);
+            _ = self.woken.fetchAdd(1, .acq_rel);
+        }
+    };
+    var ws: [3]W = .{
+        .{ .waiter = .{ .wake_fn = W.wake }, .woken = &woken },
+        .{ .waiter = .{ .wake_fn = W.wake }, .woken = &woken },
+        .{ .waiter = .{ .wake_fn = W.wake }, .woken = &woken },
+    };
+    try std.testing.expect(thunk.enrollWaiter(&ws[0].waiter));
+    try std.testing.expect(thunk.enrollWaiter(&ws[1].waiter));
+    try std.testing.expect(thunk.enrollWaiter(&ws[2].waiter));
+
+    thunk.resolve(Value.int(42));
+    try std.testing.expectEqual(@as(u32, 3), woken.load(.acquire));
+}
+
+test "thunk: enrollWaiter refuses to enroll on already-resolved thunk" {
+    var thunk = Thunk.init(Value.null_val);
+    const me = makeClaimer(0, 0);
+
+    switch (thunk.tryForce(me)) {
+        .claimed => {},
+        else => return error.UnexpectedOutcome,
+    }
+    thunk.resolve(Value.int(7));
+
+    const W = struct {
+        waiter: Waiter,
+        fn wake(_: *Waiter) void {}
+    };
+    var w: W = .{ .waiter = .{ .wake_fn = W.wake } };
+    try std.testing.expect(!thunk.enrollWaiter(&w.waiter));
 }
 
 test "thunk: same worker different fibers see .busy, not blackhole" {
