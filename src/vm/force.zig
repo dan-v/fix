@@ -122,11 +122,13 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 trace_log.forceEnter(self.vm_trace, self.worker_id, thunk_id);
                 // We own this thunk now; compute and publish (or fail and reset).
                 const result = evalThunkTarget(self, thunk.target) catch |err| {
+                    if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
                     thunk.reset();
                     trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, false);
                     return err;
                 };
                 thunk.resolve(result);
+                if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.worker_id, claimerFiberId(self), result);
                 trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, true);
                 if (demand) thunk.markDemanded();
                 return result;
@@ -184,6 +186,19 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
+    if (self.thunk_trace) |tt| {
+        const target_kind: @import("../eval/thunk_trace.zig").TargetKind = switch (closure.discriminant) {
+            .closure => .closure,
+            .builtin_closure => .builtin_closure,
+            else => .closure,
+        };
+        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.discriminant == .closure) blk: {
+            const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
+            break :blk c.chunk_id;
+        } else null;
+        const creator = creatorFrame(self);
+        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
+    }
     if (shouldSpeculateClosure(self, closure)) {
         _ = self.scheduler.submit(.{ .force_thunk = id });
     }
@@ -207,5 +222,24 @@ pub fn makeCell(self: *VM, val: Value) !Value {
     // "Cell" is just a pass-through thunk: the underlying value gets forced
     // and the result memoized in the thunk's resolved slot.
     const id = try self.heap.addThunk(Thunk.initPassThrough(val));
+    if (self.thunk_trace) |tt| {
+        const creator = creatorFrame(self);
+        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
+    }
     return Value.thunk(id);
+}
+
+const CreatorFrame = struct { chunk_id: @import("../runtime/types.zig").ChunkId, ip: u32 };
+
+fn creatorFrame(self: *VM) CreatorFrame {
+    if (self.frames_len == 0) return .{ .chunk_id = 0, .ip = 0 };
+    const f = self.frames[self.frames_len - 1];
+    return .{ .chunk_id = f.chunk_id, .ip = @intCast(f.ip) };
+}
+
+fn claimerFiberId(self: *VM) u32 {
+    // claimer_id = (worker_id << 24) | fiber_id_24bits — strip the worker
+    // byte to get the local fiber id, which is the more useful field at
+    // log-read time.
+    return self.claimer_id & 0x00FFFFFF;
 }

@@ -122,6 +122,7 @@ pub const Evaluator = struct {
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
     vm_trace: ?*@import("vm/trace_log.zig").VmTrace,
+    thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
     worker_count: u8,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
@@ -165,6 +166,7 @@ pub const Evaluator = struct {
             .env_map = null,
             .progress = null,
             .vm_trace = null,
+            .thunk_trace = null,
             .worker_count = worker_count,
             .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
@@ -230,6 +232,10 @@ pub const Evaluator = struct {
 
     pub fn setVmTrace(self: *Evaluator, vm_trace: ?*@import("vm/trace_log.zig").VmTrace) void {
         self.vm_trace = vm_trace;
+    }
+
+    pub fn setThunkTrace(self: *Evaluator, thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace) void {
+        self.thunk_trace = thunk_trace;
     }
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
@@ -485,6 +491,11 @@ pub const Evaluator = struct {
             if (worker_id == 0) &self.run.trace else null,
             if (worker_id == 0) self.progress else null,
             if (worker_id == 0) self.vm_trace else null,
+            // The thunk trace IS shared across workers — diagnosing
+            // concurrency-shaped wrong-result bugs needs to see every
+            // helper's resolves, not just main's. The trace handles
+            // its own locking.
+            self.thunk_trace,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,

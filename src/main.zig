@@ -11,6 +11,7 @@ const disasm_cmd = @import("cli/disasm.zig");
 const inspect_cmd = @import("cli/inspect.zig");
 const trace_cmd = @import("cli/trace.zig");
 const vm_trace_mod = @import("vm/trace_log.zig");
+const thunk_trace_mod = @import("eval/thunk_trace.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 const Value = @import("runtime/value.zig").Value;
@@ -69,6 +70,7 @@ const Options = struct {
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
     vm_trace_max_events: u64 = 0,
+    thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
@@ -173,12 +175,68 @@ pub fn main(init: std.process.Init) !void {
     defer trace_setup.deinit(allocator);
     if (trace_setup.trace) |t| ev.setVmTrace(t);
 
+    var thunks_setup = try setupThunkTrace(allocator, init.io, &ev, options);
+    defer thunks_setup.deinit(allocator);
+    if (thunks_setup.trace) |t| ev.setThunkTrace(t);
+
     const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
     trace_setup.finish();
+    thunks_setup.finish();
     if (!ok) {
         std.process.exit(1);
     }
+}
+
+const ThunkTraceSetup = struct {
+    trace: ?*thunk_trace_mod.ThunkTrace = null,
+    file: ?std.Io.File = null,
+    io: ?std.Io = null,
+    writer: ?*std.Io.File.Writer = null,
+    buffer: []u8 = &.{},
+
+    pub fn deinit(self: *ThunkTraceSetup, allocator: std.mem.Allocator) void {
+        if (self.writer) |w| allocator.destroy(w);
+        if (self.trace) |t| allocator.destroy(t);
+        if (self.buffer.len > 0) allocator.free(self.buffer);
+        if (self.file) |f| if (self.io) |io| f.close(io);
+    }
+
+    pub fn finish(self: *ThunkTraceSetup) void {
+        if (self.trace) |t| t.flush() catch {};
+    }
+};
+
+fn setupThunkTrace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ev: *Evaluator,
+    options: Options,
+) !ThunkTraceSetup {
+    var setup: ThunkTraceSetup = .{};
+    const path = options.thunks_log_path orelse return setup;
+
+    setup.buffer = try allocator.alloc(u8, 64 * 1024);
+    errdefer allocator.free(setup.buffer);
+
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    setup.file = file;
+    setup.io = io;
+    const writer_ptr = try allocator.create(std.Io.File.Writer);
+    errdefer allocator.destroy(writer_ptr);
+    writer_ptr.* = file.writerStreaming(io, setup.buffer);
+    setup.writer = writer_ptr;
+
+    const trace_ptr = try allocator.create(thunk_trace_mod.ThunkTrace);
+    errdefer allocator.destroy(trace_ptr);
+    trace_ptr.* = thunk_trace_mod.ThunkTrace.init(
+        &writer_ptr.interface,
+        ev.internTable(),
+        &ev.heap,
+        &ev.registry,
+    );
+    setup.trace = trace_ptr;
+    return setup;
 }
 
 const VmTraceSetup = struct {
@@ -377,6 +435,8 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
             options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
+        } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
+            options.thunks_log_path = arg["--thunks-log=".len..];
         } else {
             return error.UnknownOption;
         }

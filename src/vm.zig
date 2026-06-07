@@ -98,6 +98,10 @@ pub const VM = struct {
     progress: ?eval_progress.Sink,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
+    /// Optional per-thunk lifecycle event log (see eval/thunk_trace.zig).
+    /// Recording is disabled when null. All workers share a single
+    /// trace; writes serialize on its internal mutex.
+    thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -138,6 +142,7 @@ pub const VM = struct {
         trace_sink: ?*eval_trace.Trace,
         progress: ?eval_progress.Sink,
         vm_trace: ?*VmTrace,
+        thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
         import_host: ?ImportHost,
         builtins_value: Value,
         worker_id: u8,
@@ -161,6 +166,7 @@ pub const VM = struct {
             .trace = trace_sink,
             .progress = progress,
             .vm_trace = vm_trace,
+            .thunk_trace = thunk_trace,
             .import_host = import_host,
             .builtins = builtins_value,
             .worker_id = worker_id,

@@ -94,6 +94,10 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
     committed = true;
+    if (self.thunk_trace) |tt| {
+        const fiber_id = self.claimer_id & 0x00FFFFFF;
+        tt.recordCreate(id, self.worker_id, fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
+    }
     if (shouldSpeculate(self, chunk_id)) {
         _ = self.scheduler.submit(.{ .force_thunk = id });
     }

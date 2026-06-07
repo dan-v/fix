@@ -419,6 +419,7 @@ test "Worker basic init/deinit" {
                 null,
                 null,
                 null,
+                null,
                 Value.null_val,
                 worker_id,
                 if (comptime vm_mod.opcode_profile_enabled) &self.opcode_counts else {},
