@@ -30,6 +30,7 @@ const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
 const eval_trace = @import("eval/trace.zig");
 const eval_progress = @import("eval/progress.zig");
+const VmTrace = @import("vm/trace_log.zig").VmTrace;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
@@ -53,6 +54,8 @@ const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
 pub const Frame = struct {
     /// The chunk being executed.
     chunk_ptr: *const Chunk,
+    /// Id of the chunk being executed.
+    chunk_id: ChunkId,
     /// Instruction pointer (byte offset into chunk.code).
     ip: usize,
     /// Base index into the VM stack for local variables.
@@ -92,6 +95,8 @@ pub const VM = struct {
     trace: ?*eval_trace.Trace,
     /// Evaluator-owned progress sink.
     progress: ?eval_progress.Sink,
+    /// Optional VM execution tracer.
+    vm_trace: ?*VmTrace,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -121,6 +126,7 @@ pub const VM = struct {
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace,
         progress: ?eval_progress.Sink,
+        vm_trace: ?*VmTrace,
         import_host: ?ImportHost,
         builtins_value: Value,
         worker_id: u8,
@@ -143,6 +149,7 @@ pub const VM = struct {
             .scheduler = scheduler,
             .trace = trace_sink,
             .progress = progress,
+            .vm_trace = vm_trace,
             .import_host = import_host,
             .builtins = builtins_value,
             .worker_id = worker_id,
@@ -166,7 +173,7 @@ pub const VM = struct {
         const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
 
         // Push initial frame.
-        try stack.pushFrame(self, ch, 0, null);
+        try stack.pushFrame(self, ch, chunk_id, 0, null);
         return run.run(self) catch |err| {
             errors.captureErrorTrace(self, err) catch {};
             return err;

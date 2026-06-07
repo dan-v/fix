@@ -9,6 +9,7 @@ const ThunkTarget = thunk_mod.ThunkTarget;
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
+const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
 
@@ -91,12 +92,15 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             },
             .blackhole => return error.RecursiveThunk,
             .claimed => {
+                trace_log.forceEnter(self.vm_trace, self.worker_id, thunk_id);
                 // We own this thunk now; compute and publish (or fail and reset).
                 const result = evalThunkTarget(self, thunk.target) catch |err| {
                     thunk.reset();
+                    trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, false);
                     return err;
                 };
                 thunk.resolve(result);
+                trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, true);
                 if (demand) thunk.markDemanded();
                 return result;
             },
@@ -119,7 +123,7 @@ pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
         .closure => |closure| evalThunkClosure(self, closure),
         .bytecode => |bytecode| blk: {
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
-            break :blk closures.runIsolatedFrame(self, ch, 0, bytecode.upvalues);
+            break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, bytecode.upvalues);
         },
         .pass_through => |v| forceValueImpl(self, v, true),
     };
@@ -131,7 +135,7 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
             const closure_id = closure_val.asObjectId();
             const closure = try closures.getClosureById(self, closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-            return closures.runIsolatedFrame(self, ch, 0, closure.upvalues);
+            return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues);
         },
         .builtin_closure => {
             const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());

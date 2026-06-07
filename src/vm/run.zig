@@ -18,6 +18,7 @@ const force = @import("force.zig");
 const objects = @import("objects.zig");
 const stack = @import("stack.zig");
 const strings = @import("strings.zig");
+const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
 const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
@@ -40,6 +41,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
 
         const op: OpCode = @enumFromInt(code[frame.ip]);
         if (comptime opcode_profile_enabled) self.opcode_counts[@intFromEnum(op)] += 1;
+        trace_log.op(self.vm_trace, self.worker_id, self.frames_len, frame.chunk_id, @intCast(frame.ip), op, self.sp);
         frame.ip += 1;
 
         switch (op) {
@@ -586,6 +588,12 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             .ret => {
                 const result = stack.pop(self);
                 const finished_frame = stack.popFrame(self);
+                if (self.frames_len == 0) {
+                    trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, types.CHUNK_ID_NONE, 0);
+                } else {
+                    const ret_frame = stack.currentFrame(self);
+                    trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
+                }
                 if (self.frames_len == stop_depth) {
                     self.sp = finished_frame.frame_base;
                     return result;

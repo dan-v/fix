@@ -4,13 +4,15 @@ const types = @import("../runtime/types.zig");
 const Value = @import("../runtime/value.zig").Value;
 const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
+const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
+const ChunkId = types.ChunkId;
 
 // ---- frame management ----
 
-pub fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) !void {
+pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value) !void {
     if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const frame_base = self.sp - arg_count;
@@ -25,12 +27,14 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const
 
     self.frames[self.frames_len] = .{
         .chunk_ptr = ch,
+        .chunk_id = chunk_id,
         .ip = 0,
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
     };
     self.frames_len += 1;
+    trace_log.framePush(self.vm_trace, self.worker_id, self.frames_len, chunk_id, frame_base);
 }
 
 pub fn popFrame(self: *VM) Frame {

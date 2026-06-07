@@ -119,6 +119,7 @@ pub const Evaluator = struct {
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
+    vm_trace: ?*@import("vm/trace_log.zig").VmTrace,
     worker_count: u8,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
@@ -161,6 +162,7 @@ pub const Evaluator = struct {
             .base_path = null,
             .env_map = null,
             .progress = null,
+            .vm_trace = null,
             .worker_count = worker_count,
             .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
@@ -222,6 +224,10 @@ pub const Evaluator = struct {
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
         self.env_map = env_map;
+    }
+
+    pub fn setVmTrace(self: *Evaluator, vm_trace: ?*@import("vm/trace_log.zig").VmTrace) void {
+        self.vm_trace = vm_trace;
     }
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
@@ -445,6 +451,7 @@ pub const Evaluator = struct {
             // would violate.
             if (worker_id == 0) &self.run.trace else null,
             if (worker_id == 0) self.progress else null,
+            if (worker_id == 0) self.vm_trace else null,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
             worker_id,

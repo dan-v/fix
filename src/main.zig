@@ -9,6 +9,7 @@ const diagnostic = @import("diagnostic.zig");
 const repl_line = @import("cli/repl.zig");
 const disasm_cmd = @import("cli/disasm.zig");
 const inspect_cmd = @import("cli/inspect.zig");
+const vm_trace_mod = @import("vm/trace_log.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 const Value = @import("runtime/value.zig").Value;
@@ -64,6 +65,9 @@ const Options = struct {
     derivation_debug: derivation_debug.Options = .{},
     repl: bool = false,
     source: ?SourceArg = null,
+    vm_trace_path: ?[:0]const u8 = null,
+    vm_trace_format: enum { text, binary } = .text,
+    vm_trace_max_events: u64 = 0,
 
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
@@ -156,11 +160,75 @@ pub fn main(init: std.process.Init) !void {
     errdefer progress.deinit(false);
     ev.setProgressSink(progress.sink());
 
+    var trace_setup = try setupVmTrace(allocator, init.io, options);
+    defer trace_setup.deinit(allocator);
+    if (trace_setup.trace) |t| ev.setVmTrace(t);
+
     const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
+    trace_setup.finish();
     if (!ok) {
         std.process.exit(1);
     }
+}
+
+const VmTraceSetup = struct {
+    trace: ?*vm_trace_mod.VmTrace = null,
+    trace_storage: ?*vm_trace_mod.VmTrace = null,
+    file: ?std.Io.File = null,
+    io: ?std.Io = null,
+    writer: ?*std.Io.File.Writer = null,
+    buffer: []u8 = &.{},
+
+    pub fn deinit(self: *VmTraceSetup, allocator: std.mem.Allocator) void {
+        if (self.writer) |w| allocator.destroy(w);
+        if (self.trace_storage) |t| allocator.destroy(t);
+        if (self.buffer.len > 0) allocator.free(self.buffer);
+        if (self.file) |f| if (self.io) |io| f.close(io);
+    }
+
+    pub fn finish(self: *VmTraceSetup) void {
+        if (self.trace) |t| t.flush() catch {};
+    }
+};
+
+fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: Options) !VmTraceSetup {
+    var setup: VmTraceSetup = .{};
+    const path = options.vm_trace_path orelse return setup;
+
+    if (!vm_trace_mod.enabled) {
+        std.debug.print("warning: --vm-trace requested but binary was built without -Dvm-trace=true\n", .{});
+        return setup;
+    }
+
+    setup.buffer = try allocator.alloc(u8, 64 * 1024);
+    errdefer allocator.free(setup.buffer);
+
+    if (std.mem.eql(u8, path, "-")) {
+        const writer_ptr = try allocator.create(std.Io.File.Writer);
+        errdefer allocator.destroy(writer_ptr);
+        writer_ptr.* = std.Io.File.stderr().writerStreaming(io, setup.buffer);
+        setup.writer = writer_ptr;
+    } else {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        setup.file = file;
+        setup.io = io;
+        const writer_ptr = try allocator.create(std.Io.File.Writer);
+        errdefer allocator.destroy(writer_ptr);
+        writer_ptr.* = file.writerStreaming(io, setup.buffer);
+        setup.writer = writer_ptr;
+    }
+
+    const trace_ptr = try allocator.create(vm_trace_mod.VmTrace);
+    errdefer allocator.destroy(trace_ptr);
+    trace_ptr.* = vm_trace_mod.VmTrace.init(&setup.writer.?.interface, switch (options.vm_trace_format) {
+        .text => .text,
+        .binary => .binary,
+    });
+    trace_ptr.setMaxEvents(options.vm_trace_max_events);
+    setup.trace_storage = trace_ptr;
+    setup.trace = trace_ptr;
+    return setup;
 }
 
 fn evaluateAndWrite(
@@ -280,6 +348,18 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
             try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
         } else if (std.mem.eql(u8, arg, "--file")) {
             try options.setSource(.{ .file = args_iter.next() orelse return error.MissingPath });
+        } else if (std.mem.eql(u8, arg, "--vm-trace")) {
+            options.vm_trace_path = "-"; // stderr
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace=")) {
+            options.vm_trace_path = arg["--vm-trace=".len..];
+        } else if (std.mem.eql(u8, arg, "--vm-trace-format")) {
+            const text = args_iter.next() orelse return error.MissingVmTraceFormat;
+            options.vm_trace_format = if (std.mem.eql(u8, text, "binary")) .binary
+                else if (std.mem.eql(u8, text, "text")) .text
+                else return error.InvalidVmTraceFormat;
+        } else if (std.mem.eql(u8, arg, "--vm-trace-max-events")) {
+            const text = args_iter.next() orelse return error.MissingVmTraceMaxEvents;
+            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
         } else {
             return error.UnknownOption;
         }
@@ -299,6 +379,10 @@ fn optionErrorMessage(err: anyerror) []const u8 {
         error.InvalidColorMode => "expected --color to be auto, always, or never",
         error.InvalidProgressMode => "expected --progress to be auto, always, or never",
         error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
+        error.MissingVmTraceFormat => "missing format after --vm-trace-format",
+        error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
+        error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
+        error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };

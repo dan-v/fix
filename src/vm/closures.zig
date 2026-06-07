@@ -120,7 +120,7 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         try stack.push(self, arg); // arg is first local
-        try stack.pushFrame(self, ch, 1, closure.upvalues);
+        try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     } else if (callee.discriminant == .builtin) {
         try stack.push(self, try access.applyBuiltin(self, callee.asBuiltinId(), &.{arg}));
     } else if (callee.discriminant == .builtin_closure) {
@@ -139,7 +139,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                 const closure_id = current.asObjectId();
                 const closure = try getClosureById(self, closure_id);
                 const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-                try replaceCurrentFrame(self, ch, arg, closure.upvalues);
+                try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
                 return;
             },
             .builtin => {
@@ -156,7 +156,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     }
 }
 
-pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []const Value) !void {
+pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg: Value, upvalues: []const Value) !void {
     if (ch.local_count == 0) return error.InvalidCallFrame;
 
     const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
@@ -176,12 +176,14 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, arg: Value, upvalues: []
 
     frame.* = .{
         .chunk_ptr = ch,
+        .chunk_id = chunk_id,
         .ip = 0,
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
+    @import("trace_log.zig").framePush(self.vm_trace, self.worker_id, self.frames_len, chunk_id, frame_base);
 }
 
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
@@ -190,7 +192,7 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         try stack.push(self, arg);
-        return runIsolatedFrame(self, ch, 1, closure.upvalues);
+        return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     }
     if (callee.discriminant == .builtin) {
         return access.applyBuiltin(self, callee.asBuiltinId(), &.{arg});
@@ -205,11 +207,11 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     return trace.notCallableError(self, callee);
 }
 
-pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
+pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
     const run_mod = @import("run.zig");
     const stop_depth = self.frames_len;
     const base_sp = self.sp - arg_count;
-    stack.pushFrame(self, ch, arg_count, upvalues) catch |err| {
+    stack.pushFrame(self, ch, chunk_id, arg_count, upvalues) catch |err| {
         self.sp = base_sp;
         return err;
     };
