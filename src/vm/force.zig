@@ -132,37 +132,25 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return result;
             },
             .busy => {
-                // If we're inside a fiber slot, enroll on the thunk's
-                // fiber-waiter list and yield back to our worker so it
-                // can run other fibers while we wait. On resume, the
-                // outer while loop retries `tryForce`, where we'll
-                // observe whichever terminal state the resolver left.
+                // Enroll on the thunk's fiber-waiter list and yield back
+                // to our worker so it can run other fibers / drain the
+                // pool while we wait. On resume, the outer while loop
+                // retries `tryForce`, where we'll observe whichever
+                // terminal state the resolver left.
                 //
-                // If we're not in a fiber (OS-thread fallback — the main
-                // evaluator thread, or test scaffolding), fall through
-                // to the synchronous `waitFor`.
-                if (fiber_mod.currentFiber()) |fiber| {
-                    const slot: *worker_mod.FiberSlot = @fieldParentPtr("fiber", fiber);
-                    if (thunk.enrollWaiter(&slot.waiter)) {
-                        // Mark the slot suspended *before* yielding so the
-                        // worker's `pickResumableSlot` finds it when the
-                        // resolver eventually flips `resumable`. Reset on
-                        // resume so the slot's next state is whatever the
-                        // entry loop or another yield sets.
-                        slot.state = .suspended;
-                        fiber_mod.Fiber.yield();
-                        slot.state = .running;
-                    }
-                    continue;
+                // Every real call path now runs inside a fiber — the
+                // top-level evaluation and every Evaluator render/force
+                // entry point set up a main-thread Worker. If we're
+                // somehow here without a current fiber, that's a bug.
+                const fiber = fiber_mod.currentFiber() orelse
+                    @panic("forceThunkImpl hit .busy outside a fiber — every caller must run on a worker fiber");
+                const slot: *worker_mod.FiberSlot = @fieldParentPtr("fiber", fiber);
+                if (thunk.enrollWaiter(&slot.waiter)) {
+                    slot.state = .suspended;
+                    fiber_mod.Fiber.yield();
+                    slot.state = .running;
                 }
-                switch (thunk.waitFor()) {
-                    .resolved => |v| {
-                        if (demand) thunk.markDemanded();
-                        return v;
-                    },
-                    .blackhole => return error.RecursiveThunk,
-                    .retry => continue,
-                }
+                continue;
             },
         }
     }

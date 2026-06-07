@@ -35,6 +35,7 @@ const stable_segments_mod = @import("runtime/stable_segments.zig");
 
 const worker_id_mod = @import("runtime/worker_id.zig");
 const worker_mod = @import("worker.zig");
+const fiber_mod = @import("fiber.zig");
 
 /// Per-thread linked list of in-progress *scoped* import paths. Scoped
 /// imports are not deduplicated through `ImportEntry` (each call has a
@@ -452,16 +453,6 @@ pub const Evaluator = struct {
     }
 
     fn runChunkOnMainWorker(self: *Evaluator, chunk_id: ChunkId) !Value {
-        const worker = try worker_mod.Worker.init(
-            self.allocator,
-            &self.scheduler,
-            self.scheduler.helper_count,
-            0,
-            self,
-            initVmForWorkerSlot,
-        );
-        defer worker.deinit();
-
         var result: Value = Value.null_val;
         var err_out: ?anyerror = null;
         var ctx: TopLevelEvalCtx = .{
@@ -470,7 +461,7 @@ pub const Evaluator = struct {
             .result_out = &result,
             .err_out = &err_out,
         };
-        try worker.runTopLevel(topLevelEvalEntry, @ptrCast(&ctx));
+        try self.runOnMainFiber(topLevelEvalEntry, @ptrCast(&ctx));
         if (err_out) |e| return e;
         return result;
     }
@@ -505,38 +496,72 @@ pub const Evaluator = struct {
         self.progressBegin(.render, "result");
         defer self.progressEnd(.render, "result");
         self.run.trace.clear();
-        var vm = try self.initVm(0);
-        defer vm.deinit();
-
-        try vm_builtins.writeJsonValue(&vm, writer, value);
+        if (fiber_mod.currentFiber() != null) {
+            var vm = try self.initVm(0);
+            defer vm.deinit();
+            return vm_builtins.writeJsonValue(&vm, writer, value);
+        }
+        var ctx: WriteJsonCtx = .{ .ev = self, .writer = writer, .value = value };
+        try self.runOnMainFiber(writeJsonEntry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
     }
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
         defer self.progressEnd(.render, "result");
         self.run.trace.clear();
-        var vm = try self.initVm(0);
-        defer vm.deinit();
-
-        try vm_builtins.writeLazyXmlValue(&vm, writer, value);
+        if (fiber_mod.currentFiber() != null) {
+            var vm = try self.initVm(0);
+            defer vm.deinit();
+            return vm_builtins.writeLazyXmlValue(&vm, writer, value);
+        }
+        var ctx: WriteXmlCtx = .{ .ev = self, .writer = writer, .value = value };
+        try self.runOnMainFiber(writeXmlEntry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
     }
 
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
         self.run.trace.clear();
-        var vm = try self.initVm(0);
-        defer vm.deinit();
-
-        return vm_force.forceValue(&vm, value);
+        if (fiber_mod.currentFiber() != null) {
+            var vm = try self.initVm(0);
+            defer vm.deinit();
+            return vm_force.forceValue(&vm, value);
+        }
+        var ctx: ForceValueCtx = .{ .ev = self, .value = value };
+        try self.runOnMainFiber(forceValueEntry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
+        return ctx.result;
     }
 
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         self.progressBegin(.render, "strict result");
         defer self.progressEnd(.render, "strict result");
         self.run.trace.clear();
-        var vm = try self.initVm(0);
-        defer vm.deinit();
+        if (fiber_mod.currentFiber() != null) {
+            var vm = try self.initVm(0);
+            defer vm.deinit();
+            return vm_force.forceDeep(&vm, value);
+        }
+        var ctx: ForceDeepCtx = .{ .ev = self, .value = value };
+        try self.runOnMainFiber(forceDeepEntry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
+    }
 
-        try vm_force.forceDeep(&vm, value);
+    /// Spin up a one-shot main-thread Worker and run `entry(arg)` on
+    /// its top-level fiber. Used by the render/force public methods so
+    /// they all share the same yield-on-busy machinery as the main
+    /// evaluation — no OS-thread `waitFor` fallback needed.
+    fn runOnMainFiber(self: *Evaluator, entry: fiber_mod.EntryFn, arg: *anyopaque) !void {
+        const worker = try worker_mod.Worker.init(
+            self.allocator,
+            &self.scheduler,
+            self.scheduler.helper_count,
+            0,
+            self,
+            initVmForWorkerSlot,
+        );
+        defer worker.deinit();
+        try worker.runTopLevel(entry, arg);
     }
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
@@ -787,8 +812,12 @@ pub const Evaluator = struct {
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
         defer self.progressEnd(.render, "result");
-
-        try eval_print.writeValue(self, writer, value);
+        if (fiber_mod.currentFiber() != null) {
+            return eval_print.writeValue(self, writer, value);
+        }
+        var ctx: WriteValueCtx = .{ .ev = self, .writer = writer, .value = value };
+        try self.runOnMainFiber(writeValueEntry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
     }
 
     fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
@@ -849,6 +878,100 @@ fn topLevelEvalEntry(arg: *anyopaque) void {
     ctx.result_out.* = vm.eval(ctx.chunk_id) catch |e| {
         ctx.err_out.* = e;
         return;
+    };
+}
+
+// One context + entry per render/force method. Each entry function
+// constructs its own VM, runs the body, and captures any error back
+// into `ctx.err` for the caller to re-raise.
+
+const WriteJsonCtx = struct {
+    ev: *Evaluator,
+    writer: *std.Io.Writer,
+    value: Value,
+    err: ?anyerror = null,
+};
+
+fn writeJsonEntry(arg: *anyopaque) void {
+    const ctx: *WriteJsonCtx = @ptrCast(@alignCast(arg));
+    var vm = ctx.ev.initVm(0) catch |e| {
+        ctx.err = e;
+        return;
+    };
+    defer vm.deinit();
+    vm_builtins.writeJsonValue(&vm, ctx.writer, ctx.value) catch |e| {
+        ctx.err = e;
+    };
+}
+
+const WriteXmlCtx = struct {
+    ev: *Evaluator,
+    writer: *std.Io.Writer,
+    value: Value,
+    err: ?anyerror = null,
+};
+
+fn writeXmlEntry(arg: *anyopaque) void {
+    const ctx: *WriteXmlCtx = @ptrCast(@alignCast(arg));
+    var vm = ctx.ev.initVm(0) catch |e| {
+        ctx.err = e;
+        return;
+    };
+    defer vm.deinit();
+    vm_builtins.writeLazyXmlValue(&vm, ctx.writer, ctx.value) catch |e| {
+        ctx.err = e;
+    };
+}
+
+const ForceValueCtx = struct {
+    ev: *Evaluator,
+    value: Value,
+    result: Value = Value.null_val,
+    err: ?anyerror = null,
+};
+
+fn forceValueEntry(arg: *anyopaque) void {
+    const ctx: *ForceValueCtx = @ptrCast(@alignCast(arg));
+    var vm = ctx.ev.initVm(0) catch |e| {
+        ctx.err = e;
+        return;
+    };
+    defer vm.deinit();
+    ctx.result = vm_force.forceValue(&vm, ctx.value) catch |e| blk: {
+        ctx.err = e;
+        break :blk Value.null_val;
+    };
+}
+
+const ForceDeepCtx = struct {
+    ev: *Evaluator,
+    value: Value,
+    err: ?anyerror = null,
+};
+
+fn forceDeepEntry(arg: *anyopaque) void {
+    const ctx: *ForceDeepCtx = @ptrCast(@alignCast(arg));
+    var vm = ctx.ev.initVm(0) catch |e| {
+        ctx.err = e;
+        return;
+    };
+    defer vm.deinit();
+    vm_force.forceDeep(&vm, ctx.value) catch |e| {
+        ctx.err = e;
+    };
+}
+
+const WriteValueCtx = struct {
+    ev: *Evaluator,
+    writer: *std.Io.Writer,
+    value: Value,
+    err: ?anyerror = null,
+};
+
+fn writeValueEntry(arg: *anyopaque) void {
+    const ctx: *WriteValueCtx = @ptrCast(@alignCast(arg));
+    eval_print.writeValue(ctx.ev, ctx.writer, ctx.value) catch |e| {
+        ctx.err = e;
     };
 }
 
