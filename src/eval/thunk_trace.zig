@@ -153,6 +153,30 @@ pub const ThunkTrace = struct {
         w.writeByte('\n') catch return;
     }
 
+    pub fn recordErrored(
+        self: *ThunkTrace,
+        thunk_id: ObjectId,
+        worker_id: u8,
+        fiber_id: u32,
+        err_name: []const u8,
+        message: ?[]const u8,
+    ) void {
+        const seq = self.seq.fetchAdd(1, .monotonic);
+        self.mu.lock();
+        defer self.mu.unlock();
+        const w = self.writer;
+        w.print(
+            "seq={d} kind=errored thunk={d} worker={d} fiber={d} err=",
+            .{ seq, thunk_id, worker_id, fiber_id },
+        ) catch return;
+        writeEscapedQuoted(w, err_name) catch return;
+        if (message) |m| {
+            w.writeAll(" message=") catch return;
+            writeEscapedQuoted(w, m) catch return;
+        }
+        w.writeByte('\n') catch return;
+    }
+
     pub fn recordBlackhole(
         self: *ThunkTrace,
         thunk_id: ObjectId,

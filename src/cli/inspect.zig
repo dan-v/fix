@@ -114,7 +114,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
     try writer.print("  values:           {d}\n", .{heap_stats.values});
     try writer.print("  attrs:            {d}\n", .{heap_stats.attrs});
     try writer.print("  attr_positions:   {d}\n", .{heap_stats.attr_positions});
-    if (heap_stats.thunk_states[0] + heap_stats.thunk_states[1] + heap_stats.thunk_states[2] + heap_stats.thunk_states[3] > 0) {
+    if (heap_stats.thunk_states[0] + heap_stats.thunk_states[1] + heap_stats.thunk_states[2] + heap_stats.thunk_states[3] + heap_stats.thunk_states[4] > 0) {
         try writer.writeAll("  thunk states:\n");
         for (heap_stats.thunk_states, 0..) |count, i| {
             if (count == 0) continue;

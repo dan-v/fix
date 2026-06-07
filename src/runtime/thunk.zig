@@ -31,6 +31,10 @@ pub const ThunkState = enum(u32) {
     evaluating = 1,
     resolved = 2,
     blackhole = 3,
+    /// Body ran and failed deterministically. The captured error
+    /// (and optional message) is cached on the thunk so subsequent
+    /// forces don't re-run a body whose outcome is already known.
+    errored = 4,
 };
 
 /// Identity of whoever is currently claiming a thunk. Packs:
@@ -82,11 +86,20 @@ pub const ThunkTarget = union(enum) {
     pass_through: Value,
 };
 
+/// Captured failure of a thunk's deterministic body, replayed on
+/// subsequent forces. The message is heap-owned by the thunk and freed
+/// in `ObjectHeap.deinit`.
+pub const ErrorInfo = struct {
+    err: anyerror,
+    message: ?[]const u8,
+};
+
 pub const ForceOutcome = union(enum) {
     already_resolved: Value,
     claimed,
     blackhole,
     busy,
+    errored: ErrorInfo,
 };
 
 /// Atomic lazy thunk. Multiple threads may concurrently try to force a
@@ -105,6 +118,10 @@ pub const Thunk = struct {
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
     result: Value,
+    /// Set before `state → errored`. Read by observers of the `.errored`
+    /// state via release-acquire pairing with `state`. Owned by the heap;
+    /// the message string is freed in `ObjectHeap.deinit`.
+    error_info: ErrorInfo,
     /// Singly-linked list of fibers parked on this thunk. Manipulated
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
@@ -120,6 +137,7 @@ pub const Thunk = struct {
             .waiters_mu = .{},
             .target = .{ .closure = closure },
             .result = Value.null_val,
+            .error_info = .{ .err = error.NixThrow, .message = null },
         };
     }
 
@@ -132,6 +150,7 @@ pub const Thunk = struct {
             .waiters_mu = .{},
             .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
             .result = Value.null_val,
+            .error_info = .{ .err = error.NixThrow, .message = null },
         };
     }
 
@@ -147,6 +166,7 @@ pub const Thunk = struct {
             .waiters_mu = .{},
             .target = .{ .pass_through = value },
             .result = Value.null_val,
+            .error_info = .{ .err = error.NixThrow, .message = null },
         };
     }
 
@@ -161,17 +181,21 @@ pub const Thunk = struct {
     /// Try to claim this thunk for evaluation by `claimer`. Returns:
     ///   - `.already_resolved`: the result is published; read `self.result`.
     ///   - `.claimed`: this caller has claimed; must compute and call
-    ///     `resolve` or `reset`.
+    ///     `resolve`, `errored`, or `reset`.
     ///   - `.blackhole`: the SAME claim identity is already evaluating —
     ///     real recursion (a fiber re-entering itself).
     ///   - `.busy`: a different claim identity is evaluating; caller
     ///     must enroll on the waiter list and yield.
+    ///   - `.errored`: the body ran and failed deterministically; caller
+    ///     should re-raise the cached error and replay the message onto
+    ///     its trace.
     pub fn tryForce(self: *Thunk, claimer: ClaimerId) ForceOutcome {
         while (true) {
             const s: ThunkState = @enumFromInt(self.state.load(.acquire));
             switch (s) {
                 .resolved => return .{ .already_resolved = self.result },
                 .blackhole => return .blackhole,
+                .errored => return .{ .errored = self.error_info },
                 .unresolved => {
                     const prev = self.state.cmpxchgWeak(
                         @intFromEnum(ThunkState.unresolved),
@@ -222,11 +246,28 @@ pub const Thunk = struct {
     }
 
     /// Mark a failed evaluation as retryable. Wakes waiters so they can
-    /// re-enter `tryForce`.
+    /// re-enter `tryForce`. Use only for *transient* errors (out-of-memory,
+    /// stack overflow, scheduler contention) — for deterministic body
+    /// failures prefer `errored` so the same body isn't re-run for
+    /// nothing.
     pub fn reset(self: *Thunk) void {
         self.result = Value.null_val;
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.unresolved), .release);
+        self.wakeFiberWaiters();
+    }
+
+    /// Cache a deterministic body failure on the thunk and wake waiters.
+    /// `message` (if non-null) must be a heap-owned string; ownership
+    /// transfers to the thunk and is freed in `ObjectHeap.deinit`.
+    ///
+    /// Memory model: the message store happens-before the release-store
+    /// of `state → errored`, so any reader that acquires `errored` sees
+    /// the message.
+    pub fn errored(self: *Thunk, err: anyerror, message: ?[]const u8) void {
+        self.error_info = .{ .err = err, .message = message };
+        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.state.store(@intFromEnum(ThunkState.errored), .release);
         self.wakeFiberWaiters();
     }
 
@@ -398,6 +439,79 @@ test "thunk: same worker different fibers see .busy, not blackhole" {
         .busy => {},
         .blackhole => return error.UnexpectedBlackhole,
         else => return error.UnexpectedOutcome,
+    }
+}
+
+test "thunk: errored caches error and replays on next force" {
+    var thunk = Thunk.init(Value.null_val);
+    const me = makeClaimer(0, 0);
+
+    switch (thunk.tryForce(me)) {
+        .claimed => {},
+        else => return error.UnexpectedOutcome,
+    }
+    thunk.errored(error.NixThrow, "bad value");
+
+    switch (thunk.tryForce(makeClaimer(0, 1))) {
+        .errored => |info| {
+            try std.testing.expectEqual(@as(anyerror, error.NixThrow), info.err);
+            try std.testing.expect(info.message != null);
+            try std.testing.expectEqualStrings("bad value", info.message.?);
+        },
+        else => return error.ExpectedErroredOutcome,
+    }
+    // Replay is idempotent.
+    switch (thunk.tryForce(makeClaimer(0, 2))) {
+        .errored => |info| try std.testing.expectEqual(@as(anyerror, error.NixThrow), info.err),
+        else => return error.ExpectedErroredOutcome,
+    }
+}
+
+test "thunk: errored wakes enrolled waiters" {
+    var thunk = Thunk.init(Value.null_val);
+
+    const Failer = struct {
+        fn run(th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
+            switch (th.tryForce(makeClaimer(0, 0))) {
+                .claimed => {},
+                else => return,
+            }
+            claimed_signal.store(1, .release);
+            while (go.load(.acquire) == 0) std.atomic.spinLoopHint();
+            th.errored(error.NixThrow, null);
+        }
+    };
+
+    var claimed_signal: std.atomic.Value(u8) = .init(0);
+    var go: std.atomic.Value(u8) = .init(0);
+    var t = try std.Thread.spawn(.{}, Failer.run, .{ &thunk, &claimed_signal, &go });
+
+    while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
+
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
+        .busy => {},
+        else => return error.ExpectedBusy,
+    }
+
+    var signaled: std.atomic.Value(u8) = .init(0);
+    const W = struct {
+        waiter: Waiter,
+        signaled: *std.atomic.Value(u8),
+        fn wake(w: *Waiter) void {
+            const self: *@This() = @fieldParentPtr("waiter", w);
+            self.signaled.store(1, .release);
+        }
+    };
+    var w: W = .{ .waiter = .{ .wake_fn = W.wake }, .signaled = &signaled };
+    try std.testing.expect(thunk.enrollWaiter(&w.waiter));
+
+    go.store(1, .release);
+    while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
+    t.join();
+
+    switch (thunk.tryForce(makeClaimer(1, 0))) {
+        .errored => {},
+        else => return error.ExpectedErroredOutcome,
     }
 }
 

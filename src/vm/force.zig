@@ -118,12 +118,16 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return v;
             },
             .blackhole => return error.RecursiveThunk,
+            .errored => |info| {
+                replayCachedMessage(self, info.message);
+                return info.err;
+            },
             .claimed => {
                 trace_log.forceEnter(self.vm_trace, self.worker_id, thunk_id);
-                // We own this thunk now; compute and publish (or fail and reset).
+                // We own this thunk now; compute and publish (or
+                // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, thunk.target) catch |err| {
-                    if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
-                    thunk.reset();
+                    publishThunkFailure(self, thunk, thunk_id, err);
                     trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, false);
                     return err;
                 };
@@ -242,4 +246,49 @@ fn claimerFiberId(self: *VM) u32 {
     // byte to get the local fiber id, which is the more useful field at
     // log-read time.
     return self.claimer_id & 0x00FFFFFF;
+}
+
+/// True for errors whose outcome may differ on a future force (resource
+/// pressure, scheduler contention, recursive thunk that might be observed
+/// from a different fiber identity). For these we discard the thunk back
+/// to `.unresolved` so a later call can retry; everything else is
+/// considered a deterministic body failure and gets cached on the thunk.
+fn isTransientThunkError(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.StackOverflow,
+        error.ImportContended,
+        => true,
+        else => false,
+    };
+}
+
+fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, err: anyerror) void {
+    if (isTransientThunkError(err)) {
+        if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
+        thunk.reset();
+        return;
+    }
+    // Steal the trace message (if any) onto the thunk. We dupe via the
+    // heap allocator so the lifetime tracks the heap rather than the
+    // per-fiber/per-task trace we drained it from. On allocation
+    // failure we still publish the cached error without a message.
+    var owned_message: ?[]const u8 = null;
+    if (self.trace) |trace| {
+        if (trace.message) |msg| {
+            owned_message = self.heap.allocator.dupe(u8, msg) catch null;
+        }
+    }
+    if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), owned_message);
+    thunk.errored(err, owned_message);
+}
+
+/// When a force observes a cached error, replay its message onto the
+/// caller's trace so `captureErrorTrace` doesn't fall back to the generic
+/// default. `setMessageIfAbsent` so an outer caller that's already
+/// captured context wins.
+fn replayCachedMessage(self: *VM, message: ?[]const u8) void {
+    const trace = self.trace orelse return;
+    const msg = message orelse return;
+    trace.setMessageIfAbsent(msg) catch {};
 }

@@ -168,11 +168,51 @@ pub const ObjectHeap = struct {
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        self.freeThunkErrorMessages();
         self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
         self.values.deinit(self.allocator);
         self.objects.deinit(self.allocator);
+    }
+
+    /// Thunks in the `.errored` state own a heap-allocated message
+    /// string; we allocate them out of `self.allocator` and must release
+    /// them before tearing down the object store. Walk every object slot
+    /// (skipping unfilled TLAB reservations the same way `stats` does)
+    /// and free messages on errored thunks.
+    fn freeThunkErrorMessages(self: *ObjectHeap) void {
+        var unfilled_starts: [256]u32 = undefined;
+        var unfilled_ends: [256]u32 = undefined;
+        var unfilled_count: usize = 0;
+        for (self.worker_locals) |local| {
+            if (local.object.cursor >= local.object.end) continue;
+            if (unfilled_count >= unfilled_starts.len) break;
+            unfilled_starts[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.cursor);
+            unfilled_ends[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.end);
+            unfilled_count += 1;
+        }
+
+        const total = self.objects.count();
+        var id: u32 = 0;
+        scan: while (id < total) : (id += 1) {
+            for (unfilled_starts[0..unfilled_count], unfilled_ends[0..unfilled_count]) |s, e| {
+                if (id >= s and id < e) {
+                    id = e - 1;
+                    continue :scan;
+                }
+            }
+            const obj = self.objects.getMut(id);
+            switch (obj.payload) {
+                .thunk => |*t| {
+                    if (t.error_info.message) |msg| {
+                        self.allocator.free(msg);
+                        t.error_info.message = null;
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     pub const Stats = struct {
@@ -181,7 +221,7 @@ pub const ObjectHeap = struct {
         attrs: u32,
         attr_positions: u32,
         variant_counts: [6]u32,
-        thunk_states: [4]u32,
+        thunk_states: [5]u32,
 
         pub fn variantName(index: usize) []const u8 {
             return switch (index) {
@@ -201,6 +241,7 @@ pub const ObjectHeap = struct {
                 1 => "evaluating",
                 2 => "resolved",
                 3 => "blackhole",
+                4 => "errored",
                 else => "?",
             };
         }
@@ -215,7 +256,7 @@ pub const ObjectHeap = struct {
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
             .variant_counts = [_]u32{0} ** 6,
-            .thunk_states = [_]u32{0} ** 4,
+            .thunk_states = [_]u32{0} ** 5,
         };
 
         // Per-worker TLABs reserve OBJECT_CHUNK_SIZE slots from the global
@@ -250,7 +291,7 @@ pub const ObjectHeap = struct {
                 .builtin_closure => 3,
                 .thunk => |t| blk: {
                     const state = t.state.load(.acquire);
-                    const s_index: usize = @intCast(@min(state, 3));
+                    const s_index: usize = @intCast(@min(state, 4));
                     result.thunk_states[s_index] += 1;
                     break :blk 4;
                 },

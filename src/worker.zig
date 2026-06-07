@@ -36,6 +36,7 @@ const vm_force = @import("vm/force.zig");
 const fiber_mod = @import("fiber.zig");
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime/worker_id.zig");
+const eval_trace = @import("eval/trace.zig");
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker patches
@@ -78,6 +79,12 @@ pub const Fiber = struct {
     /// Thunk waiter — `wake_fn` recovers the parent via `@fieldParentPtr`
     /// and enqueues the fiber onto its worker's ready list.
     waiter: thunk_mod.Waiter,
+    /// Scratch trace used during speculative `force_thunk` tasks. Lets
+    /// the failing thunk's error message be captured (and copied onto the
+    /// thunk's cached error info) without polluting the user's shared
+    /// trace. Reset before each speculative task; never observed by the
+    /// user-facing code path.
+    local_trace: eval_trace.Trace,
 
     fn wakeImpl(w: *thunk_mod.Waiter) void {
         const self: *Fiber = @fieldParentPtr("waiter", w);
@@ -162,6 +169,7 @@ pub const Worker = struct {
             if (f.vm.sp_high_water > max_vm_sp) max_vm_sp = f.vm.sp_high_water;
             f.inner.deinit(self.allocator);
             f.vm.deinit();
+            f.local_trace.deinit();
             self.allocator.destroy(f);
         }
         self.fibers.deinit(self.allocator);
@@ -321,6 +329,7 @@ pub const Worker = struct {
             .current_task = null,
             .next_in_list = null,
             .waiter = .{ .wake_fn = Fiber.wakeImpl },
+            .local_trace = eval_trace.Trace.init(self.allocator),
         };
         f.vm.claimer_id = thunk_mod.makeClaimer(self.worker_id, fiber_id);
 
@@ -384,10 +393,16 @@ fn slotEntry(arg: *anyopaque) void {
             // expression's branch that wouldn't have been selected by
             // demand-driven eval) otherwise pollutes the shared trace
             // and surfaces as the user-visible error message, masking
-            // the actual root cause. Null the VM's trace for the
-            // duration of the speculation and restore on exit.
+            // the actual root cause.
+            //
+            // We still need a place to capture the error message so
+            // sticky-error caching on the thunk preserves it. Point the
+            // VM trace at this fiber's local scratch trace for the
+            // duration of the speculation: `forceThunkImpl` reads from
+            // it on failure and copies the message onto the thunk.
             const saved_trace = f.vm.trace;
-            f.vm.trace = null;
+            f.local_trace.clear();
+            f.vm.trace = &f.local_trace;
             defer f.vm.trace = saved_trace;
             const v = Value.thunk(thunk_id);
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
