@@ -9,6 +9,7 @@ const diagnostic = @import("diagnostic.zig");
 const repl_line = @import("cli/repl.zig");
 const disasm_cmd = @import("cli/disasm.zig");
 const inspect_cmd = @import("cli/inspect.zig");
+const trace_cmd = @import("cli/trace.zig");
 const vm_trace_mod = @import("vm/trace_log.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
@@ -105,6 +106,13 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, first, "inspect")) {
             const code = inspect_cmd.run(init, &args_iter) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.process.exit(code);
+        }
+        if (std.mem.eql(u8, first, "trace")) {
+            const code = trace_cmd.run(init, &args_iter) catch |err| {
                 std.debug.print("error: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
@@ -354,11 +362,14 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
             options.vm_trace_path = arg["--vm-trace=".len..];
         } else if (std.mem.eql(u8, arg, "--vm-trace-format")) {
             const text = args_iter.next() orelse return error.MissingVmTraceFormat;
-            options.vm_trace_format = if (std.mem.eql(u8, text, "binary")) .binary
-                else if (std.mem.eql(u8, text, "text")) .text
-                else return error.InvalidVmTraceFormat;
+            options.vm_trace_format = parseVmTraceFormat(text) orelse return error.InvalidVmTraceFormat;
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace-format=")) {
+            options.vm_trace_format = parseVmTraceFormat(arg["--vm-trace-format=".len..]) orelse return error.InvalidVmTraceFormat;
         } else if (std.mem.eql(u8, arg, "--vm-trace-max-events")) {
             const text = args_iter.next() orelse return error.MissingVmTraceMaxEvents;
+            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
+            const text = arg["--vm-trace-max-events=".len..];
             options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
         } else {
             return error.UnknownOption;
@@ -366,6 +377,12 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
     }
 
     return options;
+}
+
+fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trace_format) {
+    if (std.mem.eql(u8, text, "binary")) return .binary;
+    if (std.mem.eql(u8, text, "text")) return .text;
+    return null;
 }
 
 fn optionErrorMessage(err: anyerror) []const u8 {
