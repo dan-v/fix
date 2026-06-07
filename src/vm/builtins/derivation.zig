@@ -263,6 +263,16 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         try owned_strings.append(self.allocator, json);
         try env.append(self.allocator, .{ .name = "__json", .value = json });
     } else {
+        // Fan out before the sequential walk: every attr's value will be
+        // forced (either the null-check or `derivationAttrString` reaches
+        // it), and each force is independent. Helpers race the main
+        // walker — by the time main reaches an attr, the helper has
+        // often already resolved it. submitUrgent gives up silently if
+        // the queues are full; main just forces those itself inline.
+        for (original_attrs) |entry| {
+            if (entry.value.discriminant != .thunk) continue;
+            if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
+        }
         for (original_attrs) |entry| {
             const attr_name_text = self.intern.get(entry.name);
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
