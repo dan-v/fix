@@ -95,12 +95,12 @@ pub const Worker = struct {
     /// reset for a new one. Only touched by the worker thread itself.
     free_head: ?*Fiber,
 
-    /// FIFO of fibers whose blocking thunk just resolved. Pushed by
-    /// remote wake_fn calls, popped by the worker's main loop. Protected
-    /// by `ready_mu`.
-    ready_head: ?*Fiber,
-    ready_tail: ?*Fiber,
-    ready_mu: stable.SpinMutex,
+    /// Lock-free Treiber stack of fibers whose blocking thunk just
+    /// resolved. Multi-producer (remote wake_fns), single-consumer (the
+    /// owning worker). LIFO order — newer wakes process first, which is
+    /// fine since the wake order isn't semantically meaningful and the
+    /// stack has the simplest correctness story.
+    ready_head: std.atomic.Value(?*Fiber),
 
     shutdown_requested: std.atomic.Value(u8),
 
@@ -122,9 +122,7 @@ pub const Worker = struct {
             .init_vm_fn = init_vm_fn,
             .fibers = .empty,
             .free_head = null,
-            .ready_head = null,
-            .ready_tail = null,
-            .ready_mu = .{},
+            .ready_head = .init(null),
             .shutdown_requested = .init(0),
         };
         return self;
@@ -304,31 +302,30 @@ pub const Worker = struct {
         self.free_head = f;
     }
 
-    /// Push a resumable fiber onto the ready list and nudge the worker.
-    /// Called from the resolver thread (via the fiber's waiter wake_fn).
+    /// Push a resumable fiber onto the ready stack. Called from any
+    /// thread (resolver fires the wake_fn). Lock-free CAS loop — see
+    /// `ready_head` for the protocol.
     fn enqueueReady(self: *Worker, f: *Fiber) void {
-        self.ready_mu.lock();
-        f.next_in_list = null;
-        if (self.ready_tail) |tail| {
-            tail.next_in_list = f;
-        } else {
-            self.ready_head = f;
+        while (true) {
+            const old = self.ready_head.load(.acquire);
+            f.next_in_list = old;
+            if (self.ready_head.cmpxchgWeak(old, f, .release, .acquire) == null) break;
         }
-        self.ready_tail = f;
-        self.ready_mu.unlock();
         self.nudge();
     }
 
+    /// Pop a fiber from the ready stack. Called only from the owning
+    /// worker thread, so the CAS races only against producers — never
+    /// against another popper.
     fn popReady(self: *Worker) ?*Fiber {
-        self.ready_mu.lock();
-        defer self.ready_mu.unlock();
-        if (self.ready_head) |head| {
-            self.ready_head = head.next_in_list;
-            if (self.ready_head == null) self.ready_tail = null;
-            head.next_in_list = null;
-            return head;
+        while (true) {
+            const head = self.ready_head.load(.acquire) orelse return null;
+            const next = head.next_in_list;
+            if (self.ready_head.cmpxchgWeak(head, next, .release, .acquire) == null) {
+                head.next_in_list = null;
+                return head;
+            }
         }
-        return null;
     }
 
     fn anyFiberSuspended(self: *Worker) bool {
@@ -425,5 +422,5 @@ test "Worker basic init/deinit" {
     try testing.expectEqual(@as(u8, 1), worker.worker_id);
     try testing.expect(worker.fibers.items.len == 0); // none allocated yet
     try testing.expect(worker.free_head == null);
-    try testing.expect(worker.ready_head == null);
+    try testing.expect(worker.ready_head.load(.acquire) == null);
 }
