@@ -1,22 +1,24 @@
 //! Atomic lazy thunk — the core of multithreaded lazy evaluation.
 //!
-//! A thunk is a suspended computation. Multiple threads may concurrently
-//! attempt to force it. The first thread CAS-claims it and runs the
-//! suspended target. Other threads register themselves on a lock-free
-//! waiter list and park until the result is published. A thread that
-//! tries to force a thunk it already claimed gets a `blackhole` outcome
-//! (real recursion).
+//! A thunk is a suspended computation. Multiple fibers (possibly on
+//! different OS threads) may concurrently attempt to force it. The
+//! first to CAS-claim it runs the suspended target; others enroll a
+//! `Waiter` on the linked list and yield their fiber until the
+//! claimer publishes a result (or resets / blackholes). A fiber that
+//! tries to force a thunk under the *same* claim id it already holds
+//! gets `.blackhole` — real recursion within one logical evaluation.
 //!
 //! Memory model:
 //!   - `state` transitions follow release-acquire pairs.
 //!   - `result` is written before the `state → resolved` store-release;
 //!     readers observe it after acquire-loading state == resolved.
 //!   - `target` is set at construction and never mutated.
-//!
-//! Platform: parker uses Linux futex; other platforms fall back to spin.
+//!   - Waiter list manipulation is protected by `waiters_mu`. Resolvers
+//!     re-acquire the lock after the state store so any concurrent
+//!     `enrollWaiter` either sees the new state (and refuses) or its
+//!     waiter is drained.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
@@ -88,31 +90,19 @@ pub const ForceOutcome = union(enum) {
     busy,
 };
 
-pub const WaitOutcome = union(enum) {
-    resolved: Value,
-    blackhole,
-    /// State went back to unresolved or another worker claimed it; the
-    /// caller should re-run `tryForce` with a fresh `Waiter`.
-    retry,
-};
-
-/// Atomic lazy thunk. State transitions and wake-up coordination use a
-/// futex on the `state` word — no per-waiter list, so threads that hit
-/// `.busy` and want to wait don't need to allocate or register anything.
+/// Atomic lazy thunk. Multiple threads may concurrently try to force a
+/// thunk: the first thread CAS-claims it and runs the suspended target;
+/// others see `.busy` and enroll a fiber `Waiter` on `waiters_head`,
+/// yielding back to their worker until the claimer publishes a result
+/// (or resets on error / blackholes).
 ///
-/// `parked` records whether any thread has registered to be woken on
-/// state change. Resolve/reset/blackhole only invoke futex_wake when
-/// `parked` is set; in the common case (no contention) the syscall is
-/// skipped entirely.
-///
-/// `demanded` distinguishes a thunk that was resolved because a real
-/// caller observed it from one that was only resolved by speculative
-/// pre-forcing. Lazy renderers (XML lazy mode) treat the latter as
-/// "unevaluated" so speculation stays invisible to users.
+/// `demanded` distinguishes a thunk resolved because a real caller
+/// observed it from one resolved only by speculative pre-forcing. Lazy
+/// renderers (XML lazy mode) treat the latter as "unevaluated" so
+/// speculation stays invisible to users.
 pub const Thunk = struct {
     state: std.atomic.Value(u32),
     claimer: std.atomic.Value(ClaimerId),
-    parked: std.atomic.Value(u8),
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
     result: Value,
@@ -126,7 +116,6 @@ pub const Thunk = struct {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
-            .parked = .init(0),
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
@@ -139,7 +128,6 @@ pub const Thunk = struct {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
-            .parked = .init(0),
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
@@ -155,7 +143,6 @@ pub const Thunk = struct {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
-            .parked = .init(0),
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
@@ -178,8 +165,8 @@ pub const Thunk = struct {
     ///     `resolve` or `reset`.
     ///   - `.blackhole`: the SAME claim identity is already evaluating —
     ///     real recursion (a fiber re-entering itself).
-    ///   - `.busy`: a different claim identity is evaluating; caller must
-    ///     `waitFor` (OS-thread context) or yield (fiber context).
+    ///   - `.busy`: a different claim identity is evaluating; caller
+    ///     must enroll on the waiter list and yield.
     pub fn tryForce(self: *Thunk, claimer: ClaimerId) ForceOutcome {
         while (true) {
             const s: ThunkState = @enumFromInt(self.state.load(.acquire));
@@ -208,59 +195,6 @@ pub const Thunk = struct {
         }
     }
 
-    /// Park until the thunk's state changes from `evaluating`. Returns what
-    /// the caller should do next. No allocation; uses futex on the state
-    /// word directly.
-    pub fn waitFor(self: *Thunk) WaitOutcome {
-        // Spin briefly before parking. Most thunks evaluate in well under a
-        // microsecond — that's faster than a futex_wait round trip. Only
-        // park if the helper is genuinely slow.
-        const SPIN_BUDGET: u32 = 128;
-        var spins: u32 = 0;
-        while (spins < SPIN_BUDGET) : (spins += 1) {
-            switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
-                .resolved => return .{ .resolved = self.result },
-                .blackhole => return .blackhole,
-                .unresolved => return .retry,
-                .evaluating => {},
-            }
-            std.atomic.spinLoopHint();
-        }
-
-        // Announce that we are about to park so resolve() will issue a
-        // futex_wake. The order matters: set the flag, then recheck state.
-        // If resolve fires between flag and recheck, recheck sees `.resolved`
-        // and we skip the syscall. If we set the flag and then park while
-        // state is still `.evaluating`, resolve will observe the flag and
-        // wake us.
-        self.parked.store(1, .release);
-        switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
-            .resolved => return .{ .resolved = self.result },
-            .blackhole => return .blackhole,
-            .unresolved => return .retry,
-            .evaluating => {},
-        }
-
-        const evaluating_raw = @as(u32, @intFromEnum(ThunkState.evaluating));
-        switch (builtin.os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_4arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAIT, .private = true },
-                    evaluating_raw,
-                    null,
-                );
-            },
-            else => std.Thread.yield() catch {},
-        }
-
-        return switch (@as(ThunkState, @enumFromInt(self.state.load(.acquire)))) {
-            .resolved => .{ .resolved = self.result },
-            .blackhole => .blackhole,
-            .unresolved, .evaluating => .retry,
-        };
-    }
-
     /// Enroll a fiber waiter on this thunk. Returns true if the waiter
     /// was added to the list (caller should yield and wait for `wake_fn`).
     /// Returns false if the thunk left `.evaluating` between the caller's
@@ -280,12 +214,11 @@ pub const Thunk = struct {
         return true;
     }
 
-    /// Publish `value` as the result and wake all parked waiters.
+    /// Publish `value` as the result and wake all enrolled fiber waiters.
     pub fn resolve(self: *Thunk, value: Value) void {
         self.result = value;
         self.claimer.store(INVALID_CLAIMER, .release);
         self.state.store(@intFromEnum(ThunkState.resolved), .release);
-        self.wakeAll();
         self.wakeFiberWaiters();
     }
 
@@ -295,7 +228,6 @@ pub const Thunk = struct {
         self.result = Value.null_val;
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.unresolved), .release);
-        self.wakeAll();
         self.wakeFiberWaiters();
     }
 
@@ -304,7 +236,6 @@ pub const Thunk = struct {
     pub fn blackhole(self: *Thunk) void {
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.blackhole), .release);
-        self.wakeAll();
         self.wakeFiberWaiters();
     }
 
@@ -324,23 +255,6 @@ pub const Thunk = struct {
         }
     }
 
-    fn wakeAll(self: *Thunk) void {
-        // Fast path: nobody has registered to be woken. Skip the futex
-        // syscall entirely. The most common case (uncontended thunks
-        // resolved by the worker that claimed them) hits this branch.
-        if (self.parked.load(.acquire) == 0) return;
-        switch (builtin.os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_3arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAKE, .private = true },
-                    std.math.maxInt(i32),
-                );
-            },
-            else => {},
-        }
-    }
-
     /// Identity equality. Two thunks are the same object iff they live at
     /// the same heap slot — there is no structural notion of thunk equality.
     pub fn idEq(self: *const Thunk, other: *const Thunk) bool {
@@ -348,7 +262,7 @@ pub const Thunk = struct {
     }
 };
 
-test "thunk: cross-worker force waits for resolution" {
+test "thunk: cross-worker enroll + resolve signals waiter" {
     var thunk = Thunk.init(Value.null_val);
 
     const Forcer = struct {
@@ -369,28 +283,30 @@ test "thunk: cross-worker force waits for resolution" {
 
     while (ready.load(.acquire) == 0) std.atomic.spinLoopHint();
 
-    // Worker 1 starts forcing, sees .busy, waits.
-    var saw_busy = false;
+    // Worker 1 sees .busy, enrolls a waiter that flips an atomic flag
+    // when the resolver fires.
     switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
-        .busy => saw_busy = true,
+        .busy => {},
         else => unreachable,
     }
-    try std.testing.expect(saw_busy);
-
-    // Release the resolver from another thread so the waiter parks first.
-    const Releaser = struct {
-        fn run(rn: *std.atomic.Value(u8)) void {
-            rn.store(1, .release);
+    var signaled: std.atomic.Value(u8) = .init(0);
+    const W = struct {
+        waiter: Waiter,
+        signaled: *std.atomic.Value(u8),
+        fn wake(w: *Waiter) void {
+            const self: *@This() = @fieldParentPtr("waiter", w);
+            self.signaled.store(1, .release);
         }
     };
-    var rt = try std.Thread.spawn(.{}, Releaser.run, .{&release_now});
+    var w: W = .{ .waiter = .{ .wake_fn = W.wake }, .signaled = &signaled };
+    try std.testing.expect(thunk.enrollWaiter(&w.waiter));
 
-    const outcome = thunk.waitFor();
-    rt.join();
+    release_now.store(1, .release);
+    while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
     t.join();
 
-    switch (outcome) {
-        .resolved => |v| try std.testing.expectEqual(@as(i64, 99), v.asInt()),
+    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+        .already_resolved => |v| try std.testing.expectEqual(@as(i64, 99), v.asInt()),
         else => return error.UnexpectedOutcome,
     }
 }
@@ -512,19 +428,26 @@ test "thunk: reset wakes waiters and lets them retry" {
         else => return error.ExpectedBusy,
     }
 
-    const Releaser = struct {
-        fn run(g: *std.atomic.Value(u8)) void {
-            g.store(1, .release);
+    var signaled: std.atomic.Value(u8) = .init(0);
+    const W = struct {
+        waiter: Waiter,
+        signaled: *std.atomic.Value(u8),
+        fn wake(w: *Waiter) void {
+            const self: *@This() = @fieldParentPtr("waiter", w);
+            self.signaled.store(1, .release);
         }
     };
-    var rt = try std.Thread.spawn(.{}, Releaser.run, .{&go});
+    var w: W = .{ .waiter = .{ .wake_fn = W.wake }, .signaled = &signaled };
+    try std.testing.expect(thunk.enrollWaiter(&w.waiter));
 
-    const outcome = thunk.waitFor();
-    rt.join();
+    go.store(1, .release);
+    while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
     t.join();
 
-    switch (outcome) {
-        .retry => {},
-        else => return error.ExpectedRetry,
+    // After reset, the thunk is back to .unresolved — a fresh tryForce
+    // should claim it.
+    switch (thunk.tryForce(makeClaimer(1, MAIN_THREAD_SLOT))) {
+        .claimed => {},
+        else => return error.ExpectedClaimedAfterReset,
     }
 }
