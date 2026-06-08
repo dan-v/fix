@@ -30,7 +30,7 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);

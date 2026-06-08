@@ -185,7 +185,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
@@ -265,7 +265,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
@@ -300,7 +300,7 @@ pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, 
     } else {
         try emit.emitInternOp(&child, .get_attr, .get_attr_long, name_id);
     }
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);

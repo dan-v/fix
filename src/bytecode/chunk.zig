@@ -60,6 +60,12 @@ pub const ChunkBuilder = struct {
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
+    /// Byte offset of the start of the most recently written opcode.
+    /// `null` when no op has been written or when the tail is no
+    /// longer a single rewritable opcode (e.g. after a branch fixup
+    /// patches an offset in place). Used by `emit.emitRet` to fuse
+    /// the previous value-producing op into a `<op>_ret` super-op.
+    last_op_offset: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -85,6 +91,7 @@ pub const ChunkBuilder = struct {
 
     /// Write a single opcode byte.
     pub fn writeOp(self: *ChunkBuilder, allocator: std.mem.Allocator, op: OpCode) !void {
+        self.last_op_offset = self.code.items.len;
         try self.code.append(allocator, @intFromEnum(op));
     }
 

@@ -80,6 +80,47 @@ pub fn emitInitCellSlot(self: *Compiler, slot: u16) !void {
     try emitLocalOp(self, .init_cell_slot, .init_cell_slot_long, slot);
 }
 
+pub fn emitGetLocalRet(self: *Compiler, slot: u16) !void {
+    try emitLocalOp(self, .get_local_ret, .get_local_ret_long, slot);
+}
+
+/// Emit a `ret`, fusing it into the immediately-preceding value-producing
+/// op when the pattern matches a `<op>_ret` super-op. Safe because the
+/// rewrite preserves the operand bytes — source-map entries pointing at
+/// the original op's byte range still describe the same span.
+pub fn emitRet(self: *Compiler) !void {
+    if (self.builder.last_op_offset) |offset| {
+        const code = self.builder.code.items;
+        if (offset < code.len) {
+            const last_op: OpCode = @enumFromInt(code[offset]);
+            switch (last_op) {
+                .constant => {
+                    code[offset] = @intFromEnum(OpCode.constant_ret);
+                    self.builder.last_op_offset = null;
+                    return;
+                },
+                .get_upvalue => {
+                    code[offset] = @intFromEnum(OpCode.get_upvalue_ret);
+                    self.builder.last_op_offset = null;
+                    return;
+                },
+                .get_local => {
+                    code[offset] = @intFromEnum(OpCode.get_local_ret);
+                    self.builder.last_op_offset = null;
+                    return;
+                },
+                .get_local_long => {
+                    code[offset] = @intFromEnum(OpCode.get_local_ret_long);
+                    self.builder.last_op_offset = null;
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+    try emitOp(self, .ret);
+}
+
 pub fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: InternId) !void {
     if (id <= std.math.maxInt(u16)) {
         try emitOpU16(self, short_op, @intCast(id));
@@ -195,4 +236,15 @@ pub fn patchJump(self: *Compiler, instruction_offset: usize, target_offset: usiz
     self.builder.code.items[operand_offset + 1] = @truncate(relative >> 8);
     self.builder.code.items[operand_offset + 2] = @truncate(relative >> 16);
     self.builder.code.items[operand_offset + 3] = @truncate(relative >> 24);
+    // Patching a jump means some branch now lands at `target_offset`.
+    // If that target equals the current write position (`code.len`),
+    // the next opcode we emit becomes a multi-predecessor join — we
+    // can no longer assume the op at `last_op_offset` is the only
+    // path producing the value flowing into `emit.emitRet`'s fuse
+    // candidate. Conservative: drop the hint whenever the target
+    // is the tail. (Patches that land BEFORE the tail can't affect
+    // straight-line fusion of subsequent ops.)
+    if (target_offset == self.builder.code.items.len) {
+        self.builder.last_op_offset = null;
+    }
 }

@@ -623,22 +623,35 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 // sync ip back; popFrame discards the slot's
                 // contents.
                 const result = stack.pop(self);
-                const finished_frame = stack.popFrame(self);
-                if (self.frames_len == 0) {
-                    trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, types.CHUNK_ID_NONE, 0);
-                } else {
-                    const ret_frame = stack.currentFrame(self);
-                    trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
-                }
-                if (self.frames_len == stop_depth) {
-                    self.sp = finished_frame.frame_base;
-                    return result;
-                }
-                self.sp = finished_frame.frame_base;
-                try stack.push(self, result);
-                frame = stack.currentFrame(self);
-                code = frame.chunk_ptr.code;
-                ip = frame.ip;
+                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
+            },
+            // Fused value-producing + ret super-ops. Each computes
+            // the result inline and runs the same epilogue as `.ret`
+            // — one dispatch instead of two.
+            .constant_ret => {
+                const idx_low = code[ip];
+                const idx_high = code[ip + 1];
+                const idx: u16 = @as(u16, idx_low) | (@as(u16, idx_high) << 8);
+                const result = frame.chunk_ptr.constants[idx];
+                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
+            },
+            .get_local_ret => {
+                const slot = code[ip];
+                const raw = self.stack[frame.frame_base + slot];
+                const result = try force.forceValue(self, raw);
+                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
+            },
+            .get_local_ret_long => {
+                const slot = readU16(code, ip);
+                const raw = self.stack[frame.frame_base + slot];
+                const result = try force.forceValue(self, raw);
+                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
+            },
+            .get_upvalue_ret => {
+                const slot = readU16(code, ip);
+                const upvalues = frame.upvalues orelse return error.MissingClosure;
+                const result = try force.forceValue(self, upvalues[slot]);
+                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
             },
             .halt => {
                 // Stop execution.
@@ -652,6 +665,40 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
 }
 
 // ---- helpers ----
+
+/// Shared epilogue for `.ret` and the fused value+ret super-ops.
+/// Returns a non-null `Value` if the outer `runUntil` should propagate
+/// it back to its caller (we've popped past `stop_depth`); otherwise
+/// pushes the result onto the resumed caller frame and updates the
+/// dispatch locals (`frame`, `code`, `ip`) in place.
+inline fn retEpilogue(
+    self: *VM,
+    stop_depth: usize,
+    result: Value,
+    frame: **vm_mod.Frame,
+    code: *[]u8,
+    ip: *usize,
+) !?Value {
+    const finished_frame = stack.popFrame(self);
+    if (comptime trace_log.enabled) {
+        if (self.frames_len == 0) {
+            trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, types.CHUNK_ID_NONE, 0);
+        } else {
+            const ret_frame = stack.currentFrame(self);
+            trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
+        }
+    }
+    if (self.frames_len == stop_depth) {
+        self.sp = finished_frame.frame_base;
+        return result;
+    }
+    self.sp = finished_frame.frame_base;
+    try stack.push(self, result);
+    frame.* = stack.currentFrame(self);
+    code.* = frame.*.chunk_ptr.code;
+    ip.* = frame.*.ip;
+    return null;
+}
 
 pub fn expectBool(self: *VM, val: Value) !bool {
     const forced = try force.forceValue(self, val);

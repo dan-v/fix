@@ -125,7 +125,7 @@ pub const Compiler = struct {
     /// builder holds a complete chunk ready for `ChunkBuilder.finish`.
     pub fn compileAndFinish(self: *Compiler, node: *const Node, scope_value: ?Value) !void {
         try self.compileWithScope(node, scope_value);
-        try self.builder.writeOp(self.allocator, .ret);
+        try emit.emitRet(self);
         try self.builder.writeOp(self.allocator, .halt);
     }
 

@@ -130,7 +130,7 @@ fn writeOperands(
     var ip = ip_in;
     const code = chunk.code;
     switch (op) {
-        .constant => {
+        .constant, .constant_ret => {
             const idx = readU16(code, ip);
             ip += 2;
             try writer.print("#{d}", .{idx});
@@ -141,12 +141,12 @@ fn writeOperands(
         },
         .push_null, .push_true, .push_false, .pop => {},
 
-        .get_local, .set_local, .capture_local, .init_cell_slot => {
+        .get_local, .set_local, .capture_local, .init_cell_slot, .get_local_ret => {
             const slot = code[ip];
             ip += 1;
             try writer.print("local[{d}]", .{slot});
         },
-        .get_local_long, .set_local_long, .capture_local_long, .set_cell_local_long, .init_cell_slot_long => {
+        .get_local_long, .set_local_long, .capture_local_long, .set_cell_local_long, .init_cell_slot_long, .get_local_ret_long => {
             const slot = readU16(code, ip);
             ip += 2;
             try writer.print("local[{d}]", .{slot});
@@ -156,7 +156,7 @@ fn writeOperands(
             ip += 1;
             try writer.print("local[{d}]", .{slot});
         },
-        .capture_upvalue, .get_upvalue => {
+        .capture_upvalue, .get_upvalue, .get_upvalue_ret => {
             const slot = readU16(code, ip);
             ip += 2;
             try writer.print("upvalue[{d}]", .{slot});

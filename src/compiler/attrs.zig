@@ -186,7 +186,7 @@ pub fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSe
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
@@ -486,7 +486,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try emit.emitOp(&child, .ret);
+    try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);

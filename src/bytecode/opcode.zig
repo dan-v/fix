@@ -128,6 +128,21 @@ pub const OpCode = enum(u8) {
     /// callees behave like `call` and are followed by the normal `ret`.
     tail_call,
 
+    // ---- fused value+ret super-ops ----
+    /// Fused `constant + ret`: load constant N onto the stack and
+    /// return from the current frame in one dispatch. Operand:
+    /// 2-byte constant index. Emitted by `compileTailExpression`
+    /// when the tail expression is a literal — saves one of the two
+    /// dispatches that dominate the bytecode loop's per-thunk
+    /// overhead.
+    constant_ret,
+    /// Fused `get_local + ret` (narrow slot).
+    get_local_ret,
+    /// Fused `get_local + ret` (wide slot — 2-byte operand).
+    get_local_ret_long,
+    /// Fused `get_upvalue + ret` (always 2-byte upvalue index).
+    get_upvalue_ret,
+
     // ---- thunks ----
     /// Wrap the top-of-stack value in a mutable lazy cell.
     make_cell,
