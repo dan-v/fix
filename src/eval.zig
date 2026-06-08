@@ -31,12 +31,9 @@ const eval_progress = @import("eval/progress.zig");
 const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
-const stable_segments_mod = @import("runtime/stable_segments.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
-const ImportEntry = imports_mod.ImportEntry;
 
-const worker_id_mod = @import("runtime/worker_id.zig");
 const worker_mod = @import("worker.zig");
 const fiber_mod = @import("fiber.zig");
 
@@ -52,8 +49,7 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
-    imports: std.StringHashMapUnmanaged(*ImportEntry),
-    imports_mu: stable_segments_mod.SpinMutex,
+    imports: imports_mod.Registry,
     search_paths: search_path_mod.Paths,
     /// One arena per worker. Each VM allocates its stack, frames, and
     /// per-opcode scratch through its worker's arena so workers never share
@@ -99,8 +95,7 @@ pub const Evaluator = struct {
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
-            .imports = .empty,
-            .imports_mu = .{},
+            .imports = .{},
             .search_paths = .{},
             .worker_arenas = arenas,
             .builtins_value = null,
@@ -123,11 +118,6 @@ pub const Evaluator = struct {
         self.scheduler.deinit();
         if (self.base_path) |path| self.allocator.free(path);
         self.run.deinit();
-        var imports_iter = self.imports.iterator();
-        while (imports_iter.next()) |kv| {
-            self.allocator.free(kv.key_ptr.*);
-            self.allocator.destroy(kv.value_ptr.*);
-        }
         self.imports.deinit(self.allocator);
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
@@ -320,7 +310,7 @@ pub const Evaluator = struct {
         return self.evaluateSource(source, self.base_path, null, null);
     }
 
-    fn evaluateSource(
+    pub fn evaluateSource(
         self: *Evaluator,
         source: []const u8,
         base_path: ?[]const u8,
@@ -470,12 +460,12 @@ pub const Evaluator = struct {
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return self.importPath(path);
+        return imports_mod.importPath(self, path);
     }
 
     fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return self.scopedImportPath(scope, path);
+        return imports_mod.scopedImportPath(self, scope, path);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {
@@ -493,134 +483,6 @@ pub const Evaluator = struct {
         return self.search_paths.findFile(self.allocator, &self.files, &self.intern, name);
     }
 
-    fn importPath(self: *Evaluator, path: []const u8) !Value {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.importResolvedPath(resolved.text);
-    }
-
-    fn importResolvedPath(self: *Evaluator, path: []const u8) anyerror!Value {
-        const entry = try self.lookupOrCreateImportEntry(path);
-        return self.forceImportEntry(path, entry);
-    }
-
-    fn forceImportEntry(self: *Evaluator, path: []const u8, entry: *ImportEntry) anyerror!Value {
-        const me = worker_id_mod.current;
-        while (true) {
-            const state = entry.state.load(.acquire);
-            switch (state) {
-                ImportEntry.STATE_RESOLVED => return entry.result,
-                ImportEntry.STATE_FAILED => return error.ImportFailed,
-                ImportEntry.STATE_EVALUATING => {
-                    const claimer = entry.claimer.load(.acquire);
-                    if (claimer == me) return error.ImportCycle;
-                    // Helpers don't wait on contended imports. The main thread
-                    // may be holding a thunk whose force chain leads back to
-                    // us; bailing avoids the cycle and lets a real-demand
-                    // force retry later.
-                    if (me != 0) return error.ImportContended;
-                    entry.waitForChange(ImportEntry.STATE_EVALUATING);
-                },
-                ImportEntry.STATE_UNRESOLVED => {
-                    if (entry.state.cmpxchgWeak(
-                        ImportEntry.STATE_UNRESOLVED,
-                        ImportEntry.STATE_EVALUATING,
-                        .acquire,
-                        .monotonic,
-                    )) |_| continue;
-                    entry.claimer.store(me, .release);
-                    const value = self.compileImportPath(path) catch |err| {
-                        entry.state.store(ImportEntry.STATE_FAILED, .release);
-                        entry.wakeAll();
-                        return err;
-                    };
-                    entry.result = value;
-                    entry.state.store(ImportEntry.STATE_RESOLVED, .release);
-                    entry.wakeAll();
-                    return value;
-                },
-                else => unreachable,
-            }
-        }
-    }
-
-    /// Internal: do the actual file read + evaluate work for an import.
-    /// Caller has already claimed the `ImportEntry` for `path`.
-    fn compileImportPath(self: *Evaluator, path: []const u8) anyerror!Value {
-        const stable_path = try self.allocator.dupe(u8, path);
-        defer self.allocator.free(stable_path);
-
-        self.progressBegin(.import, stable_path);
-        defer self.progressEnd(.import, stable_path);
-
-        const source = if (imports_mod.corepkgsSource(stable_path)) |core_source|
-            core_source
-        else
-            self.files.readFile(stable_path) catch |err| switch (err) {
-                error.IsDir => return self.importDirectory(stable_path),
-                else => return err,
-            };
-        const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        return self.evaluateSource(source, source_base, stable_path, null);
-    }
-
-    fn lookupOrCreateImportEntry(self: *Evaluator, path: []const u8) !*ImportEntry {
-        self.imports_mu.lock();
-        defer self.imports_mu.unlock();
-
-        if (self.imports.get(path)) |entry| return entry;
-
-        const key = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(key);
-        const entry = try self.allocator.create(ImportEntry);
-        errdefer self.allocator.destroy(entry);
-        entry.* = .{};
-        try self.imports.put(self.allocator, key, entry);
-        return entry;
-    }
-
-    fn scopedImportPath(self: *Evaluator, scope: Value, path: []const u8) !Value {
-        const resolved = try self.resolveHostPath(path);
-        defer if (resolved.owned) self.allocator.free(resolved.text);
-        return self.scopedImportResolvedPath(scope, resolved.text);
-    }
-
-    fn scopedImportResolvedPath(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
-        const stable_path = try self.allocator.dupe(u8, path);
-        defer self.allocator.free(stable_path);
-
-        try imports_mod.checkScopedCycle(stable_path);
-        var frame: imports_mod.ScopedFrame = .{ .path = stable_path, .next = null };
-        const prev = imports_mod.pushScopedFrame(&frame);
-        defer imports_mod.popScopedFrame(prev);
-
-        self.progressBegin(.import, stable_path);
-        defer self.progressEnd(.import, stable_path);
-
-        const source = if (imports_mod.corepkgsSource(stable_path)) |core_source|
-            core_source
-        else
-            self.files.readFile(stable_path) catch |err| switch (err) {
-                error.IsDir => return self.scopedImportDirectory(scope, stable_path),
-                else => return err,
-            };
-        const source_base = std.fs.path.dirname(stable_path) orelse "/";
-        return self.evaluateSource(source, source_base, stable_path, scope);
-    }
-
-    fn importDirectory(self: *Evaluator, path: []const u8) anyerror!Value {
-        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
-        defer self.allocator.free(default_path);
-
-        return self.importResolvedPath(default_path);
-    }
-
-    fn scopedImportDirectory(self: *Evaluator, scope: Value, path: []const u8) anyerror!Value {
-        const default_path = try std.fs.path.resolve(self.allocator, &.{ path, "default.nix" });
-        defer self.allocator.free(default_path);
-        return self.scopedImportResolvedPath(scope, default_path);
-    }
-
     fn ensureBuiltins(self: *Evaluator) !Value {
         if (self.builtins_value) |value| return value;
         const nix_path = try self.search_paths.toNixPath(self.allocator);
@@ -630,7 +492,7 @@ pub const Evaluator = struct {
         return value;
     }
 
-    fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
+    pub fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
         if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
 
         const base_path = self.base_path orelse return error.RelativePath;
@@ -646,11 +508,11 @@ pub const Evaluator = struct {
         return self.runWithVm(writeValueBody, .{ self, writer, value });
     }
 
-    fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+    pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
         if (self.progress) |progress| progress.begin(stage, subject);
     }
 
-    fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+    pub fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
         if (self.progress) |progress| progress.end(stage, subject);
     }
 

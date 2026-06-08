@@ -506,7 +506,7 @@ test "evaluate import through evaluator file cache" {
 
     const imported = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 84), imported.asInt());
-    try std.testing.expectEqual(@as(u32, 1), ev.imports.count());
+    try std.testing.expectEqual(@as(u32, 1), ev.imports.entries.count());
 }
 
 test "evaluate path builtins coerce outPath attrsets" {
