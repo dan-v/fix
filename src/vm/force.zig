@@ -197,17 +197,16 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
     return Value.thunk(id);
 }
 
-const SPECULATION_MIN_CODE_BYTES: usize = 256;
-
 inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
     // Only Nix-level closures with a meaningfully-sized body warrant the
     // submit overhead. Builtin / builtin_closure thunks are typically a
     // single dispatched call — main can force them faster than the
-    // scheduler dance.
+    // scheduler dance. The eligibility bit is pre-computed at chunk
+    // registration time (see Chunk.speculatable).
     if (closure.discriminant != .closure) return false;
     const c = self.heap.getClosure(closure.asObjectId()) catch return false;
     const ch = self.registry.get(c.chunk_id) orelse return false;
-    return ch.code.len >= SPECULATION_MIN_CODE_BYTES;
+    return ch.speculatable;
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {

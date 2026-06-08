@@ -88,14 +88,17 @@ pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []cons
 }
 
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+    // Pre-fetch the chunk so we can read `speculatable` once instead
+    // of a second `registry.get` inside the old `shouldSpeculate`.
+    const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
     const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
-    var committed = false;
-    errdefer if (!committed) self.heap.rollbackBytecodeThunk(pending);
+    errdefer self.heap.rollbackBytecodeThunk(pending);
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
-    committed = true;
+    // commitBytecodeThunk owns `pending` past this point; the
+    // errdefer above only fires on early return.
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (shouldSpeculate(self, chunk_id)) {
+    if (ch.speculatable) {
         _ = self.scheduler.submit(.{ .force_thunk = id });
     }
     try stack.push(self, Value.thunk(id));
@@ -107,18 +110,6 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
         const fiber_id = self.claimer_id & 0x00FFFFFF;
         tt.recordCreate(id, self.worker_id, fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
     }
-}
-
-/// Speculation pays off only when the thunk's body is long enough that a
-/// helper finishing it ahead of the main thread saves more time than the
-/// submit + scheduler overhead costs. Tiny chunks (one or two opcodes)
-/// would just generate noise; the main thread can force them faster than
-/// it takes to push the task and a helper to pop it.
-const SPECULATION_MIN_CODE_BYTES: usize = 256;
-
-inline fn shouldSpeculate(self: *VM, chunk_id: ChunkId) bool {
-    const ch = self.registry.get(chunk_id) orelse return false;
-    return ch.code.len >= SPECULATION_MIN_CODE_BYTES;
 }
 
 // ---- calls ----

@@ -34,6 +34,13 @@ pub const Chunk = struct {
     constants: []Value,
     /// Number of stack slots reserved for locals in each frame.
     local_count: u16,
+    /// Pre-computed at registration time: this chunk's body is large
+    /// enough that a helper finishing it ahead of main saves more than
+    /// the scheduler submit overhead costs. Cached here so the
+    /// thunk-creation hot path (`makeBytecodeThunkFromCaptures`) doesn't
+    /// need to re-fetch the chunk via the registry just to read
+    /// `code.len`.
+    speculatable: bool = false,
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
     /// Source span ranges for cold-path error traces.
@@ -173,6 +180,12 @@ pub const ChunkRegistry = struct {
         self.chunks.deinit(self.allocator);
     }
 
+    /// Code length at or above which `makeBytecodeThunkFromCaptures`
+    /// submits a speculative force task to the helper pool. Below this
+    /// threshold, the main thread can force the body faster than it
+    /// takes to push + pop a scheduler task.
+    pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
+
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
         const stored = try self.allocator.create(Chunk);
         errdefer {
@@ -180,6 +193,7 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
+        stored.speculatable = chunk.code.len >= SPECULATION_MIN_CODE_BYTES;
         return try self.chunks.append(self.allocator, stored);
     }
 
