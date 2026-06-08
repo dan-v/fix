@@ -94,14 +94,19 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
     const id = try self.heap.commitBytecodeThunk(pending);
     committed = true;
-    if (self.thunk_trace) |tt| {
-        const fiber_id = self.claimer_id & 0x00FFFFFF;
-        tt.recordCreate(id, self.worker_id, fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
-    }
+    recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (shouldSpeculate(self, chunk_id)) {
         _ = self.scheduler.submit(.{ .force_thunk = id });
     }
     try stack.push(self, Value.thunk(id));
+}
+
+inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const Frame, chunk_id: ChunkId) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| {
+        const fiber_id = self.claimer_id & 0x00FFFFFF;
+        tt.recordCreate(id, self.worker_id, fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
+    }
 }
 
 /// Speculation pays off only when the thunk's body is long enough that a

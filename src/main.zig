@@ -215,6 +215,13 @@ fn setupThunkTrace(
 ) !ThunkTraceSetup {
     var setup: ThunkTraceSetup = .{};
     const path = options.thunks_log_path orelse return setup;
+    if (comptime !@import("vm.zig").thunks_log_enabled) {
+        std.debug.print(
+            "warning: --thunks-log requested but binary was built without -Dthunks-log; the log will be empty\n",
+            .{},
+        );
+        return setup;
+    }
 
     setup.buffer = try allocator.alloc(u8, 64 * 1024);
     errdefer allocator.free(setup.buffer);

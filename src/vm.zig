@@ -47,6 +47,7 @@ pub const trace = @import("vm/trace.zig");
 pub const debug = @import("vm/debug.zig");
 
 pub const opcode_profile_enabled = build_options.vm_opcode_profile;
+pub const thunks_log_enabled = build_options.thunks_log;
 pub const OpcodeCounts = [opcode.count]u64;
 const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
 const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
@@ -100,8 +101,10 @@ pub const VM = struct {
     vm_trace: ?*VmTrace,
     /// Optional per-thunk lifecycle event log (see eval/thunk_trace.zig).
     /// Recording is disabled when null. All workers share a single
-    /// trace; writes serialize on its internal mutex.
-    thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
+    /// trace; writes serialize on its internal mutex. The field is
+    /// compiled out entirely unless `-Dthunks-log` is set so the
+    /// per-thunk null-check overhead doesn't burden default builds.
+    thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -142,7 +145,7 @@ pub const VM = struct {
         trace_sink: ?*eval_trace.Trace,
         progress: ?eval_progress.Sink,
         vm_trace: ?*VmTrace,
-        thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
+        thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
         import_host: ?ImportHost,
         builtins_value: Value,
         worker_id: u8,

@@ -446,7 +446,7 @@ test "Worker basic init/deinit" {
                 null,
                 null,
                 null,
-                null,
+                if (comptime vm_mod.thunks_log_enabled) null else {},
                 null,
                 Value.null_val,
                 worker_id,

@@ -132,7 +132,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     return err;
                 };
                 thunk.resolve(result);
-                if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.worker_id, claimerFiberId(self), result);
+                recordResolve(self, thunk_id, result);
                 trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, true);
                 if (demand) thunk.markDemanded();
                 return result;
@@ -190,19 +190,7 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
-    if (self.thunk_trace) |tt| {
-        const target_kind: @import("../eval/thunk_trace.zig").TargetKind = switch (closure.discriminant) {
-            .closure => .closure,
-            .builtin_closure => .builtin_closure,
-            else => .closure,
-        };
-        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.discriminant == .closure) blk: {
-            const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
-            break :blk c.chunk_id;
-        } else null;
-        const creator = creatorFrame(self);
-        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
-    }
+    recordCreateForClosure(self, id, closure);
     if (shouldSpeculateClosure(self, closure)) {
         _ = self.scheduler.submit(.{ .force_thunk = id });
     }
@@ -226,10 +214,7 @@ pub fn makeCell(self: *VM, val: Value) !Value {
     // "Cell" is just a pass-through thunk: the underlying value gets forced
     // and the result memoized in the thunk's resolved slot.
     const id = try self.heap.addThunk(Thunk.initPassThrough(val));
-    if (self.thunk_trace) |tt| {
-        const creator = creatorFrame(self);
-        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
-    }
+    recordCreatePassThrough(self, id);
     return Value.thunk(id);
 }
 
@@ -246,6 +231,53 @@ fn claimerFiberId(self: *VM) u32 {
     // byte to get the local fiber id, which is the more useful field at
     // log-read time.
     return self.claimer_id & 0x00FFFFFF;
+}
+
+// ---- thunk-trace recording helpers ----
+//
+// All of these are no-ops in default builds because `thunks_log_enabled`
+// is false; the compiler folds the whole call away. With
+// `-Dthunks-log` the `vm.thunk_trace` field becomes a real pointer and
+// these forward to the trace.
+
+inline fn recordResolve(self: *VM, thunk_id: ObjectId, result: Value) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.worker_id, claimerFiberId(self), result);
+}
+
+inline fn recordReset(self: *VM, thunk_id: ObjectId, err: anyerror) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
+}
+
+inline fn recordErrored(self: *VM, thunk_id: ObjectId, err: anyerror, message: ?[]const u8) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), message);
+}
+
+inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| {
+        const target_kind: @import("../eval/thunk_trace.zig").TargetKind = switch (closure.discriminant) {
+            .closure => .closure,
+            .builtin_closure => .builtin_closure,
+            else => .closure,
+        };
+        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.discriminant == .closure) blk: {
+            const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
+            break :blk c.chunk_id;
+        } else null;
+        const creator = creatorFrame(self);
+        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
+    }
+}
+
+inline fn recordCreatePassThrough(self: *VM, id: ObjectId) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| {
+        const creator = creatorFrame(self);
+        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
+    }
 }
 
 /// True for errors whose outcome may differ on a future force (resource
@@ -265,7 +297,7 @@ fn isTransientThunkError(err: anyerror) bool {
 
 fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, err: anyerror) void {
     if (isTransientThunkError(err)) {
-        if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
+        recordReset(self, thunk_id, err);
         thunk.reset();
         return;
     }
@@ -284,7 +316,7 @@ fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, e
             }
         }
     }
-    if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), owned_message);
+    recordErrored(self, thunk_id, err, owned_message);
     publishErrored(self, thunk, err, owned_message);
 }
 

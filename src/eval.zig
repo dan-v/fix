@@ -122,7 +122,7 @@ pub const Evaluator = struct {
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
     vm_trace: ?*@import("vm/trace_log.zig").VmTrace,
-    thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace,
+    thunk_trace: if (vm_mod.thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
     worker_count: u8,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
@@ -166,7 +166,7 @@ pub const Evaluator = struct {
             .env_map = null,
             .progress = null,
             .vm_trace = null,
-            .thunk_trace = null,
+            .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
             .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
@@ -235,6 +235,10 @@ pub const Evaluator = struct {
     }
 
     pub fn setThunkTrace(self: *Evaluator, thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace) void {
+        // No-op when the trace is compiled out; callers don't need to
+        // comptime-gate. `--thunks-log` users get a heads-up at the CLI
+        // layer.
+        if (comptime !vm_mod.thunks_log_enabled) return;
         self.thunk_trace = thunk_trace;
     }
 
