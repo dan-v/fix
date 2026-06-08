@@ -1,9 +1,18 @@
 //! Evaluator-owned filesystem cache.
 //!
-//! The VM talks to this cache, not directly to the host filesystem. Cold reads
-//! are isolated behind `readFile`/`pathExists`; a later async backend can make
-//! those calls suspend/reschedule evaluator work without changing builtin
-//! semantics or VM call sites.
+//! The VM talks to this cache, not directly to the host filesystem. Cold
+//! reads are isolated behind `readFile`/`pathExists` so workers can use
+//! the same cache without each call going to the kernel.
+//!
+//! Concurrency: entries are heap-allocated and pinned, so `*Entry`
+//! pointers stay valid across hashmap inserts. The map mutex is held
+//! only briefly around lookup/insert; per-entry state is then
+//! synchronised under a per-entry mutex, so workers reading *different*
+//! files do I/O in parallel and workers reading the *same* file
+//! serialise on just that path's mutex (rather than the whole cache).
+//! For a NixOS toplevel eval — hundreds of imports across helper
+//! workers — this is the difference between file I/O being a
+//! single-file-at-a-time pipeline and a fan-out.
 
 const std = @import("std");
 const stable = @import("runtime/stable_segments.zig");
@@ -11,14 +20,14 @@ const stable = @import("runtime/stable_segments.zig");
 pub const FileCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
-    entries: std.StringHashMapUnmanaged(Entry),
-    /// Single coarse mutex around the hashmap, IO, and Entry mutations.
-    /// File I/O is rare relative to thunk forcing and pointer-invalidation
-    /// on concurrent insert would corrupt borrowed entry pointers; a finer
-    /// lock would need to either pin entries (StableSegments-style) or
-    /// repeat the lookup after each I/O step. We use a blocking mutex so
-    /// contending workers park instead of burning cores during the I/O.
-    mu: stable.BlockingMutex = .{},
+    /// Path → heap-allocated entry. The pointer stays valid across
+    /// map growth, so workers can release `map_mu` immediately after
+    /// the lookup and do I/O against the entry without blocking other
+    /// paths.
+    entries: std.StringHashMapUnmanaged(*Entry),
+    /// Protects the hashmap structure only. Held briefly during
+    /// lookup / insert, never across I/O.
+    map_mu: stable.BlockingMutex = .{},
 
     const max_read_bytes = 128 * 1024 * 1024;
 
@@ -45,6 +54,11 @@ pub const FileCache = struct {
 
     const Entry = struct {
         path: []u8,
+        /// Guards the populated-fields below. Held during I/O so a
+        /// concurrent reader for the same path waits on the in-flight
+        /// fetch rather than duplicating it. Different paths get
+        /// different entries → different mutexes → fully parallel.
+        mu: stable.BlockingMutex = .{},
         exists_known: bool = false,
         exists: bool = false,
         kind: ?FileKind = null,
@@ -63,9 +77,11 @@ pub const FileCache = struct {
     pub fn deinit(self: *FileCache) void {
         var iter = self.entries.iterator();
         while (iter.next()) |kv| {
-            self.allocator.free(kv.value_ptr.path);
-            if (kv.value_ptr.contents) |contents| self.allocator.free(contents);
-            if (kv.value_ptr.dir_entries) |entries| self.freeDirEntries(entries);
+            const entry = kv.value_ptr.*;
+            self.allocator.free(entry.path);
+            if (entry.contents) |contents| self.allocator.free(contents);
+            if (entry.dir_entries) |entries| self.freeDirEntries(entries);
+            self.allocator.destroy(entry);
         }
         self.entries.deinit(self.allocator);
     }
@@ -75,9 +91,9 @@ pub const FileCache = struct {
     }
 
     pub fn pathExists(self: *FileCache, path: []const u8) !bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        var entry = try self.entryFor(path);
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
         if (entry.exists_known) return entry.exists;
 
         const io = self.io orelse return error.FileIoUnavailable;
@@ -96,9 +112,9 @@ pub const FileCache = struct {
     }
 
     pub fn readFile(self: *FileCache, path: []const u8) ![]const u8 {
-        self.mu.lock();
-        defer self.mu.unlock();
-        var entry = try self.entryFor(path);
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
         if (entry.contents) |contents| return contents;
 
         const io = self.io orelse return error.FileIoUnavailable;
@@ -118,9 +134,9 @@ pub const FileCache = struct {
     }
 
     pub fn fileType(self: *FileCache, path: []const u8) !FileKind {
-        self.mu.lock();
-        defer self.mu.unlock();
-        var entry = try self.entryFor(path);
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
         if (entry.kind) |kind| return kind;
 
         const io = self.io orelse return error.FileIoUnavailable;
@@ -140,8 +156,6 @@ pub const FileCache = struct {
     }
 
     pub fn isExecutable(self: *FileCache, path: []const u8) !bool {
-        self.mu.lock();
-        defer self.mu.unlock();
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
         const stat = try std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false });
@@ -149,8 +163,6 @@ pub const FileCache = struct {
     }
 
     pub fn readLink(self: *FileCache, path: []const u8) ![]u8 {
-        self.mu.lock();
-        defer self.mu.unlock();
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -159,9 +171,9 @@ pub const FileCache = struct {
     }
 
     pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
-        self.mu.lock();
-        defer self.mu.unlock();
-        var entry = try self.entryFor(path);
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
         if (entry.dir_entries) |entries| return entries;
 
         const io = self.io orelse return error.FileIoUnavailable;
@@ -194,20 +206,34 @@ pub const FileCache = struct {
     }
 
     fn entryFor(self: *FileCache, path: []const u8) !*Entry {
-        if (self.entries.getPtr(path)) |entry| return entry;
+        self.map_mu.lock();
+        if (self.entries.get(path)) |entry| {
+            self.map_mu.unlock();
+            return entry;
+        }
+        // We need to insert. Hold the map mutex through canonicalise +
+        // alloc + insert; releasing in the middle would let another
+        // worker race in with the same path, and we'd both allocate
+        // entries.
+        defer self.map_mu.unlock();
 
         const canonical = try self.canonicalPath(path);
         errdefer self.allocator.free(canonical);
 
-        const gop = try self.entries.getOrPut(self.allocator, canonical);
-        if (gop.found_existing) {
+        // Recheck under the lock — `path` and the canonical form may
+        // differ, and another worker could have inserted the
+        // canonical key while we were normalising.
+        if (self.entries.get(canonical)) |entry| {
             self.allocator.free(canonical);
-            return gop.value_ptr;
+            return entry;
         }
 
-        gop.key_ptr.* = canonical;
-        gop.value_ptr.* = .{ .path = canonical };
-        return gop.value_ptr;
+        const entry = try self.allocator.create(Entry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{ .path = canonical };
+
+        try self.entries.put(self.allocator, canonical, entry);
+        return entry;
     }
 
     fn canonicalPath(self: *FileCache, path: []const u8) ![]u8 {
