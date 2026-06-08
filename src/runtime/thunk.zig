@@ -106,7 +106,12 @@ pub const ForceOutcome = union(enum) {
     claimed,
     blackhole,
     busy,
-    errored: ErrorInfo,
+    /// Borrowed pointer into the heap-owned sidecar; valid for the
+    /// lifetime of the heap. Kept as a pointer rather than an inline
+    /// `ErrorInfo` value so the union stays 24 bytes (Value-sized) —
+    /// `forceThunkImpl` is in the hot dispatch path and any growth
+    /// here measurably widens its stack frame.
+    errored: *const ErrorInfo,
 };
 
 /// Atomic lazy thunk. Multiple threads may concurrently try to force a
@@ -198,7 +203,7 @@ pub const Thunk = struct {
             switch (s) {
                 .resolved => return .{ .already_resolved = self.result },
                 .blackhole => return .blackhole,
-                .errored => return .{ .errored = self.cachedErrorInfo().* },
+                .errored => return .{ .errored = self.cachedErrorInfo() },
                 .unresolved => {
                     const prev = self.state.cmpxchgWeak(
                         @intFromEnum(ThunkState.unresolved),
@@ -260,23 +265,16 @@ pub const Thunk = struct {
         self.wakeFiberWaiters();
     }
 
-    /// Cache a deterministic body failure on the thunk and wake waiters.
-    /// `message` (if non-null) must be heap-owned by `allocator`;
-    /// ownership transfers to the thunk and is freed in
-    /// `ObjectHeap.deinit`. The `ErrorInfo` struct is also allocated
-    /// from `allocator` and freed the same way.
+    /// Publish a deterministic body failure and wake waiters. The
+    /// caller owns `info` (and any heap-allocated `info.message`) — by
+    /// convention the heap that owns this thunk also tracks `info` so
+    /// it can release the storage at deinit time. See
+    /// `ObjectHeap.trackErroredInfo`.
     ///
     /// Memory model: the info pointer is written into `result.payload`
     /// before the release-store of `state → errored`, so any reader
     /// that acquires `.errored` sees a valid pointer.
-    pub fn errored(
-        self: *Thunk,
-        allocator: std.mem.Allocator,
-        err: anyerror,
-        message: ?[]const u8,
-    ) !void {
-        const info = try allocator.create(ErrorInfo);
-        info.* = .{ .err = err, .message = message };
+    pub fn markErrored(self: *Thunk, info: *ErrorInfo) void {
         // Sidecar storage: `result` is unused while errored, so its
         // payload slot doubles as the `*ErrorInfo` pointer. Keeps the
         // Thunk struct narrow for the common (resolved) case.
@@ -475,24 +473,26 @@ test "thunk: errored caches error and replays on next force" {
         else => return error.UnexpectedOutcome,
     }
     const owned_msg = try allocator.dupe(u8, "bad value");
-    try thunk.errored(allocator, error.NixThrow, owned_msg);
+    const info = try allocator.create(ErrorInfo);
+    info.* = .{ .err = error.NixThrow, .message = owned_msg };
+    thunk.markErrored(info);
 
     switch (thunk.tryForce(makeClaimer(0, 1))) {
-        .errored => |info| {
-            try std.testing.expectEqual(@as(anyerror, error.NixThrow), info.err);
-            try std.testing.expect(info.message != null);
-            try std.testing.expectEqualStrings("bad value", info.message.?);
+        .errored => |got| {
+            try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err);
+            try std.testing.expect(got.*.message != null);
+            try std.testing.expectEqualStrings("bad value", got.*.message.?);
         },
         else => return error.ExpectedErroredOutcome,
     }
     // Replay is idempotent.
     switch (thunk.tryForce(makeClaimer(0, 2))) {
-        .errored => |info| try std.testing.expectEqual(@as(anyerror, error.NixThrow), info.err),
+        .errored => |got| try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err),
         else => return error.ExpectedErroredOutcome,
     }
 }
 
-/// Test helper: mirrors `ObjectHeap.freeThunkErrorMessages` for thunks
+/// Test helper: mirrors `ObjectHeap`'s sidecar cleanup for thunks
 /// constructed outside the heap. Walks the test thunk's sidecar info
 /// (if any) and releases its allocations.
 fn freeErroredInfoForTest(thunk: *Thunk, allocator: std.mem.Allocator) void {
@@ -516,7 +516,9 @@ test "thunk: errored wakes enrolled waiters" {
             }
             claimed_signal.store(1, .release);
             while (go.load(.acquire) == 0) std.atomic.spinLoopHint();
-            th.errored(alloc, error.NixThrow, null) catch {};
+            const info = alloc.create(ErrorInfo) catch return;
+            info.* = .{ .err = error.NixThrow, .message = null };
+            th.markErrored(info);
         }
     };
 

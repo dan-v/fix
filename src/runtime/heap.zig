@@ -153,6 +153,13 @@ pub const ObjectHeap = struct {
     /// One entry per worker (including the main thread). Indexed by
     /// `worker_id_mod.current`.
     worker_locals: []HeapLocal,
+    /// All `ErrorInfo` allocations produced by `Thunk.errored`, recorded
+    /// at publish time so `deinit` can release them in O(errored_thunks)
+    /// rather than walking every object slot. Almost always tiny — a
+    /// realistic NixOS toplevel produces ~hundreds of entries against a
+    /// heap of millions of objects.
+    errored_infos: std.ArrayListUnmanaged(*@import("thunk.zig").ErrorInfo),
+    errored_infos_mu: stable.SpinMutex,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
@@ -164,11 +171,13 @@ pub const ObjectHeap = struct {
             .attrs = .empty,
             .attr_positions = .empty,
             .worker_locals = locals,
+            .errored_infos = .empty,
+            .errored_infos_mu = .{},
         };
     }
 
     pub fn deinit(self: *ObjectHeap) void {
-        self.freeThunkErrorMessages();
+        self.freeErroredInfos();
         self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
         self.attrs.deinit(self.allocator);
@@ -176,45 +185,22 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
-    /// Thunks in the `.errored` state own a sidecar `ErrorInfo` struct
-    /// (and its optional message string) allocated from `self.allocator`.
-    /// Walk every object slot (skipping unfilled TLAB reservations the
-    /// same way `stats` does) and release the sidecar storage for any
-    /// thunk left in the errored state.
-    fn freeThunkErrorMessages(self: *ObjectHeap) void {
-        const thunk_mod = @import("thunk.zig");
-        var unfilled_starts: [256]u32 = undefined;
-        var unfilled_ends: [256]u32 = undefined;
-        var unfilled_count: usize = 0;
-        for (self.worker_locals) |local| {
-            if (local.object.cursor >= local.object.end) continue;
-            if (unfilled_count >= unfilled_starts.len) break;
-            unfilled_starts[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.cursor);
-            unfilled_ends[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.end);
-            unfilled_count += 1;
-        }
+    /// Record a freshly-allocated `ErrorInfo` so `deinit` can release it
+    /// without scanning the object store. Called by `Thunk.errored` via
+    /// the heap's tracker — see `vm/force.zig`'s `publishThunkFailure`.
+    pub fn trackErroredInfo(self: *ObjectHeap, info: *@import("thunk.zig").ErrorInfo) !void {
+        self.errored_infos_mu.lock();
+        defer self.errored_infos_mu.unlock();
+        try self.errored_infos.append(self.allocator, info);
+    }
 
-        const total = self.objects.count();
-        var id: u32 = 0;
-        scan: while (id < total) : (id += 1) {
-            for (unfilled_starts[0..unfilled_count], unfilled_ends[0..unfilled_count]) |s, e| {
-                if (id >= s and id < e) {
-                    id = e - 1;
-                    continue :scan;
-                }
-            }
-            const obj = self.objects.getMut(id);
-            switch (obj.payload) {
-                .thunk => |*t| {
-                    const state = t.state.load(.acquire);
-                    if (state != @intFromEnum(thunk_mod.ThunkState.errored)) continue;
-                    const info: *thunk_mod.ErrorInfo = @ptrFromInt(t.result.payload);
-                    if (info.message) |msg| self.allocator.free(msg);
-                    self.allocator.destroy(info);
-                },
-                else => {},
-            }
+    fn freeErroredInfos(self: *ObjectHeap) void {
+        // Single-threaded by the time deinit runs; no need to lock.
+        for (self.errored_infos.items) |info| {
+            if (info.message) |msg| self.allocator.free(msg);
+            self.allocator.destroy(info);
         }
+        self.errored_infos.deinit(self.allocator);
     }
 
     pub const Stats = struct {

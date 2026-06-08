@@ -119,8 +119,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             },
             .blackhole => return error.RecursiveThunk,
             .errored => |info| {
-                replayCachedMessage(self, info.message);
-                return info.err;
+                replayCachedMessage(self, info.*.message);
+                return info.*.err;
             },
             .claimed => {
                 trace_log.forceEnter(self.vm_trace, self.worker_id, thunk_id);
@@ -285,13 +285,29 @@ fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, e
         }
     }
     if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), owned_message);
-    thunk.errored(self.heap.allocator, err, owned_message) catch {
-        // Allocation failure: drop the message and fall back to a
-        // transient reset so a future force can retry under better
-        // memory conditions.
+    publishErrored(self, thunk, err, owned_message);
+}
+
+/// Allocate the sidecar `ErrorInfo`, register it with the heap so
+/// `ObjectHeap.deinit` can free it in O(errored_thunks), then transition
+/// the thunk into `.errored`. Falls back to `reset()` on any allocation
+/// failure so the next force can retry under better conditions.
+fn publishErrored(self: *VM, thunk: *thunk_mod.Thunk, err: anyerror, owned_message: ?[]const u8) void {
+    const info = self.heap.allocator.create(thunk_mod.ErrorInfo) catch {
         if (owned_message) |m| self.heap.allocator.free(m);
         thunk.reset();
+        return;
     };
+    info.* = .{ .err = err, .message = owned_message };
+    self.heap.trackErroredInfo(info) catch {
+        // Tracker grew via the heap allocator and failed; the info
+        // would leak if we left it dangling. Tear it down and reset.
+        if (owned_message) |m| self.heap.allocator.free(m);
+        self.heap.allocator.destroy(info);
+        thunk.reset();
+        return;
+    };
+    thunk.markErrored(info);
 }
 
 /// When a force observes a cached error, replay its message onto the
