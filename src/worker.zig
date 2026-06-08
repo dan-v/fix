@@ -217,36 +217,28 @@ pub const Worker = struct {
         return self.scheduler.isShutdown() or self.shutdown_requested.load(.acquire) != 0;
     }
 
-    /// Helper main loop. Repeatedly resumes ready fibers, allocates new
-    /// fibers for scheduler tasks, or parks until something happens.
+    /// Helper main loop. Drains until shutdown.
     pub fn run(self: *Worker) void {
         worker_id_mod.current = self.worker_id;
         while (!self.shouldStop()) {
-            if (self.popReady()) |f| {
-                self.runFiber(f);
+            if (self.drainStep() catch |err| {
+                std.log.err("worker {d} failed to allocate fiber: {s}", .{ self.worker_id, @errorName(err) });
                 continue;
-            }
-            if (self.pickTask()) |task| {
-                const f = self.acquireFreeFiber() catch |err| {
-                    std.log.err("worker {d} failed to allocate fiber: {s}", .{ self.worker_id, @errorName(err) });
-                    continue;
-                };
-                f.current_task = task;
-                f.inner.reset(slotEntry, @ptrCast(f));
-                f.state = .running;
-                self.runFiber(f);
-                continue;
-            }
+            }) continue;
             if (self.shouldStop()) break;
             self.parkAndAccount();
         }
     }
 
-    /// Drive a custom one-shot fiber to completion, draining the ready
-    /// list and scheduler tasks while it's suspended. Used by the main
-    /// thread to run the top-level evaluation (or a render/force entry
-    /// point) inside a fiber so its `.busy` collisions yield rather
-    /// than block the OS thread.
+    /// Drive a custom one-shot fiber to completion. Used by every
+    /// public entry on the Evaluator — top-level eval, render, force.
+    /// While the entry's fiber is suspended (waiting on a `.busy`
+    /// thunk), we still drain ready fibers + scheduler tasks, so the
+    /// owning OS thread participates in work-stealing the same way a
+    /// helper does. After the entry retires, we keep draining until
+    /// every fiber on this worker is back on the free list — leaving a
+    /// suspended fiber with a dangling waiter on a thunk past `deinit`
+    /// would corrupt the next caller.
     pub fn runTopLevel(
         self: *Worker,
         entry: fiber_mod.EntryFn,
@@ -259,45 +251,34 @@ pub const Worker = struct {
         top.state = .running;
         self.runFiber(top);
 
-        while (top.state != .free) {
-            if (self.popReady()) |f| {
-                self.runFiber(f);
-                continue;
-            }
-            if (self.pickTask()) |task| {
-                const f = try self.acquireFreeFiber();
-                f.current_task = task;
-                f.inner.reset(slotEntry, @ptrCast(f));
-                f.state = .running;
-                self.runFiber(f);
-                continue;
-            }
+        while (top.state != .free or self.anyFiberSuspended()) {
+            if (try self.drainStep()) continue;
             self.parkAndAccount();
         }
-
-        // The top fiber has retired to free. Drain any remaining
-        // suspended fibers before returning so their waiter pointers
-        // don't dangle on thunk lists past `deinit`.
-        while (self.anyFiberSuspended()) {
-            if (self.popReady()) |f| {
-                self.runFiber(f);
-                continue;
-            }
-            if (self.pickTask()) |task| {
-                const f = try self.acquireFreeFiber();
-                f.current_task = task;
-                f.inner.reset(slotEntry, @ptrCast(f));
-                f.state = .running;
-                self.runFiber(f);
-                continue;
-            }
-            self.parkAndAccount();
-        }
-        // The main thread's runTopLevel may exit without ever parking
-        // (helpers handle background work; main spins through ready
-        // fibers and returns). Flush so its timing is visible to
-        // `schedulerStats()` callers before the evaluator deinits.
+        // runTopLevel may exit without ever parking (helpers handle
+        // background work; this thread spins through ready fibers and
+        // returns). Flush so its timing is visible to schedulerStats()
+        // callers before the evaluator deinits.
         self.flushTimingToScheduler();
+    }
+
+    /// One iteration of the drain loop shared by `run` and
+    /// `runTopLevel`. Returns true if it did anything; false if there's
+    /// no work and the caller should park.
+    fn drainStep(self: *Worker) !bool {
+        if (self.popReady()) |f| {
+            self.runFiber(f);
+            return true;
+        }
+        if (self.pickTask()) |task| {
+            const f = try self.acquireFreeFiber();
+            f.current_task = task;
+            f.inner.reset(slotEntry, @ptrCast(f));
+            f.state = .running;
+            self.runFiber(f);
+            return true;
+        }
+        return false;
     }
 
     /// Resume the fiber and update bookkeeping based on what state it
