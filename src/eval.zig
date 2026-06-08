@@ -214,6 +214,19 @@ pub const Evaluator = struct {
         source: []const u8,
         source_path: ?[]const u8,
     ) !ChunkId {
+        return self.parseAndCompile(source, self.base_path, source_path, null);
+    }
+
+    /// Parse + compile + register, returning the compiled chunk id.
+    /// Shared by `compileSource` (public, no eval) and `evaluateSource`
+    /// (the internal eval entrypoint that runs the chunk afterwards).
+    fn parseAndCompile(
+        self: *Evaluator,
+        source: []const u8,
+        base_path: ?[]const u8,
+        source_path: ?[]const u8,
+        scope: ?Value,
+    ) !ChunkId {
         const subject = source_path orelse "expression";
 
         var arena = @import("ast.zig").AstArena.init(self.allocator);
@@ -241,14 +254,14 @@ pub const Evaluator = struct {
             source,
             &self.intern,
         );
-        compiler.base_path = self.base_path;
+        compiler.base_path = base_path;
         compiler.source_path = source_path;
         defer compiler.deinit();
 
         {
             self.progressBegin(.compile, subject);
             defer self.progressEnd(.compile, subject);
-            compiler.compileAndFinish(ast_node, null) catch |err| {
+            compiler.compileAndFinish(ast_node, scope) catch |err| {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 return err;
             };
@@ -314,66 +327,21 @@ pub const Evaluator = struct {
         source_path: ?[]const u8,
         scope: ?Value,
     ) !Value {
+        const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         const subject = source_path orelse "expression";
-
-        // 1. Parse into AST.
-        var arena = @import("ast.zig").AstArena.init(self.allocator);
-        defer arena.deinit();
-
-        var parser = parser_mod.Parser.init(self.allocator, &arena, source);
-        defer parser.deinit();
-
-        const ast_node = blk: {
-            self.progressBegin(.parse, subject);
-            defer self.progressEnd(.parse, subject);
-            break :blk parser.parse() catch {
-                try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
-                return error.ParseError;
-            };
-        };
-
-        // 2. Compile AST to bytecode.
-        var builder = try ChunkBuilder.init(self.allocator);
-        defer builder.deinit(self.allocator);
-
-        var compiler = @import("compiler.zig").Compiler.init(
-            self.allocator,
-            &builder,
-            &self.registry,
-            source,
-            &self.intern,
-        );
-        compiler.base_path = base_path;
-        compiler.source_path = source_path;
-        defer compiler.deinit();
-
-        {
-            self.progressBegin(.compile, subject);
-            defer self.progressEnd(.compile, subject);
-            compiler.compileAndFinish(ast_node, scope) catch |err| {
-                try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
-                return err;
-            };
-        }
-
-        const chunk = try builder.finish(self.allocator, compiler.slot_count);
-        const chunk_id = try self.registry.register(chunk);
-
-        // 3. Evaluate via a VM. Only the *top-level* eval (called from
-        // `Evaluator.evaluate`) goes through a main-thread fiber so the
-        // main thread can yield on a `.busy` thunk; nested invocations
-        // (imports, scoped imports) run synchronously on the existing
-        // fiber's stack — they share the outer VM's claim identity via
-        // default placeholder claimer that `initVm` hands out.
+        self.progressBegin(.evaluate, subject);
+        defer self.progressEnd(.evaluate, subject);
+        // Only the top-level eval (no scope, no source_path) goes
+        // through a main-thread fiber so the main thread can yield on
+        // a `.busy` thunk; nested invocations (imports, scoped
+        // imports) run synchronously on the existing fiber's stack —
+        // they share the outer VM's claim identity via the default
+        // placeholder claimer that `initVm` hands out.
         if (scope == null and source_path == null) {
-            self.progressBegin(.evaluate, subject);
-            defer self.progressEnd(.evaluate, subject);
             return self.runChunkOnMainWorker(chunk_id);
         }
         var vm = try self.initVm(0);
         defer vm.deinit();
-        self.progressBegin(.evaluate, subject);
-        defer self.progressEnd(.evaluate, subject);
         return vm.eval(chunk_id);
     }
 
