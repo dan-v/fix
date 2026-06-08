@@ -22,6 +22,20 @@ pub const Task = union(enum) {
     /// Speculatively force a thunk to its result. The thunk lives in the
     /// shared ObjectHeap; ObjectId identifies it.
     force_thunk: types.ObjectId,
+    /// Force a contiguous range of items from a list. Used by consumer-
+    /// side fan-out so each scheduled task pays the queue + wake overhead
+    /// once for a meaningful chunk of work instead of once per thunk.
+    /// The helper looks up `list_id` in the heap, iterates
+    /// `items[offset..offset+len]`, and forces each thunk-typed slot.
+    /// `len` is u8 — batches are O(10s) of items; longer lists submit
+    /// multiple batched tasks.
+    force_list_range: ForceListRange,
+};
+
+pub const ForceListRange = struct {
+    list_id: types.ObjectId,
+    offset: u32,
+    len: u8,
 };
 
 /// Bounded ring-buffer task queue protected by a `SpinMutex`.
@@ -544,6 +558,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[helper_idx].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
+                    .force_list_range => 0,
                 }, .acq_rel);
             }
         }

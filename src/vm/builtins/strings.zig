@@ -37,8 +37,9 @@ pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !
     const list = try vm_force.forceValue(self, list_arg);
     if (!isPlainString(sep_value) or list.discriminant != .list) return error.TypeError;
 
-    const items = try self.heap.getList(list.asObjectId());
-    vm_force.fanOutListShallow(self, items);
+    const list_id = list.asObjectId();
+    const items = try self.heap.getList(list_id);
+    vm_force.fanOutListShallow(self, list_id, items);
     const item_values = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(item_values);
     for (items, item_values) |item, *value| value.* = try coerceStringContextValue(self, item);

@@ -455,26 +455,33 @@ fn slotEntry(arg: *anyopaque) void {
     f.vm.frames_len = 0;
     const task = f.current_task orelse return;
     f.current_task = null;
+    // Speculative work must NOT touch the user-facing error trace. A
+    // speculative `throw` (legitimate in a Nix expression's branch that
+    // wouldn't have been selected by demand-driven eval) otherwise
+    // pollutes the shared trace and surfaces as the user-visible error
+    // message, masking the actual root cause.
+    //
+    // We still need a place to capture the error message so sticky-
+    // error caching on the thunk preserves it. Point the VM trace at
+    // this fiber's local scratch trace for the duration of the work;
+    // `forceThunkImpl` reads from it on failure and copies the message
+    // onto the thunk.
+    const saved_trace = f.vm.trace;
+    f.local_trace.clear();
+    f.vm.trace = &f.local_trace;
+    defer f.vm.trace = saved_trace;
     switch (task) {
         .force_thunk => |thunk_id| {
-            // Speculative work must NOT touch the user-facing error
-            // trace. A speculative `throw` (legitimate in a Nix
-            // expression's branch that wouldn't have been selected by
-            // demand-driven eval) otherwise pollutes the shared trace
-            // and surfaces as the user-visible error message, masking
-            // the actual root cause.
-            //
-            // We still need a place to capture the error message so
-            // sticky-error caching on the thunk preserves it. Point the
-            // VM trace at this fiber's local scratch trace for the
-            // duration of the speculation: `forceThunkImpl` reads from
-            // it on failure and copies the message onto the thunk.
-            const saved_trace = f.vm.trace;
-            f.local_trace.clear();
-            f.vm.trace = &f.local_trace;
-            defer f.vm.trace = saved_trace;
             const v = Value.thunk(thunk_id);
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
+        },
+        .force_list_range => |range| {
+            const items = f.vm.heap.getList(range.list_id) catch return;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
+            for (items[range.offset..end]) |item| {
+                if (item.discriminant != .thunk) continue;
+                _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
+            }
         },
     }
 }

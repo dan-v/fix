@@ -82,7 +82,7 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
             const id = forced.asObjectId();
             if (!try enterDeep(self, .list, id, seen)) return;
             const items = try self.heap.getList(id);
-            fanOutListShallow(self, items);
+            fanOutListShallow(self, id, items);
             for (items) |item| try forceDeepInner(self, item, seen);
         },
         .attrs => {
@@ -96,37 +96,53 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
     }
 }
 
-/// Demand-driven fan-out: urgently submit a shallow force_thunk for every
-/// thunk-typed item to helpers. The caller is about to walk every item
-/// itself, so this is guaranteed work, not speculation — whoever loses
-/// the race (helper or main) sees `.already_resolved` and proceeds. We
-/// stop submitting once a push fails, since `submitUrgent` only returns
-/// false when every helper queue is full and the caller will pick up the
-/// remainder inline.
+/// Demand-driven fan-out: urgently queue each thunk-typed item from a
+/// list (or attrset) for forcing by helpers. The caller is about to
+/// walk every item itself, so this is guaranteed work, not speculation
+/// — whoever loses the race sees `.already_resolved` and proceeds.
 ///
 /// Public because builtins that strictly walk a list (concatStringsSep,
 /// concatLists, foldl', concatMap, filter, sort, etc.) get the same
 /// benefit as forceDeep — main is about to touch every item, so getting
 /// helpers started early is free.
+
 /// Below this threshold, the caller can force the items itself faster
-/// than the round-trip through the scheduler (submitUrgent + helper
-/// wake + fiber resume). Chosen empirically; most "small" lists in a
-/// NixOS toplevel sit at 2–4 items (helper queue cap of 16 entries per
-/// helper is plenty when each task is substantial).
+/// than the round-trip through the scheduler (submit + helper wake +
+/// fiber resume). Chosen empirically; most "small" lists in a NixOS
+/// toplevel sit at 2-4 items.
 const fan_out_min_items: usize = 4;
 
-pub fn fanOutListShallow(self: *VM, items: []const Value) void {
+/// Items-per-batch when submitting `force_list_range` tasks. With
+/// average per-thunk force ≈ 15 µs, an 8-item batch lands at ~120 µs
+/// of helper work — comfortably above the per-task scheduling overhead
+/// without serialising the list too coarsely. The scheduler queue is
+/// sized in tasks, not items, so batching also lets a fixed-cap queue
+/// describe much more pending work.
+const fan_out_batch_items: u8 = 16;
+
+pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
     if (self.in_speculation) return;
     if (items.len < fan_out_min_items) return;
-    for (items) |v| {
-        if (v.discriminant != .thunk) continue;
-        if (!self.scheduler.submitUrgent(.{ .force_thunk = v.asObjectId() })) break;
+    var offset: u32 = 0;
+    while (offset < items.len) {
+        const remaining = items.len - offset;
+        const this_len: u8 = @intCast(@min(@as(usize, fan_out_batch_items), remaining));
+        if (!self.scheduler.submitUrgent(.{ .force_list_range = .{
+            .list_id = list_id,
+            .offset = offset,
+            .len = this_len,
+        } })) break;
+        offset += this_len;
     }
 }
 
 pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
     if (self.in_speculation) return;
     if (entries.len < fan_out_min_items) return;
+    // No batched task type for attrs yet (the heap currently lays out
+    // attrs as a slice indexed by position, but we'd need a separate
+    // task variant). Attrsets in real evals tend to be smaller than
+    // lists; one-task-per-thunk is fine for now.
     for (entries) |entry| {
         if (entry.value.discriminant != .thunk) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;

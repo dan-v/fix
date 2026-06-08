@@ -38,8 +38,9 @@ pub fn builtinConcatLists(self: anytype, arg: Value) !Value {
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
 
-    const lists = try self.heap.getList(value.asObjectId());
-    vm_force.fanOutListShallow(self, lists);
+    const list_id = value.asObjectId();
+    const lists = try self.heap.getList(list_id);
+    vm_force.fanOutListShallow(self, list_id, lists);
     for (lists) |list_item| {
         const list = try vm_force.forceValue(self, list_item);
         if (list.discriminant != .list) return error.TypeError;
