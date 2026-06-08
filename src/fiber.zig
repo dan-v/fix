@@ -28,12 +28,20 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 comptime {
     if (builtin.cpu.arch != .x86_64) {
         @compileError("fiber.zig currently only supports x86_64");
     }
 }
+
+/// Sentinel-fill the stack at init so `maxStackUsedBytes` can find the
+/// deepest byte the fiber ever touched. Off by default: the fill forces
+/// the OS to commit every page eagerly, which defeats the lazy-commit
+/// model `init` relies on. Turn on with `-Dfiber-stack-probe` when you
+/// want to size stacks against a representative workload.
+pub const stack_probe_enabled: bool = build_options.fiber_stack_probe;
 
 /// Callee-saved register set + saved stack pointer.
 /// Layout must match src/fiber/swap_x86_64.S exactly.
@@ -86,36 +94,29 @@ pub const Fiber = struct {
     /// not outlive the `resume_` call.
     caller_ctx: ?*Context,
 
-    /// Default fiber stack size. The watermark probe on a representative
-    /// NixOS toplevel evaluation tops out at ~1.7 MiB in ReleaseFast; we
-    /// round up to 3 MiB so we have nearly 2× headroom for evaluations
-    /// with deeper import chains or builtins.
-    ///
-    /// Debug builds have significantly larger Zig stack frames (no
-    /// inlining, more spills, runtime safety locals) and overflow the
-    /// release-sized stack on the same workload, so we hand them a
-    /// larger budget. This is a stopgap — the sentinel-fill in `init`
-    /// commits every page eagerly, so 16 MiB × N fibers really
-    /// materialises in RSS. A follow-up will move to lazily-committed
-    /// virtual stacks so we can provision generously without paying.
-    pub const min_stack_bytes: usize = if (@import("builtin").mode == .Debug)
-        16 * 1024 * 1024
-    else
-        3 * 1024 * 1024;
+    /// Per-fiber stack reservation. Provisioned as a virtual mapping
+    /// (PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE) — the kernel
+    /// demand-pages it, so RSS scales with actual depth touched, not
+    /// the full reservation. 8 MiB gives every worker thousands of
+    /// frames of headroom on any realistic workload while costing ~0
+    /// physical memory until the fiber recurses deeply.
+    pub const min_stack_bytes: usize = 8 * 1024 * 1024;
 
-    /// Sentinel byte pattern written to a freshly-allocated stack so
-    /// `maxStackUsedBytes` can find the deepest byte the fiber ever
-    /// touched. 0xAA chosen because it's distinctive in hex dumps and
-    /// doesn't match common ASCII or zero-initialised data.
+    /// Sentinel byte pattern written to a freshly-allocated stack when
+    /// `-Dfiber-stack-probe` is on so `maxStackUsedBytes` can find the
+    /// deepest byte the fiber ever touched. 0xAA chosen because it's
+    /// distinctive in hex dumps and doesn't match common ASCII or
+    /// zero-initialised data.
     pub const stack_sentinel: u8 = 0xAA;
 
     /// Scan the stack for the first non-sentinel byte starting from the
     /// low (deep) end. Returns the number of bytes between that byte and
     /// the high (top) end — the high-water mark across every task the
-    /// fiber has run on this stack. Use this to size production
-    /// stacks: pick a value comfortably above the max observed across a
-    /// representative workload.
+    /// fiber has run on this stack. Returns 0 unless built with
+    /// `-Dfiber-stack-probe` (without the sentinel-fill, "non-zero" is
+    /// not a reliable signal that the byte was touched by the fiber).
     pub fn maxStackUsedBytes(self: *const Fiber) usize {
+        if (comptime !stack_probe_enabled) return 0;
         for (self.stack, 0..) |b, i| {
             if (b != stack_sentinel) return self.stack.len - i;
         }
@@ -125,15 +126,31 @@ pub const Fiber = struct {
     /// Allocate a fiber with its own stack and prepare it to invoke
     /// `entry(arg)` on first resume.
     ///
-    /// The fiber owns the stack allocation; `deinit` frees it.
+    /// The fiber's stack is mmapped directly rather than going through
+    /// the supplied allocator: we want the kernel's lazy commit
+    /// behaviour, and an mmap reservation is a much better fit for
+    /// "huge virtual region, tiny working set" than the general-purpose
+    /// allocator's heap. The allocator parameter is kept for API
+    /// symmetry with `deinit` (which it likewise ignores).
     pub fn init(allocator: std.mem.Allocator, stack_bytes: usize, entry: EntryFn, arg: *anyopaque) !Fiber {
-        const stack = try allocator.alignedAlloc(u8, .@"16", stack_bytes);
-        errdefer allocator.free(stack);
-        // Sentinel-fill the stack so `maxStackUsedBytes` can find the
-        // deepest byte the fiber ever touched. The probe is cheap to
-        // read once per worker shutdown; the one-time memset cost is
-        // amortised across every task the fiber ever runs.
-        @memset(stack, stack_sentinel);
+        _ = allocator;
+        const page_size = std.heap.pageSize();
+        const aligned_len = std.mem.alignForward(usize, stack_bytes, page_size);
+        const stack_raw = std.posix.mmap(
+            null,
+            aligned_len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return error.OutOfMemory;
+        const stack: []u8 = stack_raw[0..aligned_len];
+        errdefer std.posix.munmap(@alignCast(stack));
+        if (comptime stack_probe_enabled) {
+            // Probe mode: pay the eager-commit cost so the watermark
+            // scan in `maxStackUsedBytes` can identify untouched pages.
+            @memset(stack, stack_sentinel);
+        }
 
         var fiber: Fiber = .{
             .ctx = .{},
@@ -162,9 +179,10 @@ pub const Fiber = struct {
     }
 
     pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
+        _ = allocator;
         // A live fiber whose stack is freed will crash on resume; the
         // caller must arrange shutdown semantics.
-        allocator.free(self.stack);
+        std.posix.munmap(@alignCast(self.stack));
         self.* = undefined;
     }
 
