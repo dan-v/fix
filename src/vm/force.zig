@@ -108,8 +108,16 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 /// concatLists, foldl', concatMap, filter, sort, etc.) get the same
 /// benefit as forceDeep — main is about to touch every item, so getting
 /// helpers started early is free.
+/// Below this threshold, the caller can force the items itself faster
+/// than the round-trip through the scheduler (submitUrgent + helper
+/// wake + fiber resume). Chosen empirically; most "small" lists in a
+/// NixOS toplevel sit at 2–4 items (helper queue cap of 16 entries per
+/// helper is plenty when each task is substantial).
+const fan_out_min_items: usize = 4;
+
 pub fn fanOutListShallow(self: *VM, items: []const Value) void {
     if (self.in_speculation) return;
+    if (items.len < fan_out_min_items) return;
     for (items) |v| {
         if (v.discriminant != .thunk) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = v.asObjectId() })) break;
@@ -118,6 +126,7 @@ pub fn fanOutListShallow(self: *VM, items: []const Value) void {
 
 pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
     if (self.in_speculation) return;
+    if (entries.len < fan_out_min_items) return;
     for (entries) |entry| {
         if (entry.value.discriminant != .thunk) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
