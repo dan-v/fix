@@ -481,6 +481,14 @@ pub const ObjectHeap = struct {
         };
     }
 
+    /// Skip the tagged-union dispatch when the caller has already
+    /// observed `Value.discriminant == .thunk` and can therefore prove
+    /// the object slot is a thunk. The release build elides the
+    /// generated tag check; debug builds keep it.
+    pub fn getThunkAssumeValid(self: *ObjectHeap, id: ObjectId) *Thunk {
+        return &self.get(id).thunk;
+    }
+
     pub fn addList(self: *ObjectHeap, items: []const Value) !ObjectId {
         const range = try self.reserveValuesLocal(@intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);

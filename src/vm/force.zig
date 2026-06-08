@@ -41,8 +41,10 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // the resolved-check into the caller's bytecode dispatch saves the
     // forceThunkImpl call frame on the hottest path. Everything else
     // (claimed/busy/blackhole/errored) goes through the full function.
-    const thunk_id = value.asObjectId();
-    const thunk = try self.heap.getThunk(thunk_id);
+    // `getThunkAssumeValid` skips the tagged-union dispatch — we just
+    // matched on `discriminant == .thunk`, so the object slot must be
+    // a `Thunk`.
+    const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
     const state = thunk.state.load(.acquire);
     if (state == @intFromEnum(thunk_mod.ThunkState.resolved)) {
         if (demand) thunk.markDemanded();
@@ -120,7 +122,7 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     const thunk_id = thunk_val.asObjectId();
-    const thunk = try self.heap.getThunk(thunk_id);
+    const thunk = self.heap.getThunkAssumeValid(thunk_id);
 
     while (true) {
         switch (thunk.tryForce(self.claimer_id)) {
