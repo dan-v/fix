@@ -1,3 +1,22 @@
+//! Threaded bytecode dispatcher.
+//!
+//! Every opcode is a small standalone function with the signature
+//! `fn (vm, frame, code, ip, stop_depth) anyerror!Value`. Each handler
+//! does its per-opcode work and tail-calls `dispatch`, which reads the
+//! next opcode byte and tail-calls its handler via a static table.
+//!
+//! `@call(.always_tail, ...)` forces LLVM to emit a `jmp` rather than a
+//! `call`, so handlers never push frames — the whole dispatch chain
+//! reuses a single stack frame established by the outermost `runUntil`.
+//!
+//! Why threaded code rather than one giant switch: a 70-arm switch
+//! becomes a single ~32 KB function. LLVM's register allocator gives up
+//! aggressive slot coloring at that size, so adding a single case grew
+//! the stack frame by 16 bytes for *every* arm. Splitting handlers into
+//! small standalone functions lets the compiler allocate registers
+//! locally per handler, eliminates the per-arm spill amortisation cost,
+//! and makes adding cases genuinely free at the codegen level.
+
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("../runtime/types.zig");
@@ -21,684 +40,953 @@ const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
+const Frame = vm_mod.Frame;
 const opcode_profile_enabled = vm_mod.opcode_profile_enabled;
 const readU16 = vm_mod.readU16;
 const readU32 = vm_mod.readU32;
 
-// ---- main loop ----
+const HandlerFn = *const fn (*VM, *Frame, []const u8, usize, usize) anyerror!void;
 
-pub fn run(self: *VM) anyerror!Value {
-    return runUntil(self, 0);
+// ---- entry points ----
+//
+// Handlers return `anyerror!void` because `anyerror!Value` is 24 bytes
+// on x86-64 SysV, which forces the ABI to return-by-sret-pointer,
+// which in turn prevents LLVM from `musttail`-jumping between handlers
+// (sret slot wouldn't match across the chain). Instead each handler
+// either pushes its produced value onto the VM's value stack (the
+// normal case) or leaves the dispatch chain via a normal return when
+// the chunk's frame is popped. `runUntil` pops the final result off
+// `vm.stack` and hands it back to its caller.
+
+pub fn run(vm: *VM) anyerror!Value {
+    return runUntil(vm, 0);
 }
 
-pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
-    var frame = stack.currentFrame(self);
-    var code = frame.chunk_ptr.code;
-    // Hoist `frame.ip` into a register-priority local. Per-opcode
-    // reads/writes were forcing the compiler to spill the code-ptr
-    // around dispatch (~9% of runUntil samples landed on the single
-    // spill instruction). The errdefer keeps frame.ip authoritative
-    // on the error path, where `errors.captureErrorTrace` walks the
-    // frame stack expecting accurate per-frame ip values.
-    var ip: usize = frame.ip;
-    errdefer frame.ip = ip;
-    while (true) {
-        debug.checkVm(self, "runUntil top");
-        debug.checkFrameSync(self, frame, code, "runUntil top");
-        if (ip >= code.len) break;
+pub fn runUntil(vm: *VM, stop_depth: usize) anyerror!Value {
+    const frame = stack.currentFrame(vm);
+    try dispatchEntry(vm, frame, frame.chunk_ptr.code, frame.ip, stop_depth);
+    return stack.pop(vm);
+}
 
-        const op: OpCode = @enumFromInt(code[ip]);
-        if (comptime opcode_profile_enabled) self.opcode_counts[@intFromEnum(op)] += 1;
-        trace_log.op(self.vm_trace, self.worker_id, self.frames_len, frame.chunk_id, @intCast(ip), op, self.sp);
-        ip += 1;
+/// Non-inline trampoline so `runUntil` (sig: `(vm, stop_depth)`) can
+/// kick off the dispatch chain without violating the
+/// matching-signature requirement of `@call(.always_tail)`. The body
+/// is just an inlined `dispatch`, which ends in a tail call to the
+/// first handler — that tail call is *from* this function, whose sig
+/// matches the handler sig.
+fn dispatchEntry(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
 
-        switch (op) {
-            .constant => {
-                const idx_low = code[ip];
-                const idx_high = code[ip + 1];
-                ip += 2;
-                const idx: u16 = @as(u16, idx_low) | (@as(u16, idx_high) << 8);
-                try stack.push(self, frame.chunk_ptr.constants[idx]);
-            },
+// ---- dispatch ----
 
-            .push_null => try stack.push(self, Value.null_val),
-            .push_true => try stack.push(self, Value.boolVal(true)),
-            .push_false => try stack.push(self, Value.boolVal(false)),
+/// Read the next opcode at `code[ip]` and tail-call its handler with
+/// `ip + 1` (so the handler sees `ip` pointing at the first operand
+/// byte). Inlined into every handler's epilogue so the dispatch chain
+/// is a sequence of direct tail-jumps — no per-handler stack frame.
+inline fn dispatch(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    if (ip >= code.len) return endOfCode(vm);
+    if (comptime debug.enabled) {
+        debug.checkVm(vm, "dispatch");
+        debug.checkFrameSync(vm, frame, code, "dispatch");
+    }
+    const op: OpCode = @enumFromInt(code[ip]);
+    if (comptime opcode_profile_enabled) vm.opcode_counts[@intFromEnum(op)] += 1;
+    if (comptime trace_log.enabled) {
+        trace_log.op(vm.vm_trace, vm.worker_id, vm.frames_len, frame.chunk_id, @intCast(ip), op, vm.sp);
+    }
+    return @call(.always_tail, handlers[@intFromEnum(op)], .{ vm, frame, code, ip + 1, stop_depth });
+}
 
-            .pop => {
-                _ = stack.pop(self);
-            },
+/// End of chunk reached without a `ret` — ensure there's at least one
+/// value on the stack for `runUntil` to pop.
+fn endOfCode(vm: *VM) anyerror!void {
+    if (vm.sp == 0) try stack.push(vm, Value.null_val);
+}
 
-            .get_local => {
-                const slot = code[ip];
-                ip += 1;
-                const raw = self.stack[frame.frame_base + slot];
-                const val = try force.forceValue(self, raw);
-                try stack.push(self, val);
-            },
-            .get_local_long => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const raw = self.stack[frame.frame_base + slot];
-                const val = try force.forceValue(self, raw);
-                try stack.push(self, val);
-            },
+// ---- handlers: stack ----
 
-            .capture_local => {
-                const slot = code[ip];
-                ip += 1;
-                const val = self.stack[frame.frame_base + slot];
-                try stack.push(self, val);
-            },
-            .capture_local_long => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const val = self.stack[frame.frame_base + slot];
-                try stack.push(self, val);
-            },
+fn opConstant(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const idx = readU16(code, ip);
+    try stack.push(vm, frame.chunk_ptr.constants[idx]);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
 
-            .capture_upvalue => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const upvalues = frame.upvalues orelse return error.MissingClosure;
-                try stack.push(self, upvalues[slot]);
-            },
+fn opPushNull(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    try stack.push(vm, Value.null_val);
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
 
-            .set_local => {
-                const slot = code[ip];
-                ip += 1;
-                const val = stack.pop(self);
-                stack.setStack(self, frame.frame_base + slot, val);
-            },
-            .set_local_long => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const val = stack.pop(self);
-                stack.setStack(self, frame.frame_base + slot, val);
-            },
+fn opPushTrue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    try stack.push(vm, Value.boolVal(true));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
 
-            .set_cell_local => {
-                const slot = code[ip];
-                ip += 1;
-                const val = stack.pop(self);
-                const cell_val = self.stack[frame.frame_base + slot];
-                if (cell_val.discriminant != .thunk) return error.TypeError;
-                const thunk = self.heap.getThunkAssumeValid(cell_val.asObjectId());
-                // The compiler initializes cells as pass-through thunks
-                // wrapping `null` and then sets them to their real RHS here.
-                // Update the wrapped value so the first force evaluates it.
-                thunk.target = .{ .pass_through = val };
-            },
-            .set_cell_local_long => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const val = stack.pop(self);
-                const cell_val = self.stack[frame.frame_base + slot];
-                if (cell_val.discriminant != .thunk) return error.TypeError;
-                const thunk = self.heap.getThunkAssumeValid(cell_val.asObjectId());
-                thunk.target = .{ .pass_through = val };
-            },
+fn opPushFalse(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    try stack.push(vm, Value.boolVal(false));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
 
-            .get_upvalue => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const upvalues = frame.upvalues orelse return error.MissingClosure;
-                const val = try force.forceValue(self, upvalues[slot]);
-                try stack.push(self, val);
-            },
+fn opPop(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    _ = stack.pop(vm);
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
 
-            // ---- integer arithmetic ----
-            .add_int => {
-                const b = try force.forceValue(self, stack.pop(self));
-                const a = try force.forceValue(self, stack.pop(self));
-                if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
-                    try stack.push(self, try numeric.add(a, b));
-                } else if (a.discriminant == .path) {
-                    try stack.push(self, try strings.concatPathLike(self, a, b));
-                } else {
-                    try stack.push(self, try strings.concatStringLike(self, a, b));
-                }
-            },
-            .sub_int => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, try numeric.sub(a, b));
-            },
-            .mul_int => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, try numeric.mul(a, b));
-            },
-            .div_int => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, try numeric.div(a, b));
-            },
-            .negate_int => {
-                const a = stack.pop(self);
-                try stack.push(self, try numeric.negate(a));
-            },
+// ---- handlers: locals ----
 
-            // ---- float arithmetic ----
-            .add_float => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.float(try numeric.toFloat(a) + try numeric.toFloat(b)));
-            },
-            .sub_float => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.float(try numeric.toFloat(a) - try numeric.toFloat(b)));
-            },
-            .mul_float => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.float(try numeric.toFloat(a) * try numeric.toFloat(b)));
-            },
-            .div_float => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.float(try numeric.toFloat(a) / try numeric.toFloat(b)));
-            },
-            // ---- comparison ----
-            .eq => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.boolVal(try equality.valuesEqual(self, a, b)));
-            },
-            .neq => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.boolVal(!try equality.valuesEqual(self, a, b)));
-            },
-            .lt => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.boolVal(try equality.compareValues(self, a, b) == .lt));
-            },
-            .lte => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                const r = try equality.compareValues(self, a, b);
-                try stack.push(self, Value.boolVal(r == .lt or r == .eq));
-            },
-            .gt => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                try stack.push(self, Value.boolVal(try equality.compareValues(self, a, b) == .gt));
-            },
-            .gte => {
-                const b = stack.pop(self);
-                const a = stack.pop(self);
-                const r = try equality.compareValues(self, a, b);
-                try stack.push(self, Value.boolVal(r == .gt or r == .eq));
-            },
+fn opGetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    const raw = vm.stack[frame.frame_base + slot];
+    const val = try force.forceValue(vm, raw);
+    try stack.push(vm, val);
+    return dispatch(vm, frame, code, ip + 1, stop_depth);
+}
 
-            // ---- logical ----
-            .not => {
-                const a = stack.pop(self);
-                try stack.push(self, Value.boolVal(!try expectBool(self, a)));
-            },
+fn opGetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const raw = vm.stack[frame.frame_base + slot];
+    const val = try force.forceValue(vm, raw);
+    try stack.push(vm, val);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
 
-            // ---- control flow ----
-            .jump => {
-                const offset = readU32(code, ip);
-                ip += 4;
-                ip += @as(usize, offset);
-            },
-            .jump_if_false => {
-                const offset = readU32(code, ip);
-                ip += 4;
-                const cond = self.stack[self.sp - 1];
-                if (!try expectBool(self, cond)) {
-                    ip += @as(usize, offset);
-                }
-            },
-            .fail_assertion => return error.AssertionFailed,
-            // ---- data structures ----
-            .build_attrs => {
-                const count: u16 = readU16(code, ip);
-                ip += 2;
-                try objects.buildAttrs(self, count);
-            },
-            .build_attrs_with_pos => {
-                const count: u16 = readU16(code, ip);
-                ip += 2;
-                const pos_count: u16 = readU16(code, ip);
-                ip += 2;
+fn opCaptureLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    try stack.push(vm, vm.stack[frame.frame_base + slot]);
+    return dispatch(vm, frame, code, ip + 1, stop_depth);
+}
 
-                var stack_positions: [32]heap_mod.AttrPosEntry = undefined;
-                const positions = if (pos_count <= stack_positions.len)
-                    stack_positions[0..pos_count]
-                else
-                    try self.allocator.alloc(heap_mod.AttrPosEntry, pos_count);
-                defer if (positions.ptr != stack_positions[0..].ptr) self.allocator.free(positions);
+fn opCaptureLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    try stack.push(vm, vm.stack[frame.frame_base + slot]);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
 
-                for (positions) |*position| {
-                    position.* = .{
-                        .name = readU32(code, ip),
-                        .pos = .{
-                            .file = readU32(code, ip + 4),
-                            .line = readU32(code, ip + 8),
-                            .column = readU32(code, ip + 12),
-                        },
-                    };
-                    ip += 16;
-                }
-                try objects.buildAttrsWithPositions(self, count, positions);
-            },
-            .build_list => {
-                const count: u16 = readU16(code, ip);
-                ip += 2;
-                try objects.buildList(self, count);
-            },
-            .merge_attrs => {
-                const right = stack.pop(self);
-                const left = stack.pop(self);
-                try stack.push(self, try objects.mergeAttrs(self, left, right));
-            },
-            .merge_attrs_strict => {
-                const right = stack.pop(self);
-                const left = stack.pop(self);
-                try stack.push(self, try objects.mergeAttrsStrict(self, left, right));
-            },
-            .concat_lists => {
-                const right = stack.pop(self);
-                const left = stack.pop(self);
-                try stack.push(self, try objects.concatLists(self, left, right));
-            },
-            .push_builtins => try stack.push(self, self.builtins),
-            .find_file => {
-                const name_id: u16 = readU16(code, ip);
-                ip += 2;
-                const host = self.import_host orelse return error.SearchPathUnavailable;
-                try stack.push(self, try host.find_file(host.context, self.intern.get(@intCast(name_id))));
-            },
-            .find_file_long => {
-                const name_id: InternId = readU32(code, ip);
-                ip += 4;
-                const host = self.import_host orelse return error.SearchPathUnavailable;
-                try stack.push(self, try host.find_file(host.context, self.intern.get(name_id)));
-            },
-            // ---- closure ----
-            .closure => {
-                const ch_id: u16 = readU16(code, ip);
-                ip += 2;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                try closures.makeClosure(self, ch_id, upvalue_count);
-            },
-            .closure_long => {
-                const ch_id: ChunkId = readU32(code, ip);
-                ip += 4;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                try closures.makeClosure(self, ch_id, upvalue_count);
-            },
-            .closure_captures => {
-                const ch_id: u16 = readU16(code, ip);
-                ip += 2;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
-                const descriptors = code[ip .. ip + descriptor_len];
-                ip += descriptor_len;
-                try closures.makeClosureFromCaptures(self, ch_id, descriptors, frame);
-            },
-            .closure_captures_long => {
-                const ch_id: ChunkId = readU32(code, ip);
-                ip += 4;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
-                const descriptors = code[ip .. ip + descriptor_len];
-                ip += descriptor_len;
-                try closures.makeClosureFromCaptures(self, ch_id, descriptors, frame);
-            },
-            .thunk_captures => {
-                const ch_id: u16 = readU16(code, ip);
-                ip += 2;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
-                const descriptors = code[ip .. ip + descriptor_len];
-                ip += descriptor_len;
-                try closures.makeBytecodeThunkFromCaptures(self, ch_id, descriptors, frame);
-            },
-            .thunk_captures_long => {
-                const ch_id: ChunkId = readU32(code, ip);
-                ip += 4;
-                const upvalue_count = readU16(code, ip);
-                ip += 2;
-                const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
-                const descriptors = code[ip .. ip + descriptor_len];
-                ip += descriptor_len;
-                try closures.makeBytecodeThunkFromCaptures(self, ch_id, descriptors, frame);
-            },
+fn opCaptureUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const upvalues = frame.upvalues orelse return error.MissingClosure;
+    try stack.push(vm, upvalues[slot]);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
 
-            // ---- calls ----
-            .call => {
-                // Sync ip back so doCall's pushed frame sits on a
-                // caller frame whose ip points at the next opcode.
-                frame.ip = ip;
-                const arg = stack.pop(self);
-                const callee = stack.pop(self);
-                try closures.doCall(self, callee, arg);
-                frame = stack.currentFrame(self);
-                code = frame.chunk_ptr.code;
-                ip = frame.ip;
-            },
-            .tail_call => {
-                frame.ip = ip;
-                const arg = stack.pop(self);
-                const callee = stack.pop(self);
-                try closures.doTailCall(self, callee, arg);
-                frame = stack.currentFrame(self);
-                code = frame.chunk_ptr.code;
-                ip = frame.ip;
-            },
-            // ---- thunks ----
-            .make_cell => {
-                const val = stack.pop(self);
-                try stack.push(self, try force.makeCell(self, val));
-            },
-            .init_cell_slot => {
-                const slot = code[ip];
-                ip += 1;
-                const cell = try force.makeCell(self, Value.null_val);
-                self.stack[frame.frame_base + slot] = cell;
-            },
-            .init_cell_slot_long => {
-                const slot = readU16(code, ip);
-                ip += 2;
-                const cell = try force.makeCell(self, Value.null_val);
-                self.stack[frame.frame_base + slot] = cell;
-            },
+fn opSetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    const val = stack.pop(vm);
+    stack.setStack(vm, frame.frame_base + slot, val);
+    return dispatch(vm, frame, code, ip + 1, stop_depth);
+}
 
-            // ---- attribute access ----
-            .get_attr => {
-                const name_id: u16 = readU16(code, ip);
-                ip += 2;
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrValue(self, attrs_val, @intCast(name_id));
-                try stack.push(self, result);
+fn opSetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const val = stack.pop(vm);
+    stack.setStack(vm, frame.frame_base + slot, val);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opSetCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    const val = stack.pop(vm);
+    const cell_val = vm.stack[frame.frame_base + slot];
+    if (cell_val.discriminant != .thunk) return error.TypeError;
+    const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+    thunk.target = .{ .pass_through = val };
+    return dispatch(vm, frame, code, ip + 1, stop_depth);
+}
+
+fn opSetCellLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const val = stack.pop(vm);
+    const cell_val = vm.stack[frame.frame_base + slot];
+    if (cell_val.discriminant != .thunk) return error.TypeError;
+    const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+    thunk.target = .{ .pass_through = val };
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const upvalues = frame.upvalues orelse return error.MissingClosure;
+    const val = try force.forceValue(vm, upvalues[slot]);
+    try stack.push(vm, val);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+// ---- handlers: integer arithmetic ----
+
+fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = try force.forceValue(vm, stack.pop(vm));
+    const a = try force.forceValue(vm, stack.pop(vm));
+    if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
+        try stack.push(vm, try numeric.add(a, b));
+    } else if (a.discriminant == .path) {
+        try stack.push(vm, try strings.concatPathLike(vm, a, b));
+    } else {
+        try stack.push(vm, try strings.concatStringLike(vm, a, b));
+    }
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opSubInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, try numeric.sub(a, b));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opMulInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, try numeric.mul(a, b));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opDivInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, try numeric.div(a, b));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opNegateInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const a = stack.pop(vm);
+    try stack.push(vm, try numeric.negate(a));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+// ---- handlers: float arithmetic ----
+
+fn opAddFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.float(try numeric.toFloat(a) + try numeric.toFloat(b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opSubFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.float(try numeric.toFloat(a) - try numeric.toFloat(b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opMulFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.float(try numeric.toFloat(a) * try numeric.toFloat(b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opDivFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.float(try numeric.toFloat(a) / try numeric.toFloat(b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+// ---- handlers: comparison ----
+
+fn opEq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try equality.valuesEqual(vm, a, b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opNeq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(!try equality.valuesEqual(vm, a, b)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opLt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try equality.compareValues(vm, a, b) == .lt));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opLte(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    const r = try equality.compareValues(vm, a, b);
+    try stack.push(vm, Value.boolVal(r == .lt or r == .eq));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opGt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try equality.compareValues(vm, a, b) == .gt));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opGte(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const b = stack.pop(vm);
+    const a = stack.pop(vm);
+    const r = try equality.compareValues(vm, a, b);
+    try stack.push(vm, Value.boolVal(r == .gt or r == .eq));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+// ---- handlers: logical ----
+
+fn opNot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const a = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(!try expectBool(vm, a)));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+// ---- handlers: control flow ----
+
+fn opJump(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const offset = readU32(code, ip);
+    return dispatch(vm, frame, code, ip + 4 + @as(usize, offset), stop_depth);
+}
+
+fn opJumpIfFalse(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const offset = readU32(code, ip);
+    var next_ip = ip + 4;
+    const cond = vm.stack[vm.sp - 1];
+    if (!try expectBool(vm, cond)) {
+        next_ip += @as(usize, offset);
+    }
+    return dispatch(vm, frame, code, next_ip, stop_depth);
+}
+
+fn opFailAssertion(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    _ = vm;
+    _ = frame;
+    _ = code;
+    _ = ip;
+    _ = stop_depth;
+    return error.AssertionFailed;
+}
+
+// ---- handlers: data structures ----
+
+fn opBuildAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    try objects.buildAttrs(vm, count);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opBuildAttrsWithPos(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    var cur_ip = ip + 2;
+    const pos_count = readU16(code, cur_ip);
+    cur_ip += 2;
+
+    var stack_positions: [32]heap_mod.AttrPosEntry = undefined;
+    const positions = if (pos_count <= stack_positions.len)
+        stack_positions[0..pos_count]
+    else
+        try vm.allocator.alloc(heap_mod.AttrPosEntry, pos_count);
+    defer if (positions.ptr != stack_positions[0..].ptr) vm.allocator.free(positions);
+
+    for (positions) |*position| {
+        position.* = .{
+            .name = readU32(code, cur_ip),
+            .pos = .{
+                .file = readU32(code, cur_ip + 4),
+                .line = readU32(code, cur_ip + 8),
+                .column = readU32(code, cur_ip + 12),
             },
-            .get_attr_long => {
-                const name_id: InternId = readU32(code, ip);
-                ip += 4;
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrValue(self, attrs_val, name_id);
-                try stack.push(self, result);
-            },
-            .get_attr_dynamic => {
-                const name_val = try force.forceValue(self, stack.pop(self));
-                if (name_val.discriminant != .string) return error.TypeError;
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrValue(self, attrs_val, name_val.asInternId());
-                try stack.push(self, result);
-            },
-            .get_attr_dynamic_or => {
-                const default_val = stack.pop(self);
-                const name_val = try force.forceValue(self, stack.pop(self));
-                if (name_val.discriminant != .string) return error.TypeError;
-                const attrs_val = stack.pop(self);
-                const attrs = try force.forceValue(self, attrs_val);
-                if (attrs.discriminant != .attrs) {
-                    try stack.push(self, try force.forceValue(self, default_val));
-                    continue;
-                }
-                const result = self.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
-                    error.MissingAttribute => try force.forceValue(self, default_val),
-                    else => return err,
-                };
-                try stack.push(self, try force.forceValue(self, result));
-            },
-            .get_attr_path_dynamic_or => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 2;
-                const default_val = stack.pop(self);
-                const name_val = stack.pop(self);
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..ip], false);
-                try stack.push(self, result);
-            },
-            .get_attr_path_dynamic_or_long => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 4;
-                const default_val = stack.pop(self);
-                const name_val = stack.pop(self);
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..ip], true);
-                try stack.push(self, result);
-            },
-            .get_attr_path_or => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 2;
-                const default_val = stack.pop(self);
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..ip], false);
-                try stack.push(self, result);
-            },
-            .get_attr_path_or_long => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 4;
-                const default_val = stack.pop(self);
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..ip], true);
-                try stack.push(self, result);
-            },
-            .get_attr_path_mixed_or => {
-                const segment_count = code[ip];
-                ip += 1;
-                const dynamic_count = code[ip];
-                ip += 1;
-                const segments_start = ip;
-                for (0..segment_count) |_| {
-                    const tag = code[ip];
-                    ip += 1;
-                    switch (tag) {
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => ip += 4,
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
-                        else => return error.InvalidBytecode,
-                    }
-                }
-                const default_val = stack.pop(self);
-                const dynamic_names = try self.allocator.alloc(Value, dynamic_count);
-                defer self.allocator.free(dynamic_names);
-                var dynamic_i: usize = dynamic_count;
-                while (dynamic_i > 0) {
-                    dynamic_i -= 1;
-                    dynamic_names[dynamic_i] = stack.pop(self);
-                }
-                const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathMixedOrValue(self, attrs_val, dynamic_names, default_val, code[segments_start..ip], segment_count);
-                try stack.push(self, result);
-            },
-            .has_attr_path => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 2;
-                const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..ip], false)));
-            },
-            .has_attr_path_long => {
-                const segment_count = code[ip];
-                ip += 1;
-                const names_start = ip;
-                ip += @as(usize, segment_count) * 4;
-                const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..ip], true)));
-            },
-            .has_attr_dynamic => {
-                const name_val = try force.forceValue(self, stack.pop(self));
-                if (name_val.discriminant != .string) return error.TypeError;
-                const attrs_val = try force.forceValue(self, stack.pop(self));
-                if (attrs_val.discriminant != .attrs) {
-                    try stack.push(self, Value.boolVal(false));
-                } else {
-                    const present = if (self.heap.getAttrValue(attrs_val.asObjectId(), name_val.asInternId())) |_|
-                        true
-                    else |err| switch (err) {
-                        error.MissingAttribute => false,
-                        else => return err,
-                    };
-                    try stack.push(self, Value.boolVal(present));
-                }
-            },
-            .has_attr_path_mixed => {
-                const segment_count = code[ip];
-                ip += 1;
-                const dynamic_count = code[ip];
-                ip += 1;
-                const segments_start = ip;
-                for (0..segment_count) |_| {
-                    const tag = code[ip];
-                    ip += 1;
-                    switch (tag) {
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => ip += 4,
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
-                        else => return error.InvalidBytecode,
-                    }
-                }
-                const dynamic_names = try self.allocator.alloc(Value, dynamic_count);
-                defer self.allocator.free(dynamic_names);
-                var dynamic_i: usize = dynamic_count;
-                while (dynamic_i > 0) {
-                    dynamic_i -= 1;
-                    dynamic_names[dynamic_i] = stack.pop(self);
-                }
-                const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPathMixed(self, attrs_val, dynamic_names, code[segments_start..ip], segment_count)));
-            },
-            .validate_attrs => {
-                const allow_extra = code[ip] != 0;
-                ip += 1;
-                const expected_count = readU16(code, ip);
-                ip += 2;
-                const names_start = ip;
-                ip += @as(usize, expected_count) * 2;
-                const attrs_val = stack.pop(self);
-                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..ip], false);
-            },
-            .validate_attrs_long => {
-                const allow_extra = code[ip] != 0;
-                ip += 1;
-                const expected_count = readU16(code, ip);
-                ip += 2;
-                const names_start = ip;
-                ip += @as(usize, expected_count) * 4;
-                const attrs_val = stack.pop(self);
-                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..ip], true);
-            },
-            .lookup_with => {
-                const name_id: InternId = @intCast(readU16(code, ip));
-                ip += 2;
-                const scope_count = code[ip];
-                ip += 1;
-                try access.lookupWith(self, name_id, scope_count);
-            },
-            .lookup_with_long => {
-                const name_id: InternId = readU32(code, ip);
-                ip += 4;
-                const scope_count = code[ip];
-                ip += 1;
-                try access.lookupWith(self, name_id, scope_count);
-            },
-            // ---- termination ----
-            .ret => {
-                // The frame about to be popped is ours — no need to
-                // sync ip back; popFrame discards the slot's
-                // contents.
-                const result = stack.pop(self);
-                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
-            },
-            // Fused value-producing + ret super-ops. Each computes
-            // the result inline and runs the same epilogue as `.ret`
-            // — one dispatch instead of two.
-            .constant_ret => {
-                const idx_low = code[ip];
-                const idx_high = code[ip + 1];
-                const idx: u16 = @as(u16, idx_low) | (@as(u16, idx_high) << 8);
-                const result = frame.chunk_ptr.constants[idx];
-                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
-            },
-            .get_local_ret => {
-                const slot = code[ip];
-                const raw = self.stack[frame.frame_base + slot];
-                const result = try force.forceValue(self, raw);
-                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
-            },
-            .get_local_ret_long => {
-                const slot = readU16(code, ip);
-                const raw = self.stack[frame.frame_base + slot];
-                const result = try force.forceValue(self, raw);
-                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
-            },
-            .get_upvalue_ret => {
-                const slot = readU16(code, ip);
-                const upvalues = frame.upvalues orelse return error.MissingClosure;
-                const result = try force.forceValue(self, upvalues[slot]);
-                if (try retEpilogue(self, stop_depth, result, &frame, &code, &ip)) |final| return final;
-            },
-            .halt => {
-                // Stop execution.
-                if (self.sp > 0) return stack.pop(self);
-                return Value.null_val;
-            },
+        };
+        cur_ip += 16;
+    }
+    try objects.buildAttrsWithPositions(vm, count, positions);
+    return dispatch(vm, frame, code, cur_ip, stop_depth);
+}
+
+fn opBuildList(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    try objects.buildList(vm, count);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opMergeAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const right = stack.pop(vm);
+    const left = stack.pop(vm);
+    try stack.push(vm, try objects.mergeAttrs(vm, left, right));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opMergeAttrsStrict(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const right = stack.pop(vm);
+    const left = stack.pop(vm);
+    try stack.push(vm, try objects.mergeAttrsStrict(vm, left, right));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opConcatLists(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const right = stack.pop(vm);
+    const left = stack.pop(vm);
+    try stack.push(vm, try objects.concatLists(vm, left, right));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opPushBuiltins(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    try stack.push(vm, vm.builtins);
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opFindFile(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id = readU16(code, ip);
+    const host = vm.import_host orelse return error.SearchPathUnavailable;
+    try stack.push(vm, try host.find_file(host.context, vm.intern.get(@intCast(name_id))));
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opFindFileLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id: InternId = readU32(code, ip);
+    const host = vm.import_host orelse return error.SearchPathUnavailable;
+    try stack.push(vm, try host.find_file(host.context, vm.intern.get(name_id)));
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
+// ---- handlers: closures and thunks ----
+
+fn opClosure(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id = readU16(code, ip);
+    const upvalue_count = readU16(code, ip + 2);
+    try closures.makeClosure(vm, ch_id, upvalue_count);
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
+fn opClosureLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id: ChunkId = readU32(code, ip);
+    const upvalue_count = readU16(code, ip + 4);
+    try closures.makeClosure(vm, ch_id, upvalue_count);
+    return dispatch(vm, frame, code, ip + 6, stop_depth);
+}
+
+fn opClosureCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id = readU16(code, ip);
+    const upvalue_count = readU16(code, ip + 2);
+    const descriptors_start = ip + 4;
+    const descriptor_len = @as(usize, upvalue_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame);
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
+fn opClosureCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id: ChunkId = readU32(code, ip);
+    const upvalue_count = readU16(code, ip + 4);
+    const descriptors_start = ip + 6;
+    const descriptor_len = @as(usize, upvalue_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame);
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
+fn opThunkCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id = readU16(code, ip);
+    const upvalue_count = readU16(code, ip + 2);
+    const descriptors_start = ip + 4;
+    const descriptor_len = @as(usize, upvalue_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
+fn opThunkCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id: ChunkId = readU32(code, ip);
+    const upvalue_count = readU16(code, ip + 4);
+    const descriptors_start = ip + 6;
+    const descriptor_len = @as(usize, upvalue_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
+// ---- handlers: calls ----
+
+fn opCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    // Sync ip back so doCall's pushed frame sits on a caller frame
+    // whose ip points at the next opcode.
+    _ = code;
+    frame.ip = ip;
+    const arg = stack.pop(vm);
+    const callee = stack.pop(vm);
+    try closures.doCall(vm, callee, arg);
+    const new_frame = stack.currentFrame(vm);
+    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
+fn opTailCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    _ = code;
+    frame.ip = ip;
+    const arg = stack.pop(vm);
+    const callee = stack.pop(vm);
+    try closures.doTailCall(vm, callee, arg);
+    const new_frame = stack.currentFrame(vm);
+    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
+// ---- handlers: thunks ----
+
+fn opMakeCell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const val = stack.pop(vm);
+    try stack.push(vm, try force.makeCell(vm, val));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opInitCellSlot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    const cell = try force.makeCell(vm, Value.null_val);
+    vm.stack[frame.frame_base + slot] = cell;
+    return dispatch(vm, frame, code, ip + 1, stop_depth);
+}
+
+fn opInitCellSlotLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const cell = try force.makeCell(vm, Value.null_val);
+    vm.stack[frame.frame_base + slot] = cell;
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+// ---- handlers: attribute access ----
+
+fn opGetAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id = readU16(code, ip);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrValue(vm, attrs_val, @intCast(name_id));
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opGetAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id: InternId = readU32(code, ip);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrValue(vm, attrs_val, name_id);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
+fn opGetAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_val = try force.forceValue(vm, stack.pop(vm));
+    if (name_val.discriminant != .string) return error.TypeError;
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrValue(vm, attrs_val, name_val.asInternId());
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opGetAttrDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const default_val = stack.pop(vm);
+    const name_val = try force.forceValue(vm, stack.pop(vm));
+    if (name_val.discriminant != .string) return error.TypeError;
+    const attrs_val = stack.pop(vm);
+    const attrs = try force.forceValue(vm, attrs_val);
+    if (attrs.discriminant != .attrs) {
+        try stack.push(vm, try force.forceValue(vm, default_val));
+    } else {
+        const result = vm.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
+            error.MissingAttribute => try force.forceValue(vm, default_val),
+            else => return err,
+        };
+        try stack.push(vm, try force.forceValue(vm, result));
+    }
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opGetAttrPathDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 2;
+    const default_val = stack.pop(vm);
+    const name_val = stack.pop(vm);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], false);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opGetAttrPathDynamicOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 4;
+    const default_val = stack.pop(vm);
+    const name_val = stack.pop(vm);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], true);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opGetAttrPathOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 2;
+    const default_val = stack.pop(vm);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], false);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opGetAttrPathOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 4;
+    const default_val = stack.pop(vm);
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], true);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opGetAttrPathMixedOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const dynamic_count = code[ip + 1];
+    const segments_start = ip + 2;
+    var cur_ip = segments_start;
+    for (0..segment_count) |_| {
+        const tag = code[cur_ip];
+        cur_ip += 1;
+        switch (tag) {
+            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => cur_ip += 4,
+            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
+            else => return error.InvalidBytecode,
         }
     }
-
-    return if (self.sp > 0) stack.pop(self) else Value.null_val;
+    const default_val = stack.pop(vm);
+    const dynamic_names = try vm.allocator.alloc(Value, dynamic_count);
+    defer vm.allocator.free(dynamic_names);
+    var dynamic_i: usize = dynamic_count;
+    while (dynamic_i > 0) {
+        dynamic_i -= 1;
+        dynamic_names[dynamic_i] = stack.pop(vm);
+    }
+    const attrs_val = stack.pop(vm);
+    const result = try access.getAttrPathMixedOrValue(vm, attrs_val, dynamic_names, default_val, code[segments_start..cur_ip], segment_count);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, cur_ip, stop_depth);
 }
+
+fn opHasAttrPath(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 2;
+    const attrs_val = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], false)));
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opHasAttrPathLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const names_start = ip + 1;
+    const names_end = names_start + @as(usize, segment_count) * 4;
+    const attrs_val = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], true)));
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opHasAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_val = try force.forceValue(vm, stack.pop(vm));
+    if (name_val.discriminant != .string) return error.TypeError;
+    const attrs_val = try force.forceValue(vm, stack.pop(vm));
+    if (attrs_val.discriminant != .attrs) {
+        try stack.push(vm, Value.boolVal(false));
+    } else {
+        const present = if (vm.heap.getAttrValue(attrs_val.asObjectId(), name_val.asInternId())) |_|
+            true
+        else |err| switch (err) {
+            error.MissingAttribute => false,
+            else => return err,
+        };
+        try stack.push(vm, Value.boolVal(present));
+    }
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opHasAttrPathMixed(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const segment_count = code[ip];
+    const dynamic_count = code[ip + 1];
+    const segments_start = ip + 2;
+    var cur_ip = segments_start;
+    for (0..segment_count) |_| {
+        const tag = code[cur_ip];
+        cur_ip += 1;
+        switch (tag) {
+            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => cur_ip += 4,
+            @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
+            else => return error.InvalidBytecode,
+        }
+    }
+    const dynamic_names = try vm.allocator.alloc(Value, dynamic_count);
+    defer vm.allocator.free(dynamic_names);
+    var dynamic_i: usize = dynamic_count;
+    while (dynamic_i > 0) {
+        dynamic_i -= 1;
+        dynamic_names[dynamic_i] = stack.pop(vm);
+    }
+    const attrs_val = stack.pop(vm);
+    try stack.push(vm, Value.boolVal(try access.hasAttrPathMixed(vm, attrs_val, dynamic_names, code[segments_start..cur_ip], segment_count)));
+    return dispatch(vm, frame, code, cur_ip, stop_depth);
+}
+
+fn opValidateAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const allow_extra = code[ip] != 0;
+    const expected_count = readU16(code, ip + 1);
+    const names_start = ip + 3;
+    const names_end = names_start + @as(usize, expected_count) * 2;
+    const attrs_val = stack.pop(vm);
+    try access.validateAttrs(vm, attrs_val, allow_extra, code[names_start..names_end], false);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opValidateAttrsLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const allow_extra = code[ip] != 0;
+    const expected_count = readU16(code, ip + 1);
+    const names_start = ip + 3;
+    const names_end = names_start + @as(usize, expected_count) * 4;
+    const attrs_val = stack.pop(vm);
+    try access.validateAttrs(vm, attrs_val, allow_extra, code[names_start..names_end], true);
+    return dispatch(vm, frame, code, names_end, stop_depth);
+}
+
+fn opLookupWith(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id: InternId = @intCast(readU16(code, ip));
+    const scope_count = code[ip + 2];
+    try access.lookupWith(vm, name_id, scope_count);
+    return dispatch(vm, frame, code, ip + 3, stop_depth);
+}
+
+fn opLookupWithLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id: InternId = readU32(code, ip);
+    const scope_count = code[ip + 4];
+    try access.lookupWith(vm, name_id, scope_count);
+    return dispatch(vm, frame, code, ip + 5, stop_depth);
+}
+
+// ---- handlers: termination ----
+
+fn opRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    _ = frame;
+    _ = code;
+    _ = ip;
+    const result = stack.pop(vm);
+    return retEpilogue(vm, stop_depth, result);
+}
+
+fn opConstantRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const idx = readU16(code, ip);
+    const result = frame.chunk_ptr.constants[idx];
+    return retEpilogue(vm, stop_depth, result);
+}
+
+fn opGetLocalRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const slot = code[ip];
+    const raw = vm.stack[frame.frame_base + slot];
+    const result = try force.forceValue(vm, raw);
+    return retEpilogue(vm, stop_depth, result);
+}
+
+fn opGetLocalRetLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const slot = readU16(code, ip);
+    const raw = vm.stack[frame.frame_base + slot];
+    const result = try force.forceValue(vm, raw);
+    return retEpilogue(vm, stop_depth, result);
+}
+
+fn opGetUpvalueRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const slot = readU16(code, ip);
+    const upvalues = frame.upvalues orelse return error.MissingClosure;
+    const result = try force.forceValue(vm, upvalues[slot]);
+    return retEpilogue(vm, stop_depth, result);
+}
+
+fn opHalt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    _ = frame;
+    _ = code;
+    _ = ip;
+    _ = stop_depth;
+    if (vm.sp == 0) try stack.push(vm, Value.null_val);
+}
+
+/// Pop the current frame and either leave the result on the stack
+/// for `runUntil` to retrieve (when frames_len has reached
+/// `stop_depth`) or push it onto the resumed caller frame and
+/// continue dispatching. `inline` so the tail call to `dispatch`
+/// lands in the caller (an opRet-like handler) whose signature
+/// matches handler sig — required by `@call(.always_tail)`.
+inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
+    const finished_frame = stack.popFrame(vm);
+    if (comptime trace_log.enabled) {
+        if (vm.frames_len == 0) {
+            trace_log.framePop(vm.vm_trace, vm.worker_id, vm.frames_len, types.CHUNK_ID_NONE, 0);
+        } else {
+            const ret_frame = stack.currentFrame(vm);
+            trace_log.framePop(vm.vm_trace, vm.worker_id, vm.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
+        }
+    }
+    vm.sp = finished_frame.frame_base;
+    try stack.push(vm, result);
+    if (vm.frames_len == stop_depth) return;
+    const new_frame = stack.currentFrame(vm);
+    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
+// ---- handler table ----
+
+const handlers: [opcode.count]HandlerFn = blk: {
+    var table: [opcode.count]HandlerFn = undefined;
+    table[@intFromEnum(OpCode.constant)] = opConstant;
+    table[@intFromEnum(OpCode.push_null)] = opPushNull;
+    table[@intFromEnum(OpCode.push_true)] = opPushTrue;
+    table[@intFromEnum(OpCode.push_false)] = opPushFalse;
+    table[@intFromEnum(OpCode.pop)] = opPop;
+    table[@intFromEnum(OpCode.get_local)] = opGetLocal;
+    table[@intFromEnum(OpCode.get_local_long)] = opGetLocalLong;
+    table[@intFromEnum(OpCode.capture_local)] = opCaptureLocal;
+    table[@intFromEnum(OpCode.capture_local_long)] = opCaptureLocalLong;
+    table[@intFromEnum(OpCode.capture_upvalue)] = opCaptureUpvalue;
+    table[@intFromEnum(OpCode.set_local)] = opSetLocal;
+    table[@intFromEnum(OpCode.set_local_long)] = opSetLocalLong;
+    table[@intFromEnum(OpCode.set_cell_local)] = opSetCellLocal;
+    table[@intFromEnum(OpCode.set_cell_local_long)] = opSetCellLocalLong;
+    table[@intFromEnum(OpCode.get_upvalue)] = opGetUpvalue;
+    table[@intFromEnum(OpCode.add_int)] = opAddInt;
+    table[@intFromEnum(OpCode.sub_int)] = opSubInt;
+    table[@intFromEnum(OpCode.mul_int)] = opMulInt;
+    table[@intFromEnum(OpCode.div_int)] = opDivInt;
+    table[@intFromEnum(OpCode.negate_int)] = opNegateInt;
+    table[@intFromEnum(OpCode.add_float)] = opAddFloat;
+    table[@intFromEnum(OpCode.sub_float)] = opSubFloat;
+    table[@intFromEnum(OpCode.mul_float)] = opMulFloat;
+    table[@intFromEnum(OpCode.div_float)] = opDivFloat;
+    table[@intFromEnum(OpCode.eq)] = opEq;
+    table[@intFromEnum(OpCode.neq)] = opNeq;
+    table[@intFromEnum(OpCode.lt)] = opLt;
+    table[@intFromEnum(OpCode.lte)] = opLte;
+    table[@intFromEnum(OpCode.gt)] = opGt;
+    table[@intFromEnum(OpCode.gte)] = opGte;
+    table[@intFromEnum(OpCode.not)] = opNot;
+    table[@intFromEnum(OpCode.jump)] = opJump;
+    table[@intFromEnum(OpCode.jump_if_false)] = opJumpIfFalse;
+    table[@intFromEnum(OpCode.fail_assertion)] = opFailAssertion;
+    table[@intFromEnum(OpCode.build_attrs)] = opBuildAttrs;
+    table[@intFromEnum(OpCode.build_attrs_with_pos)] = opBuildAttrsWithPos;
+    table[@intFromEnum(OpCode.build_list)] = opBuildList;
+    table[@intFromEnum(OpCode.merge_attrs_strict)] = opMergeAttrsStrict;
+    table[@intFromEnum(OpCode.merge_attrs)] = opMergeAttrs;
+    table[@intFromEnum(OpCode.concat_lists)] = opConcatLists;
+    table[@intFromEnum(OpCode.push_builtins)] = opPushBuiltins;
+    table[@intFromEnum(OpCode.find_file)] = opFindFile;
+    table[@intFromEnum(OpCode.find_file_long)] = opFindFileLong;
+    table[@intFromEnum(OpCode.closure)] = opClosure;
+    table[@intFromEnum(OpCode.closure_long)] = opClosureLong;
+    table[@intFromEnum(OpCode.closure_captures)] = opClosureCaptures;
+    table[@intFromEnum(OpCode.closure_captures_long)] = opClosureCapturesLong;
+    table[@intFromEnum(OpCode.thunk_captures)] = opThunkCaptures;
+    table[@intFromEnum(OpCode.thunk_captures_long)] = opThunkCapturesLong;
+    table[@intFromEnum(OpCode.call)] = opCall;
+    table[@intFromEnum(OpCode.tail_call)] = opTailCall;
+    table[@intFromEnum(OpCode.constant_ret)] = opConstantRet;
+    table[@intFromEnum(OpCode.get_local_ret)] = opGetLocalRet;
+    table[@intFromEnum(OpCode.get_local_ret_long)] = opGetLocalRetLong;
+    table[@intFromEnum(OpCode.get_upvalue_ret)] = opGetUpvalueRet;
+    table[@intFromEnum(OpCode.make_cell)] = opMakeCell;
+    table[@intFromEnum(OpCode.init_cell_slot)] = opInitCellSlot;
+    table[@intFromEnum(OpCode.init_cell_slot_long)] = opInitCellSlotLong;
+    table[@intFromEnum(OpCode.get_attr)] = opGetAttr;
+    table[@intFromEnum(OpCode.get_attr_long)] = opGetAttrLong;
+    table[@intFromEnum(OpCode.get_attr_dynamic)] = opGetAttrDynamic;
+    table[@intFromEnum(OpCode.get_attr_dynamic_or)] = opGetAttrDynamicOr;
+    table[@intFromEnum(OpCode.get_attr_path_dynamic_or)] = opGetAttrPathDynamicOr;
+    table[@intFromEnum(OpCode.get_attr_path_dynamic_or_long)] = opGetAttrPathDynamicOrLong;
+    table[@intFromEnum(OpCode.get_attr_path_or)] = opGetAttrPathOr;
+    table[@intFromEnum(OpCode.get_attr_path_or_long)] = opGetAttrPathOrLong;
+    table[@intFromEnum(OpCode.get_attr_path_mixed_or)] = opGetAttrPathMixedOr;
+    table[@intFromEnum(OpCode.has_attr_path)] = opHasAttrPath;
+    table[@intFromEnum(OpCode.has_attr_path_long)] = opHasAttrPathLong;
+    table[@intFromEnum(OpCode.has_attr_dynamic)] = opHasAttrDynamic;
+    table[@intFromEnum(OpCode.has_attr_path_mixed)] = opHasAttrPathMixed;
+    table[@intFromEnum(OpCode.validate_attrs)] = opValidateAttrs;
+    table[@intFromEnum(OpCode.validate_attrs_long)] = opValidateAttrsLong;
+    table[@intFromEnum(OpCode.lookup_with)] = opLookupWith;
+    table[@intFromEnum(OpCode.lookup_with_long)] = opLookupWithLong;
+    table[@intFromEnum(OpCode.ret)] = opRet;
+    table[@intFromEnum(OpCode.halt)] = opHalt;
+    break :blk table;
+};
 
 // ---- helpers ----
-
-/// Shared epilogue for `.ret` and the fused value+ret super-ops.
-/// Returns a non-null `Value` if the outer `runUntil` should propagate
-/// it back to its caller (we've popped past `stop_depth`); otherwise
-/// pushes the result onto the resumed caller frame and updates the
-/// dispatch locals (`frame`, `code`, `ip`) in place.
-inline fn retEpilogue(
-    self: *VM,
-    stop_depth: usize,
-    result: Value,
-    frame: **vm_mod.Frame,
-    code: *[]u8,
-    ip: *usize,
-) !?Value {
-    const finished_frame = stack.popFrame(self);
-    if (comptime trace_log.enabled) {
-        if (self.frames_len == 0) {
-            trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, types.CHUNK_ID_NONE, 0);
-        } else {
-            const ret_frame = stack.currentFrame(self);
-            trace_log.framePop(self.vm_trace, self.worker_id, self.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
-        }
-    }
-    if (self.frames_len == stop_depth) {
-        self.sp = finished_frame.frame_base;
-        return result;
-    }
-    self.sp = finished_frame.frame_base;
-    try stack.push(self, result);
-    frame.* = stack.currentFrame(self);
-    code.* = frame.*.chunk_ptr.code;
-    ip.* = frame.*.ip;
-    return null;
-}
 
 pub fn expectBool(self: *VM, val: Value) !bool {
     const forced = try force.forceValue(self, val);

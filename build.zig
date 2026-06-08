@@ -128,6 +128,12 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "fix",
         .root_module = exe_mod,
+        // The threaded VM dispatcher in src/vm/run.zig relies on
+        // `@call(.always_tail)`, which only the LLVM backend
+        // implements. Force LLVM for every build mode so debug
+        // builds don't unbounded-recurse through the dispatch
+        // chain.
+        .use_llvm = true,
     });
 
     // This declares intent for the executable to be installed into the
@@ -220,6 +226,8 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        // Match the exe: threaded dispatcher needs LLVM tail calls.
+        .use_llvm = true,
     });
 
     // A run step that will run the test executable.
@@ -230,6 +238,7 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = true,
     });
 
     // A run step that will run the second test executable.
