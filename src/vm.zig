@@ -133,6 +133,15 @@ pub const VM = struct {
     opcode_counts: OpcodeProfileState,
     opcode_profile_sink: OpcodeProfileSink,
 
+    /// Demand-carrier: when this VM is currently running speculative work
+    /// (a helper forcing a thunk on its own initiative), new thunks
+    /// created during that run should NOT submit themselves for further
+    /// speculation. That single rule bounds the cascade: a helper that
+    /// picks up a speculative task does at most one layer of work before
+    /// its descendants fall back to lazy. Set/cleared around speculative
+    /// entry points (see `vm/force.zig`).
+    in_speculation: bool,
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *const ChunkRegistry,
@@ -181,6 +190,7 @@ pub const VM = struct {
             .frames_len = 0,
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
+            .in_speculation = false,
         };
     }
 

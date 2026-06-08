@@ -12,6 +12,7 @@ const worker_mod = @import("../worker.zig");
 const access = @import("access.zig");
 const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
+const BuiltinId = @import("../builtins.zig").BuiltinId;
 
 const VM = vm_mod.VM;
 
@@ -30,6 +31,14 @@ pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
 /// caller later observes the thunk, lazy renderers will still treat it
 /// as unevaluated.
 pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
+    // Mark this VM as running speculative work for the duration of the
+    // force. `makeThunk` keys off this to decide whether new thunks
+    // created during evaluation should themselves be submitted for
+    // speculation — they shouldn't, otherwise a single speculative task
+    // can cascade into the rest of the dependency graph.
+    const saved = self.in_speculation;
+    self.in_speculation = true;
+    defer self.in_speculation = saved;
     return forceValueImpl(self, value, false);
 }
 
@@ -211,15 +220,48 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
 }
 
 inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
-    // Only Nix-level closures with a meaningfully-sized body warrant the
-    // submit overhead. Builtin / builtin_closure thunks are typically a
-    // single dispatched call — main can force them faster than the
-    // scheduler dance. The eligibility bit is pre-computed at chunk
-    // registration time (see Chunk.speculatable).
-    if (closure.discriminant != .closure) return false;
+    // Bound the cascade: if we got here because a helper is *itself*
+    // running speculative work, don't submit further speculation. The
+    // helper's result may or may not be observed; chaining more
+    // speculation off it would just multiply uncertain work.
+    if (self.in_speculation) return false;
+    return switch (closure.discriminant) {
+        .closure => isSpeculatableClosureChunk(self, closure),
+        // map / mapAttrs / genList / zipAttrsWith all produce
+        // builtin_closure thunks that wrap a *user* function. Real
+        // evals create millions of these; if we wait for forceDeep to
+        // submit them urgently, main is already on the critical path.
+        // Speculate them now, gated on the inner function being
+        // substantial (and on `in_speculation` above, so a helper
+        // forcing one won't speculate the next one in the chain).
+        .builtin_closure => isSpeculatableBuiltinClosure(self, closure),
+        else => false,
+    };
+}
+
+fn isSpeculatableClosureChunk(self: *VM, closure: Value) bool {
+    // The eligibility bit is pre-computed at chunk registration time
+    // (see Chunk.speculatable).
     const c = self.heap.getClosure(closure.asObjectId()) catch return false;
     const ch = self.registry.get(c.chunk_id) orelse return false;
     return ch.speculatable;
+}
+
+fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
+    const bc = self.heap.getBuiltinClosure(closure.asObjectId()) catch return false;
+    return switch (@as(BuiltinId, @enumFromInt(bc.builtin_id))) {
+        // Map-style fan-out: args[0] is the user function in each.
+        // Speculate only when that function's body is big enough to
+        // warrant the scheduler hop — the chunk-size threshold
+        // filters trivial cases like `x: x + 1`.
+        .mapValue, .mapAttrValue, .zipAttrsValue => bc.args.len > 0 and
+            bc.args[0].discriminant == .closure and
+            isSpeculatableClosureChunk(self, bc.args[0]),
+        // Derivation lazy attrs resolve drv/outPath via hashing —
+        // never trivial.
+        .derivationLazyAttr => true,
+        else => false,
+    };
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {
