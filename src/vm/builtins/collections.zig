@@ -245,7 +245,9 @@ pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
 
-    for (try self.heap.getList(list.asObjectId())) |item| {
+    const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
+    for (items) |item| {
         const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_true) try out.append(self.allocator, item);
@@ -283,7 +285,9 @@ pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
 
-    for (try self.heap.getList(list.asObjectId())) |item| {
+    const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
+    for (items) |item| {
         const mapped = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (mapped.discriminant != .list) return error.TypeError;
         try out.appendSlice(self.allocator, try self.heap.getList(mapped.asObjectId()));
@@ -335,6 +339,7 @@ pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
     if (list.discriminant != .list) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
     const sorted = try self.allocator.dupe(Value, items);
     defer self.allocator.free(sorted);
 
@@ -359,7 +364,9 @@ pub fn builtinPartition(self: anytype, pred_arg: Value, list_arg: Value) !Value 
     var wrong: std.ArrayListUnmanaged(Value) = .empty;
     defer wrong.deinit(self.allocator);
 
-    for (try self.heap.getList(list.asObjectId())) |item| {
+    const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
+    for (items) |item| {
         const result = try vm_force.forceValue(self, try vm_closures.callValue(self, pred, item));
         if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
         if (result.discriminant == .bool_true) {
@@ -391,7 +398,9 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
         groups.deinit(self.allocator);
     }
 
-    for (try self.heap.getList(list.asObjectId())) |item| {
+    const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
+    for (items) |item| {
         const key = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!isPlainString(key)) return error.TypeError;
         const key_id = try stringTextInternId(self, key);
@@ -490,7 +499,9 @@ pub fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg
     const list = try vm_force.forceValue(self, list_arg);
     if (list.discriminant != .list) return error.TypeError;
 
-    for (try self.heap.getList(list.asObjectId())) |item| {
+    const items = try self.heap.getList(list.asObjectId());
+    vm_force.fanOutListShallow(self, items);
+    for (items) |item| {
         const partial = try vm_closures.callValue(self, op, acc);
         acc = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, item));
     }

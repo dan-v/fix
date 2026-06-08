@@ -103,14 +103,21 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 /// stop submitting once a push fails, since `submitUrgent` only returns
 /// false when every helper queue is full and the caller will pick up the
 /// remainder inline.
-fn fanOutListShallow(self: *VM, items: []const Value) void {
+///
+/// Public because builtins that strictly walk a list (concatStringsSep,
+/// concatLists, foldl', concatMap, filter, sort, etc.) get the same
+/// benefit as forceDeep — main is about to touch every item, so getting
+/// helpers started early is free.
+pub fn fanOutListShallow(self: *VM, items: []const Value) void {
+    if (self.in_speculation) return;
     for (items) |v| {
         if (v.discriminant != .thunk) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = v.asObjectId() })) break;
     }
 }
 
-fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
+pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
+    if (self.in_speculation) return;
     for (entries) |entry| {
         if (entry.value.discriminant != .thunk) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
