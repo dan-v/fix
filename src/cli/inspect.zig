@@ -178,6 +178,15 @@ fn writeSchedulerStats(writer: *std.Io.Writer, helpers: u8, s: anytype) !void {
     try writer.print("  parks:             {d:>8}\n", .{s.parks});
     try writer.print("  max fiber stack:   {d:>8} bytes  (peak depth touched)\n", .{s.max_fiber_stack_used_bytes});
     try writer.print("  max VM sp:         {d:>8}        (peak value-stack depth)\n", .{s.max_vm_sp});
+    try writer.writeAll("  worker time (summed across all workers including main):\n");
+    try writer.print("    busy:            {d:>8.3} s   (inside fiber.resume)\n", .{
+        @as(f64, @floatFromInt(s.busy_ns)) / 1.0e9,
+    });
+    try writer.print("    idle:            {d:>8.3} s   (parked on wake futex)\n", .{
+        @as(f64, @floatFromInt(s.idle_ns)) / 1.0e9,
+    });
+    const accounted = s.busy_ns + s.idle_ns;
+    try writer.print("    busy / total:    {d:>8.1}%\n", .{percent(s.busy_ns, accounted)});
 }
 
 fn percent(part: u64, total: u64) f64 {

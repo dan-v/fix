@@ -24,6 +24,7 @@
 //! it parks for at most one futex round-trip.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("runtime/types.zig");
 const Value = @import("runtime/value.zig").Value;
 const thunk_mod = @import("runtime/thunk.zig");
@@ -117,6 +118,17 @@ pub const Worker = struct {
 
     shutdown_requested: std.atomic.Value(u8),
 
+    /// Accumulated time this worker spent parked waiting for work. Paired
+    /// with `busy_ns` to compute utilisation; reported to the scheduler on
+    /// `deinit` so `fix inspect` can show whether helpers are CPU-bound or
+    /// starved.
+    idle_ns: u64,
+    /// Accumulated time this worker spent inside `runFiber` (i.e. inside
+    /// `inner.resume_`). Excludes the brief pop-ready / pick-task probing
+    /// — that bookkeeping is negligible relative to either fiber work or
+    /// futex parks.
+    busy_ns: u64,
+
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
@@ -138,6 +150,8 @@ pub const Worker = struct {
             .free_head = null,
             .ready_head = .init(null),
             .shutdown_requested = .init(0),
+            .idle_ns = 0,
+            .busy_ns = 0,
         };
         // Prewarm: allocate a handful of fibers up front so the
         // common-case task pickup hits the free list instead of the
@@ -174,7 +188,19 @@ pub const Worker = struct {
         }
         self.fibers.deinit(self.allocator);
         self.scheduler.reportFiberHighWater(max_fiber_stack, max_vm_sp);
+        self.flushTimingToScheduler();
         self.allocator.destroy(self);
+    }
+
+    /// Push accumulated idle/busy counters into the scheduler. Called
+    /// from `parkAndAccount` (helpers naturally flush on each park) and
+    /// at the end of `runTopLevel` so the main thread's work is visible
+    /// to `schedulerStats()` callers before the evaluator deinits.
+    fn flushTimingToScheduler(self: *Worker) void {
+        if (self.idle_ns == 0 and self.busy_ns == 0) return;
+        self.scheduler.reportWorkerTiming(self.idle_ns, self.busy_ns);
+        self.idle_ns = 0;
+        self.busy_ns = 0;
     }
 
     pub fn requestShutdown(self: *Worker) void {
@@ -212,7 +238,7 @@ pub const Worker = struct {
                 continue;
             }
             if (self.shouldStop()) break;
-            self.scheduler.parkHelper(self.helper_idx);
+            self.parkAndAccount();
         }
     }
 
@@ -246,7 +272,7 @@ pub const Worker = struct {
                 self.runFiber(f);
                 continue;
             }
-            self.scheduler.parkHelper(self.helper_idx);
+            self.parkAndAccount();
         }
 
         // The top fiber has retired to free. Drain any remaining
@@ -265,8 +291,13 @@ pub const Worker = struct {
                 self.runFiber(f);
                 continue;
             }
-            self.scheduler.parkHelper(self.helper_idx);
+            self.parkAndAccount();
         }
+        // The main thread's runTopLevel may exit without ever parking
+        // (helpers handle background work; main spins through ready
+        // fibers and returns). Flush so its timing is visible to
+        // `schedulerStats()` callers before the evaluator deinits.
+        self.flushTimingToScheduler();
     }
 
     /// Resume the fiber and update bookkeeping based on what state it
@@ -275,7 +306,10 @@ pub const Worker = struct {
     /// push onto free list), or in a degenerate case is somehow still
     /// running (treated as same as suspended; the next wake will hit it).
     fn runFiber(self: *Worker, f: *Fiber) void {
+        const t0 = nanoMonotonic();
         f.inner.resume_();
+        const t1 = nanoMonotonic();
+        if (t1 > t0) self.busy_ns += t1 - t0;
         switch (f.inner.state) {
             .finished => {
                 // Entry returned cleanly. Recycle.
@@ -289,6 +323,20 @@ pub const Worker = struct {
             },
             .ready, .running => unreachable,
         }
+    }
+
+    /// Park on the helper wake_word and account the time toward idle_ns.
+    /// `parkHelper` is the only call that blocks the worker thread when
+    /// there's no work; everything else (pop, pick, fiber resume) is
+    /// counted as work-in-progress. Flushes local timing counters to the
+    /// scheduler first — parking is the only voluntary CPU yield, so
+    /// it's the natural batching point for the atomic add.
+    fn parkAndAccount(self: *Worker) void {
+        self.flushTimingToScheduler();
+        const t0 = nanoMonotonic();
+        self.scheduler.parkHelper(self.helper_idx);
+        const t1 = nanoMonotonic();
+        if (t1 > t0) self.idle_ns += t1 - t0;
     }
 
     fn pickTask(self: *Worker) ?Task {
@@ -378,6 +426,24 @@ pub const Worker = struct {
         return false;
     }
 };
+
+/// CLOCK_MONOTONIC reading in nanoseconds. Used to bucket worker time
+/// between fiber-resume and futex-park. Linux-only fast path (vDSO);
+/// other platforms return 0, which makes the counters stay at 0 —
+/// `fix inspect` will show 0s and the user can read off the platform
+/// instead of getting bogus numbers.
+fn nanoMonotonic() u64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+            const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+            const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+            return sec * std.time.ns_per_s + nsec;
+        },
+        else => return 0,
+    }
+}
 
 /// Standard fiber entry: run one task to completion and return.
 /// On entry, the worker has already set `current_task` and reset the

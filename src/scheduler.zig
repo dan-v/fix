@@ -98,6 +98,17 @@ pub const Scheduler = struct {
         /// Deepest VM value-stack sp seen across all workers, in Values.
         /// Multiply by `@sizeOf(Value)` (= 16) for a byte count.
         max_vm_sp: u64,
+        /// Summed across all workers (main + helpers): time spent parked
+        /// on the wake futex, in nanoseconds. Together with `busy_ns` and
+        /// the wall-clock run time, this lets `fix inspect` show whether
+        /// helpers were starved (idle ≫ busy ⇒ not enough parallel work)
+        /// or saturated (busy ≈ wall × workers ⇒ CPU-bound).
+        idle_ns: u64,
+        /// Summed across all workers: time spent inside a fiber's
+        /// `inner.resume_` (actual evaluation work). Excludes ready-queue
+        /// pops and steal attempts — those are nanoseconds compared to
+        /// either bucket and don't change the utilisation picture.
+        busy_ns: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -124,6 +135,8 @@ pub const Scheduler = struct {
     n_parks: std.atomic.Value(u64),
     n_max_fiber_stack: std.atomic.Value(u64),
     n_max_vm_sp: std.atomic.Value(u64),
+    n_idle_ns: std.atomic.Value(u64),
+    n_busy_ns: std.atomic.Value(u64),
 
     /// `total_worker_count` includes the main thread (worker 0). The
     /// scheduler manages `total_worker_count - 1` helpers.
@@ -171,6 +184,8 @@ pub const Scheduler = struct {
             .n_parks = .init(0),
             .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
+            .n_idle_ns = .init(0),
+            .n_busy_ns = .init(0),
         };
     }
 
@@ -185,6 +200,8 @@ pub const Scheduler = struct {
             .parks = self.n_parks.load(.monotonic),
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
+            .idle_ns = self.n_idle_ns.load(.monotonic),
+            .busy_ns = self.n_busy_ns.load(.monotonic),
         };
     }
 
@@ -194,6 +211,14 @@ pub const Scheduler = struct {
     pub fn reportFiberHighWater(self: *Scheduler, max_fiber_stack: u64, max_vm_sp: u64) void {
         atomicMax(&self.n_max_fiber_stack, max_fiber_stack);
         atomicMax(&self.n_max_vm_sp, max_vm_sp);
+    }
+
+    /// Worker shutdown reports its accumulated idle (parked) and busy
+    /// (fiber-resume) nanoseconds. Summed across all workers so the
+    /// scheduler stats expose total CPU-time spent each way.
+    pub fn reportWorkerTiming(self: *Scheduler, idle_ns: u64, busy_ns: u64) void {
+        _ = self.n_idle_ns.fetchAdd(idle_ns, .monotonic);
+        _ = self.n_busy_ns.fetchAdd(busy_ns, .monotonic);
     }
 
     fn atomicMax(slot: *std.atomic.Value(u64), value: u64) void {
