@@ -34,21 +34,29 @@ pub fn run(self: *VM) anyerror!Value {
 pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
     var frame = stack.currentFrame(self);
     var code = frame.chunk_ptr.code;
+    // Hoist `frame.ip` into a register-priority local. Per-opcode
+    // reads/writes were forcing the compiler to spill the code-ptr
+    // around dispatch (~9% of runUntil samples landed on the single
+    // spill instruction). The errdefer keeps frame.ip authoritative
+    // on the error path, where `errors.captureErrorTrace` walks the
+    // frame stack expecting accurate per-frame ip values.
+    var ip: usize = frame.ip;
+    errdefer frame.ip = ip;
     while (true) {
         debug.checkVm(self, "runUntil top");
         debug.checkFrameSync(self, frame, code, "runUntil top");
-        if (frame.ip >= code.len) break;
+        if (ip >= code.len) break;
 
-        const op: OpCode = @enumFromInt(code[frame.ip]);
+        const op: OpCode = @enumFromInt(code[ip]);
         if (comptime opcode_profile_enabled) self.opcode_counts[@intFromEnum(op)] += 1;
-        trace_log.op(self.vm_trace, self.worker_id, self.frames_len, frame.chunk_id, @intCast(frame.ip), op, self.sp);
-        frame.ip += 1;
+        trace_log.op(self.vm_trace, self.worker_id, self.frames_len, frame.chunk_id, @intCast(ip), op, self.sp);
+        ip += 1;
 
         switch (op) {
             .constant => {
-                const idx_low = code[frame.ip];
-                const idx_high = code[frame.ip + 1];
-                frame.ip += 2;
+                const idx_low = code[ip];
+                const idx_high = code[ip + 1];
+                ip += 2;
                 const idx: u16 = @as(u16, idx_low) | (@as(u16, idx_high) << 8);
                 try stack.push(self, frame.chunk_ptr.constants[idx]);
             },
@@ -62,56 +70,56 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             },
 
             .get_local => {
-                const slot = code[frame.ip];
-                frame.ip += 1;
+                const slot = code[ip];
+                ip += 1;
                 const raw = self.stack[frame.frame_base + slot];
                 const val = try force.forceValue(self, raw);
                 try stack.push(self, val);
             },
             .get_local_long => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const raw = self.stack[frame.frame_base + slot];
                 const val = try force.forceValue(self, raw);
                 try stack.push(self, val);
             },
 
             .capture_local => {
-                const slot = code[frame.ip];
-                frame.ip += 1;
+                const slot = code[ip];
+                ip += 1;
                 const val = self.stack[frame.frame_base + slot];
                 try stack.push(self, val);
             },
             .capture_local_long => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const val = self.stack[frame.frame_base + slot];
                 try stack.push(self, val);
             },
 
             .capture_upvalue => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const upvalues = frame.upvalues orelse return error.MissingClosure;
                 try stack.push(self, upvalues[slot]);
             },
 
             .set_local => {
-                const slot = code[frame.ip];
-                frame.ip += 1;
+                const slot = code[ip];
+                ip += 1;
                 const val = stack.pop(self);
                 stack.setStack(self, frame.frame_base + slot, val);
             },
             .set_local_long => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const val = stack.pop(self);
                 stack.setStack(self, frame.frame_base + slot, val);
             },
 
             .set_cell_local => {
-                const slot = code[frame.ip];
-                frame.ip += 1;
+                const slot = code[ip];
+                ip += 1;
                 const val = stack.pop(self);
                 const cell_val = self.stack[frame.frame_base + slot];
                 if (cell_val.discriminant != .thunk) return error.TypeError;
@@ -122,8 +130,8 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 thunk.target = .{ .pass_through = val };
             },
             .set_cell_local_long => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const val = stack.pop(self);
                 const cell_val = self.stack[frame.frame_base + slot];
                 if (cell_val.discriminant != .thunk) return error.TypeError;
@@ -132,8 +140,8 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             },
 
             .get_upvalue => {
-                const slot = readU16(code, frame.ip);
-                frame.ip += 2;
+                const slot = readU16(code, ip);
+                ip += 2;
                 const upvalues = frame.upvalues orelse return error.MissingClosure;
                 const val = try force.forceValue(self, upvalues[slot]);
                 try stack.push(self, val);
@@ -234,30 +242,30 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
 
             // ---- control flow ----
             .jump => {
-                const offset = readU32(code, frame.ip);
-                frame.ip += 4;
-                frame.ip += @as(usize, offset);
+                const offset = readU32(code, ip);
+                ip += 4;
+                ip += @as(usize, offset);
             },
             .jump_if_false => {
-                const offset = readU32(code, frame.ip);
-                frame.ip += 4;
+                const offset = readU32(code, ip);
+                ip += 4;
                 const cond = self.stack[self.sp - 1];
                 if (!try expectBool(self, cond)) {
-                    frame.ip += @as(usize, offset);
+                    ip += @as(usize, offset);
                 }
             },
             .fail_assertion => return error.AssertionFailed,
             // ---- data structures ----
             .build_attrs => {
-                const count: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
+                const count: u16 = readU16(code, ip);
+                ip += 2;
                 try objects.buildAttrs(self, count);
             },
             .build_attrs_with_pos => {
-                const count: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
-                const pos_count: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
+                const count: u16 = readU16(code, ip);
+                ip += 2;
+                const pos_count: u16 = readU16(code, ip);
+                ip += 2;
 
                 var stack_positions: [32]heap_mod.AttrPosEntry = undefined;
                 const positions = if (pos_count <= stack_positions.len)
@@ -268,20 +276,20 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
 
                 for (positions) |*position| {
                     position.* = .{
-                        .name = readU32(code, frame.ip),
+                        .name = readU32(code, ip),
                         .pos = .{
-                            .file = readU32(code, frame.ip + 4),
-                            .line = readU32(code, frame.ip + 8),
-                            .column = readU32(code, frame.ip + 12),
+                            .file = readU32(code, ip + 4),
+                            .line = readU32(code, ip + 8),
+                            .column = readU32(code, ip + 12),
                         },
                     };
-                    frame.ip += 16;
+                    ip += 16;
                 }
                 try objects.buildAttrsWithPositions(self, count, positions);
             },
             .build_list => {
-                const count: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
+                const count: u16 = readU16(code, ip);
+                ip += 2;
                 try objects.buildList(self, count);
             },
             .merge_attrs => {
@@ -301,91 +309,97 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
             },
             .push_builtins => try stack.push(self, self.builtins),
             .find_file => {
-                const name_id: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
+                const name_id: u16 = readU16(code, ip);
+                ip += 2;
                 const host = self.import_host orelse return error.SearchPathUnavailable;
                 try stack.push(self, try host.find_file(host.context, self.intern.get(@intCast(name_id))));
             },
             .find_file_long => {
-                const name_id: InternId = readU32(code, frame.ip);
-                frame.ip += 4;
+                const name_id: InternId = readU32(code, ip);
+                ip += 4;
                 const host = self.import_host orelse return error.SearchPathUnavailable;
                 try stack.push(self, try host.find_file(host.context, self.intern.get(name_id)));
             },
             // ---- closure ----
             .closure => {
-                const ch_id: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: u16 = readU16(code, ip);
+                ip += 2;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 try closures.makeClosure(self, ch_id, upvalue_count);
             },
             .closure_long => {
-                const ch_id: ChunkId = readU32(code, frame.ip);
-                frame.ip += 4;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: ChunkId = readU32(code, ip);
+                ip += 4;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 try closures.makeClosure(self, ch_id, upvalue_count);
             },
             .closure_captures => {
-                const ch_id: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: u16 = readU16(code, ip);
+                ip += 2;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
-                const descriptors = code[frame.ip .. frame.ip + descriptor_len];
-                frame.ip += descriptor_len;
+                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
+                const descriptors = code[ip .. ip + descriptor_len];
+                ip += descriptor_len;
                 try closures.makeClosureFromCaptures(self, ch_id, descriptors, frame);
             },
             .closure_captures_long => {
-                const ch_id: ChunkId = readU32(code, frame.ip);
-                frame.ip += 4;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: ChunkId = readU32(code, ip);
+                ip += 4;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
-                const descriptors = code[frame.ip .. frame.ip + descriptor_len];
-                frame.ip += descriptor_len;
+                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
+                const descriptors = code[ip .. ip + descriptor_len];
+                ip += descriptor_len;
                 try closures.makeClosureFromCaptures(self, ch_id, descriptors, frame);
             },
             .thunk_captures => {
-                const ch_id: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: u16 = readU16(code, ip);
+                ip += 2;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
-                const descriptors = code[frame.ip .. frame.ip + descriptor_len];
-                frame.ip += descriptor_len;
+                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
+                const descriptors = code[ip .. ip + descriptor_len];
+                ip += descriptor_len;
                 try closures.makeBytecodeThunkFromCaptures(self, ch_id, descriptors, frame);
             },
             .thunk_captures_long => {
-                const ch_id: ChunkId = readU32(code, frame.ip);
-                frame.ip += 4;
-                const upvalue_count = readU16(code, frame.ip);
-                frame.ip += 2;
+                const ch_id: ChunkId = readU32(code, ip);
+                ip += 4;
+                const upvalue_count = readU16(code, ip);
+                ip += 2;
                 const descriptor_len = @as(usize, upvalue_count) * 3;
-                if (descriptor_len > code.len - frame.ip) return error.InvalidBytecode;
-                const descriptors = code[frame.ip .. frame.ip + descriptor_len];
-                frame.ip += descriptor_len;
+                if (descriptor_len > code.len - ip) return error.InvalidBytecode;
+                const descriptors = code[ip .. ip + descriptor_len];
+                ip += descriptor_len;
                 try closures.makeBytecodeThunkFromCaptures(self, ch_id, descriptors, frame);
             },
 
             // ---- calls ----
             .call => {
+                // Sync ip back so doCall's pushed frame sits on a
+                // caller frame whose ip points at the next opcode.
+                frame.ip = ip;
                 const arg = stack.pop(self);
                 const callee = stack.pop(self);
                 try closures.doCall(self, callee, arg);
                 frame = stack.currentFrame(self);
                 code = frame.chunk_ptr.code;
+                ip = frame.ip;
             },
             .tail_call => {
+                frame.ip = ip;
                 const arg = stack.pop(self);
                 const callee = stack.pop(self);
                 try closures.doTailCall(self, callee, arg);
                 frame = stack.currentFrame(self);
                 code = frame.chunk_ptr.code;
+                ip = frame.ip;
             },
             // ---- thunks ----
             .make_cell => {
@@ -395,15 +409,15 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
 
             // ---- attribute access ----
             .get_attr => {
-                const name_id: u16 = readU16(code, frame.ip);
-                frame.ip += 2;
+                const name_id: u16 = readU16(code, ip);
+                ip += 2;
                 const attrs_val = stack.pop(self);
                 const result = try access.getAttrValue(self, attrs_val, @intCast(name_id));
                 try stack.push(self, result);
             },
             .get_attr_long => {
-                const name_id: InternId = readU32(code, frame.ip);
-                frame.ip += 4;
+                const name_id: InternId = readU32(code, ip);
+                ip += 4;
                 const attrs_val = stack.pop(self);
                 const result = try access.getAttrValue(self, attrs_val, name_id);
                 try stack.push(self, result);
@@ -432,58 +446,58 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 try stack.push(self, try force.forceValue(self, result));
             },
             .get_attr_path_dynamic_or => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 2;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 2;
                 const default_val = stack.pop(self);
                 const name_val = stack.pop(self);
                 const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..frame.ip], false);
+                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..ip], false);
                 try stack.push(self, result);
             },
             .get_attr_path_dynamic_or_long => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 4;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 4;
                 const default_val = stack.pop(self);
                 const name_val = stack.pop(self);
                 const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..frame.ip], true);
+                const result = try access.getAttrPathDynamicOrValue(self, attrs_val, name_val, default_val, code[names_start..ip], true);
                 try stack.push(self, result);
             },
             .get_attr_path_or => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 2;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 2;
                 const default_val = stack.pop(self);
                 const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..frame.ip], false);
+                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..ip], false);
                 try stack.push(self, result);
             },
             .get_attr_path_or_long => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 4;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 4;
                 const default_val = stack.pop(self);
                 const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..frame.ip], true);
+                const result = try access.getAttrPathOrValue(self, attrs_val, default_val, code[names_start..ip], true);
                 try stack.push(self, result);
             },
             .get_attr_path_mixed_or => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const dynamic_count = code[frame.ip];
-                frame.ip += 1;
-                const segments_start = frame.ip;
+                const segment_count = code[ip];
+                ip += 1;
+                const dynamic_count = code[ip];
+                ip += 1;
+                const segments_start = ip;
                 for (0..segment_count) |_| {
-                    const tag = code[frame.ip];
-                    frame.ip += 1;
+                    const tag = code[ip];
+                    ip += 1;
                     switch (tag) {
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => frame.ip += 4,
+                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => ip += 4,
                         @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
                         else => return error.InvalidBytecode,
                     }
@@ -497,24 +511,24 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                     dynamic_names[dynamic_i] = stack.pop(self);
                 }
                 const attrs_val = stack.pop(self);
-                const result = try access.getAttrPathMixedOrValue(self, attrs_val, dynamic_names, default_val, code[segments_start..frame.ip], segment_count);
+                const result = try access.getAttrPathMixedOrValue(self, attrs_val, dynamic_names, default_val, code[segments_start..ip], segment_count);
                 try stack.push(self, result);
             },
             .has_attr_path => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 2;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 2;
                 const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..frame.ip], false)));
+                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..ip], false)));
             },
             .has_attr_path_long => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, segment_count) * 4;
+                const segment_count = code[ip];
+                ip += 1;
+                const names_start = ip;
+                ip += @as(usize, segment_count) * 4;
                 const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..frame.ip], true)));
+                try stack.push(self, Value.boolVal(try access.hasAttrPath(self, attrs_val, code[names_start..ip], true)));
             },
             .has_attr_dynamic => {
                 const name_val = try force.forceValue(self, stack.pop(self));
@@ -533,16 +547,16 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 }
             },
             .has_attr_path_mixed => {
-                const segment_count = code[frame.ip];
-                frame.ip += 1;
-                const dynamic_count = code[frame.ip];
-                frame.ip += 1;
-                const segments_start = frame.ip;
+                const segment_count = code[ip];
+                ip += 1;
+                const dynamic_count = code[ip];
+                ip += 1;
+                const segments_start = ip;
                 for (0..segment_count) |_| {
-                    const tag = code[frame.ip];
-                    frame.ip += 1;
+                    const tag = code[ip];
+                    ip += 1;
                     switch (tag) {
-                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => frame.ip += 4,
+                        @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => ip += 4,
                         @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => {},
                         else => return error.InvalidBytecode,
                     }
@@ -555,44 +569,47 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                     dynamic_names[dynamic_i] = stack.pop(self);
                 }
                 const attrs_val = stack.pop(self);
-                try stack.push(self, Value.boolVal(try access.hasAttrPathMixed(self, attrs_val, dynamic_names, code[segments_start..frame.ip], segment_count)));
+                try stack.push(self, Value.boolVal(try access.hasAttrPathMixed(self, attrs_val, dynamic_names, code[segments_start..ip], segment_count)));
             },
             .validate_attrs => {
-                const allow_extra = code[frame.ip] != 0;
-                frame.ip += 1;
-                const expected_count = readU16(code, frame.ip);
-                frame.ip += 2;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, expected_count) * 2;
+                const allow_extra = code[ip] != 0;
+                ip += 1;
+                const expected_count = readU16(code, ip);
+                ip += 2;
+                const names_start = ip;
+                ip += @as(usize, expected_count) * 2;
                 const attrs_val = stack.pop(self);
-                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..frame.ip], false);
+                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..ip], false);
             },
             .validate_attrs_long => {
-                const allow_extra = code[frame.ip] != 0;
-                frame.ip += 1;
-                const expected_count = readU16(code, frame.ip);
-                frame.ip += 2;
-                const names_start = frame.ip;
-                frame.ip += @as(usize, expected_count) * 4;
+                const allow_extra = code[ip] != 0;
+                ip += 1;
+                const expected_count = readU16(code, ip);
+                ip += 2;
+                const names_start = ip;
+                ip += @as(usize, expected_count) * 4;
                 const attrs_val = stack.pop(self);
-                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..frame.ip], true);
+                try access.validateAttrs(self, attrs_val, allow_extra, code[names_start..ip], true);
             },
             .lookup_with => {
-                const name_id: InternId = @intCast(readU16(code, frame.ip));
-                frame.ip += 2;
-                const scope_count = code[frame.ip];
-                frame.ip += 1;
+                const name_id: InternId = @intCast(readU16(code, ip));
+                ip += 2;
+                const scope_count = code[ip];
+                ip += 1;
                 try access.lookupWith(self, name_id, scope_count);
             },
             .lookup_with_long => {
-                const name_id: InternId = readU32(code, frame.ip);
-                frame.ip += 4;
-                const scope_count = code[frame.ip];
-                frame.ip += 1;
+                const name_id: InternId = readU32(code, ip);
+                ip += 4;
+                const scope_count = code[ip];
+                ip += 1;
                 try access.lookupWith(self, name_id, scope_count);
             },
             // ---- termination ----
             .ret => {
+                // The frame about to be popped is ours — no need to
+                // sync ip back; popFrame discards the slot's
+                // contents.
                 const result = stack.pop(self);
                 const finished_frame = stack.popFrame(self);
                 if (self.frames_len == 0) {
@@ -609,6 +626,7 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 try stack.push(self, result);
                 frame = stack.currentFrame(self);
                 code = frame.chunk_ptr.code;
+                ip = frame.ip;
             },
             .halt => {
                 // Stop execution.
