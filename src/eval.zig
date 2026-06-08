@@ -32,6 +32,7 @@ const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
 const stable_segments_mod = @import("runtime/stable_segments.zig");
+const search_path_mod = @import("eval/search_path.zig");
 
 const worker_id_mod = @import("runtime/worker_id.zig");
 const worker_mod = @import("worker.zig");
@@ -112,7 +113,7 @@ pub const Evaluator = struct {
     derivations: DerivationStore,
     imports: std.StringHashMapUnmanaged(*ImportEntry),
     imports_mu: stable_segments_mod.SpinMutex,
-    search_paths: []SearchPathEntry,
+    search_paths: search_path_mod.Paths,
     /// One arena per worker. Each VM allocates its stack, frames, and
     /// per-opcode scratch through its worker's arena so workers never share
     /// a non-thread-safe allocator.
@@ -159,7 +160,7 @@ pub const Evaluator = struct {
             .derivations = DerivationStore.init(allocator),
             .imports = .empty,
             .imports_mu = .{},
-            .search_paths = &.{},
+            .search_paths = .{},
             .worker_arenas = arenas,
             .builtins_value = null,
             .base_path = null,
@@ -187,7 +188,7 @@ pub const Evaluator = struct {
             self.allocator.destroy(kv.value_ptr.*);
         }
         self.imports.deinit(self.allocator);
-        self.freeSearchPaths();
+        self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
         self.derivations.deinit();
         self.files.deinit();
@@ -247,36 +248,9 @@ pub const Evaluator = struct {
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
-        self.freeSearchPaths();
-
-        var entries: std.ArrayListUnmanaged(SearchPathEntry) = .empty;
-        errdefer {
-            for (entries.items) |entry| entry.deinit(self.allocator);
-            entries.deinit(self.allocator);
-        }
-
-        var parts = std.mem.splitScalar(u8, nix_path, ':');
-        while (parts.next()) |part| {
-            if (part.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, part, '=');
-            const prefix = if (eq) |i| part[0..i] else "";
-            const raw_path = if (eq) |i| part[i + 1 ..] else part;
-            if (raw_path.len == 0) continue;
-
-            const resolved = self.resolveHostPath(raw_path) catch |err| switch (err) {
-                error.RelativePath => continue,
-                else => return err,
-            };
-            defer if (resolved.owned) self.allocator.free(resolved.text);
-
-            try entries.append(self.allocator, .{
-                .prefix = try self.allocator.dupe(u8, prefix),
-                .path = try self.allocator.dupe(u8, resolved.text),
-            });
-        }
-
-        self.search_paths = try entries.toOwnedSlice(self.allocator);
+        try self.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
     }
+
 
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
         const resolved = try self.resolveHostPath(path);
@@ -607,26 +581,7 @@ pub const Evaluator = struct {
     }
 
     fn findFileInDefaultSearchPath(self: *Evaluator, name: []const u8) !Value {
-        if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
-            return Value.path(try self.intern.intern("/__corepkgs__/fetchurl.nix"));
-        }
-
-        for (self.search_paths) |entry| {
-            if (try self.searchPathCandidate(entry.path, entry.prefix, name)) |candidate| {
-                defer self.allocator.free(candidate);
-                return Value.path(try self.intern.intern(candidate));
-            }
-        }
-        return error.FileNotFound;
-    }
-
-    fn searchPathCandidate(self: *Evaluator, base: []const u8, prefix: []const u8, name: []const u8) !?[]u8 {
-        const suffix = path_ops.searchPathSuffix(prefix, name) orelse return null;
-        const candidate = try std.fs.path.resolve(self.allocator, &.{ base, suffix });
-        errdefer self.allocator.free(candidate);
-        if (try self.files.pathExists(candidate)) return candidate;
-        self.allocator.free(candidate);
-        return null;
+        return self.search_paths.findFile(self.allocator, &self.files, &self.intern, name);
     }
 
     fn importPath(self: *Evaluator, path: []const u8) !Value {
@@ -788,39 +743,14 @@ pub const Evaluator = struct {
 
     fn ensureBuiltins(self: *Evaluator) !Value {
         if (self.builtins_value) |value| return value;
-        const nix_path = try self.allocator.alloc(builtins.NixPathEntry, self.search_paths.len);
+        const nix_path = try self.search_paths.toNixPath(self.allocator);
         defer self.allocator.free(nix_path);
-        for (self.search_paths, nix_path) |entry, *out| {
-            out.* = .{ .prefix = entry.prefix, .path = entry.path };
-        }
-
         const value = try builtins.buildAttrSet(&self.intern, &self.heap, nix_path);
         self.builtins_value = value;
         return value;
     }
 
-    const ResolvedHostPath = struct {
-        text: []const u8,
-        owned: bool,
-    };
-
-    const SearchPathEntry = struct {
-        prefix: []u8,
-        path: []u8,
-
-        fn deinit(self: SearchPathEntry, allocator: std.mem.Allocator) void {
-            allocator.free(self.prefix);
-            allocator.free(self.path);
-        }
-    };
-
-    fn freeSearchPaths(self: *Evaluator) void {
-        for (self.search_paths) |entry| entry.deinit(self.allocator);
-        self.allocator.free(self.search_paths);
-        self.search_paths = &.{};
-    }
-
-    fn resolveHostPath(self: *Evaluator, path: []const u8) !ResolvedHostPath {
+    fn resolveHostPath(self: *Evaluator, path: []const u8) !search_path_mod.ResolvedPath {
         if (std.fs.path.isAbsolute(path)) return .{ .text = path, .owned = false };
 
         const base_path = self.base_path orelse return error.RelativePath;
