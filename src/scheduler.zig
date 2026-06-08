@@ -282,9 +282,15 @@ pub const Scheduler = struct {
     /// the cost of pushing/waking exceeds the speculative win.
     /// Returns false if all helper queues are full, no helpers exist, or
     /// the speculation backlog cap was hit.
+    ///
+    /// Cap of `helper_count * 64`: with average task ~20µs, that's ~1.3ms
+    /// of queued work per helper. Smaller caps (we used 16 previously)
+    /// dropped most submissions from a NixOS toplevel because consumer
+    /// fan-out can submit hundreds of items in a tight loop; the bounded
+    /// cascade (`vm.in_speculation`) means a deep queue can't run away.
     pub fn submit(self: *Scheduler, task: Task) bool {
         if (self.helper_count == 0) return false;
-        const cap: u32 = @as(u32, self.helper_count) * 16;
+        const cap: u32 = @as(u32, self.helper_count) * 64;
         if (self.pending_tasks.load(.monotonic) >= cap) {
             _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
             return false;
@@ -477,10 +483,10 @@ test "submitUrgent bypasses the speculation backlog cap" {
     defer sched.deinit();
     try std.testing.expectEqual(@as(u8, 1), sched.helper_count);
 
-    // The speculation cap is helper_count * 16 = 16. Fill it up via
+    // The speculation cap is helper_count * 64 = 64. Fill it up via
     // `submit` and confirm the next `submit` is rejected.
     var i: types.ObjectId = 0;
-    while (i < 16) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }));
+    while (i < 64) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }));
     try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }));
 
     // `submitUrgent` should still go through — the queue capacity is 1024.
@@ -489,7 +495,7 @@ test "submitUrgent bypasses the speculation backlog cap" {
 
     var drained: u32 = 0;
     while (sched.queues[0].steal()) |_| drained += 1;
-    try std.testing.expectEqual(@as(u32, 18), drained);
+    try std.testing.expectEqual(@as(u32, 66), drained);
 }
 
 test "stealForWorker: main (worker 0) excludes nothing; helper N excludes its own queue" {
