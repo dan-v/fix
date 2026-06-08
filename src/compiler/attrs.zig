@@ -372,10 +372,8 @@ pub fn compilePlainAttrGroup(
 
 pub fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     for (groups) |group| {
-        try emit.emitOp(self, .push_null);
-        try emit.emitOp(self, .make_cell);
         const slot = try scope.declareLocal(self, group.name, group.name_id);
-        try emit.emitSetLocal(self, slot);
+        try emit.emitInitCellSlot(self, slot);
     }
 }
 

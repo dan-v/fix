@@ -406,6 +406,18 @@ pub fn runUntil(self: *VM, stop_depth: usize) anyerror!Value {
                 const val = stack.pop(self);
                 try stack.push(self, try force.makeCell(self, val));
             },
+            .init_cell_slot => {
+                const slot = code[ip];
+                ip += 1;
+                const cell = try force.makeCell(self, Value.null_val);
+                self.stack[frame.frame_base + slot] = cell;
+            },
+            .init_cell_slot_long => {
+                const slot = readU16(code, ip);
+                ip += 2;
+                const cell = try force.makeCell(self, Value.null_val);
+                self.stack[frame.frame_base + slot] = cell;
+            },
 
             // ---- attribute access ----
             .get_attr => {

@@ -76,6 +76,10 @@ pub fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
     try emitLocalOp(self, .set_cell_local, .set_cell_local_long, slot);
 }
 
+pub fn emitInitCellSlot(self: *Compiler, slot: u16) !void {
+    try emitLocalOp(self, .init_cell_slot, .init_cell_slot_long, slot);
+}
+
 pub fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: InternId) !void {
     if (id <= std.math.maxInt(u16)) {
         try emitOpU16(self, short_op, @intCast(id));

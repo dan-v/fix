@@ -131,6 +131,15 @@ pub const OpCode = enum(u8) {
     // ---- thunks ----
     /// Wrap the top-of-stack value in a mutable lazy cell.
     make_cell,
+    /// Allocate an empty (null-wrapped) lazy cell and store it
+    /// directly into a local slot. Operand: 1-byte slot index. Fuses
+    /// the `push_null + make_cell + set_local` sequence that the
+    /// compiler emits once per let-binding / recursive-attrset
+    /// binding / lambda parameter — saving two dispatches and the
+    /// intermediate stack push/pop per call.
+    init_cell_slot,
+    /// Wide-slot variant of `init_cell_slot`. Operand: 2-byte slot index.
+    init_cell_slot_long,
 
     // ---- attribute access ----
     /// Select an attribute from attrset on stack top.

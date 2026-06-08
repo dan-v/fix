@@ -249,10 +249,8 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     for (lambda.params) |param| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
-        try emit.emitOp(&child, .push_null);
-        try emit.emitOp(&child, .make_cell);
         const slot = try scope.declareLocal(&child, name, name_id);
-        try emit.emitSetLocal(&child, slot);
+        try emit.emitInitCellSlot(&child, slot);
     }
 
     for (lambda.params) |param| {
@@ -327,10 +325,8 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const name_id = try self.intern.intern(name);
-        try emit.emitOp(self, .push_null);
-        try emit.emitOp(self, .make_cell);
         const slot = try scope.declareLocal(self, name, name_id);
-        try emit.emitSetLocal(self, slot);
+        try emit.emitInitCellSlot(self, slot);
     }
 
     for (let_in.bindings, 0..) |binding, index| {

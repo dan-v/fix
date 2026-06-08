@@ -141,12 +141,12 @@ fn writeOperands(
         },
         .push_null, .push_true, .push_false, .pop => {},
 
-        .get_local, .set_local, .capture_local => {
+        .get_local, .set_local, .capture_local, .init_cell_slot => {
             const slot = code[ip];
             ip += 1;
             try writer.print("local[{d}]", .{slot});
         },
-        .get_local_long, .set_local_long, .capture_local_long, .set_cell_local_long => {
+        .get_local_long, .set_local_long, .capture_local_long, .set_cell_local_long, .init_cell_slot_long => {
             const slot = readU16(code, ip);
             ip += 2;
             try writer.print("local[{d}]", .{slot});
