@@ -34,10 +34,21 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 }
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
-    return switch (value.discriminant) {
-        .thunk => try forceThunkImpl(self, value, demand),
-        else => value,
-    };
+    if (value.discriminant != .thunk) return value;
+    // Inline the resolved-thunk fast path. The vast majority of forces
+    // hit an already-resolved thunk in steady state (workers and
+    // demand-driven fan-out tend to resolve hot thunks early); folding
+    // the resolved-check into the caller's bytecode dispatch saves the
+    // forceThunkImpl call frame on the hottest path. Everything else
+    // (claimed/busy/blackhole/errored) goes through the full function.
+    const thunk_id = value.asObjectId();
+    const thunk = try self.heap.getThunk(thunk_id);
+    const state = thunk.state.load(.acquire);
+    if (state == @intFromEnum(thunk_mod.ThunkState.resolved)) {
+        if (demand) thunk.markDemanded();
+        return thunk.result;
+    }
+    return forceThunkImpl(self, value, demand);
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
