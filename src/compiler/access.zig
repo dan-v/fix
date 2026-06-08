@@ -179,6 +179,21 @@ pub fn compileContainerValue(self: *Compiler, node: *const Node, options: Contai
     try thunks.compileThunk(self, node);
 }
 
+/// Predicate version of `compileImmediateContainerValue` for the
+/// pure-literal cases. Mirrors the branches above that don't depend
+/// on scope state — useful for compile-time decisions about whether
+/// a binding's RHS needs a lazy cell at all.
+pub fn isLiteralContainerValue(self: *Compiler, node: *const Node) bool {
+    const unwrapped = unwrapParens(node);
+    return switch (unwrapped.tag) {
+        .integer, .float_val, .bool_true, .bool_false, .null => true,
+        .string => !stringHasInterpolation(self, unwrapped),
+        .path => !pathHasInterpolation(self, unwrapped),
+        .list => unwrapped.data.list.items.len == 0,
+        else => false,
+    };
+}
+
 pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !bool {
     const unwrapped = unwrapParens(node);
     switch (unwrapped.tag) {

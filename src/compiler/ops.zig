@@ -321,16 +321,31 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
 
     scope.beginScope(self);
 
+    // Pass 1: declare slots. For bindings whose RHS is a pure literal
+    // and whose root path has a single leaf (no nested attr path), emit
+    // the value directly into the slot and skip cell allocation — the
+    // literal can't reference any other binding, so eager evaluation
+    // is observably equivalent to the lazy cell-wrapped form. For
+    // everything else, allocate the usual lazy cell so forward and
+    // mutually-recursive references resolve correctly.
     for (let_in.bindings, 0..) |binding, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const name_id = try self.intern.intern(name);
         const slot = try scope.declareLocal(self, name, name_id);
-        try emit.emitInitCellSlot(self, slot);
+        if (isLiteralLeafBinding(self, let_in.bindings, binding.path[0])) {
+            const leaf = singleLeafBinding(self, let_in.bindings, binding.path[0]).?;
+            try access.compileContainerValue(self, leaf.expr, .{});
+            try emit.emitSetLocal(self, slot);
+        } else {
+            try emit.emitInitCellSlot(self, slot);
+        }
     }
 
+    // Pass 2: fill in non-literal bindings.
     for (let_in.bindings, 0..) |binding, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
+        if (isLiteralLeafBinding(self, let_in.bindings, binding.path[0])) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
         try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot);
@@ -344,6 +359,27 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     }
 
     scope.endScope(self);
+}
+
+/// True when the binding group sharing `root` is exactly one leaf
+/// (no nested attr paths, no duplicates) and that leaf's RHS is a
+/// pure literal — i.e. eager evaluation can replace the cell-wrap
+/// without changing observable behaviour.
+fn isLiteralLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
+    const leaf = singleLeafBinding(self, bindings, root) orelse return false;
+    return access.isLiteralContainerValue(self, leaf.expr);
+}
+
+fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom) ?Node.Binding {
+    var found: ?Node.Binding = null;
+    for (bindings) |binding| {
+        if (!attrs.attrSegmentsEqual(self, binding.path[0], root)) continue;
+        if (binding.path.len != 1) return null;
+        if (binding.inherit_outer) return null;
+        if (found != null) return null;
+        found = binding;
+    }
+    return found;
 }
 
 pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16) !void {
