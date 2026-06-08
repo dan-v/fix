@@ -322,7 +322,13 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     scope.beginScope(self);
 
     // For each unique binding root, classify how it should be
-    // compiled. Three kinds:
+    // compiled. Four kinds:
+    //   .unreferenced      — nothing else in this let (or its body)
+    //                        mentions the name; skip the binding
+    //                        entirely. Nix is pure and lazy: if no
+    //                        one forces the RHS, its side-effects
+    //                        never fire, so omitting it is observably
+    //                        equivalent.
     //   .literal           — RHS is a pure literal; eagerly bind value
     //                        directly into the slot (no cell).
     //   .uncaptured        — non-literal RHS, no earlier binding in
@@ -336,11 +342,12 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     //                        the cell exists so the earlier RHS can
     //                        capture a mutable handle that this
     //                        binding's pass 2 mutates.
-    const kinds = try classifyLetBindings(self, let_in.bindings);
+    const kinds = try classifyLetBindings(self, let_in.bindings, let_in.body);
     defer self.allocator.free(kinds);
 
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
+        if (kind == .unreferenced) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const name_id = try self.intern.intern(name);
         const slot = try scope.declareLocal(self, name, name_id);
@@ -352,19 +359,20 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
             },
             .uncaptured => {}, // pass 2 will fill the slot directly
             .needs_cell => try emit.emitInitCellSlot(self, slot),
+            .unreferenced => unreachable,
         }
     }
 
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
-        if (kind == .literal) continue;
+        if (kind == .literal or kind == .unreferenced) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
         try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),
             .uncaptured => try emit.emitSetLocal(self, slot),
-            .literal => unreachable,
+            .literal, .unreferenced => unreachable,
         }
     }
 
@@ -377,7 +385,7 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     scope.endScope(self);
 }
 
-const LetBindingKind = enum { literal, uncaptured, needs_cell };
+const LetBindingKind = enum { unreferenced, literal, uncaptured, needs_cell };
 
 /// Decide for each binding whether it can skip the cell. A binding
 /// needs a cell iff some *earlier* binding (which gets compiled first
@@ -385,7 +393,7 @@ const LetBindingKind = enum { literal, uncaptured, needs_cell };
 /// mutable-handle behaviour load-bearing. Later bindings and the body
 /// always see the bound value because pass 2 fills slots in source
 /// order before the body emits.
-fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding) ![]LetBindingKind {
+fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *const Node) ![]LetBindingKind {
     const kinds = try self.allocator.alloc(LetBindingKind, bindings.len);
     errdefer self.allocator.free(kinds);
 
@@ -396,11 +404,15 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding) ![]LetBi
             kinds[i] = .needs_cell;
             continue;
         }
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        if (!isReferencedExternally(self, bindings, i, name, body)) {
+            kinds[i] = .unreferenced;
+            continue;
+        }
         if (isLiteralLeafBinding(self, bindings, binding.path[0])) {
             kinds[i] = .literal;
             continue;
         }
-        const name = attrs.attrSegmentSpan(self, binding.path[0]);
         if (groupNeedsCell(self, bindings, i, name)) {
             kinds[i] = .needs_cell;
         } else {
@@ -408,6 +420,31 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding) ![]LetBi
         }
     }
     return kinds;
+}
+
+/// True if `name` appears in either the let body or any binding's
+/// RHS *other than* the target binding's own RHS. Used to decide
+/// whether the binding is observably required; an unreferenced
+/// binding can be omitted entirely because its lazy RHS would never
+/// be forced.
+fn isReferencedExternally(
+    self: *Compiler,
+    bindings: []const Node.Binding,
+    target_index: usize,
+    name: []const u8,
+    body: *const Node,
+) bool {
+    if (nodeReferencesName(self, body, name)) return true;
+    for (bindings, 0..) |binding, i| {
+        if (i == target_index) continue;
+        if (binding.path.len > 1) {
+            // Nested-path bindings synthesise an attr-set thunk
+            // whose captures we don't track; treat as a reference.
+            return true;
+        }
+        if (nodeReferencesName(self, binding.expr, name)) return true;
+    }
+    return false;
 }
 
 /// True if the binding rooted at `bindings[target_index]` must keep a
@@ -505,16 +542,36 @@ fn nodeReferencesName(self: *Compiler, node: *const Node, name: []const u8) bool
                 if (entry.dynamic_name) |dn| {
                     if (nodeReferencesName(self, dn, name)) return true;
                 }
+                // Attr entries with `${...}` interpolation in the
+                // path keep the dynamic expression embedded in the
+                // path atom's source span (re-parsed at compile
+                // time by `compileStringAtom`). Span-scan to catch
+                // references inside the interpolation.
+                for (entry.path) |seg| {
+                    if (spanContainsIdentifier(self, seg, name)) return true;
+                }
                 if (nodeReferencesName(self, entry.expr, name)) return true;
             }
             return false;
         },
-        .attr_path => return nodeReferencesName(self, node.data.attr_path.root, name),
+        .attr_path => {
+            if (nodeReferencesName(self, node.data.attr_path.root, name)) return true;
+            for (node.data.attr_path.segments) |seg| {
+                if (spanContainsIdentifier(self, seg, name)) return true;
+            }
+            return false;
+        },
         .attr_dynamic => return nodeReferencesName(self, node.data.attr_dynamic.root, name) or
             nodeReferencesName(self, node.data.attr_dynamic.name, name),
         .attr_or => return nodeReferencesName(self, node.data.attr_or.attr_path, name) or
             nodeReferencesName(self, node.data.attr_or.default, name),
-        .has_attr => return nodeReferencesName(self, node.data.has_attr.root, name),
+        .has_attr => {
+            if (nodeReferencesName(self, node.data.has_attr.root, name)) return true;
+            for (node.data.has_attr.segments) |seg| {
+                if (spanContainsIdentifier(self, seg, name)) return true;
+            }
+            return false;
+        },
         .has_attr_dynamic => return nodeReferencesName(self, node.data.has_attr_dynamic.root, name) or
             nodeReferencesName(self, node.data.has_attr_dynamic.name, name),
         .has_attr_mixed => {
