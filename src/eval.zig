@@ -33,71 +33,12 @@ const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
 const stable_segments_mod = @import("runtime/stable_segments.zig");
 const search_path_mod = @import("eval/search_path.zig");
+const imports_mod = @import("eval/imports.zig");
+const ImportEntry = imports_mod.ImportEntry;
 
 const worker_id_mod = @import("runtime/worker_id.zig");
 const worker_mod = @import("worker.zig");
 const fiber_mod = @import("fiber.zig");
-
-/// Per-thread linked list of in-progress *scoped* import paths. Scoped
-/// imports are not deduplicated through `ImportEntry` (each call has a
-/// distinct scope value), so cycle detection for them remains thread-local.
-const ImportFrame = struct {
-    path: []const u8,
-    next: ?*const ImportFrame,
-};
-threadlocal var scoped_import_stack_top: ?*const ImportFrame = null;
-
-fn checkScopedImportCycle(path: []const u8) !void {
-    var cursor = scoped_import_stack_top;
-    while (cursor) |node| {
-        if (std.mem.eql(u8, node.path, path)) return error.ImportCycle;
-        cursor = node.next;
-    }
-}
-
-const INVALID_CLAIMER: u8 = 0xFF;
-
-/// Per-path import deduplication entry. The first thread to claim
-/// (cmpxchg state from unresolved → evaluating) does the work; others
-/// either wait (main thread) or bail (helper threads, to avoid deadlock
-/// with the main thread holding a contended thunk).
-const ImportEntry = struct {
-    const STATE_UNRESOLVED: u32 = 0;
-    const STATE_EVALUATING: u32 = 1;
-    const STATE_RESOLVED: u32 = 2;
-    const STATE_FAILED: u32 = 3;
-
-    state: std.atomic.Value(u32) = .init(STATE_UNRESOLVED),
-    claimer: std.atomic.Value(u8) = .init(INVALID_CLAIMER),
-    result: Value = Value.null_val,
-
-    fn waitForChange(self: *ImportEntry, from: u32) void {
-        switch (@import("builtin").os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_4arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAIT, .private = true },
-                    from,
-                    null,
-                );
-            },
-            else => std.Thread.yield() catch {},
-        }
-    }
-
-    fn wakeAll(self: *ImportEntry) void {
-        switch (@import("builtin").os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_3arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAKE, .private = true },
-                    std.math.maxInt(i32),
-                );
-            },
-            else => {},
-        }
-    }
-};
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
@@ -644,7 +585,7 @@ pub const Evaluator = struct {
         self.progressBegin(.import, stable_path);
         defer self.progressEnd(.import, stable_path);
 
-        const source = if (corepkgsSource(stable_path)) |core_source|
+        const source = if (imports_mod.corepkgsSource(stable_path)) |core_source|
             core_source
         else
             self.files.readFile(stable_path) catch |err| switch (err) {
@@ -680,15 +621,15 @@ pub const Evaluator = struct {
         const stable_path = try self.allocator.dupe(u8, path);
         defer self.allocator.free(stable_path);
 
-        try checkScopedImportCycle(stable_path);
-        var frame: ImportFrame = .{ .path = stable_path, .next = scoped_import_stack_top };
-        scoped_import_stack_top = &frame;
-        defer scoped_import_stack_top = frame.next;
+        try imports_mod.checkScopedCycle(stable_path);
+        var frame: imports_mod.ScopedFrame = .{ .path = stable_path, .next = null };
+        const prev = imports_mod.pushScopedFrame(&frame);
+        defer imports_mod.popScopedFrame(prev);
 
         self.progressBegin(.import, stable_path);
         defer self.progressEnd(.import, stable_path);
 
-        const source = if (corepkgsSource(stable_path)) |core_source|
+        const source = if (imports_mod.corepkgsSource(stable_path)) |core_source|
             core_source
         else
             self.files.readFile(stable_path) catch |err| switch (err) {
@@ -697,35 +638,6 @@ pub const Evaluator = struct {
             };
         const source_base = std.fs.path.dirname(stable_path) orelse "/";
         return self.evaluateSource(source, source_base, stable_path, scope);
-    }
-
-    fn corepkgsSource(path: []const u8) ?[]const u8 {
-        if (!std.mem.eql(u8, path, "/__corepkgs__/fetchurl.nix")) return null;
-        return
-        \\{
-        \\  name ? baseNameOf url,
-        \\  url,
-        \\  hash ? "",
-        \\  sha256 ? "",
-        \\  executable ? false,
-        \\  ...
-        \\}:
-        \\let
-        \\  outputHash = if hash != "" then hash else sha256;
-        \\in
-        \\derivation {
-        \\  inherit name url executable;
-        \\  urls = [ url ];
-        \\  builder = "builtin:fetchurl";
-        \\  system = "builtin";
-        \\  inherit outputHash;
-        \\  outputHashAlgo = if hash != "" then null else "sha256";
-        \\  outputHashMode = if executable then "recursive" else "flat";
-        \\  preferLocalBuild = true;
-        \\  impureEnvVars = [ "http_proxy" "https_proxy" "ftp_proxy" "all_proxy" "no_proxy" ];
-        \\  unpack = false;
-        \\}
-        ;
     }
 
     fn importDirectory(self: *Evaluator, path: []const u8) anyerror!Value {
