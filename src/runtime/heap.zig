@@ -176,12 +176,13 @@ pub const ObjectHeap = struct {
         self.objects.deinit(self.allocator);
     }
 
-    /// Thunks in the `.errored` state own a heap-allocated message
-    /// string; we allocate them out of `self.allocator` and must release
-    /// them before tearing down the object store. Walk every object slot
-    /// (skipping unfilled TLAB reservations the same way `stats` does)
-    /// and free messages on errored thunks.
+    /// Thunks in the `.errored` state own a sidecar `ErrorInfo` struct
+    /// (and its optional message string) allocated from `self.allocator`.
+    /// Walk every object slot (skipping unfilled TLAB reservations the
+    /// same way `stats` does) and release the sidecar storage for any
+    /// thunk left in the errored state.
     fn freeThunkErrorMessages(self: *ObjectHeap) void {
+        const thunk_mod = @import("thunk.zig");
         var unfilled_starts: [256]u32 = undefined;
         var unfilled_ends: [256]u32 = undefined;
         var unfilled_count: usize = 0;
@@ -205,10 +206,11 @@ pub const ObjectHeap = struct {
             const obj = self.objects.getMut(id);
             switch (obj.payload) {
                 .thunk => |*t| {
-                    if (t.error_info.message) |msg| {
-                        self.allocator.free(msg);
-                        t.error_info.message = null;
-                    }
+                    const state = t.state.load(.acquire);
+                    if (state != @intFromEnum(thunk_mod.ThunkState.errored)) continue;
+                    const info: *thunk_mod.ErrorInfo = @ptrFromInt(t.result.payload);
+                    if (info.message) |msg| self.allocator.free(msg);
+                    self.allocator.destroy(info);
                 },
                 else => {},
             }

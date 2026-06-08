@@ -10,6 +10,14 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
     const trace = self.trace orelse return;
     try trace.setMessageIfAbsent(defaultErrorMessage(err));
     if (trace.captured_stack) return;
+    // Speculative thunk forces point vm.trace at a per-fiber scratch
+    // trace whose only consumer is publishThunkFailure (which dupes
+    // the message). Walking the frame stack to push N diagnostic
+    // frames here is pure waste — skip it for those traces.
+    if (trace.frames_disabled) {
+        trace.markCapturedStack();
+        return;
+    }
 
     var previous: ?chunk.Chunk.SourceSpan = null;
     var i: usize = self.frames_len;

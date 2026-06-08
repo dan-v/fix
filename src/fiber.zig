@@ -87,12 +87,21 @@ pub const Fiber = struct {
     caller_ctx: ?*Context,
 
     /// Default fiber stack size. The watermark probe on a representative
-    /// NixOS toplevel evaluation tops out at ~1.7 MiB; we round up to
-    /// 3 MiB so we have nearly 2× headroom for evaluations with deeper
-    /// import chains or builtins. If profiling later shows a workload
-    /// pushing past this, bump the constant (or expose a runtime knob
-    /// — `Fiber.init` already takes `stack_bytes` as a parameter).
-    pub const min_stack_bytes: usize = 3 * 1024 * 1024;
+    /// NixOS toplevel evaluation tops out at ~1.7 MiB in ReleaseFast; we
+    /// round up to 3 MiB so we have nearly 2× headroom for evaluations
+    /// with deeper import chains or builtins.
+    ///
+    /// Debug builds have significantly larger Zig stack frames (no
+    /// inlining, more spills, runtime safety locals) and overflow the
+    /// release-sized stack on the same workload, so we hand them a
+    /// larger budget. This is a stopgap — the sentinel-fill in `init`
+    /// commits every page eagerly, so 16 MiB × N fibers really
+    /// materialises in RSS. A follow-up will move to lazily-committed
+    /// virtual stacks so we can provision generously without paying.
+    pub const min_stack_bytes: usize = if (@import("builtin").mode == .Debug)
+        16 * 1024 * 1024
+    else
+        3 * 1024 * 1024;
 
     /// Sentinel byte pattern written to a freshly-allocated stack so
     /// `maxStackUsedBytes` can find the deepest byte the fiber ever

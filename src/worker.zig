@@ -332,6 +332,9 @@ pub const Worker = struct {
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
         f.vm.claimer_id = thunk_mod.makeClaimer(self.worker_id, fiber_id);
+        // Speculative work captures only the throw message for sticky
+        // caching; skip frame-stack allocation on the hot path.
+        f.local_trace.frames_disabled = true;
 
         try self.fibers.append(self.allocator, f);
         return f;

@@ -269,18 +269,29 @@ fn publishThunkFailure(self: *VM, thunk: *thunk_mod.Thunk, thunk_id: ObjectId, e
         thunk.reset();
         return;
     }
-    // Steal the trace message (if any) onto the thunk. We dupe via the
-    // heap allocator so the lifetime tracks the heap rather than the
-    // per-fiber/per-task trace we drained it from. On allocation
-    // failure we still publish the cached error without a message.
+    // Move the trace message onto the thunk's sidecar. For local
+    // (speculative) traces we can transfer ownership directly — same
+    // allocator backs both. For the user-facing shared trace we dupe
+    // so subsequent renderers can still read the message.
     var owned_message: ?[]const u8 = null;
     if (self.trace) |trace| {
         if (trace.message) |msg| {
-            owned_message = self.heap.allocator.dupe(u8, msg) catch null;
+            if (trace.frames_disabled) {
+                owned_message = msg;
+                trace.message = null;
+            } else {
+                owned_message = self.heap.allocator.dupe(u8, msg) catch null;
+            }
         }
     }
     if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), owned_message);
-    thunk.errored(err, owned_message);
+    thunk.errored(self.heap.allocator, err, owned_message) catch {
+        // Allocation failure: drop the message and fall back to a
+        // transient reset so a future force can retry under better
+        // memory conditions.
+        if (owned_message) |m| self.heap.allocator.free(m);
+        thunk.reset();
+    };
 }
 
 /// When a force observes a cached error, replay its message onto the

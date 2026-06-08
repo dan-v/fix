@@ -19,6 +19,13 @@ pub const Trace = struct {
     message: ?[]u8 = null,
     frames: std.ArrayListUnmanaged(Frame) = .empty,
     captured_stack: bool = false,
+    /// When true, frame-mutating ops (pushFrame, pushDiagnosticFrame,
+    /// captureErrorTrace's stack walk) become no-ops; only the message
+    /// is captured. Used by per-fiber scratch traces during speculative
+    /// thunk forces — sticky-error caching only needs the message, so
+    /// we skip the N-frames-per-error allocation cost on the hot
+    /// speculative path.
+    frames_disabled: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Trace {
         return .{ .allocator = allocator };
@@ -49,12 +56,14 @@ pub const Trace = struct {
     }
 
     pub fn pushFrame(self: *Trace, frame: []const u8) !void {
+        if (self.frames_disabled) return;
         try self.frames.append(self.allocator, .{
             .message = try self.allocator.dupe(u8, frame),
         });
     }
 
     pub fn pushDiagnosticFrame(self: *Trace, source_path: ?[]const u8, frame: diagnostic.Diagnostic) !void {
+        if (self.frames_disabled) return;
         const message = try self.allocator.dupe(u8, frame.message);
         errdefer self.allocator.free(message);
         const owned_path = if (source_path) |path| try self.allocator.dupe(u8, path) else null;
