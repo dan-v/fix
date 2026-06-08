@@ -393,19 +393,47 @@ const LetBindingKind = enum { unreferenced, literal, uncaptured, needs_cell };
 /// mutable-handle behaviour load-bearing. Later bindings and the body
 /// always see the bound value because pass 2 fills slots in source
 /// order before the body emits.
+///
+/// To keep compile cost reasonable on big lets the analysis builds
+/// per-RHS reference hashsets once up front. Per-binding membership
+/// checks are then O(1) instead of O(total source bytes) — a
+/// measurable `mem.eql`-dominance saving on workloads with hundreds
+/// of let bindings (e.g. nixpkgs).
 fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *const Node) ![]LetBindingKind {
     const kinds = try self.allocator.alloc(LetBindingKind, bindings.len);
     errdefer self.allocator.free(kinds);
 
+    var body_refs: std.StringHashMapUnmanaged(void) = .empty;
+    defer body_refs.deinit(self.allocator);
+    try collectReferencedNames(self, body, &body_refs);
+
+    const rhs_refs = try self.allocator.alloc(std.StringHashMapUnmanaged(void), bindings.len);
+    defer {
+        for (rhs_refs) |*s| s.deinit(self.allocator);
+        self.allocator.free(rhs_refs);
+    }
+    for (rhs_refs) |*s| s.* = .empty;
+    var any_path_nested = false;
+    for (bindings, 0..) |binding, i| {
+        if (binding.path.len > 1) {
+            // Nested-path bindings synthesise an attr-set thunk
+            // whose captures we don't statically track; conservative:
+            // any such binding "references" every other.
+            any_path_nested = true;
+        }
+        try collectReferencedNames(self, binding.expr, &rhs_refs[i]);
+    }
+
     for (bindings, 0..) |binding, i| {
         if (bindingRootSeen(self, bindings[0..i], binding.path[0])) {
-            // Duplicate root segment — the original binding's
-            // classification covers it; this slot is unused.
             kinds[i] = .needs_cell;
             continue;
         }
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
-        if (!isReferencedExternally(self, bindings, i, name, body)) {
+
+        const externally_referenced = body_refs.contains(name) or any_path_nested or
+            referencedByOtherRhs(rhs_refs, i, name);
+        if (!externally_referenced) {
             kinds[i] = .unreferenced;
             continue;
         }
@@ -413,7 +441,7 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .literal;
             continue;
         }
-        if (groupNeedsCell(self, bindings, i, name)) {
+        if (groupNeedsCellFromSets(rhs_refs, i, name)) {
             kinds[i] = .needs_cell;
         } else {
             kinds[i] = .uncaptured;
@@ -422,194 +450,145 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     return kinds;
 }
 
-/// True if `name` appears in either the let body or any binding's
-/// RHS *other than* the target binding's own RHS. Used to decide
-/// whether the binding is observably required; an unreferenced
-/// binding can be omitted entirely because its lazy RHS would never
-/// be forced.
-fn isReferencedExternally(
-    self: *Compiler,
-    bindings: []const Node.Binding,
+fn referencedByOtherRhs(
+    rhs_refs: []const std.StringHashMapUnmanaged(void),
     target_index: usize,
     name: []const u8,
-    body: *const Node,
 ) bool {
-    if (nodeReferencesName(self, body, name)) return true;
-    for (bindings, 0..) |binding, i| {
+    for (rhs_refs, 0..) |s, i| {
         if (i == target_index) continue;
-        if (binding.path.len > 1) {
-            // Nested-path bindings synthesise an attr-set thunk
-            // whose captures we don't track; treat as a reference.
-            return true;
-        }
-        if (nodeReferencesName(self, binding.expr, name)) return true;
+        if (s.contains(name)) return true;
     }
     return false;
 }
 
-/// True if the binding rooted at `bindings[target_index]` must keep a
-/// cell. A cell is needed if:
-///   - any binding at index ≤ target_index references `name`
-///     (forward-or-self reference: capture happens before the
-///     pass-2 set runs), OR
-///   - the binding's group contains nested paths or sibling tails —
-///     these synthesise an attr-set thunk whose captures we
-///     conservatively treat as touching every name in scope.
-fn groupNeedsCell(self: *Compiler, bindings: []const Node.Binding, target_index: usize, name: []const u8) bool {
-    const target = bindings[target_index];
-    if (target.path.len > 1) return true;
-
-    // Scan earlier siblings: any reference forces the cell.
+/// Cell-needed predicate using the precomputed reference sets. A
+/// binding's name is "earlier-or-self referenced" when any binding
+/// in `0..=target_index` mentions it: that's exactly the set whose
+/// pass-2 compile would either capture before the slot is filled
+/// (earlier sibling) or during its own thunk construction (self).
+fn groupNeedsCellFromSets(
+    rhs_refs: []const std.StringHashMapUnmanaged(void),
+    target_index: usize,
+    name: []const u8,
+) bool {
     var i: usize = 0;
-    while (i < target_index) : (i += 1) {
-        const binding = bindings[i];
-        if (binding.path.len > 1) return true;
-        if (nodeReferencesName(self, binding.expr, name)) return true;
-    }
-    // Self-reference (binding[target_index]'s RHS mentions `name`):
-    // capture would happen during this binding's own thunk
-    // construction, before set_local runs — needs cell.
-    if (nodeReferencesName(self, target.expr, name)) return true;
-
-    // Also check later siblings sharing the same root path — a
-    // duplicate-root group with a tail forces compileLetRootBinding
-    // into the attr-set-thunk path, whose captures we can't safely
-    // skip cells for.
-    var j: usize = target_index + 1;
-    while (j < bindings.len) : (j += 1) {
-        if (attrs.attrSegmentsEqual(self, bindings[j].path[0], target.path[0])) return true;
+    while (i <= target_index) : (i += 1) {
+        if (rhs_refs[i].contains(name)) return true;
     }
     return false;
 }
 
-fn nodeReferencesName(self: *Compiler, node: *const Node, name: []const u8) bool {
+/// Walk `node` and add every identifier name encountered to `out`,
+/// including textual matches inside `${...}` interpolation in atoms.
+/// Conservatively mirrors `nodeReferencesName`'s coverage — false
+/// positives just keep cells (and bindings) around, never break
+/// semantics.
+fn collectReferencedNames(self: *Compiler, node: *const Node, out: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.tag) {
-        .integer, .float_val, .bool_true, .bool_false, .null, .search_path => return false,
-        .string => {
-            // Interpolation parts are inside the source span; the
-            // parser surfaces them via separate child nodes only when
-            // wrapped in an apply/binary tree, but raw string atoms
-            // can contain `${name}` which references identifiers
-            // textually. Conservative: any occurrence of the name in
-            // the literal span counts.
-            return spanContainsIdentifier(self, node.data.atom, name);
-        },
-        .path => {
-            return spanContainsIdentifier(self, node.data.atom, name);
-        },
+        .integer, .float_val, .bool_true, .bool_false, .null, .search_path => {},
+        .string, .path => try collectIdentifiersInSpan(self, node.data.atom, out),
         .identifier => {
             const ident = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-            return std.mem.eql(u8, ident, name);
+            try out.put(self.allocator, ident, {});
         },
-        .unary_op => return nodeReferencesName(self, node.data.unary.expr, name),
+        .unary_op => try collectReferencedNames(self, node.data.unary.expr, out),
         .binary_op => {
-            return nodeReferencesName(self, node.data.binary.left, name) or
-                nodeReferencesName(self, node.data.binary.right, name);
+            try collectReferencedNames(self, node.data.binary.left, out);
+            try collectReferencedNames(self, node.data.binary.right, out);
         },
         .apply => {
-            return nodeReferencesName(self, node.data.apply.func, name) or
-                nodeReferencesName(self, node.data.apply.arg, name);
+            try collectReferencedNames(self, node.data.apply.func, out);
+            try collectReferencedNames(self, node.data.apply.arg, out);
         },
-        .lambda => return nodeReferencesName(self, node.data.lambda.body, name),
+        .lambda => try collectReferencedNames(self, node.data.lambda.body, out),
         .lambda_attrs => {
             const la = node.data.lambda_attrs;
             for (la.params) |param| {
-                if (param.default) |default| {
-                    if (nodeReferencesName(self, default, name)) return true;
-                }
+                if (param.default) |default| try collectReferencedNames(self, default, out);
             }
-            return nodeReferencesName(self, la.body, name);
+            try collectReferencedNames(self, la.body, out);
         },
         .let_in => {
             const li = node.data.let_in;
-            for (li.bindings) |b| {
-                if (nodeReferencesName(self, b.expr, name)) return true;
-            }
-            return nodeReferencesName(self, li.body, name);
+            for (li.bindings) |b| try collectReferencedNames(self, b.expr, out);
+            try collectReferencedNames(self, li.body, out);
         },
         .if_else => {
             const ie = node.data.if_else;
-            return nodeReferencesName(self, ie.cond, name) or
-                nodeReferencesName(self, ie.then_branch, name) or
-                nodeReferencesName(self, ie.else_branch, name);
+            try collectReferencedNames(self, ie.cond, out);
+            try collectReferencedNames(self, ie.then_branch, out);
+            try collectReferencedNames(self, ie.else_branch, out);
         },
-        .assert => return nodeReferencesName(self, node.data.assert.cond, name) or
-            nodeReferencesName(self, node.data.assert.body, name),
-        .with_expr => return nodeReferencesName(self, node.data.with_expr.attr_set, name) or
-            nodeReferencesName(self, node.data.with_expr.body, name),
+        .assert => {
+            try collectReferencedNames(self, node.data.assert.cond, out);
+            try collectReferencedNames(self, node.data.assert.body, out);
+        },
+        .with_expr => {
+            try collectReferencedNames(self, node.data.with_expr.attr_set, out);
+            try collectReferencedNames(self, node.data.with_expr.body, out);
+        },
         .attr_set => {
             for (node.data.attr_set.entries) |entry| {
-                if (entry.dynamic_name) |dn| {
-                    if (nodeReferencesName(self, dn, name)) return true;
-                }
-                // Attr entries with `${...}` interpolation in the
-                // path keep the dynamic expression embedded in the
-                // path atom's source span (re-parsed at compile
-                // time by `compileStringAtom`). Span-scan to catch
-                // references inside the interpolation.
-                for (entry.path) |seg| {
-                    if (spanContainsIdentifier(self, seg, name)) return true;
-                }
-                if (nodeReferencesName(self, entry.expr, name)) return true;
+                if (entry.dynamic_name) |dn| try collectReferencedNames(self, dn, out);
+                for (entry.path) |seg| try collectIdentifiersInSpan(self, seg, out);
+                try collectReferencedNames(self, entry.expr, out);
             }
-            return false;
         },
         .attr_path => {
-            if (nodeReferencesName(self, node.data.attr_path.root, name)) return true;
-            for (node.data.attr_path.segments) |seg| {
-                if (spanContainsIdentifier(self, seg, name)) return true;
-            }
-            return false;
+            try collectReferencedNames(self, node.data.attr_path.root, out);
+            for (node.data.attr_path.segments) |seg| try collectIdentifiersInSpan(self, seg, out);
         },
-        .attr_dynamic => return nodeReferencesName(self, node.data.attr_dynamic.root, name) or
-            nodeReferencesName(self, node.data.attr_dynamic.name, name),
-        .attr_or => return nodeReferencesName(self, node.data.attr_or.attr_path, name) or
-            nodeReferencesName(self, node.data.attr_or.default, name),
+        .attr_dynamic => {
+            try collectReferencedNames(self, node.data.attr_dynamic.root, out);
+            try collectReferencedNames(self, node.data.attr_dynamic.name, out);
+        },
+        .attr_or => {
+            try collectReferencedNames(self, node.data.attr_or.attr_path, out);
+            try collectReferencedNames(self, node.data.attr_or.default, out);
+        },
         .has_attr => {
-            if (nodeReferencesName(self, node.data.has_attr.root, name)) return true;
-            for (node.data.has_attr.segments) |seg| {
-                if (spanContainsIdentifier(self, seg, name)) return true;
-            }
-            return false;
+            try collectReferencedNames(self, node.data.has_attr.root, out);
+            for (node.data.has_attr.segments) |seg| try collectIdentifiersInSpan(self, seg, out);
         },
-        .has_attr_dynamic => return nodeReferencesName(self, node.data.has_attr_dynamic.root, name) or
-            nodeReferencesName(self, node.data.has_attr_dynamic.name, name),
+        .has_attr_dynamic => {
+            try collectReferencedNames(self, node.data.has_attr_dynamic.root, out);
+            try collectReferencedNames(self, node.data.has_attr_dynamic.name, out);
+        },
         .has_attr_mixed => {
             const ham = node.data.has_attr_mixed;
-            if (nodeReferencesName(self, ham.root, name)) return true;
+            try collectReferencedNames(self, ham.root, out);
             for (ham.segments) |seg| switch (seg) {
-                .static => {},
-                .dynamic => |n| if (nodeReferencesName(self, n, name)) return true,
+                .static => |a| try collectIdentifiersInSpan(self, a, out),
+                .dynamic => |n| try collectReferencedNames(self, n, out),
             };
-            return false;
         },
         .list => {
-            for (node.data.list.items) |item| {
-                if (nodeReferencesName(self, item, name)) return true;
-            }
-            return false;
+            for (node.data.list.items) |item| try collectReferencedNames(self, item, out);
         },
-        .parens => return nodeReferencesName(self, node.data.parens, name),
+        .parens => try collectReferencedNames(self, node.data.parens, out),
     }
 }
 
-/// Substring-with-word-boundary check on a source-text span. Used to
-/// catch references inside string interpolation (`${name}`) and path
-/// interpolation without expanding the AST through the string parser.
-/// False positives (a substring that's not a real identifier
-/// reference) just keep the cell — sound but conservative.
-fn spanContainsIdentifier(self: *Compiler, atom: Node.Atom, name: []const u8) bool {
+/// Pull out every identifier-shaped substring from a source span and
+/// add it to `out`. Catches references inside `${...}` interpolation
+/// in atom-typed fields without expanding through the string parser.
+fn collectIdentifiersInSpan(self: *Compiler, atom: Node.Atom, out: *std.StringHashMapUnmanaged(void)) !void {
     const text = self.source[atom.offset .. atom.offset + atom.len];
     var i: usize = 0;
-    while (i + name.len <= text.len) : (i += 1) {
-        if (!std.mem.eql(u8, text[i .. i + name.len], name)) continue;
-        // Check word boundaries — adjacent identifier chars mean
-        // it's part of a longer name, not a standalone reference.
-        if (i > 0 and isIdentChar(text[i - 1])) continue;
-        if (i + name.len < text.len and isIdentChar(text[i + name.len])) continue;
-        return true;
+    while (i < text.len) {
+        if (isIdentStart(text[i])) {
+            const start = i;
+            while (i < text.len and isIdentChar(text[i])) : (i += 1) {}
+            try out.put(self.allocator, text[start..i], {});
+        } else {
+            i += 1;
+        }
     }
-    return false;
+}
+
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
 }
 
 fn isIdentChar(c: u8) bool {
