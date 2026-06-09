@@ -143,7 +143,11 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
 }
 
 pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
-    if (self.in_speculation) return;
+    // Symmetric with `fanOutListShallow`: speculative helpers may
+    // cascade attr traversal further. NixOS module evaluation walks
+    // attrsets at every level (option merging via `mapAttrs`, the
+    // module config tree itself) and the cascade is what lets
+    // independent contributions parallelise.
     if (entries.len < fan_out_min_items) return;
     // No batched task type for attrs yet (the heap currently lays out
     // attrs as a slice indexed by position, but we'd need a separate
