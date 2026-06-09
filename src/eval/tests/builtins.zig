@@ -473,7 +473,7 @@ test "evaluate string context builtins" {
 test "evaluate path construction builtins" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ cwd, "test/fuzz-corpus/imported.nix" });
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ cwd, "test/imported.nix" });
     defer std.testing.allocator.free(file_path);
 
     const store_source = try std.fmt.allocPrint(std.testing.allocator, "builtins.isString (builtins.storePath \"{s}\")", .{cwd});
@@ -580,14 +580,14 @@ test "evaluate function metadata builtins" {
     defer std.testing.allocator.free(expr_cur_pos);
     try std.testing.expectEqualStrings("null", expr_cur_pos);
 
-    const imported_pos = try renderForTestFromCurrentPath("builtins.toJSON (builtins.unsafeGetAttrPos \"value\" (import ./test/fuzz-corpus/imported.nix))");
+    const imported_pos = try renderForTestFromCurrentPath("builtins.toJSON (builtins.unsafeGetAttrPos \"value\" (import ./test/imported.nix))");
     defer std.testing.allocator.free(imported_pos);
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const expected_imported_pos = try std.fmt.allocPrint(
         std.testing.allocator,
-        "\"{{\\\"column\\\":3,\\\"file\\\":\\\"{s}/test/fuzz-corpus/imported.nix\\\",\\\"line\\\":1}}\"",
+        "\"{{\\\"column\\\":3,\\\"file\\\":\\\"{s}/test/imported.nix\\\",\\\"line\\\":1}}\"",
         .{cwd},
     );
     defer std.testing.allocator.free(expected_imported_pos);

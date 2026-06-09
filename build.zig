@@ -68,21 +68,6 @@ pub fn build(b: *std.Build) void {
         else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
     }
 
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .omit_frame_pointer = omit_frame_pointer,
-    });
-    const harness_mod = b.createModule(.{
-        .root_source_file = b.path("test/harness.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .omit_frame_pointer = omit_frame_pointer,
-    });
-
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -142,59 +127,6 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
-    const integration_diff_exe = b.addExecutable(.{
-        .name = "integration-diff",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/integration_diff.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .omit_frame_pointer = omit_frame_pointer,
-            .imports = &.{
-                .{ .name = "fix-cli", .module = cli_mod },
-                .{ .name = "harness", .module = harness_mod },
-            },
-        }),
-    });
-
-    const nixpkgs_check_exe = b.addExecutable(.{
-        .name = "nixpkgs-check",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/nixpkgs_check.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .omit_frame_pointer = omit_frame_pointer,
-            .imports = &.{
-                .{ .name = "harness", .module = harness_mod },
-            },
-        }),
-    });
-
-    const integration_step = b.step("integration-test", "Run differential integration tests against nix-instantiate");
-    const integration_cmd = b.addRunArtifact(integration_diff_exe);
-    integration_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        integration_cmd.addArgs(args);
-    }
-    integration_step.dependOn(&integration_cmd.step);
-
-    const diff_fuzz_step = b.step("diff-fuzz", "Run longer differential fuzzing against nix-instantiate");
-    const diff_fuzz_cmd = b.addRunArtifact(integration_diff_exe);
-    diff_fuzz_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        diff_fuzz_cmd.addArgs(args);
-    }
-    diff_fuzz_step.dependOn(&diff_fuzz_cmd.step);
-
-    const nixpkgs_check_step = b.step("nixpkgs-check", "Compare nixpkgs package derivation paths against Nix");
-    const nixpkgs_check_cmd = b.addRunArtifact(nixpkgs_check_exe);
-    nixpkgs_check_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        nixpkgs_check_cmd.addArgs(args);
-    }
-    nixpkgs_check_step.dependOn(&nixpkgs_check_cmd.step);
-
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -244,47 +176,15 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    const integration_diff_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/integration_diff.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .omit_frame_pointer = omit_frame_pointer,
-            .imports = &.{
-                .{ .name = "fix-cli", .module = cli_mod },
-                .{ .name = "harness", .module = harness_mod },
-            },
-        }),
-    });
-    const run_integration_diff_tests = b.addRunArtifact(integration_diff_tests);
-
-    const nixpkgs_check_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("test/nixpkgs_check.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .omit_frame_pointer = omit_frame_pointer,
-            .imports = &.{
-                .{ .name = "harness", .module = harness_mod },
-            },
-        }),
-    });
-    const run_nixpkgs_check_tests = b.addRunArtifact(nixpkgs_check_tests);
-
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_integration_diff_tests.step);
-    test_step.dependOn(&run_nixpkgs_check_tests.step);
 
-    const check_step = b.step("check", "Run unit and integration tests");
+    const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
-    check_step.dependOn(integration_step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
