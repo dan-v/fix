@@ -121,7 +121,13 @@ const fan_out_min_items: usize = 4;
 const fan_out_batch_items: u8 = 16;
 
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
-    if (self.in_speculation) return;
+    // Allow helpers running speculative tasks to fan out further list
+    // work too. Module-import trees in lib.evalModules are recursive
+    // (`collectStructuredModules` walks `module.imports` for each
+    // imported module), and the only way helpers can get at the
+    // second-level imports is if the first-level helper queues them.
+    // The cascade is naturally bounded by list sizes and the
+    // scheduler's urgent-queue cap.
     if (items.len < fan_out_min_items) return;
     var offset: u32 = 0;
     while (offset < items.len) {
@@ -283,15 +289,45 @@ fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
     const bc = self.heap.getBuiltinClosure(closure.asObjectId()) catch return false;
     return switch (@as(BuiltinId, @enumFromInt(bc.builtin_id))) {
         // Map-style fan-out: args[0] is the user function in each.
-        // Speculate only when that function's body is big enough to
-        // warrant the scheduler hop — the chunk-size threshold
-        // filters trivial cases like `x: x + 1`.
+        // Speculate when it's either a user closure with a substantial
+        // body (the chunk-size threshold filters trivial cases like
+        // `x: x + 1`) or a builtin known to be expensive enough to
+        // earn the scheduler hop — most importantly `import`, which
+        // is how the NixOS module system parallelises file
+        // resolution.
         .mapValue, .mapAttrValue, .zipAttrsValue => bc.args.len > 0 and
-            bc.args[0].isClosure() and
-            isSpeculatableClosureChunk(self, bc.args[0]),
+            isSpeculatableMapFunc(self, bc.args[0]),
         // Derivation lazy attrs resolve drv/outPath via hashing —
         // never trivial.
         .derivationLazyAttr => true,
+        else => false,
+    };
+}
+
+inline fn isSpeculatableMapFunc(self: *VM, func: Value) bool {
+    if (func.isClosure()) return isSpeculatableClosureChunk(self, func);
+    if (func.isBuiltin()) return isExpensiveBuiltin(@enumFromInt(func.asBuiltinId()));
+    return false;
+}
+
+/// Builtins whose body is heavy enough that submitting a speculative
+/// force task pays for itself: file I/O, network fetches, or full
+/// nested evaluation. Lightweight ones (head, length, isList, ...)
+/// stay off this list so `map builtins.head xs` doesn't burn helper
+/// fibers on trivially-cheap work.
+fn isExpensiveBuiltin(id: BuiltinId) bool {
+    return switch (id) {
+        .import,
+        .scopedImport,
+        .fetchurl,
+        .fetchTarball,
+        .fetchGit,
+        .fetchTree,
+        .readFile,
+        .readFileType,
+        .readDir,
+        .derivation,
+        => true,
         else => false,
     };
 }
