@@ -45,6 +45,13 @@ pub const VmTrace = struct {
     /// Truncate when the limit hits — the next attempted record returns
     /// without writing.
     truncated: std.atomic.Value(bool) = .init(false),
+    /// If true, only events from worker_id == 0 (main) are recorded.
+    /// Lets you diff a single-worker run against a multi-worker run as
+    /// if they were both single-threaded — useful for finding whether
+    /// main's bytecode dispatch *itself* diverges between scheduler
+    /// configurations (it shouldn't if speculation is semantically
+    /// invisible).
+    main_only: bool = false,
 
     pub fn init(writer: *std.Io.Writer, format: Format) VmTrace {
         return .{ .writer = writer, .format = format };
@@ -54,7 +61,12 @@ pub const VmTrace = struct {
         self.max_events = n;
     }
 
-    inline fn beginEvent(self: *VmTrace) ?u64 {
+    pub fn setMainOnly(self: *VmTrace, v: bool) void {
+        self.main_only = v;
+    }
+
+    inline fn beginEvent(self: *VmTrace, worker_id: u8) ?u64 {
+        if (self.main_only and worker_id != 0) return null;
         const seq = self.seq.fetchAdd(1, .monotonic);
         if (self.max_events != 0 and seq >= self.max_events) {
             self.truncated.store(true, .monotonic);
@@ -78,7 +90,7 @@ pub const VmTrace = struct {
         opc: OpCode,
         sp: u32,
     ) void {
-        const seq = self.beginEvent() orelse return;
+        const seq = self.beginEvent(worker_id) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         switch (self.format) {
@@ -96,7 +108,7 @@ pub const VmTrace = struct {
         chunk_id: ChunkId,
         frame_base: u32,
     ) void {
-        const seq = self.beginEvent() orelse return;
+        const seq = self.beginEvent(worker_id) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         switch (self.format) {
@@ -114,7 +126,7 @@ pub const VmTrace = struct {
         returning_to_chunk: ChunkId,
         returning_to_ip: u32,
     ) void {
-        const seq = self.beginEvent() orelse return;
+        const seq = self.beginEvent(worker_id) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         switch (self.format) {
@@ -126,7 +138,7 @@ pub const VmTrace = struct {
     }
 
     pub fn recordForceEnter(self: *VmTrace, worker_id: u8, thunk_id: ObjectId) void {
-        const seq = self.beginEvent() orelse return;
+        const seq = self.beginEvent(worker_id) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         switch (self.format) {
@@ -136,7 +148,7 @@ pub const VmTrace = struct {
     }
 
     pub fn recordForceExit(self: *VmTrace, worker_id: u8, thunk_id: ObjectId, success: bool) void {
-        const seq = self.beginEvent() orelse return;
+        const seq = self.beginEvent(worker_id) orelse return;
         self.mu.lock();
         defer self.mu.unlock();
         switch (self.format) {

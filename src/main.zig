@@ -71,6 +71,7 @@ const Options = struct {
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
     vm_trace_max_events: u64 = 0,
+    vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
 
@@ -308,6 +309,7 @@ fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: Options) !VmT
         .binary => .binary,
     });
     trace_ptr.setMaxEvents(options.vm_trace_max_events);
+    trace_ptr.setMainOnly(options.vm_trace_main_only);
     setup.trace_storage = trace_ptr;
     setup.trace = trace_ptr;
     return setup;
@@ -445,6 +447,8 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
         } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
             const text = arg["--vm-trace-max-events=".len..];
             options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
+        } else if (std.mem.eql(u8, arg, "--vm-trace-main-only")) {
+            options.vm_trace_main_only = true;
         } else if (std.mem.eql(u8, arg, "--workers")) {
             const text = args_iter.next() orelse return error.MissingWorkers;
             options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
