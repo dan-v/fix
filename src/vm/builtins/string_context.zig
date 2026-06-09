@@ -25,7 +25,7 @@ pub fn builtinAppendContext(self: anytype, string_arg: Value, context_arg: Value
     const string_value = try vm_force.forceValue(self, string_arg);
     if (!strings.isStringLike(string_value)) return error.TypeError;
     const context_value = try vm_force.forceValue(self, context_arg);
-    if (context_value.discriminant != .attrs) return error.TypeError;
+    if (!context_value.isAttrs()) return error.TypeError;
 
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
@@ -78,7 +78,7 @@ pub fn builtinAddDrvOutputDependencies(self: anytype, arg: Value) !Value {
 }
 
 pub fn contextEntriesForValue(self: anytype, value: Value) ![]const heap_mod.AttrEntry {
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .string => &.{},
         .path => try singleContextEntry(self, value.asInternId(), try pathContextValue(self)),
         .string_context => (try self.heap.getContextString(value.asObjectId())).context,
@@ -105,7 +105,7 @@ pub fn appendContextEntry(self: anytype, context: *std.ArrayListUnmanaged(heap_m
 pub fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
     const left_forced = try vm_force.forceValue(self, left);
     const right_forced = try vm_force.forceValue(self, right);
-    if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
+    if (left_forced.isAttrs() and right_forced.isAttrs()) {
         return Value.attrs(try mergeContextAttrs(self, left_forced.asObjectId(), right_forced.asObjectId()));
     }
     return right;
@@ -154,7 +154,7 @@ pub fn mergeContextAttrValue(self: anytype, name: InternId, left: Value, right: 
 pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
     const left_list = try vm_force.forceValue(self, left);
     const right_list = try vm_force.forceValue(self, right);
-    if (left_list.discriminant != .list or right_list.discriminant != .list) return error.TypeError;
+    if (!left_list.isList() or !right_list.isList()) return error.TypeError;
 
     var outputs: std.ArrayListUnmanaged(Value) = .empty;
     defer outputs.deinit(self.allocator);

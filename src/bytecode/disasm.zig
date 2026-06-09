@@ -380,7 +380,7 @@ fn writeSourceColumn(writer: *std.Io.Writer, chunk: *const Chunk, ip: usize, sym
 }
 
 fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols) !void {
-    switch (value.discriminant) {
+    switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
         .bool_false => try writer.writeAll("false"),
@@ -395,6 +395,7 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols) !voi
         .builtin => try writer.print("builtin #{d}", .{value.asBuiltinId()}),
         .builtin_closure => try writer.print("builtin_closure #{d}", .{value.asObjectId()}),
         .string_context => try writer.print("string_ctx #{d}", .{value.asObjectId()}),
+        .boxed_int => try writer.print("boxed_int #{d}", .{value.asObjectId()}),
     }
 }
 

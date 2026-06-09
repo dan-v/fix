@@ -36,14 +36,14 @@ pub fn buildList(self: *VM, count: u16) !void {
 }
 
 pub fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
-    if (left.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", left);
-    if (right.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", right);
+    if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
+    if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
     return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
 }
 
 pub fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {
-    if (left.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", left);
-    if (right.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", right);
+    if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
+    if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
     return Value.attrs(try mergeAttrLiteralObjects(self, left.asObjectId(), right.asObjectId()));
 }
 
@@ -85,14 +85,14 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
 pub fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Value {
     const left_forced = try force.forceValue(self, left);
     const right_forced = try force.forceValue(self, right);
-    if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
+    if (left_forced.isAttrs() and right_forced.isAttrs()) {
         return Value.attrs(try mergeAttrLiteralObjects(self, left_forced.asObjectId(), right_forced.asObjectId()));
     }
     return error.DuplicateAttribute;
 }
 
 pub fn concatLists(self: *VM, left: Value, right: Value) !Value {
-    if (left.discriminant != .list) return trace.typeErrorExpected(self, "list", left);
-    if (right.discriminant != .list) return trace.typeErrorExpected(self, "list", right);
+    if (!left.isList()) return trace.typeErrorExpected(self, "list", left);
+    if (!right.isList()) return trace.typeErrorExpected(self, "list", right);
     return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
 }

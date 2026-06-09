@@ -510,12 +510,12 @@ test "evaluate path construction builtins" {
     try std.testing.expectEqualStrings("/nix/store/375nsbsr3gvzlfpmnviljghr7racpq67-imported", ev.intern.get(path_value.asInternId()));
 
     const path_prefix = try ev.evaluate(path_prefix_source);
-    try std.testing.expectEqual(.string_context, path_prefix.discriminant);
+    try std.testing.expectEqual(.string_context, path_prefix.kind());
     const path_prefix_string = try ev.heap.getContextString(path_prefix.asObjectId());
     try std.testing.expectEqualStrings("\"/nix/store/\"", ev.intern.get(path_prefix_string.text));
 
     const literal_paths = try ev.evaluate(literal_path_source);
-    try std.testing.expectEqual(.string_context, literal_paths.discriminant);
+    try std.testing.expectEqual(.string_context, literal_paths.kind());
     const literal_paths_string = try ev.heap.getContextString(literal_paths.asObjectId());
     const literal_paths_text = ev.intern.get(literal_paths_string.text);
     try std.testing.expect(std.mem.indexOf(u8, literal_paths_text, cwd) != null);

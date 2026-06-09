@@ -36,10 +36,10 @@ pub fn notCallableError(self: *VM, got: Value) error{NotCallable} {
 
 pub fn valueTypeName(self: *VM, value: Value) []const u8 {
     _ = self;
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .null => "null",
         .bool_false, .bool_true => "bool",
-        .int => "int",
+        .int, .boxed_int => "int",
         .float => "float",
         .string => "string",
         .path => "path",

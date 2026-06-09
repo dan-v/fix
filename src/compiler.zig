@@ -47,6 +47,12 @@ pub const Compiler = struct {
     allocator: std.mem.Allocator,
     builder: *ChunkBuilder,
     registry: *ChunkRegistry,
+    /// Used by integer-literal compilation to box i64 values that
+    /// exceed the inline Value range (see `runtime/int.zig`). The
+    /// resulting boxed object lives in the heap for the same span as
+    /// the chunk constants that reference it — i.e. the evaluator
+    /// lifetime, which always outlives any chunk execution.
+    heap: *@import("runtime/heap.zig").ObjectHeap,
     source: []const u8,
     intern: *@import("runtime/intern.zig").InternTable,
     base_path: ?[]const u8,
@@ -70,11 +76,13 @@ pub const Compiler = struct {
         registry: *ChunkRegistry,
         source: []const u8,
         intern: *@import("runtime/intern.zig").InternTable,
+        heap: *@import("runtime/heap.zig").ObjectHeap,
     ) Compiler {
         return .{
             .allocator = allocator,
             .builder = builder,
             .registry = registry,
+            .heap = heap,
             .source = source,
             .intern = intern,
             .base_path = null,

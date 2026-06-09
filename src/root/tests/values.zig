@@ -91,11 +91,11 @@ test "end-to-end: path concatenation follows Nix left-path semantics" {
     defer ev.deinit();
 
     const suffix = try ev.evaluate("./foo + \"x\"");
-    try std.testing.expectEqual(value.ValueType.path, suffix.discriminant);
+    try std.testing.expectEqual(value.ValueType.path, suffix.kind());
     try std.testing.expectEqualStrings("./foox", ev.intern.get(suffix.asInternId()));
 
     const paths = try ev.evaluate("./foo + ./bar");
-    try std.testing.expectEqual(value.ValueType.path, paths.discriminant);
+    try std.testing.expectEqual(value.ValueType.path, paths.kind());
     try std.testing.expectEqualStrings("./foo./bar", ev.intern.get(paths.asInternId()));
 
     var ev_with_base = try Evaluator.init(alloc, 0);
@@ -190,7 +190,7 @@ test "end-to-end: list elements are lazy" {
     defer ev.deinit();
 
     const result = try ev.evaluate("[ 1 (1 / 0) ]");
-    try std.testing.expectEqual(value.ValueType.list, result.discriminant);
+    try std.testing.expectEqual(value.ValueType.list, result.kind());
 }
 
 test "end-to-end: list concatenation" {
@@ -203,7 +203,7 @@ test "end-to-end: list concatenation" {
     try std.testing.expect(combined.asBool());
 
     const lazy = try ev.evaluate("[ (1 / 0) ] ++ []");
-    try std.testing.expectEqual(value.ValueType.list, lazy.discriminant);
+    try std.testing.expectEqual(value.ValueType.list, lazy.kind());
 
     try std.testing.expectError(error.TypeError, ev.evaluate("[ 1 ] ++ 2"));
 }

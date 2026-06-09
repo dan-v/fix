@@ -47,11 +47,12 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         };
 
         fn write(self: *Self, value: Value) anyerror!void {
-            switch (value.discriminant) {
+            switch (value.kind()) {
                 .null => try self.writer.writeAll("null"),
                 .bool_false => try self.writer.writeAll("false"),
                 .bool_true => try self.writer.writeAll("true"),
                 .int => try self.writer.print("{}", .{value.asInt()}),
+                .boxed_int => try self.writer.print("{}", .{try self.ev.heap.getBoxedInt(value.asObjectId())}),
                 .float => try self.writer.print("{d}", .{value.asFloat()}),
                 .string => try writeQuotedString(self.writer, self.ev.intern.get(value.asInternId())),
                 .path => try self.writer.writeAll(self.ev.intern.get(value.asInternId())),
@@ -124,7 +125,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 else => return err,
             };
             const forced_type = try self.ev.forceValue(type_value);
-            if (forced_type.discriminant != .string) return null;
+            if (!forced_type.isString()) return null;
             if (!std.mem.eql(u8, self.ev.intern.get(forced_type.asInternId()), "derivation")) return null;
 
             const drv_path_id = try self.ev.intern.intern("drvPath");
@@ -136,7 +137,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         }
 
         fn stringText(self: *Self, value: Value) ![]const u8 {
-            return switch (value.discriminant) {
+            return switch (value.kind()) {
                 .string, .path => self.ev.intern.get(value.asInternId()),
                 .string_context => blk: {
                     const string = try self.ev.heap.getContextString(value.asObjectId());
@@ -156,7 +157,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             const thunk = try self.ev.heap.getThunk(id);
             const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
             if (state == .resolved) {
-                try self.write(thunk.result);
+                try self.write(thunk.result.result);
                 return;
             }
             // Pass-through (cell-like) thunks hold a value that hasn't been

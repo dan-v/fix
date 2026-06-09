@@ -48,7 +48,7 @@ pub const DerivationMode = enum { lazy, strict };
 
 pub fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value {
     const attrs = try vm_force.forceValue(self, arg);
-    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (!attrs.isAttrs()) return error.TypeError;
 
     if (mode == .lazy) return buildLazyDerivationValue(self, attrs.asObjectId());
     return buildForcedDerivationValue(self, attrs.asObjectId(), .strict);
@@ -57,7 +57,7 @@ pub fn builtinDerivation(self: anytype, arg: Value, mode: DerivationMode) !Value
 pub fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, attrs_arg);
     const name = try vm_force.forceValue(self, name_arg);
-    if (attrs.discriminant != .attrs or !isPlainString(name)) return error.TypeError;
+    if (!attrs.isAttrs() or !isPlainString(name)) return error.TypeError;
 
     const name_id = try stringTextInternId(self, name);
     const value = try buildForcedDerivationValue(self, attrs.asObjectId(), .lazy);
@@ -270,7 +270,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         // often already resolved it. submitUrgent gives up silently if
         // the queues are full; main just forces those itself inline.
         for (original_attrs) |entry| {
-            if (entry.value.discriminant != .thunk) continue;
+            if (!entry.value.isThunk()) continue;
             if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
         }
         for (original_attrs) |entry| {
@@ -278,7 +278,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
-            if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).discriminant == .null) continue;
+            if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).isNull()) continue;
             if (isDerivationOutputAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
                 if (output_names.explicit) {
@@ -377,7 +377,7 @@ fn fixedOutputHashAlgorithm(self: anytype, attrs_id: ObjectId, hash_text: []cons
     if (isPlainString(forced_algo)) {
         const algo = self.intern.get(try stringTextInternId(self, forced_algo));
         if (algo.len != 0) return algo;
-    } else if (forced_algo.discriminant != .null) return error.TypeError;
+    } else if (!forced_algo.isNull()) return error.TypeError;
 
     const separator = derivation.hashAlgorithmSeparator(hash_text) orelse return error.InvalidHashAlgorithm;
     if (separator == 0) return error.InvalidHashAlgorithm;
@@ -395,7 +395,7 @@ fn derivationArgs(
         else => return err,
     };
     const list = try vm_force.forceValue(self, args_value);
-    if (list.discriminant != .list) return error.TypeError;
+    if (!list.isList()) return error.TypeError;
     const items = try self.heap.getList(list.asObjectId());
     const args = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(args);
@@ -465,7 +465,7 @@ fn structuredAttrsJson(
         if (std.mem.eql(u8, name, "args")) continue;
         if (std.mem.eql(u8, name, "outputs") and !explicit_outputs) continue;
         if (isDerivationOutputAttr(self, name, outputs)) continue;
-        if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).discriminant == .null) continue;
+        if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).isNull()) continue;
         if (!first) try out.append(self.allocator, ',');
         first = false;
         try appendJsonString(self, &out, self.intern.get(entry.name));
@@ -485,11 +485,12 @@ fn appendStructuredJsonValue(
     seen: *std.ArrayListUnmanaged(SeenJsonObject),
 ) !void {
     const forced = try vm_force.forceValue(self, value);
-    switch (forced.discriminant) {
+    switch (forced.kind()) {
         .null => try out.appendSlice(self.allocator, "null"),
         .bool_false => try out.appendSlice(self.allocator, "false"),
         .bool_true => try out.appendSlice(self.allocator, "true"),
         .int => try appendJsonFmt(self, out, "{}", .{forced.asInt()}),
+        .boxed_int => try appendJsonFmt(self, out, "{}", .{try self.heap.getBoxedInt(forced.asObjectId())}),
         .float => try appendJsonFmt(self, out, "{d}", .{forced.asFloat()}),
         .string, .path, .string_context => {
             try appendStructuredJsonStringValue(self, out, forced, inputs, owned_strings);
@@ -644,7 +645,7 @@ fn contextOutputs(
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const []const u8 {
     const attrs = try vm_force.forceValue(self, value);
-    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (!attrs.isAttrs()) return error.TypeError;
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("allOutputs"))) |all_outputs_value| {
         const all_outputs = try vm_force.forceValue(self, all_outputs_value);
         if (!all_outputs.isBool()) return error.TypeError;
@@ -663,7 +664,7 @@ fn contextOutputs(
     }
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
         const list = try vm_force.forceValue(self, outputs_value);
-        if (list.discriminant != .list) return error.TypeError;
+        if (!list.isList()) return error.TypeError;
         const items = try self.heap.getList(list.asObjectId());
         const outputs = try self.allocator.alloc([]const u8, items.len);
         errdefer self.allocator.free(outputs);
@@ -734,7 +735,7 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
     };
 
     const outputs_list = try vm_force.forceValue(self, outputs_value);
-    if (outputs_list.discriminant != .list) return error.TypeError;
+    if (!outputs_list.isList()) return error.TypeError;
     const items = try self.heap.getList(outputs_list.asObjectId());
     if (items.len == 0) return error.InvalidDerivationOutput;
 

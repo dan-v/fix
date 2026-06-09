@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const vm_trace = b.option(bool, "vm-trace", "Enable VM execution tracing (--vm-trace)") orelse false;
     const thunks_log = b.option(bool, "thunks-log", "Enable per-thunk lifecycle event log (--thunks-log)") orelse false;
     const fiber_stack_probe = b.option(bool, "fiber-stack-probe", "Sentinel-fill fiber stacks to enable maxStackUsedBytes — forces full RSS commit") orelse false;
+    const value8 = b.option(bool, "value8", "Use the 8-byte NaN-boxed Value representation (default: true; pass false to fall back to the 16-byte tagged-union layout)") orelse true;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
@@ -43,6 +44,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "vm_trace", vm_trace);
     build_options.addOption(bool, "thunks_log", thunks_log);
     build_options.addOption(bool, "fiber_stack_probe", fiber_stack_probe);
+    build_options.addOption(bool, "value8", value8);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of

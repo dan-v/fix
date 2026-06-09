@@ -39,7 +39,7 @@ pub fn compileInt(self: *Compiler, node: *const Node) !void {
         try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid integer literal");
         return error.InvalidNumber;
     };
-    try self.builder.emitConstant(self.allocator, Value.int(val));
+    try self.builder.emitConstant(self.allocator, try @import("../runtime/int.zig").make(self.heap, val));
 }
 
 pub fn compileFloat(self: *Compiler, node: *const Node) !void {

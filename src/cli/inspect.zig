@@ -121,6 +121,23 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
             try writer.print("    {s:<16}{d}\n", .{ @TypeOf(heap_stats).thunkStateName(i), count });
         }
     }
+    const int_total = heap_stats.intTotal();
+    if (int_total > 0) {
+        const overflow = heap_stats.intOverflowsI48();
+        try writer.print("  inline ints:      {d}\n", .{int_total});
+        try writer.writeAll("  int magnitude (NaN-box would need to box bucket 4):\n");
+        for (heap_stats.int_buckets, 0..) |count, i| {
+            try writer.print("    {s:<8}{d:>10}  ({d:.2}%)\n", .{
+                @TypeOf(heap_stats).intBucketLabel(i),
+                count,
+                percent(@intCast(count), @intCast(int_total)),
+            });
+        }
+        try writer.print("    overflows i48: {d}  ({d:.4}% of all ints)\n", .{
+            overflow,
+            percent(@intCast(overflow), @intCast(int_total)),
+        });
+    }
 
     try writer.writeAll("\nintern\n");
     try writer.print("  entries:          {d}\n", .{intern_stats.entries});

@@ -170,7 +170,7 @@ test "evaluate filterSource builtin through file cache" {
     ev.setFileIo(std.testing.io);
 
     const filtered = try ev.evaluate(source);
-    try std.testing.expectEqual(.string_context, filtered.discriminant);
+    try std.testing.expectEqual(.string_context, filtered.kind());
     const filtered_string = try ev.heap.getContextString(filtered.asObjectId());
     const filtered_path = ev.intern.get(filtered_string.text);
     try std.testing.expect(std.mem.startsWith(u8, filtered_path, "/nix/store/"));
@@ -249,7 +249,7 @@ test "evaluate filterSource builtin through file cache" {
     );
     defer std.testing.allocator.free(path_filter_source);
     const filtered_path_value = try ev.evaluate(path_filter_source);
-    try std.testing.expectEqual(.string_context, filtered_path_value.discriminant);
+    try std.testing.expectEqual(.string_context, filtered_path_value.kind());
     const filtered_path_string = try ev.heap.getContextString(filtered_path_value.asObjectId());
     const builtins_path_filtered_path = ev.intern.get(filtered_path_string.text);
     try std.testing.expect(std.mem.startsWith(u8, builtins_path_filtered_path, "/nix/store/"));

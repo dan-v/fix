@@ -38,7 +38,7 @@ pub fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
 
 pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
     const attrs = try force.forceValue(self, attrs_val);
-    if (attrs.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", attrs);
+    if (!attrs.isAttrs()) return trace.typeErrorExpected(self, "attrs", attrs);
     return force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name_id));
 }
 
@@ -47,7 +47,7 @@ pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encod
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
-        if (current.discriminant != .attrs) return force.forceValue(self, default_val);
+        if (!current.isAttrs()) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
         current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return force.forceValue(self, default_val),
@@ -63,7 +63,7 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
-        if (current.discriminant != .attrs) return force.forceValue(self, default_val);
+        if (!current.isAttrs()) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
         current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return force.forceValue(self, default_val),
@@ -72,8 +72,8 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
         current = try force.forceValue(self, current);
     }
     const name_val = try force.forceValue(self, dynamic_name);
-    if (name_val.discriminant != .string) return error.TypeError;
-    if (current.discriminant != .attrs) return force.forceValue(self, default_val);
+    if (!name_val.isString()) return error.TypeError;
+    if (!current.isAttrs()) return force.forceValue(self, default_val);
     const result = self.heap.getAttrValue(current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
         error.MissingAttribute => return force.forceValue(self, default_val),
         else => return err,
@@ -90,16 +90,16 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
         offset += 1;
         const name_id: InternId = switch (tag) {
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => name: {
-                if (current.discriminant != .attrs) return force.forceValue(self, default_val);
+                if (!current.isAttrs()) return force.forceValue(self, default_val);
                 const id = readU32(encoded_segments, offset);
                 offset += 4;
                 break :name id;
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                 const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
-                if (name_val.discriminant != .string) return error.TypeError;
+                if (!name_val.isString()) return error.TypeError;
                 dynamic_i += 1;
-                if (current.discriminant != .attrs) return force.forceValue(self, default_val);
+                if (!current.isAttrs()) return force.forceValue(self, default_val);
                 break :name name_val.asInternId();
             },
             else => return error.InvalidBytecode,
@@ -118,7 +118,7 @@ pub fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide:
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
-        if (current.discriminant != .attrs) return false;
+        if (!current.isAttrs()) return false;
         const name_id = readInternId(encoded_names, offset, wide);
         const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return false,
@@ -139,16 +139,16 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
         offset += 1;
         const name_id: InternId = switch (tag) {
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.static) => name: {
-                if (current.discriminant != .attrs) return false;
+                if (!current.isAttrs()) return false;
                 const id = readU32(encoded_segments, offset);
                 offset += 4;
                 break :name id;
             },
             @intFromEnum(bytecode_mod.MixedAttrSegmentTag.dynamic) => name: {
                 const name_val = try force.forceValue(self, dynamic_names[dynamic_i]);
-                if (name_val.discriminant != .string) return error.TypeError;
+                if (!name_val.isString()) return error.TypeError;
                 dynamic_i += 1;
-                if (current.discriminant != .attrs) return false;
+                if (!current.isAttrs()) return false;
                 break :name name_val.asInternId();
             },
             else => return error.InvalidBytecode,
@@ -165,7 +165,7 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
 
 pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_names: []const u8, wide: bool) !void {
     const value = try force.forceValue(self, attrs_val);
-    if (value.discriminant != .attrs) return trace.typeErrorExpected(self, "attrs", value);
+    if (!value.isAttrs()) return trace.typeErrorExpected(self, "attrs", value);
     if (allow_extra) return;
 
     const entries = try self.heap.getAttrs(value.asObjectId());
@@ -191,7 +191,7 @@ pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
 
     for (scopes) |scope| {
         const attrs_val = try force.forceValue(self, scope);
-        if (attrs_val.discriminant != .attrs) return error.TypeError;
+        if (!attrs_val.isAttrs()) return error.TypeError;
 
         const attr_val = self.heap.getAttrValue(attrs_val.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => continue,

@@ -43,7 +43,7 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 }
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
-    if (value.discriminant != .thunk) return value;
+    if (!value.isThunk()) return value;
     // Inline the resolved-thunk fast path. The vast majority of forces
     // hit an already-resolved thunk in steady state (workers and
     // demand-driven fan-out tend to resolve hot thunks early); folding
@@ -57,7 +57,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     const state = thunk.state.load(.acquire);
     if (state == @intFromEnum(thunk_mod.ThunkState.resolved)) {
         if (demand) thunk.markDemanded();
-        return thunk.result;
+        return thunk.result.result;
     }
     return forceThunkImpl(self, value, demand);
 }
@@ -77,7 +77,7 @@ pub const SeenDeepObject = struct {
 
 pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
     const forced = try forceValue(self, value);
-    switch (forced.discriminant) {
+    switch (forced.kind()) {
         .list => {
             const id = forced.asObjectId();
             if (!try enterDeep(self, .list, id, seen)) return;
@@ -144,7 +144,7 @@ pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.z
     // task variant). Attrsets in real evals tend to be smaller than
     // lists; one-task-per-thunk is fine for now.
     for (entries) |entry| {
-        if (entry.value.discriminant != .thunk) continue;
+        if (!entry.value.isThunk()) continue;
         if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
     }
 }
@@ -227,7 +227,7 @@ pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
 }
 
 pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
-    switch (closure_val.discriminant) {
+    switch (closure_val.kind()) {
         .closure => {
             const closure_id = closure_val.asObjectId();
             const closure = try closures.getClosureById(self, closure_id);
@@ -257,7 +257,7 @@ inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
     // helper's result may or may not be observed; chaining more
     // speculation off it would just multiply uncertain work.
     if (self.in_speculation) return false;
-    return switch (closure.discriminant) {
+    return switch (closure.kind()) {
         .closure => isSpeculatableClosureChunk(self, closure),
         // map / mapAttrs / genList / zipAttrsWith all produce
         // builtin_closure thunks that wrap a *user* function. Real
@@ -287,7 +287,7 @@ fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
         // warrant the scheduler hop — the chunk-size threshold
         // filters trivial cases like `x: x + 1`.
         .mapValue, .mapAttrValue, .zipAttrsValue => bc.args.len > 0 and
-            bc.args[0].discriminant == .closure and
+            bc.args[0].isClosure() and
             isSpeculatableClosureChunk(self, bc.args[0]),
         // Derivation lazy attrs resolve drv/outPath via hashing —
         // never trivial.
@@ -344,12 +344,12 @@ inline fn recordErrored(self: *VM, thunk_id: ObjectId, err: anyerror, message: ?
 inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
-        const target_kind: @import("../eval/thunk_trace.zig").TargetKind = switch (closure.discriminant) {
+        const target_kind: @import("../eval/thunk_trace.zig").TargetKind = switch (closure.kind()) {
             .closure => .closure,
             .builtin_closure => .builtin_closure,
             else => .closure,
         };
-        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.discriminant == .closure) blk: {
+        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.isClosure()) blk: {
             const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
             break :blk c.chunk_id;
         } else null;

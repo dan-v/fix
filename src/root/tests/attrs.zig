@@ -11,7 +11,7 @@ test "end-to-end: attribute set" {
     defer ev.deinit();
 
     const result = try ev.evaluate("{ a = 1; b = 2; }");
-    try std.testing.expectEqual(value.ValueType.attrs, result.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, result.kind());
 }
 
 test "end-to-end: simple inherit in attrsets" {
@@ -24,10 +24,10 @@ test "end-to-end: simple inherit in attrsets" {
     try std.testing.expectEqual(@as(i64, 2), inherited.asInt());
 
     const recursive = try ev.evaluate("let a = { inherit a; }; in a");
-    try std.testing.expectEqual(value.ValueType.attrs, recursive.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, recursive.kind());
 
     const nested = try ev.evaluate("(let a = { inherit a; }; in a).a.a");
-    try std.testing.expectEqual(value.ValueType.attrs, nested.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, nested.kind());
 
     const recursive_inherit = try ev.evaluate("let config = 1; in (rec { inherit config; }).config");
     try std.testing.expectEqual(@as(i64, 1), recursive_inherit.asInt());

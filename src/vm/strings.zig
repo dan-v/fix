@@ -27,7 +27,7 @@ pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
 
 pub fn stringLikeValue(self: *VM, value: Value) !Value {
     const forced = try force.forceValue(self, value);
-    return switch (forced.discriminant) {
+    return switch (forced.kind()) {
         .string, .path, .string_context => forced,
         .attrs => try attrsStringLikeValue(self, forced),
         else => trace.typeErrorExpected(self, "string or path", forced),
@@ -39,7 +39,7 @@ pub fn stringLikeInternId(self: *VM, value: Value) !InternId {
 }
 
 pub fn stringTextInternId(self: *VM, value: Value) !InternId {
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .string, .path => value.asInternId(),
         .string_context => (try self.heap.getContextString(value.asObjectId())).text,
         else => error.TypeError,
@@ -47,14 +47,14 @@ pub fn stringTextInternId(self: *VM, value: Value) !InternId {
 }
 
 pub fn stringTextInternIdsEqual(self: *VM, left: Value, right: Value) !bool {
-    if (left.discriminant != .string_context and right.discriminant != .string_context) {
+    if (!left.isContextString() and !right.isContextString()) {
         return left.asInternId() == right.asInternId();
     }
     return (try stringTextInternId(self, left)) == (try stringTextInternId(self, right));
 }
 
 pub fn isPlainString(value: Value) bool {
-    return value.discriminant == .string or value.discriminant == .string_context;
+    return value.isString() or value.isContextString();
 }
 
 pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
@@ -86,7 +86,7 @@ pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
 
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer context.deinit(self.allocator);
-    if (right_like.discriminant == .string_context) {
+    if (right_like.isContextString()) {
         if (try hasStorePathContext(self, right_like)) return error.InvalidPathConcatenation;
         try appendStringContext(self, &context, right_like);
     }
@@ -109,7 +109,7 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
 
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
     const forced = try force.forceValue(self, value);
-    return switch (forced.discriminant) {
+    return switch (forced.kind()) {
         .string, .string_context => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
         .attrs => blk: {
@@ -151,7 +151,7 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
 }
 
 pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), value: Value) !void {
-    switch (value.discriminant) {
+    switch (value.kind()) {
         .string => {},
         .path => {
             const path = self.intern.get(value.asInternId());
@@ -167,7 +167,7 @@ pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.
 }
 
 pub fn hasStorePathContext(self: *VM, value: Value) !bool {
-    if (value.discriminant != .string_context) return false;
+    if (!value.isContextString()) return false;
     const string = try self.heap.getContextString(value.asObjectId());
     for (string.context) |entry| {
         if (std.mem.startsWith(u8, self.intern.get(entry.name), "/nix/store/")) return true;
@@ -188,7 +188,7 @@ pub fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.A
 pub fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
     const left_forced = try force.forceValue(self, left);
     const right_forced = try force.forceValue(self, right);
-    if (left_forced.discriminant == .attrs and right_forced.discriminant == .attrs) {
+    if (left_forced.isAttrs() and right_forced.isAttrs()) {
         return Value.attrs(try mergeContextAttrs(self, left_forced.asObjectId(), right_forced.asObjectId()));
     }
     return right;
@@ -237,7 +237,7 @@ pub fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Valu
 pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
     const left_list = try force.forceValue(self, left);
     const right_list = try force.forceValue(self, right);
-    if (left_list.discriminant != .list or right_list.discriminant != .list) return error.TypeError;
+    if (!left_list.isList() or !right_list.isList()) return error.TypeError;
 
     var outputs: std.ArrayListUnmanaged(Value) = .empty;
     defer outputs.deinit(self.allocator);

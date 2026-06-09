@@ -31,7 +31,7 @@ test "end-to-end: ambient builtins" {
     try std.testing.expectEqualStrings("list", ev.intern.get(inner_with_shadows_outer_with.asInternId()));
 
     const version = try ev.evaluate("nixVersion");
-    try std.testing.expectEqual(value.ValueType.string, version.discriminant);
+    try std.testing.expectEqual(value.ValueType.string, version.kind());
 
     const missing_env = try ev.evaluate("builtins.getEnv \"FIX_TEST_UNSET\"");
     try std.testing.expectEqualStrings("", ev.intern.get(missing_env.asInternId()));
@@ -47,7 +47,7 @@ test "end-to-end: builtins.toFile returns store-like string" {
     defer ev.deinit();
 
     const file_value = try ev.evaluate("builtins.toFile \"x\" \"hello\"");
-    try std.testing.expectEqual(value.ValueType.string_context, file_value.discriminant);
+    try std.testing.expectEqual(value.ValueType.string_context, file_value.kind());
     const string = try ev.heap.getContextString(file_value.asObjectId());
     const text = ev.intern.get(string.text);
     try std.testing.expectEqualStrings("/nix/store/4g4g9i669dl63abpww0djbl2jxl6bwiz-x", text);
@@ -65,10 +65,10 @@ test "end-to-end: derivation preserves original attrs" {
     const drv = try ev.evaluate(
         "derivation { name = \"x\"; builder = { outPath = \"/nix/store/builder\"; }; system = \"x\"; src = { outPath = \"/nix/store/src\"; }; PATH = [ { outPath = \"/nix/store/bin\"; } ]; }",
     );
-    try std.testing.expectEqual(value.ValueType.attrs, drv.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, drv.kind());
 
     const user_hook = try ev.evaluate("(derivation { name = \"x\"; builder = \"b\"; system = \"s\"; userHook = null; }).userHook");
-    try std.testing.expectEqual(value.ValueType.null, user_hook.discriminant);
+    try std.testing.expectEqual(value.ValueType.null, user_hook.kind());
 }
 
 test "end-to-end: core fetchurl import" {
@@ -80,7 +80,7 @@ test "end-to-end: core fetchurl import" {
     const fetched = try ev.evaluate(
         "import <nix/fetchurl.nix> { name = \"seed\"; url = \"https://example.com/seed\"; sha256 = \"sha256-000\"; }",
     );
-    try std.testing.expectEqual(value.ValueType.attrs, fetched.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, fetched.kind());
 }
 
 test "end-to-end: builtins.toString" {

@@ -3,6 +3,7 @@ const types = @import("../../runtime/types.zig");
 const Value = @import("../../runtime/value.zig").Value;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("../../runtime/heap.zig");
+const int_mod = @import("../../runtime/int.zig");
 const version = @import("../../runtime/version.zig");
 const regex = @import("../../runtime/regex.zig");
 const toml = @import("../../runtime/toml.zig");
@@ -76,11 +77,12 @@ fn writeJsonValueInner(
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) anyerror!void {
     const forced = try vm_force.forceValue(self, value);
-    switch (forced.discriminant) {
+    switch (forced.kind()) {
         .null => try writer.writeAll("null"),
         .bool_false => try writer.writeAll("false"),
         .bool_true => try writer.writeAll("true"),
         .int => try writer.print("{}", .{forced.asInt()}),
+        .boxed_int => try writer.print("{}", .{try self.heap.getBoxedInt(forced.asObjectId())}),
         .float => try writer.print("{d}", .{forced.asFloat()}),
         .string, .string_context => try writeJsonStringValue(self, writer, forced, context),
         .path => {
@@ -247,11 +249,12 @@ fn writeXmlValue(
     };
 
     try writeXmlIndent(writer, depth);
-    switch (forced.discriminant) {
+    switch (forced.kind()) {
         .null => try writer.writeAll("<null />\n"),
         .bool_false => try writer.writeAll("<bool value=\"false\" />\n"),
         .bool_true => try writer.writeAll("<bool value=\"true\" />\n"),
         .int => try writer.print("<int value=\"{}\" />\n", .{forced.asInt()}),
+        .boxed_int => try writer.print("<int value=\"{}\" />\n", .{try self.heap.getBoxedInt(forced.asObjectId())}),
         .float => try writer.print("<float value=\"{d}\" />\n", .{forced.asFloat()}),
         .string => {
             try writer.writeAll("<string value=\"");
@@ -281,7 +284,7 @@ fn writeXmlValue(
 }
 
 fn xmlVisibleValue(self: anytype, value: Value) anyerror!?Value {
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .thunk => xmlThunkValue(self, value.asObjectId()),
         else => value,
     };
@@ -295,7 +298,7 @@ fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
     // Lazy XML treats those as still unevaluated so speculation stays
     // invisible — the rendered output matches the no-helper case.
     if (!thunk.isDemanded()) return null;
-    return xmlVisibleValue(self, thunk.result);
+    return xmlVisibleValue(self, thunk.result.result);
 }
 
 fn writeXmlList(
@@ -361,7 +364,7 @@ fn valueFromJson(self: anytype, value: std.json.Value) anyerror!Value {
     return switch (value) {
         .null => Value.null_val,
         .bool => |b| Value.boolVal(b),
-        .integer => |i| Value.int(i),
+        .integer => |i| int_mod.make(self.heap, i),
         .float => |f| Value.float(f),
         .number_string => |s| numberStringFromJson(self, s),
         .string => |s| Value.string(try self.intern.intern(s)),
@@ -371,8 +374,7 @@ fn valueFromJson(self: anytype, value: std.json.Value) anyerror!Value {
 }
 
 fn numberStringFromJson(self: anytype, text: []const u8) !Value {
-    _ = self;
-    if (std.fmt.parseInt(i64, text, 10)) |i| return Value.int(i) else |_| {}
+    if (std.fmt.parseInt(i64, text, 10)) |i| return int_mod.make(self.heap, i) else |_| {}
     return Value.float(std.fmt.parseFloat(f64, text) catch return error.TypeError);
 }
 
@@ -408,7 +410,7 @@ pub fn builtinFromTOML(self: anytype, arg: Value) !Value {
 fn valueFromToml(self: anytype, value: toml.Value) anyerror!Value {
     return switch (value) {
         .boolean => |b| Value.boolVal(b),
-        .integer => |i| Value.int(i),
+        .integer => |i| int_mod.make(self.heap, i),
         .float => |f| Value.float(f),
         .string => |s| Value.string(try self.intern.intern(s)),
         .array => |items| listFromToml(self, items),

@@ -19,7 +19,7 @@ const filterSourceAccepts = fetch.filterSourceAccepts;
 
 pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    const path = switch (value.discriminant) {
+    const path = switch (value.kind()) {
         .path, .string, .string_context => self.intern.get(try stringTextInternId(self, value)),
         else => return error.TypeError,
     };
@@ -28,12 +28,12 @@ pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
 
 pub fn builtinDirOf(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    const path = switch (value.discriminant) {
+    const path = switch (value.kind()) {
         .path, .string, .string_context => self.intern.get(try stringTextInternId(self, value)),
         else => return error.TypeError,
     };
     const dir = try self.intern.intern(path_ops.dirOf(path));
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .path => Value.path(dir),
         .string, .string_context => Value.string(dir),
         else => unreachable,
@@ -59,12 +59,12 @@ pub fn builtinStorePath(self: anytype, arg: Value) !Value {
 
 pub fn builtinPath(self: anytype, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
-    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (!attrs.isAttrs()) return error.TypeError;
     const attrs_id = attrs.asObjectId();
 
     const path_id = try self.intern.intern("path");
     const path_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, path_id));
-    const path = switch (path_value.discriminant) {
+    const path = switch (path_value.kind()) {
         .path, .string, .string_context => self.intern.get(try stringTextInternId(self, path_value)),
         else => return error.TypeError,
     };
@@ -76,7 +76,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
         else => return err,
     };
     var store_name = path_ops.baseName(path);
-    if (name_value.discriminant != .null) {
+    if (!name_value.isNull()) {
         const name = try vm_force.forceValue(self, name_value);
         if (!isPlainString(name)) return error.TypeError;
         store_name = self.intern.get(try stringTextInternId(self, name));
@@ -88,7 +88,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
         else => return err,
     };
 
-    const store_path = if (filter_value.discriminant == .null)
+    const store_path = if (filter_value.isNull())
         try source_paths.storePathForSourceName(self.allocator, self.files, self.derivations.store_dir, path, store_name)
     else filtered: {
         const pred = try vm_force.forceValue(self, filter_value);

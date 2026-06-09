@@ -172,6 +172,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;
@@ -205,6 +206,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;
@@ -283,6 +285,7 @@ pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, 
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;

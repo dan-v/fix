@@ -200,7 +200,7 @@ fn opSetCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     const slot = code[ip];
     const val = stack.pop(vm);
     const cell_val = vm.stack[frame.frame_base + slot];
-    if (cell_val.discriminant != .thunk) return error.TypeError;
+    if (!cell_val.isThunk()) return error.TypeError;
     const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
     thunk.target = .{ .pass_through = val };
     return dispatch(vm, frame, code, ip + 1, stop_depth);
@@ -211,7 +211,7 @@ fn opSetCellLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     const slot = readU16(code, ip);
     const val = stack.pop(vm);
     const cell_val = vm.stack[frame.frame_base + slot];
-    if (cell_val.discriminant != .thunk) return error.TypeError;
+    if (!cell_val.isThunk()) return error.TypeError;
     const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
     thunk.target = .{ .pass_through = val };
     return dispatch(vm, frame, code, ip + 2, stop_depth);
@@ -233,8 +233,8 @@ fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
     const b = try force.forceValue(vm, stack.pop(vm));
     const a = try force.forceValue(vm, stack.pop(vm));
     if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
-        try stack.push(vm, try numeric.add(a, b));
-    } else if (a.discriminant == .path) {
+        try stack.push(vm, try numeric.add(vm.heap, a, b));
+    } else if (a.isPath()) {
         try stack.push(vm, try strings.concatPathLike(vm, a, b));
     } else {
         try stack.push(vm, try strings.concatStringLike(vm, a, b));
@@ -246,7 +246,7 @@ fn opSubInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, try numeric.sub(a, b));
+    try stack.push(vm, try numeric.sub(vm.heap, a, b));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -254,7 +254,7 @@ fn opMulInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, try numeric.mul(a, b));
+    try stack.push(vm, try numeric.mul(vm.heap, a, b));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -262,14 +262,14 @@ fn opDivInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, try numeric.div(a, b));
+    try stack.push(vm, try numeric.div(vm.heap, a, b));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opNegateInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const a = stack.pop(vm);
-    try stack.push(vm, try numeric.negate(a));
+    try stack.push(vm, try numeric.negate(vm.heap, a));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -279,7 +279,7 @@ fn opAddFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, Value.float(try numeric.toFloat(a) + try numeric.toFloat(b)));
+    try stack.push(vm, Value.float(try numeric.toFloat(a, vm.heap) + try numeric.toFloat(b, vm.heap)));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -287,7 +287,7 @@ fn opSubFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, Value.float(try numeric.toFloat(a) - try numeric.toFloat(b)));
+    try stack.push(vm, Value.float(try numeric.toFloat(a, vm.heap) - try numeric.toFloat(b, vm.heap)));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -295,7 +295,7 @@ fn opMulFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, Value.float(try numeric.toFloat(a) * try numeric.toFloat(b)));
+    try stack.push(vm, Value.float(try numeric.toFloat(a, vm.heap) * try numeric.toFloat(b, vm.heap)));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -303,7 +303,13 @@ fn opDivFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     frame.ip = ip;
     const b = stack.pop(vm);
     const a = stack.pop(vm);
-    try stack.push(vm, Value.float(try numeric.toFloat(a) / try numeric.toFloat(b)));
+    const bf = try numeric.toFloat(b, vm.heap);
+    // Parity with Nix: float division by zero raises rather than
+    // producing IEEE Inf/NaN. The `numeric.div` path enforces the same
+    // rule for the fallthrough cases; `opDivFloat` is the hot path the
+    // compiler emits when either operand is statically a float.
+    if (bf == 0.0) return error.DivisionByZero;
+    try stack.push(vm, Value.float(try numeric.toFloat(a, vm.heap) / bf));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -625,7 +631,7 @@ fn opGetAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
 fn opGetAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const name_val = try force.forceValue(vm, stack.pop(vm));
-    if (name_val.discriminant != .string) return error.TypeError;
+    if (!name_val.isString()) return error.TypeError;
     const attrs_val = stack.pop(vm);
     const result = try access.getAttrValue(vm, attrs_val, name_val.asInternId());
     try stack.push(vm, result);
@@ -636,10 +642,10 @@ fn opGetAttrDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     frame.ip = ip;
     const default_val = stack.pop(vm);
     const name_val = try force.forceValue(vm, stack.pop(vm));
-    if (name_val.discriminant != .string) return error.TypeError;
+    if (!name_val.isString()) return error.TypeError;
     const attrs_val = stack.pop(vm);
     const attrs = try force.forceValue(vm, attrs_val);
-    if (attrs.discriminant != .attrs) {
+    if (!attrs.isAttrs()) {
         try stack.push(vm, try force.forceValue(vm, default_val));
     } else {
         const result = vm.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
@@ -753,9 +759,9 @@ fn opHasAttrPathLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_d
 fn opHasAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const name_val = try force.forceValue(vm, stack.pop(vm));
-    if (name_val.discriminant != .string) return error.TypeError;
+    if (!name_val.isString()) return error.TypeError;
     const attrs_val = try force.forceValue(vm, stack.pop(vm));
-    if (attrs_val.discriminant != .attrs) {
+    if (!attrs_val.isAttrs()) {
         try stack.push(vm, Value.boolVal(false));
     } else {
         const present = if (vm.heap.getAttrValue(attrs_val.asObjectId(), name_val.asInternId())) |_|
@@ -990,7 +996,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
 
 pub fn expectBool(self: *VM, val: Value) !bool {
     const forced = try force.forceValue(self, val);
-    return switch (forced.discriminant) {
+    return switch (forced.kind()) {
         .bool_false => false,
         .bool_true => true,
         else => error.TypeError,

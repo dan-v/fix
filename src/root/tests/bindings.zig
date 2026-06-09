@@ -129,7 +129,7 @@ test "end-to-end: inherit from source expression" {
     try std.testing.expectEqual(@as(i64, 1), literal_source.asInt());
 
     const lazy = try ev.evaluate("let src = 1 / 0; in { inherit (src) x; }");
-    try std.testing.expectEqual(value.ValueType.attrs, lazy.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, lazy.kind());
 }
 
 test "end-to-end: inherit in let bindings" {
@@ -148,7 +148,7 @@ test "end-to-end: inherit in let bindings" {
     try std.testing.expectEqual(@as(i64, 4), contextual_or.asInt());
 
     const lazy_source = try ev.evaluate("let src = 1 / 0; inherit (src) x; in { inherit x; }");
-    try std.testing.expectEqual(value.ValueType.attrs, lazy_source.discriminant);
+    try std.testing.expectEqual(value.ValueType.attrs, lazy_source.kind());
 }
 
 test "end-to-end: with expressions" {

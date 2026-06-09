@@ -4,12 +4,12 @@ const vm_force = @import("../force.zig");
 
 pub fn builtinTypePredicate(self: anytype, arg: Value, expected: ValueType) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.discriminant == expected);
+    return Value.boolVal(value.kind() == expected);
 }
 
 pub fn builtinIsString(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.discriminant == .string or value.discriminant == .string_context);
+    return Value.boolVal(value.isString() or value.isContextString());
 }
 
 pub fn builtinIsBool(self: anytype, arg: Value) !Value {
@@ -19,15 +19,15 @@ pub fn builtinIsBool(self: anytype, arg: Value) !Value {
 
 pub fn builtinIsFunction(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.discriminant == .closure or value.discriminant == .builtin or value.discriminant == .builtin_closure);
+    return Value.boolVal(value.isClosure() or value.isBuiltin() or value.isBuiltinClosure());
 }
 
 pub fn builtinTypeOf(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    const name: []const u8 = switch (value.discriminant) {
+    const name: []const u8 = switch (value.kind()) {
         .null => "null",
         .bool_false, .bool_true => "bool",
-        .int => "int",
+        .int, .boxed_int => "int",
         .float => "float",
         .string, .string_context => "string",
         .path => "path",

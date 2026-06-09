@@ -31,7 +31,7 @@ pub fn builtinImport(self: anytype, arg: Value) !Value {
 
 pub fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Value {
     const scope = try vm_force.forceValue(self, scope_arg);
-    if (scope.discriminant != .attrs) return vm_trace.typeErrorExpected(self, "attrs", scope);
+    if (!scope.isAttrs()) return vm_trace.typeErrorExpected(self, "attrs", scope);
     const host = self.import_host orelse return error.ImportUnavailable;
     return host.scoped_import(host.context, scope, try pathArg(self, path_arg));
 }
@@ -54,17 +54,17 @@ pub fn builtinReadDir(self: anytype, arg: Value) !Value {
 
 pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !Value {
     const search_path = try vm_force.forceValue(self, search_path_arg);
-    if (search_path.discriminant != .list) return error.TypeError;
+    if (!search_path.isList()) return error.TypeError;
     const name = try pathArg(self, name_arg);
 
     const path_id = try self.intern.intern("path");
     const prefix_id = try self.intern.intern("prefix");
     for (try self.heap.getList(search_path.asObjectId())) |item| {
         const entry = try vm_force.forceValue(self, item);
-        if (entry.discriminant != .attrs) return error.TypeError;
+        if (!entry.isAttrs()) return error.TypeError;
 
         const base_value = try vm_force.forceValue(self, try self.heap.getAttrValue(entry.asObjectId(), path_id));
-        const base = switch (base_value.discriminant) {
+        const base = switch (base_value.kind()) {
             .path, .string, .string_context => self.intern.get(try stringTextInternId(self, base_value)),
             else => return error.TypeError,
         };

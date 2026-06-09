@@ -115,17 +115,17 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 // ---- calls ----
 
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
-    if (callee.discriminant == .closure) {
+    if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         try stack.push(self, arg); // arg is first local
         try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
-    } else if (callee.discriminant == .builtin) {
+    } else if (callee.isBuiltin()) {
         try stack.push(self, try access.applyBuiltin(self, callee.asBuiltinId(), &.{arg}));
-    } else if (callee.discriminant == .builtin_closure) {
+    } else if (callee.isBuiltinClosure()) {
         try stack.push(self, try access.applyBuiltinClosure(self, callee, arg));
-    } else if (callee.discriminant == .attrs) {
+    } else if (callee.isAttrs()) {
         const callable = try access.callAttrFunctor(self, callee);
         try doCall(self, callable, arg);
     } else return trace.notCallableError(self, callee);
@@ -134,7 +134,7 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     var current = callee;
     while (true) {
-        switch (current.discriminant) {
+        switch (current.kind()) {
             .closure => {
                 const closure_id = current.asObjectId();
                 const closure = try getClosureById(self, closure_id);
@@ -187,20 +187,20 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
 }
 
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
-    if (callee.discriminant == .closure) {
+    if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
         try stack.push(self, arg);
         return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     }
-    if (callee.discriminant == .builtin) {
+    if (callee.isBuiltin()) {
         return access.applyBuiltin(self, callee.asBuiltinId(), &.{arg});
     }
-    if (callee.discriminant == .builtin_closure) {
+    if (callee.isBuiltinClosure()) {
         return access.applyBuiltinClosure(self, callee, arg);
     }
-    if (callee.discriminant == .attrs) {
+    if (callee.isAttrs()) {
         const callable = try access.callAttrFunctor(self, callee);
         return callValue(self, callable, arg);
     }

@@ -460,7 +460,7 @@ fn slotEntry(arg: *anyopaque) void {
             const items = f.vm.heap.getList(range.list_id) catch return;
             const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
             for (items[range.offset..end]) |item| {
-                if (item.discriminant != .thunk) continue;
+                if (!item.isThunk()) continue;
                 _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
             }
         },

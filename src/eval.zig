@@ -243,6 +243,7 @@ pub const Evaluator = struct {
             &self.registry,
             source,
             &self.intern,
+            &self.heap,
         );
         compiler.base_path = base_path;
         compiler.source_path = source_path;

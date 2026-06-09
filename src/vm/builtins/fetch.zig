@@ -39,12 +39,12 @@ pub fn builtinGetEnv(self: anytype, name_arg: Value) !Value {
 
 pub fn builtinToPath(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    const text_id: InternId = switch (value.discriminant) {
+    const text_id: InternId = switch (value.kind()) {
         .path, .string, .string_context => try stringTextInternId(self, value),
         else => return error.TypeError,
     };
     if (!std.fs.path.isAbsolute(self.intern.get(text_id))) return error.RelativePath;
-    if (value.discriminant == .string_context) return value;
+    if (value.isContextString()) return value;
     return Value.string(text_id);
 }
 
@@ -182,7 +182,7 @@ fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
 
 fn fetchGitSpec(self: anytype, arg: Value) !FetchGitSpec {
     const value = try vm_force.forceValue(self, arg);
-    if (value.discriminant != .attrs) {
+    if (!value.isAttrs()) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
         return .{
@@ -242,7 +242,7 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
 
 fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
     const value = try vm_force.forceValue(self, arg);
-    if (value.discriminant != .attrs) {
+    if (!value.isAttrs()) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
         return .{
@@ -307,7 +307,7 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
 
 fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
     const value = try vm_force.forceValue(self, arg);
-    if (value.discriminant != .attrs) {
+    if (!value.isAttrs()) {
         const url = try self.allocator.dupe(u8, try pathArg(self, value));
         errdefer self.allocator.free(url);
         return .{
@@ -375,17 +375,17 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
 
 pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
-    if (attrs.discriminant == .path) {
+    if (attrs.isPath()) {
         const path = self.intern.get(attrs.asInternId());
         const nar_hash = try self.fetchers.sourceHash(path, "");
         defer self.fetchers.allocator.free(nar_hash);
         return pathTreeValue(self, path, nar_hash);
     }
-    if (attrs.discriminant == .string) {
+    if (attrs.isString()) {
         const parsed = try builtinParseFlakeRef(self, attrs);
         return builtinFetchTree(self, parsed);
     }
-    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (!attrs.isAttrs()) return error.TypeError;
 
     const attrs_id = attrs.asObjectId();
     const type_value = try requiredStringAttr(self, attrs_id, "type");
@@ -464,7 +464,7 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
 
     const host = self.import_host orelse return error.ImportUnavailable;
     const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path));
-    if (flake_value.discriminant != .attrs) return error.TypeError;
+    if (!flake_value.isAttrs()) return error.TypeError;
 
     const outputs_id = try self.intern.intern("outputs");
     const outputs_func = try vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
@@ -474,7 +474,7 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     };
     const inputs = Value.attrs(try self.heap.addAttrs(&inputs_entries));
     const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, inputs));
-    if (outputs.discriminant != .attrs) return error.TypeError;
+    if (!outputs.isAttrs()) return error.TypeError;
 
     return flakeResultValue(self, source_info, inputs, outputs);
 }
@@ -561,7 +561,7 @@ pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
 
 pub fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
-    if (attrs.discriminant != .attrs) return error.TypeError;
+    if (!attrs.isAttrs()) return error.TypeError;
 
     const type_value = try requiredStringAttr(self, attrs.asObjectId(), "type");
     defer self.allocator.free(type_value);
@@ -636,7 +636,7 @@ fn defaultFetchName(self: anytype, url: []const u8) ![]u8 {
 fn dupPathAttr(self: anytype, attrs_id: ObjectId, name: []const u8) ![]u8 {
     const name_id = try self.intern.intern(name);
     const value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .path, .string, .string_context => self.allocator.dupe(u8, self.intern.get(try stringTextInternId(self, value))),
         else => error.TypeError,
     };
@@ -664,8 +664,8 @@ fn optionalBoolAttr(self: anytype, attrs_id: ObjectId, name: []const u8) !?bool 
         else => return err,
     };
     const forced = try vm_force.forceValue(self, value);
-    if (forced.discriminant != .bool_true and forced.discriminant != .bool_false) return error.TypeError;
-    return forced.discriminant == .bool_true;
+    if (!forced.isBool()) return error.TypeError;
+    return forced.asBool();
 }
 
 pub fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: file_cache.FileCache.FileKind) !bool {
@@ -673,8 +673,8 @@ pub fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: f
     const kind_value = Value.string(try self.intern.intern(kind.nixTypeName()));
     const partial = try vm_closures.callValue(self, pred, path_value);
     const result = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, kind_value));
-    if (result.discriminant != .bool_true and result.discriminant != .bool_false) return error.TypeError;
-    return result.discriminant == .bool_true;
+    if (!result.isBool()) return error.TypeError;
+    return result.asBool();
 }
 
 fn dirEntryNameLessThan(_: void, left: file_cache.FileCache.DirEntry, right: file_cache.FileCache.DirEntry) bool {

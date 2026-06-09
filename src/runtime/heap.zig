@@ -92,6 +92,12 @@ pub const Object = union(enum) {
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
     context_string: ContextStringObject,
+    /// Heap-boxed full-range i64. Only used when an integer exceeds the
+    /// inline payload range of the active Value layout. Under Value16
+    /// (default) inline ints are full i64 and this variant is never
+    /// created; under Value8 (NaN-boxed) inline ints are i48 and the
+    /// rare i64-overflow case is allocated here. See `runtime/int.zig`.
+    boxed_int: i64,
 };
 
 pub const ObjectMeta = union(enum) {
@@ -208,8 +214,20 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
-        variant_counts: [6]u32,
+        variant_counts: [7]u32,
         thunk_states: [5]u32,
+        /// Magnitude histogram for inline `.int` values found in the
+        /// values + attrs stores. Buckets are chosen to inform a 16→8
+        /// byte Value migration: a NaN-boxed Value can hold a 48-bit
+        /// sign-extended integer inline, so `int_overflows_i48` is the
+        /// count that would have to be heap-boxed.
+        ///
+        ///   0 = zero
+        ///   1 = |x| < 2^15  (i16 range)
+        ///   2 = |x| < 2^31  (i32 range)
+        ///   3 = |x| < 2^47  (i48 range — NaN-box inline limit)
+        ///   4 = |x| >= 2^47 (would require boxing under NaN-boxing)
+        int_buckets: [5]u32,
 
         pub fn variantName(index: usize) []const u8 {
             return switch (index) {
@@ -219,6 +237,7 @@ pub const ObjectHeap = struct {
                 3 => "builtin_closure",
                 4 => "thunk",
                 5 => "context_string",
+                6 => "boxed_int",
                 else => "?",
             };
         }
@@ -233,6 +252,27 @@ pub const ObjectHeap = struct {
                 else => "?",
             };
         }
+
+        pub fn intBucketLabel(index: usize) []const u8 {
+            return switch (index) {
+                0 => "zero",
+                1 => "i16",
+                2 => "i32",
+                3 => "i48",
+                4 => ">=2^47",
+                else => "?",
+            };
+        }
+
+        pub fn intTotal(self: Stats) u32 {
+            var t: u32 = 0;
+            for (self.int_buckets) |c| t += c;
+            return t;
+        }
+
+        pub fn intOverflowsI48(self: Stats) u32 {
+            return self.int_buckets[4];
+        }
     };
 
     /// Aggregate runtime stats. Safe only when there are no concurrent
@@ -243,33 +283,25 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
-            .variant_counts = [_]u32{0} ** 6,
+            .variant_counts = [_]u32{0} ** 7,
             .thunk_states = [_]u32{0} ** 5,
+            .int_buckets = [_]u32{0} ** 5,
         };
 
-        // Per-worker TLABs reserve OBJECT_CHUNK_SIZE slots from the global
-        // store but fill them one at a time. Slots between `cursor` and
-        // `end` are reserved but unfilled — their payload union is
-        // undefined memory. Skip those IDs when walking.
-        var unfilled_starts: [256]u32 = undefined;
-        var unfilled_ends: [256]u32 = undefined;
-        var unfilled_count: usize = 0;
-        for (self.worker_locals) |local| {
-            if (local.object.cursor >= local.object.end) continue;
-            if (unfilled_count >= unfilled_starts.len) break;
-            unfilled_starts[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.cursor);
-            unfilled_ends[unfilled_count] = ObjectStore.globalIdOf(local.object.segment, local.object.end);
-            unfilled_count += 1;
-        }
+        // Per-worker TLABs reserve a chunk of slots from each global store
+        // but fill them one at a time. Slots between `cursor` and `end`
+        // are reserved but unfilled — their payload is undefined memory.
+        // Build per-store skip sets so the scans below don't read garbage.
+        const obj_skip = self.collectUnfilled(.object);
+        const val_skip = self.collectUnfilled(.value);
+        const attr_skip = self.collectUnfilled(.attr);
 
         var id: u32 = 0;
-        const total = result.objects;
-        scan: while (id < total) : (id += 1) {
-            for (unfilled_starts[0..unfilled_count], unfilled_ends[0..unfilled_count]) |s, e| {
-                if (id >= s and id < e) {
-                    id = e - 1; // skip ahead; loop's id += 1 lands at e
-                    continue :scan;
-                }
+        const total_objs = result.objects;
+        scan_obj: while (id < total_objs) : (id += 1) {
+            if (obj_skip.skipPast(id)) |next| {
+                id = next - 1;
+                continue :scan_obj;
             }
             const obj = self.objects.get(id);
             const v_index: usize = switch (obj.payload) {
@@ -284,10 +316,78 @@ pub const ObjectHeap = struct {
                     break :blk 4;
                 },
                 .context_string => 5,
+                .boxed_int => 6,
             };
             result.variant_counts[v_index] += 1;
         }
+
+        // Walk the values + attrs stores for inline `.int` magnitudes.
+        // Lists, closure upvalues, and thunk-args all live in `values`;
+        // attrset values live in `attrs`. These two cover every place an
+        // int Value can be heap-resident — the VM stack contains transient
+        // ints during execution but is empty by the time stats() runs.
+        var vid: u32 = 0;
+        scan_val: while (vid < result.values) : (vid += 1) {
+            if (val_skip.skipPast(vid)) |next| {
+                vid = next - 1;
+                continue :scan_val;
+            }
+            bucketInt(&result.int_buckets, self.values.get(vid).*);
+        }
+        var aid: u32 = 0;
+        scan_attr: while (aid < result.attrs) : (aid += 1) {
+            if (attr_skip.skipPast(aid)) |next| {
+                aid = next - 1;
+                continue :scan_attr;
+            }
+            bucketInt(&result.int_buckets, self.attrs.get(aid).value);
+        }
         return result;
+    }
+
+    const Store = enum { object, value, attr };
+    const SkipSet = struct {
+        starts: [256]u32 = undefined,
+        ends: [256]u32 = undefined,
+        len: usize = 0,
+
+        /// If `id` falls inside an unfilled range, returns the first
+        /// filled id past it; otherwise null. Callers use the returned id
+        /// to skip the loop forward (subtract 1 to compensate for the
+        /// loop's increment).
+        fn skipPast(self: SkipSet, id: u32) ?u32 {
+            for (self.starts[0..self.len], self.ends[0..self.len]) |s, e| {
+                if (id >= s and id < e) return e;
+            }
+            return null;
+        }
+    };
+
+    fn collectUnfilled(self: *const ObjectHeap, comptime store: Store) SkipSet {
+        var set: SkipSet = .{};
+        for (self.worker_locals) |local| {
+            const chunk = switch (store) {
+                .object => local.object,
+                .value => local.value,
+                .attr => local.attr,
+            };
+            if (chunk.cursor >= chunk.end) continue;
+            if (set.len >= set.starts.len) break;
+            const start = switch (store) {
+                .object => ObjectStore.globalIdOf(chunk.segment, chunk.cursor),
+                .value => ValueStore.globalIdOf(chunk.segment, chunk.cursor),
+                .attr => AttrStore.globalIdOf(chunk.segment, chunk.cursor),
+            };
+            const end = switch (store) {
+                .object => ObjectStore.globalIdOf(chunk.segment, chunk.end),
+                .value => ValueStore.globalIdOf(chunk.segment, chunk.end),
+                .attr => AttrStore.globalIdOf(chunk.segment, chunk.end),
+            };
+            set.starts[set.len] = start;
+            set.ends[set.len] = end;
+            set.len += 1;
+        }
+        return set;
     }
 
     inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
@@ -599,7 +699,7 @@ pub const ObjectHeap = struct {
         var count: u32 = 0;
         var pair_i: usize = 0;
         while (pair_i < pairs.len) : (pair_i += 2) {
-            switch (pairs[pair_i].discriminant) {
+            switch (pairs[pair_i].kind()) {
                 .null => {},
                 .string => count += 1,
                 else => return error.TypeError,
@@ -612,7 +712,7 @@ pub const ObjectHeap = struct {
         var i: usize = 0;
         var entry_i: usize = 0;
         while (i < pairs.len) : (i += 2) {
-            if (pairs[i].discriminant == .null) continue;
+            if (pairs[i].isNull()) continue;
             entries[entry_i] = .{
                 .name = pairs[i].asInternId(),
                 .value = pairs[i + 1],
@@ -651,6 +751,17 @@ pub const ObjectHeap = struct {
 
     pub fn addThunk(self: *ObjectHeap, thunk: Thunk) !ObjectId {
         return self.add(.{ .thunk = thunk });
+    }
+
+    pub fn addBoxedInt(self: *ObjectHeap, v: i64) !ObjectId {
+        return self.add(.{ .boxed_int = v });
+    }
+
+    pub fn getBoxedInt(self: *const ObjectHeap, id: ObjectId) !i64 {
+        return switch (self.getConst(id).*) {
+            .boxed_int => |v| v,
+            else => error.InvalidObjectType,
+        };
     }
 
     pub fn addBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
@@ -785,6 +896,31 @@ pub const ObjectHeap = struct {
         return .{ .attr_positions = range };
     }
 };
+
+fn bucketInt(buckets: *[5]u32, value: Value) void {
+    // Boxed ints are by definition outside i48 inline range; count them
+    // in bucket 4 without a heap lookup. Inline ints get magnitude-binned.
+    if (value.isBoxedInt()) {
+        buckets[4] += 1;
+        return;
+    }
+    if (!value.isInt()) return;
+    const x = value.asInt();
+    if (x == 0) {
+        buckets[0] += 1;
+        return;
+    }
+    const mag: u64 = @abs(x);
+    const idx: usize = if (mag < (@as(u64, 1) << 15))
+        1
+    else if (mag < (@as(u64, 1) << 31))
+        2
+    else if (mag < (@as(u64, 1) << 47))
+        3
+    else
+        4;
+    buckets[idx] += 1;
+}
 
 fn attrEntryLessThan(_: void, lhs: AttrEntry, rhs: AttrEntry) bool {
     return lhs.name < rhs.name;

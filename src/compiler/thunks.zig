@@ -19,6 +19,7 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;

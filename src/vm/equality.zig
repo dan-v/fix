@@ -5,6 +5,7 @@ const Value = @import("../runtime/value.zig").Value;
 const InternId = types.InternId;
 const heap_mod = @import("../runtime/heap.zig");
 const numeric = @import("../runtime/numeric.zig");
+const int_mod = @import("../runtime/int.zig");
 
 const force = @import("force.zig");
 const strings = @import("strings.zig");
@@ -53,17 +54,21 @@ pub fn valuesEqualSeenForcedLeft(self: *VM, va: Value, b: Value, seen: *std.Arra
 }
 
 pub fn valuesEqualForced(self: *VM, va: Value, vb: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
+    if (int_mod.isAnyInt(va) and int_mod.isAnyInt(vb)) {
+        return int_mod.get(va, self.heap) == int_mod.get(vb, self.heap);
+    }
     if (numeric.isNumeric(va) and numeric.isNumeric(vb)) {
-        return try numeric.toFloat(va) == try numeric.toFloat(vb);
+        return try numeric.toFloat(va, self.heap) == try numeric.toFloat(vb, self.heap);
     }
 
     if (isStringComparable(va) and isStringComparable(vb)) {
         return strings.stringTextInternIdsEqual(self, va, vb);
     }
-    if (va.discriminant != vb.discriminant) return false;
-    return switch (va.discriminant) {
+    if (va.kind() != vb.kind()) return false;
+    return switch (va.kind()) {
         .null, .bool_false, .bool_true => true,
         .int => va.asInt() == vb.asInt(),
+        .boxed_int => (try self.heap.getBoxedInt(va.asObjectId())) == (try self.heap.getBoxedInt(vb.asObjectId())),
         .float => va.asFloat() == vb.asFloat(),
         .list => try listsEqual(self, va, vb, seen),
         .attrs => try attrsEqual(self, va, vb, seen),
@@ -173,30 +178,31 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
     const va = try force.forceValue(self, a);
     const vb = try force.forceValue(self, b);
 
-    switch (va.discriminant) {
-        .int => {
-            const ai = va.asInt();
-            if (vb.discriminant == .float) {
+    switch (va.kind()) {
+        .int, .boxed_int => {
+            const ai = int_mod.get(va, self.heap);
+            if (vb.isFloat()) {
                 const af: f64 = @floatFromInt(ai);
                 const bf = vb.asFloat();
                 if (af < bf) return .lt;
                 if (af > bf) return .gt;
                 return .eq;
             }
-            if (vb.discriminant != .int) return error.TypeError;
-            if (ai < vb.asInt()) return .lt;
-            if (ai > vb.asInt()) return .gt;
+            if (!int_mod.isAnyInt(vb)) return error.TypeError;
+            const bi = int_mod.get(vb, self.heap);
+            if (ai < bi) return .lt;
+            if (ai > bi) return .gt;
             return .eq;
         },
         .float => {
             const af = va.asFloat();
-            const bf = try numeric.toFloat(vb);
+            const bf = try numeric.toFloat(vb, self.heap);
             if (af < bf) return .lt;
             if (af > bf) return .gt;
             return .eq;
         },
         .string, .path, .string_context => {
-            if (!isStringComparable(vb) or vb.discriminant != va.discriminant) return error.TypeError;
+            if (!isStringComparable(vb) or vb.kind() != va.kind()) return error.TypeError;
             return switch (std.mem.order(u8, self.intern.get(try strings.stringTextInternId(self, va)), self.intern.get(try strings.stringTextInternId(self, vb)))) {
                 .lt => .lt,
                 .eq => .eq,
@@ -208,5 +214,5 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
 }
 
 pub fn isStringComparable(value: Value) bool {
-    return value.discriminant == .string or value.discriminant == .path or value.discriminant == .string_context;
+    return value.isString() or value.isPath() or value.isContextString();
 }

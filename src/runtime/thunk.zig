@@ -88,9 +88,9 @@ pub const ThunkTarget = union(enum) {
 
 /// Captured failure of a thunk's deterministic body, replayed on
 /// subsequent forces. Allocated out-of-band when a thunk transitions
-/// to `.errored`; pointer is stored in `Thunk.result.payload` (which
-/// is otherwise unused in that state). The struct and its message
-/// string are freed in `ObjectHeap.deinit`.
+/// to `.errored`; pointer is stored in the `result_or_error` union
+/// slot (which is otherwise unused in that state). The struct and its
+/// message string are freed in `ObjectHeap.deinit`.
 ///
 /// Sidecar storage avoids widening the (very hot) Thunk struct by
 /// 24 bytes per instance — multiplied across millions of live thunks
@@ -99,6 +99,17 @@ pub const ThunkTarget = union(enum) {
 pub const ErrorInfo = struct {
     err: anyerror,
     message: ?[]const u8,
+};
+
+/// Overlay of the resolved-`Value` slot and the errored-`*ErrorInfo`
+/// sidecar pointer. Sized at `max(@sizeOf(Value), 8)` so it stays at
+/// `@sizeOf(Value)` for the 16-byte Value layout and grows naturally
+/// to 8 bytes when Value is 8 (NaN-boxed). The union tag is implicit
+/// in `Thunk.state`: `.resolved` → read `.result`; `.errored` → read
+/// `.error_info_bits` and cast back to the heap-owned `*ErrorInfo`.
+pub const ResultOrError = extern union {
+    result: Value,
+    error_info_bits: u64,
 };
 
 pub const ForceOutcome = union(enum) {
@@ -130,9 +141,9 @@ pub const Thunk = struct {
     demanded: std.atomic.Value(u8),
     target: ThunkTarget,
     /// Holds the resolved Value when `state == .resolved`; reinterpreted
-    /// as a `*ErrorInfo` (via `payload`) when `state == .errored` — see
-    /// `errored` / `cachedErrorInfo`. Undefined for other states.
-    result: Value,
+    /// as a `*ErrorInfo` via `error_info_bits` when `state == .errored`
+    /// — see `errored` / `cachedErrorInfo`. Undefined for other states.
+    result: ResultOrError,
     /// Singly-linked list of fibers parked on this thunk. Manipulated
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
@@ -147,7 +158,7 @@ pub const Thunk = struct {
             .waiters_head = null,
             .waiters_mu = .{},
             .target = .{ .closure = closure },
-            .result = Value.null_val,
+            .result = .{ .result = Value.null_val },
         };
     }
 
@@ -159,7 +170,7 @@ pub const Thunk = struct {
             .waiters_head = null,
             .waiters_mu = .{},
             .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
-            .result = Value.null_val,
+            .result = .{ .result = Value.null_val },
         };
     }
 
@@ -174,7 +185,7 @@ pub const Thunk = struct {
             .waiters_head = null,
             .waiters_mu = .{},
             .target = .{ .pass_through = value },
-            .result = Value.null_val,
+            .result = .{ .result = Value.null_val },
         };
     }
 
@@ -201,7 +212,7 @@ pub const Thunk = struct {
         while (true) {
             const s: ThunkState = @enumFromInt(self.state.load(.acquire));
             switch (s) {
-                .resolved => return .{ .already_resolved = self.result },
+                .resolved => return .{ .already_resolved = self.result.result },
                 .blackhole => return .blackhole,
                 .errored => return .{ .errored = self.cachedErrorInfo() },
                 .unresolved => {
@@ -247,7 +258,7 @@ pub const Thunk = struct {
 
     /// Publish `value` as the result and wake all enrolled fiber waiters.
     pub fn resolve(self: *Thunk, value: Value) void {
-        self.result = value;
+        self.result = .{ .result = value };
         self.claimer.store(INVALID_CLAIMER, .release);
         self.state.store(@intFromEnum(ThunkState.resolved), .release);
         self.wakeFiberWaiters();
@@ -259,7 +270,7 @@ pub const Thunk = struct {
     /// failures prefer `errored` so the same body isn't re-run for
     /// nothing.
     pub fn reset(self: *Thunk) void {
-        self.result = Value.null_val;
+        self.result = .{ .result = Value.null_val };
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.unresolved), .release);
         self.wakeFiberWaiters();
@@ -271,14 +282,14 @@ pub const Thunk = struct {
     /// it can release the storage at deinit time. See
     /// `ObjectHeap.trackErroredInfo`.
     ///
-    /// Memory model: the info pointer is written into `result.payload`
+    /// Memory model: the info pointer is written into `result.error_info_bits`
     /// before the release-store of `state → errored`, so any reader
     /// that acquires `.errored` sees a valid pointer.
     pub fn markErrored(self: *Thunk, info: *ErrorInfo) void {
-        // Sidecar storage: `result` is unused while errored, so its
-        // payload slot doubles as the `*ErrorInfo` pointer. Keeps the
-        // Thunk struct narrow for the common (resolved) case.
-        self.result = .{ .discriminant = .null, .payload = @intFromPtr(info) };
+        // Sidecar storage: `result` is unused while errored, so the union
+        // slot doubles as the `*ErrorInfo` pointer. Keeps the Thunk struct
+        // narrow for the common (resolved) case.
+        self.result = .{ .error_info_bits = @intFromPtr(info) };
         self.claimer.store(INVALID_CLAIMER, .monotonic);
         self.state.store(@intFromEnum(ThunkState.errored), .release);
         self.wakeFiberWaiters();
@@ -288,7 +299,7 @@ pub const Thunk = struct {
     /// `state == .errored` — that state's release-acquire pairing
     /// makes the pointer visible.
     pub fn cachedErrorInfo(self: *const Thunk) *const ErrorInfo {
-        return @ptrFromInt(self.result.payload);
+        return @ptrFromInt(self.result.error_info_bits);
     }
 
     /// Mark this thunk as a blackhole. Wakes waiters so they observe the
@@ -498,7 +509,7 @@ test "thunk: errored caches error and replays on next force" {
 fn freeErroredInfoForTest(thunk: *Thunk, allocator: std.mem.Allocator) void {
     const s: ThunkState = @enumFromInt(thunk.state.load(.acquire));
     if (s != .errored) return;
-    const info: *ErrorInfo = @ptrFromInt(thunk.result.payload);
+    const info: *ErrorInfo = @ptrFromInt(thunk.result.error_info_bits);
     if (info.message) |msg| allocator.free(msg);
     allocator.destroy(info);
 }

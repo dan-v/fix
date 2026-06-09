@@ -175,6 +175,7 @@ pub fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSe
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;
@@ -475,6 +476,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
         self.registry,
         self.source,
         self.intern,
+        self.heap,
     );
     child.parent = self;
     child.base_path = self.base_path;

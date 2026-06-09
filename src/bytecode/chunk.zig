@@ -157,6 +157,20 @@ pub const ChunkBuilder = struct {
     }
 };
 
+/// Well-known chunk ids registered eagerly at `ChunkRegistry.init`. These
+/// are tiny stub chunks that builtins use to materialise lazy values
+/// without allocating a per-element `builtin_closure` object — see
+/// `genlist_apply` for the canonical example.
+pub const WellKnownChunks = struct {
+    /// Stub chunk for `builtins.genList` element thunks. Body:
+    ///   `get_upvalue 0; get_upvalue 1; tail_call; ret; halt`
+    /// Upvalues are `[func, index]`. Forcing the thunk calls
+    /// `func index` and returns the result. Replaces the
+    /// `builtin_closure(.mapValue, [func, index])` per element that
+    /// would otherwise allocate one extra Object per genList slot.
+    genlist_apply: ChunkId,
+};
+
 /// Global chunk registry. Chunks are stored here and referenced by ChunkId.
 /// This is the "program" that the VM executes.
 ///
@@ -168,12 +182,39 @@ pub const ChunkRegistry = struct {
 
     allocator: std.mem.Allocator,
     chunks: Store,
+    well_known: WellKnownChunks,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
-        return .{
+        var self: ChunkRegistry = .{
             .allocator = allocator,
             .chunks = .empty,
+            .well_known = .{ .genlist_apply = 0 },
         };
+        errdefer self.deinit();
+        self.well_known.genlist_apply = try self.registerGenListApplyChunk();
+        return self;
+    }
+
+    fn registerGenListApplyChunk(self: *ChunkRegistry) !ChunkId {
+        var builder = try ChunkBuilder.init(self.allocator);
+        defer builder.deinit(self.allocator);
+
+        // get_upvalue 0  — push func
+        try builder.writeOp(self.allocator, .get_upvalue);
+        try builder.writeU16(self.allocator, 0);
+        // get_upvalue 1  — push index
+        try builder.writeOp(self.allocator, .get_upvalue);
+        try builder.writeU16(self.allocator, 1);
+        // tail_call      — call func with index
+        try builder.writeOp(self.allocator, .tail_call);
+        // ret            — return result (tail_call to a closure transfers
+        //                  control; ret only runs when callee was a builtin)
+        try builder.writeOp(self.allocator, .ret);
+        // halt           — sentinel
+        try builder.writeOp(self.allocator, .halt);
+
+        const chunk = try builder.finish(self.allocator, 0);
+        return self.register(chunk);
     }
 
     pub fn deinit(self: *ChunkRegistry) void {

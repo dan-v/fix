@@ -4,6 +4,7 @@ const Value = @import("../../runtime/value.zig").Value;
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("../../runtime/heap.zig");
+const int_mod = @import("../../runtime/int.zig");
 const source_paths = @import("../../runtime/source_path.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
@@ -21,7 +22,7 @@ pub fn firstReplacementIdAt(self: anytype, input: []const u8, needles: []const I
 
 pub fn pathArg(self: anytype, arg: Value) ![]const u8 {
     const value = try vm_strings.stringLikeValue(self, arg);
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .path, .string => self.intern.get(value.asInternId()),
         .string_context => self.intern.get((try self.heap.getContextString(value.asObjectId())).text),
         else => vm_trace.typeErrorExpected(self, "path or string", value),
@@ -35,7 +36,7 @@ pub fn builtinStringLength(self: anytype, arg: Value) !Value {
 pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !Value {
     const sep_value = try vm_force.forceValue(self, sep_arg);
     const list = try vm_force.forceValue(self, list_arg);
-    if (!isPlainString(sep_value) or list.discriminant != .list) return error.TypeError;
+    if (!isPlainString(sep_value) or !list.isList()) return error.TypeError;
 
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
@@ -71,7 +72,7 @@ pub fn coerceStringContextId(self: anytype, arg: Value) !InternId {
 
 pub fn coerceStringContextValue(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .string, .string_context => value,
         .path => sourcePathStringValue(self, value.asInternId()),
         .attrs => coerceAttrsStringContextValue(self, value),
@@ -109,15 +110,23 @@ pub fn sourcePathStringValue(self: anytype, path_id: InternId) !Value {
 pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_arg: Value) !Value {
     const start_value = try vm_force.forceValue(self, start_arg);
     const len_value = try vm_force.forceValue(self, len_arg);
-    if (start_value.discriminant != .int or len_value.discriminant != .int) return error.TypeError;
-    if (start_value.asInt() < 0) return error.TypeError;
+    if (!int_mod.isAnyInt(start_value) or !int_mod.isAnyInt(len_value)) return error.TypeError;
+    const start_i = int_mod.get(start_value, self.heap);
+    const len_i = int_mod.get(len_value, self.heap);
+    if (start_i < 0) return error.TypeError;
 
     const string_value = try coerceStringContextValue(self, string_arg);
     const string = self.intern.get(try stringTextInternId(self, string_value));
-    const start: usize = @intCast(start_value.asInt());
+    if (start_i > std.math.maxInt(usize)) return Value.string(try self.intern.intern(""));
+    const start: usize = @intCast(start_i);
     if (start >= string.len) return Value.string(try self.intern.intern(""));
     const available = string.len - start;
-    const requested_len: usize = if (len_value.asInt() < 0) available else @intCast(len_value.asInt());
+    const requested_len: usize = if (len_i < 0)
+        available
+    else if (len_i > std.math.maxInt(usize))
+        available
+    else
+        @intCast(len_i);
     const end = start + @min(available, requested_len);
     const text_id = try self.intern.intern(string[start..end]);
     const ctx = try string_context.contextEntriesForValue(self, string_value);
@@ -167,20 +176,20 @@ pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, stri
 
 pub fn stringArg(self: anytype, arg: Value) ![]const u8 {
     const value = try vm_force.forceValue(self, arg);
-    if (!isStringLike(value) or value.discriminant == .path) return error.TypeError;
+    if (!isStringLike(value) or value.isPath()) return error.TypeError;
     return self.intern.get(try stringTextInternId(self, value));
 }
 
 pub fn isStringLike(value: Value) bool {
-    return value.discriminant == .string or value.discriminant == .path or value.discriminant == .string_context;
+    return value.isString() or value.isPath() or value.isContextString();
 }
 
 pub fn isPlainString(value: Value) bool {
-    return value.discriminant == .string or value.discriminant == .string_context;
+    return value.isString() or value.isContextString();
 }
 
 pub fn isCallable(self: anytype, value: Value) !bool {
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .closure, .builtin, .builtin_closure => true,
         .attrs => blk: {
             _ = self.heap.getAttrValue(value.asObjectId(), try self.intern.intern("__functor")) catch |err| switch (err) {
@@ -194,7 +203,7 @@ pub fn isCallable(self: anytype, value: Value) !bool {
 }
 
 pub fn stringTextInternId(self: anytype, value: Value) !InternId {
-    return switch (value.discriminant) {
+    return switch (value.kind()) {
         .string, .path => value.asInternId(),
         .string_context => (try self.heap.getContextString(value.asObjectId())).text,
         else => error.TypeError,
@@ -203,7 +212,7 @@ pub fn stringTextInternId(self: anytype, value: Value) !InternId {
 
 pub fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
     const list = try vm_force.forceValue(self, arg);
-    if (list.discriminant != .list) return error.TypeError;
+    if (!list.isList()) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
     const out = try self.allocator.alloc([]const u8, items.len);
@@ -214,7 +223,7 @@ pub fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
 
 pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
     const list = try vm_force.forceValue(self, arg);
-    if (list.discriminant != .list) return error.TypeError;
+    if (!list.isList()) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
     const ids = try self.allocator.alloc(InternId, items.len);
@@ -229,7 +238,7 @@ pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
 
 pub fn stringListValuesArg(self: anytype, arg: Value) ![]Value {
     const list = try vm_force.forceValue(self, arg);
-    if (list.discriminant != .list) return error.TypeError;
+    if (!list.isList()) return error.TypeError;
 
     const items = try self.heap.getList(list.asObjectId());
     const values = try self.allocator.alloc(Value, items.len);
@@ -252,11 +261,11 @@ pub fn coerceToStringId(self: anytype, arg: Value) !InternId {
 
 pub fn coerceToStringValue(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    switch (value.discriminant) {
+    switch (value.kind()) {
         .string, .string_context => return value,
         .path => return Value.string(value.asInternId()),
-        .int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
+        .int, .boxed_int => {
+            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
             defer self.allocator.free(s);
             return Value.string(try self.intern.intern(s));
         },
@@ -309,7 +318,7 @@ pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
 }
 
 pub fn isEmptyListStringItem(self: anytype, value: Value) !bool {
-    return value.discriminant == .list and (try self.heap.getList(value.asObjectId())).len == 0;
+    return value.isList() and (try self.heap.getList(value.asObjectId())).len == 0;
 }
 
 pub fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
@@ -332,11 +341,11 @@ pub fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
 
 pub fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    switch (value.discriminant) {
+    switch (value.kind()) {
         .string, .string_context => return value,
         .path => return sourcePathStringValue(self, value.asInternId()),
-        .int => {
-            const s = try std.fmt.allocPrint(self.allocator, "{}", .{value.asInt()});
+        .int, .boxed_int => {
+            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(value, self.heap)});
             defer self.allocator.free(s);
             return Value.string(try self.intern.intern(s));
         },

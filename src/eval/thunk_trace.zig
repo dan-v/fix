@@ -127,7 +127,7 @@ pub const ThunkTrace = struct {
         const w = self.writer;
         w.print(
             "seq={d} kind=resolve thunk={d} worker={d} fiber={d} disc={s} value=",
-            .{ seq, thunk_id, worker_id, fiber_id, @tagName(value.discriminant) },
+            .{ seq, thunk_id, worker_id, fiber_id, @tagName(value.kind()) },
         ) catch return;
         w.writeAll(summary) catch return;
         if (summary.len == scratch.len) w.writeAll("...TRUNCATED") catch return;
@@ -236,11 +236,12 @@ fn writeValueInner(
     value: Value,
     depth: u8,
 ) !void {
-    switch (value.discriminant) {
+    switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
         .bool_false => try writer.writeAll("false"),
         .int => try writer.print("{d}", .{value.asInt()}),
+        .boxed_int => try writer.print("{d}", .{heap.getBoxedInt(value.asObjectId()) catch 0}),
         .float => try writer.print("{d}", .{value.asFloat()}),
         .string => {
             try writer.writeByte('"');
