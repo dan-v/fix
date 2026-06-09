@@ -10,6 +10,7 @@ const repl_line = @import("cli/repl.zig");
 const disasm_cmd = @import("cli/disasm.zig");
 const inspect_cmd = @import("cli/inspect.zig");
 const trace_cmd = @import("cli/trace.zig");
+const thunks_cmd = @import("cli/thunks.zig");
 const vm_trace_mod = @import("vm/trace_log.zig");
 const thunk_trace_mod = @import("eval/thunk_trace.zig");
 const Evaluator = eval.Evaluator;
@@ -116,6 +117,13 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, first, "trace")) {
             const code = trace_cmd.run(init, &args_iter) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            std.process.exit(code);
+        }
+        if (std.mem.eql(u8, first, "thunks")) {
+            const code = thunks_cmd.run(init, &args_iter) catch |err| {
                 std.debug.print("error: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
