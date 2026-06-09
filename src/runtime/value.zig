@@ -1,21 +1,29 @@
-//! Compact tagged value representation.
+//! NaN-boxed 8-byte Value.
 //!
-//! Two representations live behind the same public surface, selected at
-//! build time:
+//! Layout (64 bits):
 //!
-//!   - `Value16` (default): an extern struct of `{u8 tag, u64 payload}`
-//!     padded to 16 bytes. The original layout — kept as the default
-//!     while `Value8` is validated against real workloads.
-//!   - `Value8` (`-Dvalue8=true`): an 8-byte NaN-boxed `u64`. See
-//!     `value8.zig` for the bit layout and the rationale for migrating.
+//!   If bits[63:51] != 0x1FFF — i.e. sign != 1, OR exponent != 0x7FF,
+//!   OR quiet-NaN bit != 1 — the Value is a regular IEEE 754 double.
 //!
-//! Both Value implementations expose the same method API: `kind()`,
-//! `rawPayload()`, all `isX()` / `asX()` accessors, all constructors,
-//! `idEq`, `idHash`, and `format`. Callers go through methods rather
-//! than the underlying fields so the layout swap is transparent.
+//!   Otherwise the Value is a tagged scalar/object reference:
+//!     bits[50:48]  = 3-bit primary tag (8 variants)
+//!     bits[47:0]   = 48-bit payload
+//!
+//!   For the `misc` primary tag (7), the variant is further refined by a
+//!   4-bit sub-tag in bits[47:44] and a 44-bit sub-payload in bits[43:0].
+//!
+//! Float canonicalisation: arithmetic-produced NaNs may land anywhere in
+//! the qNaN bit space, including patterns that look like a tagged value.
+//! `float(v)` scrubs any input NaN to a fixed positive canonical NaN
+//! (sign=0) that never collides with our tagged prefix (sign=1).
+//!
+//! Integers up to 2^47 fit inline in the int tag's 48-bit payload. The
+//! rare i64 overflow case is held in a heap-boxed `Object.boxed_int`
+//! slot and surfaced through the `boxed_int` ValueType — see
+//! `runtime/int.zig` for the make/get helpers callers use to stay
+//! agnostic of which encoding any given integer Value is in.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const types = @import("types.zig");
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
@@ -35,264 +43,318 @@ pub const ValueType = enum(u8) {
     builtin = 11, // payload is builtin id
     builtin_closure = 12, // payload is ObjectId
     string_context = 13, // payload is ObjectId
-    /// Heap-boxed i64. The inline `int` variant covers most of the Nix
-    /// integer range (always under Value16, only i48 under Value8); this
-    /// variant carries the rare i64 values that don't fit Value8's 48-bit
-    /// payload. Payload is an ObjectId pointing at an `Object.boxed_int`
-    /// heap slot. Created via `runtime/int.zig`'s `make`; unboxed via
-    /// `runtime/int.zig`'s `get`.
+    /// Heap-boxed i64 for values that don't fit the 48-bit inline
+    /// payload. Created and unboxed through `runtime/int.zig`'s
+    /// `make`/`get` helpers; the payload is an ObjectId into an
+    /// `Object.boxed_int` slot.
     boxed_int = 14,
     // reserved 15..255 for future extensions
 };
 
-pub const Value = if (build_options.value8) @import("value8.zig").Value else Value16;
+// ---- bit layout constants ----
 
-test {
-    _ = if (build_options.value8) @import("value8.zig") else struct {};
+/// Sign=1 quiet-NaN prefix in bits [63:51]. Any Value whose bits AND this
+/// mask equals this constant is a tagged Value; anything else is a float.
+const QNAN_PREFIX: u64 = 0xFFF8_0000_0000_0000;
+const QNAN_PREFIX_MASK: u64 = QNAN_PREFIX;
+
+/// High-16-bit mask for primary-tag isolation. Each primary tag's prefix
+/// is `QNAN_PREFIX | (tag << 48)`, and the top 16 bits uniquely identify
+/// the primary tag — so `(bits & HIGH16_MASK) == prefix(tag)` is a single
+/// load + AND + CMP predicate.
+const HIGH16_MASK: u64 = 0xFFFF_0000_0000_0000;
+
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+// Primary tags (3 bits, shifted into bits 50:48).
+const TAG_INT: u64 = 0;
+const TAG_STRING: u64 = 1;
+const TAG_PATH: u64 = 2;
+const TAG_LIST: u64 = 3;
+const TAG_ATTRS: u64 = 4;
+const TAG_THUNK: u64 = 5;
+const TAG_CLOSURE: u64 = 6;
+const TAG_MISC: u64 = 7;
+
+// Misc sub-tags (4 bits, shifted into bits 47:44).
+const MISC_SUB_SHIFT: u6 = 44;
+const MISC_SUB_MASK: u64 = 0xF;
+const MISC_SUB_BUILTIN_CLOSURE: u64 = 0;
+const MISC_SUB_STRING_CONTEXT: u64 = 1;
+const MISC_SUB_BUILTIN: u64 = 2;
+const MISC_SUB_NULL: u64 = 3;
+const MISC_SUB_BOOL_FALSE: u64 = 4;
+const MISC_SUB_BOOL_TRUE: u64 = 5;
+const MISC_SUB_BOXED_INT: u64 = 6;
+
+// Mask matching the high 16 bits + the 4-bit misc sub-tag (bits 47:44).
+const MISC_FULL_TAG_MASK: u64 = HIGH16_MASK | (MISC_SUB_MASK << MISC_SUB_SHIFT);
+
+/// 48-bit sign-extended integer encode (the int payload occupies the
+/// full 48 bits including its own sign bit).
+const I48_SIGN_BIT: u64 = 1 << 47;
+const I48_SIGN_EXT: u64 = 0xFFFF_0000_0000_0000;
+const I48_MIN: i64 = -(@as(i64, 1) << 47);
+const I48_MAX: i64 = (@as(i64, 1) << 47) - 1;
+
+/// Positive canonical NaN. Any NaN value passed to `float()` is rewritten
+/// to this bit pattern so it can't be misread as a tagged Value (which
+/// always has sign=1).
+const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0001;
+
+inline fn tagPrefix(tag: u64) u64 {
+    return QNAN_PREFIX | (tag << 48);
 }
 
-pub const Value16 = extern struct {
-    discriminant: ValueType align(8),
-    payload: u64 align(8),
+inline fn miscPrefix(sub: u64) u64 {
+    return tagPrefix(TAG_MISC) | (sub << MISC_SUB_SHIFT);
+}
+
+pub const Value = extern struct {
+    bits: u64 align(8),
 
     comptime {
-        std.debug.assert(@sizeOf(Value16) == 16);
+        std.debug.assert(@sizeOf(Value) == 8);
+        std.debug.assert(@alignOf(Value) == 8);
+    }
+
+    // ---- low-level encode helpers ----
+
+    inline fn tagged(tag: u64, payload: u64) Value {
+        std.debug.assert(payload & ~PAYLOAD_MASK == 0);
+        return .{ .bits = tagPrefix(tag) | payload };
+    }
+
+    inline fn miscTagged(sub: u64, payload: u64) Value {
+        const sub_payload_mask: u64 = PAYLOAD_MASK >> 4;
+        std.debug.assert(payload & ~sub_payload_mask == 0);
+        return .{ .bits = miscPrefix(sub) | payload };
     }
 
     // ---- constructors ----
 
-    pub const null_val: @This() = .{ .discriminant = .null, .payload = 0 };
+    pub const null_val: Value = .{ .bits = miscPrefix(MISC_SUB_NULL) };
 
-    pub fn boolVal(v: bool) @This() {
-        return .{
-            .discriminant = if (v) .bool_true else .bool_false,
-            .payload = 0,
+    pub fn boolVal(v: bool) Value {
+        return .{ .bits = miscPrefix(if (v) MISC_SUB_BOOL_TRUE else MISC_SUB_BOOL_FALSE) };
+    }
+
+    /// Construct an inline integer. Callers that may have an out-of-range
+    /// i64 should go through `runtime/int.zig`'s `make` instead, which
+    /// boxes the rare overflow case into a heap-allocated `boxed_int`.
+    /// The debug assert here catches accidental direct calls on
+    /// unbounded i64s.
+    pub fn int(v: i64) Value {
+        std.debug.assert(v >= I48_MIN and v <= I48_MAX);
+        const masked: u64 = @as(u64, @bitCast(v)) & PAYLOAD_MASK;
+        return .{ .bits = tagPrefix(TAG_INT) | masked };
+    }
+
+    pub fn float(v: f64) Value {
+        const raw: u64 = @bitCast(v);
+        // Scrub any NaN to canonical; otherwise a NaN whose bit pattern
+        // happened to overlap our tagged-Value space would be misread.
+        if ((raw & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and
+            (raw & 0x000F_FFFF_FFFF_FFFF) != 0)
+        {
+            return .{ .bits = CANONICAL_NAN };
+        }
+        return .{ .bits = raw };
+    }
+
+    pub fn string(id: InternId) Value {
+        return tagged(TAG_STRING, id);
+    }
+
+    pub fn path(id: InternId) Value {
+        return tagged(TAG_PATH, id);
+    }
+
+    pub fn list(id: ObjectId) Value {
+        return tagged(TAG_LIST, id);
+    }
+
+    pub fn attrs(id: ObjectId) Value {
+        return tagged(TAG_ATTRS, id);
+    }
+
+    pub fn closure(id: ObjectId) Value {
+        return tagged(TAG_CLOSURE, id);
+    }
+
+    pub fn thunk(id: ObjectId) Value {
+        return tagged(TAG_THUNK, id);
+    }
+
+    pub fn builtin(id: u16) Value {
+        return miscTagged(MISC_SUB_BUILTIN, id);
+    }
+
+    pub fn builtinClosure(id: ObjectId) Value {
+        return miscTagged(MISC_SUB_BUILTIN_CLOSURE, id);
+    }
+
+    pub fn contextString(id: ObjectId) Value {
+        return miscTagged(MISC_SUB_STRING_CONTEXT, id);
+    }
+
+    pub fn boxedInt(id: ObjectId) Value {
+        return miscTagged(MISC_SUB_BOXED_INT, id);
+    }
+
+    // ---- discrimination ----
+
+    inline fn isTagged(self: Value) bool {
+        return (self.bits & QNAN_PREFIX_MASK) == QNAN_PREFIX;
+    }
+
+    pub fn kind(self: Value) ValueType {
+        if (!self.isTagged()) return .float;
+        const primary: u64 = (self.bits >> 48) & 0x7;
+        return switch (primary) {
+            TAG_INT => .int,
+            TAG_STRING => .string,
+            TAG_PATH => .path,
+            TAG_LIST => .list,
+            TAG_ATTRS => .attrs,
+            TAG_THUNK => .thunk,
+            TAG_CLOSURE => .closure,
+            TAG_MISC => switch ((self.bits >> MISC_SUB_SHIFT) & MISC_SUB_MASK) {
+                MISC_SUB_BUILTIN_CLOSURE => .builtin_closure,
+                MISC_SUB_STRING_CONTEXT => .string_context,
+                MISC_SUB_BUILTIN => .builtin,
+                MISC_SUB_NULL => .null,
+                MISC_SUB_BOOL_FALSE => .bool_false,
+                MISC_SUB_BOOL_TRUE => .bool_true,
+                MISC_SUB_BOXED_INT => .boxed_int,
+                else => unreachable,
+            },
+            else => unreachable,
         };
     }
 
-    pub fn int(v: i64) @This() {
-        return .{
-            .discriminant = .int,
-            .payload = @bitCast(v),
-        };
+    pub fn rawPayload(self: Value) u64 {
+        return self.bits & PAYLOAD_MASK;
     }
 
-    pub fn float(v: f64) @This() {
-        return .{
-            .discriminant = .float,
-            .payload = @bitCast(v),
-        };
+    // ---- predicates ----
+
+    pub fn isFloat(self: Value) bool {
+        return !self.isTagged();
     }
 
-    pub fn string(id: InternId) @This() {
-        return .{
-            .discriminant = .string,
-            .payload = id,
-        };
+    pub fn isInt(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_INT);
     }
 
-    pub fn path(id: InternId) @This() {
-        return .{
-            .discriminant = .path,
-            .payload = id,
-        };
+    pub fn isString(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_STRING);
     }
 
-    pub fn list(id: ObjectId) @This() {
-        return .{
-            .discriminant = .list,
-            .payload = id,
-        };
+    pub fn isPath(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_PATH);
     }
 
-    pub fn attrs(id: ObjectId) @This() {
-        return .{
-            .discriminant = .attrs,
-            .payload = id,
-        };
+    pub fn isList(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_LIST);
     }
 
-    pub fn closure(id: ObjectId) @This() {
-        return .{
-            .discriminant = .closure,
-            .payload = id,
-        };
+    pub fn isAttrs(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_ATTRS);
     }
 
-    pub fn thunk(id: ObjectId) @This() {
-        return .{
-            .discriminant = .thunk,
-            .payload = id,
-        };
+    pub fn isThunk(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_THUNK);
     }
 
-    pub fn builtin(id: u16) @This() {
-        return .{
-            .discriminant = .builtin,
-            .payload = id,
-        };
+    pub fn isClosure(self: Value) bool {
+        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_CLOSURE);
     }
 
-    pub fn builtinClosure(id: ObjectId) @This() {
-        return .{
-            .discriminant = .builtin_closure,
-            .payload = id,
-        };
+    inline fn isMiscSub(self: Value, sub: u64) bool {
+        return (self.bits & MISC_FULL_TAG_MASK) == miscPrefix(sub);
     }
 
-    pub fn contextString(id: ObjectId) @This() {
-        return .{
-            .discriminant = .string_context,
-            .payload = id,
-        };
+    pub fn isBuiltinClosure(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_BUILTIN_CLOSURE);
     }
 
-    pub fn boxedInt(id: ObjectId) @This() {
-        return .{
-            .discriminant = .boxed_int,
-            .payload = id,
-        };
+    pub fn isContextString(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_STRING_CONTEXT);
+    }
+
+    pub fn isBoxedInt(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_BOXED_INT);
+    }
+
+    pub fn isBuiltin(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_BUILTIN);
+    }
+
+    pub fn isNull(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_NULL);
+    }
+
+    pub fn isBool(self: Value) bool {
+        // bool_true and bool_false share the misc tag and live in two
+        // adjacent sub-tag slots — check both.
+        const masked = self.bits & MISC_FULL_TAG_MASK;
+        return masked == miscPrefix(MISC_SUB_BOOL_FALSE) or
+            masked == miscPrefix(MISC_SUB_BOOL_TRUE);
+    }
+
+    pub fn asBool(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_BOOL_TRUE);
     }
 
     // ---- accessors ----
 
-    pub fn asInt(self: @This()) i64 {
-        std.debug.assert(self.discriminant == .int);
-        return @bitCast(self.payload);
+    pub fn asInt(self: Value) i64 {
+        std.debug.assert(self.isInt());
+        const masked: u64 = self.bits & PAYLOAD_MASK;
+        // Sign-extend bit 47 into the high 16 bits.
+        if ((masked & I48_SIGN_BIT) != 0) {
+            return @bitCast(masked | I48_SIGN_EXT);
+        }
+        return @bitCast(masked);
     }
 
-    pub fn asFloat(self: @This()) f64 {
-        std.debug.assert(self.discriminant == .float);
-        return @bitCast(self.payload);
+    pub fn asFloat(self: Value) f64 {
+        std.debug.assert(self.isFloat());
+        return @bitCast(self.bits);
     }
 
-    pub fn asInternId(self: @This()) InternId {
-        return @intCast(self.payload);
+    pub fn asInternId(self: Value) InternId {
+        return @intCast(self.bits & 0xFFFF_FFFF);
     }
 
-    pub fn asObjectId(self: @This()) ObjectId {
-        return @intCast(self.payload);
+    pub fn asObjectId(self: Value) ObjectId {
+        return @intCast(self.bits & 0xFFFF_FFFF);
     }
 
-    pub fn asBuiltinId(self: @This()) u16 {
-        return @intCast(self.payload);
+    pub fn asBuiltinId(self: Value) u16 {
+        return @intCast(self.bits & 0xFFFF);
     }
 
-    /// Return the value's discriminant. Prefer this over reading
-    /// `.discriminant` directly so callers stay layout-agnostic — a
-    /// future NaN-boxed encoding (`-Dvalue8`) keeps the method but
-    /// removes the field.
-    pub fn kind(self: @This()) ValueType {
-        return self.discriminant;
-    }
-
-    /// Raw 64-bit payload bits. Used by identity equality/hash where
-    /// the payload semantics are tag-implied and a bitwise compare is
-    /// sufficient. Layout-agnostic accessor for the same reason as
-    /// `kind`.
-    pub fn rawPayload(self: @This()) u64 {
-        return self.payload;
-    }
-
-    pub fn isThunk(self: @This()) bool {
-        return self.discriminant == .thunk;
-    }
-
-    pub fn isNull(self: @This()) bool {
-        return self.discriminant == .null;
-    }
-
-    pub fn isBool(self: @This()) bool {
-        return self.discriminant == .bool_true or self.discriminant == .bool_false;
-    }
-
-    pub fn asBool(self: @This()) bool {
-        return self.discriminant == .bool_true;
-    }
-
-    pub fn isInt(self: @This()) bool {
-        return self.discriminant == .int;
-    }
-
-    pub fn isFloat(self: @This()) bool {
-        return self.discriminant == .float;
-    }
-
-    pub fn isString(self: @This()) bool {
-        return self.discriminant == .string;
-    }
-
-    pub fn isPath(self: @This()) bool {
-        return self.discriminant == .path;
-    }
-
-    pub fn isList(self: @This()) bool {
-        return self.discriminant == .list;
-    }
-
-    pub fn isAttrs(self: @This()) bool {
-        return self.discriminant == .attrs;
-    }
-
-    pub fn isClosure(self: @This()) bool {
-        return self.discriminant == .closure;
-    }
-
-    pub fn isBuiltin(self: @This()) bool {
-        return self.discriminant == .builtin;
-    }
-
-    pub fn isBuiltinClosure(self: @This()) bool {
-        return self.discriminant == .builtin_closure;
-    }
-
-    pub fn isContextString(self: @This()) bool {
-        return self.discriminant == .string_context;
-    }
-
-    pub fn isBoxedInt(self: @This()) bool {
-        return self.discriminant == .boxed_int;
-    }
-
-    // ---- identity equality ----
+    // ---- identity equality / hash ----
     //
-    // These compare by tag + payload bits. For scalar tags this matches
-    // semantic equality; for object tags (list, attrs, closure, thunk, …)
-    // it is *identity* equality on the heap ObjectId. Structural equality
-    // requires heap access; see `vm/equality.zig`.
+    // Scalars and object references compare by raw bits, since the tag
+    // is part of the bit pattern. Floats use IEEE equality (so NaN !=
+    // NaN even when both are the canonical NaN pattern) to match the
+    // semantics callers of `idEq` rely on.
 
-    /// Identity equality. `boxed_int` is compared by ObjectId only — two
-    /// boxed slots holding the same numeric value but distinct ids are
-    /// NOT idEq. Semantic numeric equality across inline/boxed
-    /// encodings is handled by `runtime/int.zig` + `vm/equality.zig`.
-    pub fn idEq(self: @This(), other: @This()) bool {
-        if (self.kind() != other.kind()) return false;
-        return switch (self.kind()) {
-            .null, .bool_false, .bool_true => true,
-            .int => self.asInt() == other.asInt(),
-            .float => self.asFloat() == other.asFloat(),
-            .string, .path => self.asInternId() == other.asInternId(),
-            .list, .attrs, .closure, .thunk, .builtin, .builtin_closure, .string_context, .boxed_int => self.rawPayload() == other.rawPayload(),
-        };
+    pub fn idEq(self: Value, other: Value) bool {
+        if (self.isFloat() and other.isFloat()) {
+            return self.asFloat() == other.asFloat();
+        }
+        return self.bits == other.bits;
     }
 
-    pub fn idHash(self: @This()) u64 {
-        return switch (self.kind()) {
-            .null => 0,
-            .bool_false => 1,
-            .bool_true => 2,
-            .int => @bitCast(self.asInt()),
-            .float => @bitCast(self.asFloat()),
-            .string, .path => @as(u64, self.asInternId()) *% 31,
-            .list, .attrs => self.rawPayload() *% 31,
-            .closure, .thunk, .builtin, .builtin_closure, .string_context, .boxed_int => self.rawPayload(),
-        };
+    pub fn idHash(self: Value) u64 {
+        return self.bits;
     }
 
-    pub fn format(
-        self: @This(),
-        writer: *std.Io.Writer,
-    ) !void {
+    pub fn format(self: Value, writer: *std.Io.Writer) !void {
         switch (self.kind()) {
             .null => try writer.writeAll("null"),
             .bool_false => try writer.writeAll("false"),
@@ -312,3 +374,77 @@ pub const Value16 = extern struct {
         }
     }
 };
+
+test "value: tagged int round-trip" {
+    const cases = [_]i64{ 0, 1, -1, 42, -42, I48_MIN, I48_MAX, 1 << 30, -(1 << 30) };
+    for (cases) |v| {
+        const x = Value.int(v);
+        try std.testing.expect(x.isInt());
+        try std.testing.expect(x.kind() == .int);
+        try std.testing.expectEqual(v, x.asInt());
+    }
+}
+
+test "value: float round-trip and NaN scrub" {
+    const finite = [_]f64{ 0.0, -0.0, 1.5, -3.14, std.math.inf(f64), -std.math.inf(f64) };
+    for (finite) |v| {
+        const x = Value.float(v);
+        try std.testing.expect(x.isFloat());
+        try std.testing.expect(x.kind() == .float);
+        try std.testing.expectEqual(@as(u64, @bitCast(v)), @as(u64, @bitCast(x.asFloat())));
+    }
+    // Any NaN, regardless of source bit pattern, scrubs to canonical NaN
+    // so the tagged-space check stays unambiguous.
+    const nan_input: f64 = std.math.nan(f64);
+    const x = Value.float(nan_input);
+    try std.testing.expect(x.isFloat());
+    try std.testing.expect(std.math.isNan(x.asFloat()));
+    try std.testing.expectEqual(CANONICAL_NAN, x.bits);
+}
+
+test "value: object id and intern id round-trip" {
+    const x = Value.list(@as(ObjectId, 12345));
+    try std.testing.expect(x.isList());
+    try std.testing.expect(x.kind() == .list);
+    try std.testing.expectEqual(@as(ObjectId, 12345), x.asObjectId());
+
+    const s = Value.string(@as(InternId, 67890));
+    try std.testing.expect(s.isString());
+    try std.testing.expect(s.kind() == .string);
+    try std.testing.expectEqual(@as(InternId, 67890), s.asInternId());
+}
+
+test "value: misc-tag variants" {
+    try std.testing.expect(Value.null_val.isNull());
+    try std.testing.expect(Value.null_val.kind() == .null);
+
+    try std.testing.expect(Value.boolVal(true).isBool());
+    try std.testing.expect(Value.boolVal(true).asBool());
+    try std.testing.expect(Value.boolVal(true).kind() == .bool_true);
+
+    try std.testing.expect(Value.boolVal(false).isBool());
+    try std.testing.expect(!Value.boolVal(false).asBool());
+    try std.testing.expect(Value.boolVal(false).kind() == .bool_false);
+
+    const bi = Value.builtin(@as(u16, 257));
+    try std.testing.expect(bi.isBuiltin());
+    try std.testing.expectEqual(@as(u16, 257), bi.asBuiltinId());
+
+    const bc = Value.builtinClosure(@as(ObjectId, 99));
+    try std.testing.expect(bc.isBuiltinClosure());
+    try std.testing.expectEqual(@as(ObjectId, 99), bc.asObjectId());
+
+    const cs = Value.contextString(@as(ObjectId, 7));
+    try std.testing.expect(cs.isContextString());
+    try std.testing.expectEqual(@as(ObjectId, 7), cs.asObjectId());
+}
+
+test "value: idEq compares scalars and objects by bits, floats by IEEE" {
+    try std.testing.expect(Value.int(5).idEq(Value.int(5)));
+    try std.testing.expect(!Value.int(5).idEq(Value.int(6)));
+    try std.testing.expect(Value.list(@as(ObjectId, 1)).idEq(Value.list(@as(ObjectId, 1))));
+    try std.testing.expect(!Value.list(@as(ObjectId, 1)).idEq(Value.list(@as(ObjectId, 2))));
+    try std.testing.expect(Value.null_val.idEq(Value.null_val));
+    const nan = Value.float(std.math.nan(f64));
+    try std.testing.expect(!nan.idEq(nan));
+}

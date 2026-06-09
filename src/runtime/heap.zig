@@ -92,11 +92,8 @@ pub const Object = union(enum) {
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
     context_string: ContextStringObject,
-    /// Heap-boxed full-range i64. Only used when an integer exceeds the
-    /// inline payload range of the active Value layout. Under Value16
-    /// (default) inline ints are full i64 and this variant is never
-    /// created; under Value8 (NaN-boxed) inline ints are i48 and the
-    /// rare i64-overflow case is allocated here. See `runtime/int.zig`.
+    /// Heap-boxed full-range i64 for values that don't fit Value's
+    /// 48-bit inline int payload. See `runtime/int.zig`.
     boxed_int: i64,
 };
 

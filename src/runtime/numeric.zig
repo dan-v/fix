@@ -1,8 +1,8 @@
 //! Numeric operations shared by bytecode opcodes and builtins.
 //!
 //! All int-returning ops take the heap so they can transparently box
-//! results that overflow the inline int range (only meaningful under
-//! Value8; Value16 always inlines).
+//! results that overflow the 48-bit inline int range via
+//! `runtime/int.zig`'s `make` helper.
 
 const std = @import("std");
 const Value = @import("value.zig").Value;
@@ -178,7 +178,8 @@ test "div rejects i64.min / -1 overflow rather than invoking @divTrunc UB" {
     // unbox path used by the safety check.
     const boxed_min = Value.boxedInt(try heap.addBoxedInt(std.math.minInt(i64)));
     try std.testing.expectError(error.IntegerOverflow, div(&heap, boxed_min, Value.int(-1)));
-    // Sanity: i64.min / 1 still works (inline result on Value16, boxed on Value8).
+    // Sanity: i64.min / 1 still works (boxed result since i64.min doesn't
+    // fit i48).
     _ = try div(&heap, boxed_min, Value.int(1));
 }
 
