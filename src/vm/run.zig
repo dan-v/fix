@@ -202,7 +202,12 @@ fn opSetCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     const cell_val = vm.stack[frame.frame_base + slot];
     if (!cell_val.isThunk()) return error.TypeError;
     const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-    thunk.target = .{ .pass_through = val };
+    // Cell was born `.evaluating` claimed by us (see initBindingCell):
+    // publishCellBinding installs pass_through(val), drops the claim,
+    // and transitions back to `.unresolved` so future forces run the
+    // pass_through path lazily. Any helper that parked while we held
+    // the claim wakes here.
+    thunk.publishCellBinding(val);
     return dispatch(vm, frame, code, ip + 1, stop_depth);
 }
 
@@ -213,7 +218,7 @@ fn opSetCellLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     const cell_val = vm.stack[frame.frame_base + slot];
     if (!cell_val.isThunk()) return error.TypeError;
     const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-    thunk.target = .{ .pass_through = val };
+    thunk.publishCellBinding(val);
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
@@ -595,7 +600,7 @@ fn opMakeCell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
 fn opInitCellSlot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const slot = code[ip];
-    const cell = try force.makeCell(vm, Value.null_val);
+    const cell = try force.makeBindingCell(vm);
     vm.stack[frame.frame_base + slot] = cell;
     return dispatch(vm, frame, code, ip + 1, stop_depth);
 }
@@ -603,7 +608,7 @@ fn opInitCellSlot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
 fn opInitCellSlotLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const slot = readU16(code, ip);
-    const cell = try force.makeCell(vm, Value.null_val);
+    const cell = try force.makeBindingCell(vm);
     vm.stack[frame.frame_base + slot] = cell;
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }

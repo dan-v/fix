@@ -174,9 +174,9 @@ pub const Thunk = struct {
         };
     }
 
-    /// A "cell" thunk: holds a Value to be forced lazily. The cell pattern
-    /// (used by the compiler for recursive let bindings) is just a thunk
-    /// whose target is a wrapped Value.
+    /// A "cell" thunk: holds a Value to be forced lazily. Used by
+    /// `builtins.deepSeq`-style memoisation and by `make_cell` where
+    /// the wrapped value is known at construction time.
     pub fn initPassThrough(value: Value) Thunk {
         return .{
             .state = .init(@intFromEnum(ThunkState.unresolved)),
@@ -185,6 +185,34 @@ pub const Thunk = struct {
             .waiters_head = null,
             .waiters_mu = .{},
             .target = .{ .pass_through = value },
+            .result = .{ .result = Value.null_val },
+        };
+    }
+
+    /// A "binding cell" thunk: created by `init_cell_slot` for
+    /// recursive let bindings, BEFORE the RHS is computed. The cell is
+    /// born in `.evaluating` claimed by the creating fiber so any
+    /// concurrent force attempt sees BUSY and parks on the waiter list
+    /// instead of CAS-claiming the placeholder. The creating fiber
+    /// later publishes the real binding via
+    /// `publishCellBinding(val)`, which writes
+    /// `target = pass_through(val)` and transitions back to
+    /// `.unresolved` (keeping pass_through laziness — the cell forces
+    /// `val` only when consumers actually force the cell). Without
+    /// the EVALUATING-on-init guard, a fiber could CAS-claim the cell
+    /// while it still wraps the placeholder null and resolve the cell
+    /// to null, freezing the binding before the creator could publish.
+    pub fn initBindingCell(claimer: ClaimerId) Thunk {
+        return .{
+            .state = .init(@intFromEnum(ThunkState.evaluating)),
+            .claimer = .init(claimer),
+            .demanded = .init(0),
+            .waiters_head = null,
+            .waiters_mu = .{},
+            // Placeholder; never observed since no fiber can CAS-claim
+            // an `.evaluating` cell, and `publishCellBinding` overwrites
+            // `target` before transitioning back to `.unresolved`.
+            .target = .{ .pass_through = Value.null_val },
             .result = .{ .result = Value.null_val },
         };
     }
@@ -261,6 +289,21 @@ pub const Thunk = struct {
         self.result = .{ .result = value };
         self.claimer.store(INVALID_CLAIMER, .release);
         self.state.store(@intFromEnum(ThunkState.resolved), .release);
+        self.wakeFiberWaiters();
+    }
+
+    /// Publish a binding cell's value (see `initBindingCell`). Writes
+    /// `target = pass_through(value)` and transitions
+    /// `.evaluating → .unresolved` so the next force runs the normal
+    /// pass_through path (lazy: `value` is forced when consumers force
+    /// the cell, not now). Wakes any waiters parked on the
+    /// `.evaluating` state. Ordering: the plain write to `target` is
+    /// published by the release-store of `state`, which pairs with
+    /// `tryForce`'s acquire-load.
+    pub fn publishCellBinding(self: *Thunk, value: Value) void {
+        self.target = .{ .pass_through = value };
+        self.claimer.store(INVALID_CLAIMER, .release);
+        self.state.store(@intFromEnum(ThunkState.unresolved), .release);
         self.wakeFiberWaiters();
     }
 

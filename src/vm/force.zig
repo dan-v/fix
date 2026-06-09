@@ -344,6 +344,18 @@ pub fn makeCell(self: *VM, val: Value) !Value {
     return Value.thunk(id);
 }
 
+/// Allocate a recursive-let binding cell. The cell is born claimed by
+/// the calling fiber so concurrent forces see BUSY and park instead
+/// of CAS-claiming the placeholder. The corresponding `set_cell_local`
+/// op publishes the real binding via `thunk.publishCellBinding`, which
+/// installs `pass_through(val)`, transitions back to `.unresolved`,
+/// and wakes parked waiters.
+pub fn makeBindingCell(self: *VM) !Value {
+    const id = try self.heap.addThunk(Thunk.initBindingCell(self.claimer_id));
+    recordCreatePassThrough(self, id);
+    return Value.thunk(id);
+}
+
 const CreatorFrame = struct { chunk_id: @import("../runtime/types.zig").ChunkId, ip: u32 };
 
 fn creatorFrame(self: *VM) CreatorFrame {
