@@ -1,12 +1,24 @@
 //! Atomic lazy thunk — the core of multithreaded lazy evaluation.
 //!
-//! A thunk is a suspended computation. Multiple fibers (possibly on
-//! different OS threads) may concurrently attempt to force it. The
-//! first to CAS-claim it runs the suspended target; others enroll a
-//! `Waiter` on the linked list and yield their fiber until the
-//! claimer publishes a result (or resets / blackholes). A fiber that
-//! tries to force a thunk under the *same* claim id it already holds
-//! gets `.blackhole` — real recursion within one logical evaluation.
+//! A thunk is a suspended computation that doubles as a memoised
+//! future: the first fiber to CAS-claim it runs the suspended target;
+//! others enroll a `Waiter` and yield until the claimer publishes a
+//! result (or resets / blackholes). A fiber that tries to force a
+//! thunk under the *same* claimer id it already holds sees
+//! `.blackhole` — real recursion within one logical evaluation.
+//!
+//! Post-F1 architecture notes:
+//!   - Claimer identity (`ClaimerId`) is a globally-allocated fiber id
+//!     (`Scheduler.allocFiberId`). It does NOT encode which OS thread
+//!     the fiber runs on, so a fiber that migrates across workers
+//!     keeps the same identity.
+//!   - Wakes are routed to the scheduler's ready queue keyed by the
+//!     fiber's allocator-worker (`Fiber.worker`), but ready fibers
+//!     are stealable across workers — any worker may resume a waiter
+//!     once it's queued.
+//!   - All workers (including worker 0 / main) participate
+//!     symmetrically in `tryForce`, waiter enrollment, and resolution.
+//!     There is no special "main" path through this module.
 //!
 //! Memory model:
 //!   - `state` transitions follow release-acquire pairs.

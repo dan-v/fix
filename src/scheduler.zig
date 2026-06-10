@@ -1,17 +1,29 @@
 //! Work-stealing scheduler for parallel evaluation.
 //!
-//! Helper threads run alongside the calling ("main") thread:
-//!   - worker_id 0 → main thread; never spawned, never holds a queue.
-//!   - worker_id 1..N-1 → helper threads with their own task queue and VM.
+//! Workers are symmetric (F1). Every `worker_id ∈ 0..worker_count-1`
+//! owns:
+//!   - A task queue (`queues[id]`), receiving speculative and urgent
+//!     submissions from any worker.
+//!   - A ready-fiber queue (`ready_queues[id]`), receiving fibers
+//!     woken by thunk resolves (`wakeFiberWaiters`). Both task and
+//!     ready queues are stealable across workers.
+//!   - A wake word (`wake_words[id]`) for futex-based parking.
 //!
-//! Each helper loops on:
-//!   1. Pop from own queue (LIFO; best cache locality).
-//!   2. Steal from a random victim helper (FIFO at the victim).
-//!   3. Park on a per-helper futex until a submitter wakes us up.
+//! Worker 0 runs on the calling OS thread (it's the one returning the
+//! result to the user); worker_ids 1..N-1 are helper threads spawned
+//! in `start()`. There is no behavioral asymmetry beyond who created
+//! the thread — submissions, steals, wakes, and ready-fiber routing
+//! all treat workers uniformly.
 //!
-//! Tasks are produced by any worker (main or helper) and routed round-robin
-//! to a victim helper. Submissions may fail (full queue) — callers treat
-//! speculative submissions as best-effort.
+//! Each worker's drain loop:
+//!   1. Pop own ready fiber, or steal one from another worker.
+//!   2. Pop own task, or steal one from another worker (FIFO at the
+//!      victim).
+//!   3. Park on its wake_word until a submitter / waker nudges.
+//!
+//! Submissions may fail (full queue). Speculative submissions are
+//! best-effort and additionally gated by a backlog cap. Urgent
+//! (demand-driven) submissions skip the cap.
 
 const std = @import("std");
 const builtin = @import("builtin");

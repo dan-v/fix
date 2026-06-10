@@ -1,11 +1,18 @@
 //! Worker with a per-task fiber pool.
 //!
-//! Each helper thread (and the main thread, while it's running an
-//! evaluation) owns a Worker. The Worker owns:
-//!   - A free list of `.finished` fibers ready to be reset for a new task.
-//!   - A ready list of `.suspended` fibers whose blocking thunks have
-//!     resolved (their `wake_fn` pushed them here).
-//!   - The set of all fibers it has ever allocated, for cleanup.
+//! Each helper thread (and the main thread, persistently for the
+//! evaluator's lifetime) owns a Worker. The Worker owns:
+//!   - A mutex-protected free list of `.finished` fibers ready to be
+//!     reset for a new task. Foreign workers push onto this when a
+//!     stolen fiber finishes — see F1.4.
+//!   - The set of all fibers it has ever allocated, for teardown.
+//!
+//! The *ready* queue lives on the scheduler, not the worker — see
+//! `scheduler.zig`'s `ready_queues`. Producers (any thread waking a
+//! waiter) push there; the owning worker's drain loop pops there
+//! preferentially, and other workers steal from it when their own is
+//! empty. This is what unpins fiber execution from the allocator
+//! worker.
 //!
 //! There is *no* fixed pool size. A fresh fiber is allocated on demand
 //! when a task arrives and no free fiber is available. Recycled fibers
@@ -18,10 +25,10 @@
 //! pointers (heap, registry, intern, scheduler) live on the VM but
 //! point at evaluator-owned tables.
 //!
-//! Fibers are pinned to their worker — only the worker calls `resume_`.
-//! The wake_fn pushes a remote-resolver's wake into the ready list
-//! atomically (via a SpinMutex) and nudges the worker's wake_word so
-//! it parks for at most one futex round-trip.
+//! Fiber execution is *not* pinned to the allocator worker post-F1.4.
+//! Any worker may pop a ready fiber and resume it on its own thread;
+//! the per-fiber `in_runfiber` atomic protects against tearing down
+//! a stolen-and-currently-running fiber.
 
 const std = @import("std");
 const builtin = @import("builtin");
