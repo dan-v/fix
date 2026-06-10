@@ -34,16 +34,14 @@ pub const Chunk = struct {
     constants: []Value,
     /// Number of stack slots reserved for locals in each frame.
     local_count: u16,
-    /// Pre-computed at registration time: this chunk's body is large
-    /// enough that a helper finishing it ahead of main saves more than
-    /// the scheduler submit overhead costs. Cached here so the
-    /// thunk-creation hot path (`makeBytecodeThunkFromCaptures`) doesn't
-    /// need to re-fetch the chunk via the registry just to read
-    /// `code.len`.
-    speculatable: bool = false,
-    /// Compile-time strictness signature: which upvalues this chunk
-    /// unconditionally forces when entered. See `compiler/strictness.zig`.
-    strictness: ChunkStrictness = .{},
+    /// Compile-time scheduling hints — `body_is_substantial`
+    /// (chunk-size driven, pays the scheduler hop) and `strictness`
+    /// (which upvalues the body unconditionally forces). Both are
+    /// stamped at `ChunkBuilder.finish()` time and consumed by the VM
+    /// to decide whether to submit a thunk for parallel forcing at
+    /// creation. See `compiler/strictness.zig` for the strictness
+    /// analysis.
+    scheduling: SchedulingHints = .{},
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
     /// Source span ranges for cold-path error traces.
@@ -64,10 +62,7 @@ pub const Chunk = struct {
 ///   `deep_upvalues`   — additionally forced when the result is deep-
 ///       forced by the caller. Covers structure-building chunks
 ///       (attr-sets, lists) whose body itself forces nothing but whose
-///       contained values get forced if the result is walked. These
-///       are precisely the chunks today's `speculatable` heuristic
-///       catches (large attr-set/list constructors with empty shallow
-///       strictness).
+///       contained values get forced if the result is walked.
 pub const ChunkStrictness = struct {
     /// Upvalue slot N (0..63) is unconditionally forced when the chunk
     /// runs. Slots ≥ 64 are dropped silently — coverage degrades for
@@ -76,6 +71,19 @@ pub const ChunkStrictness = struct {
     /// Upvalue slot N is additionally forced when the result is
     /// recursively deep-forced. Superset of `forced_upvalues`.
     deep_upvalues: u64 = 0,
+};
+
+/// All compile-time hints the scheduler uses when deciding whether to
+/// submit a thunk for parallel forcing. Stamped at chunk-builder
+/// finish, never mutated at runtime.
+pub const SchedulingHints = struct {
+    /// True when the chunk's bytecode body is large enough that a
+    /// helper finishing it ahead of demand saves more than the
+    /// scheduler submit/wake overhead costs. Cached here so the
+    /// thunk-creation hot path doesn't have to re-read `code.len`.
+    body_is_substantial: bool = false,
+    /// See ChunkStrictness.
+    strictness: ChunkStrictness = .{},
 };
 
 /// A mutable builder for constructing chunks.
@@ -92,7 +100,7 @@ pub const ChunkBuilder = struct {
     last_op_offset: ?usize = null,
     /// Strictness signature computed by `compiler/strictness.zig`
     /// after the body is compiled. Carried through `finish` onto the
-    /// resulting Chunk.
+    /// resulting Chunk via `SchedulingHints`.
     strictness: ChunkStrictness = .{},
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
@@ -179,12 +187,20 @@ pub const ChunkBuilder = struct {
             .code = code,
             .constants = constants,
             .local_count = local_count,
-            .strictness = self.strictness,
+            .scheduling = .{
+                .body_is_substantial = self.code.items.len >= SPECULATION_MIN_CODE_BYTES,
+                .strictness = self.strictness,
+            },
             .function_args = function_args,
             .source_map = source_map,
         };
     }
 };
+
+/// Code length at or above which a chunk is considered substantial
+/// enough that submitting its body to a helper at thunk-creation time
+/// pays the scheduler hop. Used by `SchedulingHints.body_is_substantial`.
+pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
 
 /// Well-known chunk ids registered eagerly at `ChunkRegistry.init`. These
 /// are tiny stub chunks that builtins use to materialise lazy values
@@ -257,12 +273,6 @@ pub const ChunkRegistry = struct {
         self.chunks.deinit(self.allocator);
     }
 
-    /// Code length at or above which `makeBytecodeThunkFromCaptures`
-    /// submits a speculative force task to the helper pool. Below this
-    /// threshold, the main thread can force the body faster than it
-    /// takes to push + pop a scheduler task.
-    pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
-
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
         const stored = try self.allocator.create(Chunk);
         errdefer {
@@ -270,7 +280,6 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
-        stored.speculatable = chunk.code.len >= SPECULATION_MIN_CODE_BYTES;
         return try self.chunks.append(self.allocator, stored);
     }
 
@@ -339,10 +348,11 @@ pub const ChunkRegistry = struct {
                 else if (len < 4096) 4
                 else 5;
             result.size_buckets[bucket] += 1;
-            const has_strict = (ch.strictness.forced_upvalues | ch.strictness.deep_upvalues) != 0;
+            const strict = ch.scheduling.strictness;
+            const has_strict = (strict.forced_upvalues | strict.deep_upvalues) != 0;
             if (has_strict) result.with_strictness += 1;
-            if (ch.speculatable) result.speculatable += 1;
-            if (ch.speculatable and has_strict) result.speculatable_with_strictness += 1;
+            if (ch.scheduling.body_is_substantial) result.speculatable += 1;
+            if (ch.scheduling.body_is_substantial and has_strict) result.speculatable_with_strictness += 1;
         }
         return result;
     }

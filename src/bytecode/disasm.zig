@@ -117,9 +117,9 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         try writer.print(", {d} source spans", .{chunk.source_map.len});
     }
     try writer.writeAll(")\n");
-    if (chunk.strictness.forced_upvalues != 0) {
+    if (chunk.scheduling.strictness.forced_upvalues != 0) {
         try writer.writeAll("  strict upvalues:");
-        var mask = chunk.strictness.forced_upvalues;
+        var mask = chunk.scheduling.strictness.forced_upvalues;
         while (mask != 0) {
             const slot = @ctz(mask);
             try writer.print(" {d}", .{slot});
@@ -127,7 +127,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         }
         try writer.writeByte('\n');
     }
-    const deep_extra = chunk.strictness.deep_upvalues & ~chunk.strictness.forced_upvalues;
+    const deep_extra = chunk.scheduling.strictness.deep_upvalues & ~chunk.scheduling.strictness.forced_upvalues;
     if (deep_extra != 0) {
         try writer.writeAll("  deep upvalues:");
         var mask = deep_extra;

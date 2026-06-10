@@ -286,7 +286,7 @@ fn isSpeculatableClosureChunk(self: *VM, closure: Value) bool {
     // (see Chunk.speculatable).
     const c = self.heap.getClosure(closure.asObjectId()) catch return false;
     const ch = self.registry.get(c.chunk_id) orelse return false;
-    return ch.speculatable;
+    return ch.scheduling.body_is_substantial;
 }
 
 fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {

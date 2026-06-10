@@ -98,7 +98,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // commitBytecodeThunk owns `pending` past this point; the
     // errdefer above only fires on early return.
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (ch.speculatable) {
+    if (ch.scheduling.body_is_substantial) {
         _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));

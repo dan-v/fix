@@ -361,7 +361,7 @@ fn isSpeculatableUserFunc(self: anytype, func: Value) bool {
     if (!func.isClosure()) return false;
     const closure = self.heap.getClosure(func.asObjectId()) catch return false;
     const ch = self.registry.get(closure.chunk_id) orelse return false;
-    return ch.speculatable;
+    return ch.scheduling.body_is_substantial;
 }
 
 pub fn builtinSort(self: anytype, cmp_arg: Value, list_arg: Value) !Value {
