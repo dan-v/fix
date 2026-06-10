@@ -12,10 +12,13 @@
 //! Caller-saved registers are clobbered on swap — Zig's calling convention
 //! lets the compiler handle that around the swap call site.
 //!
-//! Fibers are pinned to whichever thread first resumed them: a fiber's
-//! Context captures a stack pointer into thread-local memory (the stack
-//! buffer's own page is fine to share, but the Zig-side `caller_ctx` is
-//! valid only while the original resumer's stack frame is live).
+//! Fibers can be resumed from any OS thread. `caller_ctx` points into
+//! the resumer's stack frame for the duration of one `resume_` call
+//! and is cleared on return — so a later `resume_` from a different
+//! thread establishes a fresh `caller_ctx` on the new resumer's frame.
+//! Thread-affinity is a property of the *wake/dispatch* layer above
+//! fibers (a wake puts the fiber on a specific worker's ready stack);
+//! the fiber primitive itself doesn't impose it.
 //!
 //! Lifecycle:
 //!   .ready    — initialized, never resumed. `entry` will run on first resume.
@@ -90,8 +93,9 @@ pub const Fiber = struct {
     entry: ?EntryFn,
     entry_arg: ?*anyopaque,
     /// Where to switch back to on yield/finish. Valid only while
-    /// `state == .running`. Pointer into the resumer's stack — must
-    /// not outlive the `resume_` call.
+    /// `state == .running`. Pointer into the resumer's stack — set
+    /// fresh on each `resume_`, cleared on return, so a subsequent
+    /// resume from a different thread is safe.
     caller_ctx: ?*Context,
 
     /// Per-fiber stack reservation. Provisioned as a virtual mapping
@@ -368,6 +372,56 @@ test "two fibers multiplex on one thread" {
     try testing.expectEqualSlices(u8, "BBB", ctx_b.log.items);
     try testing.expectEqual(State.finished, fa.state);
     try testing.expectEqual(State.finished, fb.state);
+}
+
+test "fiber resumed by different threads in sequence (migration)" {
+    // Validates that the existing caller_ctx mechanism is safe under
+    // cross-thread resume: thread A drives the fiber to a yield, then
+    // thread B drives it through another yield, then thread A finishes
+    // it. Each `resume_` call allocates a fresh local `here` Context;
+    // `caller_ctx` is set freshly per call and cleared after, so no
+    // stale resumer-stack pointer survives between resumes.
+    const Ctx = struct {
+        steps: std.atomic.Value(u32) = .init(0),
+        thread_ids: [3]std.Thread.Id = undefined,
+        fn entry(arg: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(arg));
+            ctx.thread_ids[0] = std.Thread.getCurrentId();
+            _ = ctx.steps.fetchAdd(1, .release);
+            Fiber.yield();
+            ctx.thread_ids[1] = std.Thread.getCurrentId();
+            _ = ctx.steps.fetchAdd(1, .release);
+            Fiber.yield();
+            ctx.thread_ids[2] = std.Thread.getCurrentId();
+            _ = ctx.steps.fetchAdd(1, .release);
+        }
+    };
+    var ctx: Ctx = .{};
+    var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx);
+    defer fiber.deinit(testing.allocator);
+
+    fiber.resume_();
+    try testing.expectEqual(@as(u32, 1), ctx.steps.load(.acquire));
+    try testing.expectEqual(State.suspended, fiber.state);
+
+    // Drive the second resume from a different OS thread.
+    const T = struct {
+        fn run(f: *Fiber) void {
+            f.resume_();
+        }
+    };
+    var t = try std.Thread.spawn(.{}, T.run, .{&fiber});
+    t.join();
+    try testing.expectEqual(@as(u32, 2), ctx.steps.load(.acquire));
+    try testing.expectEqual(State.suspended, fiber.state);
+
+    // Back to the original thread to finish.
+    fiber.resume_();
+    try testing.expectEqual(@as(u32, 3), ctx.steps.load(.acquire));
+    try testing.expectEqual(State.finished, fiber.state);
+
+    // The fiber observed three distinct thread contexts driving it.
+    try testing.expect(ctx.thread_ids[0] != ctx.thread_ids[1]);
 }
 
 test "nested fiber call" {
