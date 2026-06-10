@@ -515,7 +515,7 @@ test "Worker basic init/deinit" {
         arena: std.heap.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
-        fn initVm(ctx: *anyopaque, worker_id: u8, _: u32) anyerror!VM {
+        fn initVm(ctx: *anyopaque, _: u8, _: u32) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return VM.init(
                 self.arena.allocator(),
@@ -532,7 +532,6 @@ test "Worker basic init/deinit" {
                 if (comptime vm_mod.thunks_log_enabled) null else {},
                 null,
                 Value.null_val,
-                worker_id,
                 if (comptime vm_mod.opcode_profile_enabled) &self.opcode_counts else {},
             );
         }

@@ -271,7 +271,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         // the queues are full; main just forces those itself inline.
         for (original_attrs) |entry| {
             if (!entry.value.isThunk()) continue;
-            if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.worker_id)) break;
+            if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId())) break;
         }
         for (original_attrs) |entry| {
             const attr_name_text = self.intern.get(entry.name);

@@ -93,7 +93,7 @@ inline fn dispatch(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     const op: OpCode = @enumFromInt(code[ip]);
     if (comptime opcode_profile_enabled) vm.opcode_counts[@intFromEnum(op)] += 1;
     if (comptime trace_log.enabled) {
-        trace_log.op(vm.vm_trace, vm.worker_id, vm.frames_len, frame.chunk_id, @intCast(ip), op, vm.sp);
+        trace_log.op(vm.vm_trace, vm.workerId(), vm.frames_len, frame.chunk_id, @intCast(ip), op, vm.sp);
     }
     return @call(.always_tail, handlers[@intFromEnum(op)], .{ vm, frame, code, ip + 1, stop_depth });
 }
@@ -900,10 +900,10 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
     const finished_frame = stack.popFrame(vm);
     if (comptime trace_log.enabled) {
         if (vm.frames_len == 0) {
-            trace_log.framePop(vm.vm_trace, vm.worker_id, vm.frames_len, types.CHUNK_ID_NONE, 0);
+            trace_log.framePop(vm.vm_trace, vm.workerId(), vm.frames_len, types.CHUNK_ID_NONE, 0);
         } else {
             const ret_frame = stack.currentFrame(vm);
-            trace_log.framePop(vm.vm_trace, vm.worker_id, vm.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
+            trace_log.framePop(vm.vm_trace, vm.workerId(), vm.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));
         }
     }
     vm.sp = finished_frame.frame_base;

@@ -137,7 +137,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
             .list_id = list_id,
             .offset = offset,
             .len = this_len,
-        } }, self.worker_id)) break;
+        } }, self.workerId())) break;
         offset += this_len;
     }
 }
@@ -155,7 +155,7 @@ pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.z
     // lists; one-task-per-thunk is fine for now.
     for (entries) |entry| {
         if (!entry.value.isThunk()) continue;
-        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.worker_id)) break;
+        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId())) break;
     }
 }
 
@@ -187,17 +187,17 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
-                trace_log.forceEnter(self.vm_trace, self.worker_id, thunk_id);
+                trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, thunk.target) catch |err| {
                     publishThunkFailure(self, thunk, thunk_id, err);
-                    trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, false);
+                    trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
                 };
                 thunk.resolve(result);
                 recordResolve(self, thunk_id, result);
-                trace_log.forceExit(self.vm_trace, self.worker_id, thunk_id, true);
+                trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
                 if (demand) thunk.markDemanded();
                 return result;
             },
@@ -256,7 +256,7 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
     if (shouldSpeculateClosure(self, closure)) {
-        _ = self.scheduler.submit(.{ .force_thunk = id }, self.worker_id);
+        _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
     }
     return Value.thunk(id);
 }
@@ -380,17 +380,17 @@ fn claimerFiberId(self: *VM) u32 {
 
 inline fn recordResolve(self: *VM, thunk_id: ObjectId, result: Value) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
-    if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.worker_id, claimerFiberId(self), result);
+    if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.workerId(), claimerFiberId(self), result);
 }
 
 inline fn recordReset(self: *VM, thunk_id: ObjectId, err: anyerror) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
-    if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err));
+    if (self.thunk_trace) |tt| tt.recordReset(thunk_id, self.workerId(), claimerFiberId(self), @errorName(err));
 }
 
 inline fn recordErrored(self: *VM, thunk_id: ObjectId, err: anyerror, message: ?[]const u8) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
-    if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.worker_id, claimerFiberId(self), @errorName(err), message);
+    if (self.thunk_trace) |tt| tt.recordErrored(thunk_id, self.workerId(), claimerFiberId(self), @errorName(err), message);
 }
 
 inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
@@ -406,7 +406,7 @@ inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
             break :blk c.chunk_id;
         } else null;
         const creator = creatorFrame(self);
-        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
+        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
     }
 }
 
@@ -414,7 +414,7 @@ inline fn recordCreatePassThrough(self: *VM, id: ObjectId) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
         const creator = creatorFrame(self);
-        tt.recordCreate(id, self.worker_id, claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
+        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
     }
 }
 

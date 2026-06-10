@@ -382,7 +382,6 @@ pub const Evaluator = struct {
             self.thunk_trace,
             .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
             try self.ensureBuiltins(),
-            worker_id,
             if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
         );
         // Inherit the surrounding fiber's claim identity if we're inside

@@ -99,7 +99,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // errdefer above only fires on early return.
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (ch.speculatable) {
-        _ = self.scheduler.submit(.{ .force_thunk = id }, self.worker_id);
+        _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
 }
@@ -108,7 +108,7 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
         const fiber_id = self.claimer_id & 0x00FFFFFF;
-        tt.recordCreate(id, self.worker_id, fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
+        tt.recordCreate(id, self.workerId(), fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
     }
 }
 
@@ -183,7 +183,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
-    @import("trace_log.zig").framePush(self.vm_trace, self.worker_id, self.frames_len, chunk_id, frame_base);
+    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {

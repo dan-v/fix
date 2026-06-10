@@ -108,11 +108,9 @@ pub const VM = struct {
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
-    /// This VM's worker index.
-    worker_id: u8,
-    /// Identity used when claiming thunks (high byte = worker_id,
-    /// low 24 bits = fiber id within that worker's pool). Worker
-    /// patches this when binding the VM to a fiber.
+    /// Globally-unique fiber id this VM is bound to. Used as the
+    /// `ClaimerId` for thunk forces. Worker patches this when binding
+    /// the VM to a fiber.
     claimer_id: thunk_mod.ClaimerId,
 
     /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
@@ -157,7 +155,6 @@ pub const VM = struct {
         thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
         import_host: ?ImportHost,
         builtins_value: Value,
-        worker_id: u8,
         opcode_profile_sink: OpcodeProfileSink,
     ) !VM {
         const value_stack = try allocator.alloc(Value, types.VM_STACK_CAP);
@@ -181,7 +178,6 @@ pub const VM = struct {
             .thunk_trace = thunk_trace,
             .import_host = import_host,
             .builtins = builtins_value,
-            .worker_id = worker_id,
             // Placeholder; overwritten by Worker.allocateFiber with the
             // fiber's globally-allocated id before the VM runs anything.
             .claimer_id = thunk_mod.INVALID_CLAIMER,
@@ -194,6 +190,15 @@ pub const VM = struct {
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
         };
+    }
+
+    /// The OS-thread-current worker id. Reads the threadlocal set by
+    /// `Worker.run` / `Worker.runTopLevel`. Use this anywhere code
+    /// needs to know "who is executing right now" — not a stored field
+    /// because fibers migrate across workers (F1.4).
+    pub inline fn workerId(self: *const VM) u8 {
+        _ = self;
+        return @import("runtime/worker_id.zig").current;
     }
 
     pub fn deinit(self: *VM) void {

@@ -35,7 +35,7 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
         .upvalues = upvalues,
     };
     self.frames_len += 1;
-    trace_log.framePush(self.vm_trace, self.worker_id, self.frames_len, chunk_id, frame_base);
+    trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 pub fn popFrame(self: *VM) Frame {
