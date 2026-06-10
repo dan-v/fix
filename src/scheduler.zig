@@ -38,6 +38,51 @@ pub const ForceListRange = struct {
     len: u8,
 };
 
+/// Embeddable linked-list node for the per-worker ready queue.
+/// Each Fiber struct (in worker.zig) inlines one of these; the
+/// scheduler holds queues of `*ReadyNode` and the worker recovers
+/// the parent Fiber via `@fieldParentPtr`.
+pub const ReadyNode = struct {
+    next: ?*ReadyNode = null,
+};
+
+/// Mutex-protected FIFO of fibers ready to resume. Sits on the
+/// scheduler so any worker can push (when waking a fiber) or steal
+/// (when its own queue is empty). Treiber stacks would suffice if
+/// only the owner consumed, but stealing needs MPMC pop and Treiber's
+/// CAS pop has ABA hazards under concurrent consumers.
+const ReadyQueue = struct {
+    mu: stable.SpinMutex,
+    head: ?*ReadyNode,
+    tail: ?*ReadyNode,
+
+    fn init() ReadyQueue {
+        return .{ .mu = .{}, .head = null, .tail = null };
+    }
+
+    fn push(self: *ReadyQueue, node: *ReadyNode) void {
+        node.next = null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.tail) |t| {
+            t.next = node;
+        } else {
+            self.head = node;
+        }
+        self.tail = node;
+    }
+
+    fn pop(self: *ReadyQueue) ?*ReadyNode {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const n = self.head orelse return null;
+        self.head = n.next;
+        if (self.head == null) self.tail = null;
+        n.next = null;
+        return n;
+    }
+};
+
 /// Bounded ring-buffer task queue protected by a `SpinMutex`.
 ///
 /// Pushes can come from any thread (the main submitter or a helper round-
@@ -134,6 +179,11 @@ pub const Scheduler = struct {
     /// `worker_count - 1` helper threads in `start()`.
     worker_count: u8,
     queues: []TaskQueue,
+    /// Per-worker ready-fiber queues. Producers are any thread waking a
+    /// fiber (via thunk resolve → `Fiber.wakeImpl`); consumers are the
+    /// owning worker (most often) or any worker stealing when its own
+    /// queue is empty. Indexed by worker_id.
+    ready_queues: []ReadyQueue,
     threads: []std.Thread,
     wake_words: []std.atomic.Value(u32),
     shutdown_flag: std.atomic.Value(bool),
@@ -188,6 +238,10 @@ pub const Scheduler = struct {
             initialized += 1;
         }
 
+        const ready_queues = try allocator.alloc(ReadyQueue, safe_worker_count);
+        errdefer allocator.free(ready_queues);
+        for (ready_queues) |*r| r.* = ReadyQueue.init();
+
         const helper_thread_count: u8 = if (safe_worker_count > 1) safe_worker_count - 1 else 0;
         const threads = try allocator.alloc(std.Thread, helper_thread_count);
         errdefer allocator.free(threads);
@@ -200,6 +254,7 @@ pub const Scheduler = struct {
             .allocator = allocator,
             .worker_count = safe_worker_count,
             .queues = queues,
+            .ready_queues = ready_queues,
             .threads = threads,
             .wake_words = wake_words,
             .shutdown_flag = .init(false),
@@ -275,7 +330,35 @@ pub const Scheduler = struct {
         self.allocator.free(self.wake_words);
         for (self.queues) |*q| q.deinit(self.allocator);
         self.allocator.free(self.queues);
+        self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
+    }
+
+    /// Push a woken fiber's ReadyNode onto the target worker's
+    /// ready queue and nudge it.
+    pub fn enqueueReady(self: *Scheduler, target_worker_id: u8, node: *ReadyNode) void {
+        self.ready_queues[target_worker_id].push(node);
+        self.wakeWorker(target_worker_id);
+    }
+
+    /// Pop from the given worker's own ready queue.
+    pub fn popReady(self: *Scheduler, worker_id: u8) ?*ReadyNode {
+        return self.ready_queues[worker_id].pop();
+    }
+
+    /// Try to steal a ready fiber from any other worker's queue. Used
+    /// when the caller's own ready + task queues are empty so a fiber
+    /// woken on a busy worker still gets resumed promptly.
+    pub fn stealReady(self: *Scheduler, my_worker_id: u8) ?*ReadyNode {
+        if (self.worker_count < 2) return null;
+        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        var i: u8 = 0;
+        while (i < self.worker_count) : (i += 1) {
+            const idx = (start_idx + i) % self.worker_count;
+            if (idx == my_worker_id) continue;
+            if (self.ready_queues[idx].pop()) |n| return n;
+        }
+        return null;
     }
 
     /// Spawn helper threads. Each runs `workerFn(worker_id, sched, ctx)`

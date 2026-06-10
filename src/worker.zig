@@ -29,8 +29,9 @@ const types = @import("runtime/types.zig");
 const Value = @import("runtime/value.zig").Value;
 const thunk_mod = @import("runtime/thunk.zig");
 const stable = @import("runtime/stable_segments.zig");
-const Scheduler = @import("scheduler.zig").Scheduler;
-const Task = @import("scheduler.zig").Task;
+const scheduler_mod = @import("scheduler.zig");
+const Scheduler = scheduler_mod.Scheduler;
+const Task = scheduler_mod.Task;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
@@ -63,22 +64,34 @@ pub const FiberState = enum(u8) {
 
 /// One in-flight evaluation. Owns a stack, a Context (via InnerFiber),
 /// and a VM. Lives until the Worker is torn down — once allocated, it
-/// is reused via `Fiber.reset` across tasks.
+/// is reused via `Fiber.reset` across tasks. Post-F1.4 the fiber's
+/// thread affinity is advisory: it wakes onto its allocator-worker's
+/// ready queue by preference but any worker can steal it.
 pub const Fiber = struct {
+    /// The worker that allocated this fiber. Used as a hint for which
+    /// ready queue to wake into; not a binding for execution (any
+    /// worker may resume this fiber once it's on a ready queue).
     worker: *Worker,
     fiber_id: u32,
     inner: InnerFiber,
     vm: VM,
     state: FiberState,
+    /// Set to 1 while some worker is inside `inner.resume_()` on this
+    /// fiber. The owning worker's `deinit` spin-waits on this to drop
+    /// to 0 before freeing — protects against a stolen fiber being
+    /// freed mid-run.
+    in_runfiber: std.atomic.Value(u8),
     /// Task currently assigned to this fiber. Read by the fiber's entry
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
-    /// Linked-list node for ready/free lists. Only one is "active" at a
-    /// time given the fiber state, so we share the link.
-    next_in_list: ?*Fiber,
+    /// Free-list link. Only the owning worker manipulates this.
+    next_free: ?*Fiber,
+    /// Ready-queue node (scheduler-owned linked list). Set by
+    /// `wakeImpl`; cleared by the ready-queue pop.
+    ready_node: scheduler_mod.ReadyNode,
     /// Thunk waiter — `wake_fn` recovers the parent via `@fieldParentPtr`
-    /// and enqueues the fiber onto its worker's ready list.
+    /// and enqueues the fiber onto its allocator-worker's ready queue.
     waiter: thunk_mod.Waiter,
     /// Scratch trace used during speculative `force_thunk` tasks. Lets
     /// the failing thunk's error message be captured (and copied onto the
@@ -89,7 +102,7 @@ pub const Fiber = struct {
 
     fn wakeImpl(w: *thunk_mod.Waiter) void {
         const self: *Fiber = @fieldParentPtr("waiter", w);
-        self.worker.enqueueReady(self);
+        self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
     }
 };
 
@@ -107,15 +120,11 @@ pub const Worker = struct {
     fibers: std.ArrayList(*Fiber),
 
     /// LIFO of fibers that have finished their task and are ready to be
-    /// reset for a new one. Only touched by the worker thread itself.
+    /// reset for a new one. Producers: any worker (a stolen fiber that
+    /// finishes routes its completion back to the owning worker's free
+    /// list). Consumer: this worker only.
     free_head: ?*Fiber,
-
-    /// Lock-free Treiber stack of fibers whose blocking thunk just
-    /// resolved. Multi-producer (remote wake_fns), single-consumer (the
-    /// owning worker). LIFO order — newer wakes process first, which is
-    /// fine since the wake order isn't semantically meaningful and the
-    /// stack has the simplest correctness story.
-    ready_head: std.atomic.Value(?*Fiber),
+    free_mu: stable.SpinMutex,
 
     shutdown_requested: std.atomic.Value(u8),
 
@@ -147,7 +156,7 @@ pub const Worker = struct {
             .init_vm_fn = init_vm_fn,
             .fibers = .empty,
             .free_head = null,
-            .ready_head = .init(null),
+            .free_mu = .{},
             .shutdown_requested = .init(0),
             .idle_ns = 0,
             .busy_ns = 0,
@@ -174,6 +183,19 @@ pub const Worker = struct {
     }
 
     pub fn deinit(self: *Worker) void {
+        // Drain our ready queue. Any node still on it points back at
+        // one of our fibers via @fieldParentPtr, so a helper stealing
+        // mid-teardown would reach a freed fiber.
+        while (self.scheduler.popReady(self.worker_id)) |_| {}
+        // Wait for any other worker that's currently running one of our
+        // fibers (stolen via the ready-queue steal path) to finish.
+        // Freeing the fiber's stack while a helper is resumed on it
+        // would crash that helper. Eval is over by the time we reach
+        // here, so the wait is bounded by whatever yield-and-finish is
+        // currently in flight.
+        for (self.fibers.items) |f| {
+            while (f.in_runfiber.load(.acquire) != 0) std.atomic.spinLoopHint();
+        }
         var max_fiber_stack: u64 = 0;
         var max_vm_sp: u64 = 0;
         for (self.fibers.items) |f| {
@@ -266,7 +288,7 @@ pub const Worker = struct {
     /// `runTopLevel`. Returns true if it did anything; false if there's
     /// no work and the caller should park.
     fn drainStep(self: *Worker) !bool {
-        if (self.popReady()) |f| {
+        if (self.pickReady()) |f| {
             self.runFiber(f);
             return true;
         }
@@ -288,14 +310,22 @@ pub const Worker = struct {
     /// running (treated as same as suspended; the next wake will hit it).
     fn runFiber(self: *Worker, f: *Fiber) void {
         const t0 = nanoMonotonic();
+        f.in_runfiber.store(1, .release);
         f.inner.resume_();
+        f.in_runfiber.store(0, .release);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.busy_ns += t1 - t0;
         switch (f.inner.state) {
             .finished => {
-                // Entry returned cleanly. Recycle.
+                // Entry returned cleanly. Recycle onto the fiber's
+                // *owning* worker's free list — `f.worker` is the
+                // allocator, which may differ from `self` if we
+                // resumed a stolen fiber. Nudge the owning worker so
+                // its `runTopLevel` loop observes the completion (it
+                // may be parked waiting on this very fiber).
                 f.state = .free;
-                self.pushFree(f);
+                f.worker.pushFree(f);
+                if (f.worker != self) f.worker.nudge();
             },
             .suspended => {
                 // Yielded inside the body (force.busy enrolled on a
@@ -330,11 +360,14 @@ pub const Worker = struct {
     /// allocate a fresh one if the list is empty. The new fiber has its
     /// own stack + VM; the caller must `reset` it with the actual entry.
     fn acquireFreeFiber(self: *Worker) !*Fiber {
+        self.free_mu.lock();
         if (self.free_head) |head| {
-            self.free_head = head.next_in_list;
-            head.next_in_list = null;
+            self.free_head = head.next_free;
+            head.next_free = null;
+            self.free_mu.unlock();
             return head;
         }
+        self.free_mu.unlock();
         return self.allocateFiber();
     }
 
@@ -355,8 +388,10 @@ pub const Worker = struct {
             .inner = inner,
             .vm = vm,
             .state = .free,
+            .in_runfiber = .init(0),
             .current_task = null,
-            .next_in_list = null,
+            .next_free = null,
+            .ready_node = .{},
             .waiter = .{ .wake_fn = Fiber.wakeImpl },
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
@@ -370,34 +405,28 @@ pub const Worker = struct {
     }
 
     fn pushFree(self: *Worker, f: *Fiber) void {
-        f.next_in_list = self.free_head;
+        self.free_mu.lock();
+        defer self.free_mu.unlock();
+        f.next_free = self.free_head;
         self.free_head = f;
     }
 
-    /// Push a resumable fiber onto the ready stack. Called from any
-    /// thread (resolver fires the wake_fn). Lock-free CAS loop — see
-    /// `ready_head` for the protocol.
-    fn enqueueReady(self: *Worker, f: *Fiber) void {
-        while (true) {
-            const old = self.ready_head.load(.acquire);
-            f.next_in_list = old;
-            if (self.ready_head.cmpxchgWeak(old, f, .release, .acquire) == null) break;
-        }
-        self.nudge();
+    /// Pop a fiber from this worker's ready queue, or steal one from
+    /// another worker's queue if our own is empty.
+    fn pickReady(self: *Worker) ?*Fiber {
+        if (self.scheduler.popReady(self.worker_id)) |node| return readyNodeToFiber(node);
+        if (self.scheduler.stealReady(self.worker_id)) |node| return readyNodeToFiber(node);
+        return null;
     }
 
-    /// Pop a fiber from the ready stack. Called only from the owning
-    /// worker thread, so the CAS races only against producers — never
-    /// against another popper.
-    fn popReady(self: *Worker) ?*Fiber {
-        while (true) {
-            const head = self.ready_head.load(.acquire) orelse return null;
-            const next = head.next_in_list;
-            if (self.ready_head.cmpxchgWeak(head, next, .release, .acquire) == null) {
-                head.next_in_list = null;
-                return head;
-            }
-        }
+    fn readyNodeToFiber(node: *scheduler_mod.ReadyNode) *Fiber {
+        return @fieldParentPtr("ready_node", node);
+    }
+
+    fn countSuspended(self: *Worker) usize {
+        var c: usize = 0;
+        for (self.fibers.items) |f| if (f.state == .suspended) { c += 1; };
+        return c;
     }
 
     fn anyFiberSuspended(self: *Worker) bool {
@@ -537,7 +566,7 @@ test "Worker basic init/deinit" {
     // Prewarmed fibers: all on the free list, none active yet.
     try testing.expectEqual(@as(usize, prewarm_fiber_count), worker.fibers.items.len);
     try testing.expect(worker.free_head != null);
-    try testing.expect(worker.ready_head.load(.acquire) == null);
+    try testing.expect(sched.popReady(1) == null);
     // Fiber ids are now globally allocated by the scheduler — no fixed
     // mapping to position in the worker's fibers list. Each fiber's
     // claimer_id should equal `makeClaimer(fiber_id)`.

@@ -62,6 +62,12 @@ pub const Evaluator = struct {
     vm_trace: ?*@import("vm/trace_log.zig").VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
     worker_count: u8,
+    /// Persistent worker for worker_id 0 (the main / calling thread).
+    /// Lazily created on first `runWithVm`, kept alive for the
+    /// evaluator's lifetime, and deinit'd *after* the scheduler is
+    /// torn down — that ordering guarantees no helper is still running
+    /// a stolen main-fiber when its stack gets freed. See [F1.4].
+    main_worker: ?*worker_mod.Worker,
     /// Per-evaluation state (diagnostics + trace + string arena). Cleared
     /// at the start of each `evaluate()`; helpers writing diagnostics from
     /// import error paths serialize on `run.mu`.
@@ -105,6 +111,7 @@ pub const Evaluator = struct {
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
+            .main_worker = null,
             .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
         };
@@ -116,6 +123,10 @@ pub const Evaluator = struct {
         // them down (which joins on `defer vm.deinit()` inside helperLoop)
         // before freeing the arenas they borrow from.
         self.scheduler.deinit();
+        // Now that helpers are guaranteed quiescent, tear down the main
+        // worker. Doing this before scheduler shutdown could race with
+        // a helper still resuming a stolen main fiber.
+        if (self.main_worker) |w| w.deinit();
         if (self.base_path) |path| self.allocator.free(path);
         self.run.deinit();
         self.imports.deinit(self.allocator);
@@ -450,17 +461,23 @@ pub const Evaluator = struct {
             }
         };
         var ctx: Ctx = .{ .ev = self, .body_args = args };
-        const worker = try worker_mod.Worker.init(
+        const worker = try self.ensureMainWorker();
+        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx));
+        if (ctx.err) |e| return e;
+        return ctx.result;
+    }
+
+    fn ensureMainWorker(self: *Evaluator) !*worker_mod.Worker {
+        if (self.main_worker) |w| return w;
+        const w = try worker_mod.Worker.init(
             self.allocator,
             &self.scheduler,
             0,
             self,
             initVmForWorkerSlot,
         );
-        defer worker.deinit();
-        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx));
-        if (ctx.err) |e| return e;
-        return ctx.result;
+        self.main_worker = w;
+        return w;
     }
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
