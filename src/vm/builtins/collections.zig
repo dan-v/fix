@@ -270,8 +270,18 @@ pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     const out = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(out);
 
+    // Reuse the genlist_apply chunk (`tail_call upvalues[0] upvalues[1]`).
+    // The chunk doesn't care that the second upvalue is a list element
+    // instead of an integer index — it just calls `func arg`. This swap
+    // drops the per-element `BuiltinClosureObject` that the old
+    // `mapValue`-wrapped path allocated alongside the Thunk; now we
+    // have one Object per element instead of two.
+    const apply_chunk_id = self.registry.well_known.genlist_apply;
+    const speculatable = isSpeculatableUserFunc(self, func);
     for (items, out) |item, *mapped| {
-        mapped.* = try makeBuiltinThunk(self, .mapValue, &.{ func, item });
+        const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ func, item });
+        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
+        mapped.* = Value.thunk(tid);
     }
     return Value.list(try self.heap.addList(out));
 }
@@ -308,11 +318,33 @@ pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
     const out = try self.allocator.alloc(heap_mod.AttrEntry, attr_entries.len);
     defer self.allocator.free(out);
 
+    // Two paths. When `fn_arg` is already a callable value (closure,
+    // builtin, builtin-closure, callable attrs), use the
+    // `mapattrs_apply` bytecode-thunk path — one Object per entry
+    // instead of two (BuiltinClosureObject + Thunk).
+    //
+    // When `fn_arg` is still a thunk, we can't safely pre-force it
+    // here: recursive-attrset eval can route a self-reference
+    // through the function being mapped, and forcing eagerly would
+    // blackhole. Fall back to the `.mapAttrValue` builtin-closure
+    // path; that handler forces `func` on the forcing fiber, where
+    // the claim identity differs from ours.
+    if (fn_arg.isThunk()) {
+        for (attr_entries, out) |entry, *mapped| {
+            mapped.* = .{
+                .name = entry.name,
+                .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry.name), entry.value }),
+            };
+        }
+        return Value.attrs(try self.heap.addAttrs(out));
+    }
+
+    const apply_chunk_id = self.registry.well_known.mapattrs_apply;
+    const speculatable = isSpeculatableUserFunc(self, fn_arg);
     for (attr_entries, out) |entry, *mapped| {
-        mapped.* = .{
-            .name = entry.name,
-            .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry.name), entry.value }),
-        };
+        const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ fn_arg, Value.string(entry.name), entry.value });
+        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
+        mapped.* = .{ .name = entry.name, .value = Value.thunk(tid) };
     }
     return Value.attrs(try self.heap.addAttrs(out));
 }

@@ -213,7 +213,18 @@ pub const WellKnownChunks = struct {
     /// `func index` and returns the result. Replaces the
     /// `builtin_closure(.mapValue, [func, index])` per element that
     /// would otherwise allocate one extra Object per genList slot.
+    /// Reused by `builtins.map` since the body is the same single-arg
+    /// application regardless of whether arg 1 is an index or a list
+    /// item.
     genlist_apply: ChunkId,
+    /// Stub chunk for `builtins.mapAttrs` element thunks. Body:
+    ///   `get_upvalue 0; get_upvalue 1; call; get_upvalue 2; tail_call;
+    ///    ret; halt`
+    /// Upvalues are `[func, name, value]`. Forcing the thunk calls
+    /// `(func name) value` (partial application then tail call).
+    /// Replaces the `builtin_closure(.mapAttrValue, ...)` + Thunk pair
+    /// the old path allocated per attr.
+    mapattrs_apply: ChunkId,
 };
 
 /// Global chunk registry. Chunks are stored here and referenced by ChunkId.
@@ -233,10 +244,11 @@ pub const ChunkRegistry = struct {
         var self: ChunkRegistry = .{
             .allocator = allocator,
             .chunks = .empty,
-            .well_known = .{ .genlist_apply = 0 },
+            .well_known = .{ .genlist_apply = 0, .mapattrs_apply = 0 },
         };
         errdefer self.deinit();
         self.well_known.genlist_apply = try self.registerGenListApplyChunk();
+        self.well_known.mapattrs_apply = try self.registerMapAttrsApplyChunk();
         return self;
     }
 
@@ -256,6 +268,30 @@ pub const ChunkRegistry = struct {
         //                  control; ret only runs when callee was a builtin)
         try builder.writeOp(self.allocator, .ret);
         // halt           — sentinel
+        try builder.writeOp(self.allocator, .halt);
+
+        const chunk = try builder.finish(self.allocator, 0);
+        return self.register(chunk);
+    }
+
+    fn registerMapAttrsApplyChunk(self: *ChunkRegistry) !ChunkId {
+        var builder = try ChunkBuilder.init(self.allocator);
+        defer builder.deinit(self.allocator);
+
+        // get_upvalue 0  — push func
+        try builder.writeOp(self.allocator, .get_upvalue);
+        try builder.writeU16(self.allocator, 0);
+        // get_upvalue 1  — push name
+        try builder.writeOp(self.allocator, .get_upvalue);
+        try builder.writeU16(self.allocator, 1);
+        // call           — partial = func name (result on stack)
+        try builder.writeOp(self.allocator, .call);
+        // get_upvalue 2  — push value
+        try builder.writeOp(self.allocator, .get_upvalue);
+        try builder.writeU16(self.allocator, 2);
+        // tail_call      — partial value
+        try builder.writeOp(self.allocator, .tail_call);
+        try builder.writeOp(self.allocator, .ret);
         try builder.writeOp(self.allocator, .halt);
 
         const chunk = try builder.finish(self.allocator, 0);
