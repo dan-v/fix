@@ -99,7 +99,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // errdefer above only fires on early return.
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (ch.speculatable) {
-        _ = self.scheduler.submit(.{ .force_thunk = id });
+        _ = self.scheduler.submit(.{ .force_thunk = id }, self.worker_id);
     }
     try stack.push(self, Value.thunk(id));
 }

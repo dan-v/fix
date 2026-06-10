@@ -17,6 +17,7 @@ const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
+const strictness = @import("strictness.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -186,6 +187,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
+    try strictness.stampOnBuilder(&child, lambda.body);
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
@@ -267,6 +269,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
+    try strictness.stampOnBuilder(&child, lambda.body);
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

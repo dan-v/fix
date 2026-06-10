@@ -293,8 +293,13 @@ pub const Evaluator = struct {
         return self.scheduler.stats();
     }
 
-    pub fn helperCount(self: *const Evaluator) u8 {
-        return self.scheduler.helper_count;
+    pub fn workerCount(self: *const Evaluator) u8 {
+        return self.scheduler.worker_count;
+    }
+
+    pub fn setParallelismToggles(self: *Evaluator, disable_speculation: bool, disable_fanout: bool) void {
+        self.scheduler.disable_speculation = disable_speculation;
+        self.scheduler.disable_fanout = disable_fanout;
     }
 
     /// Compile source text into bytecode and evaluate it.
@@ -448,7 +453,6 @@ pub const Evaluator = struct {
         const worker = try worker_mod.Worker.init(
             self.allocator,
             &self.scheduler,
-            self.scheduler.helper_count,
             0,
             self,
             initVmForWorkerSlot,
@@ -528,12 +532,11 @@ pub const Evaluator = struct {
 /// `worker.zig`. Errors during speculation are swallowed inside the
 /// slot's entry; the thunk's own `reset()` on failure surfaces the
 /// error to a future genuine caller.
-fn helperLoop(helper_idx: u8, sched: *Scheduler, ev: *Evaluator) void {
+fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     const worker = worker_mod.Worker.init(
         ev.allocator,
         sched,
-        helper_idx,
-        helper_idx + 1,
+        worker_id,
         ev,
         initVmForWorkerSlot,
     ) catch return;

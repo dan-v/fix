@@ -41,6 +41,9 @@ pub const Chunk = struct {
     /// need to re-fetch the chunk via the registry just to read
     /// `code.len`.
     speculatable: bool = false,
+    /// Compile-time strictness signature: which upvalues this chunk
+    /// unconditionally forces when entered. See `compiler/strictness.zig`.
+    strictness: ChunkStrictness = .{},
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
     /// Source span ranges for cold-path error traces.
@@ -52,6 +55,27 @@ pub const Chunk = struct {
         allocator.free(self.function_args);
         allocator.free(self.source_map);
     }
+};
+
+/// Compile-time signal of which upvalues a chunk's body will force.
+/// Two depths:
+///   `forced_upvalues` — forced when the body is evaluated to WHNF
+///       (always, since entering a chunk runs its body).
+///   `deep_upvalues`   — additionally forced when the result is deep-
+///       forced by the caller. Covers structure-building chunks
+///       (attr-sets, lists) whose body itself forces nothing but whose
+///       contained values get forced if the result is walked. These
+///       are precisely the chunks today's `speculatable` heuristic
+///       catches (large attr-set/list constructors with empty shallow
+///       strictness).
+pub const ChunkStrictness = struct {
+    /// Upvalue slot N (0..63) is unconditionally forced when the chunk
+    /// runs. Slots ≥ 64 are dropped silently — coverage degrades for
+    /// chunks with many captures, which are rare.
+    forced_upvalues: u64 = 0,
+    /// Upvalue slot N is additionally forced when the result is
+    /// recursively deep-forced. Superset of `forced_upvalues`.
+    deep_upvalues: u64 = 0,
 };
 
 /// A mutable builder for constructing chunks.
@@ -66,6 +90,10 @@ pub const ChunkBuilder = struct {
     /// patches an offset in place). Used by `emit.emitRet` to fuse
     /// the previous value-producing op into a `<op>_ret` super-op.
     last_op_offset: ?usize = null,
+    /// Strictness signature computed by `compiler/strictness.zig`
+    /// after the body is compiled. Carried through `finish` onto the
+    /// resulting Chunk.
+    strictness: ChunkStrictness = .{},
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -151,6 +179,7 @@ pub const ChunkBuilder = struct {
             .code = code,
             .constants = constants,
             .local_count = local_count,
+            .strictness = self.strictness,
             .function_args = function_args,
             .source_map = source_map,
         };
@@ -261,6 +290,14 @@ pub const ChunkRegistry = struct {
         source_map_entries: u64,
         size_buckets: [6]u32, // <16, <64, <256, <1024, <4096, >=4096
         max_code_bytes: u32,
+        /// Chunks with a non-empty strictness signature.
+        with_strictness: u32,
+        /// Chunks marked `speculatable` by the size heuristic.
+        speculatable: u32,
+        /// Chunks that are both speculatable AND have a non-empty
+        /// strictness signature — the intersection that Phase B/C will
+        /// be able to schedule deterministically instead of speculating.
+        speculatable_with_strictness: u32,
 
         pub fn bucketLabel(index: usize) []const u8 {
             return switch (index) {
@@ -283,6 +320,9 @@ pub const ChunkRegistry = struct {
             .source_map_entries = 0,
             .size_buckets = [_]u32{0} ** 6,
             .max_code_bytes = 0,
+            .with_strictness = 0,
+            .speculatable = 0,
+            .speculatable_with_strictness = 0,
         };
         var id: u32 = 0;
         while (id < result.chunks) : (id += 1) {
@@ -299,6 +339,10 @@ pub const ChunkRegistry = struct {
                 else if (len < 4096) 4
                 else 5;
             result.size_buckets[bucket] += 1;
+            const has_strict = (ch.strictness.forced_upvalues | ch.strictness.deep_upvalues) != 0;
+            if (has_strict) result.with_strictness += 1;
+            if (ch.speculatable) result.speculatable += 1;
+            if (ch.speculatable and has_strict) result.speculatable_with_strictness += 1;
         }
         return result;
     }

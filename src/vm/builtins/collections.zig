@@ -348,7 +348,7 @@ pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
     const speculatable = isSpeculatableUserFunc(self, func);
     for (out, 0..) |*value, i| {
         const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ func, Value.int(@intCast(i)) });
-        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid });
+        if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.worker_id);
         value.* = Value.thunk(tid);
     }
     return Value.list(try self.heap.addList(out));

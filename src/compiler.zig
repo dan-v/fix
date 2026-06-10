@@ -14,6 +14,7 @@ pub const emit = @import("compiler/emit.zig");
 pub const scope = @import("compiler/scope.zig");
 pub const thunks = @import("compiler/thunks.zig");
 pub const diagnostics = @import("compiler/diagnostics.zig");
+pub const strictness = @import("compiler/strictness.zig");
 const operand = @import("compiler/operand.zig");
 const compiler_types = @import("compiler/types.zig");
 const captureCount = operand.captureCount;
@@ -133,6 +134,7 @@ pub const Compiler = struct {
     /// builder holds a complete chunk ready for `ChunkBuilder.finish`.
     pub fn compileAndFinish(self: *Compiler, node: *const Node, scope_value: ?Value) !void {
         try self.compileWithScope(node, scope_value);
+        try strictness.stampOnBuilder(self, node);
         try emit.emitRet(self);
         try self.builder.writeOp(self.allocator, .halt);
     }

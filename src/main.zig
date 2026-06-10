@@ -74,6 +74,9 @@ const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
+    disable_spec_thunks: bool = false,
+    disable_fanout: bool = false,
+    print_sched_stats: bool = false,
 
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
@@ -144,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
@@ -192,6 +196,13 @@ pub fn main(init: std.process.Init) !void {
     progress.deinit(ok);
     trace_setup.finish();
     thunks_setup.finish();
+    if (options.print_sched_stats) {
+        const s = ev.schedulerStats();
+        std.debug.print(
+            "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d}\n",
+            .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks },
+        );
+    }
     if (!ok) {
         std.process.exit(1);
     }
@@ -456,6 +467,12 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
             options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
         } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
             options.thunks_log_path = arg["--thunks-log=".len..];
+        } else if (std.mem.eql(u8, arg, "--no-spec-thunks")) {
+            options.disable_spec_thunks = true;
+        } else if (std.mem.eql(u8, arg, "--no-fanout")) {
+            options.disable_fanout = true;
+        } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
+            options.print_sched_stats = true;
         } else {
             return error.UnknownOption;
         }

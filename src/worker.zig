@@ -96,7 +96,6 @@ pub const Fiber = struct {
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     scheduler: *Scheduler,
-    helper_idx: u8,
     worker_id: u8,
     init_vm_ctx: *anyopaque,
     init_vm_fn: InitVmFn,
@@ -132,7 +131,6 @@ pub const Worker = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
-        helper_idx: u8,
         worker_id: u8,
         init_vm_ctx: *anyopaque,
         init_vm_fn: InitVmFn,
@@ -142,7 +140,6 @@ pub const Worker = struct {
         self.* = .{
             .allocator = allocator,
             .scheduler = scheduler,
-            .helper_idx = helper_idx,
             .worker_id = worker_id,
             .init_vm_ctx = init_vm_ctx,
             .init_vm_fn = init_vm_fn,
@@ -208,9 +205,10 @@ pub const Worker = struct {
         self.nudge();
     }
 
-    /// Helper-side park; pairs with `nudge`.
+    /// Park-side counterpart: poke the worker's wake word so a parked
+    /// thread will wake. Any thread may call this.
     fn nudge(self: *Worker) void {
-        self.scheduler.wakeHelperPublic(self.helper_idx);
+        self.scheduler.wakeWorkerPublic(self.worker_id);
     }
 
     fn shouldStop(self: *Worker) bool {
@@ -306,23 +304,23 @@ pub const Worker = struct {
         }
     }
 
-    /// Park on the helper wake_word and account the time toward idle_ns.
-    /// `parkHelper` is the only call that blocks the worker thread when
-    /// there's no work; everything else (pop, pick, fiber resume) is
-    /// counted as work-in-progress. Flushes local timing counters to the
-    /// scheduler first — parking is the only voluntary CPU yield, so
-    /// it's the natural batching point for the atomic add.
+    /// Park on the worker's wake word and account the time toward
+    /// idle_ns. `parkWorker` is the only call that blocks the thread
+    /// when there's no work; everything else (pop, pick, fiber resume)
+    /// is counted as work-in-progress. Flushes local timing counters
+    /// to the scheduler first — parking is the only voluntary CPU
+    /// yield, so it's the natural batching point for the atomic add.
     fn parkAndAccount(self: *Worker) void {
         self.flushTimingToScheduler();
         const t0 = nanoMonotonic();
-        self.scheduler.parkHelper(self.helper_idx);
+        self.scheduler.parkWorker(self.worker_id);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.idle_ns += t1 - t0;
     }
 
     fn pickTask(self: *Worker) ?Task {
-        if (self.scheduler.pop(self.helper_idx)) |t| return t;
-        if (self.scheduler.stealAny(self.helper_idx)) |t| return t;
+        if (self.scheduler.pop(self.worker_id)) |t| return t;
+        if (self.scheduler.stealAny(self.worker_id)) |t| return t;
         return null;
     }
 
@@ -530,7 +528,7 @@ test "Worker basic init/deinit" {
         ctx.arena.deinit();
     }
 
-    const worker = try Worker.init(testing.allocator, &sched, 0, 1, &ctx, TestCtx.initVm);
+    const worker = try Worker.init(testing.allocator, &sched, 1, &ctx, TestCtx.initVm);
     defer worker.deinit();
 
     try testing.expectEqual(@as(u8, 1), worker.worker_id);

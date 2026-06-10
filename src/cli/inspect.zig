@@ -103,7 +103,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
     const intern_stats = ev.internStats();
     const reg_stats = ev.chunkStats();
     const sched_stats = ev.schedulerStats();
-    const helpers = ev.helperCount();
+    const workers = ev.workerCount();
 
     try writer.writeAll("heap\n");
     try writer.print("  objects:          {d}\n", .{heap_stats.objects});
@@ -164,16 +164,28 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         try writeBar(writer, c, max_bucket, 24);
         try writer.writeByte('\n');
     }
+    try writer.print("  with strictness:  {d}  ({d:.1}% of all chunks)\n", .{
+        reg_stats.with_strictness,
+        percent(reg_stats.with_strictness, reg_stats.chunks),
+    });
+    try writer.print("  speculatable:     {d}  ({d:.1}% of all chunks)\n", .{
+        reg_stats.speculatable,
+        percent(reg_stats.speculatable, reg_stats.chunks),
+    });
+    try writer.print("  spec + strict:    {d}  ({d:.1}% of speculatable)\n", .{
+        reg_stats.speculatable_with_strictness,
+        percent(reg_stats.speculatable_with_strictness, reg_stats.speculatable),
+    });
 
-    try writeSchedulerStats(writer, helpers, sched_stats);
+    try writeSchedulerStats(writer, workers, sched_stats);
 
     if (top_n > 0) try writeTopInterned(writer, ev, top_n);
 }
 
-fn writeSchedulerStats(writer: *std.Io.Writer, helpers: u8, s: anytype) !void {
+fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: anytype) !void {
     try writer.writeAll("\nscheduler\n");
-    try writer.print("  helpers:          {d}\n", .{helpers});
-    if (helpers == 0) {
+    try writer.print("  workers:          {d}\n", .{workers});
+    if (workers <= 1) {
         try writer.writeAll("  (single-threaded — no parallel submissions to count)\n");
         return;
     }

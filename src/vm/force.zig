@@ -137,7 +137,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
             .list_id = list_id,
             .offset = offset,
             .len = this_len,
-        } })) break;
+        } }, self.worker_id)) break;
         offset += this_len;
     }
 }
@@ -155,7 +155,7 @@ pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.z
     // lists; one-task-per-thunk is fine for now.
     for (entries) |entry| {
         if (!entry.value.isThunk()) continue;
-        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() })) break;
+        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.worker_id)) break;
     }
 }
 
@@ -256,7 +256,7 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
     if (shouldSpeculateClosure(self, closure)) {
-        _ = self.scheduler.submit(.{ .force_thunk = id });
+        _ = self.scheduler.submit(.{ .force_thunk = id }, self.worker_id);
     }
     return Value.thunk(id);
 }

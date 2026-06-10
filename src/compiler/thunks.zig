@@ -8,6 +8,7 @@ const diagnostics = @import("diagnostics.zig");
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 const ChunkBuilder = chunk.ChunkBuilder;
+const strictness = @import("strictness.zig");
 
 pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
     var child_builder = try ChunkBuilder.init(self.allocator);
@@ -31,6 +32,7 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
+    try strictness.stampOnBuilder(&child, expr);
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

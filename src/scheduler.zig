@@ -126,7 +126,13 @@ pub const Scheduler = struct {
     };
 
     allocator: std.mem.Allocator,
-    helper_count: u8,
+    /// Total number of workers, including worker 0 (main). After F1
+    /// symmetrization there is no special main/helper split — every
+    /// worker owns a queue, a wake word, and a ready-fiber stack. The
+    /// only structural difference: worker 0 runs on the calling OS
+    /// thread (it's the one delivering the result), so we spawn
+    /// `worker_count - 1` helper threads in `start()`.
+    worker_count: u8,
     queues: []TaskQueue,
     threads: []std.Thread,
     wake_words: []std.atomic.Value(u32),
@@ -152,12 +158,23 @@ pub const Scheduler = struct {
     n_idle_ns: std.atomic.Value(u64),
     n_busy_ns: std.atomic.Value(u64),
 
-    /// `total_worker_count` includes the main thread (worker 0). The
-    /// scheduler manages `total_worker_count - 1` helpers.
-    pub fn init(allocator: std.mem.Allocator, total_worker_count: u8) !Scheduler {
-        const helper_count: u8 = if (total_worker_count > 1) total_worker_count - 1 else 0;
+    /// Measurement toggles. When set, the corresponding submission path
+    /// short-circuits to false without touching the queues. Used by
+    /// `--no-spec-thunks` / `--no-fanout` to A/B which kind of parallel
+    /// work contributes how much to wall time.
+    disable_speculation: bool,
+    disable_fanout: bool,
 
-        const queues = try allocator.alloc(TaskQueue, helper_count);
+    /// `worker_count` includes the main thread (worker 0). The
+    /// scheduler spawns `worker_count - 1` helper threads in `start()`;
+    /// worker 0 runs on the calling thread.
+    pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Scheduler {
+        const safe_worker_count: u8 = if (worker_count == 0) 1 else worker_count;
+
+        // One queue and one wake word per worker — including worker 0
+        // (main). Symmetric task ownership; the only thing not
+        // symmetric is who spawned which thread.
+        const queues = try allocator.alloc(TaskQueue, safe_worker_count);
         errdefer allocator.free(queues);
         var initialized: usize = 0;
         errdefer for (queues[0..initialized]) |*q| q.deinit(allocator);
@@ -166,22 +183,17 @@ pub const Scheduler = struct {
             initialized += 1;
         }
 
-        const threads = try allocator.alloc(std.Thread, helper_count);
+        const helper_thread_count: u8 = if (safe_worker_count > 1) safe_worker_count - 1 else 0;
+        const threads = try allocator.alloc(std.Thread, helper_thread_count);
         errdefer allocator.free(threads);
 
-        // wake_words has helper_count + 1 entries: indices 0..helper_count-1
-        // are owned by helper threads (same as before), index helper_count is
-        // reserved for the main thread's Worker. This keeps the wake/park
-        // mechanism uniform for everyone — helpers and main both park on a
-        // wake_word, and slot wake_fn signals can route to either by
-        // worker_idx (== helper_idx for helpers, == helper_count for main).
-        const wake_words = try allocator.alloc(std.atomic.Value(u32), helper_count + 1);
+        const wake_words = try allocator.alloc(std.atomic.Value(u32), safe_worker_count);
         errdefer allocator.free(wake_words);
         for (wake_words) |*w| w.* = .init(0);
 
         return .{
             .allocator = allocator,
-            .helper_count = helper_count,
+            .worker_count = safe_worker_count,
             .queues = queues,
             .threads = threads,
             .wake_words = wake_words,
@@ -200,6 +212,8 @@ pub const Scheduler = struct {
             .n_max_vm_sp = .init(0),
             .n_idle_ns = .init(0),
             .n_busy_ns = .init(0),
+            .disable_speculation = false,
+            .disable_fanout = false,
         };
     }
 
@@ -251,30 +265,32 @@ pub const Scheduler = struct {
         self.allocator.free(self.threads);
     }
 
-    /// Spawn helper threads. Each runs `workerFn(helper_idx, sched, ctx)`.
-    /// helper_idx is 0..helper_count-1 (corresponding to worker_id 1..N-1).
+    /// Spawn helper threads. Each runs `workerFn(worker_id, sched, ctx)`
+    /// where worker_id ∈ 1..worker_count-1. Worker 0 runs on the
+    /// calling thread and is not spawned here.
     /// Idempotent: subsequent calls return immediately.
     pub fn start(self: *Scheduler, comptime workerFn: anytype, ctx: anytype) !void {
         if (self.started.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) return;
-        if (self.helper_count == 0) return;
+        if (self.threads.len == 0) return;
 
         var spawned: usize = 0;
         errdefer {
             self.shutdown_flag.store(true, .release);
-            for (0..spawned) |i| self.wakeHelper(@intCast(i));
+            var i: usize = 0;
+            while (i < spawned) : (i += 1) self.wakeWorker(@intCast(i + 1));
             for (self.threads[0..spawned]) |t| t.join();
             self.started.store(false, .release);
         }
 
         const Worker = struct {
-            fn run(helper_idx: u8, sched: *Scheduler, c: @TypeOf(ctx)) void {
-                workerFn(helper_idx, sched, c);
+            fn run(worker_id: u8, sched: *Scheduler, c: @TypeOf(ctx)) void {
+                workerFn(worker_id, sched, c);
             }
         };
 
-        for (0..self.helper_count) |i| {
-            self.threads[i] = try std.Thread.spawn(.{}, Worker.run, .{
-                @as(u8, @intCast(i)),
+        for (self.threads, 0..) |*t, i| {
+            t.* = try std.Thread.spawn(.{}, Worker.run, .{
+                @as(u8, @intCast(i + 1)),
                 self,
                 ctx,
             });
@@ -286,30 +302,23 @@ pub const Scheduler = struct {
     pub fn shutdown(self: *Scheduler) void {
         if (!self.started.swap(false, .acq_rel)) return;
         self.shutdown_flag.store(true, .release);
-        var i: u8 = 0;
-        while (i < self.helper_count) : (i += 1) self.wakeHelper(i);
+        var i: u8 = 1;
+        while (i < self.worker_count) : (i += 1) self.wakeWorker(i);
         for (self.threads) |t| t.join();
     }
 
-    /// Submit a *speculative* task. Picks a victim helper round-robin and
-    /// skips the push if the backlog already saturates helpers — past that,
-    /// the cost of pushing/waking exceeds the speculative win.
-    /// Returns false if all helper queues are full, no helpers exist, or
-    /// the speculation backlog cap was hit.
-    ///
-    /// Cap of `helper_count * 64`: with average task ~20µs, that's ~1.3ms
-    /// of queued work per helper. Smaller caps (we used 16 previously)
-    /// dropped most submissions from a NixOS toplevel because consumer
-    /// fan-out can submit hundreds of items in a tight loop; the bounded
-    /// cascade (`vm.in_speculation`) means a deep queue can't run away.
-    pub fn submit(self: *Scheduler, task: Task) bool {
-        if (self.helper_count == 0) return false;
-        const cap: u32 = @as(u32, self.helper_count) * 64;
+    /// Submit a *speculative* task. The submitter passes its own
+    /// `worker_id` so we can skip its queue — pushing to your own queue
+    /// just sits there until you suspend, defeating the parallelism.
+    pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
+        if (self.worker_count <= 1) return false;
+        if (self.disable_speculation) return false;
+        const cap: u32 = @as(u32, self.worker_count - 1) * 64;
         if (self.pending_tasks.load(.monotonic) >= cap) {
             _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
             return false;
         }
-        if (self.pushRoundRobin(task)) {
+        if (self.pushRoundRobin(task, submitter_id)) {
             _ = self.n_speculative_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -317,14 +326,12 @@ pub const Scheduler = struct {
         return false;
     }
 
-    /// Submit a *demand-driven* task. The caller knows it will need the
-    /// result, so we skip the speculation backlog cap and only fail when
-    /// every helper queue is genuinely full. Used by strict barriers
-    /// (e.g., `forceDeep`, `builtins.map`) that fan out known-required
-    /// work to helpers.
-    pub fn submitUrgent(self: *Scheduler, task: Task) bool {
-        if (self.helper_count == 0) return false;
-        if (self.pushRoundRobin(task)) {
+    /// Submit a *demand-driven* task. Same submitter-self-exclusion
+    /// rule as `submit`.
+    pub fn submitUrgent(self: *Scheduler, task: Task, submitter_id: u8) bool {
+        if (self.worker_count <= 1) return false;
+        if (self.disable_fanout) return false;
+        if (self.pushRoundRobin(task, submitter_id)) {
             _ = self.n_urgent_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -332,11 +339,12 @@ pub const Scheduler = struct {
         return false;
     }
 
-    fn pushRoundRobin(self: *Scheduler, task: Task) bool {
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.helper_count);
+    fn pushRoundRobin(self: *Scheduler, task: Task, submitter_id: u8) bool {
+        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
-        while (i < self.helper_count) : (i += 1) {
-            const idx = (start_idx + i) % self.helper_count;
+        while (i < self.worker_count) : (i += 1) {
+            const idx = (start_idx + i) % self.worker_count;
+            if (idx == submitter_id) continue;
             if (self.queues[idx].push(task)) {
                 // Wake only when the queue might have been idle.
                 // `fetchAdd` returns the previous count; if it was zero,
@@ -344,46 +352,43 @@ pub const Scheduler = struct {
                 // zero, at least one helper is already draining work and
                 // will pick up our task without a syscall.
                 const prev = self.pending_tasks.fetchAdd(1, .release);
-                if (prev == 0) self.wakeHelper(idx);
+                if (prev == 0) self.wakeWorker(idx);
                 return true;
             }
         }
         return false;
     }
 
-    /// Helper-side: pop from own queue. Main worker (helper_idx ==
-    /// helper_count) doesn't own a queue — it pops nothing and steals
-    /// instead.
-    pub fn pop(self: *Scheduler, helper_idx: u8) ?Task {
-        if (helper_idx >= self.helper_count) return null;
-        const task = self.queues[helper_idx].pop() orelse return null;
+    /// Pop a task from `worker_id`'s own queue. Every worker — main and
+    /// helpers — owns a queue post-F1.
+    pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
+        if (worker_id >= self.worker_count) return null;
+        const task = self.queues[worker_id].pop() orelse return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
         _ = self.n_pops.fetchAdd(1, .monotonic);
         return task;
     }
 
-    /// Helper-side: try to steal from any other helper.
-    pub fn stealAny(self: *Scheduler, my_idx: u8) ?Task {
-        if (self.helper_count < 2) return null;
-        return self.stealExcluding(my_idx);
+    /// Try to steal one task from any worker's queue, excluding the
+    /// caller's own (`worker_id`). All workers participate in steal
+    /// symmetrically now.
+    pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
+        if (self.worker_count < 2) return null;
+        return self.stealExcluding(worker_id);
     }
 
-    /// Try to steal one task from any helper queue on behalf of `worker_id`.
-    /// Excludes the caller's own queue if they own one. worker_id 0 is the
-    /// main thread (no queue, excludes nothing). Used by callers that are
-    /// blocked waiting for fan-out work to complete and want to contribute
-    /// to throughput instead of parking.
-    pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
-        if (self.helper_count == 0) return null;
-        if (worker_id == 0) return self.stealExcluding(null);
-        return self.stealExcluding(worker_id - 1);
+    /// Alias for `stealForWorker` — workers use this from their drain
+    /// loop. Kept as a separate name so the call site reads as
+    /// "steal anything I can find," not "steal for some specific id."
+    pub fn stealAny(self: *Scheduler, worker_id: u8) ?Task {
+        return self.stealForWorker(worker_id);
     }
 
     fn stealExcluding(self: *Scheduler, exclude: ?u8) ?Task {
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.helper_count);
+        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
-        while (i < self.helper_count) : (i += 1) {
-            const idx = (start_idx + i) % self.helper_count;
+        while (i < self.worker_count) : (i += 1) {
+            const idx = (start_idx + i) % self.worker_count;
             if (exclude) |e| if (idx == e) continue;
             if (self.queues[idx].steal()) |task| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
@@ -394,10 +399,11 @@ pub const Scheduler = struct {
         return null;
     }
 
-    /// Helper-side: park on the wake word until awoken or shutdown.
-    pub fn parkHelper(self: *Scheduler, helper_idx: u8) void {
+    /// Park `worker_id`'s thread on its wake word until awoken or
+    /// shutdown. Works for any worker, including worker 0.
+    pub fn parkWorker(self: *Scheduler, worker_id: u8) void {
         _ = self.n_parks.fetchAdd(1, .monotonic);
-        const word = &self.wake_words[helper_idx];
+        const word = &self.wake_words[worker_id];
         // Try to atomically transition 0 → "waiting" (still 0; we just check
         // before sleeping). The futex syscall's "expected" param is the safe
         // way to avoid lost wakeups: if a wake arrives between our check and
@@ -429,15 +435,15 @@ pub const Scheduler = struct {
         return self.shutdown_flag.load(.acquire);
     }
 
-    /// Wake the given helper's wake_word and futex_wake it. Public so
+    /// Wake the given worker's wake_word and futex_wake it. Public so
     /// remote thunk-resolvers (in worker.zig's wake_fn) can nudge a
-    /// helper whose suspended fiber just became resumable.
-    pub fn wakeHelperPublic(self: *Scheduler, helper_idx: u8) void {
-        self.wakeHelper(helper_idx);
+    /// worker whose suspended fiber just became resumable.
+    pub fn wakeWorkerPublic(self: *Scheduler, worker_id: u8) void {
+        self.wakeWorker(worker_id);
     }
 
-    fn wakeHelper(self: *Scheduler, helper_idx: u8) void {
-        const word = &self.wake_words[helper_idx];
+    fn wakeWorker(self: *Scheduler, worker_id: u8) void {
+        const word = &self.wake_words[worker_id];
         word.store(1, .release);
         switch (builtin.os.tag) {
             .linux => {
@@ -452,35 +458,36 @@ pub const Scheduler = struct {
     }
 };
 
-test "scheduler push/pop/steal work for a single helper" {
+test "scheduler push/pop/steal work for a single worker" {
     var sched = try Scheduler.init(std.testing.allocator, 2);
     defer sched.deinit();
-    try std.testing.expectEqual(@as(u8, 1), sched.helper_count);
+    try std.testing.expectEqual(@as(u8, 2), sched.worker_count);
 
     const t1: Task = .{ .force_thunk = 7 };
     const t2: Task = .{ .force_thunk = 13 };
-    try std.testing.expect(sched.queues[0].push(t1));
-    try std.testing.expect(sched.queues[0].push(t2));
+    // Push directly to worker 1's queue (helper).
+    try std.testing.expect(sched.queues[1].push(t1));
+    try std.testing.expect(sched.queues[1].push(t2));
 
     // LIFO from owner.
-    const popped = sched.pop(0).?;
+    const popped = sched.pop(1).?;
     try std.testing.expectEqual(@as(types.ObjectId, 13), popped.force_thunk);
 
     // Steal sees the older one.
-    const stolen = sched.queues[0].steal().?;
+    const stolen = sched.queues[1].steal().?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen.force_thunk);
 
-    try std.testing.expectEqual(@as(?Task, null), sched.pop(0));
+    try std.testing.expectEqual(@as(?Task, null), sched.pop(1));
 }
 
-test "scheduler.submit round-robins across helpers" {
+test "scheduler.submit round-robins across workers" {
     var sched = try Scheduler.init(std.testing.allocator, 4);
     defer sched.deinit();
-    try std.testing.expectEqual(@as(u8, 3), sched.helper_count);
+    try std.testing.expectEqual(@as(u8, 4), sched.worker_count);
 
     var i: types.ObjectId = 0;
     while (i < 6) : (i += 1) {
-        try std.testing.expect(sched.submit(.{ .force_thunk = i }));
+        try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
     }
 
     var total: u32 = 0;
@@ -495,46 +502,47 @@ test "scheduler.submit round-robins across helpers" {
 test "submitUrgent bypasses the speculation backlog cap" {
     var sched = try Scheduler.init(std.testing.allocator, 2);
     defer sched.deinit();
-    try std.testing.expectEqual(@as(u8, 1), sched.helper_count);
+    try std.testing.expectEqual(@as(u8, 2), sched.worker_count);
 
-    // The speculation cap is helper_count * 64 = 64. Fill it up via
-    // `submit` and confirm the next `submit` is rejected.
+    // The speculation cap is (worker_count - 1) * 64 = 64. Fill it up
+    // via `submit` and confirm the next `submit` is rejected.
     var i: types.ObjectId = 0;
-    while (i < 64) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }));
-    try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }));
+    while (i < 64) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
+    try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }, 0));
 
     // `submitUrgent` should still go through — the queue capacity is 1024.
-    try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 100 }));
-    try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 101 }));
+    try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 100 }, 0));
+    try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 101 }, 0));
 
     var drained: u32 = 0;
-    while (sched.queues[0].steal()) |_| drained += 1;
+    for (sched.queues) |*q| while (q.steal()) |_| { drained += 1; };
     try std.testing.expectEqual(@as(u32, 66), drained);
 }
 
-test "stealForWorker: main (worker 0) excludes nothing; helper N excludes its own queue" {
+test "stealForWorker: each worker excludes its own queue" {
     var sched = try Scheduler.init(std.testing.allocator, 3);
     defer sched.deinit();
-    try std.testing.expectEqual(@as(u8, 2), sched.helper_count);
+    try std.testing.expectEqual(@as(u8, 3), sched.worker_count);
 
-    // Put one task in each helper queue.
-    try std.testing.expect(sched.queues[0].push(.{ .force_thunk = 100 }));
-    try std.testing.expect(sched.queues[1].push(.{ .force_thunk = 200 }));
+    // Put one task in each of worker 1 and worker 2's queues.
+    try std.testing.expect(sched.queues[1].push(.{ .force_thunk = 100 }));
+    try std.testing.expect(sched.queues[2].push(.{ .force_thunk = 200 }));
     sched.pending_tasks.store(2, .release);
 
-    // Helper at worker_id 1 (helper_idx 0) must not steal from queue 0.
-    const stolen_by_h1 = sched.stealForWorker(1).?;
-    try std.testing.expectEqual(@as(types.ObjectId, 200), stolen_by_h1.force_thunk);
+    // Worker 1 must not steal from its own queue (queues[1]).
+    const stolen_by_w1 = sched.stealForWorker(1).?;
+    try std.testing.expectEqual(@as(types.ObjectId, 200), stolen_by_w1.force_thunk);
 
-    // Helper at worker_id 2 (helper_idx 1) must not steal from queue 1.
-    const stolen_by_h2 = sched.stealForWorker(2).?;
-    try std.testing.expectEqual(@as(types.ObjectId, 100), stolen_by_h2.force_thunk);
+    // Worker 2 must not steal from its own queue (queues[2]).
+    const stolen_by_w2 = sched.stealForWorker(2).?;
+    try std.testing.expectEqual(@as(types.ObjectId, 100), stolen_by_w2.force_thunk);
 
     // No more tasks anywhere.
     try std.testing.expectEqual(@as(?Task, null), sched.stealForWorker(0));
 
-    // Refill and confirm main (worker 0) will take from any queue.
-    try std.testing.expect(sched.queues[0].push(.{ .force_thunk = 7 }));
+    // Worker 0 (main) likewise excludes its own queue but can take
+    // from any other.
+    try std.testing.expect(sched.queues[1].push(.{ .force_thunk = 7 }));
     sched.pending_tasks.store(1, .release);
     const stolen_by_main = sched.stealForWorker(0).?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen_by_main.force_thunk);
@@ -545,18 +553,20 @@ test "scheduler helpers run their loop and shut down cleanly" {
     defer sched.deinit();
 
     const Ctx = struct {
-        observed: [2]std.atomic.Value(u32) = [_]std.atomic.Value(u32){ .init(0), .init(0) },
+        // Indexed by worker_id; entry 0 unused since main doesn't run
+        // this loop in the test (no caller is driving worker 0).
+        observed: [3]std.atomic.Value(u32) = [_]std.atomic.Value(u32){ .init(0), .init(0), .init(0) },
     };
     var ctx: Ctx = .{};
 
     const Worker = struct {
-        fn run(helper_idx: u8, s: *Scheduler, c: *Ctx) void {
+        fn run(worker_id: u8, s: *Scheduler, c: *Ctx) void {
             while (!s.isShutdown()) {
-                const task = s.pop(helper_idx) orelse s.stealAny(helper_idx) orelse {
-                    s.parkHelper(helper_idx);
+                const task = s.pop(worker_id) orelse s.stealAny(worker_id) orelse {
+                    s.parkWorker(worker_id);
                     continue;
                 };
-                _ = c.observed[helper_idx].fetchAdd(switch (task) {
+                _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
                     .force_list_range => 0,
                 }, .acq_rel);
@@ -566,14 +576,14 @@ test "scheduler helpers run their loop and shut down cleanly" {
 
     try sched.start(Worker.run, &ctx);
 
-    try std.testing.expect(sched.submit(.{ .force_thunk = 5 }));
-    try std.testing.expect(sched.submit(.{ .force_thunk = 7 }));
+    try std.testing.expect(sched.submit(.{ .force_thunk = 5 }, 0));
+    try std.testing.expect(sched.submit(.{ .force_thunk = 7 }, 0));
 
     // Spin until the total is observed. Futex wake latency can easily
     // dominate a tight spin loop, so we yield to the OS on every probe.
     var spins: u32 = 0;
     while (true) : (spins += 1) {
-        const total = ctx.observed[0].load(.acquire) + ctx.observed[1].load(.acquire);
+        const total = ctx.observed[1].load(.acquire) + ctx.observed[2].load(.acquire);
         if (total == 12) break;
         if (spins > 100_000) return error.HelpersDidNotProcess;
         std.Thread.yield() catch {};
