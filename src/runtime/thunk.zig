@@ -37,21 +37,20 @@ pub const ThunkState = enum(u32) {
     errored = 4,
 };
 
-/// Identity of whoever is currently claiming a thunk. Packs:
-///   high byte (bits 24..31): worker_id (which OS thread).
-///   low 24 bits (bits 0..23): fiber id within that worker's pool.
+/// Identity of whoever is currently claiming a thunk. Each fiber is
+/// assigned a globally unique 32-bit id at allocation time (from the
+/// scheduler's `next_fiber_id` counter). The claimer is just that id.
 ///
-/// Combined, they identify a single in-progress force operation, which
-/// is what blackhole detection cares about: same fiber re-entering its
-/// own evaluation = real recursion; different fiber on same worker =
-/// must wait (no spurious blackhole). The 24-bit fiber id gives ~16M
-/// fibers per worker, well past the realistic high-water on any
-/// reasonable workload.
+/// Blackhole detection compares ids directly: same fiber re-entering
+/// its own evaluation = real recursion; different fiber on any worker
+/// = must wait. The id is stable across fiber migration (F1 unpin),
+/// so a fiber that wakes on a different worker than where it was
+/// allocated still presents the same identity.
 pub const ClaimerId = u32;
 pub const INVALID_CLAIMER: ClaimerId = std.math.maxInt(ClaimerId);
 
-pub fn makeClaimer(worker_id: u8, fiber_id: u32) ClaimerId {
-    return (@as(ClaimerId, worker_id) << 24) | (fiber_id & 0x00FFFFFF);
+pub fn makeClaimer(fiber_id: u32) ClaimerId {
+    return fiber_id;
 }
 
 /// Lightweight linked-list node used to enroll fibers on a thunk's
@@ -381,7 +380,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
     const Forcer = struct {
         fn run(th: *Thunk, value: i64, ready: *std.atomic.Value(u8), release_now: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(makeClaimer(0, 0))) {
+            switch (th.tryForce(makeClaimer(0))) {
                 .claimed => {},
                 else => return,
             }
@@ -399,7 +398,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
     // Worker 1 sees .busy, enrolls a waiter that flips an atomic flag
     // when the resolver fires.
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .busy => {},
         else => unreachable,
     }
@@ -419,7 +418,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
     while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
     t.join();
 
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .already_resolved => |v| try std.testing.expectEqual(@as(i64, 99), v.asInt()),
         else => return error.UnexpectedOutcome,
     }
@@ -427,7 +426,7 @@ test "thunk: cross-worker enroll + resolve signals waiter" {
 
 test "thunk: same claimer recursive force returns blackhole" {
     var thunk = Thunk.init(Value.null_val);
-    const me = makeClaimer(0, 0);
+    const me = makeClaimer(0);
 
     switch (thunk.tryForce(me)) {
         .claimed => {},
@@ -443,8 +442,8 @@ test "thunk: same claimer recursive force returns blackhole" {
 test "thunk: enrollWaiter adds to list and resolve drains it" {
     var thunk = Thunk.init(Value.null_val);
 
-    const me = makeClaimer(0, 0);
-    const other = makeClaimer(0, 1);
+    const me = makeClaimer(0);
+    const other = makeClaimer(1);
 
     // Claim as slot 0.
     switch (thunk.tryForce(me)) {
@@ -481,7 +480,7 @@ test "thunk: enrollWaiter adds to list and resolve drains it" {
 
 test "thunk: enrollWaiter refuses to enroll on already-resolved thunk" {
     var thunk = Thunk.init(Value.null_val);
-    const me = makeClaimer(0, 0);
+    const me = makeClaimer(0);
 
     switch (thunk.tryForce(me)) {
         .claimed => {},
@@ -497,13 +496,12 @@ test "thunk: enrollWaiter refuses to enroll on already-resolved thunk" {
     try std.testing.expect(!thunk.enrollWaiter(&w.waiter));
 }
 
-test "thunk: same worker different fibers see .busy, not blackhole" {
-    // The whole point of widening claimer to (worker, slot): two fibers
-    // on the same worker must not falsely report recursion when one
-    // touches a thunk the other claimed.
+test "thunk: different fibers see .busy, not blackhole" {
+    // Distinct claimers (different fiber ids) must not falsely report
+    // recursion when one touches a thunk the other claimed.
     var thunk = Thunk.init(Value.null_val);
-    const slot_a = makeClaimer(0, 0);
-    const slot_b = makeClaimer(0, 1);
+    const slot_a = makeClaimer(0);
+    const slot_b = makeClaimer(1);
 
     switch (thunk.tryForce(slot_a)) {
         .claimed => {},
@@ -520,7 +518,7 @@ test "thunk: errored caches error and replays on next force" {
     const allocator = std.testing.allocator;
     var thunk = Thunk.init(Value.null_val);
     defer freeErroredInfoForTest(&thunk, allocator);
-    const me = makeClaimer(0, 0);
+    const me = makeClaimer(0);
 
     switch (thunk.tryForce(me)) {
         .claimed => {},
@@ -531,7 +529,7 @@ test "thunk: errored caches error and replays on next force" {
     info.* = .{ .err = error.NixThrow, .message = owned_msg };
     thunk.markErrored(info);
 
-    switch (thunk.tryForce(makeClaimer(0, 1))) {
+    switch (thunk.tryForce(makeClaimer(1))) {
         .errored => |got| {
             try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err);
             try std.testing.expect(got.*.message != null);
@@ -540,7 +538,7 @@ test "thunk: errored caches error and replays on next force" {
         else => return error.ExpectedErroredOutcome,
     }
     // Replay is idempotent.
-    switch (thunk.tryForce(makeClaimer(0, 2))) {
+    switch (thunk.tryForce(makeClaimer(2))) {
         .errored => |got| try std.testing.expectEqual(@as(anyerror, error.NixThrow), got.*.err),
         else => return error.ExpectedErroredOutcome,
     }
@@ -564,7 +562,7 @@ test "thunk: errored wakes enrolled waiters" {
 
     const Failer = struct {
         fn run(alloc: std.mem.Allocator, th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(makeClaimer(0, 0))) {
+            switch (th.tryForce(makeClaimer(0))) {
                 .claimed => {},
                 else => return,
             }
@@ -582,7 +580,7 @@ test "thunk: errored wakes enrolled waiters" {
 
     while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
 
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .busy => {},
         else => return error.ExpectedBusy,
     }
@@ -603,7 +601,7 @@ test "thunk: errored wakes enrolled waiters" {
     while (signaled.load(.acquire) == 0) std.atomic.spinLoopHint();
     t.join();
 
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .errored => {},
         else => return error.ExpectedErroredOutcome,
     }
@@ -614,7 +612,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     const Failer = struct {
         fn run(th: *Thunk, claimed_signal: *std.atomic.Value(u8), go: *std.atomic.Value(u8)) void {
-            switch (th.tryForce(makeClaimer(0, 0))) {
+            switch (th.tryForce(makeClaimer(0))) {
                 .claimed => {},
                 else => return,
             }
@@ -630,7 +628,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     while (claimed_signal.load(.acquire) == 0) std.atomic.spinLoopHint();
 
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .busy => {},
         else => return error.ExpectedBusy,
     }
@@ -653,7 +651,7 @@ test "thunk: reset wakes waiters and lets them retry" {
 
     // After reset, the thunk is back to .unresolved — a fresh tryForce
     // should claim it.
-    switch (thunk.tryForce(makeClaimer(1, 0))) {
+    switch (thunk.tryForce(makeClaimer(0x10000000))) {
         .claimed => {},
         else => return error.ExpectedClaimedAfterReset,
     }

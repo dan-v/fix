@@ -138,6 +138,11 @@ pub const Scheduler = struct {
     wake_words: []std.atomic.Value(u32),
     shutdown_flag: std.atomic.Value(bool),
     next_victim: std.atomic.Value(u32),
+    /// Monotonic counter handing out fresh fiber ids at allocation.
+    /// Fiber ids are scheduler-global so a fiber's identity doesn't
+    /// change when it migrates across workers (F1 unpin). Used to
+    /// construct `ClaimerId` and to label the fiber in traces.
+    next_fiber_id: std.atomic.Value(u32),
     started: std.atomic.Value(bool),
     /// Total tasks currently pending across all helper queues. Used to
     /// (a) skip submissions when the backlog already saturates helpers
@@ -199,6 +204,7 @@ pub const Scheduler = struct {
             .wake_words = wake_words,
             .shutdown_flag = .init(false),
             .next_victim = .init(0),
+            .next_fiber_id = .init(0),
             .started = .init(false),
             .pending_tasks = .init(0),
             .n_speculative_ok = .init(0),
@@ -215,6 +221,13 @@ pub const Scheduler = struct {
             .disable_speculation = false,
             .disable_fanout = false,
         };
+    }
+
+    /// Allocate a fresh globally-unique fiber id. Called from
+    /// `Worker.allocateFiber` so claimer identity doesn't depend on
+    /// the worker that happened to create the fiber.
+    pub fn allocFiberId(self: *Scheduler) u32 {
+        return self.next_fiber_id.fetchAdd(1, .monotonic);
     }
 
     pub fn stats(self: *const Scheduler) Stats {

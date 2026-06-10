@@ -101,7 +101,9 @@ pub const Worker = struct {
     init_vm_fn: InitVmFn,
 
     /// Every fiber we have ever allocated. Owned by the Worker; freed in
-    /// deinit. Index in this list = fiber_id (stable identity).
+    /// deinit. The list is used purely for ownership/teardown — fiber
+    /// ids are now globally allocated by the scheduler and don't map
+    /// to positions in this list.
     fibers: std.ArrayList(*Fiber),
 
     /// LIFO of fibers that have finished their task and are ready to be
@@ -337,7 +339,7 @@ pub const Worker = struct {
     }
 
     fn allocateFiber(self: *Worker) !*Fiber {
-        const fiber_id: u32 = @intCast(self.fibers.items.len);
+        const fiber_id = self.scheduler.allocFiberId();
         const f = try self.allocator.create(Fiber);
         errdefer self.allocator.destroy(f);
 
@@ -358,7 +360,7 @@ pub const Worker = struct {
             .waiter = .{ .wake_fn = Fiber.wakeImpl },
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
-        f.vm.claimer_id = thunk_mod.makeClaimer(self.worker_id, fiber_id);
+        f.vm.claimer_id = thunk_mod.makeClaimer(fiber_id);
         // Speculative work captures only the throw message for sticky
         // caching; skip frame-stack allocation on the hot path.
         f.local_trace.frames_disabled = true;
@@ -536,9 +538,17 @@ test "Worker basic init/deinit" {
     try testing.expectEqual(@as(usize, prewarm_fiber_count), worker.fibers.items.len);
     try testing.expect(worker.free_head != null);
     try testing.expect(worker.ready_head.load(.acquire) == null);
-    for (worker.fibers.items, 0..) |f, i| {
-        try testing.expectEqual(@as(u32, @intCast(i)), f.fiber_id);
-        try testing.expectEqual(thunk_mod.makeClaimer(1, @intCast(i)), f.vm.claimer_id);
+    // Fiber ids are now globally allocated by the scheduler — no fixed
+    // mapping to position in the worker's fibers list. Each fiber's
+    // claimer_id should equal `makeClaimer(fiber_id)`.
+    for (worker.fibers.items) |f| {
+        try testing.expectEqual(thunk_mod.makeClaimer(f.fiber_id), f.vm.claimer_id);
         try testing.expectEqual(FiberState.free, f.state);
+    }
+    // All fiber ids should be distinct.
+    for (worker.fibers.items, 0..) |f, i| {
+        for (worker.fibers.items[i + 1 ..]) |g| {
+            try testing.expect(f.fiber_id != g.fiber_id);
+        }
     }
 }

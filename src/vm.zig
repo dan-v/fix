@@ -182,7 +182,9 @@ pub const VM = struct {
             .import_host = import_host,
             .builtins = builtins_value,
             .worker_id = worker_id,
-            .claimer_id = thunk_mod.makeClaimer(worker_id, 0),
+            // Placeholder; overwritten by Worker.allocateFiber with the
+            // fiber's globally-allocated id before the VM runs anything.
+            .claimer_id = thunk_mod.INVALID_CLAIMER,
             .stack = value_stack,
             .sp = 0,
             .sp_high_water = 0,
