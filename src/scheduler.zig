@@ -54,8 +54,14 @@ pub const ForceListRange = struct {
 /// Each Fiber struct (in worker.zig) inlines one of these; the
 /// scheduler holds queues of `*ReadyNode` and the worker recovers
 /// the parent Fiber via `@fieldParentPtr`.
+///
+/// `queued` is a CAS-protected dedup flag: `enqueueReady` only
+/// pushes when it can transition 0→1, and `pop` resets to 0. This
+/// keeps the node from being on the queue more than once even when
+/// multiple wakers and runner-tail paths race to enqueue.
 pub const ReadyNode = struct {
     next: ?*ReadyNode = null,
+    queued: std.atomic.Value(u8) = .init(0),
 };
 
 /// Mutex-protected FIFO of fibers ready to resume. Sits on the
@@ -91,6 +97,10 @@ const ReadyQueue = struct {
         self.head = n.next;
         if (self.head == null) self.tail = null;
         n.next = null;
+        // Mark off-queue so the next `enqueueReady` for this node can
+        // win its CAS. Release-store so it's visible to the next
+        // would-be enqueuer.
+        n.queued.store(0, .release);
         return n;
     }
 };
@@ -369,8 +379,14 @@ pub const Scheduler = struct {
     }
 
     /// Push a woken fiber's ReadyNode onto the target worker's
-    /// ready queue and nudge it.
+    /// ready queue and nudge it. A no-op if the node is already
+    /// queued — the CAS lets multiple racing wakers / runner tails
+    /// safely call this for the same fiber; only the first push
+    /// takes effect, the rest are dropped.
     pub fn enqueueReady(self: *Scheduler, target_worker_id: u8, node: *ReadyNode) void {
+        if (node.queued.cmpxchgStrong(0, 1, .acq_rel, .monotonic) != null) {
+            return;
+        }
         self.ready_queues[target_worker_id].push(node);
         self.wakeWorker(target_worker_id);
     }

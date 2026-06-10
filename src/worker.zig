@@ -88,6 +88,15 @@ pub const Fiber = struct {
     /// to 0 before freeing — protects against a stolen fiber being
     /// freed mid-run.
     in_runfiber: std.atomic.Value(u8),
+    /// Serializes concurrent `runFiber` calls on this fiber. A wake
+    /// can enqueue the `ready_node` while the fiber is mid-`resume_`;
+    /// a stealer that pops it would otherwise call `resume_` on the
+    /// running fiber concurrently with the in-flight resumer,
+    /// swapping into the same context from two threads → garbage
+    /// RIP / crash. The mutex makes those calls strictly sequential.
+    /// `ReadyNode.queued` independently prevents double-enqueue, so
+    /// in normal flow the mutex is uncontended.
+    run_mu: stable.SpinMutex,
     /// Task currently assigned to this fiber. Read by the fiber's entry
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
@@ -311,11 +320,21 @@ pub const Worker = struct {
     }
 
     /// Resume the fiber and update bookkeeping based on what state it
-    /// returned in. The fiber either yielded (still `.suspended`),
+    /// returned in. The fiber either yielded (still `.suspended`) or
     /// finished its work (entry returned → reset state to `.free` and
-    /// push onto free list), or in a degenerate case is somehow still
-    /// running (treated as same as suspended; the next wake will hit it).
+    /// push onto free list).
+    ///
+    /// `run_mu` serializes concurrent runners for this fiber. If a
+    /// wake arrives mid-`resume_` and the wake-side enqueueReady
+    /// pushes our `ready_node`, a stealer popping it ends up here
+    /// too — the mutex blocks them until the current resume completes,
+    /// so `resume_` never overlaps with another `resume_` on the same
+    /// fiber. In normal (uncontended) execution the lock/unlock is
+    /// two atomic ops.
     fn runFiber(self: *Worker, f: *Fiber) void {
+        f.run_mu.lock();
+        defer f.run_mu.unlock();
+
         const t0 = nanoMonotonic();
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
@@ -336,8 +355,10 @@ pub const Worker = struct {
             },
             .suspended => {
                 // Yielded inside the body (force.busy enrolled on a
-                // waiter list). The fiber's state was set to .suspended
-                // by force.zig before yield; we just leave it.
+                // waiter list). If the waiter has already resolved,
+                // wake_fn will have enqueued our ready_node — the
+                // `ReadyNode.queued` CAS gives us idempotent enqueue,
+                // so it's fine if multiple paths try to push.
             },
             .ready, .running => unreachable,
         }
@@ -396,6 +417,7 @@ pub const Worker = struct {
             .vm = vm,
             .state = .free,
             .in_runfiber = .init(0),
+            .run_mu = .{},
             .current_task = null,
             .next_free = null,
             .ready_node = .{},
