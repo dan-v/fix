@@ -190,7 +190,16 @@ pub const Scheduler = struct {
     /// thread (it's the one delivering the result), so we spawn
     /// `worker_count - 1` helper threads in `start()`.
     worker_count: u8,
-    queues: []TaskQueue,
+    /// Per-worker queue of *demand-driven* tasks — submitted via
+    /// `submitUrgent`. Drained with priority over speculative tasks so
+    /// fan-out and strictness-driven submissions don't sit behind a
+    /// queued speculation backlog.
+    urgent_queues: []TaskQueue,
+    /// Per-worker queue of *speculative* tasks — submitted via
+    /// `submit` when `makeThunk`'s heuristic suggests the body is
+    /// substantial enough to pre-run. Drained only when there's no
+    /// ready fiber or urgent task to handle.
+    spec_queues: []TaskQueue,
     /// Per-worker ready-fiber queues. Producers are any thread waking a
     /// fiber (via thunk resolve → `Fiber.wakeImpl`); consumers are the
     /// owning worker (most often) or any worker stealing when its own
@@ -238,16 +247,26 @@ pub const Scheduler = struct {
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !Scheduler {
         const safe_worker_count: u8 = if (worker_count == 0) 1 else worker_count;
 
-        // One queue and one wake word per worker — including worker 0
-        // (main). Symmetric task ownership; the only thing not
-        // symmetric is who spawned which thread.
-        const queues = try allocator.alloc(TaskQueue, safe_worker_count);
-        errdefer allocator.free(queues);
-        var initialized: usize = 0;
-        errdefer for (queues[0..initialized]) |*q| q.deinit(allocator);
-        for (queues) |*q| {
+        // Two queues per worker — urgent (demand-driven) and speculative.
+        // Plus one ready-fiber queue and one wake word. Symmetric task
+        // ownership; the only thing not symmetric is who spawned which
+        // thread.
+        const urgent_queues = try allocator.alloc(TaskQueue, safe_worker_count);
+        errdefer allocator.free(urgent_queues);
+        var urgent_init: usize = 0;
+        errdefer for (urgent_queues[0..urgent_init]) |*q| q.deinit(allocator);
+        for (urgent_queues) |*q| {
             q.* = try TaskQueue.init(allocator, 1024);
-            initialized += 1;
+            urgent_init += 1;
+        }
+
+        const spec_queues = try allocator.alloc(TaskQueue, safe_worker_count);
+        errdefer allocator.free(spec_queues);
+        var spec_init: usize = 0;
+        errdefer for (spec_queues[0..spec_init]) |*q| q.deinit(allocator);
+        for (spec_queues) |*q| {
+            q.* = try TaskQueue.init(allocator, 1024);
+            spec_init += 1;
         }
 
         const ready_queues = try allocator.alloc(ReadyQueue, safe_worker_count);
@@ -265,7 +284,8 @@ pub const Scheduler = struct {
         return .{
             .allocator = allocator,
             .worker_count = safe_worker_count,
-            .queues = queues,
+            .urgent_queues = urgent_queues,
+            .spec_queues = spec_queues,
             .ready_queues = ready_queues,
             .threads = threads,
             .wake_words = wake_words,
@@ -340,8 +360,10 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         self.shutdown();
         self.allocator.free(self.wake_words);
-        for (self.queues) |*q| q.deinit(self.allocator);
-        self.allocator.free(self.queues);
+        for (self.urgent_queues) |*q| q.deinit(self.allocator);
+        self.allocator.free(self.urgent_queues);
+        for (self.spec_queues) |*q| q.deinit(self.allocator);
+        self.allocator.free(self.spec_queues);
         self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
     }
@@ -426,7 +448,7 @@ pub const Scheduler = struct {
             _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
             return false;
         }
-        if (self.pushRoundRobin(task, submitter_id)) {
+        if (self.pushRoundRobin(self.spec_queues, task, submitter_id)) {
             _ = self.n_speculative_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -434,12 +456,13 @@ pub const Scheduler = struct {
         return false;
     }
 
-    /// Submit a *demand-driven* task. Same submitter-self-exclusion
-    /// rule as `submit`.
+    /// Submit a *demand-driven* task. Goes to the urgent queue —
+    /// drained before any speculative backlog so fan-out work
+    /// bypasses queued speculation.
     pub fn submitUrgent(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_fanout) return false;
-        if (self.pushRoundRobin(task, submitter_id)) {
+        if (self.pushRoundRobin(self.urgent_queues, task, submitter_id)) {
             _ = self.n_urgent_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -447,13 +470,13 @@ pub const Scheduler = struct {
         return false;
     }
 
-    fn pushRoundRobin(self: *Scheduler, task: Task, submitter_id: u8) bool {
+    fn pushRoundRobin(self: *Scheduler, queues: []TaskQueue, task: Task, submitter_id: u8) bool {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == submitter_id) continue;
-            if (self.queues[idx].push(task)) {
+            if (queues[idx].push(task)) {
                 // Wake only when the queue might have been idle.
                 // `fetchAdd` returns the previous count; if it was zero,
                 // helpers are likely parked and need a futex_wake. Past
@@ -467,22 +490,25 @@ pub const Scheduler = struct {
         return false;
     }
 
-    /// Pop a task from `worker_id`'s own queue. Every worker — main and
-    /// helpers — owns a queue post-F1.
+    /// Pop a task from `worker_id`'s own queues — urgent first, then
+    /// speculative. Every worker — main and helpers — owns both
+    /// queues post-F1.
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
-        const task = self.queues[worker_id].pop() orelse return null;
+        const task = self.urgent_queues[worker_id].pop() orelse
+            self.spec_queues[worker_id].pop() orelse
+            return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
         _ = self.n_pops.fetchAdd(1, .monotonic);
         return task;
     }
 
-    /// Try to steal one task from any worker's queue, excluding the
-    /// caller's own (`worker_id`). All workers participate in steal
-    /// symmetrically now.
+    /// Try to steal one task from any worker's queues, urgent first
+    /// then speculative, excluding the caller's own (`worker_id`).
     pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
         if (self.worker_count < 2) return null;
-        return self.stealExcluding(worker_id);
+        if (self.stealExcluding(self.urgent_queues, worker_id)) |t| return t;
+        return self.stealExcluding(self.spec_queues, worker_id);
     }
 
     /// Alias for `stealForWorker` — workers use this from their drain
@@ -492,13 +518,13 @@ pub const Scheduler = struct {
         return self.stealForWorker(worker_id);
     }
 
-    fn stealExcluding(self: *Scheduler, exclude: ?u8) ?Task {
+    fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
-            if (exclude) |e| if (idx == e) continue;
-            if (self.queues[idx].steal()) |task| {
+            if (idx == exclude) continue;
+            if (queues[idx].steal()) |task| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
                 _ = self.n_steals.fetchAdd(1, .monotonic);
                 return task;
@@ -573,16 +599,16 @@ test "scheduler push/pop/steal work for a single worker" {
 
     const t1: Task = .{ .force_thunk = 7 };
     const t2: Task = .{ .force_thunk = 13 };
-    // Push directly to worker 1's queue (helper).
-    try std.testing.expect(sched.queues[1].push(t1));
-    try std.testing.expect(sched.queues[1].push(t2));
+    // Push directly to worker 1's urgent queue.
+    try std.testing.expect(sched.urgent_queues[1].push(t1));
+    try std.testing.expect(sched.urgent_queues[1].push(t2));
 
     // LIFO from owner.
     const popped = sched.pop(1).?;
     try std.testing.expectEqual(@as(types.ObjectId, 13), popped.force_thunk);
 
     // Steal sees the older one.
-    const stolen = sched.queues[1].steal().?;
+    const stolen = sched.urgent_queues[1].steal().?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen.force_thunk);
 
     try std.testing.expectEqual(@as(?Task, null), sched.pop(1));
@@ -598,8 +624,9 @@ test "scheduler.submit round-robins across workers" {
         try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
     }
 
+    // submit pushes to spec_queues.
     var total: u32 = 0;
-    for (sched.queues) |*q| {
+    for (sched.spec_queues) |*q| {
         var count: u32 = 0;
         while (q.steal()) |_| count += 1;
         total += count;
@@ -618,12 +645,14 @@ test "submitUrgent bypasses the speculation backlog cap" {
     while (i < 64) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
     try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }, 0));
 
-    // `submitUrgent` should still go through — the queue capacity is 1024.
+    // `submitUrgent` should still go through — it lives on a separate
+    // queue with its own 1024-element capacity.
     try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 100 }, 0));
     try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 101 }, 0));
 
     var drained: u32 = 0;
-    for (sched.queues) |*q| while (q.steal()) |_| { drained += 1; };
+    for (sched.urgent_queues) |*q| while (q.steal()) |_| { drained += 1; };
+    for (sched.spec_queues) |*q| while (q.steal()) |_| { drained += 1; };
     try std.testing.expectEqual(@as(u32, 66), drained);
 }
 
@@ -632,16 +661,16 @@ test "stealForWorker: each worker excludes its own queue" {
     defer sched.deinit();
     try std.testing.expectEqual(@as(u8, 3), sched.worker_count);
 
-    // Put one task in each of worker 1 and worker 2's queues.
-    try std.testing.expect(sched.queues[1].push(.{ .force_thunk = 100 }));
-    try std.testing.expect(sched.queues[2].push(.{ .force_thunk = 200 }));
+    // Put one task in each of worker 1 and worker 2's urgent queues.
+    try std.testing.expect(sched.urgent_queues[1].push(.{ .force_thunk = 100 }));
+    try std.testing.expect(sched.urgent_queues[2].push(.{ .force_thunk = 200 }));
     sched.pending_tasks.store(2, .release);
 
-    // Worker 1 must not steal from its own queue (queues[1]).
+    // Worker 1 must not steal from its own queue.
     const stolen_by_w1 = sched.stealForWorker(1).?;
     try std.testing.expectEqual(@as(types.ObjectId, 200), stolen_by_w1.force_thunk);
 
-    // Worker 2 must not steal from its own queue (queues[2]).
+    // Worker 2 must not steal from its own queue.
     const stolen_by_w2 = sched.stealForWorker(2).?;
     try std.testing.expectEqual(@as(types.ObjectId, 100), stolen_by_w2.force_thunk);
 
@@ -650,7 +679,7 @@ test "stealForWorker: each worker excludes its own queue" {
 
     // Worker 0 (main) likewise excludes its own queue but can take
     // from any other.
-    try std.testing.expect(sched.queues[1].push(.{ .force_thunk = 7 }));
+    try std.testing.expect(sched.urgent_queues[1].push(.{ .force_thunk = 7 }));
     sched.pending_tasks.store(1, .release);
     const stolen_by_main = sched.stealForWorker(0).?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen_by_main.force_thunk);
