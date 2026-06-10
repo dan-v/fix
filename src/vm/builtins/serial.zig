@@ -7,7 +7,7 @@ const int_mod = @import("../../runtime/int.zig");
 const version = @import("../../runtime/version.zig");
 const regex = @import("../../runtime/regex.zig");
 const toml = @import("../../runtime/toml.zig");
-const ThunkState = @import("../../runtime/thunk.zig").ThunkState;
+const FutureState = @import("../../runtime/thunk.zig").FutureState;
 const collections = @import("collections.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
@@ -292,13 +292,13 @@ fn xmlVisibleValue(self: anytype, value: Value) anyerror!?Value {
 
 fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
     const thunk = try self.heap.getThunk(id);
-    const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
+    const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
     if (state != .resolved) return null;
     // Speculation can resolve a thunk before any real observer touches it.
     // Lazy XML treats those as still unevaluated so speculation stays
     // invisible — the rendered output matches the no-helper case.
     if (!thunk.isDemanded()) return null;
-    return xmlVisibleValue(self, thunk.result.result);
+    return xmlVisibleValue(self, thunk.future.result.result);
 }
 
 fn writeXmlList(

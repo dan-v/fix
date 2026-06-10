@@ -54,10 +54,10 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // matched on `discriminant == .thunk`, so the object slot must be
     // a `Thunk`.
     const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
-    const state = thunk.state.load(.acquire);
-    if (state == @intFromEnum(thunk_mod.ThunkState.resolved)) {
+    const state = thunk.future.state.load(.acquire);
+    if (state == @intFromEnum(thunk_mod.FutureState.resolved)) {
         if (demand) thunk.markDemanded();
-        return thunk.result.result;
+        return thunk.future.result.result;
     }
     return forceThunkImpl(self, value, demand);
 }

@@ -22,7 +22,6 @@ const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
 const derivation = @import("derivation.zig");
 const Value = @import("runtime/value.zig").Value;
-const ThunkState = @import("runtime/thunk.zig").ThunkState;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");

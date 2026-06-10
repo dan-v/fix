@@ -307,7 +307,7 @@ pub const ObjectHeap = struct {
                 .closure => 2,
                 .builtin_closure => 3,
                 .thunk => |t| blk: {
-                    const state = t.state.load(.acquire);
+                    const state = t.future.state.load(.acquire);
                     const s_index: usize = @intCast(@min(state, 4));
                     result.thunk_states[s_index] += 1;
                     break :blk 4;

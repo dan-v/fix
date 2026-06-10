@@ -3,7 +3,7 @@
 const std = @import("std");
 const types = @import("../runtime/types.zig");
 const Value = @import("../runtime/value.zig").Value;
-const ThunkState = @import("../runtime/thunk.zig").ThunkState;
+const FutureState = @import("../runtime/thunk.zig").FutureState;
 
 pub fn writeValue(ev: anytype, writer: *std.Io.Writer, value: Value) !void {
     var printer = ValuePrinter(@TypeOf(ev)){
@@ -155,9 +155,9 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             defer self.leave();
 
             const thunk = try self.ev.heap.getThunk(id);
-            const state: ThunkState = @enumFromInt(thunk.state.load(.acquire));
+            const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
             if (state == .resolved) {
-                try self.write(thunk.result.result);
+                try self.write(thunk.future.result.result);
                 return;
             }
             // Pass-through (cell-like) thunks hold a value that hasn't been

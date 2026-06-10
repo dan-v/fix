@@ -1,11 +1,18 @@
-//! Atomic lazy thunk — the core of multithreaded lazy evaluation.
+//! Atomic lazy thunk and the `Future` primitive it's built on.
 //!
-//! A thunk is a suspended computation that doubles as a memoised
-//! future: the first fiber to CAS-claim it runs the suspended target;
-//! others enroll a `Waiter` and yield until the claimer publishes a
-//! result (or resets / blackholes). A fiber that tries to force a
-//! thunk under the *same* claimer id it already holds sees
+//! `Future` is the shared claim+wait state machine: a state word, an
+//! optional result, a waiter list, and the methods that drive
+//! transitions atomically. It's the abstraction `Thunk` is built on
+//! and the one `eval/imports.zig`'s `ImportEntry` also embeds. The
+//! protocol is identical wherever it appears: the first fiber to
+//! CAS-claim runs the work; others enroll a `Waiter` and yield until
+//! the claimer publishes a terminal state. A fiber that tries to
+//! force a future under the *same* claimer id it already holds sees
 //! `.blackhole` — real recursion within one logical evaluation.
+//!
+//! `Thunk` layers a `ThunkTarget` (what to evaluate) and a
+//! `demanded` flag (was this resolution observed by a real caller?)
+//! on top of `Future`.
 //!
 //! Post-F1 architecture notes:
 //!   - Claimer identity (`ClaimerId`) is a globally-allocated fiber id
@@ -21,10 +28,12 @@
 //!     There is no special "main" path through this module.
 //!
 //! Memory model:
-//!   - `state` transitions follow release-acquire pairs.
-//!   - `result` is written before the `state → resolved` store-release;
-//!     readers observe it after acquire-loading state == resolved.
-//!   - `target` is set at construction and never mutated.
+//!   - `Future.state` transitions follow release-acquire pairs.
+//!   - `Future.result` is written before the `state → resolved`
+//!     store-release; readers observe it after acquire-loading
+//!     state == resolved.
+//!   - `Thunk.target` is set at construction and never mutated
+//!     (except by `publishCellBinding` under EVALUATING claim).
 //!   - Waiter list manipulation is protected by `waiters_mu`. Resolvers
 //!     re-acquire the lock after the state store so any concurrent
 //!     `enrollWaiter` either sees the new state (and refuses) or its
@@ -36,16 +45,18 @@ const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
 const stable = @import("stable_segments.zig");
 
-/// `state` is a u32 so we can `futex_wait` / `futex_wake` directly on it.
-/// The low byte encodes the lifecycle (ThunkState); the rest is zero.
-pub const ThunkState = enum(u32) {
+/// `state` is a u32 so it's the right shape for futex-style ops if we
+/// ever need them. The low byte encodes the lifecycle (`FutureState`);
+/// the rest is zero.
+pub const FutureState = enum(u32) {
     unresolved = 0,
     evaluating = 1,
     resolved = 2,
     blackhole = 3,
-    /// Body ran and failed deterministically. The captured error
-    /// (and optional message) is cached on the thunk so subsequent
-    /// forces don't re-run a body whose outcome is already known.
+    /// The work ran and failed deterministically. The captured error
+    /// (and optional message) is cached in the sidecar `ErrorInfo` so
+    /// subsequent forces don't re-run a body whose outcome is already
+    /// known.
     errored = 4,
 };
 
@@ -65,15 +76,15 @@ pub fn makeClaimer(fiber_id: u32) ClaimerId {
     return fiber_id;
 }
 
-/// Lightweight linked-list node used to enroll fibers on a thunk's
-/// waiter list. The thunk owns the list; the embedding struct (a
+/// Lightweight linked-list node used to enroll fibers on a future's
+/// waiter list. The future owns the list; the embedding struct (a
 /// FiberSlot in worker.zig) supplies `wake_fn`, which is invoked when
-/// the thunk resolves/resets/blackholes. `wake_fn` typically marks
+/// the future resolves/resets/blackholes. `wake_fn` typically marks
 /// the parent slot resumable and nudges its owning worker.
 ///
 /// Embedders use `@fieldParentPtr("waiter", w)` inside `wake_fn` to
-/// recover the parent. The Thunk module is intentionally agnostic
-/// about what the parent is — it just walks pointers.
+/// recover the parent. The Future is intentionally agnostic about
+/// what the parent is — it just walks pointers.
 pub const Waiter = struct {
     next: ?*Waiter = null,
     wake_fn: *const fn (*Waiter) void,
@@ -136,128 +147,94 @@ pub const ForceOutcome = union(enum) {
     errored: *const ErrorInfo,
 };
 
-/// Atomic lazy thunk. Multiple threads may concurrently try to force a
-/// thunk: the first thread CAS-claims it and runs the suspended target;
-/// others see `.busy` and enroll a fiber `Waiter` on `waiters_head`,
-/// yielding back to their worker until the claimer publishes a result
-/// (or resets on error / blackholes).
+/// Shared claim+wait state machine. Both `Thunk` and `ImportEntry`
+/// embed one. A `Future` owns: a 5-state lifecycle, a claimer id, a
+/// result-or-error slot, and a fiber waiter list.
 ///
-/// `demanded` distinguishes a thunk resolved because a real caller
-/// observed it from one resolved only by speculative pre-forcing. Lazy
-/// renderers (XML lazy mode) treat the latter as "unevaluated" so
-/// speculation stays invisible to users.
-pub const Thunk = struct {
+/// `tryForce` is the central method. The first caller to observe
+/// `.unresolved` CAS-claims to `.evaluating` and gets `.claimed` —
+/// it is now responsible for computing the work and calling exactly
+/// one of `resolve`, `markErrored`, `reset`, or `blackhole`. Other
+/// callers see `.busy` and must enroll a `Waiter` via `enrollWaiter`,
+/// then yield until `wake_fn` fires.
+pub const Future = struct {
     state: std.atomic.Value(u32),
     claimer: std.atomic.Value(ClaimerId),
+    /// Was this future's resolution observed by a real caller (vs.
+    /// pre-forced by speculation / fan-out)? Used by lazy renderers
+    /// (XML lazy mode) to treat unobserved resolutions as still
+    /// "unevaluated" so speculation stays invisible. Lives inside
+    /// `Future` rather than `Thunk` so the hot `forceValueImpl`
+    /// fast-path (state load + demand mark + result read) stays
+    /// inside a single cache line. `ImportEntry` doesn't read it but
+    /// pays one byte for the field — there are O(100s) of imports vs.
+    /// millions of thunks, so the trade is firmly in the thunk's
+    /// favour.
     demanded: std.atomic.Value(u8),
-    target: ThunkTarget,
     /// Holds the resolved Value when `state == .resolved`; reinterpreted
     /// as a `*ErrorInfo` via `error_info_bits` when `state == .errored`
-    /// — see `errored` / `cachedErrorInfo`. Undefined for other states.
+    /// — see `cachedErrorInfo`. Undefined for other states.
     result: ResultOrError,
-    /// Singly-linked list of fibers parked on this thunk. Manipulated
+    /// Singly-linked list of fibers parked on this future. Manipulated
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
     waiters_head: ?*Waiter,
     waiters_mu: stable.SpinMutex,
 
-    pub fn init(closure: Value) Thunk {
+    pub fn init() Future {
         return .{
-            .state = .init(@intFromEnum(ThunkState.unresolved)),
+            .state = .init(@intFromEnum(FutureState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
             .demanded = .init(0),
+            .result = .{ .result = Value.null_val },
             .waiters_head = null,
             .waiters_mu = .{},
-            .target = .{ .closure = closure },
-            .result = .{ .result = Value.null_val },
         };
     }
 
-    pub fn initBytecode(chunk_id: ChunkId, upvalues: []const Value) Thunk {
+    /// Construct a Future born in `.evaluating` claimed by `claimer`.
+    /// Used by `Thunk.initBindingCell` so a concurrent force attempt
+    /// sees BUSY and parks instead of CAS-claiming a placeholder.
+    pub fn initClaimed(claimer: ClaimerId) Future {
         return .{
-            .state = .init(@intFromEnum(ThunkState.unresolved)),
-            .claimer = .init(INVALID_CLAIMER),
-            .demanded = .init(0),
-            .waiters_head = null,
-            .waiters_mu = .{},
-            .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
-            .result = .{ .result = Value.null_val },
-        };
-    }
-
-    /// A "cell" thunk: holds a Value to be forced lazily. Used by
-    /// `builtins.deepSeq`-style memoisation and by `make_cell` where
-    /// the wrapped value is known at construction time.
-    pub fn initPassThrough(value: Value) Thunk {
-        return .{
-            .state = .init(@intFromEnum(ThunkState.unresolved)),
-            .claimer = .init(INVALID_CLAIMER),
-            .demanded = .init(0),
-            .waiters_head = null,
-            .waiters_mu = .{},
-            .target = .{ .pass_through = value },
-            .result = .{ .result = Value.null_val },
-        };
-    }
-
-    /// A "binding cell" thunk: created by `init_cell_slot` for
-    /// recursive let bindings, BEFORE the RHS is computed. The cell is
-    /// born in `.evaluating` claimed by the creating fiber so any
-    /// concurrent force attempt sees BUSY and parks on the waiter list
-    /// instead of CAS-claiming the placeholder. The creating fiber
-    /// later publishes the real binding via
-    /// `publishCellBinding(val)`, which writes
-    /// `target = pass_through(val)` and transitions back to
-    /// `.unresolved` (keeping pass_through laziness — the cell forces
-    /// `val` only when consumers actually force the cell). Without
-    /// the EVALUATING-on-init guard, a fiber could CAS-claim the cell
-    /// while it still wraps the placeholder null and resolve the cell
-    /// to null, freezing the binding before the creator could publish.
-    pub fn initBindingCell(claimer: ClaimerId) Thunk {
-        return .{
-            .state = .init(@intFromEnum(ThunkState.evaluating)),
+            .state = .init(@intFromEnum(FutureState.evaluating)),
             .claimer = .init(claimer),
             .demanded = .init(0),
+            .result = .{ .result = Value.null_val },
             .waiters_head = null,
             .waiters_mu = .{},
-            // Placeholder; never observed since no fiber can CAS-claim
-            // an `.evaluating` cell, and `publishCellBinding` overwrites
-            // `target` before transitioning back to `.unresolved`.
-            .target = .{ .pass_through = Value.null_val },
-            .result = .{ .result = Value.null_val },
         };
     }
 
-    pub fn markDemanded(self: *Thunk) void {
+    pub inline fn markDemanded(self: *Future) void {
         self.demanded.store(1, .release);
     }
 
-    pub fn isDemanded(self: *const Thunk) bool {
+    pub inline fn isDemanded(self: *const Future) bool {
         return self.demanded.load(.acquire) != 0;
     }
 
-    /// Try to claim this thunk for evaluation by `claimer`. Returns:
+    /// Try to claim this future for evaluation by `claimer`. Returns:
     ///   - `.already_resolved`: the result is published; read `self.result`.
     ///   - `.claimed`: this caller has claimed; must compute and call
-    ///     `resolve`, `errored`, or `reset`.
+    ///     `resolve`, `markErrored`, `reset`, or `blackhole`.
     ///   - `.blackhole`: the SAME claim identity is already evaluating —
     ///     real recursion (a fiber re-entering itself).
     ///   - `.busy`: a different claim identity is evaluating; caller
     ///     must enroll on the waiter list and yield.
     ///   - `.errored`: the body ran and failed deterministically; caller
-    ///     should re-raise the cached error and replay the message onto
-    ///     its trace.
-    pub fn tryForce(self: *Thunk, claimer: ClaimerId) ForceOutcome {
+    ///     should re-raise the cached error.
+    pub fn tryForce(self: *Future, claimer: ClaimerId) ForceOutcome {
         while (true) {
-            const s: ThunkState = @enumFromInt(self.state.load(.acquire));
+            const s: FutureState = @enumFromInt(self.state.load(.acquire));
             switch (s) {
                 .resolved => return .{ .already_resolved = self.result.result },
                 .blackhole => return .blackhole,
                 .errored => return .{ .errored = self.cachedErrorInfo() },
                 .unresolved => {
                     const prev = self.state.cmpxchgWeak(
-                        @intFromEnum(ThunkState.unresolved),
-                        @intFromEnum(ThunkState.evaluating),
+                        @intFromEnum(FutureState.unresolved),
+                        @intFromEnum(FutureState.evaluating),
                         .acquire,
                         .monotonic,
                     );
@@ -276,19 +253,19 @@ pub const Thunk = struct {
         }
     }
 
-    /// Enroll a fiber waiter on this thunk. Returns true if the waiter
+    /// Enroll a fiber waiter on this future. Returns true if the waiter
     /// was added to the list (caller should yield and wait for `wake_fn`).
-    /// Returns false if the thunk left `.evaluating` between the caller's
+    /// Returns false if the future left `.evaluating` between the caller's
     /// `tryForce` and now — caller should re-loop `tryForce` instead.
     ///
     /// Ordering: we re-check `state` under the lock so that any caller
     /// that observes `.evaluating` and enrolls is guaranteed to be drained
     /// by the resolver, which takes the same lock after publishing the
     /// new state.
-    pub fn enrollWaiter(self: *Thunk, waiter: *Waiter) bool {
+    pub fn enrollWaiter(self: *Future, waiter: *Waiter) bool {
         self.waiters_mu.lock();
         defer self.waiters_mu.unlock();
-        const s: ThunkState = @enumFromInt(self.state.load(.acquire));
+        const s: FutureState = @enumFromInt(self.state.load(.acquire));
         if (s != .evaluating) return false;
         waiter.next = self.waiters_head;
         self.waiters_head = waiter;
@@ -296,78 +273,53 @@ pub const Thunk = struct {
     }
 
     /// Publish `value` as the result and wake all enrolled fiber waiters.
-    pub fn resolve(self: *Thunk, value: Value) void {
+    pub fn resolve(self: *Future, value: Value) void {
         self.result = .{ .result = value };
         self.claimer.store(INVALID_CLAIMER, .release);
-        self.state.store(@intFromEnum(ThunkState.resolved), .release);
+        self.state.store(@intFromEnum(FutureState.resolved), .release);
         self.wakeFiberWaiters();
     }
 
-    /// Publish a binding cell's value (see `initBindingCell`). Writes
-    /// `target = pass_through(value)` and transitions
-    /// `.evaluating → .unresolved` so the next force runs the normal
-    /// pass_through path (lazy: `value` is forced when consumers force
-    /// the cell, not now). Wakes any waiters parked on the
-    /// `.evaluating` state. Ordering: the plain write to `target` is
-    /// published by the release-store of `state`, which pairs with
-    /// `tryForce`'s acquire-load.
-    pub fn publishCellBinding(self: *Thunk, value: Value) void {
-        self.target = .{ .pass_through = value };
-        self.claimer.store(INVALID_CLAIMER, .release);
-        self.state.store(@intFromEnum(ThunkState.unresolved), .release);
-        self.wakeFiberWaiters();
-    }
-
-    /// Mark a failed evaluation as retryable. Wakes waiters so they can
-    /// re-enter `tryForce`. Use only for *transient* errors (out-of-memory,
-    /// stack overflow, scheduler contention) — for deterministic body
-    /// failures prefer `errored` so the same body isn't re-run for
-    /// nothing.
-    pub fn reset(self: *Thunk) void {
+    /// Drop back to `.unresolved` and wake waiters so they can retry.
+    /// Use only for *transient* errors (out-of-memory, stack overflow,
+    /// scheduler contention) — deterministic failures should go through
+    /// `markErrored` instead.
+    pub fn reset(self: *Future) void {
         self.result = .{ .result = Value.null_val };
         self.claimer.store(INVALID_CLAIMER, .monotonic);
-        self.state.store(@intFromEnum(ThunkState.unresolved), .release);
+        self.state.store(@intFromEnum(FutureState.unresolved), .release);
         self.wakeFiberWaiters();
     }
 
     /// Publish a deterministic body failure and wake waiters. The
-    /// caller owns `info` (and any heap-allocated `info.message`) — by
-    /// convention the heap that owns this thunk also tracks `info` so
-    /// it can release the storage at deinit time. See
-    /// `ObjectHeap.trackErroredInfo`.
-    ///
-    /// Memory model: the info pointer is written into `result.error_info_bits`
-    /// before the release-store of `state → errored`, so any reader
-    /// that acquires `.errored` sees a valid pointer.
-    pub fn markErrored(self: *Thunk, info: *ErrorInfo) void {
-        // Sidecar storage: `result` is unused while errored, so the union
-        // slot doubles as the `*ErrorInfo` pointer. Keeps the Thunk struct
-        // narrow for the common (resolved) case.
+    /// caller owns `info` (and any heap-allocated `info.message`) —
+    /// by convention the storage owner of this future also tracks
+    /// `info` so it can release it at teardown.
+    pub fn markErrored(self: *Future, info: *ErrorInfo) void {
+        // Sidecar storage: `result` is unused while errored, so the
+        // union slot doubles as the `*ErrorInfo` pointer.
         self.result = .{ .error_info_bits = @intFromPtr(info) };
         self.claimer.store(INVALID_CLAIMER, .monotonic);
-        self.state.store(@intFromEnum(ThunkState.errored), .release);
+        self.state.store(@intFromEnum(FutureState.errored), .release);
         self.wakeFiberWaiters();
     }
 
-    /// Read the sidecar `ErrorInfo` pointer. Only valid when
-    /// `state == .errored` — that state's release-acquire pairing
-    /// makes the pointer visible.
-    pub fn cachedErrorInfo(self: *const Thunk) *const ErrorInfo {
+    pub fn cachedErrorInfo(self: *const Future) *const ErrorInfo {
         return @ptrFromInt(self.result.error_info_bits);
     }
 
-    /// Mark this thunk as a blackhole. Wakes waiters so they observe the
-    /// new state and return an error.
-    pub fn blackhole(self: *Thunk) void {
+    /// Mark this future as a blackhole. Wakes waiters so they observe
+    /// the new state and return an error.
+    pub fn blackhole(self: *Future) void {
         self.claimer.store(INVALID_CLAIMER, .monotonic);
-        self.state.store(@intFromEnum(ThunkState.blackhole), .release);
+        self.state.store(@intFromEnum(FutureState.blackhole), .release);
         self.wakeFiberWaiters();
     }
 
     /// Drain the waiter list under the lock, then call each waiter's
     /// `wake_fn` outside the lock so a slow wake doesn't block other
-    /// resolvers waiting to drain their own (different) thunks' lists.
-    fn wakeFiberWaiters(self: *Thunk) void {
+    /// resolvers waiting to drain their own (different) futures' lists.
+    fn wakeFiberWaiters(self: *Future) void {
         self.waiters_mu.lock();
         var head = self.waiters_head;
         self.waiters_head = null;
@@ -378,6 +330,116 @@ pub const Thunk = struct {
             w.wake_fn(w);
             head = next;
         }
+    }
+};
+
+/// Atomic lazy thunk: a `Future` plus a `ThunkTarget` (what to
+/// evaluate) plus a `demanded` flag. `demanded` distinguishes a thunk
+/// resolved because a real caller observed it from one resolved only
+/// by speculative pre-forcing. Lazy renderers (XML lazy mode) treat
+/// the latter as "unevaluated" so speculation stays invisible to
+/// users.
+pub const Thunk = struct {
+    future: Future,
+    target: ThunkTarget,
+
+    pub fn init(closure: Value) Thunk {
+        return .{
+            .future = Future.init(),
+            .target = .{ .closure = closure },
+        };
+    }
+
+    pub fn initBytecode(chunk_id: ChunkId, upvalues: []const Value) Thunk {
+        return .{
+            .future = Future.init(),
+            .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
+        };
+    }
+
+    /// A "cell" thunk: holds a Value to be forced lazily. Used by
+    /// `builtins.deepSeq`-style memoisation and by `make_cell` where
+    /// the wrapped value is known at construction time.
+    pub fn initPassThrough(value: Value) Thunk {
+        return .{
+            .future = Future.init(),
+            .target = .{ .pass_through = value },
+        };
+    }
+
+    /// A "binding cell" thunk: created by `init_cell_slot` for
+    /// recursive let bindings, BEFORE the RHS is computed. The cell is
+    /// born in `.evaluating` claimed by the creating fiber so any
+    /// concurrent force attempt sees BUSY and parks on the waiter list
+    /// instead of CAS-claiming the placeholder. The creating fiber
+    /// later publishes the real binding via `publishCellBinding(val)`,
+    /// which writes `target = pass_through(val)` and transitions back
+    /// to `.unresolved` (keeping pass_through laziness — the cell
+    /// forces `val` only when consumers actually force the cell).
+    /// Without the EVALUATING-on-init guard, a fiber could CAS-claim
+    /// the cell while it still wraps the placeholder null and resolve
+    /// the cell to null, freezing the binding before the creator could
+    /// publish.
+    pub fn initBindingCell(claimer: ClaimerId) Thunk {
+        return .{
+            .future = Future.initClaimed(claimer),
+            // Placeholder; never observed since no fiber can CAS-claim
+            // an `.evaluating` cell, and `publishCellBinding` overwrites
+            // `target` before transitioning back to `.unresolved`.
+            .target = .{ .pass_through = Value.null_val },
+        };
+    }
+
+    pub inline fn markDemanded(self: *Thunk) void {
+        self.future.markDemanded();
+    }
+
+    pub inline fn isDemanded(self: *const Thunk) bool {
+        return self.future.isDemanded();
+    }
+
+    /// Publish a binding cell's value (see `initBindingCell`). Writes
+    /// `target = pass_through(value)` and transitions `.evaluating →
+    /// .unresolved` so the next force runs the normal pass_through
+    /// path. Ordering: the plain write to `target` is published by the
+    /// release-store inside `future.reset`, which pairs with
+    /// `tryForce`'s acquire-load.
+    pub fn publishCellBinding(self: *Thunk, value: Value) void {
+        self.target = .{ .pass_through = value };
+        self.future.reset();
+    }
+
+    // Delegators to the embedded Future. Kept thin (and `inline` for
+    // the hot ones) so callers can keep using `thunk.tryForce(...)`,
+    // `thunk.resolve(...)`, etc., with no extra call frame in the hot
+    // force path.
+
+    pub inline fn tryForce(self: *Thunk, claimer: ClaimerId) ForceOutcome {
+        return self.future.tryForce(claimer);
+    }
+
+    pub inline fn enrollWaiter(self: *Thunk, waiter: *Waiter) bool {
+        return self.future.enrollWaiter(waiter);
+    }
+
+    pub inline fn resolve(self: *Thunk, value: Value) void {
+        self.future.resolve(value);
+    }
+
+    pub fn reset(self: *Thunk) void {
+        self.future.reset();
+    }
+
+    pub fn markErrored(self: *Thunk, info: *ErrorInfo) void {
+        self.future.markErrored(info);
+    }
+
+    pub inline fn cachedErrorInfo(self: *const Thunk) *const ErrorInfo {
+        return self.future.cachedErrorInfo();
+    }
+
+    pub fn blackhole(self: *Thunk) void {
+        self.future.blackhole();
     }
 
     /// Identity equality. Two thunks are the same object iff they live at
@@ -560,9 +622,9 @@ test "thunk: errored caches error and replays on next force" {
 /// constructed outside the heap. Walks the test thunk's sidecar info
 /// (if any) and releases its allocations.
 fn freeErroredInfoForTest(thunk: *Thunk, allocator: std.mem.Allocator) void {
-    const s: ThunkState = @enumFromInt(thunk.state.load(.acquire));
+    const s: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
     if (s != .errored) return;
-    const info: *ErrorInfo = @ptrFromInt(thunk.result.error_info_bits);
+    const info: *ErrorInfo = @ptrFromInt(thunk.future.result.error_info_bits);
     if (info.message) |msg| allocator.free(msg);
     allocator.destroy(info);
 }

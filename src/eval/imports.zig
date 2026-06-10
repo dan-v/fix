@@ -1,16 +1,16 @@
 //! Path-based import resolution: dedup, cycle detection, file read,
 //! and the back-call into the evaluator for parse+compile+eval.
 //!
-//! `ImportEntry` is a fiber-park claim+wait protocol: the first fiber
-//! to cmpxchg UNRESOLVED→EVALUATING runs `compileImportPath` inline.
-//! Concurrent fibers enroll on the entry's waiter list and yield —
-//! their workers drain other work meanwhile. When the claimer
-//! publishes, the resolver drains the waiter list and each parked
-//! fiber observes the terminal state. Same model as `Thunk`.
+//! Each `ImportEntry` wraps a `runtime.thunk.Future` — the same
+//! claim+wait state machine `Thunk` uses. The first fiber to claim
+//! runs `compileImportPath` inline; concurrent fibers enroll on the
+//! future's waiter list and yield. Same protocol, same primitive: a
+//! Future is a Future whether it backs a thunk or a path.
 //!
-//! There is no main/helper asymmetry: every fiber follows the same
-//! claim-or-park protocol. Cycle detection is per-fiber by
-//! `ClaimerId` (stable across migration).
+//! There is no main/helper asymmetry. Cycle detection is per-fiber
+//! by `ClaimerId` (stable across migration); same-fiber recursion
+//! shows up as `Future.tryForce` returning `.blackhole`, which we
+//! translate to `error.ImportCycle`.
 //!
 //! Scoped imports skip this dedup — each call carries a distinct scope
 //! Value — so cycle detection for them is a thread-local linked list
@@ -25,11 +25,10 @@ const Value = @import("../runtime/value.zig").Value;
 const thunk_mod = @import("../runtime/thunk.zig");
 const fiber_mod = @import("../fiber.zig");
 const worker_mod = @import("../worker.zig");
-const stable = @import("../runtime/stable_segments.zig");
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
-/// during lookup/insert; the entry's own atomics + waiter list
-/// coordinate the actual evaluation.
+/// during lookup/insert; the entry's own `Future` coordinates the
+/// actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
     mu: @import("../runtime/stable_segments.zig").SpinMutex = .{},
@@ -37,8 +36,13 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
         var it = self.entries.iterator();
         while (it.next()) |kv| {
+            const entry = kv.value_ptr.*;
+            if (entry.error_info) |info| {
+                if (info.message) |msg| allocator.free(msg);
+                allocator.destroy(info);
+            }
             allocator.free(kv.key_ptr.*);
-            allocator.destroy(kv.value_ptr.*);
+            allocator.destroy(entry);
         }
         self.entries.deinit(allocator);
     }
@@ -57,65 +61,18 @@ pub const Registry = struct {
         errdefer allocator.free(key);
         const entry = try allocator.create(ImportEntry);
         errdefer allocator.destroy(entry);
-        entry.* = .{};
+        entry.* = .{ .future = thunk_mod.Future.init() };
         try self.entries.put(allocator, key, entry);
         return entry;
     }
 };
 
 pub const ImportEntry = struct {
-    pub const STATE_UNRESOLVED: u32 = 0;
-    pub const STATE_EVALUATING: u32 = 1;
-    pub const STATE_RESOLVED: u32 = 2;
-    pub const STATE_FAILED: u32 = 3;
-
-    state: std.atomic.Value(u32) = .init(STATE_UNRESOLVED),
-    /// Globally-unique fiber id of the claimer (matches
-    /// `VM.claimer_id`). `INVALID_CLAIMER` when unclaimed. Same-fiber
-    /// re-entry while `EVALUATING` is `error.ImportCycle`.
-    claimer: std.atomic.Value(thunk_mod.ClaimerId) = .init(thunk_mod.INVALID_CLAIMER),
-    result: Value = Value.null_val,
-    /// Fibers parked on this entry. Manipulated only under
-    /// `waiters_mu`. The resolver drains outside the lock so a slow
-    /// wake doesn't block other resolvers — mirrors
-    /// `Thunk.wakeFiberWaiters`.
-    waiters_head: ?*thunk_mod.Waiter = null,
-    waiters_mu: stable.SpinMutex = .{},
-
-    pub fn enrollWaiter(self: *ImportEntry, waiter: *thunk_mod.Waiter) bool {
-        self.waiters_mu.lock();
-        defer self.waiters_mu.unlock();
-        if (self.state.load(.acquire) != STATE_EVALUATING) return false;
-        waiter.next = self.waiters_head;
-        self.waiters_head = waiter;
-        return true;
-    }
-
-    fn wakeWaiters(self: *ImportEntry) void {
-        self.waiters_mu.lock();
-        var head = self.waiters_head;
-        self.waiters_head = null;
-        self.waiters_mu.unlock();
-        while (head) |w| {
-            const next = w.next;
-            w.next = null;
-            w.wake_fn(w);
-            head = next;
-        }
-    }
-
-    pub fn publishResolved(self: *ImportEntry, value: Value) void {
-        self.result = value;
-        self.claimer.store(thunk_mod.INVALID_CLAIMER, .release);
-        self.state.store(STATE_RESOLVED, .release);
-        self.wakeWaiters();
-    }
-
-    pub fn publishFailed(self: *ImportEntry) void {
-        self.claimer.store(thunk_mod.INVALID_CLAIMER, .release);
-        self.state.store(STATE_FAILED, .release);
-        self.wakeWaiters();
-    }
+    future: thunk_mod.Future,
+    /// Owned by this entry. Allocated when the compile fails so the
+    /// future can transition to `.errored` with a sidecar. Freed by
+    /// `Registry.deinit`.
+    error_info: ?*thunk_mod.ErrorInfo = null,
 };
 
 /// Per-thread linked list of in-progress *scoped* import paths.
@@ -167,48 +124,56 @@ pub fn importResolvedPath(ev: anytype, path: []const u8) anyerror!Value {
     return forceEntry(ev, path, entry);
 }
 
-/// Drive the claim protocol on `entry`. The first fiber to CAS
-/// UNRESOLVED→EVALUATING runs `compileImportPath` inline; concurrent
-/// fibers enroll on the waiter list and yield until the claimer
-/// publishes a terminal state. Cycle detection is per-fiber: same
-/// fiber id observing its own claim → `error.ImportCycle`.
+/// Drive the claim protocol on `entry`. The first fiber to claim
+/// runs `compileImportPath` inline; concurrent fibers enroll on the
+/// future's waiter list and yield until the claimer publishes a
+/// terminal state. Cycle detection comes for free from `Future`:
+/// same-claimer recursion returns `.blackhole`, which we translate
+/// to `error.ImportCycle`.
 pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!Value {
     const me = currentClaimer();
     while (true) {
-        const state = entry.state.load(.acquire);
-        switch (state) {
-            ImportEntry.STATE_RESOLVED => return entry.result,
-            ImportEntry.STATE_FAILED => return error.ImportFailed,
-            ImportEntry.STATE_EVALUATING => {
-                if (entry.claimer.load(.acquire) == me) return error.ImportCycle;
+        switch (entry.future.tryForce(me)) {
+            .already_resolved => |v| return v,
+            .blackhole => return error.ImportCycle,
+            .errored => |info| return info.err,
+            .busy => {
                 const inner = fiber_mod.currentFiber() orelse
-                    @panic("forceEntry hit EVALUATING outside a fiber");
+                    @panic("forceEntry hit .busy outside a fiber");
                 const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
-                if (entry.enrollWaiter(&wf.waiter)) {
+                if (entry.future.enrollWaiter(&wf.waiter)) {
                     wf.state = .suspended;
                     fiber_mod.Fiber.yield();
                     wf.state = .running;
                 }
                 continue;
             },
-            ImportEntry.STATE_UNRESOLVED => {
-                if (entry.state.cmpxchgWeak(
-                    ImportEntry.STATE_UNRESOLVED,
-                    ImportEntry.STATE_EVALUATING,
-                    .acquire,
-                    .monotonic,
-                )) |_| continue;
-                entry.claimer.store(me, .release);
+            .claimed => {
                 const value = compileImportPath(ev, path) catch |err| {
-                    entry.publishFailed();
+                    publishCompileFailure(ev, entry, err);
                     return err;
                 };
-                entry.publishResolved(value);
+                entry.future.resolve(value);
                 return value;
             },
-            else => unreachable,
         }
     }
+}
+
+/// Cache a compile failure on the entry's future. Allocates an
+/// `ErrorInfo` so the same error replays on every subsequent force —
+/// imports that fail (file not found, parse error, etc.) almost
+/// always fail deterministically. If allocation itself fails, we
+/// fall back to `Future.reset` (transient), so the next caller
+/// retries.
+fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
+    const info = ev.allocator.create(thunk_mod.ErrorInfo) catch {
+        entry.future.reset();
+        return;
+    };
+    info.* = .{ .err = err, .message = null };
+    entry.error_info = info;
+    entry.future.markErrored(info);
 }
 
 fn currentClaimer() thunk_mod.ClaimerId {
