@@ -199,16 +199,13 @@ pub const Worker = struct {
     }
 
     pub fn deinit(self: *Worker) void {
-        // Drain our ready queue. Any node still on it points back at
-        // one of our fibers via @fieldParentPtr, so a helper stealing
-        // mid-teardown would reach a freed fiber.
-        while (self.scheduler.popReady(self.worker_id)) |_| {}
-        // Wait for any other worker that's currently running one of our
-        // fibers (stolen via the ready-queue steal path) to finish.
-        // Freeing the fiber's stack while a helper is resumed on it
-        // would crash that helper. Eval is over by the time we reach
-        // here, so the wait is bounded by whatever yield-and-finish is
-        // currently in flight.
+        // By the time we get here `scheduler.deinit()` has already
+        // joined all helpers and freed `scheduler.ready_queues`, so
+        // there's no one left to steal from us and nothing safe to
+        // pop. Just spin-wait for any in-flight `runFiber` on our
+        // fibers to drop `in_runfiber` (which it would have done
+        // before the helper exited); the loop is bounded by however
+        // much yield-and-finish was in flight at shutdown.
         for (self.fibers.items) |f| {
             while (f.in_runfiber.load(.acquire) != 0) std.atomic.spinLoopHint();
         }
