@@ -11,6 +11,15 @@ const ChunkBuilder = chunk.ChunkBuilder;
 const strictness = @import("strictness.zig");
 
 pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
+    return compileThunkEager(self, expr, false);
+}
+
+/// Same as `compileThunk`, but emits the eager-spawn variant if
+/// `eager` is true — the resulting thunk gets submitted to the
+/// scheduler's urgent queue at creation. Called from let-binding
+/// compile when strictness analysis on the let-body confirms the
+/// binding will be forced.
+pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void {
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
 
@@ -38,7 +47,11 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
 
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
-    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
+    if (eager) {
+        try emit.emitEagerThunkWithCaptures(self, child_id, child.captures.items);
+    } else {
+        try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
+    }
 }
 
 pub fn compileStringAtomThunk(self: *Compiler, atom: Node.Atom) !void {

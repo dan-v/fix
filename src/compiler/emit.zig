@@ -159,12 +159,26 @@ pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, capture
 }
 
 pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+    return emitThunkWithCapturesImpl(self, chunk_id, captures, false);
+}
+
+/// Same as `emitThunkWithCaptures` but emits the `thunk_captures_eager`
+/// variant — runtime will submit the thunk to the urgent scheduler
+/// queue at creation. Called by `compileThunk` when the surrounding
+/// chunk's strictness signature says this binding will be forced.
+pub fn emitEagerThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+    return emitThunkWithCapturesImpl(self, chunk_id, captures, true);
+}
+
+fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture, eager: bool) !void {
     const upvalue_count = try captureCount(captures.len);
 
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .thunk_captures, @intCast(chunk_id));
+        const op: bytecode.OpCode = if (eager) .thunk_captures_eager else .thunk_captures;
+        try emitOpU16(self, op, @intCast(chunk_id));
     } else {
-        try emitOp(self, .thunk_captures_long);
+        const op: bytecode.OpCode = if (eager) .thunk_captures_eager_long else .thunk_captures_long;
+        try emitOp(self, op);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);

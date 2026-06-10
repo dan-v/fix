@@ -62,6 +62,11 @@ pub const AttrEntryGroups = struct {
 
 pub const ContainerValueOptions = struct {
     raw_identifier: bool = false,
+    /// When true and the value compiles to a thunk, emit the eager
+    /// variant — runtime submits the thunk to the urgent scheduler
+    /// queue at creation. Set by let-binding compile when the body's
+    /// strictness signature includes this binding's name.
+    eager: bool = false,
 };
 
 pub const with_capture_name = "\x00with";

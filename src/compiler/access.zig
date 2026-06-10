@@ -176,7 +176,7 @@ pub fn compileList(self: *Compiler, node: *const Node) !void {
 
 pub fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {
     if (try compileImmediateContainerValue(self, node, options)) return;
-    try thunks.compileThunk(self, node);
+    try thunks.compileThunkEager(self, node, options.eager);
 }
 
 /// Predicate version of `compileImmediateContainerValue` for the

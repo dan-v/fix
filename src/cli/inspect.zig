@@ -36,6 +36,7 @@ const Options = struct {
     strict: bool = false,
     no_eval: bool = false,
     top: u32 = 0,
+    workers: ?u8 = null,
 };
 
 pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -58,7 +59,7 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const worker_count: u8 = if (builtin.single_threaded)
         1
     else
-        @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
+        options.workers orelse @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
@@ -293,6 +294,11 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
         } else if (std.mem.eql(u8, arg, "--top")) {
             const text = args_iter.next() orelse return error.MissingTop;
             options.top = std.fmt.parseInt(u32, text, 10) catch return error.InvalidTop;
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            const text = args_iter.next() orelse return error.MissingWorkers;
+            options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
+        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
+            options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
         } else {
             _ = cli;
             return error.UnknownOption;
@@ -307,6 +313,8 @@ fn optionErrorMessage(err: anyerror) []const u8 {
         error.MissingPath => "missing path after --file",
         error.MissingTop => "missing N after --top",
         error.InvalidTop => "expected --top to be a non-negative integer",
+        error.MissingWorkers => "missing N after --workers",
+        error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.TooManySources => "provide only one expression or file",
         error.UnknownOption => "unknown option",
         else => @errorName(err),

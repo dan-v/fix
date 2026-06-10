@@ -88,8 +88,8 @@ pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []cons
 }
 
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-    // Pre-fetch the chunk so we can read `speculatable` once instead
-    // of a second `registry.get` inside the old `shouldSpeculate`.
+    // Pre-fetch the chunk so we can read `body_is_substantial` once
+    // instead of a second `registry.get` from `shouldSpeculate`.
     const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
     const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
     errdefer self.heap.rollbackBytecodeThunk(pending);
@@ -100,6 +100,30 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (ch.scheduling.body_is_substantial) {
         _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+    }
+    try stack.push(self, Value.thunk(id));
+}
+
+/// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
+/// urgent queue at creation time. Used by `thunk_captures_eager` —
+/// the compiler emits that op when strictness analysis confirms the
+/// surrounding chunk's body forces this binding.
+///
+/// `in_speculation` brake: if a helper is currently running a force
+/// task (set by `forceValueSpeculative`), we skip the urgent submit
+/// — otherwise the cascade is unbounded. The thunk is still created
+/// (so subsequent code sees it), it just doesn't fan out further. The
+/// helper finishes its current force, then any consumer that forces
+/// this thunk gets normal demand-driven handling.
+pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+    _ = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+    const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
+    errdefer self.heap.rollbackBytecodeThunk(pending);
+    try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
+    const id = try self.heap.commitBytecodeThunk(pending);
+    recordBytecodeThunkCreate(self, id, frame, chunk_id);
+    if (!self.in_speculation) {
+        _ = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
 }

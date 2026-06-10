@@ -302,6 +302,41 @@ pub fn analyzeChunkBody(
     return .{ .strict = strict, .allocator = allocator };
 }
 
+/// For each binding name, decide whether the let-block's body will
+/// unconditionally force it. Used by `compileLetIn` to emit
+/// `thunk_captures_eager` for those bindings — they get submitted to
+/// the urgent scheduler queue at creation instead of waiting for the
+/// chunk-size speculation heuristic.
+///
+/// Analyzes `body` with an empty bound_stack so binding names appear
+/// as free identifiers in the strict set. Inner scopes (nested lets,
+/// lambdas) correctly shadow via the analyzer's bound_stack
+/// management, so a shadowed outer name doesn't get a false positive.
+pub fn analyzeLetEagerness(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    source: []const u8,
+    body: *const Node,
+    binding_names: []const InternId,
+    out_eager: []bool,
+) !void {
+    std.debug.assert(binding_names.len == out_eager.len);
+    var an: Analyzer = .{
+        .allocator = allocator,
+        .intern = intern,
+        .source = source,
+        .bound_stack = .empty,
+    };
+    defer an.deinit();
+
+    var strict = try an.analyze(body);
+    defer strict.deinit(allocator);
+
+    for (binding_names, out_eager) |name, *eager| {
+        eager.* = strict.shallow.contains(name);
+    }
+}
+
 const Compiler = @import("../compiler.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {

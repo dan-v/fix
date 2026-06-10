@@ -232,7 +232,7 @@ fn writeOperands(
             try writeInternRef(writer, id, symbols);
         },
 
-        .closure, .thunk_captures => {
+        .closure, .thunk_captures, .thunk_captures_eager => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -240,7 +240,7 @@ fn writeOperands(
             try writer.print("chunk #{d}, {d} upvalues", .{ id, upvalues });
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .closure_long, .thunk_captures_long => {
+        .closure_long, .thunk_captures_long, .thunk_captures_eager_long => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);

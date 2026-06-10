@@ -118,6 +118,15 @@ pub const OpCode = enum(u8) {
     /// Wide-chunk-id form of thunk_captures.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
     thunk_captures_long,
+    /// Same as `thunk_captures` but submits the thunk to the urgent
+    /// scheduler queue at creation time. Emitted by the compiler when
+    /// strictness analysis says the surrounding chunk's body will
+    /// unconditionally force this binding — turns the chunk-size
+    /// speculation heuristic into a deterministic decision and
+    /// bypasses the speculation backlog cap.
+    thunk_captures_eager,
+    /// Wide-chunk-id form of thunk_captures_eager.
+    thunk_captures_eager_long,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.

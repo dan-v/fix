@@ -351,6 +351,29 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     const kinds = try classifyLetBindings(self, let_in.bindings, let_in.body);
     defer self.allocator.free(kinds);
 
+    // Strictness-driven eagerness: analyze the body once, then for
+    // each binding whose name appears in body's shallow strict set
+    // emit the eager thunk variant. That submits the thunk to the
+    // urgent scheduler queue at creation so helpers can race ahead.
+    const eager_flags = try self.allocator.alloc(bool, let_in.bindings.len);
+    defer self.allocator.free(eager_flags);
+    {
+        const binding_name_ids = try self.allocator.alloc(InternId, let_in.bindings.len);
+        defer self.allocator.free(binding_name_ids);
+        for (let_in.bindings, binding_name_ids) |binding, *nid| {
+            const name = attrs.attrSegmentSpan(self, binding.path[0]);
+            nid.* = try self.intern.intern(name);
+        }
+        try @import("strictness.zig").analyzeLetEagerness(
+            self.allocator,
+            self.intern,
+            self.source,
+            let_in.body,
+            binding_name_ids,
+            eager_flags,
+        );
+    }
+
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
         if (kind == .unreferenced) continue;
@@ -374,7 +397,7 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
         if (kind == .literal or kind == .unreferenced) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
-        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot);
+        try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index]);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),
             .uncaptured => try emit.emitSetLocal(self, slot),
@@ -623,7 +646,7 @@ fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node
     return found;
 }
 
-pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16) !void {
+pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool) !void {
     var leaf: ?Node.Binding = null;
     var tail_count: usize = 0;
 
@@ -645,7 +668,7 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
         const binding = leaf orelse return error.UndefinedVariable;
         const previous_skip = self.skip_local_slot;
         if (binding.inherit_outer) self.skip_local_slot = slot;
-        const compile_result = access.compileContainerValue(self, binding.expr, .{});
+        const compile_result = access.compileContainerValue(self, binding.expr, .{ .eager = eager });
         self.skip_local_slot = previous_skip;
         return compile_result;
     }
