@@ -427,7 +427,6 @@ fn isTransientThunkError(err: anyerror) bool {
     return switch (err) {
         error.OutOfMemory,
         error.StackOverflow,
-        error.ImportContended,
         => true,
         else => false,
     };

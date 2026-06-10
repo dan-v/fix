@@ -1,11 +1,16 @@
 //! Path-based import resolution: dedup, cycle detection, file read,
 //! and the back-call into the evaluator for parse+compile+eval.
 //!
-//! `ImportEntry` is the futex-backed claim+wait protocol for path
-//! deduplication: the first thread to cmpxchg UNRESOLVED→EVALUATING
-//! does the work; others either wait on the futex (main thread) or
-//! bail with `error.ImportContended` (helpers, to avoid deadlock with
-//! a main thread holding a contended thunk).
+//! `ImportEntry` is a fiber-park claim+wait protocol: the first fiber
+//! to cmpxchg UNRESOLVED→EVALUATING runs `compileImportPath` inline.
+//! Concurrent fibers enroll on the entry's waiter list and yield —
+//! their workers drain other work meanwhile. When the claimer
+//! publishes, the resolver drains the waiter list and each parked
+//! fiber observes the terminal state. Same model as `Thunk`.
+//!
+//! There is no main/helper asymmetry: every fiber follows the same
+//! claim-or-park protocol. Cycle detection is per-fiber by
+//! `ClaimerId` (stable across migration).
 //!
 //! Scoped imports skip this dedup — each call carries a distinct scope
 //! Value — so cycle detection for them is a thread-local linked list
@@ -17,13 +22,14 @@
 
 const std = @import("std");
 const Value = @import("../runtime/value.zig").Value;
-const worker_id_mod = @import("../runtime/worker_id.zig");
-
-pub const INVALID_CLAIMER: u8 = 0xFF;
+const thunk_mod = @import("../runtime/thunk.zig");
+const fiber_mod = @import("../fiber.zig");
+const worker_mod = @import("../worker.zig");
+const stable = @import("../runtime/stable_segments.zig");
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
-/// during lookup/insert; the entry's own atomics + futex coordinate
-/// the actual evaluation.
+/// during lookup/insert; the entry's own atomics + waiter list
+/// coordinate the actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
     mu: @import("../runtime/stable_segments.zig").SpinMutex = .{},
@@ -64,34 +70,51 @@ pub const ImportEntry = struct {
     pub const STATE_FAILED: u32 = 3;
 
     state: std.atomic.Value(u32) = .init(STATE_UNRESOLVED),
-    claimer: std.atomic.Value(u8) = .init(INVALID_CLAIMER),
+    /// Globally-unique fiber id of the claimer (matches
+    /// `VM.claimer_id`). `INVALID_CLAIMER` when unclaimed. Same-fiber
+    /// re-entry while `EVALUATING` is `error.ImportCycle`.
+    claimer: std.atomic.Value(thunk_mod.ClaimerId) = .init(thunk_mod.INVALID_CLAIMER),
     result: Value = Value.null_val,
+    /// Fibers parked on this entry. Manipulated only under
+    /// `waiters_mu`. The resolver drains outside the lock so a slow
+    /// wake doesn't block other resolvers — mirrors
+    /// `Thunk.wakeFiberWaiters`.
+    waiters_head: ?*thunk_mod.Waiter = null,
+    waiters_mu: stable.SpinMutex = .{},
 
-    pub fn waitForChange(self: *ImportEntry, from: u32) void {
-        switch (@import("builtin").os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_4arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAIT, .private = true },
-                    from,
-                    null,
-                );
-            },
-            else => std.Thread.yield() catch {},
+    pub fn enrollWaiter(self: *ImportEntry, waiter: *thunk_mod.Waiter) bool {
+        self.waiters_mu.lock();
+        defer self.waiters_mu.unlock();
+        if (self.state.load(.acquire) != STATE_EVALUATING) return false;
+        waiter.next = self.waiters_head;
+        self.waiters_head = waiter;
+        return true;
+    }
+
+    fn wakeWaiters(self: *ImportEntry) void {
+        self.waiters_mu.lock();
+        var head = self.waiters_head;
+        self.waiters_head = null;
+        self.waiters_mu.unlock();
+        while (head) |w| {
+            const next = w.next;
+            w.next = null;
+            w.wake_fn(w);
+            head = next;
         }
     }
 
-    pub fn wakeAll(self: *ImportEntry) void {
-        switch (@import("builtin").os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_3arg(
-                    @ptrCast(&self.state),
-                    .{ .cmd = .WAKE, .private = true },
-                    std.math.maxInt(i32),
-                );
-            },
-            else => {},
-        }
+    pub fn publishResolved(self: *ImportEntry, value: Value) void {
+        self.result = value;
+        self.claimer.store(thunk_mod.INVALID_CLAIMER, .release);
+        self.state.store(STATE_RESOLVED, .release);
+        self.wakeWaiters();
+    }
+
+    pub fn publishFailed(self: *ImportEntry) void {
+        self.claimer.store(thunk_mod.INVALID_CLAIMER, .release);
+        self.state.store(STATE_FAILED, .release);
+        self.wakeWaiters();
     }
 };
 
@@ -144,22 +167,29 @@ pub fn importResolvedPath(ev: anytype, path: []const u8) anyerror!Value {
     return forceEntry(ev, path, entry);
 }
 
-/// Drive the futex protocol on `entry`. The first thread to claim it
-/// runs `compileImportPath` and publishes; later arrivals either wait
-/// (main thread) or bail with `ImportContended` (helpers, to keep a
-/// contended-thunk deadlock from forming).
+/// Drive the claim protocol on `entry`. The first fiber to CAS
+/// UNRESOLVED→EVALUATING runs `compileImportPath` inline; concurrent
+/// fibers enroll on the waiter list and yield until the claimer
+/// publishes a terminal state. Cycle detection is per-fiber: same
+/// fiber id observing its own claim → `error.ImportCycle`.
 pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!Value {
-    const me = worker_id_mod.current;
+    const me = currentClaimer();
     while (true) {
         const state = entry.state.load(.acquire);
         switch (state) {
             ImportEntry.STATE_RESOLVED => return entry.result,
             ImportEntry.STATE_FAILED => return error.ImportFailed,
             ImportEntry.STATE_EVALUATING => {
-                const claimer = entry.claimer.load(.acquire);
-                if (claimer == me) return error.ImportCycle;
-                if (me != 0) return error.ImportContended;
-                entry.waitForChange(ImportEntry.STATE_EVALUATING);
+                if (entry.claimer.load(.acquire) == me) return error.ImportCycle;
+                const inner = fiber_mod.currentFiber() orelse
+                    @panic("forceEntry hit EVALUATING outside a fiber");
+                const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+                if (entry.enrollWaiter(&wf.waiter)) {
+                    wf.state = .suspended;
+                    fiber_mod.Fiber.yield();
+                    wf.state = .running;
+                }
+                continue;
             },
             ImportEntry.STATE_UNRESOLVED => {
                 if (entry.state.cmpxchgWeak(
@@ -170,18 +200,21 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!V
                 )) |_| continue;
                 entry.claimer.store(me, .release);
                 const value = compileImportPath(ev, path) catch |err| {
-                    entry.state.store(ImportEntry.STATE_FAILED, .release);
-                    entry.wakeAll();
+                    entry.publishFailed();
                     return err;
                 };
-                entry.result = value;
-                entry.state.store(ImportEntry.STATE_RESOLVED, .release);
-                entry.wakeAll();
+                entry.publishResolved(value);
                 return value;
             },
             else => unreachable,
         }
     }
+}
+
+fn currentClaimer() thunk_mod.ClaimerId {
+    const inner = fiber_mod.currentFiber() orelse return thunk_mod.INVALID_CLAIMER;
+    const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+    return wf.vm.claimer_id;
 }
 
 /// Caller has already claimed the `ImportEntry`. Reads the source
