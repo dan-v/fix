@@ -30,6 +30,27 @@ const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
 const SHARD_COUNT: u32 = 64;
 const SHARD_MASK: u64 = SHARD_COUNT - 1;
 
+const cache_size: usize = 32;
+const cache_max_len: usize = 24;
+
+const CacheSlot = struct {
+    hash: u64 = 0,
+    table_token: u64 = 0,
+    id: InternId = 0,
+    len: u8 = 0,
+    bytes: [cache_max_len]u8 = @splat(0),
+};
+
+/// Per-thread direct-mapped cache for short-string interns. Indexed
+/// by the input's Wyhash mod `cache_size`. `table_token` distinguishes
+/// InternTable instances — pointer comparison fails when the allocator
+/// reuses the same address across deinit/init (which broke the cache
+/// across sequential tests). Tokens are monotonic and unique per
+/// table init. Strings longer than `cache_max_len` skip the cache.
+threadlocal var thread_cache: [cache_size]CacheSlot = @splat(.{});
+
+var next_table_token: std.atomic.Value(u64) = .init(1);
+
 fn hashString(s: []const u8) u64 {
     return std.hash.Wyhash.hash(0, s);
 }
@@ -82,6 +103,10 @@ pub const InternTable = struct {
     /// the input's hash. `entries` and `data` remain global so that ids
     /// stay dense and `get()` doesn't need to know the shard.
     shards: [SHARD_COUNT]Shard,
+    /// Unique-per-init identifier the thread-local intern cache uses to
+    /// avoid stale-hit races when an InternTable is recreated at the
+    /// same heap address.
+    token: u64,
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
         var table: InternTable = .{
@@ -89,6 +114,7 @@ pub const InternTable = struct {
             .entries = .empty,
             .data = .empty,
             .shards = [_]Shard{.{}} ** SHARD_COUNT,
+            .token = next_table_token.fetchAdd(1, .monotonic),
         };
         // Reserve id 0 as the empty string so `id == 0` is a valid "no string"
         // sentinel that `get` can resolve without touching the segments.
@@ -105,6 +131,22 @@ pub const InternTable = struct {
 
     pub fn intern(self: *InternTable, s: []const u8) !InternId {
         const h = hashString(s);
+
+        // Thread-local direct-mapped cache. Short identifiers get
+        // re-interned repeatedly from many call sites (attr names,
+        // builtin args, paths); a per-thread cache short-circuits the
+        // shard lock + HashMap probe + segment lookup. Inline copy of
+        // the bytes keeps the comparison branch-local (one cache line
+        // per slot) instead of paying a `data.slice` indirection.
+        if (s.len <= cache_max_len) {
+            const slot = &thread_cache[h % cache_size];
+            if (slot.hash == h and slot.table_token == self.token and
+                slot.len == s.len and std.mem.eql(u8, slot.bytes[0..s.len], s))
+            {
+                return slot.id;
+            }
+        }
+
         const shard = &self.shards[h & SHARD_MASK];
 
         shard.mu.lock();
@@ -113,7 +155,17 @@ pub const InternTable = struct {
         const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
         const ctx = IdContext{ .table = self };
         const gop = try shard.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
-        if (gop.found_existing) return gop.key_ptr.*;
+        if (gop.found_existing) {
+            if (s.len <= cache_max_len) {
+                const slot = &thread_cache[h % cache_size];
+                slot.hash = h;
+                slot.table_token = self.token;
+                slot.id = gop.key_ptr.*;
+                slot.len = @intCast(s.len);
+                @memcpy(slot.bytes[0..s.len], s);
+            }
+            return gop.key_ptr.*;
+        }
 
         // Append bytes, then the entry. The byte rollback handles failure
         // mid-allocation; entry append happens last so its failure leaves
@@ -132,6 +184,14 @@ pub const InternTable = struct {
         };
 
         gop.key_ptr.* = new_id;
+        if (s.len <= cache_max_len) {
+            const slot = &thread_cache[h % cache_size];
+            slot.hash = h;
+            slot.table_token = self.token;
+            slot.id = new_id;
+            slot.len = @intCast(s.len);
+            @memcpy(slot.bytes[0..s.len], s);
+        }
         return new_id;
     }
 
