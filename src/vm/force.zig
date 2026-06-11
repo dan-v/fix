@@ -181,7 +181,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 if (demand) thunk.markDemanded();
                 return v;
             },
-            .blackhole => return error.RecursiveThunk,
+            .blackhole => {
+                recordBlackhole(self, thunk_id);
+                return error.RecursiveThunk;
+            },
             .errored => |info| {
                 replayCachedMessage(self, info.*.message);
                 return info.*.err;
@@ -381,6 +384,11 @@ fn claimerFiberId(self: *VM) u32 {
 inline fn recordResolve(self: *VM, thunk_id: ObjectId, result: Value) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| tt.recordResolve(thunk_id, self.workerId(), claimerFiberId(self), result);
+}
+
+inline fn recordBlackhole(self: *VM, thunk_id: ObjectId) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| tt.recordBlackhole(thunk_id, self.workerId(), claimerFiberId(self));
 }
 
 inline fn recordReset(self: *VM, thunk_id: ObjectId, err: anyerror) void {
