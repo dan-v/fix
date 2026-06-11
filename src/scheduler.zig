@@ -144,6 +144,15 @@ const TaskQueue = struct {
     }
 
     fn pop(self: *TaskQueue) ?Task {
+        // Lockless empty fast path — `head` and `tail` are mutated
+        // only under the mutex, but a torn read here is safe: at
+        // worst we miss a task and the caller retries on the next
+        // drain iteration. Avoiding the lock when there's nothing
+        // to pop saves a huge amount of SpinMutex contention under
+        // 32 helpers each polling for work.
+        if (@atomicLoad(u32, &self.tail, .acquire) == @atomicLoad(u32, &self.head, .acquire)) {
+            return null;
+        }
         self.mu.lock();
         defer self.mu.unlock();
         if (self.tail == self.head) return null;
@@ -152,6 +161,10 @@ const TaskQueue = struct {
     }
 
     fn steal(self: *TaskQueue) ?Task {
+        // See `pop` — lockless empty check.
+        if (@atomicLoad(u32, &self.tail, .acquire) == @atomicLoad(u32, &self.head, .acquire)) {
+            return null;
+        }
         self.mu.lock();
         defer self.mu.unlock();
         if (self.tail == self.head) return null;
