@@ -27,7 +27,7 @@ const Entry = struct {
 const EntryStore = stable.StableSegments(Entry, .{ .first_segment_size = 256 });
 const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
 
-const SHARD_COUNT: u32 = 16;
+const SHARD_COUNT: u32 = 64;
 const SHARD_MASK: u64 = SHARD_COUNT - 1;
 
 fn hashString(s: []const u8) u64 {
@@ -51,12 +51,17 @@ const IdContext = struct {
 };
 
 /// Adapter used by `getOrPutAdapted` so lookups by `[]const u8` use the
-/// caller's bytes but storage uses `InternId`.
+/// caller's bytes but storage uses `InternId`. `intern()` precomputes
+/// the hash for shard selection and threads it in so the HashMap's
+/// internal hash call doesn't recompute the same Wyhash over the same
+/// bytes.
 const StringAdapter = struct {
     table: *const InternTable,
+    precomputed_hash: u64,
 
-    pub fn hash(_: StringAdapter, key: []const u8) u64 {
-        return hashString(key);
+    pub fn hash(self: StringAdapter, key: []const u8) u64 {
+        _ = key;
+        return self.precomputed_hash;
     }
     pub fn eql(self: StringAdapter, key: []const u8, id: InternId) bool {
         const stored = self.table.get(id);
@@ -105,7 +110,7 @@ pub const InternTable = struct {
         shard.mu.lock();
         defer shard.mu.unlock();
 
-        const adapter = StringAdapter{ .table = self };
+        const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
         const ctx = IdContext{ .table = self };
         const gop = try shard.lookup.getOrPutContextAdapted(self.allocator, s, adapter, ctx);
         if (gop.found_existing) return gop.key_ptr.*;
