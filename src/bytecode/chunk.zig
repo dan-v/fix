@@ -410,13 +410,17 @@ pub const ChunkRegistry = struct {
         var builder = try ChunkBuilder.init(self.allocator);
         defer builder.deinit(self.allocator);
 
-        // get_upvalue 0  — push func
-        try builder.writeOp(self.allocator, .get_upvalue);
+        // capture_upvalue 0 — push func, unforced. builtinMap/builtinGenList
+        // force fn_arg before storing it as upvalue 0, so it's already
+        // callable.
+        try builder.writeOp(self.allocator, .capture_upvalue);
         try builder.writeU16(self.allocator, 0);
-        // get_upvalue 1  — push index
-        try builder.writeOp(self.allocator, .get_upvalue);
+        // capture_upvalue 1 — push index or item, *unforced*. Passing
+        // unforced lets the user fn decide laziness — same reasoning as
+        // the mapattrs_apply value upvalue (see registerMapAttrsApplyChunk).
+        try builder.writeOp(self.allocator, .capture_upvalue);
         try builder.writeU16(self.allocator, 1);
-        // tail_call      — call func with index
+        // tail_call      — call func with index/item
         try builder.writeOp(self.allocator, .tail_call);
         // ret            — return result (tail_call to a closure transfers
         //                  control; ret only runs when callee was a builtin)
@@ -432,16 +436,24 @@ pub const ChunkRegistry = struct {
         var builder = try ChunkBuilder.init(self.allocator);
         defer builder.deinit(self.allocator);
 
-        // get_upvalue 0  — push func
-        try builder.writeOp(self.allocator, .get_upvalue);
+        // capture_upvalue 0 — push func, unforced. mapAttrs only takes
+        // this path when fn_arg is already callable; no force needed.
+        try builder.writeOp(self.allocator, .capture_upvalue);
         try builder.writeU16(self.allocator, 0);
-        // get_upvalue 1  — push name
-        try builder.writeOp(self.allocator, .get_upvalue);
+        // capture_upvalue 1 — push name. mapAttrs stores `Value.string`
+        // here, so force would be a no-op anyway.
+        try builder.writeOp(self.allocator, .capture_upvalue);
         try builder.writeU16(self.allocator, 1);
         // call           — partial = func name (result on stack)
         try builder.writeOp(self.allocator, .call);
-        // get_upvalue 2  — push value
-        try builder.writeOp(self.allocator, .get_upvalue);
+        // capture_upvalue 2 — push value *unforced*. `value` is whatever
+        // the source attrset stored, typically a thunk. Forcing it here
+        // (the old `get_upvalue`) eagerly evaluated entries that the
+        // user lambda would otherwise treat lazily — when the lambda
+        // captures the parent recursive attrset (typical NixOS module
+        // pattern), the eager force routes through that parent and
+        // blackholes. Passing unforced lets the user lambda decide.
+        try builder.writeOp(self.allocator, .capture_upvalue);
         try builder.writeU16(self.allocator, 2);
         // tail_call      — partial value
         try builder.writeOp(self.allocator, .tail_call);

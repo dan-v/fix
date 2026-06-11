@@ -8,7 +8,6 @@ const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
-const thunk_mod = @import("../runtime/thunk.zig");
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -152,16 +151,9 @@ inline fn shortCircuitIdentityUpvalue(self: *VM, descriptors: []const u8, frame:
 }
 
 /// Compose outer + inner descriptors and build the closure directly,
-/// then wrap it in a pass-through thunk so observers see a `Value.thunk`
-/// at this slot — same shape the unoptimised path would produce after
-/// the wrapping thunk resolved.
-///
-/// We keep the pass-through wrapper because some downstream code paths
-/// distinguish thunks from raw closures (e.g. demand-marking, isThunk
-/// checks at attrset write sites); short-circuiting the *value type*
-/// in addition to the thunk allocation broke NixOS module evaluation
-/// even when the underlying closure was identical (see memory:
-/// project-trivial-body-short-circuit).
+/// skipping the wrapping bytecode thunk. Inner descriptors are all
+/// kind=upvalue (classifier guarantee), so each inner upvalue resolves
+/// to `outer_descriptors[inner_idx]` evaluated against the outer frame.
 inline fn shortCircuitClosureCaptures(
     self: *VM,
     cl_chunk_id: ChunkId,
@@ -199,22 +191,9 @@ inline fn shortCircuitClosureCaptures(
         out_index += 1;
     }
     self.sp = out_index;
-    try makeClosure(self, cl_chunk_id, @intCast(k));
-    // makeClosure pushed the closure; wrap it in a pass-through thunk
-    // so the caller sees a thunk-shaped value at this slot.
-    const closure_val = stack.pop(self);
-    const thunk_id = try self.heap.addThunk(thunk_mod.Thunk.initPassThrough(closure_val));
-    recordPassThroughCreate(self, thunk_id, frame);
-    try stack.push(self, Value.thunk(thunk_id));
+    return makeClosure(self, cl_chunk_id, @intCast(k));
 }
 
-inline fn recordPassThroughCreate(self: *VM, id: types.ObjectId, frame: *const Frame) void {
-    if (comptime !vm_mod.thunks_log_enabled) return;
-    if (self.thunk_trace) |tt| {
-        const fiber_id = self.claimer_id & 0x00FFFFFF;
-        tt.recordCreate(id, self.workerId(), fiber_id, frame.chunk_id, @intCast(frame.ip), .pass_through, null);
-    }
-}
 
 
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
