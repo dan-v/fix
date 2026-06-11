@@ -91,6 +91,29 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // Pre-fetch the chunk so we can read `body_is_substantial` once
     // instead of a second `registry.get` from `shouldSpeculate`.
     const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+
+    // Trivial-body short-circuit: if the chunk's whole body is
+    // `get_upvalue_ret upvalue[N]; halt` or `constant_ret #idx; halt`,
+    // we already know what forcing the thunk will produce — the
+    // captured value, or the constant. Push it directly instead of
+    // allocating a thunk, populating its upvalues, and (later)
+    // running a 4-byte chunk through the dispatcher. Saves a heap
+    // alloc, a markDemanded, a frame push/pop, and several dispatches
+    // per occurrence — the dominant pattern that drives the
+    // `thunk_captures` op count (~15% of all ops on NixOS toplevel).
+    switch (ch.scheduling.trivial) {
+        .identity_upvalue => |idx| {
+            return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
+        },
+        .constant => |const_idx| {
+            return stack.push(self, ch.constants[const_idx]);
+        },
+        .closure_zero => |cl_id| {
+            return makeClosure(self, cl_id, 0);
+        },
+        .none => {},
+    }
+
     const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
     errdefer self.heap.rollbackBytecodeThunk(pending);
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
@@ -104,6 +127,26 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try stack.push(self, Value.thunk(id));
 }
 
+/// Push the value of capture descriptor `idx` directly without
+/// constructing a thunk. The descriptors operand is laid out as
+/// (kind:1, index:2) triples; we read the `idx`-th triple and resolve
+/// it the same way `fillCaptureValues` would.
+inline fn shortCircuitIdentityUpvalue(self: *VM, descriptors: []const u8, frame: *const Frame, idx: u16) !void {
+    const offset: usize = @as(usize, idx) * 3;
+    if (offset + 3 > descriptors.len) return error.InvalidBytecode;
+    const capture_index = readU16(descriptors, offset + 1);
+    const value: Value = switch (descriptors[offset]) {
+        0 => self.stack[frame.frame_base + capture_index],
+        1 => blk: {
+            const upvalues = frame.upvalues orelse return error.MissingClosure;
+            break :blk upvalues[capture_index];
+        },
+        else => return error.InvalidBytecode,
+    };
+    return stack.push(self, value);
+}
+
+
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
 /// urgent queue at creation time. Used by `thunk_captures_eager` —
 /// the compiler emits that op when strictness analysis confirms the
@@ -116,7 +159,19 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 /// helper finishes its current force, then any consumer that forces
 /// this thunk gets normal demand-driven handling.
 pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-    _ = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+    const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+    switch (ch.scheduling.trivial) {
+        .identity_upvalue => |idx| {
+            return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
+        },
+        .constant => |const_idx| {
+            return stack.push(self, ch.constants[const_idx]);
+        },
+        .closure_zero => |cl_id| {
+            return makeClosure(self, cl_id, 0);
+        },
+        .none => {},
+    }
     const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
     errdefer self.heap.rollbackBytecodeThunk(pending);
     try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));

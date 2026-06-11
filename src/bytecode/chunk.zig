@@ -73,6 +73,29 @@ pub const ChunkStrictness = struct {
     deep_upvalues: u64 = 0,
 };
 
+/// Compile-time classification of trivial chunk shapes. When a
+/// chunk's entire body is a single value-load followed by ret, we can
+/// short-circuit `thunk_captures` and skip creating a thunk altogether
+/// — just push the inlined value at the caller. Cuts a heap alloc, a
+/// future force, a frame push/pop, and 2 dispatches per occurrence.
+pub const TrivialBody = union(enum) {
+    /// Not a trivial shape — full thunk creation required.
+    none,
+    /// Body is `get_upvalue_ret upvalue[N]` (or `get_upvalue N; ret`).
+    /// At thunk_captures we know upvalue N's value from the descriptor,
+    /// so we push that value directly instead of allocating a thunk.
+    identity_upvalue: u16,
+    /// Body is `constant_ret #idx` (or `constant #idx; ret`).
+    /// The value is in `chunk.constants[idx]`. We push it directly.
+    constant: ConstIdx,
+    /// Body is `closure CL, 0; ret; halt` (or `closure_long`). The
+    /// chunk wraps a zero-upvalue closure. At thunk_captures we
+    /// allocate the closure directly, skipping the thunk wrapper.
+    /// Each invocation still gets a fresh closure ObjectId — same as
+    /// running the body — but the thunk alloc + future force vanish.
+    closure_zero: ChunkId,
+};
+
 /// All compile-time hints the scheduler uses when deciding whether to
 /// submit a thunk for parallel forcing. Stamped at chunk-builder
 /// finish, never mutated at runtime.
@@ -84,6 +107,8 @@ pub const SchedulingHints = struct {
     body_is_substantial: bool = false,
     /// See ChunkStrictness.
     strictness: ChunkStrictness = .{},
+    /// Trivial-shape classification — see `TrivialBody`.
+    trivial: TrivialBody = .none,
 };
 
 /// A mutable builder for constructing chunks.
@@ -190,12 +215,77 @@ pub const ChunkBuilder = struct {
             .scheduling = .{
                 .body_is_substantial = self.code.items.len >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
+                .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
             },
             .function_args = function_args,
             .source_map = source_map,
         };
     }
 };
+
+/// Classify the body of a freshly-built chunk as one of the trivial
+/// shapes that let `thunk_captures` skip thunk allocation entirely.
+/// Run once at chunk-finish; result lives on the immutable Chunk so
+/// the hot path reads it without re-parsing the bytecode.
+fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: u16) TrivialBody {
+    // Trivial-body short-circuit is only safe for chunks used as
+    // *thunk bodies*. Thunk bodies have local_count == 0 (no args,
+    // no temporaries). Closure bodies (lambdas) have local_count >= 1
+    // for the param and may have additional locals. We must not
+    // short-circuit those because `thunk_captures` against a chunk
+    // assumes the chunk is a thunk body, not a lambda body.
+    if (local_count != 0) return .none;
+    if (code.len < 2) return .none;
+    const first: OpCode = @enumFromInt(code[0]);
+    switch (first) {
+        // `get_upvalue_ret upvalue[N]; halt`
+        // Layout: 1 byte op, 2 bytes upvalue idx, 1 byte halt.
+        .get_upvalue_ret => {
+            if (code.len != 4) return .none;
+            if (@as(OpCode, @enumFromInt(code[3])) != .halt) return .none;
+            const idx = readU16Inline(code, 1);
+            return .{ .identity_upvalue = idx };
+        },
+        // `constant_ret #idx; halt` — 1 byte op, 2 bytes idx, 1 byte halt.
+        .constant_ret => {
+            if (code.len != 4) return .none;
+            if (@as(OpCode, @enumFromInt(code[3])) != .halt) return .none;
+            const idx = readU16Inline(code, 1);
+            if (idx >= constants.len) return .none;
+            return .{ .constant = idx };
+        },
+        // `closure CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
+        .closure => {
+            if (code.len != 7) return .none;
+            if (@as(OpCode, @enumFromInt(code[5])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[6])) != .halt) return .none;
+            const upvalue_count = readU16Inline(code, 3);
+            if (upvalue_count != 0) return .none; // non-zero closure needs stack values
+            return .{ .closure_zero = readU16Inline(code, 1) };
+        },
+        // `closure_long CL(4), 0; ret; halt` — 1 + 4 + 2 + 1 + 1 = 9 bytes.
+        .closure_long => {
+            if (code.len != 9) return .none;
+            if (@as(OpCode, @enumFromInt(code[7])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[8])) != .halt) return .none;
+            const upvalue_count = readU16Inline(code, 5);
+            if (upvalue_count != 0) return .none;
+            return .{ .closure_zero = readU32Inline(code, 1) };
+        },
+        else => return .none,
+    }
+}
+
+inline fn readU16Inline(buf: []const u8, off: usize) u16 {
+    return @as(u16, buf[off]) | (@as(u16, buf[off + 1]) << 8);
+}
+
+inline fn readU32Inline(buf: []const u8, off: usize) u32 {
+    return @as(u32, buf[off]) |
+        (@as(u32, buf[off + 1]) << 8) |
+        (@as(u32, buf[off + 2]) << 16) |
+        (@as(u32, buf[off + 3]) << 24);
+}
 
 /// Code length at or above which a chunk is considered substantial
 /// enough that submitting its body to a helper at thunk-creation time
