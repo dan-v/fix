@@ -39,27 +39,27 @@ pub fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
 pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
     const attrs = try force.forceValue(self, attrs_val);
     if (!attrs.isAttrs()) return trace.typeErrorExpected(self, "attrs", attrs);
+    return force.forceValue(self, try cachedAttrLookup(self, attrs.asObjectId(), name_id));
+}
 
-    // Thread-local inline cache: (heap_token, obj_id, name_id) → raw
-    // attr value. Hits skip the binary search inside
-    // `heap.getAttrValue`. We still force the cached value — thunks
-    // are memoised at the future level, so re-force on a resolved
-    // thunk is the fast path. The cache value is the pre-force entry,
-    // which keeps invariants identical to the uncached path (caller
-    // sees a forced value either way).
-    const obj_id = attrs.asObjectId();
+/// Thread-local inline cache: (heap_token, obj_id, name_id) → raw
+/// attr value. Hits skip the binary search inside
+/// `heap.getAttrValue`. The cached value is pre-force; callers force
+/// the result if they need a resolved value.
+inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId) !Value {
     const slot_idx = attrCacheIndex(obj_id, name_id);
     const slot = &attr_cache[slot_idx];
-    if (slot.heap_token == self.heap.token and slot.obj_id == obj_id and slot.name_id == name_id) {
-        return force.forceValue(self, slot.value);
+    const token = self.heap.token;
+    if (slot.heap_token == token and slot.obj_id == obj_id and slot.name_id == name_id) {
+        return slot.value;
     }
 
     const raw = try self.heap.getAttrValue(obj_id, name_id);
-    slot.heap_token = self.heap.token;
+    slot.heap_token = token;
     slot.obj_id = obj_id;
     slot.name_id = name_id;
     slot.value = raw;
-    return force.forceValue(self, raw);
+    return raw;
 }
 
 const attr_cache_size: usize = 256;
@@ -88,7 +88,7 @@ pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encod
     while (offset < encoded_names.len) : (offset += stride) {
         if (!current.isAttrs()) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
-        current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+        current = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
@@ -104,7 +104,7 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
     while (offset < encoded_names.len) : (offset += stride) {
         if (!current.isAttrs()) return force.forceValue(self, default_val);
         const name_id = readInternId(encoded_names, offset, wide);
-        current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+        current = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
@@ -113,7 +113,7 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
     const name_val = try force.forceValue(self, dynamic_name);
     if (!name_val.isString()) return error.TypeError;
     if (!current.isAttrs()) return force.forceValue(self, default_val);
-    const result = self.heap.getAttrValue(current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
+    const result = cachedAttrLookup(self, current.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
         error.MissingAttribute => return force.forceValue(self, default_val),
         else => return err,
     };
@@ -143,7 +143,7 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
             },
             else => return error.InvalidBytecode,
         };
-        current = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+        current = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return force.forceValue(self, default_val),
             else => return err,
         };
@@ -159,7 +159,7 @@ pub fn hasAttrPath(self: *VM, attrs_val: Value, encoded_names: []const u8, wide:
     while (offset < encoded_names.len) : (offset += stride) {
         if (!current.isAttrs()) return false;
         const name_id = readInternId(encoded_names, offset, wide);
-        const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+        const attr = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return false,
             else => return err,
         };
@@ -192,7 +192,7 @@ pub fn hasAttrPathMixed(self: *VM, attrs_val: Value, dynamic_names: []const Valu
             },
             else => return error.InvalidBytecode,
         };
-        const attr = self.heap.getAttrValue(current.asObjectId(), name_id) catch |err| switch (err) {
+        const attr = cachedAttrLookup(self, current.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => return false,
             else => return err,
         };
@@ -232,7 +232,7 @@ pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
         const attrs_val = try force.forceValue(self, scope);
         if (!attrs_val.isAttrs()) return error.TypeError;
 
-        const attr_val = self.heap.getAttrValue(attrs_val.asObjectId(), name_id) catch |err| switch (err) {
+        const attr_val = cachedAttrLookup(self, attrs_val.asObjectId(), name_id) catch |err| switch (err) {
             error.MissingAttribute => continue,
             else => return err,
         };
