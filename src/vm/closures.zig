@@ -8,6 +8,7 @@ const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
+const thunk_mod = @import("../runtime/thunk.zig");
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -111,6 +112,10 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         .closure_zero => |cl_id| {
             return makeClosure(self, cl_id, 0);
         },
+        .closure_captures => |info| {
+            const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
+            return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
+        },
         .none => {},
     }
 
@@ -146,6 +151,71 @@ inline fn shortCircuitIdentityUpvalue(self: *VM, descriptors: []const u8, frame:
     return stack.push(self, value);
 }
 
+/// Compose outer + inner descriptors and build the closure directly,
+/// then wrap it in a pass-through thunk so observers see a `Value.thunk`
+/// at this slot — same shape the unoptimised path would produce after
+/// the wrapping thunk resolved.
+///
+/// We keep the pass-through wrapper because some downstream code paths
+/// distinguish thunks from raw closures (e.g. demand-marking, isThunk
+/// checks at attrset write sites); short-circuiting the *value type*
+/// in addition to the thunk allocation broke NixOS module evaluation
+/// even when the underlying closure was identical (see memory:
+/// project-trivial-body-short-circuit).
+inline fn shortCircuitClosureCaptures(
+    self: *VM,
+    cl_chunk_id: ChunkId,
+    inner_descriptors: []const u8,
+    outer_descriptors: []const u8,
+    frame: *const Frame,
+) !void {
+    const k = inner_descriptors.len / 3;
+    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    if (k > @as(usize, stack_cap - self.sp)) return error.StackOverflow;
+
+    var current_upvalues: ?[]const Value = null;
+    var out_index = self.sp;
+    var i: usize = 0;
+    while (i < inner_descriptors.len) : (i += 3) {
+        // Classifier guarantees inner kind == 1 (upvalue); the
+        // descriptor's index field selects which outer descriptor to
+        // re-evaluate.
+        const inner_idx = readU16(inner_descriptors, i + 1);
+        const outer_off: usize = @as(usize, inner_idx) * 3;
+        if (outer_off + 3 > outer_descriptors.len) return error.InvalidBytecode;
+        const outer_kind = outer_descriptors[outer_off];
+        const outer_idx = readU16(outer_descriptors, outer_off + 1);
+        const value: Value = switch (outer_kind) {
+            0 => self.stack[frame.frame_base + outer_idx],
+            1 => blk: {
+                if (current_upvalues == null) {
+                    current_upvalues = frame.upvalues orelse return error.MissingClosure;
+                }
+                break :blk current_upvalues.?[outer_idx];
+            },
+            else => return error.InvalidBytecode,
+        };
+        self.stack[out_index] = value;
+        out_index += 1;
+    }
+    self.sp = out_index;
+    try makeClosure(self, cl_chunk_id, @intCast(k));
+    // makeClosure pushed the closure; wrap it in a pass-through thunk
+    // so the caller sees a thunk-shaped value at this slot.
+    const closure_val = stack.pop(self);
+    const thunk_id = try self.heap.addThunk(thunk_mod.Thunk.initPassThrough(closure_val));
+    recordPassThroughCreate(self, thunk_id, frame);
+    try stack.push(self, Value.thunk(thunk_id));
+}
+
+inline fn recordPassThroughCreate(self: *VM, id: types.ObjectId, frame: *const Frame) void {
+    if (comptime !vm_mod.thunks_log_enabled) return;
+    if (self.thunk_trace) |tt| {
+        const fiber_id = self.claimer_id & 0x00FFFFFF;
+        tt.recordCreate(id, self.workerId(), fiber_id, frame.chunk_id, @intCast(frame.ip), .pass_through, null);
+    }
+}
+
 
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
 /// urgent queue at creation time. Used by `thunk_captures_eager` —
@@ -169,6 +239,10 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
         },
         .closure_zero => |cl_id| {
             return makeClosure(self, cl_id, 0);
+        },
+        .closure_captures => |info| {
+            const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
+            return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
         },
         .none => {},
     }

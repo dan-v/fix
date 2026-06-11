@@ -94,6 +94,26 @@ pub const TrivialBody = union(enum) {
     /// Each invocation still gets a fresh closure ObjectId — same as
     /// running the body — but the thunk alloc + future force vanish.
     closure_zero: ChunkId,
+    /// Body is `closure_captures CL, K, descriptors; ret; halt` with
+    /// K >= 1 and every inner descriptor of kind=upvalue (which is
+    /// guaranteed since thunk bodies have local_count == 0). At
+    /// `thunk_captures`, the closure's upvalue values can be resolved
+    /// directly: inner_upvalue[i] = outer_descriptors[inner_idx[i]]
+    /// evaluated against the outer frame. We compose the two
+    /// descriptor layers and build the closure in place, skipping
+    /// thunk creation entirely.
+    closure_captures: ClosureCaptures,
+};
+
+pub const ClosureCaptures = struct {
+    closure_chunk_id: ChunkId,
+    /// Slice into the *enclosing* chunk's `code` buffer where the
+    /// inner descriptors live. Stored as (offset, len) since the
+    /// classifier runs before the buffer is duped into the final
+    /// Chunk — we resolve to a real slice at use time via
+    /// `ch.code[offset..offset+len]`.
+    inner_descriptors_offset: u16,
+    inner_descriptors_len: u16,
 };
 
 /// All compile-time hints the scheduler uses when deciding whether to
@@ -271,6 +291,50 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             const upvalue_count = readU16Inline(code, 5);
             if (upvalue_count != 0) return .none;
             return .{ .closure_zero = readU32Inline(code, 1) };
+        },
+        // `closure_captures CL, K, descriptors(3K); ret; halt`
+        // 1 op + 2 chunk_id + 2 K + 3K descriptors + 1 ret + 1 halt = 7 + 3K.
+        .closure_captures => {
+            if (code.len < 7) return .none;
+            const k = readU16Inline(code, 3);
+            if (k == 0) return .none; // shouldn't happen — emit drops to .closure when K==0
+            const desc_len: usize = @as(usize, k) * 3;
+            if (code.len != 7 + desc_len) return .none;
+            if (@as(OpCode, @enumFromInt(code[5 + desc_len])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[6 + desc_len])) != .halt) return .none;
+            // Inner descriptors must all be kind=upvalue (1) since the
+            // thunk body has no locals. If the compiler ever emits
+            // kind=local here it would read garbage, so refusing the
+            // short-circuit is the safe fallback.
+            var i: usize = 0;
+            while (i < desc_len) : (i += 3) {
+                if (code[5 + i] != 1) return .none;
+            }
+            return .{ .closure_captures = .{
+                .closure_chunk_id = readU16Inline(code, 1),
+                .inner_descriptors_offset = 5,
+                .inner_descriptors_len = @intCast(desc_len),
+            } };
+        },
+        // `closure_captures_long CL(4), K, descriptors(3K); ret; halt`
+        // 1 + 4 + 2 + 3K + 1 + 1 = 9 + 3K.
+        .closure_captures_long => {
+            if (code.len < 9) return .none;
+            const k = readU16Inline(code, 5);
+            if (k == 0) return .none;
+            const desc_len: usize = @as(usize, k) * 3;
+            if (code.len != 9 + desc_len) return .none;
+            if (@as(OpCode, @enumFromInt(code[7 + desc_len])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[8 + desc_len])) != .halt) return .none;
+            var i: usize = 0;
+            while (i < desc_len) : (i += 3) {
+                if (code[7 + i] != 1) return .none;
+            }
+            return .{ .closure_captures = .{
+                .closure_chunk_id = readU32Inline(code, 1),
+                .inner_descriptors_offset = 7,
+                .inner_descriptors_len = @intCast(desc_len),
+            } };
         },
         else => return .none,
     }
