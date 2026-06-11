@@ -254,13 +254,31 @@ const Analyzer = struct {
                 try self.analyzeInto(node.data.attr_dynamic.name, out);
             },
 
-            .attr_or => try self.analyzeInto(node.data.attr_or.attr_path, out),
+            .attr_or => try self.analyzeAttrOrChain(node.data.attr_or.attr_path, out),
 
             .has_attr => try self.analyzeInto(node.data.has_attr.root, out),
             .has_attr_dynamic => try self.analyzeInto(node.data.has_attr_dynamic.root, out),
             .has_attr_mixed => try self.analyzeInto(node.data.has_attr_mixed.root, out),
 
             .parens => try self.analyzeInto(node.data.parens, out),
+        }
+    }
+
+    /// Walk an `attr_or`'s lookup chain conservatively: only the
+    /// chain's base expression is unconditionally evaluated. Each
+    /// segment (static or dynamic) may short-circuit if a preceding
+    /// lookup fails — so we must NOT mark dynamic-segment names as
+    /// strict, since `attr.${k} or d` will skip evaluating `k` when
+    /// an earlier segment in the chain misses.
+    fn analyzeAttrOrChain(self: *Analyzer, node: *const Node, out: *Strictness) anyerror!void {
+        switch (node.tag) {
+            .attr_path => try self.analyzeInto(node.data.attr_path.root, out),
+            .attr_dynamic => try self.analyzeAttrOrChain(node.data.attr_dynamic.root, out),
+            .has_attr => try self.analyzeInto(node.data.has_attr.root, out),
+            .has_attr_dynamic => try self.analyzeAttrOrChain(node.data.has_attr_dynamic.root, out),
+            .has_attr_mixed => try self.analyzeInto(node.data.has_attr_mixed.root, out),
+            .parens => try self.analyzeAttrOrChain(node.data.parens, out),
+            else => try self.analyzeInto(node, out),
         }
     }
 };
