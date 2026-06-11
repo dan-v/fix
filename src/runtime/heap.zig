@@ -46,6 +46,8 @@ const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024 })
 const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512 });
 const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512 });
 
+var next_heap_token: std.atomic.Value(u64) = .init(1);
+
 pub const ValueRange = ValueStore.Range;
 pub const AttrRange = AttrStore.Range;
 pub const AttrPosRange = AttrPosStore.Range;
@@ -163,6 +165,11 @@ pub const ObjectHeap = struct {
     /// heap of millions of objects.
     errored_infos: std.ArrayListUnmanaged(*@import("thunk.zig").ErrorInfo),
     errored_infos_mu: stable.SpinMutex,
+    /// Unique-per-init id for cache invalidation. Same trick as the
+    /// intern table: thread-local caches outlive an Evaluator, and the
+    /// allocator can reuse heap addresses, so a stale slot would match
+    /// pointer equality even though it refers to a freed heap.
+    token: u64,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
@@ -176,6 +183,7 @@ pub const ObjectHeap = struct {
             .worker_locals = locals,
             .errored_infos = .empty,
             .errored_infos_mu = .{},
+            .token = next_heap_token.fetchAdd(1, .monotonic),
         };
     }
 

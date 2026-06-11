@@ -39,7 +39,46 @@ pub fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
 pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
     const attrs = try force.forceValue(self, attrs_val);
     if (!attrs.isAttrs()) return trace.typeErrorExpected(self, "attrs", attrs);
-    return force.forceValue(self, try self.heap.getAttrValue(attrs.asObjectId(), name_id));
+
+    // Thread-local inline cache: (heap_token, obj_id, name_id) → raw
+    // attr value. Hits skip the binary search inside
+    // `heap.getAttrValue`. We still force the cached value — thunks
+    // are memoised at the future level, so re-force on a resolved
+    // thunk is the fast path. The cache value is the pre-force entry,
+    // which keeps invariants identical to the uncached path (caller
+    // sees a forced value either way).
+    const obj_id = attrs.asObjectId();
+    const slot_idx = attrCacheIndex(obj_id, name_id);
+    const slot = &attr_cache[slot_idx];
+    if (slot.heap_token == self.heap.token and slot.obj_id == obj_id and slot.name_id == name_id) {
+        return force.forceValue(self, slot.value);
+    }
+
+    const raw = try self.heap.getAttrValue(obj_id, name_id);
+    slot.heap_token = self.heap.token;
+    slot.obj_id = obj_id;
+    slot.name_id = name_id;
+    slot.value = raw;
+    return force.forceValue(self, raw);
+}
+
+const attr_cache_size: usize = 256;
+
+const AttrCacheSlot = struct {
+    heap_token: u64 = 0,
+    obj_id: types.ObjectId = 0,
+    name_id: InternId = 0,
+    value: Value = Value.null_val,
+};
+
+threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
+
+inline fn attrCacheIndex(obj_id: types.ObjectId, name_id: InternId) usize {
+    // Mix obj_id and name_id — same lookup site on the same object
+    // hits the same slot, but different lookups on the same object
+    // (e.g. `.x` and `.y`) land in different slots.
+    const mixed: u64 = (@as(u64, obj_id) *% 0x9E3779B97F4A7C15) ^ @as(u64, name_id);
+    return @intCast(mixed % attr_cache_size);
 }
 
 pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
