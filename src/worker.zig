@@ -367,7 +367,22 @@ pub const Worker = struct {
     /// is counted as work-in-progress. Flushes local timing counters
     /// to the scheduler first — parking is the only voluntary CPU
     /// yield, so it's the natural batching point for the atomic add.
+    ///
+    /// Pre-park spin polls the shared `pending_tasks` counter — a
+    /// single relaxed atomic load — so a submission burst landing in
+    /// the next few µs catches helpers before they pay a futex pair.
+    /// Polling drainStep directly would do per-queue CAS probes whose
+    /// contention destroys cache coherence across 32 workers; reading
+    /// one shared counter is much cheaper.
     fn parkAndAccount(self: *Worker) void {
+        const SPIN_ITERATIONS: u32 = 1024;
+        var i: u32 = 0;
+        while (i < SPIN_ITERATIONS) : (i += 1) {
+            if (self.scheduler.pending_tasks.load(.monotonic) > 0) return;
+            if (self.shouldStop()) return;
+            std.atomic.spinLoopHint();
+        }
+
         self.flushTimingToScheduler();
         const t0 = nanoMonotonic();
         self.scheduler.parkWorker(self.worker_id);
