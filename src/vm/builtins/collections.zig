@@ -621,7 +621,10 @@ pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !
         }
     }
 
-    return Value.attrs(try self.heap.addAttrs(entries.items));
+    // `left_entries` and `right_entries` are sorted by name (heap
+    // invariant); the merge-walk preserves order and adds no
+    // duplicates, so `entries.items` is sorted+unique by construction.
+    return Value.attrs(try self.heap.addAttrsSorted(entries.items));
 }
 
 pub fn stringListContainsIntern(self: anytype, list_id: ObjectId, needle: InternId) !bool {

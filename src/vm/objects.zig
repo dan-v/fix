@@ -79,7 +79,7 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
         merged.appendAssumeCapacity(right[right_i]);
     }
 
-    return self.heap.addAttrs(merged.items);
+    return self.heap.addAttrsSorted(merged.items);
 }
 
 pub fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Value {

@@ -608,6 +608,16 @@ pub const ObjectHeap = struct {
         return self.add(.{ .attrs = range });
     }
 
+    /// Same as `addAttrs` but the caller guarantees `entries` is already
+    /// sorted by `name` and contains no duplicates. Skips the sort and
+    /// duplicate-check that `prepareAttrsRange` runs on unsorted input.
+    /// Use this from merge-walk style builders (`mergeAttrs`,
+    /// `intersectAttrs`) whose output is sorted+unique by construction.
+    pub fn addAttrsSorted(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
+        const range = try self.appendAttrEntries(entries);
+        return self.add(.{ .attrs = range });
+    }
+
     /// Allocate + sort + dedup an AttrRange without wrapping it in an
     /// object slot. Used by reserve+fill flows where the caller wants
     /// to compute the final attrs payload before publishing the
@@ -675,10 +685,13 @@ pub const ObjectHeap = struct {
         const meta = try self.mergeAttrPositionMeta(left_id, right_id, right);
         errdefer self.rollbackMeta(meta);
 
+        // Both inputs are already sorted+deduped attrs (invariants of
+        // `addAttrs`/`prepareAttrsRange`), and the merge walks them in
+        // lockstep — the output is sorted and unique by construction.
+        // Skip the sort + duplicate check that `prepareAttrsRange`
+        // does for unsorted callers; on nixpkgs module merge they're
+        // the dominant cost of this routine.
         const range = try self.appendAttrEntries(merged.items);
-        errdefer self.attrs.rollback(range);
-        self.sortAttrs(range);
-        try self.rejectDuplicateAttrs(range);
         return self.addWithMeta(.{ .attrs = range }, meta);
     }
 

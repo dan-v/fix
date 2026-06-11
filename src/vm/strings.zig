@@ -226,7 +226,7 @@ pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !Obje
         merged.appendAssumeCapacity(right[right_i]);
     }
 
-    return self.heap.addAttrs(merged.items);
+    return self.heap.addAttrsSorted(merged.items);
 }
 
 pub fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Value) !Value {

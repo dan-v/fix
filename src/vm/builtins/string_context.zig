@@ -143,7 +143,7 @@ pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !
         merged.appendAssumeCapacity(right[right_i]);
     }
 
-    return self.heap.addAttrs(merged.items);
+    return self.heap.addAttrsSorted(merged.items);
 }
 
 pub fn mergeContextAttrValue(self: anytype, name: InternId, left: Value, right: Value) !Value {
