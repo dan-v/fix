@@ -207,7 +207,14 @@ pub const Future = struct {
     }
 
     pub inline fn markDemanded(self: *Future) void {
-        self.demanded.store(1, .release);
+        // Skip the cache-line-evicting store when the flag is already
+        // set. Hot thunks get re-forced repeatedly; on each re-force
+        // the unconditional store invalidated other workers' copies of
+        // the line even though the value didn't change. Idempotent
+        // write — racing observers all store the same value.
+        if (self.demanded.load(.monotonic) == 0) {
+            self.demanded.store(1, .release);
+        }
     }
 
     pub inline fn isDemanded(self: *const Future) bool {
