@@ -79,6 +79,47 @@ pub fn jitGetAttr(vm: *anyopaque, attrs_val: Value, name_id: types.InternId) cal
     return .{ .value = v, .error_code = 0 };
 }
 
+/// JIT handler for the well-known `mapattrs_apply` chunk. Equivalent
+/// to running:
+///   capture_upvalue 0 (func); capture_upvalue 1 (name); call;
+///   capture_upvalue 2 (value); tail_call; ret; halt
+/// through the interpreter, but skips bytecode dispatch and the
+/// inner-frame push for the partial result.
+pub fn jitMapAttrsApply(vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_len: usize) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    _ = upvalues_len;
+    const VM = @import("vm.zig").VM;
+    const closures = @import("vm/closures.zig");
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const func = upvalues_ptr[0];
+    const name = upvalues_ptr[1];
+    const value = upvalues_ptr[2];
+    const partial = closures.callValue(v, func, name) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const result = closures.callValue(v, partial, value) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
+/// JIT handler for the well-known `genlist_apply` chunk. Body:
+///   capture_upvalue 0 (func); capture_upvalue 1 (arg); tail_call;
+///   ret; halt
+pub fn jitGenListApply(vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_len: usize) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    _ = upvalues_len;
+    const VM = @import("vm.zig").VM;
+    const closures = @import("vm/closures.zig");
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const func = upvalues_ptr[0];
+    const arg = upvalues_ptr[1];
+    const result = closures.callValue(v, func, arg) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
 /// RWX executable code buffer. mmap-backed for simplicity (W^X
 /// would require remapping after each write; not worth it yet). One
 /// instance per Evaluator, owned by the chunk registry — compiled
@@ -139,7 +180,53 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (compileConstantRet(buf, ch)) |f| return f;
     if (compileGetUpvalueRet(buf, ch)) |f| return f;
     if (compileGetUpvalueAttrRet(buf, ch)) |f| return f;
+    if (matchMapAttrsApply(ch)) return &jitMapAttrsApply;
+    if (matchGenListApply(ch)) return &jitGenListApply;
     return null;
+}
+
+/// Recognize the exact bytecode shape of the well-known
+/// `mapattrs_apply` chunk (`registerMapAttrsApplyChunk`):
+///   capture_upvalue 0  ; func
+///   capture_upvalue 1  ; name
+///   call
+///   capture_upvalue 2  ; value
+///   tail_call
+///   ret
+///   halt
+fn matchMapAttrsApply(ch: *const Chunk) bool {
+    if (ch.local_count != 0) return false;
+    if (ch.code.len != 13) return false;
+    const expected = [_]u8{
+        @intFromEnum(OpCode.capture_upvalue), 0, 0,
+        @intFromEnum(OpCode.capture_upvalue), 1, 0,
+        @intFromEnum(OpCode.call),
+        @intFromEnum(OpCode.capture_upvalue), 2, 0,
+        @intFromEnum(OpCode.tail_call),
+        @intFromEnum(OpCode.ret),
+        @intFromEnum(OpCode.halt),
+    };
+    return std.mem.eql(u8, ch.code, &expected);
+}
+
+/// Recognize the well-known `genlist_apply` chunk
+/// (`registerGenListApplyChunk`):
+///   capture_upvalue 0  ; func
+///   capture_upvalue 1  ; arg
+///   tail_call
+///   ret
+///   halt
+fn matchGenListApply(ch: *const Chunk) bool {
+    if (ch.local_count != 0) return false;
+    if (ch.code.len != 9) return false;
+    const expected = [_]u8{
+        @intFromEnum(OpCode.capture_upvalue), 0, 0,
+        @intFromEnum(OpCode.capture_upvalue), 1, 0,
+        @intFromEnum(OpCode.tail_call),
+        @intFromEnum(OpCode.ret),
+        @intFromEnum(OpCode.halt),
+    };
+    return std.mem.eql(u8, ch.code, &expected);
 }
 
 /// `constant_ret #idx; halt` → `movabs rax, imm64; xor edx, edx; ret`.
