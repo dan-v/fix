@@ -69,14 +69,31 @@ pub fn jitForceValue(vm: *anyopaque, value: Value) callconv(.c) JitResult {
     return .{ .value = v, .error_code = 0 };
 }
 
+pub fn jitGetAttr(vm: *anyopaque, attrs_val: Value, name_id: types.InternId) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const access = @import("vm/access.zig");
+    const VM = @import("vm.zig").VM;
+    const v = access.getAttrValue(@as(*VM, @ptrCast(@alignCast(vm))), attrs_val, name_id) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = v, .error_code = 0 };
+}
+
 /// RWX executable code buffer. mmap-backed for simplicity (W^X
 /// would require remapping after each write; not worth it yet). One
 /// instance per Evaluator, owned by the chunk registry — compiled
 /// stubs live for the registry's lifetime.
+///
+/// `append` serializes on a SpinMutex — chunk registration runs
+/// concurrently from parallel imports, and an unsynchronized bump
+/// of `len` produces silently overlapping stubs that read each
+/// other's bytes. (Manifested as MissingAttribute/TypeError on
+/// random chunks during NixOS toplevel only at workers >= 2.)
 pub const CodeBuffer = struct {
     base: [*]u8,
     capacity: usize,
     len: usize,
+    mu: @import("runtime/stable_segments.zig").SpinMutex,
 
     pub fn init(capacity: usize) !CodeBuffer {
         if (!enabled) @compileError("CodeBuffer used in a build without -Djit");
@@ -89,7 +106,7 @@ pub const CodeBuffer = struct {
             -1,
             0,
         ) catch return error.OutOfMemory;
-        return .{ .base = @ptrCast(raw.ptr), .capacity = aligned, .len = 0 };
+        return .{ .base = @ptrCast(raw.ptr), .capacity = aligned, .len = 0, .mu = .{} };
     }
 
     pub fn deinit(self: *CodeBuffer) void {
@@ -98,20 +115,17 @@ pub const CodeBuffer = struct {
         self.* = undefined;
     }
 
-    /// Reserve `n` bytes and return a writable pointer to them.
-    /// Returns null when full — caller falls back to interpreter.
-    pub fn reserve(self: *CodeBuffer, n: usize) ?[*]u8 {
-        if (self.len + n > self.capacity) return null;
-        const p = self.base + self.len;
-        self.len += n;
-        return p;
-    }
-
     /// Append raw bytes to the buffer, returning a fn-pointer to the
     /// start of the appended region. Caller is responsible for the
     /// bytes being a valid function (e.g., must end in `ret`).
+    /// Serialized — safe to call concurrently from multiple
+    /// registrations.
     pub fn append(self: *CodeBuffer, bytes: []const u8) ?CompiledFn {
-        const dest = self.reserve(bytes.len) orelse return null;
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.len + bytes.len > self.capacity) return null;
+        const dest = self.base + self.len;
+        self.len += bytes.len;
         @memcpy(dest[0..bytes.len], bytes);
         return @ptrCast(@alignCast(dest));
     }
@@ -124,6 +138,7 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (!enabled) return null;
     if (compileConstantRet(buf, ch)) |f| return f;
     if (compileGetUpvalueRet(buf, ch)) |f| return f;
+    if (compileGetUpvalueAttrRet(buf, ch)) |f| return f;
     return null;
 }
 
@@ -190,6 +205,57 @@ fn compileGetUpvalueRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     //   49 bb <imm64>           movabs r11, &jitForceValue
     //   41 ff e3                jmp r11
     const target: u64 = @intFromPtr(&jitForceValue);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+
+    return buf.append(stub[0..len]);
+}
+
+/// `get_upvalue_attr N M; ret; halt` → load `upvalues[N]` and
+/// tail-call `jitGetAttr(vm, val, name_id)`. The common `lib.foo` /
+/// `config.bar` chunk after `emitGetAttr`'s `get_upvalue+get_attr`
+/// fusion (see `compiler/emit.zig`).
+fn compileGetUpvalueAttrRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 7) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[6])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const name_id: u16 = @as(u16, ch.code[3]) | (@as(u16, ch.code[4]) << 8);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [25]u8 = undefined;
+    var len: usize = 0;
+
+    // Load upvalues[slot] into rsi (becomes `attrs_val` arg).
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+
+    // mov edx, name_id (zero-extends into rdx)
+    //   ba <imm32>
+    stub[len] = 0xba;
+    std.mem.writeInt(u32, stub[len + 1 ..][0..4], name_id, .little);
+    len += 5;
+
+    // movabs r11, &jitGetAttr ; jmp r11
+    const target: u64 = @intFromPtr(&jitGetAttr);
     stub[len] = 0x49;
     stub[len + 1] = 0xbb;
     std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
