@@ -233,6 +233,14 @@ pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
         .closure => |closure| evalThunkClosure(self, closure),
         .bytecode => |bytecode| blk: {
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
+            // JIT fast path: if the registry produced a native-code
+            // entry for this chunk, call it instead of pushing a
+            // frame and dispatching. Null jit_code (the universal
+            // case, including any build without `-Djit`) falls
+            // through to the interpreter.
+            if (ch.jit_code) |jit_fn| {
+                break :blk jit_fn(@ptrCast(self), bytecode.upvalues.ptr, bytecode.upvalues.len);
+            }
             break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, bytecode.upvalues);
         },
         .pass_through => |v| forceValueImpl(self, v, true),

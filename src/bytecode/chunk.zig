@@ -46,6 +46,10 @@ pub const Chunk = struct {
     function_args: []const AttrEntry = &.{},
     /// Source span ranges for cold-path error traces.
     source_map: []const SourceMapEntry = &.{},
+    /// Optional native-code entry point produced by the JIT. Null
+    /// means "interpret the bytecode normally" — the canonical path
+    /// and the only one available without `-Djit`. See `src/jit.zig`.
+    jit_code: ?@import("../jit.zig").CompiledFn = null,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
@@ -409,16 +413,23 @@ pub const WellKnownChunks = struct {
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
     const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
+    const jit = @import("../jit.zig");
+    const JitCodeBuffer = if (jit.enabled) jit.CodeBuffer else void;
 
     allocator: std.mem.Allocator,
     chunks: Store,
     well_known: WellKnownChunks,
+    /// JIT'd native-code buffer, one per registry. `void` when the
+    /// JIT is disabled at build time — has zero footprint and the
+    /// interpreter handles everything.
+    jit_buffer: JitCodeBuffer,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
             .allocator = allocator,
             .chunks = .empty,
             .well_known = .{ .genlist_apply = 0, .mapattrs_apply = 0 },
+            .jit_buffer = if (jit.enabled) try jit.CodeBuffer.init(1 << 20) else {},
         };
         errdefer self.deinit();
         self.well_known.genlist_apply = try self.registerGenListApplyChunk();
@@ -493,6 +504,7 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
+        if (jit.enabled) self.jit_buffer.deinit();
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
@@ -502,6 +514,11 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
+        if (jit.enabled) {
+            // Best-effort: failure to JIT just leaves the interpreter
+            // to handle it. Don't propagate.
+            stored.jit_code = jit.compile(&self.jit_buffer, stored);
+        }
         return try self.chunks.append(self.allocator, stored);
     }
 
