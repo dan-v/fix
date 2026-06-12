@@ -237,7 +237,7 @@ pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
 
     if (builtins.hasConstant(name)) {
         try emit.emitOp(self, .push_builtins);
-        try emit.emitInternOp(self, .get_attr, .get_attr_long, try self.intern.intern(name));
+        try emit.emitGetAttr(self, try self.intern.intern(name));
         return true;
     }
 

@@ -304,7 +304,7 @@ pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, 
         try child.builder.writeByte(child.allocator, 1);
         try emit.writeInternId(&child, name_id, name_id > std.math.maxInt(u16));
     } else {
-        try emit.emitInternOp(&child, .get_attr, .get_attr_long, name_id);
+        try emit.emitGetAttr(&child, name_id);
     }
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);

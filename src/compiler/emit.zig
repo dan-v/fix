@@ -130,6 +130,37 @@ pub fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: Inte
     }
 }
 
+/// Emit `get_attr name`, fusing with an immediately-preceding source
+/// op into a compound super-op (`get_upvalue_attr`, `get_local_attr`,
+/// `get_local_attr_long`). Only fuses when the attr name InternId
+/// fits in u16; there's no long-name form yet.
+pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
+    if (id <= std.math.maxInt(u16)) {
+        if (self.builder.last_op_offset) |offset| {
+            const code = self.builder.code.items;
+            if (offset < code.len) {
+                const last_op: OpCode = @enumFromInt(code[offset]);
+                const fused: ?OpCode = switch (last_op) {
+                    .get_upvalue => .get_upvalue_attr,
+                    .get_local => .get_local_attr,
+                    .get_local_long => .get_local_attr_long,
+                    else => null,
+                };
+                if (fused) |op| {
+                    code[offset] = @intFromEnum(op);
+                    try self.builder.writeU16(self.allocator, @intCast(id));
+                    self.builder.last_op_offset = null;
+                    // The unfused encoding would have been 3 bytes
+                    // (get_attr op + 2-byte name); we wrote 2 bytes.
+                    self.builder.fusion_savings += 1;
+                    return;
+                }
+            }
+        }
+    }
+    try emitInternOp(self, .get_attr, .get_attr_long, id);
+}
+
 pub fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
     try bytecode.writeInternId(&self.builder.code, self.allocator, id, wide);
 }

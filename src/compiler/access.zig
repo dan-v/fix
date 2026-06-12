@@ -45,7 +45,7 @@ pub fn compileAttrPath(self: *Compiler, node: *const Node) !void {
             try emit.emitOp(self, .get_attr_dynamic);
         } else {
             const name_id = try attrs.attrSegmentNameId(self, seg);
-            try emit.emitInternOp(self, .get_attr, .get_attr_long, name_id);
+            try emit.emitGetAttr(self, name_id);
         }
     }
 }

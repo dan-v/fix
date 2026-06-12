@@ -906,6 +906,34 @@ fn opGetUpvalueRet(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     return retEpilogue(vm, stop_depth, result);
 }
 
+fn opGetUpvalueAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const name_id = readU16(code, ip + 2);
+    const upvalues = frame.upvalues orelse return error.MissingClosure;
+    const result = try access.getAttrValue(vm, upvalues[slot], @intCast(name_id));
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
+fn opGetLocalAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = code[ip];
+    const name_id = readU16(code, ip + 1);
+    const result = try access.getAttrValue(vm, vm.stack[frame.frame_base + slot], @intCast(name_id));
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 3, stop_depth);
+}
+
+fn opGetLocalAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const slot = readU16(code, ip);
+    const name_id = readU16(code, ip + 2);
+    const result = try access.getAttrValue(vm, vm.stack[frame.frame_base + slot], @intCast(name_id));
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
 fn opHalt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     _ = frame;
     _ = code;
@@ -998,6 +1026,9 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.get_local_ret)] = opGetLocalRet;
     table[@intFromEnum(OpCode.get_local_ret_long)] = opGetLocalRetLong;
     table[@intFromEnum(OpCode.get_upvalue_ret)] = opGetUpvalueRet;
+    table[@intFromEnum(OpCode.get_upvalue_attr)] = opGetUpvalueAttr;
+    table[@intFromEnum(OpCode.get_local_attr)] = opGetLocalAttr;
+    table[@intFromEnum(OpCode.get_local_attr_long)] = opGetLocalAttrLong;
     table[@intFromEnum(OpCode.make_cell)] = opMakeCell;
     table[@intFromEnum(OpCode.init_cell_slot)] = opInitCellSlot;
     table[@intFromEnum(OpCode.init_cell_slot_long)] = opInitCellSlotLong;

@@ -143,6 +143,13 @@ pub const ChunkBuilder = struct {
     /// patches an offset in place). Used by `emit.emitRet` to fuse
     /// the previous value-producing op into a `<op>_ret` super-op.
     last_op_offset: ?usize = null,
+    /// Bytes saved by emit-time fusion (super-op rewrites). Added back
+    /// to `code.items.len` when computing `body_is_substantial` so a
+    /// chunk's perceived "weight" reflects the work it does, not the
+    /// fusion-compressed encoding. Speculation tuning lives at a sharp
+    /// cliff (see project-tier1-perf-session); shifting chunks across
+    /// the threshold by 1 byte per fusion was a real regression.
+    fusion_savings: u32 = 0,
     /// Strictness signature computed by `compiler/strictness.zig`
     /// after the body is compiled. Carried through `finish` onto the
     /// resulting Chunk via `SchedulingHints`.
@@ -233,7 +240,7 @@ pub const ChunkBuilder = struct {
             .constants = constants,
             .local_count = local_count,
             .scheduling = .{
-                .body_is_substantial = self.code.items.len >= SPECULATION_MIN_CODE_BYTES,
+                .body_is_substantial = self.code.items.len + self.fusion_savings >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
             },

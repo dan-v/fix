@@ -152,6 +152,21 @@ pub const OpCode = enum(u8) {
     /// Fused `get_upvalue + ret` (always 2-byte upvalue index).
     get_upvalue_ret,
 
+    // ---- fused compound super-ops ----
+    /// Fused `get_upvalue + get_attr` — read upvalue, force, look up
+    /// attribute. Operand: 2-byte upvalue index + 2-byte name InternId.
+    /// Saves the push/pop of the attrs value plus one dispatch. The
+    /// `lib.foo` and `config.bar` patterns are everywhere in NixOS
+    /// modules; profiling shows `get_upvalue` is 10% of all ops and
+    /// `get_attr` is 3%, much of it the same upvalue→attr chain.
+    get_upvalue_attr,
+    /// Fused `get_local + get_attr` (narrow slot — 1-byte). Operand:
+    /// 1-byte slot + 2-byte name InternId.
+    get_local_attr,
+    /// Fused `get_local_long + get_attr` (wide slot — 2-byte). Operand:
+    /// 2-byte slot + 2-byte name InternId.
+    get_local_attr_long,
+
     // ---- thunks ----
     /// Wrap the top-of-stack value in a mutable lazy cell.
     make_cell,

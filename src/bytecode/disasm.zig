@@ -277,6 +277,27 @@ fn writeOperands(
             ip += 4;
             try writeInternRef(writer, id, symbols);
         },
+        .get_upvalue_attr => {
+            const slot = readU16(code, ip);
+            const id: InternId = @intCast(readU16(code, ip + 2));
+            ip += 4;
+            try writer.print("upvalue[{d}].", .{slot});
+            try writeInternRef(writer, id, symbols);
+        },
+        .get_local_attr => {
+            const slot = code[ip];
+            const id: InternId = @intCast(readU16(code, ip + 1));
+            ip += 3;
+            try writer.print("local[{d}].", .{slot});
+            try writeInternRef(writer, id, symbols);
+        },
+        .get_local_attr_long => {
+            const slot = readU16(code, ip);
+            const id: InternId = @intCast(readU16(code, ip + 2));
+            ip += 4;
+            try writer.print("local[{d}].", .{slot});
+            try writeInternRef(writer, id, symbols);
+        },
         .get_attr_dynamic_or => {
             try writer.writeAll("(dynamic, with default)");
         },
