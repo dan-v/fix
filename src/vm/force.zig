@@ -239,7 +239,11 @@ pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
             // case, including any build without `-Djit`) falls
             // through to the interpreter.
             if (ch.jit_code) |jit_fn| {
-                break :blk jit_fn(@ptrCast(self), bytecode.upvalues.ptr, bytecode.upvalues.len);
+                const result = jit_fn(@ptrCast(self), bytecode.upvalues.ptr, bytecode.upvalues.len);
+                if (result.error_code != 0) {
+                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
+                }
+                break :blk result.value;
             }
             break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, bytecode.upvalues);
         },
