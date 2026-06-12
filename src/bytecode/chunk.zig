@@ -103,6 +103,12 @@ pub const TrivialBody = union(enum) {
     /// descriptor layers and build the closure in place, skipping
     /// thunk creation entirely.
     closure_captures: ClosureCaptures,
+    /// Body is `push_builtins; ret; halt` — the binding aliases the
+    /// evaluator's builtins attrset. At thunk_captures we push
+    /// `vm.builtins` directly. Common via `with builtins;` blocks and
+    /// `let lib = import ...; in ...` patterns where lib transitively
+    /// embeds `builtins`.
+    builtins,
 };
 
 pub const ClosureCaptures = struct {
@@ -280,6 +286,13 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             const idx = readU16Inline(code, 1);
             if (idx >= constants.len) return .none;
             return .{ .constant = idx };
+        },
+        // `push_builtins; ret; halt` — 1 + 1 + 1 = 3 bytes.
+        .push_builtins => {
+            if (code.len != 3) return .none;
+            if (@as(OpCode, @enumFromInt(code[1])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[2])) != .halt) return .none;
+            return .builtins;
         },
         // `closure CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
         .closure => {

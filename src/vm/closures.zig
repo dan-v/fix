@@ -115,6 +115,9 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
             const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
             return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
         },
+        .builtins => {
+            return stack.push(self, self.builtins);
+        },
         .none => {},
     }
 
@@ -222,6 +225,9 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
         .closure_captures => |info| {
             const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
             return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
+        },
+        .builtins => {
+            return stack.push(self, self.builtins);
         },
         .none => {},
     }
