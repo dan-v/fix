@@ -50,6 +50,15 @@ pub const Chunk = struct {
     /// means "interpret the bytecode normally" — the canonical path
     /// and the only one available without `-Djit`. See `src/jit.zig`.
     jit_code: ?@import("../jit.zig").CompiledFn = null,
+    /// Native-code entry point for *lambda bodies* (chunks called via
+    /// `doCall`/`doTailCall`/`callValue`). Distinct ABI from
+    /// `jit_code` because the caller passes the argument as a Value
+    /// register, not via the VM stack — JIT'd lambdas skip the
+    /// frame push and bytecode dispatch entirely. Mutually exclusive
+    /// with `jit_code` at most: thunk bodies have `local_count == 0`
+    /// and lambda bodies have `local_count >= 1`, so a chunk is
+    /// classified one way or the other (never both).
+    jit_lambda_code: ?@import("../jit.zig").LambdaCompiledFn = null,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
@@ -546,7 +555,11 @@ pub const ChunkRegistry = struct {
         if (jit.enabled) {
             // Best-effort: failure to JIT just leaves the interpreter
             // to handle it. Don't propagate.
-            stored.jit_code = jit.compile(&self.jit_buffer, stored);
+            if (stored.local_count == 0) {
+                stored.jit_code = jit.compile(&self.jit_buffer, stored);
+            } else {
+                stored.jit_lambda_code = jit.compileLambda(&self.jit_buffer, stored);
+            }
         }
         return try self.chunks.append(self.allocator, stored);
     }

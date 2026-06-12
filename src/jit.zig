@@ -55,6 +55,16 @@ pub const JitResult = extern struct {
 ///   return = JitResult: rax=value bits, rdx=error_code.
 pub const CompiledFn = *const fn (vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_len: usize) callconv(.c) JitResult;
 
+/// ABI for JIT'd *lambda* entry. Distinct from `CompiledFn` because
+/// the caller passes the function argument as a register instead of
+/// requiring the JIT'd code to load it from a VM stack frame:
+///   rdi=vm, rsi=upvalues.ptr, rdx=arg (the Value passed to the lambda).
+///   return = JitResult.
+/// Skipping the frame setup is what makes lambda JIT worth doing —
+/// `runIsolatedFrame` builds a `Frame`, pushes onto the VM stack, and
+/// runs the dispatch loop; the JIT-direct path does none of that.
+pub const LambdaCompiledFn = *const fn (vm: *anyopaque, upvalues_ptr: [*]const Value, arg: Value) callconv(.c) JitResult;
+
 /// Helper called from JIT'd code to force a Value through the VM's
 /// existing thunk machinery. Wraps `forceValue`'s error union as a
 /// `JitResult` so the JIT'd code can tail-call this and return
@@ -311,6 +321,17 @@ const dump_unsupported = false;
 pub var compile_counts: Counts = .{};
 
 pub const Counts = struct {
+    /// Lambda shapes (chunks reached via `callValue`/`doCall`/
+    /// `doTailCall`, distinguished from thunk shapes by
+    /// `local_count >= 1`).
+    lambda_identity: u32 = 0,
+    lambda_local_attr_ret: u32 = 0,
+    lambda_local_eq_null_ret: u32 = 0,
+    lambda_local_neq_null_ret: u32 = 0,
+    lambda_local_not_ret: u32 = 0,
+    /// Lambdas whose body uses only upvalues (ignores the arg);
+    /// these reuse the upvalue-only thunk stubs.
+    lambda_as_thunk: u32 = 0,
     constant_ret: u32 = 0,
     push_lit_ret: u32 = 0,
     get_upvalue_ret: u32 = 0,
@@ -328,11 +349,197 @@ pub const Counts = struct {
     /// Chunks that were offered to `compile` but didn't match any
     /// shape; the interpreter handles them.
     unsupported: u32 = 0,
+    /// Lambda chunks (`local_count >= 1`) offered to `compileLambda`
+    /// that didn't match any shape.
+    unsupported_lambda: u32 = 0,
     /// Histogram of unsupported chunks keyed by the first opcode in
     /// the body. Cheap visibility into what shapes the JIT is still
     /// missing — readable via `--print-sched-stats`.
     unsupported_by_first_op: [256]u32 = [_]u32{0} ** 256,
 };
+
+/// Try to JIT-compile `ch` as a lambda body. Caller guarantees
+/// `ch.local_count >= 1`. Returns null when the shape isn't yet
+/// supported — the interpreter handles the chunk via the usual
+/// `runIsolatedFrame` path.
+pub fn compileLambda(buf: *CodeBuffer, ch: *const Chunk) ?LambdaCompiledFn {
+    if (!enabled) return null;
+    // Lambda shapes only target single-argument lambdas (the local
+    // is the arg, no extra locals). Anything else would need real
+    // VM-stack manipulation in native code, which we're avoiding.
+    if (ch.local_count != 1) return null;
+    if (compileLambdaIdentity(buf, ch)) |f| {
+        compile_counts.lambda_identity += 1;
+        return f;
+    }
+    if (compileLambdaLocalAttrRet(buf, ch)) |f| {
+        compile_counts.lambda_local_attr_ret += 1;
+        return f;
+    }
+    if (compileLambdaLocalCmpNullRet(buf, ch, .eq_null, &jitForceEqNull)) |f| {
+        compile_counts.lambda_local_eq_null_ret += 1;
+        return f;
+    }
+    if (compileLambdaLocalCmpNullRet(buf, ch, .neq_null, &jitForceNeqNull)) |f| {
+        compile_counts.lambda_local_neq_null_ret += 1;
+        return f;
+    }
+    if (compileLambdaLocalNotRet(buf, ch)) |f| {
+        compile_counts.lambda_local_not_ret += 1;
+        return f;
+    }
+    // If the lambda body uses only upvalues (ignores the arg), the
+    // thunk-style stubs work without modification — the ABI registers
+    // are bit-identical at the calling-convention level (upvalues_len
+    // and arg both occupy rdx as a 64-bit register, and the stubs
+    // below clobber/overwrite rdx before using it). Try them in the
+    // same order as `compile` to share emitter machinery.
+    if (asLambda(compileGetUpvalueRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    if (asLambda(compileGetUpvalueAttrRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    if (asLambda(compileGetUpvalueAttrAttrRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    if (asLambda(compileBuiltinAttrRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    if (asLambda(compileConstantRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    if (asLambda(compilePushLitRet(buf, ch))) |f| {
+        compile_counts.lambda_as_thunk += 1;
+        return f;
+    }
+    compile_counts.unsupported_lambda += 1;
+    if (dump_unsupported and ch.code.len <= 24) {
+        std.debug.print("jit-unsup-lambda local_count={d} len={d}:", .{ ch.local_count, ch.code.len });
+        for (ch.code) |b| std.debug.print(" {x:0>2}", .{b});
+        std.debug.print("\n", .{});
+    }
+    return null;
+}
+
+/// Reinterpret a thunk-style `CompiledFn` as a `LambdaCompiledFn`.
+/// Safe iff the body doesn't read the third argument register —
+/// i.e., its bytecode shape doesn't access any local. The callers
+/// of `asLambda` are gated on shapes that match this contract.
+inline fn asLambda(maybe: ?CompiledFn) ?LambdaCompiledFn {
+    return @ptrCast(maybe orelse return null);
+}
+
+/// `x: x` body — `get_local_ret 0; halt` (3 bytes).
+/// Stub: tail-call `jitForceValue(vm, arg)`. `get_local_ret` forces
+/// the local before returning, so we route through `forceValue`.
+fn compileLambdaIdentity(buf: *CodeBuffer, ch: *const Chunk) ?LambdaCompiledFn {
+    if (ch.code.len != 3) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_local_ret) return null;
+    if (ch.code[1] != 0) return null; // slot 0 = arg
+    if (@as(OpCode, @enumFromInt(ch.code[2])) != .halt) return null;
+
+    // mov rsi, rdx        ; arg (rdx) -> jitForceValue's `value` arg (rsi)
+    // movabs r11, &jitForceValue
+    // jmp r11
+    var stub: [16]u8 = undefined;
+    stub[0] = 0x48;
+    stub[1] = 0x89;
+    stub[2] = 0xd6;
+    const target: u64 = @intFromPtr(&jitForceValue);
+    stub[3] = 0x49;
+    stub[4] = 0xbb;
+    std.mem.writeInt(u64, stub[5..13], target, .little);
+    stub[13] = 0x41;
+    stub[14] = 0xff;
+    stub[15] = 0xe3;
+    return @ptrCast(@alignCast(buf.append(&stub) orelse return null));
+}
+
+/// `x: x == null` / `x != null` body — `get_local 0; eq_null|neq_null;
+/// ret; halt` (5 bytes). Same machine code as the upvalue variant
+/// except we source the value from rdx (arg) instead of an upvalues
+/// slot.
+fn compileLambdaLocalCmpNullRet(buf: *CodeBuffer, ch: *const Chunk, expected_op: OpCode, helper: *const anyopaque) ?LambdaCompiledFn {
+    if (ch.code.len != 5) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_local) return null;
+    if (ch.code[1] != 0) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[2])) != expected_op) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .halt) return null;
+    // mov rsi, rdx          ; arg -> helper's second arg
+    // movabs r11, &helper
+    // jmp r11
+    var stub: [16]u8 = undefined;
+    stub[0] = 0x48;
+    stub[1] = 0x89;
+    stub[2] = 0xd6;
+    const target: u64 = @intFromPtr(helper);
+    stub[3] = 0x49;
+    stub[4] = 0xbb;
+    std.mem.writeInt(u64, stub[5..13], target, .little);
+    stub[13] = 0x41;
+    stub[14] = 0xff;
+    stub[15] = 0xe3;
+    return @ptrCast(@alignCast(buf.append(&stub) orelse return null));
+}
+
+/// `x: !x` body — `get_local 0; not; ret; halt` (5 bytes).
+fn compileLambdaLocalNotRet(buf: *CodeBuffer, ch: *const Chunk) ?LambdaCompiledFn {
+    if (ch.code.len != 5) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_local) return null;
+    if (ch.code[1] != 0) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[2])) != .not) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .halt) return null;
+    var stub: [16]u8 = undefined;
+    stub[0] = 0x48;
+    stub[1] = 0x89;
+    stub[2] = 0xd6;
+    const target: u64 = @intFromPtr(&jitForceNot);
+    stub[3] = 0x49;
+    stub[4] = 0xbb;
+    std.mem.writeInt(u64, stub[5..13], target, .little);
+    stub[13] = 0x41;
+    stub[14] = 0xff;
+    stub[15] = 0xe3;
+    return @ptrCast(@alignCast(buf.append(&stub) orelse return null));
+}
+
+/// `x: x.foo` body — `get_local_attr 0 N; ret; halt` (6 bytes).
+/// Stub: tail-call `jitGetAttr(vm, arg, name_id)`.
+fn compileLambdaLocalAttrRet(buf: *CodeBuffer, ch: *const Chunk) ?LambdaCompiledFn {
+    if (ch.code.len != 6) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_local_attr) return null;
+    if (ch.code[1] != 0) return null;
+    const name_id: u16 = @as(u16, ch.code[2]) | (@as(u16, ch.code[3]) << 8);
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .halt) return null;
+
+    // mov rsi, rdx        ; arg -> attrs_val (jitGetAttr's 2nd arg)
+    // mov edx, name_id    ; name (zero-extends into rdx)
+    // movabs r11, &jitGetAttr
+    // jmp r11
+    var stub: [21]u8 = undefined;
+    stub[0] = 0x48;
+    stub[1] = 0x89;
+    stub[2] = 0xd6;
+    stub[3] = 0xba;
+    std.mem.writeInt(u32, stub[4..8], name_id, .little);
+    const target: u64 = @intFromPtr(&jitGetAttr);
+    stub[8] = 0x49;
+    stub[9] = 0xbb;
+    std.mem.writeInt(u64, stub[10..18], target, .little);
+    stub[18] = 0x41;
+    stub[19] = 0xff;
+    stub[20] = 0xe3;
+    return @ptrCast(@alignCast(buf.append(&stub) orelse return null));
+}
 
 pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (!enabled) return null;

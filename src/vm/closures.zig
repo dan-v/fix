@@ -14,6 +14,7 @@ const debug = @import("debug.zig");
 const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
+const jit_mod = @import("../jit.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -317,6 +318,15 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = try closureChunkViaIC(self, closure.chunk_id);
+        if (comptime jit_mod.enabled) {
+            if (ch.jit_lambda_code) |jit_fn| {
+                const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
+                if (result.error_code != 0) {
+                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
+                }
+                return stack.push(self, result.value);
+            }
+        }
         try stack.push(self, arg); // arg is first local
         try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     } else if (callee.isBuiltin()) {
@@ -337,6 +347,19 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                 const closure_id = current.asObjectId();
                 const closure = try getClosureById(self, closure_id);
                 const ch = try closureChunkViaIC(self, closure.chunk_id);
+                if (comptime jit_mod.enabled) {
+                    if (ch.jit_lambda_code) |jit_fn| {
+                        const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
+                        if (result.error_code != 0) {
+                            return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
+                        }
+                        // Mirror the builtin tail-call case: push the
+                        // result on the current frame's stack. The
+                        // surrounding op (`opTailCall`) then resumes
+                        // dispatch on the next op, which is `ret`.
+                        return stack.push(self, result.value);
+                    }
+                }
                 try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
                 return;
             },
@@ -389,6 +412,15 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+        if (comptime jit_mod.enabled) {
+            if (ch.jit_lambda_code) |jit_fn| {
+                const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
+                if (result.error_code != 0) {
+                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
+                }
+                return result.value;
+            }
+        }
         try stack.push(self, arg);
         return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     }
