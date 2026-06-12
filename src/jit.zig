@@ -79,6 +79,37 @@ pub fn jitGetAttr(vm: *anyopaque, attrs_val: Value, name_id: types.InternId) cal
     return .{ .value = v, .error_code = 0 };
 }
 
+/// `builtins.<name>` — load `vm.builtins` and look up `name_id`.
+/// Bytecode shape: `push_builtins; get_attr N; ret; halt`.
+pub fn jitBuiltinAttr(vm: *anyopaque, name_id: types.InternId) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const access = @import("vm/access.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const result = access.getAttrValue(v, v.builtins, name_id) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
+/// Force an upvalue (the function) and call it with a baked-in
+/// constant argument. Bytecode: `get_upvalue N; constant K; call;
+/// ret; halt`.
+pub fn jitForceCallConst(vm: *anyopaque, func_unforced: Value, arg: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const force = @import("vm/force.zig");
+    const closures = @import("vm/closures.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const func = force.forceValue(v, func_unforced) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const result = closures.callValue(v, func, arg) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
 /// JIT handler for the well-known `mapattrs_apply` chunk. Equivalent
 /// to running:
 ///   capture_upvalue 0 (func); capture_upvalue 1 (name); call;
@@ -175,14 +206,140 @@ pub const CodeBuffer = struct {
 /// Try to JIT-compile `ch`'s body. Returns null when the chunk's
 /// shape isn't yet supported — caller leaves `ch.jit_code` null and
 /// the interpreter handles it.
+/// Per-shape JIT compile counters, summed across all chunks
+/// registered in this process. Read via `compileCounts()`. Cheap
+/// (un-atomic) — single-writer per `register` call up to the
+/// `CodeBuffer` mutex, and only read post-hoc.
+pub var compile_counts: Counts = .{};
+
+pub const Counts = struct {
+    constant_ret: u32 = 0,
+    get_upvalue_ret: u32 = 0,
+    get_upvalue_attr_ret: u32 = 0,
+    builtin_attr_ret: u32 = 0,
+    upvalue_call_const_ret: u32 = 0,
+    mapattrs_apply: u32 = 0,
+    genlist_apply: u32 = 0,
+    /// Chunks that were offered to `compile` but didn't match any
+    /// shape; the interpreter handles them.
+    unsupported: u32 = 0,
+};
+
 pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (!enabled) return null;
-    if (compileConstantRet(buf, ch)) |f| return f;
-    if (compileGetUpvalueRet(buf, ch)) |f| return f;
-    if (compileGetUpvalueAttrRet(buf, ch)) |f| return f;
-    if (matchMapAttrsApply(ch)) return &jitMapAttrsApply;
-    if (matchGenListApply(ch)) return &jitGenListApply;
+    if (compileConstantRet(buf, ch)) |f| {
+        compile_counts.constant_ret += 1;
+        return f;
+    }
+    if (compileGetUpvalueRet(buf, ch)) |f| {
+        compile_counts.get_upvalue_ret += 1;
+        return f;
+    }
+    if (compileGetUpvalueAttrRet(buf, ch)) |f| {
+        compile_counts.get_upvalue_attr_ret += 1;
+        return f;
+    }
+    if (compileBuiltinAttrRet(buf, ch)) |f| {
+        compile_counts.builtin_attr_ret += 1;
+        return f;
+    }
+    if (compileUpvalueCallConstRet(buf, ch)) |f| {
+        compile_counts.upvalue_call_const_ret += 1;
+        return f;
+    }
+    if (matchMapAttrsApply(ch)) {
+        compile_counts.mapattrs_apply += 1;
+        return &jitMapAttrsApply;
+    }
+    if (matchGenListApply(ch)) {
+        compile_counts.genlist_apply += 1;
+        return &jitGenListApply;
+    }
+    compile_counts.unsupported += 1;
     return null;
+}
+
+/// `push_builtins; get_attr N; ret; halt` → load `vm.builtins` and
+/// tail-call `jitBuiltinAttr`. The `builtins.X` pattern is
+/// everywhere in NixOS module code (`builtins.elem`,
+/// `builtins.foldl'`, `builtins.toString`, ...).
+fn compileBuiltinAttrRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 6) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .push_builtins) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[1])) != .get_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .halt) return null;
+    const name_id: u16 = @as(u16, ch.code[2]) | (@as(u16, ch.code[3]) << 8);
+
+    //   be <imm32>          mov esi, name_id  (zero-extends to rsi)
+    //   49 bb <imm64>        movabs r11, &jitBuiltinAttr
+    //   41 ff e3             jmp r11
+    var stub: [18]u8 = undefined;
+    stub[0] = 0xbe;
+    std.mem.writeInt(u32, stub[1..5], name_id, .little);
+    const target: u64 = @intFromPtr(&jitBuiltinAttr);
+    stub[5] = 0x49;
+    stub[6] = 0xbb;
+    std.mem.writeInt(u64, stub[7..15], target, .little);
+    stub[15] = 0x41;
+    stub[16] = 0xff;
+    stub[17] = 0xe3;
+    return buf.append(&stub);
+}
+
+/// `get_upvalue N; constant K; call; ret; halt` →
+///   mov rsi, [rsi + 8*N]            ; func = upvalues[N] (unforced)
+///   movabs rdx, <constant_bits>      ; arg = ch.constants[K] (baked in)
+///   movabs r11, &jitForceCallConst
+///   jmp r11
+/// `f(literal)` pattern; topped the unsupported-chunk frequency
+/// histogram on NixOS toplevel.
+fn compileUpvalueCallConstRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 9) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != .constant) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[6])) != .call) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[7])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[8])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const const_idx: u16 = @as(u16, ch.code[4]) | (@as(u16, ch.code[5]) << 8);
+    if (const_idx >= ch.constants.len) return null;
+    const constant_bits: u64 = @bitCast(ch.constants[const_idx]);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [30]u8 = undefined;
+    var len: usize = 0;
+    // Load upvalues[slot] into rsi.
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+    // movabs rdx, <constant_bits>
+    stub[len] = 0x48;
+    stub[len + 1] = 0xba;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], constant_bits, .little);
+    len += 10;
+    // movabs r11, &jitForceCallConst ; jmp r11
+    const target: u64 = @intFromPtr(&jitForceCallConst);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+
+    return buf.append(stub[0..len]);
 }
 
 /// Recognize the exact bytecode shape of the well-known
