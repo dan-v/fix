@@ -145,6 +145,45 @@ pub fn jitForceCallUpvalue(vm: *anyopaque, func_unforced: Value, arg: Value) cal
     return .{ .value = result, .error_code = 0 };
 }
 
+/// `get_upvalue N; eq_null; ret; halt` (or `neq_null`). Force the
+/// upvalue and compare its kind against null. The compiler emits
+/// `eq_null` for explicit `x == null` / `x != null` comparisons,
+/// which are pervasive defaulting idioms in Nix.
+pub fn jitForceEqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const force = @import("vm/force.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const forced = force.forceValue(v, val_unforced) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = Value.boolVal(forced.kind() == .null), .error_code = 0 };
+}
+
+pub fn jitForceNeqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const force = @import("vm/force.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const forced = force.forceValue(v, val_unforced) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = Value.boolVal(forced.kind() != .null), .error_code = 0 };
+}
+
+/// `get_upvalue N; not; ret; halt`. Force the upvalue, expect a
+/// boolean, return its negation. Common as a thunk body for `!x`.
+pub fn jitForceNot(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const run = @import("vm/run.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const b = run.expectBool(v, val_unforced) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = Value.boolVal(!b), .error_code = 0 };
+}
+
 /// Three chained attr accesses on an upvalue. Bytecode:
 /// `get_upvalue_attr N M; get_attr P; get_attr Q; ret; halt`.
 /// Examples: `config.foo.bar.baz`, `pkgs.lib.attrsets.zipAttrs`.
@@ -278,6 +317,9 @@ pub const Counts = struct {
     get_upvalue_attr_ret: u32 = 0,
     get_upvalue_attr_attr_ret: u32 = 0,
     get_upvalue_attr3_ret: u32 = 0,
+    get_upvalue_eq_null_ret: u32 = 0,
+    get_upvalue_neq_null_ret: u32 = 0,
+    get_upvalue_not_ret: u32 = 0,
     builtin_attr_ret: u32 = 0,
     upvalue_call_const_ret: u32 = 0,
     upvalue_call_upvalue_ret: u32 = 0,
@@ -316,6 +358,18 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     }
     if (compileGetUpvalueAttr3Ret(buf, ch)) |f| {
         compile_counts.get_upvalue_attr3_ret += 1;
+        return f;
+    }
+    if (compileGetUpvalueCmpNullRet(buf, ch, .eq_null, &jitForceEqNull)) |f| {
+        compile_counts.get_upvalue_eq_null_ret += 1;
+        return f;
+    }
+    if (compileGetUpvalueCmpNullRet(buf, ch, .neq_null, &jitForceNeqNull)) |f| {
+        compile_counts.get_upvalue_neq_null_ret += 1;
+        return f;
+    }
+    if (compileGetUpvalueNotRet(buf, ch)) |f| {
+        compile_counts.get_upvalue_not_ret += 1;
         return f;
     }
     if (compileBuiltinAttrRet(buf, ch)) |f| {
@@ -466,6 +520,83 @@ fn compileGetUpvalueAttr3Ret(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     stub[len + 2] = 0xe3;
     len += 3;
 
+    return buf.append(stub[0..len]);
+}
+
+/// `get_upvalue N; eq_null|neq_null; ret; halt` (6 bytes) →
+///   mov rsi, [rsi + 8*N]
+///   movabs r11, &jitForceEqNull|jitForceNeqNull
+///   jmp r11
+fn compileGetUpvalueCmpNullRet(buf: *CodeBuffer, ch: *const Chunk, expected_op: OpCode, helper: *const anyopaque) ?CompiledFn {
+    if (ch.code.len != 6) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != expected_op) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [20]u8 = undefined;
+    var len: usize = 0;
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+    const target: u64 = @intFromPtr(helper);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+    return buf.append(stub[0..len]);
+}
+
+/// `get_upvalue N; not; ret; halt` (6 bytes) → load + tail-call helper.
+fn compileGetUpvalueNotRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 6) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != .not) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[4])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [20]u8 = undefined;
+    var len: usize = 0;
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+    const target: u64 = @intFromPtr(&jitForceNot);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
     return buf.append(stub[0..len]);
 }
 

@@ -205,8 +205,8 @@ pub fn main(init: std.process.Init) !void {
         if (comptime @import("jit.zig").enabled) {
             const c = @import("jit.zig").compile_counts;
             std.debug.print(
-                "jit: constant_ret={d} push_lit_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} get_upvalue_attr3_ret={d} builtin_attr_ret={d} upvalue_call_const_ret={d} upvalue_call_upvalue_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
-                .{ c.constant_ret, c.push_lit_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.get_upvalue_attr3_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.upvalue_call_upvalue_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
+                "jit: constant_ret={d} push_lit_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} get_upvalue_attr3_ret={d} eq_null={d} neq_null={d} not={d} builtin_attr_ret={d} upvalue_call_const_ret={d} upvalue_call_upvalue_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
+                .{ c.constant_ret, c.push_lit_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.get_upvalue_attr3_ret, c.get_upvalue_eq_null_ret, c.get_upvalue_neq_null_ret, c.get_upvalue_not_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.upvalue_call_upvalue_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
             );
             // Top-10 unsupported chunks by first opcode — useful
             // for picking the next shape to JIT.
