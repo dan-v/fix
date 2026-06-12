@@ -126,6 +126,45 @@ pub fn jitForceCallConst(vm: *anyopaque, func_unforced: Value, arg: Value) callc
     return .{ .value = result, .error_code = 0 };
 }
 
+/// Force an upvalue function and call it with another upvalue
+/// (passed unforced — the callee decides laziness, same as the
+/// well-known apply chunks). Bytecode shape:
+/// `get_upvalue N; get_upvalue M; call; ret; halt`.
+pub fn jitForceCallUpvalue(vm: *anyopaque, func_unforced: Value, arg: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const force = @import("vm/force.zig");
+    const closures = @import("vm/closures.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const func = force.forceValue(v, func_unforced) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const result = closures.callValue(v, func, arg) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
+/// Three chained attr accesses on an upvalue. Bytecode:
+/// `get_upvalue_attr N M; get_attr P; get_attr Q; ret; halt`.
+/// Examples: `config.foo.bar.baz`, `pkgs.lib.attrsets.zipAttrs`.
+pub fn jitGetUpvalueAttr3(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u32, name3: u32) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const access = @import("vm/access.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const a = access.getAttrValue(v, attrs_val, name1) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const b = access.getAttrValue(v, a, name2) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const c = access.getAttrValue(v, b, name3) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = c, .error_code = 0 };
+}
+
 /// JIT handler for the well-known `mapattrs_apply` chunk. Equivalent
 /// to running:
 ///   capture_upvalue 0 (func); capture_upvalue 1 (name); call;
@@ -222,6 +261,10 @@ pub const CodeBuffer = struct {
 /// Try to JIT-compile `ch`'s body. Returns null when the chunk's
 /// shape isn't yet supported — caller leaves `ch.jit_code` null and
 /// the interpreter handles it.
+/// Temporary diagnostic switch; toggle by hand when investigating
+/// which bytecode shapes still slip through to the interpreter.
+const dump_unsupported = false;
+
 /// Per-shape JIT compile counters, summed across all chunks
 /// registered in this process. Read via `compileCounts()`. Cheap
 /// (un-atomic) — single-writer per `register` call up to the
@@ -230,22 +273,33 @@ pub var compile_counts: Counts = .{};
 
 pub const Counts = struct {
     constant_ret: u32 = 0,
+    push_lit_ret: u32 = 0,
     get_upvalue_ret: u32 = 0,
     get_upvalue_attr_ret: u32 = 0,
     get_upvalue_attr_attr_ret: u32 = 0,
+    get_upvalue_attr3_ret: u32 = 0,
     builtin_attr_ret: u32 = 0,
     upvalue_call_const_ret: u32 = 0,
+    upvalue_call_upvalue_ret: u32 = 0,
     mapattrs_apply: u32 = 0,
     genlist_apply: u32 = 0,
     /// Chunks that were offered to `compile` but didn't match any
     /// shape; the interpreter handles them.
     unsupported: u32 = 0,
+    /// Histogram of unsupported chunks keyed by the first opcode in
+    /// the body. Cheap visibility into what shapes the JIT is still
+    /// missing — readable via `--print-sched-stats`.
+    unsupported_by_first_op: [256]u32 = [_]u32{0} ** 256,
 };
 
 pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (!enabled) return null;
     if (compileConstantRet(buf, ch)) |f| {
         compile_counts.constant_ret += 1;
+        return f;
+    }
+    if (compilePushLitRet(buf, ch)) |f| {
+        compile_counts.push_lit_ret += 1;
         return f;
     }
     if (compileGetUpvalueRet(buf, ch)) |f| {
@@ -260,12 +314,20 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
         compile_counts.get_upvalue_attr_attr_ret += 1;
         return f;
     }
+    if (compileGetUpvalueAttr3Ret(buf, ch)) |f| {
+        compile_counts.get_upvalue_attr3_ret += 1;
+        return f;
+    }
     if (compileBuiltinAttrRet(buf, ch)) |f| {
         compile_counts.builtin_attr_ret += 1;
         return f;
     }
     if (compileUpvalueCallConstRet(buf, ch)) |f| {
         compile_counts.upvalue_call_const_ret += 1;
+        return f;
+    }
+    if (compileUpvalueCallUpvalueRet(buf, ch)) |f| {
+        compile_counts.upvalue_call_upvalue_ret += 1;
         return f;
     }
     if (matchMapAttrsApply(ch)) {
@@ -277,6 +339,19 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
         return &jitGenListApply;
     }
     compile_counts.unsupported += 1;
+    if (ch.code.len > 0) {
+        compile_counts.unsupported_by_first_op[ch.code[0]] += 1;
+        if (dump_unsupported and ch.code.len <= 24) {
+            // Only dump the first 64 instances of each first-op so the
+            // sample is enough to spot the dominant shape without
+            // drowning out the rest of stderr.
+            if (compile_counts.unsupported_by_first_op[ch.code[0]] <= 64) {
+                std.debug.print("jit-unsup len={d}:", .{ch.code.len});
+                for (ch.code) |b| std.debug.print(" {x:0>2}", .{b});
+                std.debug.print("\n", .{});
+            }
+        }
+    }
     return null;
 }
 
@@ -334,6 +409,66 @@ fn compileGetUpvalueAttrAttrRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn 
     return buf.append(stub[0..len]);
 }
 
+/// `get_upvalue_attr N M; get_attr P; get_attr Q; ret; halt` →
+///   mov rsi, [rsi + 8*N]
+///   mov edx, M ; mov ecx, P ; mov r8d, Q
+///   jmp jitGetUpvalueAttr3
+/// `config.foo.bar.baz` / `pkgs.lib.attrsets.x` pattern.
+fn compileGetUpvalueAttr3Ret(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 13) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .get_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[8])) != .get_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[11])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[12])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const name1: u16 = @as(u16, ch.code[3]) | (@as(u16, ch.code[4]) << 8);
+    const name2: u16 = @as(u16, ch.code[6]) | (@as(u16, ch.code[7]) << 8);
+    const name3: u16 = @as(u16, ch.code[9]) | (@as(u16, ch.code[10]) << 8);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [36]u8 = undefined;
+    var len: usize = 0;
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+    // mov edx, name1
+    stub[len] = 0xba;
+    std.mem.writeInt(u32, stub[len + 1 ..][0..4], name1, .little);
+    len += 5;
+    // mov ecx, name2
+    stub[len] = 0xb9;
+    std.mem.writeInt(u32, stub[len + 1 ..][0..4], name2, .little);
+    len += 5;
+    // mov r8d, name3
+    stub[len] = 0x41;
+    stub[len + 1] = 0xb8;
+    std.mem.writeInt(u32, stub[len + 2 ..][0..4], name3, .little);
+    len += 6;
+    // movabs r11, &jitGetUpvalueAttr3 ; jmp r11
+    const target: u64 = @intFromPtr(&jitGetUpvalueAttr3);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+
+    return buf.append(stub[0..len]);
+}
+
 /// `push_builtins; get_attr N; ret; halt` → load `vm.builtins` and
 /// tail-call `jitBuiltinAttr`. The `builtins.X` pattern is
 /// everywhere in NixOS module code (`builtins.elem`,
@@ -373,7 +508,8 @@ fn compileUpvalueCallConstRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (ch.code.len != 9) return null;
     if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue) return null;
     if (@as(OpCode, @enumFromInt(ch.code[3])) != .constant) return null;
-    if (@as(OpCode, @enumFromInt(ch.code[6])) != .call) return null;
+    const call_op = @as(OpCode, @enumFromInt(ch.code[6]));
+    if (call_op != .call and call_op != .tail_call) return null;
     if (@as(OpCode, @enumFromInt(ch.code[7])) != .ret) return null;
     if (@as(OpCode, @enumFromInt(ch.code[8])) != .halt) return null;
     const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
@@ -405,6 +541,80 @@ fn compileUpvalueCallConstRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     len += 10;
     // movabs r11, &jitForceCallConst ; jmp r11
     const target: u64 = @intFromPtr(&jitForceCallConst);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+
+    return buf.append(stub[0..len]);
+}
+
+/// `get_upvalue N; get_upvalue M; call|tail_call; ret; halt` →
+///   mov rdx, [rsi + 8*M]     ; arg = upvalues[M] (unforced)
+///   mov rsi, [rsi + 8*N]     ; func = upvalues[N] (unforced)
+///   movabs r11, &jitForceCallUpvalue
+///   jmp r11
+/// `f x` where both `f` and `x` are upvalues. The compiler emits
+/// `tail_call` for `f x` in tail position, which is the common case
+/// for thunk bodies; `call` shows up when the value is consumed by
+/// a non-tail op. Both run the same helper — semantics are
+/// equivalent for thunk bodies (no frame to elide).
+fn compileUpvalueCallUpvalueRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 9) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[3])) != .get_upvalue) return null;
+    const call_op = @as(OpCode, @enumFromInt(ch.code[6]));
+    if (call_op != .call and call_op != .tail_call) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[7])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[8])) != .halt) return null;
+    const slot_func: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const slot_arg: u16 = @as(u16, ch.code[4]) | (@as(u16, ch.code[5]) << 8);
+    const disp_arg: u32 = @as(u32, slot_arg) * @sizeOf(Value);
+    const disp_func: u32 = @as(u32, slot_func) * @sizeOf(Value);
+
+    // Important ordering: load the arg into rdx *before* we
+    // clobber rsi with the func value, because the upvalues base
+    // is in rsi on entry. Two source loads off rsi, one of which
+    // also overwrites rsi.
+    var stub: [40]u8 = undefined;
+    var len: usize = 0;
+
+    // mov rdx, [rsi + 8*slot_arg]
+    if (disp_arg <= 0x7f) {
+        stub[len] = 0x48;
+        stub[len + 1] = 0x8b;
+        stub[len + 2] = 0x56;
+        stub[len + 3] = @intCast(disp_arg);
+        len += 4;
+    } else {
+        stub[len] = 0x48;
+        stub[len + 1] = 0x8b;
+        stub[len + 2] = 0x96;
+        std.mem.writeInt(u32, stub[len + 3 ..][0..4], disp_arg, .little);
+        len += 7;
+    }
+
+    // mov rsi, [rsi + 8*slot_func]
+    if (disp_func <= 0x7f) {
+        stub[len] = 0x48;
+        stub[len + 1] = 0x8b;
+        stub[len + 2] = 0x76;
+        stub[len + 3] = @intCast(disp_func);
+        len += 4;
+    } else {
+        stub[len] = 0x48;
+        stub[len + 1] = 0x8b;
+        stub[len + 2] = 0xb6;
+        std.mem.writeInt(u32, stub[len + 3 ..][0..4], disp_func, .little);
+        len += 7;
+    }
+
+    // movabs r11, &jitForceCallUpvalue ; jmp r11
+    const target: u64 = @intFromPtr(&jitForceCallUpvalue);
     stub[len] = 0x49;
     stub[len + 1] = 0xbb;
     std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
@@ -459,6 +669,36 @@ fn matchGenListApply(ch: *const Chunk) bool {
         @intFromEnum(OpCode.halt),
     };
     return std.mem.eql(u8, ch.code, &expected);
+}
+
+/// `push_null|push_true|push_false; ret; halt` → bake the literal
+/// `Value` bits in and return. Slips through the trivial-body
+/// classifier (which only recognizes constant_ret / get_upvalue_ret /
+/// closure / push_builtins) so these tiny 3-byte chunks were
+/// previously executed by the interpreter end-to-end.
+fn compilePushLitRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 3) return null;
+    const op: OpCode = @enumFromInt(ch.code[0]);
+    const value: Value = switch (op) {
+        .push_null => Value.null_val,
+        .push_true => Value.boolVal(true),
+        .push_false => Value.boolVal(false),
+        else => return null,
+    };
+    if (@as(OpCode, @enumFromInt(ch.code[1])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[2])) != .halt) return null;
+
+    //   48 b8 <imm64>    movabs rax, value.bits
+    //   31 d2            xor edx, edx
+    //   c3               ret
+    var stub: [13]u8 = undefined;
+    stub[0] = 0x48;
+    stub[1] = 0xb8;
+    std.mem.writeInt(u64, stub[2..10], @bitCast(value), .little);
+    stub[10] = 0x31;
+    stub[11] = 0xd2;
+    stub[12] = 0xc3;
+    return buf.append(&stub);
 }
 
 /// `constant_ret #idx; halt` → `movabs rax, imm64; xor edx, edx; ret`.

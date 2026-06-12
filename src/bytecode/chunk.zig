@@ -429,7 +429,12 @@ pub const ChunkRegistry = struct {
             .allocator = allocator,
             .chunks = .empty,
             .well_known = .{ .genlist_apply = 0, .mapattrs_apply = 0 },
-            .jit_buffer = if (jit.enabled) try jit.CodeBuffer.init(1 << 20) else {},
+            // 16 MiB — NixOS toplevel registers ~700K chunks at
+            // ~20 bytes per stub when many shapes match, comfortably
+            // under capacity. Reservation is virtual until populated
+            // so the over-provision is free for callers who don't
+            // hit the upper bound.
+            .jit_buffer = if (jit.enabled) try jit.CodeBuffer.init(16 << 20) else {},
         };
         errdefer self.deinit();
         self.well_known.genlist_apply = try self.registerGenListApplyChunk();

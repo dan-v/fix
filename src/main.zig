@@ -205,9 +205,36 @@ pub fn main(init: std.process.Init) !void {
         if (comptime @import("jit.zig").enabled) {
             const c = @import("jit.zig").compile_counts;
             std.debug.print(
-                "jit: constant_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} builtin_attr_ret={d} upvalue_call_const_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
-                .{ c.constant_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
+                "jit: constant_ret={d} push_lit_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} get_upvalue_attr3_ret={d} builtin_attr_ret={d} upvalue_call_const_ret={d} upvalue_call_upvalue_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
+                .{ c.constant_ret, c.push_lit_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.get_upvalue_attr3_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.upvalue_call_upvalue_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
             );
+            // Top-10 unsupported chunks by first opcode — useful
+            // for picking the next shape to JIT.
+            const OpCode = @import("bytecode/opcode.zig").OpCode;
+            const Slot = struct { op: u8, n: u32 };
+            var top: [10]Slot = .{Slot{ .op = 0, .n = 0 }} ** 10;
+            for (c.unsupported_by_first_op, 0..) |n, op| {
+                if (n == 0) continue;
+                var slot: usize = 10;
+                for (top, 0..) |t, i| {
+                    if (n > t.n) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot < 10) {
+                    var j: usize = 9;
+                    while (j > slot) : (j -= 1) top[j] = top[j - 1];
+                    top[slot] = .{ .op = @intCast(op), .n = n };
+                }
+            }
+            std.debug.print("jit unsupported by first op:", .{});
+            for (top) |t| {
+                if (t.n == 0) break;
+                const name = @tagName(@as(OpCode, @enumFromInt(t.op)));
+                std.debug.print(" {s}={d}", .{ name, t.n });
+            }
+            std.debug.print("\n", .{});
         }
     }
     if (!ok) {
