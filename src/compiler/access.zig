@@ -194,7 +194,7 @@ pub fn isLiteralContainerValue(self: *Compiler, node: *const Node) bool {
     };
 }
 
-pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !bool {
+pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) anyerror!bool {
     const unwrapped = unwrapParens(node);
     switch (unwrapped.tag) {
         .integer => try literals.compileInt(self, unwrapped),
@@ -211,8 +211,41 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
         .bool_false => try emit.emitOp(self, .push_false),
         .null => try emit.emitOp(self, .push_null),
         .list => {
-            if (unwrapped.data.list.items.len != 0) return false;
-            try emit.emitOpU16(self, .build_list, 0);
+            if (unwrapped.data.list.items.len == 0) {
+                try emit.emitOpU16(self, .build_list, 0);
+            } else {
+                // Build the list shell in place, then wrap in a
+                // pre-resolved "lazy shell" thunk. Forcing it in the
+                // future is O(1) (resolved fast path); XML lazy mode
+                // still prints `<unevaluated />` until a real
+                // consumer marks it demanded, matching the
+                // observable laziness of a true thunk-wrapped list.
+                try compileList(self, unwrapped);
+                try emit.emitOp(self, .make_lazy_shell);
+            }
+        },
+        .attr_set => {
+            // Only inline in eager let-binding context (set by
+            // compileLetRootBinding when strictness says forced).
+            // Other contexts — attrset-entry values, function
+            // arguments — break NixOS module fix-points if their
+            // attrset values are eagerly compiled into the parent's
+            // chunk scope. The eager let-binding path is safe
+            // because strictness already guarantees the binding
+            // gets forced before any consumer might observe a
+            // fix-point race.
+            if (!options.eager) return false;
+            if (unwrapped.data.attr_set.recursive) return false;
+            try @import("attrs.zig").compileAttrSet(self, unwrapped);
+            try emit.emitOp(self, .make_lazy_shell);
+        },
+        .lambda => {
+            try @import("ops.zig").compileLambda(self, unwrapped);
+            try emit.emitOp(self, .make_lazy_shell);
+        },
+        .lambda_attrs => {
+            try @import("ops.zig").compileLambdaAttrs(self, unwrapped);
+            try emit.emitOp(self, .make_lazy_shell);
         },
         .identifier => {
             if (!options.raw_identifier) return false;

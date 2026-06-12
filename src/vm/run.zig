@@ -703,6 +703,14 @@ fn opMakeCell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
+fn opMakeLazyShell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const val = stack.pop(vm);
+    const id = try vm.heap.addLazyShell(val);
+    try stack.push(vm, Value.thunk(id));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
 fn opInitCellSlot(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const slot = code[ip];
@@ -1118,6 +1126,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.get_local_attr)] = opGetLocalAttr;
     table[@intFromEnum(OpCode.get_local_attr_long)] = opGetLocalAttrLong;
     table[@intFromEnum(OpCode.make_cell)] = opMakeCell;
+    table[@intFromEnum(OpCode.make_lazy_shell)] = opMakeLazyShell;
     table[@intFromEnum(OpCode.init_cell_slot)] = opInitCellSlot;
     table[@intFromEnum(OpCode.init_cell_slot_long)] = opInitCellSlotLong;
     table[@intFromEnum(OpCode.get_attr)] = opGetAttr;

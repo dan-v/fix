@@ -189,7 +189,7 @@ fn writeOperands(
         .fail_assertion, .push_builtins,
         .merge_attrs, .merge_attrs_strict, .concat_lists,
         .get_attr_dynamic, .has_attr_dynamic,
-        .call, .tail_call, .make_cell, .ret, .halt => {},
+        .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
 
         .jump => {
             const off = readU32(code, ip);

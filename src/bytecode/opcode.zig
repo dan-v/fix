@@ -192,6 +192,16 @@ pub const OpCode = enum(u8) {
     // ---- thunks ----
     /// Wrap the top-of-stack value in a mutable lazy cell.
     make_cell,
+    /// Wrap the top-of-stack value in a pre-resolved, undemanded
+    /// thunk. Used by the compiler when an eagerly-buildable shape
+    /// (list / attrset / lambda) appears in a context that requires
+    /// the value to *look* like a lazy thunk to renderers (XML lazy
+    /// mode in particular) — we skip emitting a child chunk +
+    /// `thunk_captures` and just wrap the already-built shell. The
+    /// resulting thunk's `force` is O(1) (resolved fast path); the
+    /// XML serializer keeps printing `<unevaluated />` until a real
+    /// caller marks it demanded.
+    make_lazy_shell,
     /// Allocate an empty (null-wrapped) lazy cell and store it
     /// directly into a local slot. Operand: 1-byte slot index. Fuses
     /// the `push_null + make_cell + set_local` sequence that the

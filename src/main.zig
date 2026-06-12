@@ -202,6 +202,7 @@ pub fn main(init: std.process.Init) !void {
             "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d}\n",
             .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks },
         );
+        std.debug.print("registry: chunks={d}\n", .{ev.chunkStats().chunks});
         // Total CPU time across all workers (fiber resume vs futex
         // park). At workers=N the ratio busy/(busy+idle) is the
         // average worker utilisation; a high idle share means

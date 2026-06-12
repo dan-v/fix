@@ -192,6 +192,25 @@ pub const Future = struct {
         };
     }
 
+    /// Construct a Future born in `.resolved` carrying `value`, with
+    /// `demanded = 0`. Forcing it hits the resolved-thunk fast path
+    /// in `forceValueImpl` and returns `value` immediately. Lazy
+    /// renderers (XML) see resolved+undemanded and print
+    /// `<unevaluated />` — matching the appearance of a true
+    /// untouched thunk. Used by the compiler to wrap eagerly-built
+    /// shells (attrsets, lists, lambdas) into a thunk-shaped value
+    /// without paying the eventual evaluate-and-resolve roundtrip.
+    pub fn initResolved(value: Value) Future {
+        return .{
+            .state = .init(@intFromEnum(FutureState.resolved)),
+            .claimer = .init(INVALID_CLAIMER),
+            .demanded = .init(0),
+            .result = .{ .result = value },
+            .waiters_head = null,
+            .waiters_mu = .{},
+        };
+    }
+
     /// Construct a Future born in `.evaluating` claimed by `claimer`.
     /// Used by `Thunk.initBindingCell` so a concurrent force attempt
     /// sees BUSY and parks instead of CAS-claiming a placeholder.
@@ -370,6 +389,26 @@ pub const Thunk = struct {
     pub fn initPassThrough(value: Value) Thunk {
         return .{
             .future = Future.init(),
+            .target = .{ .pass_through = value },
+        };
+    }
+
+    /// Pre-resolved "lazy shell" thunk: wraps a value that's already
+    /// computed but should still appear unevaluated to lazy renderers.
+    /// Forces in O(1) (resolved fast path), prints `<unevaluated />`
+    /// in XML lazy mode until a real consumer marks it demanded.
+    ///
+    /// Used by the compiler when an eager-buildable shape (list /
+    /// attrset / lambda) sits in a context where the value is
+    /// observably lazy (attrset entry, list item) — we skip the
+    /// chunk-registration + bytecode-dispatch roundtrip and just
+    /// wrap the already-built shell.
+    pub fn initLazyShell(value: Value) Thunk {
+        return .{
+            .future = Future.initResolved(value),
+            // Target is unreachable — the resolved fast path never
+            // looks at it — but pass_through is the cheapest variant
+            // to construct and keeps debug invariants consistent.
             .target = .{ .pass_through = value },
         };
     }

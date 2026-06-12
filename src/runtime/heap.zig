@@ -839,6 +839,14 @@ pub const ObjectHeap = struct {
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });
     }
 
+    /// Wrap `value` in a pre-resolved, undemanded thunk. Used by the
+    /// compiler to make eagerly-built attrsets/lists/lambdas appear
+    /// lazy to renderers (XML) while skipping the chunk-registration
+    /// + bytecode-dispatch roundtrip of a real lazy thunk.
+    pub fn addLazyShell(self: *ObjectHeap, value: Value) !ObjectId {
+        return self.add(.{ .thunk = Thunk.initLazyShell(value) });
+    }
+
     pub fn beginBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalue_count: usize) !PendingBytecodeThunk {
         const range = try self.reserveValuesLocal(@intCast(upvalue_count));
         return .{
