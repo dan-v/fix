@@ -336,6 +336,20 @@ fn opNeq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize)
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
+fn opEqNull(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const v = try force.forceValue(vm, stack.pop(vm));
+    try stack.push(vm, Value.boolVal(v.kind() == .null));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
+fn opNeqNull(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const v = try force.forceValue(vm, stack.pop(vm));
+    try stack.push(vm, Value.boolVal(v.kind() != .null));
+    return dispatch(vm, frame, code, ip, stop_depth);
+}
+
 fn opLt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const b = stack.pop(vm);
@@ -1063,6 +1077,8 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.div_float)] = opDivFloat;
     table[@intFromEnum(OpCode.eq)] = opEq;
     table[@intFromEnum(OpCode.neq)] = opNeq;
+    table[@intFromEnum(OpCode.eq_null)] = opEqNull;
+    table[@intFromEnum(OpCode.neq_null)] = opNeqNull;
     table[@intFromEnum(OpCode.lt)] = opLt;
     table[@intFromEnum(OpCode.lte)] = opLte;
     table[@intFromEnum(OpCode.gt)] = opGt;

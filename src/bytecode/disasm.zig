@@ -185,7 +185,7 @@ fn writeOperands(
 
         .add_int, .sub_int, .mul_int, .div_int, .negate_int,
         .add_float, .sub_float, .mul_float, .div_float,
-        .eq, .neq, .lt, .lte, .gt, .gte, .not,
+        .eq, .neq, .eq_null, .neq_null, .lt, .lte, .gt, .gte, .not,
         .fail_assertion, .push_builtins,
         .merge_attrs, .merge_attrs_strict, .concat_lists,
         .get_attr_dynamic, .has_attr_dynamic,

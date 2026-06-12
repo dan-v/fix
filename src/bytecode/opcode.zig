@@ -57,6 +57,13 @@ pub const OpCode = enum(u8) {
     lte,
     gt,
     gte,
+    /// Specialized `eq null` — pop one value, push `true` if it
+    /// forces to null. Emitted by `compileBinary` when one side of
+    /// `==` is a literal `null`. Skips the generic `valuesEqual`
+    /// dispatch and gives the JIT a type-monomorphic null-check.
+    eq_null,
+    /// Specialized `neq null` — symmetric with `eq_null`.
+    neq_null,
 
     // ---- logical ----
     not,

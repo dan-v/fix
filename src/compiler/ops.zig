@@ -45,6 +45,19 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
         else => {},
     }
 
+    // Specialized comparison with literal `null`. Emit only the
+    // non-null side and use `eq_null`/`neq_null` so the runtime
+    // (and the eventual JIT) sees a type-monomorphic null check.
+    if (bin.op == .eq or bin.op == .neq) {
+        const left_null = unwrapParens(bin.left).tag == .null;
+        const right_null = unwrapParens(bin.right).tag == .null;
+        if (left_null != right_null) {
+            try self.compileNode(if (left_null) bin.right else bin.left);
+            try emit.emitOp(self, if (bin.op == .eq) .eq_null else .neq_null);
+            return;
+        }
+    }
+
     try self.compileNode(bin.left);
     try self.compileNode(bin.right);
 
