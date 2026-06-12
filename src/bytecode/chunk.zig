@@ -113,6 +113,12 @@ pub const TrivialBody = union(enum) {
     /// `let lib = import ...; in ...` patterns where lib transitively
     /// embeds `builtins`.
     builtins,
+    /// Body is one of `push_null|push_true|push_false; ret; halt` — a
+    /// 3-byte literal-return chunk that the compiler emits for thunk
+    /// bindings of `null`/`true`/`false`. The chunk has no constant
+    /// pool entry to point at, so we cache the literal `Value`
+    /// directly. Saves one heap alloc + one thunk force per binding.
+    literal: Value,
 };
 
 pub const ClosureCaptures = struct {
@@ -297,6 +303,24 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (@as(OpCode, @enumFromInt(code[1])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[2])) != .halt) return .none;
             return .builtins;
+        },
+        // `push_null|push_true|push_false; ret; halt` — 3 bytes.
+        // The compiler doesn't fuse these into a `_ret` super-op
+        // (only `constant`/`get_upvalue`/`get_local`/`get_local_long`
+        // are fused), so without the short-circuit each binding to
+        // `null`/`true`/`false` allocates a thunk whose body trivially
+        // returns the literal.
+        .push_null, .push_true, .push_false => {
+            if (code.len != 3) return .none;
+            if (@as(OpCode, @enumFromInt(code[1])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[2])) != .halt) return .none;
+            const literal: Value = switch (first) {
+                .push_null => Value.null_val,
+                .push_true => Value.boolVal(true),
+                .push_false => Value.boolVal(false),
+                else => unreachable,
+            };
+            return .{ .literal = literal };
         },
         // `closure CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
         .closure => {

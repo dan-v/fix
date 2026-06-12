@@ -118,6 +118,9 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         .builtins => {
             return stack.push(self, self.builtins);
         },
+        .literal => |val| {
+            return stack.push(self, val);
+        },
         .none => {},
     }
 
@@ -228,6 +231,9 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
         },
         .builtins => {
             return stack.push(self, self.builtins);
+        },
+        .literal => |val| {
+            return stack.push(self, val);
         },
         .none => {},
     }
