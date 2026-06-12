@@ -92,6 +92,22 @@ pub fn jitBuiltinAttr(vm: *anyopaque, name_id: types.InternId) callconv(.c) JitR
     return .{ .value = result, .error_code = 0 };
 }
 
+/// Chain two attr accesses on an upvalue. Bytecode:
+/// `get_upvalue_attr N M; get_attr P; ret; halt`.
+pub fn jitGetUpvalueAttrAttr(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u32) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const access = @import("vm/access.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const mid = access.getAttrValue(v, attrs_val, name1) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    const result = access.getAttrValue(v, mid, name2) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
 /// Force an upvalue (the function) and call it with a baked-in
 /// constant argument. Bytecode: `get_upvalue N; constant K; call;
 /// ret; halt`.
@@ -216,6 +232,7 @@ pub const Counts = struct {
     constant_ret: u32 = 0,
     get_upvalue_ret: u32 = 0,
     get_upvalue_attr_ret: u32 = 0,
+    get_upvalue_attr_attr_ret: u32 = 0,
     builtin_attr_ret: u32 = 0,
     upvalue_call_const_ret: u32 = 0,
     mapattrs_apply: u32 = 0,
@@ -239,6 +256,10 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
         compile_counts.get_upvalue_attr_ret += 1;
         return f;
     }
+    if (compileGetUpvalueAttrAttrRet(buf, ch)) |f| {
+        compile_counts.get_upvalue_attr_attr_ret += 1;
+        return f;
+    }
     if (compileBuiltinAttrRet(buf, ch)) |f| {
         compile_counts.builtin_attr_ret += 1;
         return f;
@@ -257,6 +278,60 @@ pub fn compile(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     }
     compile_counts.unsupported += 1;
     return null;
+}
+
+/// `get_upvalue_attr N M; get_attr P; ret; halt` →
+///   mov rsi, [rsi + 8*N]    ; load upvalues[N]
+///   mov edx, M               ; first name
+///   mov ecx, P               ; second name
+///   jmp jitGetUpvalueAttrAttr
+/// `lib.foo.bar` / `config.system.build` pattern.
+fn compileGetUpvalueAttrAttrRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
+    if (ch.code.len != 10) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[0])) != .get_upvalue_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[5])) != .get_attr) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[8])) != .ret) return null;
+    if (@as(OpCode, @enumFromInt(ch.code[9])) != .halt) return null;
+    const slot: u16 = @as(u16, ch.code[1]) | (@as(u16, ch.code[2]) << 8);
+    const name1: u16 = @as(u16, ch.code[3]) | (@as(u16, ch.code[4]) << 8);
+    const name2: u16 = @as(u16, ch.code[6]) | (@as(u16, ch.code[7]) << 8);
+    const disp: u32 = @as(u32, slot) * @sizeOf(Value);
+
+    var stub: [30]u8 = undefined;
+    var len: usize = 0;
+    if (disp <= 0x7f) {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0x76;
+        stub[3] = @intCast(disp);
+        len = 4;
+    } else {
+        stub[0] = 0x48;
+        stub[1] = 0x8b;
+        stub[2] = 0xb6;
+        std.mem.writeInt(u32, stub[3..7], disp, .little);
+        len = 7;
+    }
+    // mov edx, name1
+    stub[len] = 0xba;
+    std.mem.writeInt(u32, stub[len + 1 ..][0..4], name1, .little);
+    len += 5;
+    // mov ecx, name2
+    stub[len] = 0xb9;
+    std.mem.writeInt(u32, stub[len + 1 ..][0..4], name2, .little);
+    len += 5;
+    // movabs r11, &jitGetUpvalueAttrAttr ; jmp r11
+    const target: u64 = @intFromPtr(&jitGetUpvalueAttrAttr);
+    stub[len] = 0x49;
+    stub[len + 1] = 0xbb;
+    std.mem.writeInt(u64, stub[len + 2 ..][0..8], target, .little);
+    len += 10;
+    stub[len] = 0x41;
+    stub[len + 1] = 0xff;
+    stub[len + 2] = 0xe3;
+    len += 3;
+
+    return buf.append(stub[0..len]);
 }
 
 /// `push_builtins; get_attr N; ret; halt` → load `vm.builtins` and

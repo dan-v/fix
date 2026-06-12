@@ -205,8 +205,8 @@ pub fn main(init: std.process.Init) !void {
         if (comptime @import("jit.zig").enabled) {
             const c = @import("jit.zig").compile_counts;
             std.debug.print(
-                "jit: constant_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} builtin_attr_ret={d} upvalue_call_const_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
-                .{ c.constant_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
+                "jit: constant_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} builtin_attr_ret={d} upvalue_call_const_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
+                .{ c.constant_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
             );
         }
     }
