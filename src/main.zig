@@ -240,6 +240,21 @@ pub fn main(init: std.process.Init) !void {
             }
             std.debug.print("\n", .{});
         }
+        if (comptime @import("prof.zig").enabled) {
+            const prof = @import("prof.zig");
+            inline for (@typeInfo(prof.Path).@"enum".fields) |f| {
+                const samp = prof.samples[f.value];
+                if (samp.calls != 0) {
+                    std.debug.print("prof: {s}: excl_cy={d} incl_cy={d} calls={d} avg_excl={d}\n", .{
+                        f.name,
+                        samp.cycles,
+                        samp.cycles_inclusive,
+                        samp.calls,
+                        samp.cycles / samp.calls,
+                    });
+                }
+            }
+        }
     }
     if (!ok) {
         std.process.exit(1);

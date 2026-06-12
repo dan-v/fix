@@ -9,6 +9,7 @@ const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
+const prof = @import("../prof.zig");
 
 const VM = vm_mod.VM;
 const readU32 = vm_mod.readU32;
@@ -37,6 +38,8 @@ pub fn applyBuiltinClosure(self: *VM, callee: Value, arg: Value) !Value {
 }
 
 pub fn getAttrValue(self: *VM, attrs_val: Value, name_id: InternId) !Value {
+    const t = prof.start(.get_attr_value);
+    defer prof.end(.get_attr_value, t);
     const attrs = try force.forceValue(self, attrs_val);
     if (!attrs.isAttrs()) return trace.typeErrorExpected(self, "attrs", attrs);
     return force.forceValue(self, try cachedAttrLookup(self, attrs.asObjectId(), name_id));

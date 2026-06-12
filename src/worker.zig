@@ -46,6 +46,7 @@ const fiber_mod = @import("fiber.zig");
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime/worker_id.zig");
 const eval_trace = @import("eval/trace.zig");
+const prof = @import("prof.zig");
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker patches
@@ -385,7 +386,9 @@ pub const Worker = struct {
 
         self.flushTimingToScheduler();
         const t0 = nanoMonotonic();
+        const pt = prof.start(.park_main_worker);
         self.scheduler.parkWorker(self.worker_id);
+        prof.end(.park_main_worker, pt);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.idle_ns += t1 - t0;
     }

@@ -15,6 +15,7 @@ const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const jit_mod = @import("../jit.zig");
+const prof = @import("../prof.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -89,6 +90,8 @@ pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []cons
 }
 
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+    const t = prof.start(.make_bytecode_thunk);
+    defer prof.end(.make_bytecode_thunk, t);
     // Pre-fetch the chunk so we can read `body_is_substantial` once
     // instead of a second `registry.get` from `shouldSpeculate`.
     const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
@@ -314,6 +317,8 @@ inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
 }
 
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
+    const t = prof.start(.do_call);
+    defer prof.end(.do_call, t);
     if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
@@ -340,6 +345,8 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
 }
 
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
+    const t = prof.start(.do_tail_call);
+    defer prof.end(.do_tail_call, t);
     var current = callee;
     while (true) {
         switch (current.kind()) {
@@ -408,6 +415,8 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
 }
 
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
+    const t = prof.start(.call_value);
+    defer prof.end(.call_value, t);
     if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
@@ -438,6 +447,8 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
 }
 
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
+    const t = prof.start(.run_isolated_frame);
+    defer prof.end(.run_isolated_frame, t);
     const run_mod = @import("run.zig");
     const stop_depth = self.frames_len;
     const base_sp = self.sp - arg_count;

@@ -13,6 +13,7 @@ const access = @import("access.zig");
 const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("../builtins.zig").BuiltinId;
+const prof = @import("../prof.zig");
 
 const VM = vm_mod.VM;
 
@@ -23,6 +24,8 @@ pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
 }
 
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
+    const t = prof.start(.force_value);
+    defer prof.end(.force_value, t);
     return forceValueImpl(self, value, true);
 }
 
@@ -172,6 +175,8 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
+    const t = prof.start(.force_thunk_slow);
+    defer prof.end(.force_thunk_slow, t);
     const thunk_id = thunk_val.asObjectId();
     const thunk = self.heap.getThunkAssumeValid(thunk_id);
 
@@ -219,7 +224,9 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 const worker_fiber: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
                 if (thunk.enrollWaiter(&worker_fiber.waiter)) {
                     worker_fiber.state = .suspended;
+                    const ty = prof.start(.wait_busy_thunk);
                     fiber_mod.Fiber.yield();
+                    prof.end(.wait_busy_thunk, ty);
                     worker_fiber.state = .running;
                 }
                 continue;
