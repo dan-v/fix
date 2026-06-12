@@ -60,7 +60,23 @@ pub fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Valu
     if (!attrs.isAttrs() or !isPlainString(name)) return error.TypeError;
 
     const name_id = try stringTextInternId(self, name);
-    const value = try buildForcedDerivationValue(self, attrs.asObjectId(), .lazy);
+    const attrs_id = attrs.asObjectId();
+
+    // Reuse a previously-built lazy derivation value for the same
+    // input attrs. The naïve path rebuilt the whole derivation per
+    // per-attr access (drvPath, outPath, outputName, named outputs,
+    // ...) — `buildForcedDerivationValue` is the bulk of
+    // `derivationLazyAttr`'s wall time on workloads like the
+    // NixOS toplevel where one derivation is touched for several
+    // of its lazy attrs.
+    const cached_bits = self.derivations.lookupLazyDerivation(attrs_id);
+    const value: Value = if (cached_bits) |bits| .{ .bits = bits } else blk: {
+        const built = try buildForcedDerivationValue(self, attrs_id, .lazy);
+        // Best-effort cache; if the put fails (OOM) we still
+        // proceed — correctness doesn't depend on caching.
+        self.derivations.cacheLazyDerivation(attrs_id, built.bits) catch {};
+        break :blk built;
+    };
     return self.heap.getAttrValue(value.asObjectId(), name_id);
 }
 

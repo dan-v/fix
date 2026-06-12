@@ -62,6 +62,11 @@ pub const Path = enum {
     /// from main's perspective; if this is large, helpers aren't
     /// keeping main fed.
     park_main_worker,
+    /// `builtins.applyBuiltin` outer dispatch — covers the entire
+    /// inline body of whichever builtin matched. A large share of
+    /// `do_call` exclusive time usually lands here when the callee
+    /// is `.isBuiltin()` or `.isBuiltinClosure()`.
+    apply_builtin,
 };
 
 pub const Sample = struct {
@@ -79,6 +84,37 @@ const path_count = @typeInfo(Path).@"enum".fields.len;
 /// Per-path counters. Main-thread-only writes; reads (for printing)
 /// happen after the eval finishes.
 pub var samples: [path_count]Sample = @splat(.{});
+
+/// Per-builtin counters (indexed by `BuiltinId`). Populated by
+/// `applyBuiltin` instrumentation when the path's outer scope is
+/// active. Numerator is `apply_builtin` exclusive cycles; this
+/// breakdown attributes that bucket to specific builtins.
+pub const max_builtin_id: usize = 256;
+pub var builtin_samples: [max_builtin_id]Sample = @splat(.{});
+
+/// Read TSC unconditionally. Used by `recordBuiltin` to get an
+/// inclusive timestamp without going through the prof stack.
+pub inline fn tscMainOnly() u64 {
+    if (!enabled) return 0;
+    if (worker_id.current != 0) return 0;
+    return rdtsc();
+}
+
+/// Record one call to `builtin_id`. `start` is the value returned
+/// by `tscMainOnly()` at builtin entry; the inclusive delta is
+/// recorded against `builtin_samples[builtin_id]`. No exclusive-
+/// time bookkeeping — the breakdown is just to identify the few
+/// builtins whose total wall share is biggest.
+pub inline fn recordBuiltin(builtin_id: u16, t_start: u64) void {
+    if (!enabled) return;
+    if (t_start == 0) return;
+    if (builtin_id >= max_builtin_id) return;
+    const inclusive = rdtsc() - t_start;
+    const s = &builtin_samples[builtin_id];
+    s.calls += 1;
+    s.cycles += inclusive;
+    s.cycles_inclusive += inclusive;
+}
 
 const StackFrame = struct {
     path: Path,

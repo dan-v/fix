@@ -202,6 +202,19 @@ pub fn main(init: std.process.Init) !void {
             "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d}\n",
             .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks },
         );
+        // Total CPU time across all workers (fiber resume vs futex
+        // park). At workers=N the ratio busy/(busy+idle) is the
+        // average worker utilisation; a high idle share means
+        // helpers are starved for work even though wall time hasn't
+        // converged.
+        std.debug.print(
+            "sched: busy_ms={d} idle_ms={d} util={d:.2}%\n",
+            .{
+                s.busy_ns / std.time.ns_per_ms,
+                s.idle_ns / std.time.ns_per_ms,
+                if (s.busy_ns + s.idle_ns == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(s.busy_ns)) / @as(f64, @floatFromInt(s.busy_ns + s.idle_ns)),
+            },
+        );
         if (comptime @import("jit.zig").enabled) {
             const c = @import("jit.zig").compile_counts;
             std.debug.print(
@@ -253,6 +266,31 @@ pub fn main(init: std.process.Init) !void {
                         samp.cycles / samp.calls,
                     });
                 }
+            }
+            // Top builtins by inclusive cycles on main.
+            const BSlot = struct { id: u16, cycles: u64, calls: u64 };
+            var top_b: [10]BSlot = .{BSlot{ .id = 0, .cycles = 0, .calls = 0 }} ** 10;
+            for (prof.builtin_samples, 0..) |samp, id| {
+                if (samp.calls == 0) continue;
+                var slot: usize = 10;
+                for (top_b, 0..) |entry, i| {
+                    if (samp.cycles > entry.cycles) {
+                        slot = i;
+                        break;
+                    }
+                }
+                if (slot < 10) {
+                    var j: usize = 9;
+                    while (j > slot) : (j -= 1) top_b[j] = top_b[j - 1];
+                    top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .calls = samp.calls };
+                }
+            }
+            const BuiltinId = @import("builtins.zig").BuiltinId;
+            std.debug.print("prof builtins (top-10 by incl cycles):\n", .{});
+            for (top_b) |entry| {
+                if (entry.cycles == 0) break;
+                const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
+                std.debug.print("  {s}: cy={d} calls={d} avg={d}\n", .{ name, entry.cycles, entry.calls, entry.cycles / entry.calls });
             }
         }
     }

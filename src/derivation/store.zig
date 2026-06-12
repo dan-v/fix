@@ -25,6 +25,18 @@ pub const DerivationStore = struct {
     debug_enabled: bool = false,
     debug_records: std.ArrayListUnmanaged(DebugRecord) = .empty,
     mu: stable.BlockingMutex = .{},
+    /// Cache of fully-built lazy derivation values keyed by the
+    /// input `attrs_id` to `buildForcedDerivationValue(.lazy)`. The
+    /// `builtinDerivationLazyAttr` path was rebuilding the entire
+    /// derivation on every per-attr access (drvPath, outPath,
+    /// outputName, named outputs, ...) — the cache deduplicates so
+    /// the first access pays and the rest just look the result up.
+    ///
+    /// `u64` storage instead of `Value` to keep this header from
+    /// having to know about the runtime Value type. The caller
+    /// converts via `@bitCast` at each end.
+    lazy_drv_cache: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    lazy_drv_mu: stable.SpinMutex = .{},
 
     const Record = struct {
         hash_modulo: HashModulo,
@@ -50,6 +62,23 @@ pub const DerivationStore = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.records.deinit(self.allocator);
+        self.lazy_drv_cache.deinit(self.allocator);
+    }
+
+    /// Look up a cached `buildForcedDerivationValue(.lazy)` result.
+    /// Returns the cached `Value.bits` if present, `null` otherwise.
+    pub fn lookupLazyDerivation(self: *DerivationStore, attrs_id: u32) ?u64 {
+        self.lazy_drv_mu.lock();
+        defer self.lazy_drv_mu.unlock();
+        return self.lazy_drv_cache.get(attrs_id);
+    }
+
+    /// Cache the result of `buildForcedDerivationValue(.lazy)` for
+    /// future per-attr lookups against the same input attrs.
+    pub fn cacheLazyDerivation(self: *DerivationStore, attrs_id: u32, value_bits: u64) !void {
+        self.lazy_drv_mu.lock();
+        defer self.lazy_drv_mu.unlock();
+        try self.lazy_drv_cache.put(self.allocator, attrs_id, value_bits);
     }
 
     pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {

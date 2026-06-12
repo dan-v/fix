@@ -18,11 +18,16 @@ const paths = @import("builtins/paths.zig");
 const io = @import("builtins/io.zig");
 const hash = @import("builtins/hash.zig");
 const vm_force = @import("force.zig");
+const prof = @import("../prof.zig");
 
 pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;
 
 pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value {
+    const t = prof.start(.apply_builtin);
+    defer prof.end(.apply_builtin, t);
+    const tb = prof.tscMainOnly();
+    defer prof.recordBuiltin(builtin_id, tb);
     const id: BuiltinId = @enumFromInt(builtin_id);
     const arity = builtins_mod.arity(id);
     if (args.len < arity) return shared.makeBuiltinClosure(self, builtin_id, args);
