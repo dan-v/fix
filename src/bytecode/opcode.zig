@@ -128,6 +128,21 @@ pub const OpCode = enum(u8) {
     /// Wide-chunk-id form of thunk_captures_eager.
     thunk_captures_eager_long,
 
+    /// Fused `thunk_captures + set_cell_local`. Creates the thunk
+    /// from the chunk-id + descriptors, then `publishCellBinding`s it
+    /// into the cell-thunk at frame_base + slot (skipping the
+    /// push/pop of the new thunk reference). Operand layout:
+    ///   chunk_id:2 + K:2 + 3K descriptors + slot:1
+    /// The slot byte is at the END so we can rewrite `thunk_captures`
+    /// in place at emit time without shifting the descriptor bytes.
+    thunk_captures_store_cell_local,
+    /// Fused `thunk_captures + set_local`.
+    thunk_captures_store_local,
+    /// Fused `thunk_captures_eager + set_cell_local`.
+    thunk_captures_eager_store_cell_local,
+    /// Fused `thunk_captures_eager + set_local`.
+    thunk_captures_eager_store_local,
+
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
     /// The stack layout before: [closure, arg].

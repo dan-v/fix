@@ -69,11 +69,50 @@ pub fn emitCaptureLocal(self: *Compiler, slot: u16) !void {
 }
 
 pub fn emitSetLocal(self: *Compiler, slot: u16) !void {
+    if (try fuseStoreToSlot(self, slot, .narrow_local)) return;
     try emitLocalOp(self, .set_local, .set_local_long, slot);
 }
 
 pub fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
+    if (try fuseStoreToSlot(self, slot, .narrow_cell)) return;
     try emitLocalOp(self, .set_cell_local, .set_cell_local_long, slot);
+}
+
+const StoreTarget = enum { narrow_local, narrow_cell };
+
+/// Rewrite a just-emitted `thunk_captures` / `thunk_captures_eager` op
+/// into the fused `*_store_local` / `*_store_cell_local` variant by
+/// appending the destination slot byte. Saves the push/pop of the
+/// new thunk reference plus one dispatch.
+///
+/// Only fuses for 1-byte slots (`set_local`/`set_cell_local`, not
+/// the `_long` forms); ~all let-bindings fit. Only the short-chunk-id
+/// variants of `thunk_captures` are fused — `_long` is rare and
+/// adding it would double the opcode count without a meaningful win.
+fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
+    if (slot > std.math.maxInt(u8)) return false;
+    const offset = self.builder.last_op_offset orelse return false;
+    const code = self.builder.code.items;
+    if (offset >= code.len) return false;
+    const last_op: OpCode = @enumFromInt(code[offset]);
+    const fused: OpCode = switch (last_op) {
+        .thunk_captures => switch (target) {
+            .narrow_local => .thunk_captures_store_local,
+            .narrow_cell => .thunk_captures_store_cell_local,
+        },
+        .thunk_captures_eager => switch (target) {
+            .narrow_local => .thunk_captures_eager_store_local,
+            .narrow_cell => .thunk_captures_eager_store_cell_local,
+        },
+        else => return false,
+    };
+    code[offset] = @intFromEnum(fused);
+    try self.builder.writeByte(self.allocator, @intCast(slot));
+    self.builder.last_op_offset = null;
+    // Unfused: extra `set_local` op (1 byte) + slot byte. Fused: just
+    // the slot byte appended. Net 1 byte saved.
+    self.builder.fusion_savings += 1;
+    return true;
 }
 
 pub fn emitInitCellSlot(self: *Compiler, slot: u16) !void {
