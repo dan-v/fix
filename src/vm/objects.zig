@@ -51,35 +51,53 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     const left = try self.heap.getAttrs(left_id);
     const right = try self.heap.getAttrs(right_id);
 
-    var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left.len + right.len);
-    defer merged.deinit(self.allocator);
+    // Reserve worst-case (no overlap) directly in heap attr storage
+    // and walk both sides in lockstep, writing the merge in place.
+    // Both inputs are sorted+deduped (heap invariant), so the output
+    // is sorted+unique by construction. Skips a per-merge ArrayList
+    // alloc + one copy compared to the staged-then-flush pattern.
+    const cap: u32 = @intCast(left.len + right.len);
+    const reserved = try self.heap.reserveAttrsForMerge(cap);
+    const dst = self.heap.attrsMutSlice(reserved);
 
+    var out: usize = 0;
     var left_i: usize = 0;
     var right_i: usize = 0;
     while (left_i < left.len and right_i < right.len) {
         const l = left[left_i];
         const r = right[right_i];
         if (l.name < r.name) {
-            merged.appendAssumeCapacity(l);
+            dst[out] = l;
+            out += 1;
             left_i += 1;
         } else if (l.name > r.name) {
-            merged.appendAssumeCapacity(r);
+            dst[out] = r;
+            out += 1;
             right_i += 1;
         } else {
+            // Duplicate name. `mergeAttrLiteralValue` reads from the
+            // heap so it's safe to call while we hold a reserved
+            // range — the merge target is its own segment of the
+            // attr store, not the inputs we're reading.
             const value = try mergeAttrLiteralValue(self, l.value, r.value);
-            merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
+            dst[out] = .{ .name = l.name, .value = value };
+            out += 1;
             left_i += 1;
             right_i += 1;
         }
     }
-    while (left_i < left.len) : (left_i += 1) {
-        merged.appendAssumeCapacity(left[left_i]);
+    if (left_i < left.len) {
+        const n = left.len - left_i;
+        @memcpy(dst[out..][0..n], left[left_i..]);
+        out += n;
     }
-    while (right_i < right.len) : (right_i += 1) {
-        merged.appendAssumeCapacity(right[right_i]);
+    if (right_i < right.len) {
+        const n = right.len - right_i;
+        @memcpy(dst[out..][0..n], right[right_i..]);
+        out += n;
     }
 
-    return self.heap.addAttrsSorted(merged.items);
+    return self.heap.publishMergedAttrs(reserved, @intCast(out));
 }
 
 pub fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Value {

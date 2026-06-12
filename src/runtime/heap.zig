@@ -415,6 +415,33 @@ pub const ObjectHeap = struct {
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
+    /// Reserve `n` slots of attr storage for a merge in progress.
+    /// Caller writes into the returned range via `attrsMutSlice` and
+    /// publishes the final entry count with `publishMergedAttrs`. Used
+    /// by attr-set merge primitives to skip a per-merge ArrayList +
+    /// extra copy.
+    pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !AttrRange {
+        return self.reserveAttrsLocal(n);
+    }
+
+    pub fn attrsMutSlice(self: *ObjectHeap, range: AttrRange) []AttrEntry {
+        return self.attrs.sliceMut(range);
+    }
+
+    /// Commit a partially-filled reservation as a new attrs object.
+    /// `actual` is the number of entries written (<= range.len). The
+    /// trailing unused slots remain reserved but unreferenced; on the
+    /// merge workload the overlap rate makes this waste small
+    /// relative to the steady-state attr storage footprint.
+    pub fn publishMergedAttrs(self: *ObjectHeap, range: AttrRange, actual: u32) !ObjectId {
+        const trimmed: AttrRange = .{
+            .segment = range.segment,
+            .offset = range.offset,
+            .len = actual,
+        };
+        return self.add(.{ .attrs = trimmed });
+    }
+
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         const local = self.currentLocal();
         const chunk = &local.attr;
@@ -667,39 +694,63 @@ pub const ObjectHeap = struct {
         const left = try self.getAttrs(left_id);
         const right = try self.getAttrs(right_id);
 
-        var merged = try std.ArrayListUnmanaged(AttrEntry).initCapacity(self.allocator, left.len + right.len);
-        defer merged.deinit(self.allocator);
+        // Reserve worst-case (no overlap) directly in the heap's attr
+        // storage and write the merge in place. Skips a per-merge
+        // ArrayList allocation + one of the two memcpys the old path
+        // did (input → ArrayList → heap). Inputs are both sorted+
+        // deduped (invariant of `addAttrs`/`prepareAttrsRange`), so
+        // the in-order walk produces sorted+unique output by
+        // construction.
+        //
+        // Slight wastage: if entries overlap, we leave the trailing
+        // unused slots reserved (the segment cursor doesn't roll
+        // back). On NixOS module merge the overlap rate is high but
+        // the absolute waste is small compared to the steady-state
+        // attr storage footprint.
+        const cap: u32 = @intCast(left.len + right.len);
+        const reserved = try self.reserveAttrsLocal(cap);
+        const dst = self.attrs.sliceMut(reserved);
 
+        var out: usize = 0;
         var left_i: usize = 0;
         var right_i: usize = 0;
         while (left_i < left.len and right_i < right.len) {
             const l = left[left_i];
             const r = right[right_i];
             if (l.name < r.name) {
-                merged.appendAssumeCapacity(l);
+                dst[out] = l;
+                out += 1;
                 left_i += 1;
             } else if (l.name > r.name) {
-                merged.appendAssumeCapacity(r);
+                dst[out] = r;
+                out += 1;
                 right_i += 1;
             } else {
-                merged.appendAssumeCapacity(r);
+                dst[out] = r;
+                out += 1;
                 left_i += 1;
                 right_i += 1;
             }
         }
-        while (left_i < left.len) : (left_i += 1) merged.appendAssumeCapacity(left[left_i]);
-        while (right_i < right.len) : (right_i += 1) merged.appendAssumeCapacity(right[right_i]);
+        if (left_i < left.len) {
+            const n = left.len - left_i;
+            @memcpy(dst[out..][0..n], left[left_i..]);
+            out += n;
+        }
+        if (right_i < right.len) {
+            const n = right.len - right_i;
+            @memcpy(dst[out..][0..n], right[right_i..]);
+            out += n;
+        }
 
         const meta = try self.mergeAttrPositionMeta(left_id, right_id, right);
         errdefer self.rollbackMeta(meta);
 
-        // Both inputs are already sorted+deduped attrs (invariants of
-        // `addAttrs`/`prepareAttrsRange`), and the merge walks them in
-        // lockstep — the output is sorted and unique by construction.
-        // Skip the sort + duplicate check that `prepareAttrsRange`
-        // does for unsorted callers; on nixpkgs module merge they're
-        // the dominant cost of this routine.
-        const range = try self.appendAttrEntries(merged.items);
+        const range: AttrRange = .{
+            .segment = reserved.segment,
+            .offset = reserved.offset,
+            .len = @intCast(out),
+        };
         return self.addWithMeta(.{ .attrs = range }, meta);
     }
 
