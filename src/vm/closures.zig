@@ -252,11 +252,65 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 
 // ---- calls ----
 
+/// Per-call-site inline cache. Caches the (chunk_id → Chunk*) lookup
+/// at every `call`/`tail_call` site keyed by the caller's
+/// (chunk_id, ip). On hit the registry hashtable lookup is skipped,
+/// and the cache contents are first-class JIT feedback: at code-gen
+/// time the JIT reads the IC to discover whether a site is
+/// monomorphic, polymorphic, or megamorphic.
+///
+/// Heap-token gated: chunk_ids aren't unique across Evaluator
+/// instances (each registry starts at 0), and the IC is threadlocal,
+/// so a stale `ch_ptr` from a prior eval would point at a freed
+/// chunk. Matching `heap_token` invalidates the cache when the
+/// evaluator changes — same trick the attr IC uses.
+const CallICSlot = struct {
+    heap_token: u64 = 0,
+    caller_chunk_id: ChunkId = 0,
+    caller_ip: u32 = 0,
+    callee_chunk_id: ChunkId = 0,
+    callee_ch_ptr: ?*const Chunk = null,
+};
+
+const call_ic_size: usize = 256;
+threadlocal var call_ic: [call_ic_size]CallICSlot = @splat(.{});
+
+inline fn callICIndex(caller_chunk_id: ChunkId, caller_ip: u32) usize {
+    const mixed: u64 = (@as(u64, caller_chunk_id) *% 0x9E3779B97F4A7C15) ^ @as(u64, caller_ip);
+    return @intCast(mixed % call_ic_size);
+}
+
+/// Resolve a closure's Chunk*, consulting the per-call-site IC keyed
+/// by the current frame's (chunk_id, ip). On miss the slot is
+/// updated to the observed callee. Used by `doCall` / `doTailCall`.
+inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
+    const caller = stack.currentFrame(self);
+    const token = self.heap.token;
+    const idx = callICIndex(caller.chunk_id, @intCast(caller.ip));
+    const slot = &call_ic[idx];
+    if (slot.heap_token == token and
+        slot.caller_chunk_id == caller.chunk_id and
+        slot.caller_ip == caller.ip and
+        slot.callee_chunk_id == callee_chunk_id)
+    {
+        return slot.callee_ch_ptr orelse return error.InvalidChunk;
+    }
+    const ch = self.registry.get(callee_chunk_id) orelse return error.InvalidChunk;
+    slot.* = .{
+        .heap_token = token,
+        .caller_chunk_id = caller.chunk_id,
+        .caller_ip = @intCast(caller.ip),
+        .callee_chunk_id = callee_chunk_id,
+        .callee_ch_ptr = ch,
+    };
+    return ch;
+}
+
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
-        const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+        const ch = try closureChunkViaIC(self, closure.chunk_id);
         try stack.push(self, arg); // arg is first local
         try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     } else if (callee.isBuiltin()) {
@@ -276,7 +330,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
             .closure => {
                 const closure_id = current.asObjectId();
                 const closure = try getClosureById(self, closure_id);
-                const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+                const ch = try closureChunkViaIC(self, closure.chunk_id);
                 try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
                 return;
             },
