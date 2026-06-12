@@ -105,28 +105,41 @@ const ReadyQueue = struct {
     }
 };
 
-/// Bounded ring-buffer task queue protected by a `SpinMutex`.
+/// Lock-free Chase-Lev work-stealing deque.
 ///
-/// Pushes can come from any thread (the main submitter or a helper round-
-/// robining to a victim). Pops are LIFO (owner-hot end), steals are FIFO
-/// (cold end), but with the mutex protecting both ends the LIFO/FIFO
-/// distinction is only a locality hint.
+/// Owner-only `push` and `pop` (LIFO) — atomic stores on `bottom`
+/// with no CAS on the hot path. `steal` is multi-consumer (FIFO),
+/// CAS-on-`top` to claim a slot.
+///
+/// Memory ordering follows the standard Chase-Lev formulation
+/// (Le-Pop-Cohen-Nardelli-Padua 2013 revision):
+///   - `bottom` writes use release; reads in stealers use acquire.
+///   - `top` writes use seq_cst (CAS) so the owner's `pop` race for
+///     the last element synchronises with concurrent steals.
+///   - The seq_cst fence in `pop` after writing `bottom` is what
+///     prevents the owner from "seeing past" a stealer that has
+///     already taken the slot.
+///
+/// Capacity is fixed power-of-two; full push returns false and the
+/// caller drops the task (speculation is best-effort; urgent
+/// submission's cap is enforced upstream by `pending_tasks`).
 const TaskQueue = struct {
     tasks: []Task,
-    capacity: u32,
-    head: u32,
-    tail: u32,
-    mu: stable.SpinMutex,
+    mask: u64,
+    /// Owner-only writes (push/pop). Stealers read with acquire.
+    bottom: std.atomic.Value(u64),
+    /// CAS by stealers (and the owner's last-element pop).
+    top: std.atomic.Value(u64),
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !TaskQueue {
+        std.debug.assert(std.math.isPowerOfTwo(capacity));
         const tasks = try allocator.alloc(Task, capacity);
         @memset(tasks, undefined);
         return .{
             .tasks = tasks,
-            .capacity = capacity,
-            .head = 0,
-            .tail = 0,
-            .mu = .{},
+            .mask = @as(u64, capacity) - 1,
+            .bottom = .init(0),
+            .top = .init(0),
         };
     }
 
@@ -134,43 +147,70 @@ const TaskQueue = struct {
         allocator.free(self.tasks);
     }
 
+    /// Owner-only. Returns false on full.
     fn push(self: *TaskQueue, task: Task) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.tail - self.head >= self.capacity) return false;
-        self.tasks[self.tail % self.capacity] = task;
-        self.tail +%= 1;
+        const b = self.bottom.load(.monotonic);
+        const t = self.top.load(.acquire);
+        if (b - t > self.mask) return false; // full
+        self.tasks[@intCast(b & self.mask)] = task;
+        // Release: the slot write must be visible before stealers
+        // see the updated bottom.
+        self.bottom.store(b + 1, .release);
         return true;
     }
 
+    /// Owner-only LIFO pop.
     fn pop(self: *TaskQueue) ?Task {
-        // Lockless empty fast path — `head` and `tail` are mutated
-        // only under the mutex, but a torn read here is safe: at
-        // worst we miss a task and the caller retries on the next
-        // drain iteration. Avoiding the lock when there's nothing
-        // to pop saves a huge amount of SpinMutex contention under
-        // 32 helpers each polling for work.
-        if (@atomicLoad(u32, &self.tail, .acquire) == @atomicLoad(u32, &self.head, .acquire)) {
+        const b = self.bottom.load(.monotonic) -% 1;
+        self.bottom.store(b, .monotonic);
+        // seq_cst fence: prevents reordering of the bottom write
+        // above with the top load below. Without it, the owner
+        // could observe a stale `top` and dequeue a slot a stealer
+        // is concurrently taking.
+        // x86_64-only — fix's fiber primitive already comptime-asserts the target.
+        // `@fence` is gone in Zig 0.16; std.atomic doesn't expose a fence helper.
+        asm volatile ("mfence" ::: .{ .memory = true });
+        const t = self.top.load(.monotonic);
+        if (@as(i64, @bitCast(b -% t)) < 0) {
+            // Empty — restore bottom.
+            self.bottom.store(t, .monotonic);
             return null;
         }
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.tail == self.head) return null;
-        self.tail -%= 1;
-        return self.tasks[self.tail % self.capacity];
+        const task = self.tasks[@intCast(b & self.mask)];
+        if (b != t) return task; // not the last element, no race
+        // Last element: race a concurrent steal for it.
+        if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+            // Lost the race — stealer took it. Restore bottom.
+            self.bottom.store(t + 1, .monotonic);
+            return null;
+        }
+        self.bottom.store(t + 1, .monotonic);
+        return task;
     }
 
+    /// Multi-consumer FIFO steal.
     fn steal(self: *TaskQueue) ?Task {
-        // See `pop` — lockless empty check.
-        if (@atomicLoad(u32, &self.tail, .acquire) == @atomicLoad(u32, &self.head, .acquire)) {
-            return null;
+        const t = self.top.load(.acquire);
+        // Acquire-acquire fence: see `bottom` after `top`. Without
+        // this we could observe a `bottom` from before `top` was
+        // bumped by another stealer, leading to phantom reads of
+        // already-claimed slots.
+        // x86_64-only — fix's fiber primitive already comptime-asserts the target.
+        // `@fence` is gone in Zig 0.16; std.atomic doesn't expose a fence helper.
+        asm volatile ("mfence" ::: .{ .memory = true });
+        const b = self.bottom.load(.acquire);
+        if (@as(i64, @bitCast(b -% t)) <= 0) return null;
+        const task = self.tasks[@intCast(t & self.mask)];
+        if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+            return null; // lost the race
         }
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.tail == self.head) return null;
-        const task = self.tasks[self.head % self.capacity];
-        self.head +%= 1;
         return task;
+    }
+
+    fn approxLen(self: *const TaskQueue) u64 {
+        const b = self.bottom.load(.monotonic);
+        const t = self.top.load(.monotonic);
+        return if (b -% t > 0 and (b -% t) < (self.mask + 1)) b -% t else 0;
     }
 };
 
@@ -466,9 +506,13 @@ pub const Scheduler = struct {
         for (self.threads) |t| t.join();
     }
 
-    /// Submit a *speculative* task. The submitter passes its own
-    /// `worker_id` so we can skip its queue — pushing to your own queue
-    /// just sits there until you suspend, defeating the parallelism.
+    /// Submit a *speculative* task. With Chase-Lev work-stealing the
+    /// submitter pushes onto its own queue: lock-free SPMC `push` is
+    /// the hot path. Idle helpers will steal when their own queue is
+    /// empty. The previous "push to a peer" model required a MPMC
+    /// mutex on the hot path; this trades that for a steal
+    /// round-trip on the cold path, which has been hidden by spin-
+    /// before-park (project-tier1-perf-session).
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;
@@ -477,7 +521,7 @@ pub const Scheduler = struct {
             _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
             return false;
         }
-        if (self.pushRoundRobin(self.spec_queues, task, submitter_id)) {
+        if (self.pushOwn(self.spec_queues, task, submitter_id)) {
             _ = self.n_speculative_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -491,7 +535,7 @@ pub const Scheduler = struct {
     pub fn submitUrgent(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_fanout) return false;
-        if (self.pushRoundRobin(self.urgent_queues, task, submitter_id)) {
+        if (self.pushOwn(self.urgent_queues, task, submitter_id)) {
             _ = self.n_urgent_ok.fetchAdd(1, .monotonic);
             return true;
         }
@@ -499,24 +543,24 @@ pub const Scheduler = struct {
         return false;
     }
 
-    fn pushRoundRobin(self: *Scheduler, queues: []TaskQueue, task: Task, submitter_id: u8) bool {
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
-        var i: u8 = 0;
-        while (i < self.worker_count) : (i += 1) {
-            const idx = (start_idx + i) % self.worker_count;
-            if (idx == submitter_id) continue;
-            if (queues[idx].push(task)) {
-                // Wake only when the queue might have been idle.
-                // `fetchAdd` returns the previous count; if it was zero,
-                // helpers are likely parked and need a futex_wake. Past
-                // zero, at least one helper is already draining work and
-                // will pick up our task without a syscall.
-                const prev = self.pending_tasks.fetchAdd(1, .release);
-                if (prev == 0) self.wakeWorker(idx);
-                return true;
-            }
+    fn pushOwn(self: *Scheduler, queues: []TaskQueue, task: Task, submitter_id: u8) bool {
+        // Chase-Lev `push` is owner-only — submitter must own its
+        // queue. Helpers always set their threadlocal worker_id;
+        // non-worker callers (none today) would need their own
+        // submission path.
+        if (submitter_id >= self.worker_count) return false;
+        if (!queues[submitter_id].push(task)) return false;
+        // Wake a peer if the system was previously idle. Wake a
+        // *different* worker (round-robin) so the task doesn't just
+        // sit on our queue if we're CPU-bound — peers will steal it
+        // once they wake.
+        const prev = self.pending_tasks.fetchAdd(1, .release);
+        if (prev == 0) {
+            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
+            self.wakeWorker(target);
         }
-        return false;
+        return true;
     }
 
     /// Pop a task from `worker_id`'s own queues — urgent first, then
