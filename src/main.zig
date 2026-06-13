@@ -294,6 +294,9 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("  {s}: cy={d} calls={d} avg={d}\n", .{ name, entry.cycles, entry.calls, entry.cycles / entry.calls });
             }
         }
+        if (comptime @import("prof_path.zig").enabled) {
+            @import("prof_path.zig").report(ev.chunkRegistry(), ev.internTable());
+        }
     }
     if (!ok) {
         std.process.exit(1);

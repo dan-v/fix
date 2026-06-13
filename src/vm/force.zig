@@ -14,6 +14,24 @@ const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("../builtins.zig").BuiltinId;
 const prof = @import("../prof.zig");
+const prof_path = @import("../prof_path.zig");
+
+/// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
+/// source location) for bytecode/closure thunks, a per-builtin key for
+/// builtin closures, a synthetic key for pass-through cells. Only
+/// evaluated in `-Dprof-path` builds.
+inline fn pathKey(self: *VM, target: ThunkTarget) u32 {
+    return switch (target) {
+        .bytecode => |b| b.chunk_id,
+        .closure => |c| switch (c.kind()) {
+            .closure => if (self.heap.getClosure(c.asObjectId())) |cl| cl.chunk_id else |_| prof_path.KEY_OTHER,
+            .builtin_closure => if (self.heap.getBuiltinClosure(c.asObjectId())) |bc| prof_path.BUILTIN_BASE + @as(u32, bc.builtin_id) else |_| prof_path.KEY_OTHER,
+            .builtin => prof_path.BUILTIN_BASE + @as(u32, c.asBuiltinId()),
+            else => prof_path.KEY_OTHER,
+        },
+        .pass_through => prof_path.KEY_PASS_THROUGH,
+    };
+}
 
 const VM = vm_mod.VM;
 
@@ -195,6 +213,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
+                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, thunk.target)) else @as(usize, 0);
+                defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
