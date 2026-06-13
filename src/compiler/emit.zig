@@ -37,14 +37,27 @@ pub fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.A
         return;
     }
 
+    // Bake the positions pre-sorted by name. `findAttrPos` binary-
+    // searches by name and the attrs themselves are sorted by name at
+    // build time, so a name-sorted position block stays consistent —
+    // and the runtime `build_attrs_with_pos` op can then skip a sort it
+    // would otherwise pay on every execution (≈1.6% of all opcodes).
+    const sorted = try self.allocator.dupe(heap_mod.AttrPosEntry, positions);
+    defer self.allocator.free(sorted);
+    std.mem.sort(heap_mod.AttrPosEntry, sorted, {}, posNameLessThan);
+
     try emitOpU16(self, .build_attrs_with_pos, count);
-    try self.builder.writeU16(self.allocator, try u16Count(positions.len));
-    for (positions) |position| {
+    try self.builder.writeU16(self.allocator, try u16Count(sorted.len));
+    for (sorted) |position| {
         try self.builder.writeU32(self.allocator, position.name);
         try self.builder.writeU32(self.allocator, position.pos.file);
         try self.builder.writeU32(self.allocator, position.pos.line);
         try self.builder.writeU32(self.allocator, position.pos.column);
     }
+}
+
+fn posNameLessThan(_: void, a: heap_mod.AttrPosEntry, b: heap_mod.AttrPosEntry) bool {
+    return a.name < b.name;
 }
 
 pub fn emitOpByte(self: *Compiler, op: OpCode, val: u8) !void {

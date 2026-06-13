@@ -793,10 +793,21 @@ pub const ObjectHeap = struct {
 
         if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
 
+        // Positions arrive pre-sorted by name: the only producer is the
+        // compiler's `emitBuildAttrs`, which bakes them sorted. No
+        // runtime sort needed (findAttrPos binary-searches by name).
+        std.debug.assert(positionsSortedByName(positions));
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
-        self.sortAttrPositions(pos_range);
         return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+    }
+
+    fn positionsSortedByName(positions: []const AttrPosEntry) bool {
+        if (positions.len < 2) return true;
+        for (positions[1..], positions[0 .. positions.len - 1]) |cur, prev| {
+            if (cur.name < prev.name) return false;
+        }
+        return true;
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
