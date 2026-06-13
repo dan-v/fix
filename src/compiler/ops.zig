@@ -388,6 +388,31 @@ pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void 
     try emit.emitOp(self, op);
 }
 
+/// Detect the forwarding shape `param: f param` where `f` is a captured
+/// free variable, returning `f`'s upvalue index (its position in the
+/// child's capture list). The lambda then forces its parameter iff `f`
+/// does — resolved at the call site. `null` when the body is not this
+/// exact shape.
+fn forwardingUpvalue(self: *Compiler, child: *Compiler, body: *const Node, param_name: []const u8) ?u16 {
+    const b = @import("../ast.zig").unwrapParens(body);
+    if (b.tag != .apply) return null;
+    const func = @import("../ast.zig").unwrapParens(b.data.apply.func);
+    const arg = @import("../ast.zig").unwrapParens(b.data.apply.arg);
+    if (func.tag != .identifier or arg.tag != .identifier) return null;
+    const arg_name = self.source[arg.data.atom.offset .. arg.data.atom.offset + arg.data.atom.len];
+    if (!std.mem.eql(u8, arg_name, param_name)) return null;
+    const func_name = self.source[func.data.atom.offset .. func.data.atom.offset + func.data.atom.len];
+    if (std.mem.eql(u8, func_name, param_name)) return null;
+    // Upvalue index == position in the child's capture list (upvalues
+    // are staged from captures in order).
+    for (child.captures.items, 0..) |cap, idx| {
+        if (std.mem.eql(u8, cap.name, func_name)) {
+            return if (idx <= std.math.maxInt(u16)) @intCast(idx) else null;
+        }
+    }
+    return null;
+}
+
 /// True iff `func` is a `x: body` lambda whose body must-force its
 /// parameter (so a caller may pass its argument eagerly).
 fn directlyAppliedStrictLambda(self: *Compiler, func: *const Node) !bool {
@@ -431,6 +456,11 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     // argument eagerly instead of thunking it (see the `apply` arg op).
     // Sound must-force, same contract as let elision.
     child_builder.strict_param = try strictness.bodyMustForceName(self.allocator, self.intern, self.source, lambda.body, param_id);
+    // Forwarding strictness: `x: f x` forces x iff `f` does. Record the
+    // upvalue index of `f` so the caller can resolve it at the call site.
+    if (!child_builder.strict_param) {
+        child_builder.strict_via_upvalue = forwardingUpvalue(self, &child, lambda.body, param_name);
+    }
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

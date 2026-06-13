@@ -161,6 +161,12 @@ pub const SchedulingHints = struct {
     /// compiler's directly-applied-lambda eager arg. Only meaningful when
     /// `local_count == 1` (one param, no extra locals).
     strict_param: bool = false,
+    /// Forwarding strictness: the body is exactly `f param` for a
+    /// captured function `f` at this upvalue index, so the lambda forces
+    /// its parameter *iff* `f` does. The caller resolves it at the call
+    /// site (it holds the closure's upvalues). `null` when not a simple
+    /// forwarder.
+    strict_via_upvalue: ?u16 = null,
 };
 
 /// A mutable builder for constructing chunks.
@@ -189,6 +195,8 @@ pub const ChunkBuilder = struct {
     /// Single-param lambda whose body must-forces its parameter. Set by
     /// `compileLambda`; carried onto `SchedulingHints.strict_param`.
     strict_param: bool = false,
+    /// See `SchedulingHints.strict_via_upvalue`. Set by `compileLambda`.
+    strict_via_upvalue: ?u16 = null,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -279,6 +287,7 @@ pub const ChunkBuilder = struct {
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,
+                .strict_via_upvalue = if (local_count == 1) self.strict_via_upvalue else null,
             },
             .function_args = function_args,
             .source_map = source_map,

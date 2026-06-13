@@ -146,7 +146,21 @@ pub fn calleeForcesArg(self: *VM, callee: Value) bool {
     if (!callee.isClosure()) return false;
     const cl = self.heap.getClosure(callee.asObjectId()) catch return false;
     const ch = self.registry.get(cl.chunk_id) orelse return false;
-    return ch.scheduling.strict_param;
+    if (ch.scheduling.strict_param) return true;
+    // Forwarding `x: f x`: forces x iff the captured `f` (an upvalue we
+    // hold here) forces its own argument. One level — enough to catch
+    // wrappers around directly-strict functions.
+    if (ch.scheduling.strict_via_upvalue) |idx| {
+        if (idx < cl.upvalues.len) {
+            const f = cl.upvalues[idx];
+            if (f.isClosure()) {
+                const fcl = self.heap.getClosure(f.asObjectId()) catch return false;
+                const fch = self.registry.get(fcl.chunk_id) orelse return false;
+                return fch.scheduling.strict_param;
+            }
+        }
+    }
+    return false;
 }
 
 /// Evaluate an `apply_arg` argument eagerly to a value (used when the
