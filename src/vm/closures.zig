@@ -8,6 +8,7 @@ const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
+const BytecodeThunk = @import("../runtime/thunk.zig").BytecodeThunk;
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -128,17 +129,29 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         .none => {},
     }
 
-    const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
-    errdefer self.heap.rollbackBytecodeThunk(pending);
-    try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
-    const id = try self.heap.commitBytecodeThunk(pending);
-    // commitBytecodeThunk owns `pending` past this point; the
-    // errdefer above only fires on early return.
+    const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (ch.scheduling.body_is_substantial) {
         _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
+}
+
+/// Materialise a bytecode thunk from capture descriptors. Small captures
+/// (<= INLINE_CAP) are filled into a stack buffer and stored inline in
+/// the thunk (no `values`-store range); wider captures fill the heap's
+/// reserved range directly.
+fn captureBytecodeThunk(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !types.ObjectId {
+    const count = descriptors.len / 3;
+    if (count <= BytecodeThunk.INLINE_CAP) {
+        var buf: [BytecodeThunk.INLINE_CAP]Value = undefined;
+        try fillCaptureValues(self, descriptors, frame, buf[0..count]);
+        return self.heap.addBytecodeThunk(chunk_id, buf[0..count]);
+    }
+    const pending = try self.heap.beginBytecodeThunk(chunk_id, count);
+    errdefer self.heap.rollbackBytecodeThunk(pending);
+    try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
+    return self.heap.commitBytecodeThunk(pending);
 }
 
 /// Push the value of capture descriptor `idx` directly without
@@ -241,10 +254,7 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
         },
         .none => {},
     }
-    const pending = try self.heap.beginBytecodeThunk(chunk_id, descriptors.len / 3);
-    errdefer self.heap.rollbackBytecodeThunk(pending);
-    try fillCaptureValues(self, descriptors, frame, self.heap.pendingBytecodeThunkUpvalues(pending));
-    const id = try self.heap.commitBytecodeThunk(pending);
+    const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (!self.in_speculation) {
         _ = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());

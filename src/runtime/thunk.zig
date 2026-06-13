@@ -92,7 +92,32 @@ pub const Waiter = struct {
 
 pub const BytecodeThunk = struct {
     chunk_id: ChunkId,
-    upvalues: []const Value,
+    upvalue_count: u32,
+    storage: Storage,
+
+    /// Up to `INLINE_CAP` upvalues live *inline* in the thunk — one
+    /// allocation, one cache line on the hot force path, no separate
+    /// `values`-store range to chase. The overwhelming majority of
+    /// bytecode thunks capture 0-2 upvalues. Wider captures spill to a
+    /// slice into the heap's `values` store. The discriminant is
+    /// `upvalue_count` itself (no tag word), which keeps the struct at
+    /// the same 24 bytes the old `[]const Value` slice occupied — so the
+    /// (very hot, millions-live) Thunk doesn't grow.
+    pub const INLINE_CAP: u32 = 2;
+
+    const Storage = union {
+        inline_vals: [INLINE_CAP]Value,
+        spilled: []const Value,
+    };
+
+    /// The captured upvalues. For inline storage the returned slice
+    /// points into `self`, so this MUST be called through a stable
+    /// pointer to the thunk (the heap's append-only store gives stable
+    /// addresses) — never on a by-value copy of the thunk.
+    pub fn upvalues(self: *const BytecodeThunk) []const Value {
+        if (self.upvalue_count <= INLINE_CAP) return self.storage.inline_vals[0..self.upvalue_count];
+        return self.storage.spilled;
+    }
 };
 
 /// What a thunk evaluates when forced.
@@ -376,10 +401,25 @@ pub const Thunk = struct {
         };
     }
 
+    /// `upvalues` of length <= `BytecodeThunk.INLINE_CAP` are copied
+    /// inline; wider captures keep the passed slice (the caller is
+    /// responsible for it living in stable `values` storage).
     pub fn initBytecode(chunk_id: ChunkId, upvalues: []const Value) Thunk {
+        var storage: BytecodeThunk.Storage = undefined;
+        if (upvalues.len <= BytecodeThunk.INLINE_CAP) {
+            var arr: [BytecodeThunk.INLINE_CAP]Value = undefined;
+            @memcpy(arr[0..upvalues.len], upvalues);
+            storage = .{ .inline_vals = arr };
+        } else {
+            storage = .{ .spilled = upvalues };
+        }
         return .{
             .future = Future.init(),
-            .target = .{ .bytecode = .{ .chunk_id = chunk_id, .upvalues = upvalues } },
+            .target = .{ .bytecode = .{
+                .chunk_id = chunk_id,
+                .upvalue_count = @intCast(upvalues.len),
+                .storage = storage,
+            } },
         };
     }
 

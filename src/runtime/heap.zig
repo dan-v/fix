@@ -20,6 +20,7 @@ const stable = @import("stable_segments.zig");
 const worker_id_mod = @import("worker_id.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
+const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 
 pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
@@ -832,6 +833,12 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
+        // Inline-storage thunks (<= INLINE_CAP upvalues) need no
+        // `values`-store allocation — `initBytecode` copies them into the
+        // thunk. Only wider captures spill to a stable slice.
+        if (upvalues.len <= BytecodeThunk.INLINE_CAP) {
+            return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
+        }
         const range = try self.appendValues(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });

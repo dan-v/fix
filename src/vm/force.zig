@@ -218,7 +218,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
-                const result = evalThunkTarget(self, thunk.target) catch |err| {
+                const result = evalThunkTarget(self, &thunk.target) catch |err| {
                     publishThunkFailure(self, thunk, thunk_id, err);
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
@@ -255,24 +255,28 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     }
 }
 
-pub fn evalThunkTarget(self: *VM, target: ThunkTarget) anyerror!Value {
-    return switch (target) {
+pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget) anyerror!Value {
+    return switch (target.*) {
         .closure => |closure| evalThunkClosure(self, closure),
-        .bytecode => |bytecode| blk: {
+        // Capture by pointer: `upvalues()` may return a slice into the
+        // thunk's own inline storage, which would dangle off a by-value
+        // copy. `target` points into the heap's stable thunk store.
+        .bytecode => |*bytecode| blk: {
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
+            const upvalues = bytecode.upvalues();
             // JIT fast path: if the registry produced a native-code
             // entry for this chunk, call it instead of pushing a
             // frame and dispatching. Null jit_code (the universal
             // case, including any build without `-Djit`) falls
             // through to the interpreter.
             if (ch.jit_code) |jit_fn| {
-                const result = jit_fn(@ptrCast(self), bytecode.upvalues.ptr, bytecode.upvalues.len);
+                const result = jit_fn(@ptrCast(self), upvalues.ptr, upvalues.len);
                 if (result.error_code != 0) {
                     return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
                 }
                 break :blk result.value;
             }
-            break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, bytecode.upvalues);
+            break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, upvalues);
         },
         .pass_through => |v| forceValueImpl(self, v, true),
     };
