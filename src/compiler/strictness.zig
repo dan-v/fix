@@ -95,6 +95,14 @@ const Analyzer = struct {
     intern: *InternTable,
     source: []const u8,
     bound_stack: std.ArrayListUnmanaged(BoundFrame),
+    /// When true, `shallow` is a sound *must-force* under-approximation
+    /// (a name is included only if it is forced on every path, before
+    /// any other observable effect). Differs from the default may-force
+    /// set only at `assert` (body may be skipped if the assertion
+    /// fails) and `with` (the scope expr is forced lazily). Used by
+    /// `analyzeLetMustForce` to drive eager-binding elision, where
+    /// being wrong would force a value lazy eval wouldn't.
+    must_force: bool = false,
 
     fn deinit(self: *Analyzer) void {
         for (self.bound_stack.items) |*frame| {
@@ -238,12 +246,17 @@ const Analyzer = struct {
             .assert => {
                 const a = node.data.assert;
                 try self.analyzeInto(a.cond, out);
-                try self.analyzeInto(a.body, out);
+                // The body runs only if the assertion passes, so under
+                // must-force we can't promise its names are forced.
+                if (!self.must_force) try self.analyzeInto(a.body, out);
             },
 
             .with_expr => {
                 const w = node.data.with_expr;
-                try self.analyzeInto(w.attr_set, out);
+                // The scope expr is forced lazily (only when the body
+                // resolves a name through it), so exclude it under
+                // must-force. The body always runs.
+                if (!self.must_force) try self.analyzeInto(w.attr_set, out);
                 try self.analyzeInto(w.body, out);
             },
 
@@ -352,6 +365,40 @@ pub fn analyzeLetEagerness(
 
     for (binding_names, out_eager) |name, *eager| {
         eager.* = strict.shallow.contains(name);
+    }
+}
+
+/// Sound *must-force* version of `analyzeLetEagerness`: sets
+/// `out_must_force[i]` iff the let-block body unconditionally forces
+/// `binding_names[i]` to WHNF on every path before any other
+/// observable effect. Used by `compileLetIn` to eagerly evaluate such
+/// bindings directly into their slot instead of emitting a thunk —
+/// which is safe precisely because lazy evaluation would force them
+/// anyway, so eager eval can't turn a success into an error (only
+/// possibly change which error surfaces in an already-failing eval).
+pub fn analyzeLetMustForce(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    source: []const u8,
+    body: *const Node,
+    binding_names: []const InternId,
+    out_must_force: []bool,
+) !void {
+    std.debug.assert(binding_names.len == out_must_force.len);
+    var an: Analyzer = .{
+        .allocator = allocator,
+        .intern = intern,
+        .source = source,
+        .bound_stack = .empty,
+        .must_force = true,
+    };
+    defer an.deinit();
+
+    var strict = try an.analyze(body);
+    defer strict.deinit(allocator);
+
+    for (binding_names, out_must_force) |name, *mf| {
+        mf.* = strict.shallow.contains(name);
     }
 }
 

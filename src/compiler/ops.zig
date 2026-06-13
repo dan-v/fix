@@ -565,28 +565,42 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     const kinds = try classifyLetBindings(self, let_in.bindings, let_in.body);
     defer self.allocator.free(kinds);
 
-    // Strictness-driven eagerness: analyze the body once, then for
-    // each binding whose name appears in body's shallow strict set
-    // emit the eager thunk variant. That submits the thunk to the
-    // urgent scheduler queue at creation so helpers can race ahead.
+    // Strictness-driven eagerness. Two analyses over the body:
+    //   `eager_flags`      — may-force shallow set; drives the eager
+    //                        *thunk* submit hint (helpers race ahead).
+    //   `must_force_flags` — sound must-force set; drives eager
+    //                        *elision* (pass 2): a non-recursive binding
+    //                        the body unconditionally forces is compiled
+    //                        straight into its slot, with no thunk at
+    //                        all. Sound because lazy eval would force it
+    //                        regardless — can't turn a success into an
+    //                        error (only reorder which error surfaces in
+    //                        an already-failing eval).
+    const binding_name_ids = try self.allocator.alloc(InternId, let_in.bindings.len);
+    defer self.allocator.free(binding_name_ids);
+    for (let_in.bindings, binding_name_ids) |binding, *nid| {
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        nid.* = try self.intern.intern(name);
+    }
+    // Earliest source index of each binding root — the forward-ref guard
+    // for eager elision (a binding can't be eagerly evaluated if its RHS
+    // references a binding defined later, whose slot isn't filled yet).
+    var earliest_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
+    defer earliest_index.deinit(self.allocator);
+    for (binding_name_ids, 0..) |nid, i| {
+        if (!earliest_index.contains(nid)) try earliest_index.put(self.allocator, nid, i);
+    }
+
     const eager_flags = try self.allocator.alloc(bool, let_in.bindings.len);
     defer self.allocator.free(eager_flags);
-    {
-        const binding_name_ids = try self.allocator.alloc(InternId, let_in.bindings.len);
-        defer self.allocator.free(binding_name_ids);
-        for (let_in.bindings, binding_name_ids) |binding, *nid| {
-            const name = attrs.attrSegmentSpan(self, binding.path[0]);
-            nid.* = try self.intern.intern(name);
-        }
-        try @import("strictness.zig").analyzeLetEagerness(
-            self.allocator,
-            self.intern,
-            self.source,
-            let_in.body,
-            binding_name_ids,
-            eager_flags,
-        );
-    }
+    const must_force_flags = try self.allocator.alloc(bool, let_in.bindings.len);
+    defer self.allocator.free(must_force_flags);
+    try @import("strictness.zig").analyzeLetEagerness(
+        self.allocator, self.intern, self.source, let_in.body, binding_name_ids, eager_flags,
+    );
+    try @import("strictness.zig").analyzeLetMustForce(
+        self.allocator, self.intern, self.source, let_in.body, binding_name_ids, must_force_flags,
+    );
 
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
@@ -611,6 +625,19 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
         if (kind == .literal or kind == .unreferenced) continue;
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
         const slot = scope.resolveLocal(self, name) orelse return error.UndefinedVariable;
+
+        // Eager elision: a non-recursive (`.uncaptured`) binding that the
+        // body unconditionally forces, with a computational RHS that
+        // references no later binding — evaluate it straight into the
+        // slot, skipping the thunk alloc + force + frame entirely.
+        if (kind == .uncaptured and must_force_flags[index]) {
+            if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
+                try self.compileNode(leaf.expr);
+                try emit.emitSetLocal(self, slot);
+                continue;
+            }
+        }
+
         try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index]);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),
@@ -914,6 +941,60 @@ pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, ro
     }
 
     return attrs.compileAttrEntriesThunk(self, tails, true);
+}
+
+/// Eager-elision eligibility for a let binding. Returns the single-leaf
+/// binding iff (a) it is a single leaf (not a nested attr path),
+/// (b) its RHS is a computational shape — not a structural builder we
+/// keep lazy (attrset/lambda/list) — and (c) its RHS references no
+/// binding defined later in the same `let` (which would read an
+/// unfilled slot when evaluated eagerly here). The caller guarantees
+/// the binding is non-recursive (`.uncaptured`) and must-forced.
+fn eligibleEagerLeaf(
+    self: *Compiler,
+    bindings: []const Node.Binding,
+    root: Node.Atom,
+    earliest: *const std.AutoHashMapUnmanaged(InternId, usize),
+    index: usize,
+) ?Node.Binding {
+    const leaf = singleLeafBinding(self, bindings, root) orelse return null;
+    if (!isEagerEvalShape(leaf.expr)) return null;
+    if (rhsHasForwardRef(self, leaf.expr, earliest, index)) return null;
+    return leaf;
+}
+
+/// Structural builders (attrset/lambda/list) stay lazy: they're already
+/// inlined thunk-free where eager, and eagerly building an attrset value
+/// can perturb module fixpoints. Everything else is a scalar/
+/// computational expression whose strict evaluation is exactly what
+/// forcing the binding-thunk would have done.
+fn isEagerEvalShape(expr: *const Node) bool {
+    return switch (expr.tag) {
+        .attr_set, .lambda, .lambda_attrs, .list => false,
+        else => true,
+    };
+}
+
+/// Conservative forward-reference check: true if `expr` references any
+/// `let` binding root whose earliest definition index is > `index`. On
+/// collection failure returns true so the caller keeps the lazy path.
+fn rhsHasForwardRef(
+    self: *Compiler,
+    expr: *const Node,
+    earliest: *const std.AutoHashMapUnmanaged(InternId, usize),
+    index: usize,
+) bool {
+    var refs: std.StringHashMapUnmanaged(void) = .empty;
+    defer refs.deinit(self.allocator);
+    collectReferencedNames(self, expr, &refs) catch return true;
+    var it = refs.keyIterator();
+    while (it.next()) |k| {
+        const id = self.intern.intern(k.*) catch return true;
+        if (earliest.get(id)) |first| {
+            if (first > index) return true;
+        }
+    }
+    return false;
 }
 
 pub fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
