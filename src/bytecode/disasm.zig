@@ -252,7 +252,7 @@ fn writeOperands(
             try writer.print("chunk #{d}, {d} captures → local[{d}]", .{ id, upvalues, slot });
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .closure_long, .thunk_captures_long, .thunk_captures_eager_long => {
+        .closure_long, .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);

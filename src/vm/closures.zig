@@ -137,6 +137,32 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     try stack.push(self, Value.thunk(id));
 }
 
+/// Does `callee` force its argument to WHNF? True for a closure whose
+/// chunk's body must-forces its parameter (`strict_param`). Conservative
+/// (false) for builtins, builtin-closures, and callable attrsets — those
+/// keep the lazy thunk. Cheap: one closure load + one chunk lookup, both
+/// of which `doCall` performs again immediately after.
+pub fn calleeForcesArg(self: *VM, callee: Value) bool {
+    if (!callee.isClosure()) return false;
+    const cl = self.heap.getClosure(callee.asObjectId()) catch return false;
+    const ch = self.registry.get(cl.chunk_id) orelse return false;
+    return ch.scheduling.strict_param;
+}
+
+/// Evaluate an `apply_arg` argument eagerly to a value (used when the
+/// callee forces it). Stages the captured upvalues onto the stack below
+/// a fresh frame, runs the argument chunk, then replaces the staged
+/// upvalues with the resulting value. No thunk is allocated.
+pub fn evalArgEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
+    const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+    const base = self.sp;
+    const upvalue_count = try stageCaptureDescriptors(self, descriptors, frame);
+    const upvalues = self.stack[base .. base + upvalue_count];
+    const result = try runIsolatedFrame(self, ch, chunk_id, 0, upvalues);
+    self.sp = base; // drop the staged upvalues
+    try stack.push(self, result);
+}
+
 /// Materialise a bytecode thunk from capture descriptors. Small captures
 /// (<= INLINE_CAP) are filled into a stack buffer and stored inline in
 /// the thunk (no `values`-store range); wider captures fill the heap's

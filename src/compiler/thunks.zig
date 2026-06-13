@@ -54,6 +54,47 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
     }
 }
 
+/// Compile a function argument as a runtime-adaptive `apply_arg` (the
+/// callee, already on the stack, decides thunk-vs-eager at run time).
+/// Trivial-body args fall back to a plain `thunk_captures`: they
+/// short-circuit to a value with no thunk either way, so the adaptive
+/// runtime check would be pure overhead.
+pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
+    var child_builder = try ChunkBuilder.init(self.allocator);
+    defer child_builder.deinit(self.allocator);
+
+    var child = Compiler.init(
+        self.allocator,
+        &child_builder,
+        self.registry,
+        self.source,
+        self.intern,
+        self.heap,
+    );
+    child.parent = self;
+    child.base_path = self.base_path;
+    child.source_path = self.source_path;
+    child.source_file_id = self.source_file_id;
+    defer child.deinit();
+
+    child.compileNode(expr) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
+        return err;
+    };
+    try strictness.stampOnBuilder(&child, expr);
+    try emit.emitRet(&child);
+    try emit.emitOp(&child, .halt);
+
+    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const trivial = child_chunk.scheduling.trivial != .none;
+    const child_id = try self.registry.register(child_chunk);
+    if (trivial) {
+        try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
+    } else {
+        try emit.emitApplyArg(self, child_id, child.captures.items);
+    }
+}
+
 pub fn compileStringAtomThunk(self: *Compiler, atom: Node.Atom) !void {
     var node = Node{
         .tag = .string,

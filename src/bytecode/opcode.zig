@@ -119,6 +119,16 @@ pub const OpCode = enum(u8) {
     /// Wide-chunk-id form of closure_captures.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
     closure_captures_long,
+    /// Function-argument with a runtime-adaptive laziness decision. The
+    /// callee is already on the stack (just below where the argument
+    /// goes). If it is a closure whose chunk's body must-forces its
+    /// parameter (`scheduling.strict_param`), the argument expression is
+    /// evaluated eagerly to a value — no thunk; otherwise it is
+    /// materialised as a thunk exactly like `thunk_captures`. Lets us
+    /// skip the thunk for dynamically-dispatched strict calls, which the
+    /// compiler can't resolve statically.
+    /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
+    apply_arg,
     /// Create a thunk directly from a chunk and inline capture descriptors.
     /// Operand: 2-byte ChunkId, 2-byte count, then repeated descriptors.
     thunk_captures,

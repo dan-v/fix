@@ -154,6 +154,13 @@ pub const SchedulingHints = struct {
     strictness: ChunkStrictness = .{},
     /// Trivial-shape classification — see `TrivialBody`.
     trivial: TrivialBody = .none,
+    /// True for a single-parameter lambda whose body unconditionally
+    /// forces its parameter (sound must-force). Lets a caller that holds
+    /// this closure at a `call` site evaluate the argument eagerly
+    /// instead of thunking it — the runtime-known-callee analogue of the
+    /// compiler's directly-applied-lambda eager arg. Only meaningful when
+    /// `local_count == 1` (one param, no extra locals).
+    strict_param: bool = false,
 };
 
 /// A mutable builder for constructing chunks.
@@ -179,6 +186,9 @@ pub const ChunkBuilder = struct {
     /// after the body is compiled. Carried through `finish` onto the
     /// resulting Chunk via `SchedulingHints`.
     strictness: ChunkStrictness = .{},
+    /// Single-param lambda whose body must-forces its parameter. Set by
+    /// `compileLambda`; carried onto `SchedulingHints.strict_param`.
+    strict_param: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -268,6 +278,7 @@ pub const ChunkBuilder = struct {
                 .body_is_substantial = self.code.items.len + self.fusion_savings >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
+                .strict_param = self.strict_param and local_count == 1,
             },
             .function_args = function_args,
             .source_map = source_map,

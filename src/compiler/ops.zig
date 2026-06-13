@@ -376,9 +376,14 @@ pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void 
     // (same success/failure; only error ordering in a failing eval can
     // differ). Structural-builder args stay lazy (isEagerEvalShape).
     if (isEagerEvalShape(ap.arg) and try directlyAppliedStrictLambda(self, ap.func)) {
+        // Statically-known strict callee: eager arg, no runtime check.
         try self.compileNode(ap.arg);
+    } else if (try access.compileImmediateContainerValue(self, ap.arg, .{})) {
+        // Immediate value (literal/empty list/...): already thunk-free.
     } else {
-        try access.compileContainerValue(self, ap.arg, .{});
+        // Dynamically-dispatched call: defer the thunk-vs-eager decision
+        // to runtime via `apply_arg`, which reads the callee's strictness.
+        try @import("thunks.zig").compileApplyArgThunk(self, ap.arg);
     }
     try emit.emitOp(self, op);
 }
@@ -421,6 +426,11 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         return err;
     };
     try strictness.stampOnBuilder(&child, lambda.body);
+    // Stamp the strict-param bit: does the body unconditionally force its
+    // single parameter? Lets a caller holding this closure evaluate the
+    // argument eagerly instead of thunking it (see the `apply` arg op).
+    // Sound must-force, same contract as let elision.
+    child_builder.strict_param = try strictness.bodyMustForceName(self.allocator, self.intern, self.source, lambda.body, param_id);
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

@@ -268,6 +268,17 @@ fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures:
     try emitCaptureDescriptors(self, captures);
 }
 
+/// Emit `apply_arg` — a function argument whose laziness is decided at
+/// runtime from the callee's strictness. Always wide chunk-id (the 2
+/// extra operand bytes are negligible vs. avoiding a second opcode).
+pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+    const upvalue_count = try captureCount(captures.len);
+    try emitOp(self, .apply_arg);
+    try self.builder.writeU32(self.allocator, chunk_id);
+    try self.builder.writeU16(self.allocator, upvalue_count);
+    try emitCaptureDescriptors(self, captures);
+}
+
 pub fn emitCaptureDescriptors(self: *Compiler, captures: []const Capture) !void {
     for (captures) |capture| {
         try self.builder.writeByte(self.allocator, switch (capture.kind) {

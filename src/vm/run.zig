@@ -561,6 +561,25 @@ fn opClosureCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, st
     return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
 }
 
+fn opApplyArg(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const ch_id: ChunkId = readU32(code, ip);
+    const upvalue_count = readU16(code, ip + 4);
+    const descriptors_start = ip + 6;
+    const descriptor_len = @as(usize, upvalue_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    // The callee is already on the stack just below where the argument
+    // goes. If it forces its parameter, evaluate the argument eagerly to
+    // a value; otherwise materialise the usual thunk.
+    if (closures.calleeForcesArg(vm, vm.stack[vm.sp - 1])) {
+        try closures.evalArgEager(vm, ch_id, descriptors, frame);
+    } else {
+        try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
+    }
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
 fn opThunkCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const ch_id = readU16(code, ip);
@@ -1115,6 +1134,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.closure_long)] = opClosureLong;
     table[@intFromEnum(OpCode.closure_captures)] = opClosureCaptures;
     table[@intFromEnum(OpCode.closure_captures_long)] = opClosureCapturesLong;
+    table[@intFromEnum(OpCode.apply_arg)] = opApplyArg;
     table[@intFromEnum(OpCode.thunk_captures)] = opThunkCaptures;
     table[@intFromEnum(OpCode.thunk_captures_long)] = opThunkCapturesLong;
     table[@intFromEnum(OpCode.thunk_captures_eager)] = opThunkCapturesEager;
