@@ -653,19 +653,93 @@ pub const ObjectHeap = struct {
     }
 
     /// Materialize (memoized) a `merge_attrs` chain into a flat attrs
-    /// object and return its id. Recursively flattens nested merge nodes
-    /// first, then performs one real `//` merge.
+    /// object and return its id. Collects the whole chain's leaves in
+    /// precedence order and does ONE k-way right-biased merge — avoiding
+    /// the O(depth·N) intermediate attrs objects a recursive pairwise
+    /// flatten would allocate.
     fn flattenMerge(self: *ObjectHeap, id: ObjectId) anyerror!ObjectId {
         const cached = self.get(id).merge_attrs.flattened.load(.acquire);
         if (cached != NO_FLAT) return cached;
 
-        const m = self.getConst(id).merge_attrs;
-        const base_flat = if (self.getConst(m.base).* == .merge_attrs) try self.flattenMerge(m.base) else m.base;
-        const overlay_flat = if (self.getConst(m.overlay).* == .merge_attrs) try self.flattenMerge(m.overlay) else m.overlay;
-        const flat = try self.addMergedAttrs(base_flat, overlay_flat);
+        var leaves: std.ArrayListUnmanaged(ObjectId) = .empty;
+        defer leaves.deinit(self.allocator);
+        try self.collectMergeLeaves(id, &leaves);
+        const flat = try self.kwayMergeLeaves(leaves.items);
 
         const prev = self.get(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
         return prev orelse flat;
+    }
+
+    /// Append the plain-attrs leaves of a `merge_attrs` subtree to `out`
+    /// in left-to-right (oldest-base → newest-overlay) precedence order.
+    /// An already-flattened node contributes its cached flat leaf.
+    fn collectMergeLeaves(self: *ObjectHeap, id: ObjectId, out: *std.ArrayListUnmanaged(ObjectId)) anyerror!void {
+        switch (self.getConst(id).*) {
+            .attrs => try out.append(self.allocator, id),
+            .merge_attrs => |m| {
+                const f = m.flattened.load(.acquire);
+                if (f != NO_FLAT) {
+                    try out.append(self.allocator, f);
+                    return;
+                }
+                try self.collectMergeLeaves(m.base, out);
+                try self.collectMergeLeaves(m.overlay, out);
+            },
+            else => return error.InvalidObjectType,
+        }
+    }
+
+    /// One-pass k-way merge of sorted plain-attrs `leaves`, right-biased:
+    /// on a name shared by several leaves the highest-indexed (newest)
+    /// wins. Positions are dropped (getAttrPos walks the merge chain, not
+    /// the flattened object).
+    fn kwayMergeLeaves(self: *ObjectHeap, leaves: []const ObjectId) !ObjectId {
+        if (leaves.len == 1) return leaves[0];
+        const n = leaves.len;
+        const slices = try self.allocator.alloc([]const AttrEntry, n);
+        defer self.allocator.free(slices);
+        const cursors = try self.allocator.alloc(usize, n);
+        defer self.allocator.free(cursors);
+
+        var cap: u32 = 0;
+        for (leaves, 0..) |leaf, i| {
+            slices[i] = self.attrs.slice(self.getConst(leaf).attrs.range);
+            cursors[i] = 0;
+            cap += @intCast(slices[i].len);
+        }
+
+        const reserved = try self.reserveAttrsLocal(cap);
+        const dst = self.attrs.sliceMut(reserved);
+        var out: usize = 0;
+        while (true) {
+            // Smallest name still available across all cursors.
+            var min_name: ?InternId = null;
+            for (slices, cursors) |s, c| {
+                if (c < s.len) {
+                    const nm = s[c].name;
+                    if (min_name == null or nm < min_name.?) min_name = nm;
+                }
+            }
+            const name = min_name orelse break;
+            // Among leaves positioned at `name`, the last (newest) wins;
+            // advance every cursor sitting on `name`.
+            var winner: usize = 0;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (cursors[i] < slices[i].len and slices[i][cursors[i]].name == name) {
+                    winner = i;
+                }
+            }
+            dst[out] = slices[winner][cursors[winner]];
+            out += 1;
+            i = 0;
+            while (i < n) : (i += 1) {
+                if (cursors[i] < slices[i].len and slices[i][cursors[i]].name == name) cursors[i] += 1;
+            }
+        }
+
+        const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
+        return self.add(.{ .attrs = .{ .range = range } });
     }
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {

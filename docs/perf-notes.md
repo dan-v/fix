@@ -67,7 +67,20 @@ Result (A/B, 10 runs × 3 rounds, layer wins every round):
 
 Byte-identical `.drv`, full tests green. Attr store 19.41M → 17.48M entries
 (~1.9M fewer copies); 30.5K large merges layered. Params `MERGE_LAYER_MIN=32`,
-`MERGE_FLATTEN_DEPTH=8` (swept: deeper/lower-min `16/32` was worse). This is
+`MERGE_FLATTEN_DEPTH=8` (swept: deeper/lower-min `16/32` was worse).
+
+**Follow-up — k-way flatten (`flattenMerge`):** the first cut flattened a
+chain by *recursive pairwise* `addMergedAttrs` — a depth-8 chain did 8
+sequential merges, each allocating an O(N) intermediate (so true flatten work
+was ~depth·N and littered the store with throwaways). Replaced with a single
+k-way right-biased merge over the collected chain leaves (`collectMergeLeaves`
++ `kwayMergeLeaves`): one pass, one allocation, newest-leaf-wins on a shared
+name. Result: flatten count 9990→6420, flatten-entries 5.86M→2.41M, **attr
+store 17.48M → 14.03M (−28% vs the 19.41M baseline)**; w=1 a further ~1.3%
+(3.47→3.42 best), w=32 neutral-to-better within noise. Positions are dropped
+on the flat object (getAttrPos walks the merge chain, not the flat).
+
+This is
 a **critical-path** win — unlike the throughput micro-opts, attacking the
 serial fixpoint merge transfers to w=32. Reconciles the earlier "`//` merge
 is 1.5% of cycles, a red herring" note: the merge *loop* is cheap, but the
