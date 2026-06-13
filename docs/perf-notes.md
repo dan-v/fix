@@ -17,6 +17,43 @@ Correctness oracle: the printed `.drv` store path is a hash of the entire
 evaluated derivation graph. **Identical path == byte-identical evaluation.**
 Any perf change must keep it unchanged (plus `zig build test`).
 
+## Cumulative result (this session)
+
+Controlled A/B, session-start (a984a99) vs HEAD, back-to-back:
+
+| workers | session-start | now | Δ |
+| --- | --- | --- | --- |
+| 1 | 3.669 | 3.564 | −3.1% |
+| 32 | 1.836 | 1.750 | **−5.4%** |
+
+Committed wins that stack and **transfer to w=32**: heap object-shrink,
+attr-position pre-sort (drop a runtime sort), strictness-driven eager
+elision of must-forced `let` bindings, inline small thunk upvalues
+(−60% values-store entries), and runtime-adaptive arg thunking
+(`apply_arg`). Earlier "w=1 wins don't transfer" calls were noisy
+single-change artifacts — the controlled cumulative shows they do.
+
+## Strictness-based thunk reduction: surface is small (measured)
+
+The architecture is right — defer thunk-vs-eager to runtime where the
+callee is known (`apply_arg`) — and it's committed and correct. But the
+*surface* on nixpkgs is small: must-forced `let` bindings 37K, direct-
+strict args 94K, forwarding `x: f x` **0** (eta-expansion is rare). Most
+args are trivial (short-circuited), immediate, or to builtin/non-strict
+callees. So strictness can't make a big dent here.
+
+## The real remaining lever: the 5M never-forced thunks
+
+44% of the 5.9M thunks are **created and never forced** — attrset values
+(the config option tree) and cells, built eagerly at attrset-build time
+but never accessed. This is the "we don't need it at all" case: we only
+know which attrs are needed at *access* time. The architectural shift is
+**lazy attrset values** — store a way to compute each value on demand
+instead of materialising a thunk per attr at build time, so never-
+accessed attrs cost nothing. Major change (attrset representation, build
+op, getAttr, every attr reader) but it targets the biggest waste, and
+the never-forced thunks are why thunk_captures is the top opcode (15.5%).
+
 ## The shape of the problem
 
 - **Parallelism is saturated at ~16 workers**; helpers are ~87% idle at
