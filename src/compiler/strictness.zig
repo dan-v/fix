@@ -402,6 +402,32 @@ pub fn analyzeLetMustForce(
     }
 }
 
+/// Does `body` unconditionally force the free name `name_id` to WHNF on
+/// every path (sound must-force)? `body` is analyzed with an empty bound
+/// stack so `name_id` reads as a free identifier; nested scopes that
+/// rebind the name correctly shadow it. Used to decide whether a
+/// directly-applied lambda `(x: body) arg` forces its parameter, so the
+/// caller may evaluate `arg` eagerly instead of thunking it.
+pub fn bodyMustForceName(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    source: []const u8,
+    body: *const Node,
+    name_id: InternId,
+) !bool {
+    var an: Analyzer = .{
+        .allocator = allocator,
+        .intern = intern,
+        .source = source,
+        .bound_stack = .empty,
+        .must_force = true,
+    };
+    defer an.deinit();
+    var strict = try an.analyze(body);
+    defer strict.deinit(allocator);
+    return strict.shallow.contains(name_id);
+}
+
 const Compiler = @import("../compiler.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {

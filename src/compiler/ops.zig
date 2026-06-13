@@ -370,8 +370,27 @@ pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
     const ap = node.data.apply;
     try self.compileNode(ap.func);
-    try access.compileContainerValue(self, ap.arg, .{});
+    // Directly-applied lambda `(x: body) arg` whose body unconditionally
+    // forces `x`: evaluate `arg` straight onto the stack instead of
+    // thunking it. The lambda forces it regardless, so this is sound
+    // (same success/failure; only error ordering in a failing eval can
+    // differ). Structural-builder args stay lazy (isEagerEvalShape).
+    if (isEagerEvalShape(ap.arg) and try directlyAppliedStrictLambda(self, ap.func)) {
+        try self.compileNode(ap.arg);
+    } else {
+        try access.compileContainerValue(self, ap.arg, .{});
+    }
     try emit.emitOp(self, op);
+}
+
+/// True iff `func` is a `x: body` lambda whose body must-force its
+/// parameter (so a caller may pass its argument eagerly).
+fn directlyAppliedStrictLambda(self: *Compiler, func: *const Node) !bool {
+    if (func.tag != .lambda) return false;
+    const lambda = func.data.lambda;
+    const param_name = self.source[lambda.param_offset .. lambda.param_offset + lambda.param_len];
+    const param_id = try self.intern.intern(param_name);
+    return strictness.bodyMustForceName(self.allocator, self.intern, self.source, lambda.body, param_id);
 }
 
 pub fn compileLambda(self: *Compiler, node: *const Node) !void {
