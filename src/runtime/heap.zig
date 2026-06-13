@@ -41,7 +41,7 @@ pub const AttrPosEntry = struct {
     pos: SourcePos,
 };
 
-const ObjectStore = stable.StableSegments(HeapObject, .{ .first_segment_size = 256 });
+const ObjectStore = stable.StableSegments(Object, .{ .first_segment_size = 256 });
 const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024 });
 const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512 });
 const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512 });
@@ -51,6 +51,11 @@ var next_heap_token: std.atomic.Value(u64) = .init(1);
 pub const ValueRange = ValueStore.Range;
 pub const AttrRange = AttrStore.Range;
 pub const AttrPosRange = AttrPosStore.Range;
+
+/// A zero-length attr-position range: the attrset carries no source
+/// positions. Sliced only after a `len == 0` guard, so the (possibly
+/// segment-less) store is never indexed.
+pub const EMPTY_ATTR_POS: AttrPosRange = .{ .segment = 0, .offset = 0, .len = 0 };
 
 pub const Closure = struct {
     chunk_id: ChunkId,
@@ -87,9 +92,22 @@ const ContextStringObject = struct {
     context: AttrRange,
 };
 
+/// An attrset slot: the sorted attr entries plus optional source
+/// positions for `unsafeGetAttrPos` / error messages. Positions used to
+/// live in a separate `meta` field on every heap object; folding them
+/// into the attrs variant (which is far smaller than the thunk variant
+/// that sizes the union) let the per-object `meta` field be removed
+/// entirely — a ~20% shrink across all heap objects, the vast majority
+/// of which carry no positions. `positions.len == 0` means "no
+/// positions"; it is never sliced.
+pub const AttrsObject = struct {
+    range: AttrRange,
+    positions: AttrPosRange = EMPTY_ATTR_POS,
+};
+
 pub const Object = union(enum) {
     list: ValueRange,
-    attrs: AttrRange,
+    attrs: AttrsObject,
     closure: ClosureObject,
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
@@ -97,16 +115,6 @@ pub const Object = union(enum) {
     /// Heap-boxed full-range i64 for values that don't fit Value's
     /// 48-bit inline int payload. See `runtime/int.zig`.
     boxed_int: i64,
-};
-
-pub const ObjectMeta = union(enum) {
-    none,
-    attr_positions: AttrPosRange,
-};
-
-const HeapObject = struct {
-    payload: Object,
-    meta: ObjectMeta = .none,
 };
 
 /// Per-worker thread-local allocation buffer. Each worker reserves a
@@ -309,7 +317,7 @@ pub const ObjectHeap = struct {
                 continue :scan_obj;
             }
             const obj = self.objects.get(id);
-            const v_index: usize = switch (obj.payload) {
+            const v_index: usize = switch (obj.*) {
                 .list => 0,
                 .attrs => 1,
                 .closure => 2,
@@ -439,7 +447,7 @@ pub const ObjectHeap = struct {
             .offset = range.offset,
             .len = actual,
         };
-        return self.add(.{ .attrs = trimmed });
+        return self.add(.{ .attrs = .{ .range = trimmed } });
     }
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
@@ -476,13 +484,7 @@ pub const ObjectHeap = struct {
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
         const id = try self.reserveObjectSlot();
-        self.fillObjectSlot(id, object, .none);
-        return id;
-    }
-
-    pub fn addWithMeta(self: *ObjectHeap, object: Object, meta: ObjectMeta) !ObjectId {
-        const id = try self.reserveObjectSlot();
-        self.fillObjectSlot(id, object, meta);
+        self.fillObjectSlot(id, object);
         return id;
     }
 
@@ -510,20 +512,16 @@ pub const ObjectHeap = struct {
         return id;
     }
 
-    pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object, meta: ObjectMeta) void {
-        self.objects.getMut(id).* = .{ .payload = object, .meta = meta };
+    pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object) void {
+        self.objects.getMut(id).* = object;
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
-        return &self.objects.getMut(id).payload;
+        return self.objects.getMut(id);
     }
 
     pub fn getConst(self: *const ObjectHeap, id: ObjectId) *const Object {
-        return &self.objects.get(id).payload;
-    }
-
-    pub fn getMeta(self: *const ObjectHeap, id: ObjectId) ObjectMeta {
-        return self.objects.get(id).meta;
+        return self.objects.get(id);
     }
 
     pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
@@ -545,7 +543,7 @@ pub const ObjectHeap = struct {
 
     pub fn getAttrs(self: *const ObjectHeap, id: ObjectId) ![]const AttrEntry {
         return switch (self.getConst(id).*) {
-            .attrs => |range| self.attrs.slice(range),
+            .attrs => |a| self.attrs.slice(a.range),
             else => error.InvalidObjectType,
         };
     }
@@ -570,9 +568,9 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
-        return switch (self.getMeta(id)) {
-            .none => null,
-            .attr_positions => |range| self.findAttrPos(range, name),
+        return switch (self.getConst(id).*) {
+            .attrs => |a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
+            else => null,
         };
     }
 
@@ -640,7 +638,7 @@ pub const ObjectHeap = struct {
 
     pub fn addAttrs(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.prepareAttrsRange(entries);
-        return self.add(.{ .attrs = range });
+        return self.add(.{ .attrs = .{ .range = range } });
     }
 
     /// Same as `addAttrs` but the caller guarantees `entries` is already
@@ -650,7 +648,7 @@ pub const ObjectHeap = struct {
     /// `intersectAttrs`) whose output is sorted+unique by construction.
     pub fn addAttrsSorted(self: *ObjectHeap, entries: []const AttrEntry) !ObjectId {
         const range = try self.appendAttrEntries(entries);
-        return self.add(.{ .attrs = range });
+        return self.add(.{ .attrs = .{ .range = range } });
     }
 
     /// Allocate + sort + dedup an AttrRange without wrapping it in an
@@ -679,7 +677,7 @@ pub const ObjectHeap = struct {
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
         self.sortAttrPositions(pos_range);
-        return self.addWithMeta(.{ .attrs = range }, .{ .attr_positions = pos_range });
+        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
@@ -743,15 +741,15 @@ pub const ObjectHeap = struct {
             out += n;
         }
 
-        const meta = try self.mergeAttrPositionMeta(left_id, right_id, right);
-        errdefer self.rollbackMeta(meta);
+        const positions = try self.mergeAttrPositions(left_id, right_id, right);
+        errdefer if (positions.len != 0) self.attr_positions.rollback(positions);
 
         const range: AttrRange = .{
             .segment = reserved.segment,
             .offset = reserved.offset,
             .len = @intCast(out),
         };
-        return self.addWithMeta(.{ .attrs = range }, meta);
+        return self.add(.{ .attrs = .{ .range = range, .positions = positions } });
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
@@ -792,12 +790,12 @@ pub const ObjectHeap = struct {
         self.sortAttrs(range);
         try self.rejectDuplicateAttrs(range);
 
-        if (positions.len == 0) return self.add(.{ .attrs = range });
+        if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
 
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
         self.sortAttrPositions(pos_range);
-        return self.addWithMeta(.{ .attrs = range }, .{ .attr_positions = pos_range });
+        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
@@ -905,13 +903,6 @@ pub const ObjectHeap = struct {
         }
     }
 
-    fn rollbackMeta(self: *ObjectHeap, meta: ObjectMeta) void {
-        switch (meta) {
-            .none => {},
-            .attr_positions => |range| self.attr_positions.rollback(range),
-        }
-    }
-
     fn findAttrPos(self: *const ObjectHeap, range: AttrPosRange, name: InternId) ?SourcePos {
         const entries = self.attr_positions.slice(range);
         var lo: usize = 0;
@@ -931,24 +922,19 @@ pub const ObjectHeap = struct {
         return null;
     }
 
-    fn mergeAttrPositionMeta(
+    /// Merge the source positions of two attrsets being `//`-combined.
+    /// Returns an `AttrPosRange` (empty — `len == 0` — when neither side
+    /// carries positions, which is the common case for builtin-built
+    /// attrsets).
+    fn mergeAttrPositions(
         self: *ObjectHeap,
         left_id: ObjectId,
         right_id: ObjectId,
         right_attrs: []const AttrEntry,
-    ) !ObjectMeta {
-        const left_meta = self.getMeta(left_id);
-        const right_meta = self.getMeta(right_id);
-        if (left_meta == .none and right_meta == .none) return .none;
-
-        const left_positions = switch (left_meta) {
-            .none => &[_]AttrPosEntry{},
-            .attr_positions => |range| self.attr_positions.slice(range),
-        };
-        const right_positions = switch (right_meta) {
-            .none => &[_]AttrPosEntry{},
-            .attr_positions => |range| self.attr_positions.slice(range),
-        };
+    ) !AttrPosRange {
+        const left_positions = self.attrPositionsSlice(left_id);
+        const right_positions = self.attrPositionsSlice(right_id);
+        if (left_positions.len == 0 and right_positions.len == 0) return EMPTY_ATTR_POS;
 
         var merged = try std.ArrayListUnmanaged(AttrPosEntry).initCapacity(
             self.allocator,
@@ -967,10 +953,19 @@ pub const ObjectHeap = struct {
             }
         }
 
-        if (merged.items.len == 0) return .none;
+        if (merged.items.len == 0) return EMPTY_ATTR_POS;
         const range = try self.appendAttrPositions(merged.items);
         self.sortAttrPositions(range);
-        return .{ .attr_positions = range };
+        return range;
+    }
+
+    /// Borrow an attrset's source-position entries (empty slice when it
+    /// has none or `id` is not an attrset).
+    fn attrPositionsSlice(self: *const ObjectHeap, id: ObjectId) []const AttrPosEntry {
+        return switch (self.getConst(id).*) {
+            .attrs => |a| if (a.positions.len == 0) &.{} else self.attr_positions.slice(a.positions),
+            else => &.{},
+        };
     }
 };
 

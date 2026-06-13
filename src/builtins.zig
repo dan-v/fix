@@ -455,7 +455,7 @@ pub fn buildAttrSet(intern: *InternTable, heap: *ObjectHeap, nix_path: []const N
         .value = Value.attrs(self_id),
     });
     const attr_range = try heap.prepareAttrsRange(entries.items);
-    heap.fillObjectSlot(self_id, .{ .attrs = attr_range }, .none);
+    heap.fillObjectSlot(self_id, .{ .attrs = .{ .range = attr_range } });
     return Value.attrs(self_id);
 }
 
