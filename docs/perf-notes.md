@@ -45,6 +45,34 @@ Any perf change must keep it unchanged (plus `zig build test`).
 | Shrink every heap object 20% by removing the per-object `meta` field | **Landed, small win.** −2% w=1, ~0 w=32, ~320MB less heap, net code reduction. Confirms locality is a *small* factor at w=1, not the w=32 lever. |
 | Combinator fusion of map/mapAttrs/genList (eliminate intermediate structures / never-forced element thunks) | **Dead end, measured.** Tagged map-family element thunks and counted them in the heap scan: at w=1 they are **194K of 5.93M thunks (3.3%)** and **99.97% are forced** (52 never forced). So there is essentially no build-then-discard waste to fuse, and intermediate-elimination is just cheap lazy-thunk allocation (the apply-thunk experiment was neutral). Even perfect pattern-discovery reclaims ~0. NOTE: 2.78M thunks (47%) *are* never forced — but they're module-system option-tree thunks (attrset values, `let` bindings), not combinators; eliding those isn't fusion and a deferred computation *is* a thunk. |
 
+## Source-level profile (`-Dprof-path`, workers=1)
+
+The `-Dprof-path` profiler attributes serial self-cycles to Nix source
+locations (`fix --workers=1 --print-sched-stats`). First run on the
+toplevel — where the ~3.5s serial time goes:
+
+| self cycles | calls | location / builtin |
+| --- | --- | --- |
+| 1.66B | 2.2K | `lib/modules.nix:450` — apply each module fn to args |
+| 1.58B | 261 | `lib/fixed-points.nix:331` — `prev // overlay final prev` (overlay-fixpoint `//` merge) |
+| 1.03B | 6.9K | builtin `derivationLazyAttr` (drvPath/outPath hashing) |
+| 574M | 342K | builtin `mapAttrValue` (recursive mapAttrs over option trees) |
+| ~1B+ | — | many more `lib/modules.nix` lines (888 option-decl merge, 570, 536, 891, 1265, 880) |
+
+Read: the serial cost is the **NixOS module system** (module application
++ option merging, all attrset-heavy) and the **overlay fixpoint `//`
+merge** over whole-nixpkgs attrsets, plus derivation hashing. Much of
+this is *our* evaluator's attrset machinery (`merge_attrs`/`//`,
+`mapAttrs`, attr lookup) running on very large attrsets — and the
+fixpoint/module-merge is inherently the serial critical path, so
+speeding those specific operations should transfer to w=32 (unlike
+generic throughput wins). Concrete next targets: the `//` large-attrset
+merge and `mapAttrValue`.
+
+Caveat: `-Dprof-path`'s "heaviest force subtree" span is an OPTIMISTIC
+bound (models independent sibling forces as parallel); the flat
+self-cycle table is the ground truth.
+
 ## What this points at
 
 The 1s target needs the **critical path** at high worker count:
