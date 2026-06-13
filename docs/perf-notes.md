@@ -73,6 +73,19 @@ Caveat: `-Dprof-path`'s "heaviest force subtree" span is an OPTIMISTIC
 bound (models independent sibling forces as parallel); the flat
 self-cycle table is the ground truth.
 
+**Bigger caveat — `prof-path` self-time over-attributes to driver chunks.**
+Spans nest on thunk *forces* only, not direct closure calls. So a driver
+like `lib/fixed-points.nix:331` (`prev // overlay final prev`) shows
+1.58B self that is really the *overlays it calls*, not the `//` merge.
+Verified by adding a `merge_attrs` counter to `-Dprof-main`: the `//`
+merge is only **247M cycles** (1.5%), 261K calls at 947 cyc — NOT a
+hotspot. Lesson: use `prof-path` for "which forcing site drives call
+work", `prof-main` for operation-level truth. The operation-level truth
+remains: cost is broadly distributed across force machinery (~4.2B),
+builtin bodies (~3.7B), and frame/dispatch (~2.5B) — no single hot
+operation. The only big levers stay a method-JIT or force-volume
+reduction; the `//`-merge lead was a red herring.
+
 ## What this points at
 
 The 1s target needs the **critical path** at high worker count:

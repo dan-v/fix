@@ -28,6 +28,7 @@ const opcode = bytecode_mod.opcode;
 const OpCode = opcode.OpCode;
 const heap_mod = @import("../runtime/heap.zig");
 const numeric = @import("../runtime/numeric.zig");
+const prof = @import("../prof.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
@@ -470,7 +471,10 @@ fn opMergeAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     frame.ip = ip;
     const right = stack.pop(vm);
     const left = stack.pop(vm);
-    try stack.push(vm, try objects.mergeAttrs(vm, left, right));
+    const t = prof.start(.merge_attrs);
+    const merged = try objects.mergeAttrs(vm, left, right);
+    prof.end(.merge_attrs, t);
+    try stack.push(vm, merged);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -478,7 +482,10 @@ fn opMergeAttrsStrict(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     frame.ip = ip;
     const right = stack.pop(vm);
     const left = stack.pop(vm);
-    try stack.push(vm, try objects.mergeAttrsStrict(vm, left, right));
+    const t = prof.start(.merge_attrs);
+    const merged = try objects.mergeAttrsStrict(vm, left, right);
+    prof.end(.merge_attrs, t);
+    try stack.push(vm, merged);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 

@@ -67,6 +67,10 @@ pub const Path = enum {
     /// `do_call` exclusive time usually lands here when the callee
     /// is `.isBuiltin()` or `.isBuiltinClosure()`.
     apply_builtin,
+    /// `//` attrset update (`opMergeAttrs` + `opMergeAttrsStrict`) —
+    /// the sorted merge-walk over two attrsets. Hot on the overlay
+    /// fixpoint (`prev // overlay final prev`).
+    merge_attrs,
 };
 
 pub const Sample = struct {
