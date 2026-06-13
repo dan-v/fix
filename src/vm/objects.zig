@@ -38,7 +38,7 @@ pub fn buildList(self: *VM, count: u16) !void {
 pub fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
     if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
     if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
-    return Value.attrs(try self.heap.addMergedAttrs(left.asObjectId(), right.asObjectId()));
+    return Value.attrs(try self.heap.mergeAttrsLayered(left.asObjectId(), right.asObjectId()));
 }
 
 pub fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {

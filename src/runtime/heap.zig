@@ -106,9 +106,42 @@ pub const AttrsObject = struct {
     positions: AttrPosRange = EMPTY_ATTR_POS,
 };
 
+/// A lazy, layered `//` (update) result: `base // overlay`, both attrset
+/// objects (either may itself be a `merge_attrs`, forming a chain). The
+/// NixOS module/overlay fixpoints build a massive attrset by `//`-ing an
+/// accumulator thousands of times; materializing each step copies the
+/// whole accumulator (O(N) per merge → O(N·K) total, and ~18M of the
+/// 19.4M attr-store entries are these throwaway copies). Layering makes a
+/// large `//` O(1): just record `base`+`overlay`. `//` is *shallow*
+/// right-biased, so lookup checks `overlay` then `base`; the (obj,name)
+/// inline cache absorbs repeated lookups. The chain is flattened (one
+/// real merge) once `depth` exceeds `MERGE_FLATTEN_DEPTH`, bounding both
+/// lookup depth and the chain length any single flatten must walk.
+/// `flattened` memoizes the flattened plain-attrs object (NO_FLAT until
+/// first `getAttrs`/iteration forces it).
+pub const MergeAttrsObject = struct {
+    base: ObjectId,
+    overlay: ObjectId,
+    depth: u16,
+    flattened: std.atomic.Value(ObjectId),
+};
+
+/// Sentinel for `MergeAttrsObject.flattened` meaning "not yet flattened".
+const NO_FLAT: ObjectId = std.math.maxInt(ObjectId);
+
+/// Only layer `a // b` when `a` is at least this large — small merges
+/// (literal `{..} // {..}`) stay eager so the common cheap case keeps its
+/// flat single-binary-search lookup and pays no indirection.
+const MERGE_LAYER_MIN: u32 = 32;
+
+/// Flatten a layer chain once it gets this deep, so `getAttrValue` walks
+/// at most this many overlays and each flatten merges a bounded chain.
+const MERGE_FLATTEN_DEPTH: u16 = 8;
+
 pub const Object = union(enum) {
     list: ValueRange,
     attrs: AttrsObject,
+    merge_attrs: MergeAttrsObject,
     closure: ClosureObject,
     builtin_closure: BuiltinClosureObject,
     thunk: Thunk,
@@ -228,7 +261,7 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
-        variant_counts: [7]u32,
+        variant_counts: [8]u32,
         thunk_states: [5]u32,
         /// Magnitude histogram for inline `.int` values found in the
         /// values + attrs stores. Buckets are chosen to inform a 16→8
@@ -252,6 +285,7 @@ pub const ObjectHeap = struct {
                 4 => "thunk",
                 5 => "context_string",
                 6 => "boxed_int",
+                7 => "merge_attrs",
                 else => "?",
             };
         }
@@ -297,7 +331,7 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
-            .variant_counts = [_]u32{0} ** 7,
+            .variant_counts = [_]u32{0} ** 8,
             .thunk_states = [_]u32{0} ** 5,
             .int_buckets = [_]u32{0} ** 5,
         };
@@ -331,6 +365,7 @@ pub const ObjectHeap = struct {
                 },
                 .context_string => 5,
                 .boxed_int => 6,
+                .merge_attrs => 7,
             };
             result.variant_counts[v_index] += 1;
         }
@@ -542,37 +577,95 @@ pub const ObjectHeap = struct {
         return items[index];
     }
 
-    pub fn getAttrs(self: *const ObjectHeap, id: ObjectId) ![]const AttrEntry {
+    /// Full attr entries. A `merge_attrs` (layered `//`) is flattened to a
+    /// real attrs object on first call (memoized), so value-iterating
+    /// callers (deep force, `==`, JSON/XML, `attrNames`) see a normal
+    /// sorted entry slice. Non-const because flattening allocates.
+    pub fn getAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
         return switch (self.getConst(id).*) {
             .attrs => |a| self.attrs.slice(a.range),
+            .merge_attrs => self.attrs.slice(self.getConst(try self.flattenMerge(id)).attrs.range),
             else => error.InvalidObjectType,
         };
     }
 
     pub fn getAttrValue(self: *const ObjectHeap, id: ObjectId, name: InternId) !Value {
-        const entries = try self.getAttrs(id);
-        var lo: usize = 0;
-        var hi: usize = entries.len;
+        return (try self.getAttrValueOpt(id, name)) orelse error.MissingAttribute;
+    }
 
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const entry = entries[mid];
-            if (entry.name == name) return entry.value;
-            if (entry.name < name) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        return error.MissingAttribute;
+    /// Right-biased attr lookup returning null for a missing key. Walks a
+    /// `merge_attrs` chain overlay-first without flattening (read-only, so
+    /// it stays const and feeds the hot inline cache). Once a node has
+    /// been flattened it delegates to the flat object's binary search.
+    pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
+        return switch (self.getConst(id).*) {
+            .attrs => |a| binarySearchAttr(self.attrs.slice(a.range), name),
+            .merge_attrs => |m| {
+                const flat = m.flattened.load(.acquire);
+                if (flat != NO_FLAT) {
+                    return binarySearchAttr(self.attrs.slice(self.getConst(flat).attrs.range), name);
+                }
+                if (try self.getAttrValueOpt(m.overlay, name)) |v| return v;
+                return self.getAttrValueOpt(m.base, name);
+            },
+            else => error.InvalidObjectType,
+        };
     }
 
     pub fn getAttrPos(self: *const ObjectHeap, id: ObjectId, name: InternId) ?SourcePos {
         return switch (self.getConst(id).*) {
             .attrs => |a| if (a.positions.len == 0) null else self.findAttrPos(a.positions, name),
+            // `//` is right-biased; report the overlay's position if it
+            // defines the name, else the base's. Walks the chain rather
+            // than flattening (flattening drops positions).
+            .merge_attrs => |m| if (self.attrContains(m.overlay, name))
+                self.getAttrPos(m.overlay, name)
+            else
+                self.getAttrPos(m.base, name),
             else => null,
         };
+    }
+
+    fn attrContains(self: *const ObjectHeap, id: ObjectId, name: InternId) bool {
+        return switch (self.getConst(id).*) {
+            .attrs => |a| binarySearchAttrIndex(self.attrs.slice(a.range), name) != null,
+            .merge_attrs => |m| self.attrContains(m.overlay, name) or self.attrContains(m.base, name),
+            else => false,
+        };
+    }
+
+    /// `left // right` as a (possibly layered) attrset. Large left
+    /// operands are wrapped in a `merge_attrs` node instead of copied;
+    /// small ones and over-deep chains fall back to the eager flat merge.
+    pub fn mergeAttrsLayered(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+        const next_depth: u16 = switch (self.getConst(left_id).*) {
+            .attrs => |a| if (a.range.len < MERGE_LAYER_MIN) 0 else 1,
+            .merge_attrs => |m| if (m.depth + 1 > MERGE_FLATTEN_DEPTH) 0 else m.depth + 1,
+            else => 0,
+        };
+        if (next_depth == 0) return self.addMergedAttrs(left_id, right_id);
+        return self.add(.{ .merge_attrs = .{
+            .base = left_id,
+            .overlay = right_id,
+            .depth = next_depth,
+            .flattened = .init(NO_FLAT),
+        } });
+    }
+
+    /// Materialize (memoized) a `merge_attrs` chain into a flat attrs
+    /// object and return its id. Recursively flattens nested merge nodes
+    /// first, then performs one real `//` merge.
+    fn flattenMerge(self: *ObjectHeap, id: ObjectId) anyerror!ObjectId {
+        const cached = self.get(id).merge_attrs.flattened.load(.acquire);
+        if (cached != NO_FLAT) return cached;
+
+        const m = self.getConst(id).merge_attrs;
+        const base_flat = if (self.getConst(m.base).* == .merge_attrs) try self.flattenMerge(m.base) else m.base;
+        const overlay_flat = if (self.getConst(m.overlay).* == .merge_attrs) try self.flattenMerge(m.overlay) else m.overlay;
+        const flat = try self.addMergedAttrs(base_flat, overlay_flat);
+
+        const prev = self.get(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
+        return prev orelse flat;
     }
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
@@ -1010,6 +1103,27 @@ fn bucketInt(buckets: *[5]u32, value: Value) void {
     else
         4;
     buckets[idx] += 1;
+}
+
+fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
+    const idx = binarySearchAttrIndex(entries, name) orelse return null;
+    return entries[idx].value;
+}
+
+fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const entry_name = entries[mid].name;
+        if (entry_name == name) return mid;
+        if (entry_name < name) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return null;
 }
 
 fn attrEntryLessThan(_: void, lhs: AttrEntry, rhs: AttrEntry) bool {
