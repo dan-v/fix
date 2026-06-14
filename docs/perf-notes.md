@@ -165,6 +165,38 @@ much of the option tree is forced) — not VM micro-architecture. Versus
 single-threaded tree-walking C++ Nix, fix is almost certainly already far
 ahead; the 1 s-at-w=32 target is bounded by inherent serial dependencies.
 
+## On-chain work reduction (LANDED) — structural frame/cell elimination
+
+The critical-path analysis said the only remaining lever is eliminating
+real *work* on the serial chain. Two such wins landed, both byte-identical
+`.drv` (w=1 and w=32), both transferring to w=32 (they're on the chain):
+
+1. **Direct formal binding** (`72f2638`): every attrset-pattern lambda
+   (`{ config, lib, pkgs, ... }: body` — every NixOS module fn) gave each
+   formal a binding *cell* (`init_cell_slot`: a heap alloc + a force
+   indirection per access). Cells are only needed for mutually-recursive
+   defaults (`{ a, b ? a }`). The common case (no defaults / no sibling
+   refs) now binds formals directly via `set_local`. ~0.5–1.5% w=1 & w=32.
+   NB an earlier whole-body *dead-formal* analysis regressed ~4% — the
+   `collectReferencedNames` body walk cost more than it saved; the shipped
+   version walks only the (tiny/absent) defaults.
+
+2. **Frameless `attr_access` thunk** (`012f829`): the most common thunk
+   shape is `someUpvalue.attr` (`config.foo`, `lib.bar`, param lookups) — a
+   bytecode thunk over a 7-byte `get_upvalue_attr; ret` chunk that forced
+   by pushing an *isolated frame* + dispatch. New `ThunkTarget.attr_access
+   {base, name}` (classified at chunk-finish, built frameless at thunk
+   creation) forces via a direct `getAttrValue` — no frame, no dispatch.
+   **~2% w=32** (median, 16-run×4).
+
+These **refine the floor finding**: the per-node machinery (`run_isolated_
+frame` etc.) *is* partially reducible on the chain — but only by
+**structural** elimination (the thunk genuinely has no frame), NOT by
+per-op/per-call runtime checks (the trivial-lambda short-circuit added an
+`if jit/trivial` test to every call and regressed). The distinction is the
+lesson: remove the work, don't gate it. Possible next in the same vein:
+2-level `attr_access` (`config.foo.bar`, ~20% as common as 1-level).
+
 ## Method-JIT (per-body) is measured-dead — the cost is in the call graph
 
 Built the ambitious version the prof-main profile pointed at: a real
