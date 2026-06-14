@@ -30,6 +30,7 @@ inline fn pathKey(self: *VM, target: ThunkTarget) u32 {
             else => prof_path.KEY_OTHER,
         },
         .pass_through => prof_path.KEY_PASS_THROUGH,
+        .attr_access => prof_path.KEY_OTHER,
     };
 }
 
@@ -279,6 +280,11 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget) anyerror!Value {
             break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, upvalues);
         },
         .pass_through => |v| forceValueImpl(self, v, true),
+        // Frameless `someUpvalue.attr`: skip the isolated frame +
+        // bytecode dispatch and go straight to the attr lookup, exactly
+        // as the `get_upvalue_attr; ret` body would (getAttrValue forces
+        // the attrs operand and the result).
+        .attr_access => |aa| access.getAttrValue(self, aa.base, aa.name),
     };
 }
 

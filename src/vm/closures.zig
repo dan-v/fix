@@ -9,6 +9,7 @@ const Chunk = chunk.Chunk;
 const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
 const BytecodeThunk = @import("../runtime/thunk.zig").BytecodeThunk;
+const Thunk = @import("../runtime/thunk.zig").Thunk;
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -126,6 +127,9 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         .literal => |val| {
             return stack.push(self, val);
         },
+        .attr_access => |aa| {
+            return shortCircuitAttrAccess(self, descriptors, frame, aa, chunk_id);
+        },
         .none => {},
     }
 
@@ -194,23 +198,37 @@ fn captureBytecodeThunk(self: *VM, chunk_id: ChunkId, descriptors: []const u8, f
     return self.heap.commitBytecodeThunk(pending);
 }
 
-/// Push the value of capture descriptor `idx` directly without
-/// constructing a thunk. The descriptors operand is laid out as
-/// (kind:1, index:2) triples; we read the `idx`-th triple and resolve
-/// it the same way `fillCaptureValues` would.
-inline fn shortCircuitIdentityUpvalue(self: *VM, descriptors: []const u8, frame: *const Frame, idx: u16) !void {
+/// Resolve capture descriptor `idx` to its Value against the current
+/// frame. Descriptors are (kind:1, index:2) triples — same resolution
+/// `fillCaptureValues` does.
+inline fn resolveDescriptorValue(self: *VM, descriptors: []const u8, frame: *const Frame, idx: u16) !Value {
     const offset: usize = @as(usize, idx) * 3;
     if (offset + 3 > descriptors.len) return error.InvalidBytecode;
     const capture_index = readU16(descriptors, offset + 1);
-    const value: Value = switch (descriptors[offset]) {
+    return switch (descriptors[offset]) {
         0 => self.stack[frame.frame_base + capture_index],
         1 => blk: {
             const upvalues = frame.upvalues orelse return error.MissingClosure;
             break :blk upvalues[capture_index];
         },
-        else => return error.InvalidBytecode,
+        else => error.InvalidBytecode,
     };
-    return stack.push(self, value);
+}
+
+/// Push the value of capture descriptor `idx` directly without
+/// constructing a thunk (`x: x`-shaped trivial bodies).
+inline fn shortCircuitIdentityUpvalue(self: *VM, descriptors: []const u8, frame: *const Frame, idx: u16) !void {
+    return stack.push(self, try resolveDescriptorValue(self, descriptors, frame, idx));
+}
+
+/// Build a frameless `attr_access` thunk for a `someUpvalue.attr` body:
+/// resolve the base attrset from the descriptor and bake (base, name).
+/// Forcing it later runs `getAttrValue` with no frame/dispatch.
+inline fn shortCircuitAttrAccess(self: *VM, descriptors: []const u8, frame: *const Frame, aa: chunk.AttrAccessShape, chunk_id: ChunkId) !void {
+    const base = try resolveDescriptorValue(self, descriptors, frame, aa.upvalue_index);
+    const id = try self.heap.addThunk(Thunk.initAttrAccess(base, aa.name));
+    recordBytecodeThunkCreate(self, id, frame, chunk_id);
+    return stack.push(self, Value.thunk(id));
 }
 
 /// Compose outer + inner descriptors and build the closure directly,
@@ -291,6 +309,9 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
         },
         .literal => |val| {
             return stack.push(self, val);
+        },
+        .attr_access => |aa| {
+            return shortCircuitAttrAccess(self, descriptors, frame, aa, chunk_id);
         },
         .none => {},
     }

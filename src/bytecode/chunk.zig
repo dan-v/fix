@@ -128,6 +128,19 @@ pub const TrivialBody = union(enum) {
     /// pool entry to point at, so we cache the literal `Value`
     /// directly. Saves one heap alloc + one thunk force per binding.
     literal: Value,
+    /// Body is `get_upvalue_attr U N; ret; halt` (7 bytes) — the
+    /// pervasive `someUpvalue.attr` thunk (`config.foo`, `lib.bar`,
+    /// attrset-pattern param lookups). At thunk creation we resolve
+    /// upvalue `U` from the descriptor and build a frameless
+    /// `attr_access` thunk over (base, name), so forcing skips the
+    /// isolated frame + bytecode dispatch and goes straight to
+    /// `getAttrValue`.
+    attr_access: AttrAccessShape,
+};
+
+pub const AttrAccessShape = struct {
+    upvalue_index: u16,
+    name: u16,
 };
 
 pub const ClosureCaptures = struct {
@@ -325,6 +338,16 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             const idx = readU16Inline(code, 1);
             if (idx >= constants.len) return .none;
             return .{ .constant = idx };
+        },
+        // `get_upvalue_attr U N; ret; halt` — 1 + 2 + 2 + 1 + 1 = 7 bytes.
+        .get_upvalue_attr => {
+            if (code.len != 7) return .none;
+            if (@as(OpCode, @enumFromInt(code[5])) != .ret) return .none;
+            if (@as(OpCode, @enumFromInt(code[6])) != .halt) return .none;
+            return .{ .attr_access = .{
+                .upvalue_index = readU16Inline(code, 1),
+                .name = readU16Inline(code, 3),
+            } };
         },
         // `push_builtins; ret; halt` — 1 + 1 + 1 = 3 bytes.
         .push_builtins => {

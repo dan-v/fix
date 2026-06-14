@@ -127,10 +127,23 @@ pub const BytecodeThunk = struct {
 ///   - `.pass_through` is a memoization wrapper: the underlying Value is
 ///     forced and the result becomes the thunk's resolved value. This is
 ///     how the compiler models recursive let-binding cells.
+/// Frameless lazy attr access: forcing computes `getAttrValue(base,
+/// name)` directly, with no frame push or bytecode dispatch. The
+/// overwhelmingly common `someUpvalue.attr` thunk shape (`config.foo`,
+/// `lib.bar`, attrset-pattern param lookups) would otherwise allocate a
+/// `bytecode` thunk over a 7-byte `get_upvalue_attr; ret` chunk and run a
+/// whole isolated frame to force it — `run_isolated_frame` is the biggest
+/// machinery bucket on the serial critical path.
+pub const AttrAccess = struct {
+    base: Value,
+    name: types.InternId,
+};
+
 pub const ThunkTarget = union(enum) {
     closure: Value,
     bytecode: BytecodeThunk,
     pass_through: Value,
+    attr_access: AttrAccess,
 };
 
 /// Captured failure of a thunk's deterministic body, replayed on
@@ -420,6 +433,15 @@ pub const Thunk = struct {
                 .upvalue_count = @intCast(upvalues.len),
                 .storage = storage,
             } },
+        };
+    }
+
+    /// A frameless attr-access thunk (see `AttrAccess`). Forcing computes
+    /// `getAttrValue(base, name)` with no frame/dispatch.
+    pub fn initAttrAccess(base: Value, name: types.InternId) Thunk {
+        return .{
+            .future = Future.init(),
+            .target = .{ .attr_access = .{ .base = base, .name = name } },
         };
     }
 
