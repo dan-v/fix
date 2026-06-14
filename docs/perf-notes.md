@@ -197,6 +197,49 @@ per-op/per-call runtime checks (the trivial-lambda short-circuit added an
 lesson: remove the work, don't gate it. Possible next in the same vein:
 2-level `attr_access` (`config.foo.bar`, ~20% as common as 1-level).
 
+## Post-wins re-profile — VM-level work reduction is exhausted for this eval
+
+After the three on-chain wins, re-profiled main at w=32 and systematically
+checked the remaining candidates. The result: VM-level work reduction is
+spent for the NixOS toplevel.
+
+- **Machinery is mined out.** The frameless `attr_access` win halved on-path
+  `run_isolated_frame` excl (38M → 19.7M); total main-path machinery
+  (`run_isolated_frame`+`do_call`+`force_*`) is now ~28M excl — small.
+  `apply_builtin` excl (541M) is the dominant bucket and it's **builtin
+  *bodies*** (drv-hash SHA256/ATerm self, string interning), i.e. inherent.
+- **Hot builtins are clean** — checked for over-forcing / over-fan-out:
+  `length` is O(1) (no element force); `any`/`all` short-circuit and do NOT
+  fan out; `filter`/`concatMap` fan out only because they walk the whole
+  list; `substring`/`toString`/`length` high *inclusive* is inherent
+  arg-forcing (big strings, drv hashing), not waste.
+- **drv hashing**: 828 distinct drvs = exactly the toplevel's necessary drv
+  closure, memoized O(N) via the `DerivationStore` resolver, 3 genuinely
+  distinct ATerm serializations each. No redundancy.
+- **No over-forcing** found: lazy eval forces only what's demanded;
+  speculation "waste" is helper-side and helpers are 86% idle (no wall
+  contention). The drv closure and assertion-forcing are required for
+  correctness (`.drv`-identical), so there's no semantic slack to cut.
+
+Measured-and-rejected this round (neutral/negative on the toplevel — the
+levers don't *bite* this workload):
+- **Deeper `attr_access` chains** (`config.foo.bar(.baz)`): ~0.7% w=32 (in
+  noise) but a consistent ~0.5% w=1 regression from the wider struct +
+  bigger `TrivialBody` on every chunk. Reverted.
+- **`zipAttrsWith` linear-scan → hashmap**: it IS a latent O(total ×
+  unique_keys) quadratic (module def-merge core), but it isn't hot here —
+  the attrsets it zips are small, so the hashmap's alloc/hash overhead
+  slightly *loses* the common case (neutral best, ~0.5% worse median).
+  Reverted; keep the linear scan. (Worth revisiting only if a config ever
+  makes `zipAttrsWith` hot on large key sets.)
+
+Conclusion: the cheap/medium *and* the algorithmic on-chain work-reduction
+wins are now harvested (cumulative session: layered `//` + k-way flatten,
+direct formals, frameless attr_access ≈ **−4.5% w=32 / −2.5% w=1**). What
+remains on the serial chain is inherent (drv-hash DAG + module-system user
+functions + required assertion evaluation). Below the current floor needs a
+different evaluation model, not VM micro-architecture.
+
 ## Method-JIT (per-body) is measured-dead — the cost is in the call graph
 
 Built the ambitious version the prof-main profile pointed at: a real
