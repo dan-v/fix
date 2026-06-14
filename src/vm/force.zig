@@ -36,6 +36,53 @@ inline fn pathKey(self: *VM, target: ThunkTarget) u32 {
 
 const VM = vm_mod.VM;
 
+// ---- thunk-result memo ----
+//
+// nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`,
+// `lib.mkXxx`, ...) with identical arguments across thousands of modules,
+// producing distinct thunk objects that compute identical values — work
+// the per-object thunk memoization can't share. ~10.8% of bytecode-thunk
+// computations on the NixOS toplevel are such duplicates.
+//
+// This is a bounded, **thread-local** (per-worker, zero-contention) cache
+// mapping (heap_token, chunk_id, ≤2 upvalues) → resolved Value. Before
+// computing a freshly-claimed bytecode thunk we check it; a hit resolves
+// the thunk to the cached value and skips re-running the body. Pure
+// functions, so reuse is sound; the `heap_token` guard invalidates stale
+// entries across Evaluator instances (same trick as the attr inline
+// cache). Limited to ≤2-upvalue thunks so the key compares exactly with
+// no allocation — that's the inline-storage majority.
+const MEMO_BITS = 14;
+const MEMO_SIZE = 1 << MEMO_BITS;
+const MemoSlot = struct {
+    token: u64 = 0, // 0 = empty (heap tokens start at 1)
+    chunk: u32 = 0,
+    count: u8 = 0,
+    up0: u64 = 0,
+    up1: u64 = 0,
+    value: Value = Value.null_val,
+};
+threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
+
+inline fn memoSlotIndex(chunk: u32, up0: u64, up1: u64) usize {
+    var h: u64 = @as(u64, chunk) *% 0x9E3779B97F4A7C15;
+    h ^= up0 *% 0xC2B2AE3D27D4EB4F;
+    h ^= up1 *% 0x165667B19E3779F9;
+    return @intCast((h ^ (h >> 29)) & (MEMO_SIZE - 1));
+}
+
+const MemoKey = struct { chunk: u32, count: u8, up0: u64, up1: u64, idx: usize };
+
+/// Build the memo key for a bytecode thunk if it's memoizable (≤2
+/// upvalues), else null.
+inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
+    const ups = b.upvalues();
+    if (ups.len > 2) return null;
+    const a0: u64 = if (ups.len >= 1) ups[0].bits else 0;
+    const a1: u64 = if (ups.len >= 2) ups[1].bits else 0;
+    return .{ .chunk = b.chunk_id, .count = @intCast(ups.len), .up0 = a0, .up1 = a1, .idx = memoSlotIndex(b.chunk_id, a0, a1) };
+}
+
 // ---- thunk management ----
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
@@ -214,6 +261,24 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
+                // Thunk-result memo: reuse a previous identical pure
+                // computation on this worker, skipping re-running the body.
+                const memo_key: ?MemoKey = switch (thunk.target) {
+                    .bytecode => |*b| memoKeyForBytecode(b),
+                    else => null,
+                };
+                if (memo_key) |k| {
+                    const s = &thunk_memo[k.idx];
+                    if (s.token == self.heap.token and s.chunk == k.chunk and
+                        s.count == k.count and s.up0 == k.up0 and s.up1 == k.up1)
+                    {
+                        thunk.resolve(s.value);
+                        recordResolve(self, thunk_id, s.value);
+                        if (demand) thunk.markDemanded();
+                        return s.value;
+                    }
+                }
+
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, thunk.target)) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
@@ -225,6 +290,14 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     return err;
                 };
                 thunk.resolve(result);
+                if (memo_key) |k| thunk_memo[k.idx] = .{
+                    .token = self.heap.token,
+                    .chunk = k.chunk,
+                    .count = k.count,
+                    .up0 = k.up0,
+                    .up1 = k.up1,
+                    .value = result,
+                };
                 recordResolve(self, thunk_id, result);
                 trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
                 if (demand) thunk.markDemanded();
