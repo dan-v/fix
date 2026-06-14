@@ -112,6 +112,59 @@ big lever is the **method-JIT** (compile hot lambda bodies, remove per-call
 frame+dispatch overhead). `merge_attrs` excl is now only 187M (was the lever,
 now mined).
 
+## Wait-chain analysis: fix is at the SERIAL CRITICAL-PATH FLOOR (decisive)
+
+Ran the existing main-thread profiler (`-Dprof-main`, which records *only*
+worker 0 / main, including `wait_busy_thunk` = main blocked on a helper and
+`park_main_worker` = main idle) at **workers=32** for the first time. The
+result settles the long-open question "is the w=32 wall a JIT problem or a
+critical-path problem":
+
+| main (worker 0) @ w=32 | calls |
+| --- | --- |
+| `wait_busy_thunk` (blocked on a helper) | **2** |
+| `park_main_worker` (idle, queue empty) | **3** (~2 ms) |
+| `force_value` | 68 K (vs **23 M** at w=1) |
+| `force_thunk_slow` (main computes the thunk itself) | 13.7 K |
+| `run_isolated_frame` | 14 K |
+| `apply_builtin` | 10 K |
+
+**Main never waits.** It runs the entire critical path itself, end-to-end,
+and almost never blocks on a helper or idles. Helpers offload 99.7% of
+forces (23 M → main only does 68 K) — everything *off* the critical path —
+but the path itself is a strict serial chain main must walk node by node.
+So **the w=32 wall ≈ main's serial execution of the critical chain**, which
+is exactly why work-elimination *on that chain* (the layered-`//` merge win)
+transferred to w=32 while throughput/parallelism work didn't.
+
+**What's on the chain** (`prof builtins` @ w=32, by what main runs):
+`derivationLazyAttr` (drv/outPath SHA256 over the input-drv DAG — memoized
+O(N) via the `DerivationStore` resolver, inherent crypto), and the
+map-family (`mapAttrValue`/`map`/`mapAttrs`/`any`/`length`/`concatMap`)
+whose cost is the *user functions* they drive. Both inherent.
+
+**Strategic consequences (this is the important part):**
+1. **More parallelism is useless** — main never waits, helpers are 86% idle;
+   the chain is genuine data-dependency, discovered just-in-time, so helpers
+   can't get ahead of it (confirms Plan-2 / burst-dispatch dead ends).
+2. **A JIT cannot reach the 1 s goal** — main's *machinery* (force + frame +
+   dispatch: `run_isolated_frame`+`force_thunk_slow`+`force_value`+`do_call`
+   ≈ 100 M excl cycles) is only ~7% of the w=32 wall; the rest is inherent
+   builtin/user-fn/hashing work. Even a perfect tracing JIT only attacks the
+   ~7%. (Matches the measured-neutral per-body JIT.)
+3. **The only lever left is eliminating real *work* on the serial chain** —
+   the merge win was that; the big remaining items (drv hashing, module-system
+   user functions) are inherent. The cheap and medium work-elimination wins
+   are spent.
+
+Bottom line: fix (parallel bytecode VM, ~1.7 s w=32 / ~3.4 s w=1) sits at
+its serial-critical-path floor for the NixOS toplevel. Going materially
+below ~1.7 s needs a *fundamentally* different evaluation strategy (e.g.
+caching module/option evaluation at the Nix-semantic level, or reducing how
+much of the option tree is forced) — not VM micro-architecture. Versus
+single-threaded tree-walking C++ Nix, fix is almost certainly already far
+ahead; the 1 s-at-w=32 target is bounded by inherent serial dependencies.
+
 ## Method-JIT (per-body) is measured-dead — the cost is in the call graph
 
 Built the ambitious version the prof-main profile pointed at: a real
