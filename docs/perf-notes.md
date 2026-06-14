@@ -87,6 +87,31 @@ is 1.5% of cycles, a red herring" note: the merge *loop* is cheap, but the
 *copy volume + allocation* it drives (and its position on the serial chain)
 was not — eliminating the copies, not speeding the loop, is what paid.
 
+### Merge family fully mined — adjacent levers measured & rejected
+- **strict/recursive merge (`merge_attrs_strict`)**: 137,962 calls, 2.77M
+  entries, avg ~20; only **8** calls have left≥32 (max 389). All tiny
+  recursive merges — no large subpopulation to layer, and layering is
+  recursive (complex). Not worth it.
+- **list `++` (`addConcatenatedLists`)**: 128,717 calls, only 358K entries
+  total (max 2037). The `foldl' (++)` quadratic isn't biting (nixpkgs lists
+  are short). Not worth layering.
+- **trivial single-param lambda short-circuit** (`x: x`, `x: c`, `x: <upval>`
+  resolved at the call site without a frame): **regressed ~2-3% at w=1 AND
+  w=32** and was reverted. `doCall`/`callValue`/`doTailCall` are the hottest
+  paths (~4.5M calls); adding a per-call union load + branch cost more on the
+  majority (non-trivial) than it saved on the trivial minority. Unlike the
+  trivial-*thunk* short-circuit (which saves a heap alloc on the cooler
+  thunk-creation path), the call path is too hot to tax for a minority win —
+  this is JIT territory (compile the body, no per-call interpreter check).
+
+Post-merge-win operation profile (`-Dprof-main`, w=1): cost is now dominated
+by the **call/frame/dispatch machinery** — `apply_builtin` ~4B, `run_isolated
+_frame` ~3.3B, `do_call` ~2B excl cycles — i.e. the module system applying
+millions of functions (`modules.nix:450`). No single hot op; the remaining
+big lever is the **method-JIT** (compile hot lambda bodies, remove per-call
+frame+dispatch overhead). `merge_attrs` excl is now only 187M (was the lever,
+now mined).
+
 ## The real remaining lever: the 5M never-forced thunks
 
 44% of the 5.9M thunks are **created and never forced** — attrset values
