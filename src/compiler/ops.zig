@@ -523,19 +523,41 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     }
     try child_builder.setFunctionArgs(self.allocator, function_args.items);
 
-    for (lambda.params) |param| {
-        const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-        const name_id = try self.intern.intern(name);
-        const slot = try scope.declareLocal(&child, name, name_id);
-        try emit.emitInitCellSlot(&child, slot);
-    }
+    // Binding cells are only needed when a formal's default references
+    // another formal (mutually-recursive defaults, e.g. `{ a, b ? a }`):
+    // the cell gives each formal a mutable handle the others can capture.
+    // The overwhelmingly common case — no defaults at all, or defaults
+    // that don't reference sibling formals (every NixOS module function,
+    // `{ config, lib, pkgs, ... }`) — needs no cells: each formal binds
+    // directly to its lookup thunk via `set_local`, skipping a per-formal
+    // binding-cell heap alloc plus a force-indirection on every param
+    // access. This lands on the hot critical path (module application,
+    // modules.nix:450). The check only walks DEFAULTS (tiny / absent),
+    // never bodies, so it adds negligible compile cost.
+    const needs_cells = attrParamsNeedCells(self, lambda.params);
 
-    for (lambda.params) |param| {
-        const name = self.source[param.name.offset .. param.name.offset + param.name.len];
-        const name_id = try self.intern.intern(name);
-        const slot = scope.resolveLocal(&child, name) orelse return error.UndefinedVariable;
-        try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
-        try emit.emitSetCellLocal(&child, slot);
+    if (needs_cells) {
+        for (lambda.params) |param| {
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
+            const name_id = try self.intern.intern(name);
+            const slot = try scope.declareLocal(&child, name, name_id);
+            try emit.emitInitCellSlot(&child, slot);
+        }
+        for (lambda.params) |param| {
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
+            const name_id = try self.intern.intern(name);
+            const slot = scope.resolveLocal(&child, name) orelse return error.UndefinedVariable;
+            try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
+            try emit.emitSetCellLocal(&child, slot);
+        }
+    } else {
+        for (lambda.params) |param| {
+            const name = self.source[param.name.offset .. param.name.offset + param.name.len];
+            const name_id = try self.intern.intern(name);
+            const slot = try scope.declareLocal(&child, name, name_id);
+            try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
+            try emit.emitSetLocal(&child, slot);
+        }
     }
 
     compileTailExpression(&child, lambda.body) catch |err| {
@@ -549,6 +571,32 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitClosureWithCaptures(self, child_id, child.captures.items);
+}
+
+/// Do this attrset pattern's formals need binding cells? Only when a
+/// formal's default references another formal (mutually-recursive
+/// defaults). Walks only the (usually absent / tiny) defaults, so it's
+/// cheap; conservatively returns true on any analysis failure.
+fn attrParamsNeedCells(self: *Compiler, params: []const Node.LambdaAttrParam) bool {
+    var has_default = false;
+    for (params) |p| {
+        if (p.default != null) {
+            has_default = true;
+            break;
+        }
+    }
+    if (!has_default) return false;
+
+    var refs: std.StringHashMapUnmanaged(void) = .empty;
+    defer refs.deinit(self.allocator);
+    for (params) |p| {
+        if (p.default) |d| collectReferencedNames(self, d, &refs) catch return true;
+    }
+    for (params) |p| {
+        const name = self.source[p.name.offset .. p.name.offset + p.name.len];
+        if (refs.contains(name)) return true;
+    }
+    return false;
 }
 
 pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
