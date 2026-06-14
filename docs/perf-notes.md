@@ -112,6 +112,50 @@ big lever is the **method-JIT** (compile hot lambda bodies, remove per-call
 frame+dispatch overhead). `merge_attrs` excl is now only 187M (was the lever,
 now mined).
 
+## Method-JIT (per-body) is measured-dead — the cost is in the call graph
+
+Built the ambitious version the prof-main profile pointed at: a real
+**linear whole-body JIT compiler** (`jit_linear.zig`, committed 09ebe5f) —
+a stack machine that emits native code for an arbitrary straight-line chunk
+body op-by-op (operand stack in native-stack memory, no VM-layout coupling;
+`rbx`=vm/`r14`=upvalues/`r15`=arg; complex ops tail into the existing C-ABI
+helpers), falling back to the interpreter on any unhandled op. Covers
+constant/push_lit/capture+get upvalue+local/call/tail_call/ret. **~3× the
+peephole matcher's chunk coverage.** Byte-identical `.drv` at w=1 and w=32,
+all tests green, no parallel race.
+
+**Two independent expansions, both measured WALL-NEUTRAL** (3-way A/B,
+no-JIT vs peephole vs linear, 10×N runs):
+- linear compiler (3× coverage): neutral at w=32, ~2% *slower* at w=1.
+- + inlined `force` fast path (non-thunk → no helper call): still neutral.
+
+| | w=1 best | w=32 best |
+| --- | --- | --- |
+| no-JIT | 3.41–3.44 | 1.72–1.76 |
+| JIT peephole | 3.48 | 1.74–1.77 |
+| JIT +linear | 3.46 | 1.72–1.77 |
+| JIT +linear +inline-force | 3.55 (drift) | 1.73–1.75 |
+
+**Root cause (conclusive):** the per-body JIT removes bytecode *dispatch*
+from chunk bodies, but the dominant cost is NOT body dispatch — it's
+(a) the helpers the body calls (`callValue`→`runIsolatedFrame` for the
+*callee*, `forceValue` of substantial thunks), (b) the callee frame
+machinery, and (c) a per-call `if ch.jit_code` dispatch-check tax the
+marginally-faster bodies don't recover (the ~2% w=1 regression). The JIT'd
+bodies are thin wrappers; the time is in the *call graph* they drive, which
+a per-body compiler cannot touch. Tripling coverage and inlining the force
+fast path both confirmed it: neither moved the wall.
+
+**What this means for a winning JIT:** only a **tracing / cross-procedure
+inlining JIT** — record a hot force-chain *across call boundaries* and
+compile it to straight-line native with guards + deopt — collapses the
+call-graph/frame/dispatch overhead that dominates. That's the PyPy/LuaJIT
+shape; it's research-grade (trace recording, guard/side-exit, deopt) and
+multi-month. The committed linear compiler + emitter + C-ABI helpers are a
+usable substrate for it, but the per-body approach alone is a dead end for
+this workload. (`-Djit` stays opt-in / off by default; zero impact on real
+builds.)
+
 ## The real remaining lever: the 5M never-forced thunks
 
 44% of the 5.9M thunks are **created and never forced** — attrset values
