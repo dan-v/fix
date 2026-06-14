@@ -467,6 +467,7 @@ pub const WellKnownChunks = struct {
 pub const ChunkRegistry = struct {
     const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
     const jit = @import("../jit.zig");
+    const jit_linear = @import("../jit_linear.zig");
     const JitCodeBuffer = if (jit.enabled) jit.CodeBuffer else void;
 
     allocator: std.mem.Allocator,
@@ -574,11 +575,20 @@ pub const ChunkRegistry = struct {
         stored.* = chunk;
         if (jit.enabled) {
             // Best-effort: failure to JIT just leaves the interpreter
-            // to handle it. Don't propagate.
+            // to handle it. Don't propagate. The peephole matcher runs
+            // first (its hand-tuned tail-call stubs are optimal for the
+            // tiny fixed shapes); the linear compiler catches the
+            // larger straight-line bodies the peephole can't.
             if (stored.local_count == 0) {
                 stored.jit_code = jit.compile(&self.jit_buffer, stored);
+                if (stored.jit_code == null) {
+                    stored.jit_code = @ptrCast(jit_linear.compileLinear(&self.jit_buffer, stored, false));
+                }
             } else {
                 stored.jit_lambda_code = jit.compileLambda(&self.jit_buffer, stored);
+                if (stored.jit_lambda_code == null) {
+                    stored.jit_lambda_code = @ptrCast(jit_linear.compileLinear(&self.jit_buffer, stored, true));
+                }
             }
         }
         return try self.chunks.append(self.allocator, stored);

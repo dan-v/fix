@@ -214,6 +214,23 @@ pub fn jitGetUpvalueAttr3(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u
     return .{ .value = c, .error_code = 0 };
 }
 
+/// Generic `callValue(vm, callee, arg)` for the linear compiler's
+/// `call`/`tail_call` ops. Matches the interpreter `call` op: the callee
+/// is already forced (the function-position op forced it), arg is passed
+/// as-is (callee decides laziness). `callValue` runs the callee to
+/// completion and returns its value — semantically equivalent to the
+/// interpreter's frame-based `call` for a value-producing body.
+pub fn jitCallValue(vm: *anyopaque, callee: Value, arg: Value) callconv(.c) JitResult {
+    if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
+    const closures = @import("vm/closures.zig");
+    const VM = @import("vm.zig").VM;
+    const v: *VM = @ptrCast(@alignCast(vm));
+    const result = closures.callValue(v, callee, arg) catch |err| {
+        return .{ .value = Value.null_val, .error_code = @intFromError(err) };
+    };
+    return .{ .value = result, .error_code = 0 };
+}
+
 /// JIT handler for the well-known `mapattrs_apply` chunk. Equivalent
 /// to running:
 ///   capture_upvalue 0 (func); capture_upvalue 1 (name); call;
