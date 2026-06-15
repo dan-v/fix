@@ -157,13 +157,13 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             const thunk = try self.ev.heap.getThunk(id);
             const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
             if (state == .resolved) {
-                try self.write(thunk.future.result.result);
+                try self.write(thunk.payload.result);
                 return;
             }
             // Pass-through (cell-like) thunks hold a value that hasn't been
             // forced yet. Render the wrapped value rather than an opaque
             // `...`, matching how cells used to render their `initial`.
-            switch (thunk.target) {
+            switch (thunk.payload.target) {
                 .pass_through => |v| try self.write(v),
                 else => try self.writer.writeAll("..."),
             }

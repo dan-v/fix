@@ -298,7 +298,7 @@ fn xmlThunkValue(self: anytype, id: ObjectId) anyerror!?Value {
     // Lazy XML treats those as still unevaluated so speculation stays
     // invisible — the rendered output matches the no-helper case.
     if (!thunk.isDemanded()) return null;
-    return xmlVisibleValue(self, thunk.future.result.result);
+    return xmlVisibleValue(self, thunk.payload.result);
 }
 
 fn writeXmlList(

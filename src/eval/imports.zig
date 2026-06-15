@@ -69,6 +69,9 @@ pub const Registry = struct {
 
 pub const ImportEntry = struct {
     future: thunk_mod.Future,
+    /// The resolved import value. `Future` is value-less, so the entry
+    /// owns its own result slot, written before `future.publish()`.
+    result: Value = Value.null_val,
     /// Owned by this entry. Allocated when the compile fails so the
     /// future can transition to `.errored` with a sidecar. Freed by
     /// `Registry.deinit`.
@@ -133,10 +136,10 @@ pub fn importResolvedPath(ev: anytype, path: []const u8) anyerror!Value {
 pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!Value {
     const me = currentClaimer();
     while (true) {
-        switch (entry.future.tryForce(me)) {
-            .already_resolved => |v| return v,
+        switch (entry.future.tryClaim(me)) {
+            .already_resolved => return entry.result,
             .blackhole => return error.ImportCycle,
-            .errored => |info| return info.err,
+            .errored => return entry.error_info.?.err,
             .busy => {
                 const inner = fiber_mod.currentFiber() orelse
                     @panic("forceEntry hit .busy outside a fiber");
@@ -153,7 +156,8 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!V
                     publishCompileFailure(ev, entry, err);
                     return err;
                 };
-                entry.future.resolve(value);
+                entry.result = value;
+                entry.future.publish();
                 return value;
             },
         }
@@ -173,7 +177,7 @@ fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
     };
     info.* = .{ .err = err, .message = null };
     entry.error_info = info;
-    entry.future.markErrored(info);
+    entry.future.publishErrored();
 }
 
 fn currentClaimer() thunk_mod.ClaimerId {

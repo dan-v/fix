@@ -126,7 +126,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     const state = thunk.future.state.load(.acquire);
     if (state == @intFromEnum(thunk_mod.FutureState.resolved)) {
         if (demand) thunk.markDemanded();
-        return thunk.future.result.result;
+        return thunk.payload.result;
     }
     return forceThunkImpl(self, value, demand);
 }
@@ -263,7 +263,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             .claimed => {
                 // Thunk-result memo: reuse a previous identical pure
                 // computation on this worker, skipping re-running the body.
-                const memo_key: ?MemoKey = switch (thunk.target) {
+                const memo_key: ?MemoKey = switch (thunk.payload.target) {
                     .bytecode => |*b| memoKeyForBytecode(b),
                     else => null,
                 };
@@ -279,12 +279,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
 
-                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, thunk.target)) else @as(usize, 0);
+                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, thunk.payload.target)) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
-                const result = evalThunkTarget(self, &thunk.target) catch |err| {
+                const result = evalThunkTarget(self, &thunk.payload.target) catch |err| {
                     publishThunkFailure(self, thunk, thunk_id, err);
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
