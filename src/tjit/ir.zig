@@ -27,6 +27,11 @@ pub const Op = enum(u8) {
     const_val,
     /// Upvalue slot `aux` of the anchor closure.
     load_upvalue,
+    /// Upvalue slot `aux` of an *inlined* closure `a` (its func Ref). Distinct
+    /// from `load_upvalue` because each closure instance of a chunk has its
+    /// own upvalues; an inlined callee reads the specific closure it was
+    /// called on, captured in the trace.
+    load_upvalue_of,
     /// Frame local slot `aux`, live at trace entry.
     load_local,
     /// The argument supplied at the anchor (lambda traces).

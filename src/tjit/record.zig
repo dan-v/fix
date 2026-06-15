@@ -50,7 +50,7 @@ fn state(vm: *VM) ?*Recording {
 
 /// Begin recording at a freshly-armed anchor frame. No-op if already
 /// recording (we don't nest recordings).
-pub fn start(vm: *VM, anchor: ChunkId, is_lambda: bool, root_depth: u32) void {
+pub fn start(vm: *VM, anchor: ChunkId, local_count: u16, is_lambda: bool, root_depth: u32) void {
     if (vm.tjit_rec != null) return;
     const r = vm.allocator.create(Recording) catch return;
     r.* = .{
@@ -60,6 +60,12 @@ pub fn start(vm: *VM, anchor: ChunkId, is_lambda: bool, root_depth: u32) void {
         .root_depth = root_depth,
     };
     r.rec = Recorder.init(vm.allocator, &r.trace);
+    r.rec.startRoot(local_count, is_lambda) catch {
+        r.rec.deinit();
+        r.trace.deinit(vm.allocator);
+        vm.allocator.destroy(r);
+        return;
+    };
     vm.tjit_rec = r;
 }
 
@@ -96,14 +102,16 @@ pub fn cleanup(vm: *VM) void {
 /// `vm.tjit_rec != null`.
 pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) void {
     const r = state(vm) orelse return;
-    // Off the anchor frame → a call or nesting force happened; can't
-    // linearize without inlining (phase 2). Abort.
-    if (vm.frames_len != r.root_depth) {
+    // The recorder's inline-frame depth must track the VM's. A mismatch means
+    // the VM nested a frame we didn't model — an *implicit* force that ran a
+    // thunk body — which we can't linearize without force-inlining. Abort.
+    const expected = r.root_depth + @as(u32, @intCast(r.rec.inlineDepth())) - 1;
+    if (vm.frames_len != expected) {
         abort(vm);
         return;
     }
     r.rec.setIp(@intCast(ip));
-    observeOp(&r.rec, frame, code, ip, op) catch {
+    observeOp(vm, &r.rec, frame, code, ip, op) catch {
         abort(vm);
         return;
     };
@@ -114,16 +122,30 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
     }
 }
 
-fn observeOp(rec: *Recorder, frame: *Frame, code: []const u8, ip: usize, op: OpCode) !void {
+/// Resolve the callee of a `call`/`tail_call` (on the VM operand stack as
+/// `[.., callee, arg]`) to an inlinable arity-1 closure chunk, or null.
+fn inlinableCallee(vm: *VM) ?struct { chunk: ChunkId, local_count: u16 } {
+    if (vm.sp < 2) return null;
+    const callee = vm.stack[vm.sp - 2];
+    if (!callee.isClosure()) return null;
+    const closure = vm.heap.getClosure(callee.asObjectId()) catch return null;
+    const ch = vm.registry.get(closure.chunk_id) orelse return null;
+    if (ch.arity != 1) return null; // uncurried/saturated calls: later
+    return .{ .chunk = closure.chunk_id, .local_count = ch.local_count };
+}
+
+fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize, op: OpCode) !void {
     switch (op) {
         .push_null => try rec.pushConst(Value.null_val),
         .push_true => try rec.pushConst(Value.boolVal(true)),
         .push_false => try rec.pushConst(Value.boolVal(false)),
         .pop => try rec.dropTop(),
         .constant => try rec.pushConst(frame.chunk_ptr.constants[readU16(code, ip + 1)]),
-        .get_local => try rec.pushLocal(code[ip + 1]),
-        .get_local_long => try rec.pushLocal(readU16(code, ip + 1)),
-        .get_upvalue => try rec.pushUpvalue(readU16(code, ip + 1)),
+        .get_local => try rec.getLocal(code[ip + 1]),
+        .get_local_long => try rec.getLocal(readU16(code, ip + 1)),
+        .set_local => try rec.setLocal(code[ip + 1]),
+        .set_local_long => try rec.setLocal(readU16(code, ip + 1)),
+        .get_upvalue => try rec.getUpvalue(readU16(code, ip + 1)),
         .add_int => try rec.binOp(.add_int),
         .sub_int => try rec.binOp(.sub_int),
         .mul_int => try rec.binOp(.mul_int),
@@ -133,17 +155,25 @@ fn observeOp(rec: *Recorder, frame: *Frame, code: []const u8, ip: usize, op: OpC
         .get_attr => try rec.getAttr(readU16(code, ip + 1)),
         .get_attr_long => try rec.getAttr(readU32(code, ip + 1)),
         .get_upvalue_attr => {
-            try rec.pushUpvalue(readU16(code, ip + 1));
+            try rec.getUpvalue(readU16(code, ip + 1));
             try rec.getAttr(readU16(code, ip + 3));
         },
         .get_local_attr => {
-            try rec.pushLocal(code[ip + 1]);
+            try rec.getLocal(code[ip + 1]);
             try rec.getAttr(readU16(code, ip + 2));
         },
+        .call => {
+            const callee = inlinableCallee(vm) orelse return rec.abort();
+            try rec.enterCall(callee.chunk, callee.local_count);
+        },
+        .tail_call => {
+            const callee = inlinableCallee(vm) orelse return rec.abort();
+            try rec.replaceTail(callee.chunk, callee.local_count);
+        },
         .ret => try rec.ret(),
-        // Everything else (calls, jumps, allocations, thunk/closure creation,
-        // compound forcing ops) needs inlining or control-flow handling we
-        // don't do yet — abort the trace.
+        // Everything else (call_n/tail_call_n, jumps, allocations,
+        // thunk/closure creation, set_cell_local, …) needs handling we don't
+        // do yet — abort the trace.
         else => rec.abort(),
     }
 }

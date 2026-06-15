@@ -48,7 +48,11 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
     // Begin recording this just-pushed frame if its chunk armed. `root_depth`
     // is the post-push frame depth; ops at any other depth abort the trace.
     if (comptime hot_mod.enabled) {
-        if (tjit_armed) record_mod.start(self, chunk_id, ch.local_count >= 1, self.frames_len);
+        // Only arity-1 anchors (curried lambdas / thunks) for now; the
+        // recorder's frame model assumes a single trace argument.
+        if (tjit_armed and ch.arity == 1) {
+            record_mod.start(self, chunk_id, ch.local_count, ch.local_count >= 1, self.frames_len);
+        }
     }
 }
 

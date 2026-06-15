@@ -1,19 +1,18 @@
 //! Trace recorder for the tracing JIT (`-Dtjit`).
 //!
-//! The recorder is *driven by the interpreter*: in record mode each opcode
-//! handler calls the matching method here, passing decoded operands and (for
-//! the guarded ops) the runtime value needed to choose a guard. The recorder
-//! keeps an **abstract operand stack** mapping each live VM stack slot to the
-//! IR `Ref` that produces it, and emits IR as it goes. This mirrors how
-//! LuaJIT's recorder hangs off the bytecode interpreter — it avoids
-//! re-decoding bytecode and naturally inlines through `call`/`force` (the
-//! interpreter just keeps executing into the callee/thunk body and the
-//! recorder keeps recording). See `docs/tracing-jit.md`.
+//! Driven by the interpreter (a method per executed op). It keeps an
+//! **inline-frame stack** and a shared **abstract operand stack** of IR
+//! `Ref`s, emitting IR as it goes. Inlining is the point: `enterCall` pushes
+//! an inline frame whose first local *is the caller's argument Ref* — so a
+//! callee's parameter reads become direct uses of the caller's value, with no
+//! frame at trace-execution time. That's what later lets allocation sinking
+//! delete intermediate thunks/attrsets. See `docs/tracing-jit.md`.
 //!
-//! This module is the recording *core* — abstract-stack discipline, IR
-//! emission, and deopt-snapshot capture. The interpreter integration (record
-//! mode in the dispatch loop) and the guard-value decisions live at the call
-//! sites; the core is unit-tested by driving the methods directly.
+//! Locals and upvalues are pure dataflow (resolved to existing Refs, no IR);
+//! only genuine effects (force/get_attr/call guards, arithmetic) emit IR. The
+//! driver keeps the recorder's frame depth in lock-step with the VM's, so an
+//! *unmodeled* nesting (an implicit force that ran a thunk body) is detected
+//! as a depth mismatch and aborts the trace.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -27,18 +26,25 @@ const GuardKind = ir.GuardKind;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 
-/// Bound on a single trace's length; over-long paths abort (they rarely
-/// re-converge and blow out codegen / register pressure).
 pub const MAX_TRACE_LEN: usize = 4096;
+pub const MAX_INLINE_DEPTH: usize = 64;
+
+/// One inlined call frame. `locals[i]` is the IR Ref currently in local slot
+/// `i` (null = uninitialized). `upvalue_src` is null for the anchor frame
+/// (upvalues are a trace input → `load_upvalue`) or the callee's func Ref for
+/// an inlined frame (→ `load_upvalue_of`). `operand_base` is where this
+/// frame's operands start in the shared operand stack.
+const InlineFrame = struct {
+    locals: []?Ref,
+    upvalue_src: ?Ref,
+    operand_base: u32,
+};
 
 pub const Recorder = struct {
     allocator: std.mem.Allocator,
     trace: *Trace,
-    /// Abstract operand stack: slot i holds the IR Ref producing VM stack[i].
-    /// Length tracks the VM's `sp` for the recorded region.
-    stack: std.ArrayListUnmanaged(Ref) = .empty,
-    /// Current bytecode position, for snapshot resume points. The driver
-    /// updates this before each guarded op.
+    operand: std.ArrayListUnmanaged(Ref) = .empty,
+    frames: std.ArrayListUnmanaged(InlineFrame) = .empty,
     ip: u32 = 0,
     aborted: bool = false,
     done: bool = false,
@@ -48,69 +54,83 @@ pub const Recorder = struct {
     }
 
     pub fn deinit(self: *Recorder) void {
-        self.stack.deinit(self.allocator);
+        for (self.frames.items) |f| self.allocator.free(f.locals);
+        self.frames.deinit(self.allocator);
+        self.operand.deinit(self.allocator);
+    }
+
+    /// Push the anchor frame. For an arity-1 lambda, local 0 is the trace
+    /// argument; a thunk anchor has no locals.
+    pub fn startRoot(self: *Recorder, local_count: u16, is_lambda: bool) !void {
+        const locals = try self.allocator.alloc(?Ref, local_count);
+        @memset(locals, null);
+        try self.frames.append(self.allocator, .{ .locals = locals, .upvalue_src = null, .operand_base = 0 });
+        if (is_lambda and local_count >= 1) {
+            locals[0] = try self.emit(.{ .op = .trace_arg });
+        }
     }
 
     pub fn setIp(self: *Recorder, ip: u32) void {
         self.ip = ip;
     }
 
+    pub fn inlineDepth(self: *const Recorder) usize {
+        return self.frames.items.len;
+    }
+
+    fn cur(self: *Recorder) *InlineFrame {
+        return &self.frames.items[self.frames.items.len - 1];
+    }
+
     fn emit(self: *Recorder, instr: ir.Instr) !Ref {
-        if (self.trace.len() >= MAX_TRACE_LEN) {
-            self.aborted = true;
-            return error.TraceAborted;
-        }
+        if (self.trace.len() >= MAX_TRACE_LEN) return error.TraceAborted;
         return self.trace.emit(self.allocator, instr);
     }
 
     fn push(self: *Recorder, ref: Ref) !void {
-        try self.stack.append(self.allocator, ref);
+        try self.operand.append(self.allocator, ref);
     }
 
     fn pop(self: *Recorder) !Ref {
-        if (self.stack.items.len == 0) {
-            self.aborted = true;
-            return error.TraceAborted;
-        }
-        return self.stack.pop().?;
+        if (self.operand.items.len == 0) return error.TraceAborted;
+        return self.operand.pop().?;
     }
 
-    fn peek(self: *Recorder) !Ref {
-        if (self.stack.items.len == 0) {
-            self.aborted = true;
-            return error.TraceAborted;
-        }
-        return self.stack.items[self.stack.items.len - 1];
-    }
-
-    /// Capture the live abstract stack as a deopt snapshot at the current ip:
-    /// each live Ref must be written back to its VM stack slot on side-exit.
     fn snapshot(self: *Recorder) !u32 {
-        var entries = try self.allocator.alloc(ir.SnapshotEntry, self.stack.items.len);
+        const items = self.operand.items;
+        var entries = try self.allocator.alloc(ir.SnapshotEntry, items.len);
         defer self.allocator.free(entries);
-        for (self.stack.items, 0..) |ref, i| {
-            entries[i] = .{ .ref = ref, .loc = .{ .stack = @intCast(i) } };
-        }
+        for (items, 0..) |ref, i| entries[i] = .{ .ref = ref, .loc = .{ .stack = @intCast(i) } };
         return self.trace.addSnapshot(self.allocator, self.ip, entries);
     }
 
-    // ---- value-producing inputs ----
+    // ---- inputs ----
 
     pub fn pushConst(self: *Recorder, v: Value) !void {
         const cidx = try self.trace.addConst(self.allocator, v);
         try self.push(try self.emit(.{ .op = .const_val, .aux = cidx }));
     }
 
-    pub fn pushLocal(self: *Recorder, slot: u16) !void {
-        try self.push(try self.emit(.{ .op = .load_local, .aux = slot }));
+    pub fn getLocal(self: *Recorder, slot: u16) !void {
+        const f = self.cur();
+        if (slot >= f.locals.len) return error.TraceAborted;
+        const ref = f.locals[slot] orelse return error.TraceAborted;
+        try self.push(ref);
     }
 
-    pub fn pushUpvalue(self: *Recorder, slot: u16) !void {
-        try self.push(try self.emit(.{ .op = .load_upvalue, .aux = slot }));
+    pub fn setLocal(self: *Recorder, slot: u16) !void {
+        const f = self.cur();
+        if (slot >= f.locals.len) return error.TraceAborted;
+        f.locals[slot] = try self.pop();
     }
 
-    pub fn pushArg(self: *Recorder) !void {
-        try self.push(try self.emit(.{ .op = .trace_arg }));
+    pub fn getUpvalue(self: *Recorder, slot: u16) !void {
+        const f = self.cur();
+        if (f.upvalue_src) |src| {
+            try self.push(try self.emit(.{ .op = .load_upvalue_of, .a = src, .aux = slot }));
+        } else {
+            try self.push(try self.emit(.{ .op = .load_upvalue, .aux = slot }));
+        }
     }
 
     // ---- stack shuffles ----
@@ -120,7 +140,8 @@ pub const Recorder = struct {
     }
 
     pub fn dup(self: *Recorder) !void {
-        try self.push(try self.peek());
+        if (self.operand.items.len == 0) return error.TraceAborted;
+        try self.push(self.operand.items[self.operand.items.len - 1]);
     }
 
     // ---- pure ops ----
@@ -138,51 +159,64 @@ pub const Recorder = struct {
 
     // ---- guarded effects ----
 
-    /// Force the top-of-stack value. Emits a guard (driven by the runtime
-    /// thunk state the interpreter observed) then the force; replaces the top
-    /// with the forced value. For an already-resolved thunk the guard is
-    /// `thunk_resolved` (load memo); for a single-use unresolved thunk the
-    /// driver passes `thunk_claimed` (atomic-claim, body inlined as recording
-    /// continues into it). A non-thunk needs no force — the driver skips this.
-    pub fn forceTop(self: *Recorder, guard: GuardKind) !void {
-        const v = try self.peek();
-        const snap = try self.snapshot();
-        _ = try self.emit(.{ .op = .guard, .a = v, .aux = @intFromEnum(guard), .snapshot = snap });
-        const forced = try self.emit(.{ .op = .force, .a = v });
-        self.stack.items[self.stack.items.len - 1] = forced;
-    }
-
-    /// `attrs.name`. Assumes `attrs` (top) is already forced. Guards the
-    /// attrset shape so the resolved attr position stays valid, then reads it.
     pub fn getAttr(self: *Recorder, name: InternId) !void {
-        // Snapshot before popping: a side-exit resumes at the get_attr op,
-        // which still expects `attrs` on the operand stack.
-        const attrs = try self.peek();
+        if (self.operand.items.len == 0) return error.TraceAborted;
+        const attrs = self.operand.items[self.operand.items.len - 1];
         const snap = try self.snapshot();
         _ = try self.pop();
         _ = try self.emit(.{ .op = .guard, .a = attrs, .aux = @intFromEnum(GuardKind.attr_shape), .aux2 = name, .snapshot = snap });
         try self.push(try self.emit(.{ .op = .get_attr, .a = attrs, .aux = name }));
     }
 
-    /// Apply `func` (below `arg` on the stack) to `arg`. Guards that `func`
-    /// resolves to the recorded chunk so the inlined body stays valid; the
-    /// interpreter then executes into that body and the recorder keeps
-    /// recording (inlining). The `call` IR node marks the boundary.
-    pub fn call(self: *Recorder, callee_chunk: ChunkId) !void {
-        // Snapshot before popping: a side-exit resumes at the call op, which
-        // still expects [.., func, arg] on the operand stack.
-        const snap = try self.snapshot();
+    /// Inline a call: pop func + arg, guard the callee chunk, push an inline
+    /// frame whose local 0 is the arg Ref.
+    pub fn enterCall(self: *Recorder, callee_chunk: ChunkId, local_count: u16) !void {
+        if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
         const arg = try self.pop();
         const func = try self.pop();
+        const snap = try self.snapshot();
         _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
-        try self.push(try self.emit(.{ .op = .call, .a = func, .b = arg, .aux = callee_chunk }));
+        const locals = try self.allocator.alloc(?Ref, local_count);
+        @memset(locals, null);
+        if (local_count >= 1) locals[0] = arg;
+        try self.frames.append(self.allocator, .{
+            .locals = locals,
+            .upvalue_src = func,
+            .operand_base = @intCast(self.operand.items.len),
+        });
     }
 
-    /// Finalize: the trace result is the top of stack.
+    /// Tail call: like `enterCall` but reuses the current frame (no depth
+    /// change), matching the interpreter's frame reuse.
+    pub fn replaceTail(self: *Recorder, callee_chunk: ChunkId, local_count: u16) !void {
+        const arg = try self.pop();
+        const func = try self.pop();
+        const snap = try self.snapshot();
+        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        const f = self.cur();
+        // Tail position: no live operands should remain above this frame's base.
+        self.operand.shrinkRetainingCapacity(f.operand_base);
+        const locals = try self.allocator.alloc(?Ref, local_count);
+        @memset(locals, null);
+        if (local_count >= 1) locals[0] = arg;
+        self.allocator.free(f.locals);
+        f.locals = locals;
+        f.upvalue_src = func;
+    }
+
+    /// Return from the current frame. At the anchor frame this finalizes the
+    /// trace; in an inlined frame the result becomes the caller's call result.
     pub fn ret(self: *Recorder) !void {
-        const r = try self.pop();
-        _ = try self.emit(.{ .op = .ret, .a = r });
-        self.done = true;
+        const result = try self.pop();
+        if (self.frames.items.len == 1) {
+            _ = try self.emit(.{ .op = .ret, .a = result });
+            self.done = true;
+            return;
+        }
+        const f = self.frames.pop().?;
+        self.operand.shrinkRetainingCapacity(f.operand_base);
+        self.allocator.free(f.locals);
+        try self.push(result);
     }
 
     pub fn abort(self: *Recorder) void {
@@ -190,65 +224,76 @@ pub const Recorder = struct {
     }
 };
 
-test "recorder: config.foo style force+attr access" {
+test "recorder: inlined call makes the callee param the caller arg" {
     const allocator = std.testing.allocator;
     var trace = Trace.init(7, true);
     defer trace.deinit(allocator);
     var rec = Recorder.init(allocator, &trace);
     defer rec.deinit();
 
-    // upvalue `config`; force it (resolved); .foo; ret
-    try rec.pushUpvalue(0);
-    try rec.forceTop(.thunk_resolved);
-    try rec.getAttr(42);
+    // anchor lambda: local0 = arg. Body: push local0 as func-ish... model a
+    // call `f x` where f and x are upvalues, callee body returns its param.
+    try rec.startRoot(1, true);
+    try rec.getUpvalue(0); // func
+    try rec.getUpvalue(1); // arg
+    try rec.enterCall(99, 1); // inline callee chunk 99 (1 local)
+    // callee body: `local0` (its param) then ret
+    try rec.getLocal(0);
+    try rec.ret(); // returns from inlined frame
+    try std.testing.expectEqual(@as(usize, 1), rec.inlineDepth()); // back at root
+    // root ret of the call result
     try rec.ret();
+    try std.testing.expect(rec.done and !rec.aborted);
 
-    try std.testing.expect(!rec.aborted);
-    try std.testing.expect(rec.done);
-    // load_upvalue, guard, force, guard, get_attr, ret
+    // The callee's param (local 0) resolved to the arg Ref (load_upvalue 1),
+    // NOT a fresh load — that's the inlining win.
     const ops = trace.instrs.items;
-    try std.testing.expectEqual(@as(usize, 6), ops.len);
-    try std.testing.expectEqual(Op.load_upvalue, ops[0].op);
-    try std.testing.expectEqual(Op.guard, ops[1].op);
-    try std.testing.expectEqual(Op.force, ops[2].op);
+    // trace_arg, load_upvalue(0)=func, load_upvalue(1)=arg, guard(chunk_id), ret
+    try std.testing.expectEqual(Op.trace_arg, ops[0].op);
+    try std.testing.expectEqual(Op.load_upvalue, ops[1].op);
+    try std.testing.expectEqual(Op.load_upvalue, ops[2].op);
     try std.testing.expectEqual(Op.guard, ops[3].op);
-    try std.testing.expectEqual(Op.get_attr, ops[4].op);
-    try std.testing.expectEqual(Op.ret, ops[5].op);
-    // get_attr reads the forced value (ref 2), not the raw upvalue (ref 0).
-    try std.testing.expectEqual(@as(Ref, 2), ops[4].a);
-    // the attr-shape guard snapshot has one live entry (the forced attrs).
-    const snap = trace.snapshots.items[ops[3].snapshot];
-    try std.testing.expectEqual(@as(usize, 1), snap.entries.len);
+    try std.testing.expectEqual(@as(Ref, 1), ops[3].a); // guards the func Ref (%1)
+    try std.testing.expectEqual(Op.ret, ops[ops.len - 1].op);
+    // The final ret returns the arg Ref (%2) — the callee just echoed its param.
+    try std.testing.expectEqual(@as(Ref, 2), ops[ops.len - 1].a);
 }
 
-test "recorder: arithmetic stack discipline" {
+test "recorder: inlined upvalue reads the callee closure" {
     const allocator = std.testing.allocator;
-    var trace = Trace.init(1, false);
+    var trace = Trace.init(1, true);
     defer trace.deinit(allocator);
     var rec = Recorder.init(allocator, &trace);
     defer rec.deinit();
 
-    // (a + b) where a=local0, b=const 5 ; then ret
-    try rec.pushLocal(0);
-    try rec.pushConst(Value.int(5));
-    try rec.binOp(.add_int);
+    try rec.startRoot(1, true);
+    try rec.getUpvalue(0); // func  (%1 load_upvalue 0)
+    try rec.getLocal(0); // arg = trace_arg (%0)
+    try rec.enterCall(42, 1);
+    try rec.getUpvalue(3); // upvalue 3 of the *callee* closure
+    try rec.ret();
     try rec.ret();
 
     try std.testing.expect(rec.done and !rec.aborted);
     const ops = trace.instrs.items;
-    try std.testing.expectEqual(Op.add_int, ops[2].op);
-    try std.testing.expectEqual(@as(Ref, 0), ops[2].a); // local
-    try std.testing.expectEqual(@as(Ref, 1), ops[2].b); // const
-    try std.testing.expectEqual(@as(usize, 0), rec.stack.items.len); // balanced
+    // find the load_upvalue_of
+    var found = false;
+    for (ops) |o| {
+        if (o.op == .load_upvalue_of) {
+            found = true;
+            try std.testing.expectEqual(@as(Ref, 1), o.a); // the func Ref
+            try std.testing.expectEqual(@as(u32, 3), o.aux); // slot 3
+        }
+    }
+    try std.testing.expect(found);
 }
 
-test "recorder: stack underflow aborts cleanly" {
+test "recorder: get_local on uninitialized slot aborts" {
     const allocator = std.testing.allocator;
     var trace = Trace.init(1, false);
     defer trace.deinit(allocator);
     var rec = Recorder.init(allocator, &trace);
     defer rec.deinit();
-
-    try std.testing.expectError(error.TraceAborted, rec.binOp(.add_int));
-    try std.testing.expect(rec.aborted);
+    try rec.startRoot(2, true); // local0 = arg, local1 = null
+    try std.testing.expectError(error.TraceAborted, rec.getLocal(1));
 }
