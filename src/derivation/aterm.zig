@@ -8,6 +8,14 @@ pub fn toATerm(drv: anytype, allocator: std.mem.Allocator, mask_outputs: bool, a
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    // Pre-size from the dominant content (env values + input paths) so the
+    // build doesn't repeatedly realloc-and-copy a growing buffer.
+    var estimate: usize = 256;
+    for (drv.env) |e| estimate += e.name.len + e.value.len + 8;
+    const est_inputs = actual_inputs orelse drv.input_drvs;
+    for (est_inputs) |i| estimate += i.path.len + 16;
+    try out.ensureTotalCapacity(allocator, estimate);
+
     try out.appendSlice(allocator, "Derive([");
     const sorted_outputs = try sort.sortedOutputs(allocator, drv.outputs);
     defer allocator.free(sorted_outputs);
@@ -90,16 +98,29 @@ fn appendUnquotedStringList(allocator: std.mem.Allocator, out: *std.ArrayListUnm
 
 fn appendString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), string: []const u8) !void {
     try out.append(allocator, '"');
-    for (string) |char| {
-        switch (char) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, char),
+    // Bulk-copy maximal runs with no escape-needing char, then emit the
+    // one escape, instead of appending byte-by-byte (each with its own
+    // capacity check). Derivation env values (build scripts, dependency
+    // lists) are large and almost entirely escape-free, so this is one
+    // `appendSlice` per value in the common case rather than N appends —
+    // and this runs on the w=32 critical path (drv ATerm hashing).
+    var start: usize = 0;
+    for (string, 0..) |char, i| {
+        const esc: ?[]const u8 = switch (char) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |e| {
+            if (i > start) try out.appendSlice(allocator, string[start..i]);
+            try out.appendSlice(allocator, e);
+            start = i + 1;
         }
     }
+    if (start < string.len) try out.appendSlice(allocator, string[start..]);
     try out.append(allocator, '"');
 }
 
