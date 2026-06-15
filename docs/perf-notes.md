@@ -766,3 +766,37 @@ Controlled back-to-back A/B, n=12, vs `c7dfccd` (flat store):
 Real and **transfers to w=32** (−2.5% median — the headline). Below the
 hypothesized "leap past C++", but a solid critical-path win on top of the
 flat store. Byte-identical `.drv` at w=1/w=32; tests green.
+
+## drv-hashing ATerm + make_lazy_shell (LANDED)
+
+After the flat store + uncurry, fresh `-Dprof-main` showed no machinery
+hotspot > ~25%; cost is distributed inherent work (module-eval user fns +
+drv hashing), `util=14.7%` at w=32 (parallelism mined — main runs the
+serial critical path, helpers ~85% idle). The two wins that *did* land:
+
+**`make_lazy_shell` gating (`5994e7d`).** The op wraps eager shapes so the
+lazy-XML renderer shows `<unevaluated/>`; that's its only consumer. Gated
+on `VM.lazy_shells_visible` (true only for `--xml`); elsewhere it pushes
+the value directly. Eliminates ~964K throwaway thunks. **w=1 −1.3%, w=32
+neutral** (off the critical path — throughput-only, as the lazy-attr
+analysis predicted for never-forced thunks).
+
+**ATerm bulk-copy + presize (`f8808a9`).** `toATerm` appended env-value
+bytes one-at-a-time; `appendString` now bulk-copies escape-free runs and
+the buffer is pre-sized. **w=1 −1.3%, w=32 −1.8%/−3.7% best/median —
+transfers to w=32** because main hashes ~477 drvs on its serial critical
+path. The decisive lesson: constant-factor string-build optimization *on
+the critical path* is a live w=32 lever even for an "inherent" algorithm.
+
+Dead-ends confirmed (neutral, reverted): dedupe `hashModuloInputs`
+double-call; attr/call inline-cache 256→4096 (obj_id churn defeats it).
+
+## Session cumulative (de587cd → f8808a9, n=12 back-to-back)
+
+| workers | session start | now | Δ best / median |
+| --- | --- | --- | --- |
+| 1 | 3.220 / 3.275 | 2.984 / 3.009 | **−7.3% / −8.1%** |
+| 32 | 1.596 / 1.643 | 1.546 / 1.612 | −3.1% / −1.9% |
+
+Stack: flat object store + uncurry/PAP + per-param strictness + lazy-shell
+gating + ATerm bulk-copy. All byte-identical `.drv`, tests green.
