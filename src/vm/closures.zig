@@ -16,6 +16,7 @@ const debug = @import("debug.zig");
 const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
+const force = @import("force.zig");
 const jit_mod = @import("../jit.zig");
 const prof = @import("../prof.zig");
 
@@ -391,6 +392,23 @@ inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
 /// to size the on-stack arg buffers in the PAP machinery below.
 const MAX_UNCURRY_ARITY: u16 = types.MAX_UNCURRY_ARITY;
 
+/// Eagerly force the must-force arg positions (`ch.strict_params`) of a
+/// saturated uncurried call, in place on the stack at `args_base..+n`.
+/// The body forces these regardless (sound must-force analysis), so this
+/// is value-preserving; doing it before the body runs recovers the
+/// single-param eager-arg optimization for the multi-param case and stops
+/// lazy-thunk chains from accumulating in accumulator-style recursion.
+inline fn forceStrictArgs(self: *VM, ch: *const Chunk, args_base: u32, n: u16) !void {
+    var mask = ch.strict_params;
+    while (mask != 0) {
+        const i = @ctz(mask);
+        mask &= mask - 1;
+        if (i >= n) break;
+        const idx = args_base + i;
+        self.stack[idx] = try force.forceValue(self, self.stack[idx]);
+    }
+}
+
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_call);
     defer prof.end(.do_call, t);
@@ -447,8 +465,10 @@ fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
         return stack.push(self, Value.partialApp(id));
     }
     // Saturated: stage args + the final one, run the body in a fresh frame.
+    const args_base = self.sp;
     for (pa.args) |a| try stack.push(self, a);
     try stack.push(self, arg);
+    try forceStrictArgs(self, ch, args_base, ch.arity);
     try stack.pushFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
 }
 
@@ -591,6 +611,7 @@ pub fn doCallN(self: *VM, n: u16) !void {
             var j: u32 = 0;
             while (j < n) : (j += 1) self.stack[base - 1 + j] = self.stack[base + j];
             self.sp -= 1;
+            try forceStrictArgs(self, ch, base - 1, n);
             return stack.pushFrame(self, ch, closure.chunk_id, n, closure.upvalues);
         }
     }
@@ -617,6 +638,7 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
         const closure = try getClosureById(self, callee.asObjectId());
         const ch = try closureChunkViaIC(self, closure.chunk_id);
         if (ch.arity == n) {
+            try forceStrictArgs(self, ch, base, n);
             return replaceCurrentFrameMulti(self, ch, closure.chunk_id, base, n, closure.upvalues);
         }
     }
@@ -684,7 +706,9 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
         const id = try self.heap.addPartialApp(pa.func, buf[0..total]);
         return Value.partialApp(id);
     }
+    const args_base = self.sp;
     for (buf[0..total]) |a| try stack.push(self, a);
+    try forceStrictArgs(self, ch, args_base, ch.arity);
     return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
 }
 

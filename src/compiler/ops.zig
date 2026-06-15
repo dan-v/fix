@@ -367,14 +367,17 @@ pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
     }
 }
 
-/// Compile one argument of a flattened `call_n` spine. Multi-param
-/// strictness isn't tracked (uncurried chunks don't carry `strict_param`),
-/// so we never eager-eval here: immediate container values stay thunk-free,
-/// everything else becomes a lazy arg thunk — the same default the
-/// single-arg path uses for a non-statically-strict callee.
+/// Compile one argument of a flattened `call_n` spine. We deliberately do
+/// NOT use the runtime-adaptive `apply_arg` op here: its eager-vs-thunk
+/// check reads the callee at `stack[sp-1]`, which is the real callee only
+/// for the *first* spine arg (later args would see the previous arg). So
+/// immediate container values stay thunk-free and everything else becomes
+/// a plain lazy thunk; the saturated `call_n` path then eagerly forces the
+/// arg positions the callee chunk marks must-force (`strict_params`),
+/// recovering eager-arg behavior with the callee actually known.
 fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
     if (try access.compileImmediateContainerValue(self, arg, .{})) return;
-    try @import("thunks.zig").compileApplyArgThunk(self, arg);
+    try @import("thunks.zig").compileThunk(self, arg);
 }
 
 pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
@@ -539,6 +542,19 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         if (!child_builder.strict_param) {
             child_builder.strict_via_upvalue = forwardingUpvalue(self, &child, body, params[0]);
         }
+    } else {
+        // Uncurried chunk: a per-param must-force bitmask. The saturated
+        // `call_n` path forces these arg positions eagerly, recovering the
+        // eager-arg behavior `apply_arg` gives the single-param shape (and
+        // avoiding lazy-thunk-chain buildup in accumulator recursion).
+        var mask: u8 = 0;
+        var si: u16 = 0;
+        while (si < n) : (si += 1) {
+            if (try strictness.bodyMustForceName(self.allocator, self.intern, self.source, body, param_ids[si])) {
+                mask |= @as(u8, 1) << @intCast(si);
+            }
+        }
+        child_builder.strict_params = mask;
     }
     child_builder.arity = n;
     try emit.emitRet(&child);

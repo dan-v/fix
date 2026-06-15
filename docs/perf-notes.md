@@ -735,18 +735,34 @@ PAP behaves as a function everywhere: `isFunction`/`typeOf "lambda"`,
 `isCallable`, `functionArgs → {}` (merged value-lambdas carry no formal
 metadata); JSON/XML/equality mirror the closure arms.
 
-Controlled back-to-back A/B, n=10, vs `c7dfccd` (flat store):
+**Per-param strictness recovery (the piece that makes it pay).** A first
+cut left uncurried-chunk args fully lazy (uncurried chunks don't carry the
+single-param `strict_param`), so they became lazy thunks — extra allocs
+that mostly cancelled the saved closure allocs (~0–1%), and an accumulator
+like `go = acc: n: ... go (acc+n) (n-1)` built a thunk chain instead of the
+eager `n` the curried form produced. Fix: `compileLambda` stamps a
+per-param must-force bitmask `Chunk.strict_params` (`bodyMustForceName` per
+param — the exact analysis the single-param `strict_param` uses), and the
+saturated run sites (`call_n` fast path, `tail_call_n` reuse, PAP
+saturation in `doCall`/`callValue`) eagerly force those arg positions
+before the body runs. Value-preserving (sound must-force), and it
+reproduces the curried form's eager-arg behavior exactly.
+
+Spine args are compiled with a plain lazy thunk (`compileThunk`), **not**
+the runtime-adaptive `apply_arg`: `apply_arg` decides eager-vs-thunk from
+`stack[sp-1]`, which is the real callee only for the *first* spine arg
+(later args would inspect the previous arg) — a latent
+laziness/over-eager bug `call_n` flattening would otherwise introduce. The
+`strict_params` forcing recovers the eager arg with the callee actually
+known.
+
+Controlled back-to-back A/B, n=12, vs `c7dfccd` (flat store):
 
 | workers | flat store | + uncurry | Δ best / median |
 | --- | --- | --- | --- |
-| 1 | 3.110 / 3.181 | 3.107 / 3.153 | ~0% / −0.9% |
-| 32 | 1.627 / 1.665 | 1.601 / 1.648 | −1.6% / −1.0% |
+| 1 | 3.132 / 3.186 | 3.105 / 3.138 | −0.9% / −1.5% |
+| 32 | 1.576 / 1.624 | 1.544 / 1.583 | **−2.0% / −2.5%** |
 
-**Modest (~1%), below the hypothesized "past C++" lever.** The merged-chunk
-structural win is partly offset because uncurried chunks lose the
-single-param eager-arg optimization (`strict_param` is gated to
-`local_count == 1`), so their args become lazy thunks — extra thunk allocs
-that cancel some of the saved closure allocs. Recovering per-param
-strictness (force the must-forced arg positions in the saturated `call_n`
-path) is the open follow-up that should unlock the rest. Byte-identical
-`.drv` at w=1/w=32; tests green.
+Real and **transfers to w=32** (−2.5% median — the headline). Below the
+hypothesized "leap past C++", but a solid critical-path win on top of the
+flat store. Byte-identical `.drv` at w=1/w=32; tests green.

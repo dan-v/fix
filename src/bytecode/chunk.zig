@@ -42,6 +42,14 @@ pub const Chunk = struct {
     /// supplying N args runs the body in one frame, under-application
     /// builds a partial-application (PAP) value. `arity <= local_count`.
     arity: u16 = 1,
+    /// Bitmask (bit i = param i) of which params an *uncurried* (arity>1)
+    /// chunk's body unconditionally forces — the multi-param analogue of
+    /// `scheduling.strict_param`. The saturated `call_n` path eagerly
+    /// forces these arg positions before running the body, recovering the
+    /// eager-arg optimization the single-param path gets via `apply_arg`
+    /// (and avoiding lazy-thunk-chain buildup in accumulator recursion).
+    /// 0 for arity-1 chunks (handled by `strict_param`) and thunk bodies.
+    strict_params: u8 = 0,
     /// Compile-time scheduling hints — `body_is_substantial`
     /// (chunk-size driven, pays the scheduler hop) and `strictness`
     /// (which upvalues the body unconditionally forces). Both are
@@ -222,6 +230,9 @@ pub const ChunkBuilder = struct {
     /// onto `Chunk.arity`. Set by `compileLambda` when it merges an
     /// adjacent value-lambda chain into one uncurried chunk; otherwise 1.
     arity: u16 = 1,
+    /// Per-param must-force bitmask for an uncurried chunk — carried onto
+    /// `Chunk.strict_params`. Set by `compileLambda`.
+    strict_params: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -308,6 +319,7 @@ pub const ChunkBuilder = struct {
             .constants = constants,
             .local_count = local_count,
             .arity = self.arity,
+            .strict_params = self.strict_params,
             .scheduling = .{
                 .body_is_substantial = self.code.items.len + self.fusion_savings >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
