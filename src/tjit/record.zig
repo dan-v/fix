@@ -1,0 +1,156 @@
+//! Record mode for the tracing JIT (`-Dtjit`): drives the `Recorder` from
+//! the interpreter dispatch loop. See `docs/tracing-jit.md`.
+//!
+//! When a chunk arms (`hot.onEntry` returns true in `stack.pushFrame`), the
+//! interpreter `start`s a recording anchored at that frame. Thereafter the
+//! dispatch loop calls `observe` before each op, which mirrors the op into
+//! Trace IR via the recorder. **Recording is purely observational** — it
+//! reads VM state and builds IR; it never alters execution, so a bug here
+//! cannot change `.drv` output (worst case: an aborted/garbage trace).
+//!
+//! Phase 1 (this module): single-frame, no inlining. Any nesting — a `call`,
+//! or an *implicit* force that ran a thunk body — moves `frames_len` off the
+//! anchor depth, and we abort cleanly. So traces succeed only for leaf-ish
+//! chunks whose body forces nothing that nests. That validates the
+//! record→IR pipeline on the real workload and prints trace shapes. Inlining
+//! through force/call (the valuable part) layers on next.
+
+const std = @import("std");
+const build_options = @import("build_options");
+const vm_mod = @import("../vm.zig");
+const ir = @import("ir.zig");
+const Recorder = @import("recorder.zig").Recorder;
+const OpCode = @import("../bytecode/opcode.zig").OpCode;
+const Value = @import("../runtime/value.zig").Value;
+const types = @import("../runtime/types.zig");
+
+pub const enabled: bool = build_options.tjit;
+
+const VM = vm_mod.VM;
+const Frame = vm_mod.Frame;
+const ChunkId = types.ChunkId;
+const readU16 = vm_mod.readU16;
+const readU32 = vm_mod.readU32;
+
+/// Per-VM recording state, heap-allocated for the duration of one recording
+/// and referenced from `vm.tjit_rec` (as `?*anyopaque` to avoid a vm↔tjit
+/// import cycle).
+pub const Recording = struct {
+    trace: ir.Trace,
+    rec: Recorder,
+    anchor: ChunkId,
+    /// `frames_len` at the anchor frame; ops observed at any other depth mean
+    /// we've nested and must abort (phase 1 doesn't inline).
+    root_depth: u32,
+};
+
+fn state(vm: *VM) ?*Recording {
+    return @ptrCast(@alignCast(vm.tjit_rec orelse return null));
+}
+
+/// Begin recording at a freshly-armed anchor frame. No-op if already
+/// recording (we don't nest recordings).
+pub fn start(vm: *VM, anchor: ChunkId, is_lambda: bool, root_depth: u32) void {
+    if (vm.tjit_rec != null) return;
+    const r = vm.allocator.create(Recording) catch return;
+    r.* = .{
+        .trace = ir.Trace.init(anchor, is_lambda),
+        .rec = undefined,
+        .anchor = anchor,
+        .root_depth = root_depth,
+    };
+    r.rec = Recorder.init(vm.allocator, &r.trace);
+    vm.tjit_rec = r;
+}
+
+fn teardown(vm: *VM) void {
+    const r = state(vm) orelse return;
+    r.rec.deinit();
+    r.trace.deinit(vm.allocator);
+    vm.allocator.destroy(r);
+    vm.tjit_rec = null;
+}
+
+fn abort(vm: *VM) void {
+    const r = state(vm) orelse return;
+    const anchor = r.anchor;
+    teardown(vm);
+    if (vm.registry.hot) |h| h.markAborted(anchor);
+}
+
+fn finish(vm: *VM) void {
+    const r = state(vm) orelse return;
+    const anchor = r.anchor;
+    printTrace(&r.trace);
+    teardown(vm);
+    if (vm.registry.hot) |h| h.markTraced(anchor);
+}
+
+/// Release a recording abandoned by an unwinding error (called from VM
+/// teardown so a mid-trace exception doesn't leak the Recording).
+pub fn cleanup(vm: *VM) void {
+    teardown(vm);
+}
+
+/// Observe one about-to-execute op. Called from `dispatch` only while
+/// `vm.tjit_rec != null`.
+pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) void {
+    const r = state(vm) orelse return;
+    // Off the anchor frame → a call or nesting force happened; can't
+    // linearize without inlining (phase 2). Abort.
+    if (vm.frames_len != r.root_depth) {
+        abort(vm);
+        return;
+    }
+    r.rec.setIp(@intCast(ip));
+    observeOp(&r.rec, frame, code, ip, op) catch {
+        abort(vm);
+        return;
+    };
+    if (r.rec.aborted) {
+        abort(vm);
+    } else if (r.rec.done) {
+        finish(vm);
+    }
+}
+
+fn observeOp(rec: *Recorder, frame: *Frame, code: []const u8, ip: usize, op: OpCode) !void {
+    switch (op) {
+        .push_null => try rec.pushConst(Value.null_val),
+        .push_true => try rec.pushConst(Value.boolVal(true)),
+        .push_false => try rec.pushConst(Value.boolVal(false)),
+        .pop => try rec.dropTop(),
+        .constant => try rec.pushConst(frame.chunk_ptr.constants[readU16(code, ip + 1)]),
+        .get_local => try rec.pushLocal(code[ip + 1]),
+        .get_local_long => try rec.pushLocal(readU16(code, ip + 1)),
+        .get_upvalue => try rec.pushUpvalue(readU16(code, ip + 1)),
+        .add_int => try rec.binOp(.add_int),
+        .sub_int => try rec.binOp(.sub_int),
+        .mul_int => try rec.binOp(.mul_int),
+        .eq => try rec.binOp(.eq),
+        .lt => try rec.binOp(.lt),
+        .not => try rec.unOp(.not),
+        .get_attr => try rec.getAttr(readU16(code, ip + 1)),
+        .get_attr_long => try rec.getAttr(readU32(code, ip + 1)),
+        .get_upvalue_attr => {
+            try rec.pushUpvalue(readU16(code, ip + 1));
+            try rec.getAttr(readU16(code, ip + 3));
+        },
+        .get_local_attr => {
+            try rec.pushLocal(code[ip + 1]);
+            try rec.getAttr(readU16(code, ip + 2));
+        },
+        .ret => try rec.ret(),
+        // Everything else (calls, jumps, allocations, thunk/closure creation,
+        // compound forcing ops) needs inlining or control-flow handling we
+        // don't do yet — abort the trace.
+        else => rec.abort(),
+    }
+}
+
+fn printTrace(trace: *const ir.Trace) void {
+    std.debug.print("--- tjit trace (anchor chunk {d}, {d} instrs) ---\n", .{ trace.anchor_chunk, trace.len() });
+    for (trace.instrs.items, 0..) |instr, i| {
+        std.debug.print("  %{d:<3} {s} a=%{d} b=%{d} aux={d}\n", .{ i, @tagName(instr.op), instr.a, instr.b, instr.aux });
+    }
+}

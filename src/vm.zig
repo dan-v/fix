@@ -81,6 +81,11 @@ pub const VM = struct {
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs).
     registry: *const ChunkRegistry,
+    /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
+    /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
+    /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
+    /// are comptime-gated).
+    tjit_rec: ?*anyopaque = null,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
@@ -213,6 +218,7 @@ pub const VM = struct {
 
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
+        if (comptime @import("tjit/record.zig").enabled) @import("tjit/record.zig").cleanup(self);
         self.allocator.free(self.stack);
         self.allocator.free(self.frames);
     }

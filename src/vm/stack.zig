@@ -6,6 +6,7 @@ const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
 const hot_mod = @import("../tjit/hot.zig");
+const record_mod = @import("../tjit/record.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -17,14 +18,10 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
     // Tracing-JIT hot-anchor detection: every chunk entry (lambda calls and
     // thunk/closure forcing both route through here) bumps the chunk's hot
     // counter. Comptime-gated to `-Dtjit` — zero cost in normal builds.
-    if (comptime hot_mod.enabled) {
-        if (self.registry.hot) |h| {
-            if (h.onEntry(chunk_id)) {
-                // Armed: this chunk is now a trace anchor. Recording hook
-                // lands here next (task #11 record mode).
-            }
-        }
-    }
+    const tjit_armed = if (comptime hot_mod.enabled) blk: {
+        if (self.registry.hot) |h| break :blk h.onEntry(chunk_id);
+        break :blk false;
+    } else false;
     if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const frame_base = self.sp - arg_count;
@@ -48,6 +45,11 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
     };
     self.frames_len += 1;
     trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+    // Begin recording this just-pushed frame if its chunk armed. `root_depth`
+    // is the post-push frame depth; ops at any other depth abort the trace.
+    if (comptime hot_mod.enabled) {
+        if (tjit_armed) record_mod.start(self, chunk_id, ch.local_count >= 1, self.frames_len);
+    }
 }
 
 pub fn popFrame(self: *VM) Frame {

@@ -40,6 +40,7 @@ const stack = @import("stack.zig");
 const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
 const ngram_probe = @import("ngram_probe.zig");
+const tjit_record = @import("../tjit/record.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -95,6 +96,9 @@ inline fn dispatch(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     const op: OpCode = @enumFromInt(code[ip]);
     if (comptime opcode_profile_enabled) vm.opcode_counts[@intFromEnum(op)] += 1;
     if (comptime ngram_probe.enabled) ngram_probe.record(op, @intFromPtr(frame));
+    if (comptime tjit_record.enabled) {
+        if (vm.tjit_rec != null) tjit_record.observe(vm, frame, code, ip, op);
+    }
     if (comptime trace_log.enabled) {
         trace_log.op(vm.vm_trace, vm.workerId(), vm.frames_len, frame.chunk_id, @intCast(ip), op, vm.sp);
     }
