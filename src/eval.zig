@@ -55,6 +55,10 @@ pub const Evaluator = struct {
     /// a non-thread-safe allocator.
     worker_arenas: []std.heap.ArenaAllocator,
     builtins_value: ?Value,
+    /// Whether the final render observes lazy shells (only lazy-XML).
+    /// Propagated to every VM via `initVm`; gates `make_lazy_shell`.
+    /// Default false — the CLI sets it true only for `--xml`.
+    lazy_shells_visible: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -394,6 +398,7 @@ pub const Evaluator = struct {
             const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
             vm.claimer_id = wf.vm.claimer_id;
         }
+        vm.lazy_shells_visible = self.lazy_shells_visible;
         return vm;
     }
 

@@ -46,6 +46,9 @@ pub fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
 pub fn renderXmlForTest(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
+    // Lazy shells (eager shapes that render `<unevaluated />`) are only
+    // built when the render observes them — mirror the CLI's `--xml`.
+    ev.lazy_shells_visible = true;
 
     const result = try ev.evaluate(source);
 

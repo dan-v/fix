@@ -749,9 +749,16 @@ fn opMakeCell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
 
 fn opMakeLazyShell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const val = stack.pop(vm);
-    const id = try vm.heap.addLazyShell(val);
-    try stack.push(vm, Value.thunk(id));
+    // The lazy-shell wrap exists solely so the lazy-XML renderer can show
+    // eagerly-built shapes as `<unevaluated />` until demanded. Outside
+    // that mode (the common default/JSON/`.drv`/strict path) it's pure
+    // overhead — leave the value on the stack instead of allocating a
+    // throwaway thunk (millions on the NixOS toplevel).
+    if (vm.lazy_shells_visible) {
+        const val = stack.pop(vm);
+        const id = try vm.heap.addLazyShell(val);
+        try stack.push(vm, Value.thunk(id));
+    }
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 

@@ -147,6 +147,9 @@ pub fn main(init: std.process.Init) !void {
 
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
+    // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap
+    // is pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
+    ev.lazy_shells_visible = options.output == .xml;
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.setEnvironment(init.environ_map);

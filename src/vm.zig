@@ -140,6 +140,15 @@ pub const VM = struct {
     /// entry points (see `vm/force.zig`).
     in_speculation: bool,
 
+    /// True only when the result will be rendered as lazy XML, where
+    /// eagerly-built shapes (list/attrset/lambda) must appear unevaluated
+    /// (`<unevaluated />`) until demanded. The compiler emits
+    /// `make_lazy_shell` to wrap such values; when this is false (the
+    /// common default/JSON/`.drv`/strict path) the wrap is pure overhead
+    /// — millions of throwaway thunks — so the op pushes the value
+    /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
+    lazy_shells_visible: bool,
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *const ChunkRegistry,
@@ -189,6 +198,7 @@ pub const VM = struct {
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
+            .lazy_shells_visible = false,
         };
     }
 
