@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
     const prof_main = b.option(bool, "prof-main", "Time main thread's hot serial paths via rdtsc; print via --print-sched-stats") orelse false;
     const prof_path = b.option(bool, "prof-path", "Record the force-call tree (workers=1) and report the critical path + source-attributed profile; print via --print-sched-stats") orelse false;
     const trace_probe = b.option(bool, "trace-probe", "Measure tracing-JIT headroom: per-thunk read-count histogram (single-use vs shared) + body-size distribution. Run at --workers=1.") orelse false;
+    const opcode_ngram = b.option(bool, "opcode-ngram", "Profile hottest adjacent (fall-through) opcode pairs for superinstruction fusion. Run at --workers=1.") orelse false;
+    const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
@@ -51,6 +53,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "prof_main", prof_main);
     build_options.addOption(bool, "prof_path", prof_path);
     build_options.addOption(bool, "trace_probe", trace_probe);
+    build_options.addOption(bool, "opcode_ngram", opcode_ngram);
+    build_options.addOption(bool, "tjit", tjit);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
