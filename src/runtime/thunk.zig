@@ -139,7 +139,19 @@ pub const AttrAccess = struct {
     name: types.InternId,
 };
 
-pub const ThunkTarget = union(enum) {
+/// Discriminant for `ThunkTarget`. Stored as a plain byte in `Future`'s
+/// padding (`Future.target_kind`) rather than as a `union(enum)` tag —
+/// the union is 8-aligned (it holds `Value`s and pointers), so an inline
+/// tag would round the whole target up by 8 bytes. Externalizing the
+/// 1-byte discriminant into otherwise-wasted padding shrinks the
+/// (millions-live) Thunk by 8 bytes.
+pub const TargetKind = enum(u8) { closure, bytecode, pass_through, attr_access };
+
+/// Bare (untagged) union — the active arm is named by `Future.target_kind`,
+/// set at construction and immutable thereafter (a target is never
+/// mutated after creation except by `publishCellBinding`, which keeps
+/// the same `pass_through` kind).
+pub const ThunkTarget = union {
     closure: Value,
     bytecode: BytecodeThunk,
     pass_through: Value,
@@ -210,6 +222,13 @@ pub const Future = struct {
     /// (XML lazy mode) to treat unobserved resolutions as still
     /// "unevaluated" so speculation stays invisible.
     demanded: std.atomic.Value(u8),
+    /// Embedder-owned discriminant, free in `Future`'s padding. `Thunk`
+    /// stores its `ThunkTarget`'s active arm here (see `TargetKind`);
+    /// `ImportEntry` leaves it at the default. Plain (non-atomic): set
+    /// once at construction, immutable thereafter, so the claimer that
+    /// reads it after an acquiring `tryClaim` sees the construction
+    /// store published through whatever made the thunk reachable.
+    target_kind: TargetKind = .closure,
     /// Singly-linked list of fibers parked on this future. Manipulated
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
@@ -224,6 +243,15 @@ pub const Future = struct {
             .waiters_head = null,
             .waiters_mu = .{},
         };
+    }
+
+    /// `init` but stamping the embedder's `target_kind`. Used by the
+    /// `Thunk` constructors so the bare `ThunkTarget` union has its
+    /// active arm recorded.
+    pub fn initFor(kind: TargetKind) Future {
+        var f = init();
+        f.target_kind = kind;
+        return f;
     }
 
     /// Construct a Future born in `.resolved` with `demanded = 0`. The
@@ -427,7 +455,7 @@ pub const Thunk = struct {
             storage = .{ .spilled = upvalues };
         }
         return .{
-            .future = Future.init(),
+            .future = Future.initFor(.bytecode),
             .payload = .{ .target = .{ .bytecode = .{
                 .chunk_id = chunk_id,
                 .upvalue_count = @intCast(upvalues.len),
@@ -439,14 +467,14 @@ pub const Thunk = struct {
     /// A frameless attr-access thunk (see `AttrAccess`). Forcing computes
     /// `getAttrValue(base, name)` with no frame/dispatch.
     pub fn initAttrAccess(base: Value, name: types.InternId) Thunk {
-        return .{ .future = Future.init(), .payload = .{ .target = .{ .attr_access = .{ .base = base, .name = name } } } };
+        return .{ .future = Future.initFor(.attr_access), .payload = .{ .target = .{ .attr_access = .{ .base = base, .name = name } } } };
     }
 
     /// A "cell" thunk: holds a Value to be forced lazily. Used by
     /// `builtins.deepSeq`-style memoisation and by `make_cell` where
     /// the wrapped value is known at construction time.
     pub fn initPassThrough(value: Value) Thunk {
-        return .{ .future = Future.init(), .payload = .{ .target = .{ .pass_through = value } } };
+        return .{ .future = Future.initFor(.pass_through), .payload = .{ .target = .{ .pass_through = value } } };
     }
 
     /// Pre-resolved "lazy shell" thunk: wraps a value that's already
@@ -478,8 +506,10 @@ pub const Thunk = struct {
     /// the cell to null, freezing the binding before the creator could
     /// publish.
     pub fn initBindingCell(claimer: ClaimerId) Thunk {
+        var f = Future.initClaimed(claimer);
+        f.target_kind = .pass_through;
         return .{
-            .future = Future.initClaimed(claimer),
+            .future = f,
             // Placeholder; never observed since no fiber can CAS-claim
             // an `.evaluating` cell, and `publishCellBinding` overwrites
             // `target` before transitioning back to `.unresolved`.
@@ -493,6 +523,13 @@ pub const Thunk = struct {
 
     pub inline fn isDemanded(self: *const Thunk) bool {
         return self.future.isDemanded();
+    }
+
+    /// The active arm of the bare `payload.target` union. Only meaningful
+    /// while the thunk is unresolved/evaluating (the states in which
+    /// `target` is the live union arm).
+    pub inline fn targetKind(self: *const Thunk) TargetKind {
+        return self.future.target_kind;
     }
 
     /// Publish a binding cell's value (see `initBindingCell`). Writes

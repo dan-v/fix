@@ -163,9 +163,10 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             // Pass-through (cell-like) thunks hold a value that hasn't been
             // forced yet. Render the wrapped value rather than an opaque
             // `...`, matching how cells used to render their `initial`.
-            switch (thunk.payload.target) {
-                .pass_through => |v| try self.write(v),
-                else => try self.writer.writeAll("..."),
+            if (thunk.targetKind() == .pass_through) {
+                try self.write(thunk.payload.target.pass_through);
+            } else {
+                try self.writer.writeAll("...");
             }
         }
 

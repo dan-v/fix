@@ -20,13 +20,13 @@ const prof_path = @import("../prof_path.zig");
 /// source location) for bytecode/closure thunks, a per-builtin key for
 /// builtin closures, a synthetic key for pass-through cells. Only
 /// evaluated in `-Dprof-path` builds.
-inline fn pathKey(self: *VM, target: ThunkTarget) u32 {
-    return switch (target) {
-        .bytecode => |b| b.chunk_id,
-        .closure => |c| switch (c.kind()) {
-            .closure => if (self.heap.getClosure(c.asObjectId())) |cl| cl.chunk_id else |_| prof_path.KEY_OTHER,
-            .builtin_closure => if (self.heap.getBuiltinClosure(c.asObjectId())) |bc| prof_path.BUILTIN_BASE + @as(u32, bc.builtin_id) else |_| prof_path.KEY_OTHER,
-            .builtin => prof_path.BUILTIN_BASE + @as(u32, c.asBuiltinId()),
+inline fn pathKey(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetKind) u32 {
+    return switch (kind) {
+        .bytecode => target.bytecode.chunk_id,
+        .closure => switch (target.closure.kind()) {
+            .closure => if (self.heap.getClosure(target.closure.asObjectId())) |cl| cl.chunk_id else |_| prof_path.KEY_OTHER,
+            .builtin_closure => if (self.heap.getBuiltinClosure(target.closure.asObjectId())) |bc| prof_path.BUILTIN_BASE + @as(u32, bc.builtin_id) else |_| prof_path.KEY_OTHER,
+            .builtin => prof_path.BUILTIN_BASE + @as(u32, target.closure.asBuiltinId()),
             else => prof_path.KEY_OTHER,
         },
         .pass_through => prof_path.KEY_PASS_THROUGH,
@@ -263,8 +263,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             .claimed => {
                 // Thunk-result memo: reuse a previous identical pure
                 // computation on this worker, skipping re-running the body.
-                const memo_key: ?MemoKey = switch (thunk.payload.target) {
-                    .bytecode => |*b| memoKeyForBytecode(b),
+                const memo_key: ?MemoKey = switch (thunk.targetKind()) {
+                    .bytecode => memoKeyForBytecode(&thunk.payload.target.bytecode),
                     else => null,
                 };
                 if (memo_key) |k| {
@@ -279,12 +279,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
 
-                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, thunk.payload.target)) else @as(usize, 0);
+                const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
-                const result = evalThunkTarget(self, &thunk.payload.target) catch |err| {
+                const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
                     publishThunkFailure(self, thunk, thunk_id, err);
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
@@ -329,13 +329,14 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     }
 }
 
-pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget) anyerror!Value {
-    return switch (target.*) {
-        .closure => |closure| evalThunkClosure(self, closure),
+pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetKind) anyerror!Value {
+    return switch (kind) {
+        .closure => evalThunkClosure(self, target.closure),
         // Capture by pointer: `upvalues()` may return a slice into the
         // thunk's own inline storage, which would dangle off a by-value
         // copy. `target` points into the heap's stable thunk store.
-        .bytecode => |*bytecode| blk: {
+        .bytecode => blk: {
+            const bytecode = &target.bytecode;
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
             const upvalues = bytecode.upvalues();
             // JIT fast path: if the registry produced a native-code
@@ -352,12 +353,12 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget) anyerror!Value {
             }
             break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, upvalues);
         },
-        .pass_through => |v| forceValueImpl(self, v, true),
+        .pass_through => forceValueImpl(self, target.pass_through, true),
         // Frameless `someUpvalue.attr`: skip the isolated frame +
         // bytecode dispatch and go straight to the attr lookup, exactly
         // as the `get_upvalue_attr; ret` body would (getAttrValue forces
         // the attrs operand and the result).
-        .attr_access => |aa| access.getAttrValue(self, aa.base, aa.name),
+        .attr_access => access.getAttrValue(self, target.attr_access.base, target.attr_access.name),
     };
 }
 
