@@ -48,7 +48,13 @@ pub const ValueType = enum(u8) {
     /// `make`/`get` helpers; the payload is an ObjectId into an
     /// `Object.boxed_int` slot.
     boxed_int = 14,
-    // reserved 15..255 for future extensions
+    /// Partial application of an uncurried (arity>1) closure: some but
+    /// not all of its parameters have been supplied. Payload is an
+    /// ObjectId into an `Object.partial_app` slot. Behaves as a function
+    /// (`isFunction`, `typeOf "lambda"`) and is callable — applying the
+    /// remaining args runs the underlying body. See `vm/closures.zig`.
+    partial_app = 15,
+    // reserved 16..255 for future extensions
 };
 
 // ---- bit layout constants ----
@@ -86,6 +92,7 @@ const MISC_SUB_NULL: u64 = 3;
 const MISC_SUB_BOOL_FALSE: u64 = 4;
 const MISC_SUB_BOOL_TRUE: u64 = 5;
 const MISC_SUB_BOXED_INT: u64 = 6;
+const MISC_SUB_PARTIAL_APP: u64 = 7;
 
 // Mask matching the high 16 bits + the 4-bit misc sub-tag (bits 47:44).
 const MISC_FULL_TAG_MASK: u64 = HIGH16_MASK | (MISC_SUB_MASK << MISC_SUB_SHIFT);
@@ -202,6 +209,10 @@ pub const Value = extern struct {
         return miscTagged(MISC_SUB_BOXED_INT, id);
     }
 
+    pub fn partialApp(id: ObjectId) Value {
+        return miscTagged(MISC_SUB_PARTIAL_APP, id);
+    }
+
     // ---- discrimination ----
 
     inline fn isTagged(self: Value) bool {
@@ -227,6 +238,7 @@ pub const Value = extern struct {
                 MISC_SUB_BOOL_FALSE => .bool_false,
                 MISC_SUB_BOOL_TRUE => .bool_true,
                 MISC_SUB_BOXED_INT => .boxed_int,
+                MISC_SUB_PARTIAL_APP => .partial_app,
                 else => unreachable,
             },
             else => unreachable,
@@ -289,6 +301,10 @@ pub const Value = extern struct {
 
     pub fn isBuiltin(self: Value) bool {
         return self.isMiscSub(MISC_SUB_BUILTIN);
+    }
+
+    pub fn isPartialApp(self: Value) bool {
+        return self.isMiscSub(MISC_SUB_PARTIAL_APP);
     }
 
     pub fn isNull(self: Value) bool {
@@ -371,6 +387,7 @@ pub const Value = extern struct {
             .builtin_closure => try writer.writeAll("<builtin-closure>"),
             .string_context => try writer.writeAll("<string-context>"),
             .boxed_int => try writer.print("<boxed-int:{d}>", .{self.asObjectId()}),
+            .partial_app => try writer.writeAll("<partial-app>"),
         }
     }
 };

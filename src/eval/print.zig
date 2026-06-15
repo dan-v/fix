@@ -66,6 +66,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 .thunk => try self.writeThunk(value.asObjectId()),
                 .builtin => try self.writer.writeAll("<builtin>"),
                 .builtin_closure => try self.writer.writeAll("<builtin-closure>"),
+                .partial_app => try self.writer.writeAll("<partial-app>"),
             }
         }
 

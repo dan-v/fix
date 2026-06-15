@@ -168,6 +168,16 @@ pub const OpCode = enum(u8) {
     /// Call in tail position. Closure callees reuse the current frame; other
     /// callees behave like `call` and are followed by the normal `ret`.
     tail_call,
+    /// Apply a callee to N arguments in one op. Stack before:
+    /// [callee, arg1, ..., argN]; after: [result]. Operand: 1-byte N
+    /// (N >= 1). Semantically identical to N sequential `call`s, but when
+    /// the callee is an uncurried closure whose arity == N the body runs
+    /// in a single frame with zero intermediate closure/PAP allocation —
+    /// the uncurrying win. Under/over-application and non-closure callees
+    /// fall back to one-arg-at-a-time application. See `vm/closures.zig`.
+    call_n,
+    /// `call_n` in tail position.
+    tail_call_n,
 
     // ---- fused value+ret super-ops ----
     /// Fused `constant + ret`: load constant N onto the stack and

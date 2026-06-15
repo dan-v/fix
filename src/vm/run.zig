@@ -720,6 +720,24 @@ fn opTailCall(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
 }
 
+fn opCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const n = code[ip];
+    // Resume past the 1-byte operand when the callee frame rets (fast
+    // path) or immediately (fold path pushes a value, no new frame).
+    frame.ip = ip + 1;
+    try closures.doCallN(vm, n);
+    const new_frame = stack.currentFrame(vm);
+    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
+fn opTailCallN(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const n = code[ip];
+    frame.ip = ip + 1;
+    try closures.doTailCallN(vm, n);
+    const new_frame = stack.currentFrame(vm);
+    return dispatch(vm, new_frame, new_frame.chunk_ptr.code, new_frame.ip, stop_depth);
+}
+
 // ---- handlers: thunks ----
 
 fn opMakeCell(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -1145,6 +1163,8 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.thunk_captures_eager_store_local)] = opThunkCapturesEagerStoreLocal;
     table[@intFromEnum(OpCode.call)] = opCall;
     table[@intFromEnum(OpCode.tail_call)] = opTailCall;
+    table[@intFromEnum(OpCode.call_n)] = opCallN;
+    table[@intFromEnum(OpCode.tail_call_n)] = opTailCallN;
     table[@intFromEnum(OpCode.constant_ret)] = opConstantRet;
     table[@intFromEnum(OpCode.get_local_ret)] = opGetLocalRet;
     table[@intFromEnum(OpCode.get_local_ret_long)] = opGetLocalRetLong;

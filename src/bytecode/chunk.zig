@@ -34,6 +34,14 @@ pub const Chunk = struct {
     constants: []Value,
     /// Number of stack slots reserved for locals in each frame.
     local_count: u16,
+    /// Number of parameters the function consumes before its body runs.
+    /// 1 for curried/attrset lambdas (the historical default) and for
+    /// thunk bodies (which are never "called"). N>1 for an *uncurried*
+    /// chunk produced by merging an adjacent `a: b: ...:` value-lambda
+    /// chain (see `compiler/ops.zig compileLambda`): a call site
+    /// supplying N args runs the body in one frame, under-application
+    /// builds a partial-application (PAP) value. `arity <= local_count`.
+    arity: u16 = 1,
     /// Compile-time scheduling hints — `body_is_substantial`
     /// (chunk-size driven, pays the scheduler hop) and `strictness`
     /// (which upvalues the body unconditionally forces). Both are
@@ -210,6 +218,10 @@ pub const ChunkBuilder = struct {
     strict_param: bool = false,
     /// See `SchedulingHints.strict_via_upvalue`. Set by `compileLambda`.
     strict_via_upvalue: ?u16 = null,
+    /// Number of params the chunk consumes before the body runs — carried
+    /// onto `Chunk.arity`. Set by `compileLambda` when it merges an
+    /// adjacent value-lambda chain into one uncurried chunk; otherwise 1.
+    arity: u16 = 1,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -295,6 +307,7 @@ pub const ChunkBuilder = struct {
             .code = code,
             .constants = constants,
             .local_count = local_count,
+            .arity = self.arity,
             .scheduling = .{
                 .body_is_substantial = self.code.items.len + self.fusion_savings >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,

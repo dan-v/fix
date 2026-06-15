@@ -45,7 +45,7 @@ pub fn valueTypeName(self: *VM, value: Value) []const u8 {
         .path => "path",
         .list => "list",
         .attrs => "attrs",
-        .closure, .builtin, .builtin_closure => "function",
+        .closure, .builtin, .builtin_closure, .partial_app => "function",
         .thunk => "thunk",
         .string_context => "string",
     };

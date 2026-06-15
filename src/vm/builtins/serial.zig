@@ -102,7 +102,7 @@ fn writeJsonValueInner(
                 try writeJsonAttrs(self, writer, forced.asObjectId(), seen, path_mode, context);
             }
         },
-        .closure, .builtin, .builtin_closure => return error.TypeError,
+        .closure, .builtin, .builtin_closure, .partial_app => return error.TypeError,
         .thunk => unreachable,
     }
 }
@@ -278,7 +278,7 @@ fn writeXmlValue(
         },
         .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context),
         .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context),
-        .closure, .builtin, .builtin_closure => try writer.writeAll("<function />\n"),
+        .closure, .builtin, .builtin_closure, .partial_app => try writer.writeAll("<function />\n"),
         .thunk => unreachable,
     }
 }

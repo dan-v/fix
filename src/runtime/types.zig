@@ -12,6 +12,13 @@ pub const VM_STACK_CAP: usize = 65_536;
 /// Maximum call frame depth.
 pub const MAX_FRAMES: usize = 512;
 
+/// Hard cap on how many adjacent value-lambda params the compiler merges
+/// into one uncurried chunk (`compiler/ops.zig compileLambda`), and thus
+/// the largest `Chunk.arity` / partial-application arg count. Bounds the
+/// on-stack arg buffers in the VM's PAP machinery. Chains longer than
+/// this stay curried beyond the cap.
+pub const MAX_UNCURRY_ARITY: u16 = 4;
+
 /// Initial capacity for a bytecode chunk constant pool.
 pub const CHUNK_CONSTANTS_CAP: usize = 128;
 

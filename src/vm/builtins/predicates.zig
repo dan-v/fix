@@ -19,7 +19,7 @@ pub fn builtinIsBool(self: anytype, arg: Value) !Value {
 
 pub fn builtinIsFunction(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    return Value.boolVal(value.isClosure() or value.isBuiltin() or value.isBuiltinClosure());
+    return Value.boolVal(value.isClosure() or value.isBuiltin() or value.isBuiltinClosure() or value.isPartialApp());
 }
 
 pub fn builtinTypeOf(self: anytype, arg: Value) !Value {
@@ -33,7 +33,7 @@ pub fn builtinTypeOf(self: anytype, arg: Value) !Value {
         .path => "path",
         .list => "list",
         .attrs => "set",
-        .closure, .builtin, .builtin_closure => "lambda",
+        .closure, .builtin, .builtin_closure, .partial_app => "lambda",
         .thunk => unreachable,
     };
     return Value.string(try self.intern.intern(name));

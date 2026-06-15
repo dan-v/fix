@@ -585,7 +585,10 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
 
 pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
     const func = try vm_force.forceValue(self, arg);
-    if (func.isBuiltin() or func.isBuiltinClosure()) {
+    // PAPs wrap merged *value*-lambda chunks, which carry no formal-arg
+    // metadata — `functionArgs` of a simple-param lambda is `{}`, same as
+    // for builtins.
+    if (func.isBuiltin() or func.isBuiltinClosure() or func.isPartialApp()) {
         return Value.attrs(try self.heap.addAttrs(&.{}));
     }
     if (!func.isClosure()) return error.TypeError;

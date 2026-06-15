@@ -387,6 +387,10 @@ inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
     return ch;
 }
 
+/// Hard cap on merged-chain arity; see `types.MAX_UNCURRY_ARITY`. Used
+/// to size the on-stack arg buffers in the PAP machinery below.
+const MAX_UNCURRY_ARITY: u16 = types.MAX_UNCURRY_ARITY;
+
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_call);
     defer prof.end(.do_call, t);
@@ -394,6 +398,14 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = try closureChunkViaIC(self, closure.chunk_id);
+        if (ch.arity != 1) {
+            // Uncurried closure, one arg supplied → under-applied PAP.
+            // (arity == 1 is the overwhelmingly common path and stays
+            // branch-cheap below; jit_lambda_code is only attached to
+            // arity-1 chunks.)
+            const id = try self.heap.addPartialApp(callee, &.{arg});
+            return stack.push(self, Value.partialApp(id));
+        }
         if (comptime jit_mod.enabled) {
             if (ch.jit_lambda_code) |jit_fn| {
                 const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
@@ -405,6 +417,8 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         }
         try stack.push(self, arg); // arg is first local
         try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
+    } else if (callee.isPartialApp()) {
+        try applyToPartial(self, callee, arg);
     } else if (callee.isBuiltin()) {
         try stack.push(self, try access.applyBuiltin(self, callee.asBuiltinId(), &.{arg}));
     } else if (callee.isBuiltinClosure()) {
@@ -413,6 +427,29 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         const callable = try access.callAttrFunctor(self, callee);
         try doCall(self, callable, arg);
     } else return trace.notCallableError(self, callee);
+}
+
+/// Apply one argument to a partial-application value (control-transfer
+/// flavor, used by `doCall`/`call_n` fold). Extends the PAP if still
+/// under-applied, otherwise stages all args and pushes a frame so the
+/// underlying body runs (its result lands on the caller's stack exactly
+/// as a normal `call` would).
+fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
+    const pa = try self.heap.getPartialApp(pap.asObjectId());
+    const closure = try getClosureById(self, pa.func.asObjectId());
+    const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+    const have: u16 = @intCast(pa.args.len);
+    if (have + 1 < ch.arity) {
+        var buf: [MAX_UNCURRY_ARITY]Value = undefined;
+        @memcpy(buf[0..pa.args.len], pa.args);
+        buf[pa.args.len] = arg;
+        const id = try self.heap.addPartialApp(pa.func, buf[0 .. pa.args.len + 1]);
+        return stack.push(self, Value.partialApp(id));
+    }
+    // Saturated: stage args + the final one, run the body in a fresh frame.
+    for (pa.args) |a| try stack.push(self, a);
+    try stack.push(self, arg);
+    try stack.pushFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
 }
 
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
@@ -425,6 +462,13 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                 const closure_id = current.asObjectId();
                 const closure = try getClosureById(self, closure_id);
                 const ch = try closureChunkViaIC(self, closure.chunk_id);
+                if (ch.arity != 1) {
+                    // Uncurried closure, one arg → under-applied PAP value.
+                    // The following `ret` returns it (mirrors the builtin
+                    // tail-call case below).
+                    const id = try self.heap.addPartialApp(current, &.{arg});
+                    return stack.push(self, Value.partialApp(id));
+                }
                 if (comptime jit_mod.enabled) {
                     if (ch.jit_lambda_code) |jit_fn| {
                         const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
@@ -439,6 +483,15 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                     }
                 }
                 try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
+                return;
+            },
+            .partial_app => {
+                // Saturation here pushes a fresh frame (non-tail) rather
+                // than reusing the current one — rare (a PAP saturating in
+                // tail position via a single arg); direct multi-arg tail
+                // spines go through `tail_call_n`, which DOES reuse the
+                // frame. Correctness preserved; depth grows by 1 here.
+                try applyToPartial(self, current, arg);
                 return;
             },
             .builtin => {
@@ -485,6 +538,97 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
     @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
+/// Like `replaceCurrentFrame` but for an uncurried (arity>1) callee:
+/// `args` (length == ch.arity) are the new frame's first locals. The
+/// args currently live at the top of the stack at `args_base..args_base+n`
+/// (the caller has already removed the callee). They're copied down to the
+/// reused frame's base and the frame is re-pointed at `ch` with ip=0.
+fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, args_base: u32, n: u16, upvalues: []const Value) !void {
+    if (ch.local_count < n) return error.InvalidCallFrame;
+    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const frame = stack.currentFrame(self);
+    const frame_base = frame.frame_base;
+    // Copy the n args down to the frame base. dst (frame_base) <= src
+    // (args_base) and we copy ascending, so any overlap is safe.
+    var j: u32 = 0;
+    while (j < n) : (j += 1) self.stack[frame_base + j] = self.stack[args_base + j];
+
+    const arg_end = frame_base + n;
+    const reserved = @as(u32, ch.local_count) - n;
+    if (reserved > stack_cap - arg_end) return error.StackOverflow;
+    const new_sp = arg_end + reserved;
+    @memset(self.stack[@intCast(arg_end)..@intCast(new_sp)], Value.null_val);
+    self.sp = new_sp;
+
+    frame.* = .{
+        .chunk_ptr = ch,
+        .chunk_id = chunk_id,
+        .ip = 0,
+        .frame_base = frame_base,
+        .local_count = ch.local_count,
+        .upvalues = upvalues,
+    };
+    debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrameMulti");
+    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+}
+
+/// `call_n`: apply `callee` to `n` args, all already on the stack as
+/// `[callee, arg1, ..., argN]` (sp just past argN). Semantically identical
+/// to `n` sequential `call`s; the win is the saturated fast path
+/// (closure arity == n) which runs the body in ONE frame with no
+/// intermediate closure/PAP allocation. Either pushes a frame (control
+/// transfer) or pushes a result value — the caller (`opCallN`) dispatches
+/// `currentFrame` afterward, which handles both, exactly like `opCall`.
+pub fn doCallN(self: *VM, n: u16) !void {
+    const base = self.sp - n;
+    const callee = self.stack[base - 1];
+    if (callee.isClosure()) {
+        const closure = try getClosureById(self, callee.asObjectId());
+        const ch = try closureChunkViaIC(self, closure.chunk_id);
+        if (ch.arity == n) {
+            // Saturated: drop the callee from below the args (shift the
+            // args down one slot), then push one frame over the n args.
+            var j: u32 = 0;
+            while (j < n) : (j += 1) self.stack[base - 1 + j] = self.stack[base + j];
+            self.sp -= 1;
+            return stack.pushFrame(self, ch, closure.chunk_id, n, closure.upvalues);
+        }
+    }
+    // General fold: reduce one arg at a time to a value (run-to-completion),
+    // then replace [callee, args] with the result. `callValue` is
+    // stack-neutral, so the not-yet-consumed args stay put at `base+i`.
+    var acc = callee;
+    var i: u16 = 0;
+    while (i < n) : (i += 1) {
+        acc = try callValue(self, acc, self.stack[base + i]);
+    }
+    self.sp = base - 1;
+    try stack.push(self, acc);
+}
+
+/// `tail_call_n`: tail-position `call_n`. The saturated closure case
+/// reuses the current frame (so deep multi-arg tail recursion doesn't
+/// grow the stack); everything else folds to a value (the following
+/// `ret` returns it).
+pub fn doTailCallN(self: *VM, n: u16) !void {
+    const base = self.sp - n;
+    const callee = self.stack[base - 1];
+    if (callee.isClosure()) {
+        const closure = try getClosureById(self, callee.asObjectId());
+        const ch = try closureChunkViaIC(self, closure.chunk_id);
+        if (ch.arity == n) {
+            return replaceCurrentFrameMulti(self, ch, closure.chunk_id, base, n, closure.upvalues);
+        }
+    }
+    var acc = callee;
+    var i: u16 = 0;
+    while (i < n) : (i += 1) {
+        acc = try callValue(self, acc, self.stack[base + i]);
+    }
+    self.sp = base - 1;
+    try stack.push(self, acc);
+}
+
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     const t = prof.start(.call_value);
     defer prof.end(.call_value, t);
@@ -492,6 +636,11 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
         const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+        if (ch.arity != 1) {
+            // Uncurried closure, one arg → under-applied PAP value.
+            const id = try self.heap.addPartialApp(callee, &.{arg});
+            return Value.partialApp(id);
+        }
         if (comptime jit_mod.enabled) {
             if (ch.jit_lambda_code) |jit_fn| {
                 const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
@@ -504,6 +653,9 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
         try stack.push(self, arg);
         return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     }
+    if (callee.isPartialApp()) {
+        return callValuePartial(self, callee, arg);
+    }
     if (callee.isBuiltin()) {
         return access.applyBuiltin(self, callee.asBuiltinId(), &.{arg});
     }
@@ -515,6 +667,25 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
         return callValue(self, callable, arg);
     }
     return trace.notCallableError(self, callee);
+}
+
+/// `callValue` for a partial-application callee: extend if still
+/// under-applied, else run the underlying body to completion with all
+/// args and return its value.
+fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
+    const pa = try self.heap.getPartialApp(pap.asObjectId());
+    const closure = try getClosureById(self, pa.func.asObjectId());
+    const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+    var buf: [MAX_UNCURRY_ARITY]Value = undefined;
+    @memcpy(buf[0..pa.args.len], pa.args);
+    buf[pa.args.len] = arg;
+    const total: u16 = @intCast(pa.args.len + 1);
+    if (total < ch.arity) {
+        const id = try self.heap.addPartialApp(pa.func, buf[0..total]);
+        return Value.partialApp(id);
+    }
+    for (buf[0..total]) |a| try stack.push(self, a);
+    return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
 }
 
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {

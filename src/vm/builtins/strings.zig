@@ -190,7 +190,7 @@ pub fn isPlainString(value: Value) bool {
 
 pub fn isCallable(self: anytype, value: Value) !bool {
     return switch (value.kind()) {
-        .closure, .builtin, .builtin_closure => true,
+        .closure, .builtin, .builtin_closure, .partial_app => true,
         .attrs => blk: {
             _ = self.heap.getAttrValue(value.asObjectId(), try self.intern.intern("__functor")) catch |err| switch (err) {
                 error.MissingAttribute => break :blk false,

@@ -705,3 +705,48 @@ Byte-identical `.drv` at w=1 and w=32; `zig build test` green (added
 `FlatStore` round-trip / contiguity / capacity-error / concurrent-reserve
 tests). The value/attr/attr_pos stores stay segmented (they hand out
 `Range`s); only the object store moved.
+
+## Uncurrying multi-arg lambdas + PAP (LANDED, byte-identical)
+
+`compileLambda` historically compiled `a: b: body` as *nested* closures:
+the outer chunk existed only to allocate an intermediate closure capturing
+`a`, then call it with `b`. Every 2+-arg application paid a throwaway
+closure alloc + frame (`call` 4.3M, `closure_captures` 1.8M on the
+toplevel). Uncurrying merges an adjacent *value*-lambda chain into ONE
+chunk with N params (`Chunk.arity = N`, capped at
+`types.MAX_UNCURRY_ARITY = 4`); a nested lambda referencing an outer param
+now captures it as a frame *local* instead of an upvalue — the alloc we
+drop.
+
+The calling convention stays additive via a **partial-application (PAP)**
+value (`MISC_SUB_PARTIAL_APP` → `Object.partial_app = {func, args}`,
+modeled on `builtin_closure`): applying one arg to an arity-N>1 closure
+yields a PAP; applying to a PAP extends it or, at arity, runs the body.
+`callValue` (the universal applier all builtins route through) handles
+both, so `mapAttrs`/`map`/`foldl'`/overlays transparently get the merged
+body via PAP saturation. A new `call_n N` / `tail_call_n N` op (emitted for
+saturated syntactic spines `f a b`) runs the body in a single frame with
+**zero** intermediate alloc on the fast path (`arity == N`);
+`tail_call_n` reuses the current frame so deep multi-arg tail recursion
+doesn't grow the stack. Under/over-application and non-closure callees fold
+one arg at a time (same result).
+
+PAP behaves as a function everywhere: `isFunction`/`typeOf "lambda"`,
+`isCallable`, `functionArgs → {}` (merged value-lambdas carry no formal
+metadata); JSON/XML/equality mirror the closure arms.
+
+Controlled back-to-back A/B, n=10, vs `c7dfccd` (flat store):
+
+| workers | flat store | + uncurry | Δ best / median |
+| --- | --- | --- | --- |
+| 1 | 3.110 / 3.181 | 3.107 / 3.153 | ~0% / −0.9% |
+| 32 | 1.627 / 1.665 | 1.601 / 1.648 | −1.6% / −1.0% |
+
+**Modest (~1%), below the hypothesized "past C++" lever.** The merged-chunk
+structural win is partly offset because uncurried chunks lose the
+single-param eager-arg optimization (`strict_param` is gated to
+`local_count == 1`), so their args become lazy thunks — extra thunk allocs
+that cancel some of the saved closure allocs. Recovering per-param
+strictness (force the must-forced arg positions in the saturated `call_n`
+path) is the open follow-up that should unlock the rest. Byte-identical
+`.drv` at w=1/w=32; tests green.

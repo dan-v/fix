@@ -116,6 +116,9 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     if (chunk.source_map.len > 0) {
         try writer.print(", {d} source spans", .{chunk.source_map.len});
     }
+    if (chunk.arity != 1) {
+        try writer.print(", arity {d}", .{chunk.arity});
+    }
     try writer.writeAll(")\n");
     if (chunk.scheduling.strictness.forced_upvalues != 0) {
         try writer.writeAll("  strict upvalues:");
@@ -190,6 +193,12 @@ fn writeOperands(
         .merge_attrs, .merge_attrs_strict, .concat_lists,
         .get_attr_dynamic, .has_attr_dynamic,
         .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
+
+        .call_n, .tail_call_n => {
+            const n = code[ip];
+            ip += 1;
+            try writer.print("{d} args", .{n});
+        },
 
         .jump => {
             const off = readU32(code, ip);
@@ -450,6 +459,7 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols) !voi
         .builtin_closure => try writer.print("builtin_closure #{d}", .{value.asObjectId()}),
         .string_context => try writer.print("string_ctx #{d}", .{value.asObjectId()}),
         .boxed_int => try writer.print("boxed_int #{d}", .{value.asObjectId()}),
+        .partial_app => try writer.print("partial_app #{d}", .{value.asObjectId()}),
     }
 }
 

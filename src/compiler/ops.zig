@@ -367,7 +367,48 @@ pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
     }
 }
 
+/// Compile one argument of a flattened `call_n` spine. Multi-param
+/// strictness isn't tracked (uncurried chunks don't carry `strict_param`),
+/// so we never eager-eval here: immediate container values stay thunk-free,
+/// everything else becomes a lazy arg thunk — the same default the
+/// single-arg path uses for a non-statically-strict callee.
+fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
+    if (try access.compileImmediateContainerValue(self, arg, .{})) return;
+    try @import("thunks.zig").compileApplyArgThunk(self, arg);
+}
+
 pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
+    // Flatten the application spine `f a1 a2 ... aK` and, for K >= 2, emit
+    // one `call_n K` instead of K nested `call`s. When the callee is an
+    // uncurried (merged) closure of arity K this runs the body in a single
+    // frame with no intermediate closure/PAP allocation; otherwise it
+    // folds one arg at a time (same result). K == 1 keeps the original
+    // single-arg path below (which still carries the eager-strict-arg and
+    // tail-call-frame-reuse optimizations).
+    {
+        var args: [256]*const Node = undefined;
+        var k: usize = 0;
+        var head: *const Node = unwrapParens(node);
+        while (head.tag == .apply and k < args.len) {
+            args[k] = head.data.apply.arg;
+            k += 1;
+            head = unwrapParens(head.data.apply.func);
+        }
+        if (k >= 2 and head.tag != .apply) {
+            // `args` is in reverse (last-applied first); emit head then
+            // a1..aK in application order.
+            try self.compileNode(head);
+            var i: usize = k;
+            while (i > 0) {
+                i -= 1;
+                try compileSpineArg(self, args[i]);
+            }
+            const call_op: OpCode = if (op == .tail_call) .tail_call_n else .call_n;
+            try emit.emitOpByte(self, call_op, @intCast(k));
+            return;
+        }
+    }
+
     const ap = node.data.apply;
     try self.compileNode(ap.func);
     // Directly-applied lambda `(x: body) arg` whose body unconditionally
@@ -424,8 +465,41 @@ fn directlyAppliedStrictLambda(self: *Compiler, func: *const Node) !bool {
 }
 
 pub fn compileLambda(self: *Compiler, node: *const Node) !void {
-    const lambda = node.data.lambda;
-    const param_name = self.source[lambda.param_offset .. lambda.param_offset + lambda.param_len];
+    // Uncurry: collect the maximal chain of adjacent *value* lambdas
+    // `a: b: ...: body` into ONE chunk with N params (each a frame local)
+    // and `arity = N`. The historical compilation nested each as its own
+    // closure, so every extra param cost a throwaway intermediate closure
+    // alloc + frame at every application. Merging makes nested lambdas
+    // that reference an outer param capture it as a *local* (not an
+    // upvalue) — that's the alloc we drop. A call site supplying N args
+    // (`call_n`) then runs the body in one frame. Stops at the first
+    // non-value-lambda (attrset-pattern lambda or non-lambda body), at the
+    // `MAX_UNCURRY_ARITY` cap, or at a repeated param name (so we never
+    // rely on within-frame shadow ordering of identically-named locals).
+    const MAX = types.MAX_UNCURRY_ARITY;
+    var params: [MAX][]const u8 = undefined;
+    var param_ids: [MAX]InternId = undefined;
+    var n: u16 = 0;
+    var cur: *const Node = node;
+    while (n < MAX and cur.tag == .lambda) {
+        const lam = cur.data.lambda;
+        const name = self.source[lam.param_offset .. lam.param_offset + lam.param_len];
+        const id = try self.intern.intern(name);
+        var dup = false;
+        var k: u16 = 0;
+        while (k < n) : (k += 1) {
+            if (param_ids[k] == id) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) break;
+        params[n] = name;
+        param_ids[n] = id;
+        n += 1;
+        cur = unwrapParens(lam.body);
+    }
+    const body = cur;
 
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
@@ -444,23 +518,29 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     child.source_file_id = self.source_file_id;
     defer child.deinit();
 
-    const param_id = try self.intern.intern(param_name);
-    _ = try scope.declareLocal(&child, param_name, param_id);
-    compileTailExpression(&child, lambda.body) catch |err| {
+    var pi: u16 = 0;
+    while (pi < n) : (pi += 1) {
+        _ = try scope.declareLocal(&child, params[pi], param_ids[pi]);
+    }
+    compileTailExpression(&child, body) catch |err| {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try strictness.stampOnBuilder(&child, lambda.body);
-    // Stamp the strict-param bit: does the body unconditionally force its
-    // single parameter? Lets a caller holding this closure evaluate the
-    // argument eagerly instead of thunking it (see the `apply` arg op).
-    // Sound must-force, same contract as let elision.
-    child_builder.strict_param = try strictness.bodyMustForceName(self.allocator, self.intern, self.source, lambda.body, param_id);
-    // Forwarding strictness: `x: f x` forces x iff `f` does. Record the
-    // upvalue index of `f` so the caller can resolve it at the call site.
-    if (!child_builder.strict_param) {
-        child_builder.strict_via_upvalue = forwardingUpvalue(self, &child, lambda.body, param_name);
+    try strictness.stampOnBuilder(&child, body);
+    // Strict-param / forwarding analysis only applies to the single-param
+    // (curried) shape — `finish` gates `strict_param` to `local_count == 1`
+    // anyway, and an uncurried chunk's params are locals, not upvalues.
+    if (n == 1) {
+        // Does the body unconditionally force its single parameter? Lets a
+        // caller evaluate the argument eagerly instead of thunking it.
+        child_builder.strict_param = try strictness.bodyMustForceName(self.allocator, self.intern, self.source, body, param_ids[0]);
+        // Forwarding `x: f x` forces x iff `f` does — record `f`'s upvalue
+        // index so the caller can resolve it at the call site.
+        if (!child_builder.strict_param) {
+            child_builder.strict_via_upvalue = forwardingUpvalue(self, &child, body, params[0]);
+        }
     }
+    child_builder.arity = n;
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 

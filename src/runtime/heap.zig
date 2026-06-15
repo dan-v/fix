@@ -78,6 +78,11 @@ pub const BuiltinClosure = struct {
     args: []const Value,
 };
 
+pub const PartialApp = struct {
+    func: Value,
+    args: []const Value,
+};
+
 pub const ContextString = struct {
     text: InternId,
     context: []const AttrEntry,
@@ -96,6 +101,15 @@ const BuiltinClosureObject = struct {
 const ClosureObject = struct {
     chunk_id: ChunkId,
     upvalues: ValueRange,
+};
+
+/// A partial application: an uncurried (arity>1) `func` closure with
+/// `0 < args.len < arity` parameters already supplied. Applying the
+/// remaining args runs the body. Modeled exactly like
+/// `BuiltinClosureObject` — a callable plus its accumulated args.
+const PartialAppObject = struct {
+    func: Value,
+    args: ValueRange,
 };
 
 const ContextStringObject = struct {
@@ -159,6 +173,7 @@ pub const Object = union(enum) {
     /// Heap-boxed full-range i64 for values that don't fit Value's
     /// 48-bit inline int payload. See `runtime/int.zig`.
     boxed_int: i64,
+    partial_app: PartialAppObject,
 };
 
 /// Per-worker thread-local allocation buffer. Each worker reserves a
@@ -273,7 +288,7 @@ pub const ObjectHeap = struct {
         values: u32,
         attrs: u32,
         attr_positions: u32,
-        variant_counts: [8]u32,
+        variant_counts: [9]u32,
         thunk_states: [5]u32,
         /// Magnitude histogram for inline `.int` values found in the
         /// values + attrs stores. Buckets are chosen to inform a 16→8
@@ -298,6 +313,7 @@ pub const ObjectHeap = struct {
                 5 => "context_string",
                 6 => "boxed_int",
                 7 => "merge_attrs",
+                8 => "partial_app",
                 else => "?",
             };
         }
@@ -343,7 +359,7 @@ pub const ObjectHeap = struct {
             .values = self.values.count(),
             .attrs = self.attrs.count(),
             .attr_positions = self.attr_positions.count(),
-            .variant_counts = [_]u32{0} ** 8,
+            .variant_counts = [_]u32{0} ** 9,
             .thunk_states = [_]u32{0} ** 5,
             .int_buckets = [_]u32{0} ** 5,
         };
@@ -378,6 +394,7 @@ pub const ObjectHeap = struct {
                 .context_string => 5,
                 .boxed_int => 6,
                 .merge_attrs => 7,
+                .partial_app => 8,
             };
             result.variant_counts[v_index] += 1;
         }
@@ -774,6 +791,16 @@ pub const ObjectHeap = struct {
         };
     }
 
+    pub fn getPartialApp(self: *const ObjectHeap, id: ObjectId) !PartialApp {
+        return switch (self.getConst(id).*) {
+            .partial_app => |pa| .{
+                .func = pa.func,
+                .args = self.values.slice(pa.args),
+            },
+            else => error.InvalidObjectType,
+        };
+    }
+
     pub fn getContextString(self: *const ObjectHeap, id: ObjectId) !ContextString {
         return switch (self.getConst(id).*) {
             .context_string => |string| .{
@@ -1009,6 +1036,17 @@ pub const ObjectHeap = struct {
 
     pub fn addThunk(self: *ObjectHeap, thunk: Thunk) !ObjectId {
         return self.add(.{ .thunk = thunk });
+    }
+
+    /// Build a partial-application object from `func` (an arity>1 closure
+    /// or another PAP's underlying closure) and the args supplied so far.
+    pub fn addPartialApp(self: *ObjectHeap, func: Value, args: []const Value) !ObjectId {
+        const range = try self.appendValues(args);
+        errdefer self.values.rollback(range);
+        return self.add(.{ .partial_app = .{
+            .func = func,
+            .args = range,
+        } });
     }
 
     pub fn addBoxedInt(self: *ObjectHeap, v: i64) !ObjectId {
