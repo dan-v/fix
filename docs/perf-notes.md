@@ -197,6 +197,36 @@ per-op/per-call runtime checks (the trivial-lambda short-circuit added an
 lesson: remove the work, don't gate it. Possible next in the same vein:
 2-level `attr_access` (`config.foo.bar`, ~20% as common as 1-level).
 
+## Proper work reduction: thunk-result memo (eliminate redundant computation)
+
+The "VM-level exhausted" call below was premature in one dimension: it
+looked at machinery, not *redundant work*. Measured the redundant-force
+rate — bytecode-thunk forces whose `(chunk_id, upvalue-bits)` key was
+already computed by an earlier *distinct* thunk (same pure inputs → same
+result, which the per-object thunk memoization can't share): **10.8% of
+bytecode-thunk computations**, spread across the `lib` helpers
+(`lib.types.*`, `lib.mkXxx`) that nixpkgs re-evaluates with identical args
+across thousands of modules (top single chunk only ~5%, so it needs a
+general memo, not a targeted patch).
+
+Landed (`05359c7`): a bounded **thread-local** (per-worker, zero-contention)
+cache `(heap_token, chunk_id, ≤2 upvalues) → resolved Value`, checked on the
+freshly-claimed force path; a hit resolves the thunk to the cached value and
+skips re-running the body. Sound (pure fns), exact key compare (no hash-only
+false hits), `heap_token`-guarded for multi-eval (the attr-cache trick).
+Direct-mapped 16K slots (64K was *worse* — 2.5MB/thread blows L2); only taxes
+the slow force path (`force_thunk_slow` ~2.9M), not the 23M resolved-fast
+hits. Byte-identical w=1 & w=32, tests green. **~2.5–3% w=1, ~2% w=32.**
+
+This is the genuine non-incremental lever: not faster machinery, *less
+computation*. The redundancy is inherent to the nixpkgs source (it re-writes
+`types.bool` etc. inline everywhere; C++ Nix re-evaluates it too) — we just
+stop recomputing identical pure suspensions within a run.
+
+**Cumulative session** (049fa0f → 05359c7): layered `//` + k-way flatten,
+direct formal binding, frameless `attr_access`, thunk-result memo ≈
+**−5.5% w=32 / −5.4% w=1** (median), all byte-identical `.drv`.
+
 ## Post-wins re-profile — VM-level work reduction is exhausted for this eval
 
 After the three on-chain wins, re-profiled main at w=32 and systematically
