@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const jit = b.option(bool, "jit", "Enable the experimental native-code JIT (x86_64 Linux only)") orelse false;
     const prof_main = b.option(bool, "prof-main", "Time main thread's hot serial paths via rdtsc; print via --print-sched-stats") orelse false;
     const prof_path = b.option(bool, "prof-path", "Record the force-call tree (workers=1) and report the critical path + source-attributed profile; print via --print-sched-stats") orelse false;
+    const trace_probe = b.option(bool, "trace-probe", "Measure tracing-JIT headroom: per-thunk read-count histogram (single-use vs shared) + body-size distribution. Run at --workers=1.") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
@@ -49,6 +50,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "jit", jit);
     build_options.addOption(bool, "prof_main", prof_main);
     build_options.addOption(bool, "prof_path", prof_path);
+    build_options.addOption(bool, "trace_probe", trace_probe);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of

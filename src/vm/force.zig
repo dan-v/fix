@@ -15,6 +15,7 @@ const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("../builtins.zig").BuiltinId;
 const prof = @import("../prof.zig");
 const prof_path = @import("../prof_path.zig");
+const trace_probe = @import("trace_probe.zig");
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
@@ -113,6 +114,7 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
     if (!value.isThunk()) return value;
+    if (comptime trace_probe.enabled) trace_probe.recordRead(value.asObjectId());
     // Inline the resolved-thunk fast path. The vast majority of forces
     // hit an already-resolved thunk in steady state (workers and
     // demand-driven fan-out tend to resolve hot thunks early); folding
@@ -279,6 +281,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
 
+                if (comptime trace_probe.enabled) {
+                    if (thunk.targetKind() == .bytecode) {
+                        if (self.registry.get(thunk.payload.target.bytecode.chunk_id)) |ch|
+                            trace_probe.recordComputeBody(ch.code.len);
+                    }
+                }
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);

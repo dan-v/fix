@@ -122,6 +122,7 @@ pub const Evaluator = struct {
 
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
+        @import("vm/trace_probe.zig").report();
         // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
         // them down (which joins on `defer vm.deinit()` inside helperLoop)
         // before freeing the arenas they borrow from.
@@ -319,6 +320,7 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+        @import("vm/trace_probe.zig").init(self.allocator);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
