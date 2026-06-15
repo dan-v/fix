@@ -10,6 +10,8 @@ const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("../runtime/value.zig").Value;
 const AttrEntry = @import("../runtime/heap.zig").AttrEntry;
 const stable = @import("../runtime/stable_segments.zig");
+const hot_mod = @import("../tjit/hot.zig");
+const HotTable = hot_mod.HotTable;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -525,6 +527,15 @@ pub const ChunkRegistry = struct {
     /// JIT is disabled at build time — has zero footprint and the
     /// interpreter handles everything.
     jit_buffer: JitCodeBuffer,
+    /// Tracing-JIT hot-anchor table (`-Dtjit`). Heap-allocated so workers can
+    /// mutate it through the VM's `*const ChunkRegistry`. Null when tjit is off.
+    hot: ?*HotTable = null,
+
+    /// Fixed capacity for the hot table — comfortably over the toplevel's
+    /// chunk count; ids beyond it are untracked (never go hot).
+    const HOT_CAPACITY: usize = 1 << 21;
+    const HOT_THRESHOLD: u32 = 64;
+    const HOT_MAX_ABORTS: u8 = 3;
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -539,6 +550,11 @@ pub const ChunkRegistry = struct {
             .jit_buffer = if (jit.enabled) try jit.CodeBuffer.init(16 << 20) else {},
         };
         errdefer self.deinit();
+        if (hot_mod.enabled) {
+            const h = try allocator.create(HotTable);
+            h.* = try HotTable.init(allocator, HOT_CAPACITY, HOT_THRESHOLD, HOT_MAX_ABORTS);
+            self.hot = h;
+        }
         self.well_known.genlist_apply = try self.registerGenListApplyChunk();
         self.well_known.mapattrs_apply = try self.registerMapAttrsApplyChunk();
         return self;
@@ -612,6 +628,10 @@ pub const ChunkRegistry = struct {
         }
         self.chunks.deinit(self.allocator);
         if (jit.enabled) self.jit_buffer.deinit();
+        if (self.hot) |h| {
+            h.deinit(self.allocator);
+            self.allocator.destroy(h);
+        }
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {

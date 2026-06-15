@@ -120,10 +120,45 @@ pub const Evaluator = struct {
         };
     }
 
+    /// `-Dtjit` diagnostic: which chunks went hot enough to anchor a trace.
+    /// Resolves each armed/traced chunk to its source location so we can see
+    /// the recorder's targets on the real workload.
+    fn reportHotAnchors(self: *Evaluator) void {
+        const h = self.registry.hot orelse return;
+        var armed: usize = 0;
+        var traced: usize = 0;
+        var shown: usize = 0;
+        const count = self.registry.count();
+        var id: u32 = 0;
+        while (id < count and id < h.entries.len) : (id += 1) {
+            const st = h.stateOf(id);
+            if (st == .cold or st == .blacklisted) continue;
+            if (st == .traced) traced += 1 else armed += 1;
+            if (shown >= 80) continue;
+            shown += 1;
+            const ch = self.registry.get(id) orelse continue;
+            var line: u32 = 0;
+            var file: ?types.InternId = null;
+            for (ch.source_map) |e| {
+                if (e.start == 0) {
+                    line = e.span.line;
+                    file = e.span.file;
+                    break;
+                }
+            }
+            const path = if (file) |f| std.fs.path.basename(self.intern.get(f)) else "<no-file>";
+            std.debug.print("HOT-ANCHOR chunk={d} {s}:{d} {s} entries={d} locals={d}\n", .{
+                id, path, line, @tagName(st), h.entries[id].count.load(.monotonic), ch.local_count,
+            });
+        }
+        std.debug.print("=== tjit hot anchors: {d} armed, {d} traced (threshold={d}, chunks={d}) ===\n", .{ armed, traced, h.hot_threshold, count });
+    }
+
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         @import("vm/trace_probe.zig").report();
         @import("vm/ngram_probe.zig").report();
+        if (comptime @import("tjit/hot.zig").enabled) self.reportHotAnchors();
         // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
         // them down (which joins on `defer vm.deinit()` inside helperLoop)
         // before freeing the arenas they borrow from.

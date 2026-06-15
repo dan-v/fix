@@ -5,6 +5,7 @@ const Value = @import("../runtime/value.zig").Value;
 const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
+const hot_mod = @import("../tjit/hot.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -13,6 +14,17 @@ const ChunkId = types.ChunkId;
 // ---- frame management ----
 
 pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value) !void {
+    // Tracing-JIT hot-anchor detection: every chunk entry (lambda calls and
+    // thunk/closure forcing both route through here) bumps the chunk's hot
+    // counter. Comptime-gated to `-Dtjit` — zero cost in normal builds.
+    if (comptime hot_mod.enabled) {
+        if (self.registry.hot) |h| {
+            if (h.onEntry(chunk_id)) {
+                // Armed: this chunk is now a trace anchor. Recording hook
+                // lands here next (task #11 record mode).
+            }
+        }
+    }
     if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const frame_base = self.sp - arg_count;
