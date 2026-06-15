@@ -609,3 +609,52 @@ The 1s target needs the **critical path** at high worker count:
 Throughput micro-optimizations (allocation shape, sync, object size) are
 largely spent for the w=32 goal — they help w=1 by single-digit % and
 don't transfer.
+
+## Lean thunk: value-less Future + result/target union (LANDED, byte-identical)
+
+Premise from a fresh baseline: **fix w=1 (3.25s) is measurably SLOWER than
+C++ `nix-instantiate` (2.75s)** on the identical eval (byte-identical
+`.drv`), and 32 cores buy only ~1.9×. `-Dprof-main` at w=1 showed the thunk
+machinery is **~4.5B cy / ~28% of w=1** and cache-bound: the resolved
+fast-path `force_value` is **99 cy/call** over 16M calls ≈ one cache miss
+per force, because every heap `Object` slot was **64 B** (`Thunk`
+dominates the union → every object pays Thunk's size).
+
+Shrank the hottest, most-numerous heap object **64 B → 48 B** in two
+byte-identical steps:
+1. `Future` is now **value-less** — the embedder (`Thunk`/`ImportEntry`)
+   owns its typed result slot. In `Thunk`, `result` and `target` share a
+   bare union (never live at once: read `target` to compute, overwrite
+   with `result` at resolution; `future.state` is the discriminant). 64→56.
+2. `ThunkTarget` is a **bare union**; its 1-byte discriminant moved to a
+   plain `target_kind` in `Future`'s padding (Zig packs it free). Drops the
+   8-aligned enum-tag rounding. 56→48. No atomic-transition change.
+
+Controlled A/B, back-to-back n=10, vs `fff7b31`:
+
+| workers | baseline (64 B) | now (48 B) | Δ median |
+| --- | --- | --- | --- |
+| 1 | 3.254 / 3.287 | 3.179 / 3.215 | −2.2% |
+| 32 | 1.588 / 1.652 | 1.554 / 1.613 | **−2.4%** |
+
+So object-shrink **does transfer to w=32** (~2.4%), consistent with the
+earlier "controlled cumulative shows transfer" finding — main's
+critical-path forces are equally cache-bound.
+
+**Diminishing returns / where it stops.** Step 1 (64→56) carried most of
+the w=1 win; step 2 (56→48) was perf-neutral alone (real only cumulatively
+at w=32). The working set of live thunks (5.86M × 48 B ≈ 281 MB) ≫ L3, so
+most forces miss to DRAM regardless of size — shrinking helps residency
+second-order, not miss *rate*. Size is **not** the dominant w=1→C++ gap;
+the bigger w=1 self-time is `apply_builtin` (3.74B cy) and
+`run_isolated_frame` (2.04B cy) — builtin dispatch + frame machinery.
+
+**Next shrink is gated on risk.** 48→32 B requires evicting the 8-byte
+`waiters_head` pointer (the only field left that costs size — the 1-byte
+fields hide in alignment padding) into a side-table with an intricate
+lock-free enroll/wake protocol. This is the exact code behind multiple
+past race fixes (`speculation_race_threshold128`, `fiber_resume_race`);
+high-risk for ~2-3%. Deferred. For the headline w=32 number the higher-EV
+ambitious lever is **parallel derivation-DAG hashing** (offload the 828-node
+drv-hash DAG — all required, a pure function of built attrsets — onto the
+86%-idle helpers, moving ~13% of work off main's serial chain).
