@@ -8,4 +8,5 @@ test {
     _ = @import("../tjit/ir.zig");
     _ = @import("../tjit/hot.zig");
     _ = @import("../tjit/recorder.zig");
+    _ = @import("../tjit/opt.zig");
 }

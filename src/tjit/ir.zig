@@ -66,7 +66,36 @@ pub const Op = enum(u8) {
     guard,
     /// Trace result is value `a`.
     ret,
+    /// Deleted instruction (left in place by optimizer passes so SSA `Ref`s —
+    /// which are array indices — don't need renumbering). Skipped by codegen.
+    nop,
 };
+
+/// True for ops with no observable effect: removable by DCE when their result
+/// is unused, and foldable. Effectful/control ops (guard, ret, get_attr,
+/// force, call, allocations) are conservatively kept.
+pub fn isPure(op: Op) bool {
+    return switch (op) {
+        .const_val, .load_upvalue, .load_upvalue_of, .load_local, .trace_arg, .add_int, .sub_int, .mul_int, .eq, .lt, .not => true,
+        else => false,
+    };
+}
+
+/// Whether operand field `a` / `b` of an instruction is an SSA `Ref` (vs an
+/// immediate like a const index or slot). Used by passes to walk the dataflow.
+pub fn usesA(op: Op) bool {
+    return switch (op) {
+        .load_upvalue_of, .add_int, .sub_int, .mul_int, .eq, .lt, .not, .guard, .get_attr, .force, .call, .ret => true,
+        else => false,
+    };
+}
+
+pub fn usesB(op: Op) bool {
+    return switch (op) {
+        .add_int, .sub_int, .mul_int, .eq, .lt, .call => true,
+        else => false,
+    };
+}
 
 pub const GuardKind = enum(u8) {
     /// Thunk `a` is already resolved (acquire load of future.state).

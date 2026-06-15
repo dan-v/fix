@@ -20,6 +20,7 @@ const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const ir = @import("ir.zig");
 const Recorder = @import("recorder.zig").Recorder;
+const opt = @import("opt.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;
 const Value = @import("../runtime/value.zig").Value;
 const types = @import("../runtime/types.zig");
@@ -87,7 +88,9 @@ fn abort(vm: *VM) void {
 fn finish(vm: *VM) void {
     const r = state(vm) orelse return;
     const anchor = r.anchor;
-    printTrace(&r.trace);
+    const raw = r.trace.len();
+    opt.optimize(&r.trace, vm.allocator) catch {};
+    printTrace(&r.trace, raw);
     teardown(vm);
     if (vm.registry.hot) |h| h.markTraced(anchor);
 }
@@ -178,9 +181,10 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
     }
 }
 
-fn printTrace(trace: *const ir.Trace) void {
-    std.debug.print("--- tjit trace (anchor chunk {d}, {d} instrs) ---\n", .{ trace.anchor_chunk, trace.len() });
+fn printTrace(trace: *const ir.Trace, raw_len: usize) void {
+    std.debug.print("--- tjit trace (anchor chunk {d}, {d} raw -> {d} live instrs) ---\n", .{ trace.anchor_chunk, raw_len, opt.liveLen(trace) });
     for (trace.instrs.items, 0..) |instr, i| {
+        if (instr.op == .nop) continue;
         std.debug.print("  %{d:<3} {s} a=%{d} b=%{d} aux={d}\n", .{ i, @tagName(instr.op), instr.a, instr.b, instr.aux });
     }
 }
