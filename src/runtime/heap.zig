@@ -42,7 +42,17 @@ pub const AttrPosEntry = struct {
     pos: SourcePos,
 };
 
-const ObjectStore = stable.StableSegments(Object, .{ .first_segment_size = 256 });
+/// The object store is backed by a single mmap-reserved contiguous
+/// region rather than geometric segments: it is referenced *only* by
+/// flat ObjectId (never via an externally-handed-out `Range`/`slice`,
+/// unlike the value/attr stores), so `get(id)` collapses to one load —
+/// `base[id]` — with no segment decode (`clz` + shifts) and no per-access
+/// atomic segment-pointer load. On the NixOS toplevel this access happens
+/// tens of millions of times. `OBJECT_MAX_SLOTS` is a virtual reservation
+/// (MAP_NORESERVE), so the headroom over the ~6M objects a real eval
+/// produces costs no physical memory.
+const OBJECT_MAX_SLOTS: u32 = 1 << 30;
+const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS });
 const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024 });
 const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512 });
 const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512 });
@@ -214,11 +224,13 @@ pub const ObjectHeap = struct {
     token: u64,
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
+        var objects = try ObjectStore.init();
+        errdefer objects.deinit(allocator);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
         for (locals) |*l| l.* = .{};
         return .{
             .allocator = allocator,
-            .objects = .empty,
+            .objects = objects,
             .values = .empty,
             .attrs = .empty,
             .attr_positions = .empty,

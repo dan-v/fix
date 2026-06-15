@@ -658,3 +658,50 @@ high-risk for ~2-3%. Deferred. For the headline w=32 number the higher-EV
 ambitious lever is **parallel derivation-DAG hashing** (offload the 828-node
 drv-hash DAG — all required, a pure function of built attrsets — onto the
 86%-idle helpers, moving ~13% of work off main's serial chain).
+
+## Flat object store: one-load `get(id)` (LANDED, byte-identical)
+
+The w=1 gap vs C++ `nix-instantiate` (3.2s vs 2.75s) is per-op overhead,
+not inherent work (49.9M opcodes ≈ 290 cy/op). One pervasive contributor:
+**every `heap.get(id)` decoded a flat ObjectId into `(segment, offset)`**
+via `StableSegments.locationOf` (a `clz` + shifts), then did an atomic
+segment-pointer load, then the object load — ~5-7 cy of pure indirection
+on top of the load, repeated *tens of millions* of times (16.06M from
+`force_value` alone), where C++ does a single deref.
+
+The object store is referenced **only by flat ObjectId** — unlike the
+value/attr/attr_pos stores it never hands out a `Range`/`slice`
+externally — so it doesn't need segmentation at all. Backed it with a new
+`stable.FlatStore`: one `mmap`-reserved contiguous region (`MAP_NORESERVE`,
+`1<<30` slots ≈ 60 GB virtual but only touched pages cost physical memory),
+mapped once at `ObjectHeap.init` before any worker spawns and **never
+relocated**. `get(id)` collapses to `base[id]` — one load, no decode, no
+per-access atomic (the base is immutable, so reads need no synchronization;
+`reserve` still bumps a cursor under `write_mu`). The `Range`/`globalIdOf`
+shape mirrors `StableSegments` (segment always 0, offset = global id) so
+the heap's per-worker TLAB code is store-agnostic and unchanged.
+
+Pointer stability under concurrent append at w=32 is free: the mapping
+never moves, and a reader only ever touches an id published through the
+value/state release that made it reachable (happens-after the fill).
+`MAP_NORESERVE` pages commit on first write — same fault-in behavior as
+the allocator-backed segments, so no commit-ordering subtlety.
+
+`-Dprof-main` w=1, identical 16,064,708 calls: `force_value` exclusive
+**100 → 95 cy/call** (−5%, total excl 1.61B → 1.53B cy) — exactly the
+decode overhead removed; the load itself still misses to DRAM (the ~95 cy
+floor). The wall win is larger than force_value's slice because *every*
+consumer (`getConst`, `getAttrValueOpt`, closure/list access) shed the
+same decode.
+
+Controlled A/B, back-to-back n=10, vs `de587cd`:
+
+| workers | baseline | flat store | Δ best / median |
+| --- | --- | --- | --- |
+| 1 | 3.205 / 3.248 | 3.071 / 3.140 | **−4.2% / −3.3%** |
+| 32 | 1.613 / 1.661 | 1.561 / 1.630 | −3.2% / −1.9% |
+
+Byte-identical `.drv` at w=1 and w=32; `zig build test` green (added
+`FlatStore` round-trip / contiguity / capacity-error / concurrent-reserve
+tests). The value/attr/attr_pos stores stay segmented (they hand out
+`Range`s); only the object store moved.

@@ -281,6 +281,123 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
     };
 }
 
+pub const FlatParams = struct {
+    /// Virtual address space to reserve, in slots. The whole region is
+    /// mapped up front (MAP_NORESERVE — only touched pages cost physical
+    /// memory) and never relocated, so a slot's address is stable for the
+    /// store's lifetime and reads need no synchronization on the base.
+    max_slots: u32,
+};
+
+/// Append-only flat storage backed by a single mmap-reserved contiguous
+/// region. A drop-in replacement for `StableSegments` *for flat-id*
+/// entities (the object store): `get(id)` is one load — `base[id]` — with
+/// no segment decode, no per-access atomic. The trade vs `StableSegments`
+/// is a fixed virtual reservation instead of geometric segment growth; it
+/// only suits stores referenced solely by flat id (never via `Range`/
+/// `slice` handed out externally).
+///
+/// Thread safety:
+///   - `base` is set once in `init` (single-threaded, before any worker
+///     spawns) and never changes, so `get`/`getMut` are plain loads.
+///   - `reserve` bumps `cursor` under `write_mu`; concurrent readers only
+///     ever touch ids already published through the value/state release
+///     that made them reachable, which happens-after the slot was filled.
+pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
+    comptime {
+        if (T == void) @compileError("FlatStore(void) is unsupported");
+        if (params.max_slots == 0) @compileError("max_slots must be > 0");
+    }
+
+    return struct {
+        const Self = @This();
+
+        pub const MAX_SLOTS = params.max_slots;
+
+        /// Range shape mirrors `StableSegments.Range` so the heap's TLAB
+        /// code is store-agnostic. `segment` is always 0 here (one flat
+        /// region); `offset` is the global id.
+        pub const Range = struct {
+            segment: u32,
+            offset: u32,
+            len: u32,
+        };
+
+        /// Base of the mmap-reserved region. Immutable after `init`.
+        base: [*]T,
+        /// Next free slot. Bumped under `write_mu`; loaded atomically by
+        /// `count()` so an opportunistic reader doesn't tear.
+        cursor: std.atomic.Value(u32),
+        write_mu: SpinMutex,
+
+        const BYTES: usize = @as(usize, params.max_slots) * @sizeOf(T);
+
+        pub fn init() !Self {
+            const mem = std.posix.mmap(
+                null,
+                BYTES,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+                -1,
+                0,
+            ) catch return error.OutOfMemory;
+            return .{
+                .base = @ptrCast(@alignCast(mem.ptr)),
+                .cursor = .init(0),
+                .write_mu = .{},
+            };
+        }
+
+        /// `allocator` is accepted for API parity with `StableSegments`
+        /// (the heap calls `deinit(allocator)` uniformly); the flat store
+        /// owns mmap memory, not allocator memory, so it's ignored.
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            _ = allocator;
+            const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
+            std.posix.munmap(bytes[0..BYTES]);
+            self.cursor.store(0, .monotonic);
+        }
+
+        /// Reserve `len` consecutive slots. `allocator` ignored (see
+        /// `deinit`). The returned `Range.offset` is the global id of the
+        /// first slot.
+        pub fn reserve(self: *Self, allocator: std.mem.Allocator, len: u32) !Range {
+            _ = allocator;
+            if (len == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+            const start = self.cursor.load(.monotonic);
+            if (start > params.max_slots - len) return error.OutOfMemory;
+            self.cursor.store(start + len, .release);
+            return .{ .segment = 0, .offset = start, .len = len };
+        }
+
+        pub fn get(self: *const Self, id: u32) *const T {
+            return &self.base[id];
+        }
+
+        pub fn getMut(self: *Self, id: u32) *T {
+            return &self.base[id];
+        }
+
+        /// Total slots reserved. Approximate under concurrent writers
+        /// (cursor moves at reserve end, so an in-flight reserve isn't
+        /// reflected) — same contract as `StableSegments.count`.
+        pub fn count(self: *const Self) u32 {
+            return self.cursor.load(.acquire);
+        }
+
+        /// A flat store has a single region, so the global id IS the
+        /// offset. `segment` must be 0 (the only value `reserve` produces).
+        pub fn globalIdOf(segment: u32, offset: u32) u32 {
+            std.debug.assert(segment == 0);
+            return offset;
+        }
+    };
+}
+
+const page_size_min = std.heap.page_size_min;
+
 test "stable segments: append and get" {
     const allocator = std.testing.allocator;
     var seg = StableSegments(u32, .{ .first_segment_size = 4 }).empty;
@@ -405,6 +522,85 @@ test "stable segments: concurrent appends are race-free" {
     var id: u32 = 0;
     while (id < seg.count()) : (id += 1) {
         const v = seg.get(id).*;
+        try std.testing.expect(!seen.contains(v));
+        try seen.put(v, {});
+    }
+    try std.testing.expectEqual(@as(usize, worker_count * per_worker), seen.count());
+}
+
+test "flat store: reserve, fill, get round-trip" {
+    var store = try FlatStore(u64, .{ .max_slots = 4096 }).init();
+    defer store.deinit(std.testing.allocator);
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        const r = try store.reserve(std.testing.allocator, 1);
+        try std.testing.expectEqual(@as(u32, 0), r.segment);
+        try std.testing.expectEqual(i, r.offset);
+        store.getMut(r.offset).* = @as(u64, i) * 7;
+    }
+    try std.testing.expectEqual(@as(u32, 1000), store.count());
+    i = 0;
+    while (i < 1000) : (i += 1) {
+        try std.testing.expectEqual(@as(u64, i) * 7, store.get(i).*);
+    }
+}
+
+test "flat store: multi-slot reservation is contiguous" {
+    const Store = FlatStore(u32, .{ .max_slots = 256 });
+    var store = try Store.init();
+    defer store.deinit(std.testing.allocator);
+
+    const r1 = try store.reserve(std.testing.allocator, 3);
+    try std.testing.expectEqual(@as(u32, 0), r1.offset);
+    const r2 = try store.reserve(std.testing.allocator, 5);
+    try std.testing.expectEqual(@as(u32, 3), r2.offset);
+    try std.testing.expectEqual(@as(u32, 8), store.count());
+    try std.testing.expectEqual(@as(u32, 5), Store.globalIdOf(0, 5));
+}
+
+test "flat store: reserve past capacity errors without relocating" {
+    var store = try FlatStore(u32, .{ .max_slots = 8 }).init();
+    defer store.deinit(std.testing.allocator);
+
+    const r = try store.reserve(std.testing.allocator, 8);
+    try std.testing.expectEqual(@as(u32, 0), r.offset);
+    try std.testing.expectError(error.OutOfMemory, store.reserve(std.testing.allocator, 1));
+    // The successfully-reserved slots remain addressable after the failure.
+    store.getMut(7).* = 0xDEAD;
+    try std.testing.expectEqual(@as(u32, 0xDEAD), store.get(7).*);
+}
+
+test "flat store: concurrent reserves are race-free" {
+    const Store = FlatStore(u64, .{ .max_slots = 4096 });
+    var store = try Store.init();
+    defer store.deinit(std.testing.allocator);
+
+    const Worker = struct {
+        fn run(s: *Store, worker_id: u64, per_worker: u32) void {
+            var i: u32 = 0;
+            while (i < per_worker) : (i += 1) {
+                const r = s.reserve(std.testing.allocator, 1) catch return;
+                s.getMut(r.offset).* = (worker_id << 32) | i;
+            }
+        }
+    };
+
+    const worker_count: u8 = 4;
+    const per_worker: u32 = 250;
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &store, @as(u64, @intCast(i)), per_worker });
+    }
+    for (&threads) |t| t.join();
+
+    try std.testing.expectEqual(@as(u32, worker_count * per_worker), store.count());
+
+    var seen = std.AutoHashMap(u64, void).init(std.testing.allocator);
+    defer seen.deinit();
+    var id: u32 = 0;
+    while (id < store.count()) : (id += 1) {
+        const v = store.get(id).*;
         try std.testing.expect(!seen.contains(v));
         try seen.put(v, {});
     }
