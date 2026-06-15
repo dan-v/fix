@@ -18,6 +18,7 @@ pub const Capture = struct {
     pub const Kind = enum { local, upvalue };
 
     name: []const u8,
+    name_id: InternId,
     kind: Kind,
     index: u16,
 };

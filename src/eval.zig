@@ -243,6 +243,8 @@ pub const Evaluator = struct {
         const ast_node = blk: {
             self.progressBegin(.parse, subject);
             defer self.progressEnd(.parse, subject);
+            const pt = @import("prof.zig").start(.parse);
+            defer @import("prof.zig").end(.parse, pt);
             break :blk parser.parse() catch {
                 try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
                 return error.ParseError;
@@ -267,6 +269,8 @@ pub const Evaluator = struct {
         {
             self.progressBegin(.compile, subject);
             defer self.progressEnd(.compile, subject);
+            const ct = @import("prof.zig").start(.compile);
+            defer @import("prof.zig").end(.compile, ct);
             compiler.compileAndFinish(ast_node, scope) catch |err| {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 return err;

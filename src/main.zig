@@ -272,29 +272,30 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             // Top builtins by inclusive cycles on main.
-            const BSlot = struct { id: u16, cycles: u64, calls: u64 };
-            var top_b: [10]BSlot = .{BSlot{ .id = 0, .cycles = 0, .calls = 0 }} ** 10;
+            const N = 20;
+            const BSlot = struct { id: u16, cycles: u64, incl: u64, calls: u64 };
+            var top_b: [N]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** N;
             for (prof.builtin_samples, 0..) |samp, id| {
                 if (samp.calls == 0) continue;
-                var slot: usize = 10;
+                var slot: usize = N;
                 for (top_b, 0..) |entry, i| {
                     if (samp.cycles > entry.cycles) {
                         slot = i;
                         break;
                     }
                 }
-                if (slot < 10) {
-                    var j: usize = 9;
+                if (slot < N) {
+                    var j: usize = N - 1;
                     while (j > slot) : (j -= 1) top_b[j] = top_b[j - 1];
-                    top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .calls = samp.calls };
+                    top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
                 }
             }
             const BuiltinId = @import("builtins.zig").BuiltinId;
-            std.debug.print("prof builtins (top-10 by incl cycles):\n", .{});
+            std.debug.print("prof builtins (top-20 by EXCL cycles — own-body cost):\n", .{});
             for (top_b) |entry| {
                 if (entry.cycles == 0) break;
                 const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
-                std.debug.print("  {s}: cy={d} calls={d} avg={d}\n", .{ name, entry.cycles, entry.calls, entry.cycles / entry.calls });
+                std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
             }
         }
         if (comptime @import("prof_path.zig").enabled) {

@@ -258,11 +258,12 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
 
 pub fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-    if (scope.resolveLocal(self, span)) |slot| {
+    const name_id = try self.intern.intern(span);
+    if (scope.resolveLocalId(self, name_id)) |slot| {
         try emit.emitCaptureLocal(self, slot);
         return true;
     }
-    if (try scope.resolveCapture(self, span)) |slot| {
+    if (try scope.resolveCaptureId(self, span, name_id)) |slot| {
         try emit.emitOpU16(self, .capture_upvalue, slot);
         return true;
     }

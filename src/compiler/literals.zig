@@ -190,9 +190,17 @@ pub fn compileIdent(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (std.mem.eql(u8, span, "__curPos")) {
         try compileCurPos(self, node.data.atom);
-    } else if (scope.resolveLocal(self, span)) |slot| {
+        return;
+    }
+    // Intern once, then resolve by id (u32 compares) up the scope chain
+    // instead of re-comparing the source bytes against every local at
+    // every parent level. Identifier resolution is the bulk of compile
+    // time (~13% of w=1), and most references are deep upvalues
+    // (`lib`/`config`/`pkgs`) that walk the whole parent chain.
+    const name_id = try self.intern.intern(span);
+    if (scope.resolveLocalId(self, name_id)) |slot| {
         try emit.emitGetLocal(self, slot);
-    } else if (try scope.resolveCapture(self, span)) |slot| {
+    } else if (try scope.resolveCaptureId(self, span, name_id)) |slot| {
         try emit.emitOpU16(self, .get_upvalue, slot);
     } else if (std.mem.eql(u8, span, "builtins")) {
         try emit.emitOp(self, .push_builtins);

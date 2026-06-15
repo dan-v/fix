@@ -71,6 +71,10 @@ pub const Path = enum {
     /// the sorted merge-walk over two attrsets. Hot on the overlay
     /// fixpoint (`prev // overlay final prev`).
     merge_attrs,
+    /// `Parser.parse` — tokenize + build the AST for an imported file.
+    parse,
+    /// `Compiler.compileAndFinish` — AST → bytecode for an imported file.
+    compile,
 };
 
 pub const Sample = struct {
@@ -120,12 +124,18 @@ pub inline fn recordBuiltin(builtin_id: u16, t_start: u64) void {
     s.cycles_inclusive += inclusive;
 }
 
+const NO_BUILTIN: u16 = std.math.maxInt(u16);
+
 const StackFrame = struct {
     path: Path,
     start_tsc: u64,
     /// Sum of inclusive deltas of nested instrumented calls that
     /// have already returned. Used to compute exclusive time at end.
     child_exclusion: u64,
+    /// For an `apply_builtin` frame opened via `startBuiltin`, the
+    /// builtin whose EXCLUSIVE time this frame should be attributed to
+    /// (`builtin_samples`). `NO_BUILTIN` otherwise.
+    builtin_id: u16 = NO_BUILTIN,
 };
 
 const stack_cap: usize = 256;
@@ -168,6 +178,26 @@ pub inline fn start(comptime path: Path) u64 {
     return idx;
 }
 
+/// Like `start(.apply_builtin)` but tags the frame so its EXCLUSIVE
+/// cycles are also attributed to `builtin_samples[builtin_id]` at
+/// `end` — giving a per-builtin breakdown of the `apply_builtin`
+/// bucket that excludes nested instrumented work (force/call/etc.),
+/// i.e. the builtin's own body cost. Pair with `end(.apply_builtin, _)`.
+pub inline fn startBuiltin(builtin_id: u16) u64 {
+    if (!enabled) return std.math.maxInt(u64);
+    if (worker_id.current != 0) return std.math.maxInt(u64);
+    if (prof_stack_len >= stack_cap) return std.math.maxInt(u64);
+    const idx = prof_stack_len;
+    prof_stack[idx] = .{
+        .path = .apply_builtin,
+        .start_tsc = rdtsc(),
+        .child_exclusion = 0,
+        .builtin_id = builtin_id,
+    };
+    prof_stack_len += 1;
+    return idx;
+}
+
 /// End a measurement started by `start`. No-op on disabled builds
 /// and helper threads.
 pub inline fn end(comptime path: Path, t: u64) void {
@@ -187,6 +217,12 @@ pub inline fn end(comptime path: Path, t: u64) void {
     s.calls += 1;
     s.cycles += exclusive;
     s.cycles_inclusive += inclusive;
+    if (frame.builtin_id != NO_BUILTIN and frame.builtin_id < max_builtin_id) {
+        const b = &builtin_samples[frame.builtin_id];
+        b.calls += 1;
+        b.cycles += exclusive;
+        b.cycles_inclusive += inclusive;
+    }
     prof_stack_len -= 1;
     // Attribute the popped scope's inclusive delta to the parent's
     // child_exclusion so the parent's exclusive time skips it.

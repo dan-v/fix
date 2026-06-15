@@ -66,19 +66,32 @@ pub fn resolveLocalId(self: *const Compiler, name_id: InternId) ?u16 {
 }
 
 pub fn resolveCapture(self: *Compiler, name: []const u8) !?u16 {
+    return resolveCaptureId(self, name, try self.intern.intern(name));
+}
+
+/// Id-based capture resolution: identical to `resolveCapture` but
+/// compares interned `name_id`s (u32) up the parent chain instead of
+/// re-comparing the source bytes at every level. The `name` slice is
+/// still stored on the capture (used by `forwardingUpvalue` and capture
+/// descriptors). Hot: every non-local identifier reference walks this.
+pub fn resolveCaptureId(self: *Compiler, name: []const u8, name_id: InternId) anyerror!?u16 {
     const parent = self.parent orelse return null;
-    if (resolveLocal(parent, name)) |parent_slot| {
-        return try addCapture(self, name, .local, parent_slot);
+    if (resolveLocalId(parent, name_id)) |parent_slot| {
+        return try addCaptureId(self, name, name_id, .local, parent_slot);
     }
-    if (try resolveCapture(parent, name)) |parent_upvalue| {
-        return try addCapture(self, name, .upvalue, parent_upvalue);
+    if (try resolveCaptureId(parent, name, name_id)) |parent_upvalue| {
+        return try addCaptureId(self, name, name_id, .upvalue, parent_upvalue);
     }
     return null;
 }
 
 pub fn addCapture(self: *Compiler, name: []const u8, kind: Capture.Kind, capture_index: u16) !u16 {
+    return addCaptureId(self, name, try self.intern.intern(name), kind, capture_index);
+}
+
+pub fn addCaptureId(self: *Compiler, name: []const u8, name_id: InternId, kind: Capture.Kind, capture_index: u16) !u16 {
     for (self.captures.items, 0..) |capture, existing_index| {
-        if (capture.kind == kind and capture.index == capture_index and std.mem.eql(u8, capture.name, name)) {
+        if (capture.kind == kind and capture.index == capture_index and capture.name_id == name_id) {
             return @intCast(existing_index);
         }
     }
@@ -86,6 +99,7 @@ pub fn addCapture(self: *Compiler, name: []const u8, kind: Capture.Kind, capture
     if (self.captures.items.len > std.math.maxInt(u16)) return error.TooManyCaptures;
     try self.captures.append(self.allocator, .{
         .name = name,
+        .name_id = name_id,
         .kind = kind,
         .index = capture_index,
     });
