@@ -5,6 +5,7 @@ const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("../../runtime/heap.zig");
 const int_mod = @import("../../runtime/int.zig");
+const numeric = @import("../../runtime/numeric.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
@@ -106,18 +107,82 @@ pub fn callComparator(self: anytype, cmp: Value, left: Value, right: Value) !boo
     return result.asBool();
 }
 
+/// A hashcode for a forced `genericClosure` key that respects
+/// `valuesEqualForced`: equal keys MUST share a hashcode (collisions are
+/// fine — they fall back to an exact compare). Numerics hash by their
+/// float value (so `1 == 1.0` and the int/float merge rule both hold),
+/// with `-0.0` normalized to `0.0`. String-likes hash by their canonical
+/// text intern id (string equality is id equality). Compound keys
+/// (lists/attrs/closures/...) share one sentinel bucket so they are
+/// always exhaustively compared — identical to the old linear scan, just
+/// without inflating the simple-key buckets.
+fn gcKeyMix(tag: u64, x: u64) u64 {
+    var h = (tag *% 0x9E3779B97F4A7C15) ^ x;
+    h *%= 0xC2B2AE3D27D4EB4F;
+    return h ^ (h >> 31);
+}
+
+fn gcKeyHashCode(self: anytype, key: Value) !u64 {
+    if (numeric.isNumeric(key)) {
+        const f = try numeric.toFloat(key, self.heap);
+        const norm: f64 = if (f == 0.0) 0.0 else f; // collapse -0.0 -> 0.0
+        return gcKeyMix(1, @bitCast(norm));
+    }
+    if (vm_equality.isStringComparable(key)) {
+        return gcKeyMix(2, try stringTextInternId(self, key));
+    }
+    return switch (key.kind()) {
+        .null => 3,
+        .bool_false => 4,
+        .bool_true => 5,
+        else => 6, // compound: shared sentinel bucket, exhaustively compared
+    };
+}
+
+/// O(1)-amortized dedup set for `genericClosure` keys, replacing the old
+/// O(N) linear scan per insert (O(N²) over the closure). The module
+/// system's `genericClosure` over the full module set (N≈3800 on a NixOS
+/// toplevel) spent ~114M cy on that scan, all on the serial critical
+/// path. Buckets keyed by `gcKeyHashCode`; membership confirmed by the
+/// same `valuesEqualForced` the linear scan used, so the result is
+/// byte-identical.
+pub const GcKeySet = struct {
+    index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(Value)) = .empty,
+    seen: std.ArrayListUnmanaged(vm_equality.EqualityPair) = .empty,
+
+    pub fn deinit(self: *GcKeySet, allocator: std.mem.Allocator) void {
+        var it = self.index.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        self.index.deinit(allocator);
+        self.seen.deinit(allocator);
+    }
+
+    /// True if `key` was already present (skip it); otherwise inserts it
+    /// and returns false.
+    fn contains(self: *GcKeySet, vm: anytype, key: Value) !bool {
+        const hc = try gcKeyHashCode(vm, key);
+        const gop = try self.index.getOrPut(vm.allocator, hc);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (gop.value_ptr.items) |stored| {
+            self.seen.clearRetainingCapacity();
+            if (try vm_equality.valuesEqualForced(vm, key, stored, &self.seen)) return true;
+        }
+        try gop.value_ptr.append(vm.allocator, key);
+        return false;
+    }
+};
+
 pub fn genericClosureAppend(
     self: anytype,
     key_name: InternId,
     item: Value,
     result: *std.ArrayListUnmanaged(Value),
-    keys: *std.ArrayListUnmanaged(Value),
+    keys: *GcKeySet,
 ) !void {
     const forced = try vm_force.forceValue(self, item);
     if (!forced.isAttrs()) return error.TypeError;
     const key = try vm_force.forceValue(self, try self.heap.getAttrValue(forced.asObjectId(), key_name));
-    if (try vm_equality.valueSliceContainsForcedValue(self, key, keys.items)) return;
-    try keys.append(self.allocator, key);
+    if (try keys.contains(self, key)) return;
     try result.append(self.allocator, item);
 }
 
@@ -498,7 +563,7 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
 
     var result: std.ArrayListUnmanaged(Value) = .empty;
     defer result.deinit(self.allocator);
-    var keys: std.ArrayListUnmanaged(Value) = .empty;
+    var keys: GcKeySet = .{};
     defer keys.deinit(self.allocator);
 
     const key_name = try self.intern.intern("key");
