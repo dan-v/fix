@@ -22,6 +22,7 @@ const ir = @import("ir.zig");
 const Recorder = @import("recorder.zig").Recorder;
 const opt = @import("opt.zig");
 const codegen = @import("codegen.zig");
+const hot = @import("hot.zig");
 const jit = @import("../jit.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;
 const Value = @import("../runtime/value.zig").Value;
@@ -45,6 +46,7 @@ var traces_done: u64 = 0;
 
 pub fn report() void {
     if (comptime !enabled) return;
+    if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, nesting(force)={d} call={d} error={d} ===\n", .{ traces_done, abort_nesting, abort_call, abort_error });
     // Top unhandled ops.
     var shown: usize = 0;
@@ -121,7 +123,7 @@ fn finish(vm: *VM) void {
     traces_done += 1;
     const raw = r.trace.len();
     opt.optimize(&r.trace, vm.allocator) catch {};
-    printTrace(&r.trace, raw);
+    if (hot.report_enabled) printTrace(&r.trace, raw);
     // Transfer the trace to a stable heap allocation and publish it for
     // execution. Ownership of the trace's arrays moves to `t`; we free the
     // recorder + Recording struct but must NOT deinit the moved-out trace.

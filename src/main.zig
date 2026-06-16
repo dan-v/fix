@@ -195,6 +195,14 @@ pub fn main(init: std.process.Init) !void {
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 
+    // Tracing-JIT diagnostics (trace dumps, hot-anchor list, exec counters)
+    // print during/after eval only when stats are requested; otherwise a
+    // `-Dtjit` build stays quiet. Must be set before evaluation since traces
+    // are dumped as they're recorded.
+    if (comptime @import("tjit/hot.zig").enabled) {
+        @import("tjit/hot.zig").report_enabled = options.print_sched_stats;
+    }
+
     const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
     trace_setup.finish();

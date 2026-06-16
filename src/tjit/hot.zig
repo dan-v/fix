@@ -19,6 +19,13 @@ const types = @import("../runtime/types.zig");
 
 pub const enabled: bool = build_options.tjit;
 
+/// Runtime gate for the JIT's diagnostic output (per-trace IR dumps, hot-anchor
+/// listing, exec/recording counters). Off by default so a `-Dtjit` build runs
+/// clean — the spew is opt-in via `--print-sched-stats`. (Always-on stderr
+/// dumps also corrupt the `zig build test --listen=-` IPC stream.) Set once in
+/// `main` before evaluation; read at every JIT print site.
+pub var report_enabled: bool = false;
+
 const ChunkId = types.ChunkId;
 
 pub const State = enum(u8) { cold, armed, traced, blacklisted };

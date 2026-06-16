@@ -39,6 +39,7 @@ var deopt_count: std.atomic.Value(u64) = .{ .raw = 0 };
 
 pub fn report() void {
     if (comptime !enabled) return;
+    if (!@import("hot.zig").report_enabled) return;
     const nat = native_count.load(.monotonic);
     const e = exec_count.load(.monotonic);
     const d = deopt_count.load(.monotonic);

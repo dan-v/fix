@@ -124,6 +124,7 @@ pub const Evaluator = struct {
     /// Resolves each armed/traced chunk to its source location so we can see
     /// the recorder's targets on the real workload.
     fn reportHotAnchors(self: *Evaluator) void {
+        if (!@import("tjit/hot.zig").report_enabled) return;
         const h = self.registry.hot orelse return;
         var armed: usize = 0;
         var traced: usize = 0;
