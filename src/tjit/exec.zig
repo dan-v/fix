@@ -138,10 +138,18 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                 vals[i] = try access.getAttrValue(vm, attrs, @intCast(instr.aux));
             },
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
-                // The attr lookup itself (get_attr) does the real work and
-                // raises identically on a missing attr, so the shape guard is
-                // a no-op here (it exists for a future fast direct-slot load).
-                .attr_shape => {},
+                // Validate the recorded attr shape: the operand must force to an
+                // attrset that actually contains the recorded key. A divergent
+                // instance (non-attrs, or missing the key) side-exits here —
+                // otherwise the following `get_attr` would *raise*
+                // MissingAttribute instead of deopting, mis-evaluating a chunk
+                // whose attr shape varies across executions.
+                .attr_shape => {
+                    const a = try force.forceValue(vm, vals[instr.a]);
+                    if (!a.isAttrs()) return null;
+                    const found = vm.heap.getAttrValueOpt(a.asObjectId(), @intCast(instr.aux2)) catch return null;
+                    if (found == null) return null;
+                },
                 .chunk_id => {
                     const c = try force.forceValue(vm, vals[instr.a]);
                     if (!c.isClosure()) return null;

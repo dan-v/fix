@@ -96,7 +96,13 @@ pub fn compile(buf: *CodeBuffer, trace: *const ir.Trace) ?*const anyopaque {
                 e.storeRaxToStack(i);
             },
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
-                .attr_shape => {}, // no-op: get_attr does the real lookup
+                .attr_shape => {
+                    e.loadStackToRsi(instr.a); // the attrs Ref
+                    e.movEdxImm32(instr.aux2); // expected attr name
+                    e.movRdiRbx();
+                    e.callHelper(@intFromPtr(&helpers.tjitGuardAttrShape));
+                    e.errCheckToEpilogue(); // deopt (missing/non-attrs) or error → epilogue
+                },
                 .chunk_id => {
                     e.loadStackToRsi(instr.a); // the func Ref
                     e.movEdxImm32(instr.aux2); // expected chunk id

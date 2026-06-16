@@ -71,6 +71,20 @@ pub fn tjitGetAttr(vm: *anyopaque, attrs: Value, name: u32) callconv(.c) JitResu
     return ok(access.getAttrValue(self, av, @as(InternId, name)) catch |e| return errResult(e));
 }
 
+/// Guard that `attrs` forces to an attrset that actually contains `name`.
+/// Deopt otherwise (non-attrs, or a different-shaped instance missing the
+/// recorded key). Without this the following `get_attr` would *raise*
+/// `MissingAttribute` on a divergent shape instead of cleanly side-exiting —
+/// the soundness hole that blocks tracing variable-shape chunks.
+pub fn tjitGuardAttrShape(vm: *anyopaque, attrs: Value, name: u32) callconv(.c) JitResult {
+    const self: *VM = @ptrCast(@alignCast(vm));
+    const av = force.forceValue(self, attrs) catch |e| return errResult(e);
+    if (!av.isAttrs()) return deopt();
+    const found = self.heap.getAttrValueOpt(av.asObjectId(), @as(InternId, name)) catch return deopt();
+    if (found == null) return deopt();
+    return ok(av);
+}
+
 /// Guard that `func` resolves to a closure of `chunk_id`. Deopt on mismatch.
 pub fn tjitGuardChunkId(vm: *anyopaque, func: Value, chunk_id: u32) callconv(.c) JitResult {
     const self: *VM = @ptrCast(@alignCast(vm));
