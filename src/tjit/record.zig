@@ -21,6 +21,8 @@ const vm_mod = @import("../vm.zig");
 const ir = @import("ir.zig");
 const Recorder = @import("recorder.zig").Recorder;
 const opt = @import("opt.zig");
+const codegen = @import("codegen.zig");
+const jit = @import("../jit.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;
 const Value = @import("../runtime/value.zig").Value;
 const types = @import("../runtime/types.zig");
@@ -103,7 +105,17 @@ fn finish(vm: *VM) void {
     r.rec.deinit();
     vm.allocator.destroy(r);
     vm.tjit_rec = null;
-    if (vm.registry.hot) |h| h.publishTrace(anchor, @intFromPtr(t));
+    // Try to lower the trace to native code; fall back to the exec.zig
+    // interpreter (publishTrace) either way.
+    var native_fn: ?*const anyopaque = null;
+    if (comptime jit.code_enabled) {
+        const reg = @constCast(vm.registry); // append serializes internally
+        native_fn = codegen.compile(&reg.jit_buffer, t);
+    }
+    if (vm.registry.hot) |h| {
+        if (native_fn) |nf| h.publishNative(anchor, @intFromPtr(nf));
+        h.publishTrace(anchor, @intFromPtr(t));
+    }
 }
 
 /// Release a recording abandoned by an unwinding error (called from VM

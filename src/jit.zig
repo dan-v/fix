@@ -35,6 +35,13 @@ pub const enabled: bool = build_options.jit and
     builtin.cpu.arch == .x86_64 and
     builtin.os.tag == .linux;
 
+/// The RWX `CodeBuffer` + x86-64 emitter are shared by the per-body JIT
+/// (`-Djit`) and the tracing JIT (`-Dtjit`). `code_enabled` gates the
+/// machinery both need; `enabled` still gates the per-body compile paths.
+pub const code_enabled: bool = (build_options.jit or build_options.tjit) and
+    builtin.cpu.arch == .x86_64 and
+    builtin.os.tag == .linux;
+
 /// 16-byte struct return: SysV x86_64 returns the low 8 bytes in
 /// rax and the high 8 bytes in rdx, so JIT'd code can hand back
 /// both `value` and `error_code` in registers without spilling.
@@ -289,7 +296,7 @@ pub const CodeBuffer = struct {
     mu: @import("runtime/stable_segments.zig").SpinMutex,
 
     pub fn init(capacity: usize) !CodeBuffer {
-        if (!enabled) @compileError("CodeBuffer used in a build without -Djit");
+        if (!code_enabled) @compileError("CodeBuffer used in a build without -Djit/-Dtjit");
         const aligned = std.mem.alignForward(usize, capacity, std.heap.pageSize());
         const raw = std.posix.mmap(
             null,
@@ -303,7 +310,7 @@ pub const CodeBuffer = struct {
     }
 
     pub fn deinit(self: *CodeBuffer) void {
-        if (!enabled) return;
+        if (!code_enabled) return;
         std.posix.munmap(@alignCast(self.base[0..self.capacity]));
         self.* = undefined;
     }

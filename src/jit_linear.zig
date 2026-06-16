@@ -33,14 +33,14 @@ const MAX_PATCHES = 128; // max epilogue jump sites
 /// Minimal append-only x86-64 emitter. Only the instruction forms the
 /// linear compiler needs; memory operands always use disp32 to keep the
 /// encoder branch-free.
-const Emitter = struct {
+pub const Emitter = struct {
     buf: [MAX_CODE]u8 = undefined,
     len: usize = 0,
     epi_patches: [MAX_PATCHES]usize = undefined,
     n_patches: usize = 0,
     overflow: bool = false,
 
-    fn byte(self: *Emitter, v: u8) void {
+    pub fn byte(self: *Emitter, v: u8) void {
         if (self.len >= self.buf.len) {
             self.overflow = true;
             return;
@@ -49,18 +49,18 @@ const Emitter = struct {
         self.len += 1;
     }
 
-    fn bytes(self: *Emitter, vs: []const u8) void {
+    pub fn bytes(self: *Emitter, vs: []const u8) void {
         for (vs) |v| self.byte(v);
     }
 
-    fn u32le(self: *Emitter, v: u32) void {
+    pub fn u32le(self: *Emitter, v: u32) void {
         self.byte(@truncate(v));
         self.byte(@truncate(v >> 8));
         self.byte(@truncate(v >> 16));
         self.byte(@truncate(v >> 24));
     }
 
-    fn u64le(self: *Emitter, v: u64) void {
+    pub fn u64le(self: *Emitter, v: u64) void {
         self.u32le(@truncate(v));
         self.u32le(@truncate(v >> 32));
     }
@@ -68,7 +68,7 @@ const Emitter = struct {
     // ---- memory operands (disp32) ----
 
     /// mov [rsp + disp], <reg encoded in `modrm_reg`>  (REX provided).
-    fn movStoreRsp(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
+    pub fn movStoreRsp(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
         self.byte(rex);
         self.byte(0x89);
         self.byte(0x84 | (modrm_reg << 3)); // mod=10, rm=100(SIB)
@@ -76,7 +76,7 @@ const Emitter = struct {
         self.u32le(disp);
     }
     /// mov <reg>, [rsp + disp]
-    fn movLoadRsp(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
+    pub fn movLoadRsp(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
         self.byte(rex);
         self.byte(0x8b);
         self.byte(0x84 | (modrm_reg << 3));
@@ -84,7 +84,7 @@ const Emitter = struct {
         self.u32le(disp);
     }
     /// mov <reg>, [r14 + disp]  (REX.W+B = 0x49 baked into callers)
-    fn movLoadR14(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
+    pub fn movLoadR14(self: *Emitter, rex: u8, modrm_reg: u8, disp: u32) void {
         self.byte(rex);
         self.byte(0x8b);
         self.byte(0x86 | (modrm_reg << 3)); // mod=10, rm=110 (r14, no SIB)
@@ -92,64 +92,70 @@ const Emitter = struct {
     }
 
     // Common register-encoded variants (modrm_reg in bits 5:3).
-    fn storeRaxToStack(self: *Emitter, slot: u32) void {
+    pub fn storeRaxToStack(self: *Emitter, slot: u32) void {
         self.movStoreRsp(0x48, 0, slot * 8); // rax
     }
-    fn storeR15ToStack(self: *Emitter, slot: u32) void {
+    pub fn storeR15ToStack(self: *Emitter, slot: u32) void {
         self.movStoreRsp(0x4c, 7, slot * 8); // r15 (REX.R)
     }
-    fn loadStackToRax(self: *Emitter, slot: u32) void {
+    pub fn loadStackToRax(self: *Emitter, slot: u32) void {
         self.movLoadRsp(0x48, 0, slot * 8);
     }
-    fn loadStackToRsi(self: *Emitter, slot: u32) void {
+    pub fn loadStackToRsi(self: *Emitter, slot: u32) void {
         self.movLoadRsp(0x48, 6, slot * 8);
     }
-    fn loadStackToRdx(self: *Emitter, slot: u32) void {
+    pub fn loadStackToRdx(self: *Emitter, slot: u32) void {
         self.movLoadRsp(0x48, 2, slot * 8);
     }
-    fn loadUpvalueToRax(self: *Emitter, slot: u32) void {
+    pub fn loadUpvalueToRax(self: *Emitter, slot: u32) void {
         self.movLoadR14(0x49, 0, slot * 8);
     }
-    fn loadUpvalueToRsi(self: *Emitter, slot: u32) void {
+    pub fn loadUpvalueToRsi(self: *Emitter, slot: u32) void {
         self.movLoadR14(0x49, 6, slot * 8);
     }
 
     // ---- immediates / reg moves ----
-    fn movRaxImm64(self: *Emitter, v: u64) void {
+    pub fn movRaxImm64(self: *Emitter, v: u64) void {
         self.bytes(&.{ 0x48, 0xb8 });
         self.u64le(v);
     }
-    fn movRdiRbx(self: *Emitter) void {
+    pub fn movRdiRbx(self: *Emitter) void {
         self.bytes(&.{ 0x48, 0x89, 0xdf });
     }
-    fn movRsiR15(self: *Emitter) void {
+    pub fn movRsiR15(self: *Emitter) void {
         self.bytes(&.{ 0x4c, 0x89, 0xfe });
     }
-    fn xorEdxEdx(self: *Emitter) void {
+    pub fn xorEdxEdx(self: *Emitter) void {
         self.bytes(&.{ 0x31, 0xd2 });
+    }
+    /// mov edx, imm32 (zero-extends to rdx). For passing an attr-name /
+    /// chunk-id immediate as a helper's 3rd C-ABI arg.
+    pub fn movEdxImm32(self: *Emitter, v: u32) void {
+        self.byte(0xba);
+        self.u32le(v);
     }
 
     // ---- calls / control ----
     /// movabs r11, target ; call r11
-    fn callHelper(self: *Emitter, target: u64) void {
+    pub fn callHelper(self: *Emitter, target: u64) void {
         self.bytes(&.{ 0x49, 0xbb });
         self.u64le(target);
         self.bytes(&.{ 0x41, 0xff, 0xd3 });
     }
     /// test rdx,rdx ; jnz epilogue  (records a patch site)
-    fn errCheckToEpilogue(self: *Emitter) void {
+    pub fn errCheckToEpilogue(self: *Emitter) void {
         self.bytes(&.{ 0x48, 0x85, 0xd2 }); // test rdx,rdx
         self.bytes(&.{ 0x0f, 0x85 }); // jnz rel32
         self.recordEpiPatch();
         self.u32le(0); // placeholder
     }
     /// jmp epilogue (records a patch site)
-    fn jmpEpilogue(self: *Emitter) void {
+    pub fn jmpEpilogue(self: *Emitter) void {
         self.byte(0xe9); // jmp rel32
         self.recordEpiPatch();
         self.u32le(0);
     }
-    fn recordEpiPatch(self: *Emitter) void {
+    pub fn recordEpiPatch(self: *Emitter) void {
         if (self.n_patches >= self.epi_patches.len) {
             self.overflow = true;
             return;
@@ -158,7 +164,7 @@ const Emitter = struct {
         self.n_patches += 1;
     }
 
-    fn prologue(self: *Emitter, reserve: u32) void {
+    pub fn prologue(self: *Emitter, reserve: u32) void {
         // push rbx ; push r14 ; push r15
         self.bytes(&.{ 0x53, 0x41, 0x56, 0x41, 0x57 });
         // mov rbx,rdi ; mov r14,rsi ; mov r15,rdx
@@ -168,7 +174,7 @@ const Emitter = struct {
         self.u32le(reserve);
     }
 
-    fn bindEpilogue(self: *Emitter, reserve: u32) void {
+    pub fn bindEpilogue(self: *Emitter, reserve: u32) void {
         const epi: usize = self.len;
         // add rsp, reserve ; pop r15 ; pop r14 ; pop rbx ; ret
         self.bytes(&.{ 0x48, 0x81, 0xc4 });

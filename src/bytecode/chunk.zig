@@ -518,7 +518,7 @@ pub const ChunkRegistry = struct {
     const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
     const jit = @import("../jit.zig");
     const jit_linear = @import("../jit_linear.zig");
-    const JitCodeBuffer = if (jit.enabled) jit.CodeBuffer else void;
+    const JitCodeBuffer = if (jit.code_enabled) jit.CodeBuffer else void;
 
     allocator: std.mem.Allocator,
     chunks: Store,
@@ -547,7 +547,7 @@ pub const ChunkRegistry = struct {
             // under capacity. Reservation is virtual until populated
             // so the over-provision is free for callers who don't
             // hit the upper bound.
-            .jit_buffer = if (jit.enabled) try jit.CodeBuffer.init(16 << 20) else {},
+            .jit_buffer = if (jit.code_enabled) try jit.CodeBuffer.init(16 << 20) else {},
         };
         errdefer self.deinit();
         if (hot_mod.enabled) {
@@ -627,7 +627,7 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
-        if (jit.enabled) self.jit_buffer.deinit();
+        if (jit.code_enabled) self.jit_buffer.deinit();
         if (self.hot) |h| {
             h.deinit(self.allocator);
             self.allocator.destroy(h);

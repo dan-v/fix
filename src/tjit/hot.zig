@@ -32,6 +32,9 @@ pub const ChunkHot = struct {
     /// release / read acquire so a reader that sees the pointer sees a fully
     /// built trace.
     trace_bits: std.atomic.Value(usize) = .{ .raw = 0 },
+    /// Native-compiled trace fn (LambdaCompiledFn) as bits, 0 = none. When
+    /// set, preferred over `trace_bits` (the exec.zig interpreter fallback).
+    native_bits: std.atomic.Value(usize) = .{ .raw = 0 },
 };
 
 pub const HotTable = struct {
@@ -86,6 +89,17 @@ pub const HotTable = struct {
     pub fn traceOf(self: *const HotTable, id: ChunkId) usize {
         if (id >= self.entries.len) return 0;
         return self.entries[id].trace_bits.load(.acquire);
+    }
+
+    /// Publish a native-compiled trace fn (pointer bits) for `id`.
+    pub fn publishNative(self: *HotTable, id: ChunkId, fn_bits: usize) void {
+        if (id < self.entries.len) self.entries[id].native_bits.store(fn_bits, .release);
+    }
+
+    /// The installed native trace fn bits for `id` (0 = none). Acquire load.
+    pub fn nativeOf(self: *const HotTable, id: ChunkId) usize {
+        if (id >= self.entries.len) return 0;
+        return self.entries[id].native_bits.load(.acquire);
     }
 
     pub fn markTraced(self: *HotTable, id: ChunkId) void {

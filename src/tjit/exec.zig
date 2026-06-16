@@ -28,17 +28,21 @@ const strings = @import("../vm/strings.zig");
 const VM = vm_mod.VM;
 const GuardKind = ir.GuardKind;
 const ChunkId = @import("../runtime/types.zig").ChunkId;
+const jit = @import("../jit.zig");
+const helpers = @import("jit_helpers.zig");
 
 pub const enabled: bool = @import("build_options").tjit;
 
+var native_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var exec_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var deopt_count: std.atomic.Value(u64) = .{ .raw = 0 };
 
 pub fn report() void {
     if (comptime !enabled) return;
+    const nat = native_count.load(.monotonic);
     const e = exec_count.load(.monotonic);
     const d = deopt_count.load(.monotonic);
-    std.debug.print("=== tjit exec: {d} trace runs completed, {d} side-exits (deopts) ===\n", .{ e, d });
+    std.debug.print("=== tjit exec: {d} native runs, {d} interpreted runs, {d} side-exits (deopts) ===\n", .{ nat, e, d });
 }
 
 /// Entry point for the interpreter's execution hooks: if chunk `chunk_id` has
@@ -48,6 +52,21 @@ pub fn report() void {
 pub fn tryRun(vm: *VM, chunk_id: ChunkId, upvalues: []const Value, arg: Value) anyerror!?Value {
     if (vm.tjit_rec != null) return null; // don't execute a trace mid-recording
     const h = vm.registry.hot orelse return null;
+    // Native-compiled trace takes priority over the exec.zig interpreter.
+    const nbits = h.nativeOf(chunk_id);
+    if (nbits != 0) {
+        const native: jit.LambdaCompiledFn = @ptrFromInt(nbits);
+        const r = native(@ptrCast(vm), upvalues.ptr, arg);
+        if (r.error_code == 0) {
+            _ = native_count.fetchAdd(1, .monotonic);
+            return r.value;
+        }
+        if (r.error_code == helpers.DEOPT_CODE) {
+            _ = deopt_count.fetchAdd(1, .monotonic);
+            return null; // side-exit → caller interprets
+        }
+        return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(r.error_code)));
+    }
     const bits = h.traceOf(chunk_id);
     if (bits == 0) return null;
     const trace: *const ir.Trace = @ptrFromInt(bits);
