@@ -148,7 +148,7 @@ pub const Evaluator = struct {
             }
             const path = if (file) |f| std.fs.path.basename(self.intern.get(f)) else "<no-file>";
             std.debug.print("HOT-ANCHOR chunk={d} {s}:{d} {s} entries={d} locals={d}\n", .{
-                id, path, line, @tagName(st), h.entries[id].count.load(.monotonic), ch.local_count,
+                id, path, line, @tagName(st), h.entries[id].count, ch.local_count,
             });
         }
         std.debug.print("=== tjit hot anchors: {d} armed, {d} traced (threshold={d}, chunks={d}) ===\n", .{ armed, traced, h.hot_threshold, count });

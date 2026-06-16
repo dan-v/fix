@@ -24,7 +24,12 @@ const ChunkId = types.ChunkId;
 pub const State = enum(u8) { cold, armed, traced, blacklisted };
 
 pub const ChunkHot = struct {
-    count: std.atomic.Value(u32) = .{ .raw = 0 },
+    /// Entry counter. Plain (non-atomic): hotness is approximate, so racy
+    /// increments at high worker counts are benign (a chunk just heats a
+    /// little slower); only the cold→armed transition needs the atomic CAS.
+    /// This keeps the per-frame-entry cost a plain load+store, not a LOCK
+    /// fetchAdd, across the millions of cold entries.
+    count: u32 = 0,
     state: std.atomic.Value(u8) = .{ .raw = @intFromEnum(State.cold) },
     aborts: std.atomic.Value(u8) = .{ .raw = 0 },
     /// Installed compiled trace as `@intFromPtr` (0 = none). Stored as raw
@@ -62,7 +67,8 @@ pub const HotTable = struct {
         if (id >= self.entries.len) return false;
         const e = &self.entries[id];
         if (e.state.load(.monotonic) != @intFromEnum(State.cold)) return false;
-        const n = e.count.fetchAdd(1, .monotonic) + 1;
+        e.count += 1; // plain; racy-benign at w>1
+        const n = e.count;
         if (n != self.hot_threshold) return false;
         // Exactly one fetchAdd produced n == threshold; that worker arms.
         return e.state.cmpxchgStrong(
@@ -114,7 +120,7 @@ pub const HotTable = struct {
         if (n >= self.max_aborts) {
             e.state.store(@intFromEnum(State.blacklisted), .release);
         } else {
-            e.count.store(0, .monotonic);
+            e.count = 0;
             e.state.store(@intFromEnum(State.cold), .release);
         }
     }
