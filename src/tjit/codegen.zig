@@ -31,7 +31,7 @@ const MAX_INSTRS: usize = 400;
 fn supported(trace: *const ir.Trace) bool {
     for (trace.instrs.items) |instr| {
         switch (instr.op) {
-            .nop, .const_val, .load_upvalue, .load_upvalue_of, .trace_arg, .add_int, .sub_int, .mul_int, .get_attr, .ret => {},
+            .nop, .const_val, .load_upvalue, .load_upvalue_of, .trace_arg, .force, .add_int, .sub_int, .mul_int, .get_attr, .ret => {},
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
                 .attr_shape, .chunk_id, .bool_is => {},
                 else => return false,
@@ -84,6 +84,13 @@ pub fn compile(buf: *CodeBuffer, trace: *const ir.Trace) ?*const anyopaque {
                 e.movEdxImm32(instr.aux); // name InternId
                 e.movRdiRbx();
                 e.callHelper(@intFromPtr(&helpers.tjitGetAttr));
+                e.errCheckToEpilogue();
+                e.storeRaxToStack(i);
+            },
+            .force => {
+                e.loadStackToRsi(instr.a);
+                e.movRdiRbx();
+                e.callHelper(@intFromPtr(&helpers.tjitForce));
                 e.errCheckToEpilogue();
                 e.storeRaxToStack(i);
             },

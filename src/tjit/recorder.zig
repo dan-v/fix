@@ -133,6 +133,17 @@ pub const Recorder = struct {
         }
     }
 
+    /// Force the top-of-stack value to WHNF, replacing it with the forced Ref.
+    /// Emitted for the *forcing* load opcodes (`get_local`/`get_upvalue`) so the
+    /// trace reproduces the interpreter's evaluation exactly — without it a body
+    /// like `get_upvalue 0; ret` would carry an unforced thunk where the
+    /// interpreter produced WHNF (deep-equal, but breaks downstream type checks).
+    /// `capture_*` opcodes intentionally skip this (closure captures stay lazy).
+    pub fn forceTop(self: *Recorder) !void {
+        const v = try self.pop();
+        try self.push(try self.emit(.{ .op = .force, .a = v }));
+    }
+
     // ---- stack shuffles ----
 
     pub fn dropTop(self: *Recorder) !void {

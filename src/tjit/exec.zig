@@ -36,6 +36,7 @@ pub const enabled: bool = @import("build_options").tjit;
 var native_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var exec_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var deopt_count: std.atomic.Value(u64) = .{ .raw = 0 };
+var err_deopt_count: std.atomic.Value(u64) = .{ .raw = 0 }; // deopts from a trace raising
 
 pub fn report() void {
     if (comptime !enabled) return;
@@ -43,13 +44,18 @@ pub fn report() void {
     const nat = native_count.load(.monotonic);
     const e = exec_count.load(.monotonic);
     const d = deopt_count.load(.monotonic);
-    std.debug.print("=== tjit exec: {d} native runs, {d} interpreted runs, {d} side-exits (deopts) ===\n", .{ nat, e, d });
+    const ed = err_deopt_count.load(.monotonic);
+    std.debug.print("=== tjit exec: {d} native runs, {d} interpreted runs, {d} side-exits (deopts, {d} from raises) ===\n", .{ nat, e, d, ed });
 }
 
 /// Entry point for the interpreter's execution hooks: if chunk `chunk_id` has
 /// an installed trace and we're not currently recording, run it. Returns the
 /// trace result, or `null` to fall back to interpreting the chunk (no trace,
-/// recording in progress, or a guard side-exit). Errors propagate.
+/// recording in progress, or a guard side-exit). A trace that *raises* an eval
+/// error also side-exits (see `errorDeopt`): the interpreter is the oracle for
+/// errors just as for control flow, so a spurious raise from an unguarded
+/// value-kind divergence is recovered, and a genuine error is re-raised
+/// identically by the interpreter.
 pub fn tryRun(vm: *VM, chunk_id: ChunkId, upvalues: []const Value, arg: Value) anyerror!?Value {
     if (vm.tjit_rec != null) return null; // don't execute a trace mid-recording
     const h = vm.registry.hot orelse return null;
@@ -64,20 +70,32 @@ pub fn tryRun(vm: *VM, chunk_id: ChunkId, upvalues: []const Value, arg: Value) a
         }
         if (r.error_code == helpers.DEOPT_CODE) {
             _ = deopt_count.fetchAdd(1, .monotonic);
-            return null; // side-exit → caller interprets
+            return null; // guard side-exit → caller interprets
         }
-        return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(r.error_code)));
+        return errorDeopt(vm); // trace raised → side-exit, interpreter re-decides
     }
     const bits = h.traceOf(chunk_id);
     if (bits == 0) return null;
     const trace: *const ir.Trace = @ptrFromInt(bits);
-    const result = try execute(vm, trace, upvalues, arg);
+    const result = execute(vm, trace, upvalues, arg) catch return errorDeopt(vm);
     if (result != null) {
         _ = exec_count.fetchAdd(1, .monotonic);
     } else {
         _ = deopt_count.fetchAdd(1, .monotonic);
     }
     return result;
+}
+
+/// A trace raised an eval error. Discard any partial error context it built on
+/// the VM's error trace (the interpreter rebuilds the authoritative one if it
+/// genuinely errors) and side-exit. Safe because a trace's only side effects
+/// are memoized forces + pure reads; a trace is only ever entered mid-force, so
+/// `vm.trace` is clean (no in-flight error) at that point.
+fn errorDeopt(vm: *VM) ?Value {
+    if (vm.trace) |t| t.clear();
+    _ = err_deopt_count.fetchAdd(1, .monotonic);
+    _ = deopt_count.fetchAdd(1, .monotonic);
+    return null;
 }
 
 /// Execute `trace`. Returns its result, or `null` to deopt (caller should
@@ -104,6 +122,7 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                 vals[i] = cl.upvalues[instr.aux];
             },
             .trace_arg => vals[i] = arg,
+            .force => vals[i] = try force.forceValue(vm, vals[instr.a]),
             .add_int => {
                 // Matches opAddInt: generic `+` over numbers / paths / strings.
                 const a = try force.forceValue(vm, vals[instr.a]);

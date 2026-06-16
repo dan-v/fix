@@ -38,16 +38,17 @@ const readU32 = vm_mod.readU32;
 
 // --- abort-reason diagnostics (why traces fail to record) ---
 const op_count = @import("../bytecode/opcode.zig").count;
-var abort_nesting: u64 = 0; // implicit force ran a thunk body (force-inlining)
+var abort_underflow: u64 = 0; // VM popped above our model (defensive abort)
 var abort_call: u64 = 0; // call/tail_call to a non-arity-1 / non-closure callee
 var abort_error: u64 = 0; // recorder error (stack underflow, depth/emit overflow)
 var abort_op: [op_count]u64 = @splat(0); // unhandled opcode, by op
 var traces_done: u64 = 0;
+var suppress_spans: u64 = 0; // implicit-force bodies skipped (recorded as re-force)
 
 pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
-    std.debug.print("=== tjit recording aborts: {d} done, nesting(force)={d} call={d} error={d} ===\n", .{ traces_done, abort_nesting, abort_call, abort_error });
+    std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
@@ -72,9 +73,13 @@ pub const Recording = struct {
     trace: ir.Trace,
     rec: Recorder,
     anchor: ChunkId,
-    /// `frames_len` at the anchor frame; ops observed at any other depth mean
-    /// we've nested and must abort (phase 1 doesn't inline).
+    /// `frames_len` at the anchor frame. The recorder's modeled depth is
+    /// `root_depth + inlineDepth() - 1`; a VM depth above it is an unmodeled
+    /// implicit-force body we suppress (see `observe`).
     root_depth: u32,
+    /// True while observation is suppressed inside a nested implicit-force
+    /// body. Tracks span entry for the diagnostic counter.
+    suppressing: bool = false,
 };
 
 fn state(vm: *VM) ?*Recording {
@@ -159,15 +164,32 @@ pub fn cleanup(vm: *VM) void {
 /// `vm.tjit_rec != null`.
 pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) void {
     const r = state(vm) orelse return;
-    // The recorder's inline-frame depth must track the VM's. A mismatch means
-    // the VM nested a frame we didn't model — an *implicit* force that ran a
-    // thunk body — which we can't linearize without force-inlining. Abort.
+    // The recorder's inline-frame depth must track the VM's. A VM depth *above*
+    // our model means a consumer op (get_attr / a binop / get_local …) forced
+    // an unresolved thunk and the interpreter is running that thunk's body in a
+    // nested frame we never modeled. We don't inline it: the consumer recorded
+    // its operand as a raw (unforced) Ref, and the executor re-forces that Ref
+    // through the full `forceValue` (running the body then, deterministically +
+    // memoized). So we *suppress* observation until the body unwinds back to
+    // our depth, then resume — turning the old hard abort into a recorded
+    // re-force. Soundness rests on the guards actually validating re-forced
+    // values (e.g. attr_shape deopts on a divergent shape, see exec.zig).
     const expected = r.root_depth + @as(u32, @intCast(r.rec.inlineDepth())) - 1;
-    if (vm.frames_len != expected) {
-        abort_nesting += 1;
+    if (vm.frames_len > expected) {
+        if (!r.suppressing) {
+            r.suppressing = true;
+            suppress_spans += 1;
+        }
+        return;
+    }
+    if (vm.frames_len < expected) {
+        // Unwound past the anchor frame without observing its `ret` — shouldn't
+        // happen on a normal path. Bail defensively.
+        abort_underflow += 1;
         abort(vm);
         return;
     }
+    r.suppressing = false;
     r.rec.setIp(@intCast(ip));
     observeOp(vm, &r.rec, frame, code, ip, op) catch {
         abort_error += 1;
@@ -200,13 +222,26 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
         .push_false => try rec.pushConst(Value.boolVal(false)),
         .pop => try rec.dropTop(),
         .constant => try rec.pushConst(frame.chunk_ptr.constants[readU16(code, ip + 1)]),
-        .get_local => try rec.getLocal(code[ip + 1]),
-        .get_local_long => try rec.getLocal(readU16(code, ip + 1)),
+        // Forcing loads: the interpreter evaluates the slot to WHNF, so the
+        // trace forces too (forceTop). Skipping this would let an unforced thunk
+        // flow to `ret` / a non-forcing consumer — deep-equal to the
+        // interpreter's value but breaking downstream type checks.
+        .get_local => {
+            try rec.getLocal(code[ip + 1]);
+            try rec.forceTop();
+        },
+        .get_local_long => {
+            try rec.getLocal(readU16(code, ip + 1));
+            try rec.forceTop();
+        },
         .set_local => try rec.setLocal(code[ip + 1]),
         .set_local_long => try rec.setLocal(readU16(code, ip + 1)),
-        .get_upvalue => try rec.getUpvalue(readU16(code, ip + 1)),
-        // Captures push a value (unforced) to be closed over — same dataflow
-        // as get_upvalue/get_local in the trace (the consumer forces).
+        .get_upvalue => {
+            try rec.getUpvalue(readU16(code, ip + 1));
+            try rec.forceTop();
+        },
+        // Capturing loads push the value *unforced* for a closure to capture —
+        // they must NOT force (laziness preserved).
         .capture_upvalue => try rec.getUpvalue(readU16(code, ip + 1)),
         .capture_local => try rec.getLocal(code[ip + 1]),
         .capture_local_long => try rec.getLocal(readU16(code, ip + 1)),

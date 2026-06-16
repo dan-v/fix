@@ -64,6 +64,13 @@ pub fn tjitMul(vm: *anyopaque, a: Value, b: Value) callconv(.c) JitResult {
     return ok(numeric.mul(self.heap, av, bv) catch |e| return errResult(e));
 }
 
+/// Force `v` to WHNF (matches the interpreter's forcing loads). Errors
+/// propagate as error_code → the trace side-exits.
+pub fn tjitForce(vm: *anyopaque, v: Value) callconv(.c) JitResult {
+    const self: *VM = @ptrCast(@alignCast(vm));
+    return ok(force.forceValue(self, v) catch |e| return errResult(e));
+}
+
 /// `attrs.name` — force the attrs operand then look it up (matches exec.zig).
 pub fn tjitGetAttr(vm: *anyopaque, attrs: Value, name: u32) callconv(.c) JitResult {
     const self: *VM = @ptrCast(@alignCast(vm));
