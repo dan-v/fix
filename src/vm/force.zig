@@ -16,6 +16,7 @@ const BuiltinId = @import("../builtins.zig").BuiltinId;
 const prof = @import("../prof.zig");
 const prof_path = @import("../prof_path.zig");
 const trace_probe = @import("trace_probe.zig");
+const tjit_exec = @import("../tjit/exec.zig");
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
@@ -347,6 +348,11 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
             const bytecode = &target.bytecode;
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
             const upvalues = bytecode.upvalues();
+            // Tracing-JIT: run an installed trace for this thunk body instead
+            // of interpreting it. A guard side-exit returns null → fall through.
+            if (comptime tjit_exec.enabled) {
+                if (try tjit_exec.tryRun(self, bytecode.chunk_id, upvalues, Value.null_val)) |result| break :blk result;
+            }
             // JIT fast path: if the registry produced a native-code
             // entry for this chunk, call it instead of pushing a
             // frame and dispatching. Null jit_code (the universal

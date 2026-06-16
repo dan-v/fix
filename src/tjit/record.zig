@@ -91,8 +91,19 @@ fn finish(vm: *VM) void {
     const raw = r.trace.len();
     opt.optimize(&r.trace, vm.allocator) catch {};
     printTrace(&r.trace, raw);
-    teardown(vm);
-    if (vm.registry.hot) |h| h.markTraced(anchor);
+    // Transfer the trace to a stable heap allocation and publish it for
+    // execution. Ownership of the trace's arrays moves to `t`; we free the
+    // recorder + Recording struct but must NOT deinit the moved-out trace.
+    const t = vm.allocator.create(ir.Trace) catch {
+        teardown(vm);
+        if (vm.registry.hot) |h| h.markTraced(anchor);
+        return;
+    };
+    t.* = r.trace;
+    r.rec.deinit();
+    vm.allocator.destroy(r);
+    vm.tjit_rec = null;
+    if (vm.registry.hot) |h| h.publishTrace(anchor, @intFromPtr(t));
 }
 
 /// Release a recording abandoned by an unwinding error (called from VM

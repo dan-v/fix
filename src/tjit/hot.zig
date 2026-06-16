@@ -27,6 +27,11 @@ pub const ChunkHot = struct {
     count: std.atomic.Value(u32) = .{ .raw = 0 },
     state: std.atomic.Value(u8) = .{ .raw = @intFromEnum(State.cold) },
     aborts: std.atomic.Value(u8) = .{ .raw = 0 },
+    /// Installed compiled trace as `@intFromPtr` (0 = none). Stored as raw
+    /// bits so this module stays decoupled from the trace IR type. Published
+    /// release / read acquire so a reader that sees the pointer sees a fully
+    /// built trace.
+    trace_bits: std.atomic.Value(usize) = .{ .raw = 0 },
 };
 
 pub const HotTable = struct {
@@ -68,6 +73,19 @@ pub const HotTable = struct {
     pub fn stateOf(self: *const HotTable, id: ChunkId) State {
         if (id >= self.entries.len) return .cold;
         return @enumFromInt(self.entries[id].state.load(.monotonic));
+    }
+
+    /// Publish a compiled trace (as pointer bits) for `id` and mark it traced.
+    pub fn publishTrace(self: *HotTable, id: ChunkId, trace_bits: usize) void {
+        if (id >= self.entries.len) return;
+        self.entries[id].trace_bits.store(trace_bits, .release);
+        self.entries[id].state.store(@intFromEnum(State.traced), .release);
+    }
+
+    /// The installed trace pointer bits for `id` (0 = none). Acquire load.
+    pub fn traceOf(self: *const HotTable, id: ChunkId) usize {
+        if (id >= self.entries.len) return 0;
+        return self.entries[id].trace_bits.load(.acquire);
     }
 
     pub fn markTraced(self: *HotTable, id: ChunkId) void {

@@ -2,6 +2,7 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("../runtime/types.zig");
 const Value = @import("../runtime/value.zig").Value;
+const tjit_exec = @import("../tjit/exec.zig");
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
 const chunk = @import("../bytecode.zig").chunk;
@@ -431,6 +432,13 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
                     return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
                 }
                 return stack.push(self, result.value);
+            }
+        }
+        // Tracing-JIT: run an installed trace for this lambda body instead of
+        // pushing a frame. A guard side-exit returns null → fall through.
+        if (comptime tjit_exec.enabled) {
+            if (try tjit_exec.tryRun(self, closure.chunk_id, closure.upvalues, arg)) |result| {
+                return stack.push(self, result);
             }
         }
         try stack.push(self, arg); // arg is first local
