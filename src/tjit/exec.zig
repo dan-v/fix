@@ -147,6 +147,11 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                     const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
                     if (cl.chunk_id != instr.aux2) return null;
                 },
+                .bool_is => {
+                    const c = try force.forceValue(vm, vals[instr.a]);
+                    if (!c.isBool()) return null;
+                    if (@intFromBool(c.asBool()) != instr.aux2) return null; // branch flipped → deopt
+                },
                 else => return null,
             },
             .ret => return vals[instr.a],

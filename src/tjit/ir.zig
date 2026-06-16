@@ -108,6 +108,10 @@ pub const GuardKind = enum(u8) {
     attr_shape,
     /// Callee `a` is the recorded chunk id (so the inlined body is valid).
     chunk_id,
+    /// Boolean `a` equals the recorded branch condition (`aux2`: 1=true,
+    /// 0=false). Lets a trace specialize one side of a conditional and
+    /// side-exit if the branch flips. `a` is an already-forced bool.
+    bool_is,
 };
 
 pub const NO_SNAPSHOT: u32 = std.math.maxInt(u32);

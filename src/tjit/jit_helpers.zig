@@ -81,6 +81,16 @@ pub fn tjitGuardChunkId(vm: *anyopaque, func: Value, chunk_id: u32) callconv(.c)
     return ok(c);
 }
 
+/// Guard that `cond` is a bool equal to `expected` (1/0). Deopt on a flipped
+/// branch (or non-bool).
+pub fn tjitGuardBool(vm: *anyopaque, cond: Value, expected: u32) callconv(.c) JitResult {
+    const self: *VM = @ptrCast(@alignCast(vm));
+    const c = force.forceValue(self, cond) catch |e| return errResult(e);
+    if (!c.isBool()) return deopt();
+    if (@intFromBool(c.asBool()) != expected) return deopt();
+    return ok(c);
+}
+
 /// Upvalue `slot` of inlined closure `func`. Deopt if not the expected shape.
 pub fn tjitLoadUpvalueOf(vm: *anyopaque, func: Value, slot: u32) callconv(.c) JitResult {
     const self: *VM = @ptrCast(@alignCast(vm));

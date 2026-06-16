@@ -203,6 +203,19 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
         .set_local => try rec.setLocal(code[ip + 1]),
         .set_local_long => try rec.setLocal(readU16(code, ip + 1)),
         .get_upvalue => try rec.getUpvalue(readU16(code, ip + 1)),
+        // Captures push a value (unforced) to be closed over — same dataflow
+        // as get_upvalue/get_local in the trace (the consumer forces).
+        .capture_upvalue => try rec.getUpvalue(readU16(code, ip + 1)),
+        .capture_local => try rec.getLocal(code[ip + 1]),
+        .capture_local_long => try rec.getLocal(readU16(code, ip + 1)),
+        // Conditional: specialize the branch taken at record time, guarding
+        // the (already-forced bool) condition. A flipped branch side-exits.
+        .jump_if_false => {
+            if (vm.sp < 1) return rec.abort();
+            const cond = vm.stack[vm.sp - 1];
+            if (!cond.isBool()) return rec.abort();
+            try rec.guardBool(cond.asBool());
+        },
         .add_int => try rec.binOp(.add_int),
         .sub_int => try rec.binOp(.sub_int),
         .mul_int => try rec.binOp(.mul_int),

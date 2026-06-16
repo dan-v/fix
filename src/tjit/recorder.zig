@@ -204,6 +204,19 @@ pub const Recorder = struct {
         f.upvalue_src = func;
     }
 
+    /// Specialize a conditional branch: pop the (forced bool) condition and
+    /// guard it equals `taken` (the value observed at record time). At runtime
+    /// a flipped branch side-exits; the recorder keeps following whichever path
+    /// the interpreter actually took.
+    pub fn guardBool(self: *Recorder, taken: bool) !void {
+        if (self.operand.items.len == 0) return error.TraceAborted;
+        const cond = self.operand.items[self.operand.items.len - 1];
+        const snap = try self.snapshot();
+        // jump_if_false PEEKS the condition (the VM leaves it on the stack for
+        // a later explicit `pop`), so we must not pop it here either.
+        _ = try self.emit(.{ .op = .guard, .a = cond, .aux = @intFromEnum(GuardKind.bool_is), .aux2 = @intFromBool(taken), .snapshot = snap });
+    }
+
     /// Return from the current frame. At the anchor frame this finalizes the
     /// trace; in an inlined frame the result becomes the caller's call result.
     pub fn ret(self: *Recorder) !void {

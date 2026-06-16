@@ -33,7 +33,7 @@ fn supported(trace: *const ir.Trace) bool {
         switch (instr.op) {
             .nop, .const_val, .load_upvalue, .load_upvalue_of, .trace_arg, .add_int, .sub_int, .mul_int, .get_attr, .ret => {},
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
-                .attr_shape, .chunk_id => {},
+                .attr_shape, .chunk_id, .bool_is => {},
                 else => return false,
             },
             else => return false, // eq/lt/not/alloc/… → exec.zig
@@ -103,6 +103,13 @@ pub fn compile(buf: *CodeBuffer, trace: *const ir.Trace) ?*const anyopaque {
                     e.movRdiRbx();
                     e.callHelper(@intFromPtr(&helpers.tjitGuardChunkId));
                     e.errCheckToEpilogue(); // deopt or error → epilogue
+                },
+                .bool_is => {
+                    e.loadStackToRsi(instr.a); // the condition Ref
+                    e.movEdxImm32(instr.aux2); // expected bool (1/0)
+                    e.movRdiRbx();
+                    e.callHelper(@intFromPtr(&helpers.tjitGuardBool));
+                    e.errCheckToEpilogue();
                 },
                 else => return null,
             },
