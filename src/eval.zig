@@ -160,6 +160,7 @@ pub const Evaluator = struct {
         @import("vm/ngram_probe.zig").report();
         if (comptime @import("tjit/hot.zig").enabled) self.reportHotAnchors();
         if (comptime @import("tjit/exec.zig").enabled) @import("tjit/exec.zig").report();
+        if (comptime @import("tjit/record.zig").enabled) @import("tjit/record.zig").report();
         // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
         // them down (which joins on `defer vm.deinit()` inside helperLoop)
         // before freeing the arenas they borrow from.

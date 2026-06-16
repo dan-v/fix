@@ -35,6 +35,34 @@ const ChunkId = types.ChunkId;
 const readU16 = vm_mod.readU16;
 const readU32 = vm_mod.readU32;
 
+// --- abort-reason diagnostics (why traces fail to record) ---
+const op_count = @import("../bytecode/opcode.zig").count;
+var abort_nesting: u64 = 0; // implicit force ran a thunk body (force-inlining)
+var abort_call: u64 = 0; // call/tail_call to a non-arity-1 / non-closure callee
+var abort_error: u64 = 0; // recorder error (stack underflow, depth/emit overflow)
+var abort_op: [op_count]u64 = @splat(0); // unhandled opcode, by op
+var traces_done: u64 = 0;
+
+pub fn report() void {
+    if (comptime !enabled) return;
+    std.debug.print("=== tjit recording aborts: {d} done, nesting(force)={d} call={d} error={d} ===\n", .{ traces_done, abort_nesting, abort_call, abort_error });
+    // Top unhandled ops.
+    var shown: usize = 0;
+    while (shown < 12) : (shown += 1) {
+        var max: u64 = 0;
+        var max_i: usize = op_count;
+        for (abort_op, 0..) |c, i| {
+            if (c > max) {
+                max = c;
+                max_i = i;
+            }
+        }
+        if (max == 0) break;
+        std.debug.print("  unhandled-op {s}: {d}\n", .{ @tagName(@as(OpCode, @enumFromInt(max_i))), max });
+        abort_op[max_i] = 0; // consume for next iteration
+    }
+}
+
 /// Per-VM recording state, heap-allocated for the duration of one recording
 /// and referenced from `vm.tjit_rec` (as `?*anyopaque` to avoid a vm↔tjit
 /// import cycle).
@@ -90,6 +118,7 @@ fn abort(vm: *VM) void {
 fn finish(vm: *VM) void {
     const r = state(vm) orelse return;
     const anchor = r.anchor;
+    traces_done += 1;
     const raw = r.trace.len();
     opt.optimize(&r.trace, vm.allocator) catch {};
     printTrace(&r.trace, raw);
@@ -133,11 +162,13 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
     // thunk body — which we can't linearize without force-inlining. Abort.
     const expected = r.root_depth + @as(u32, @intCast(r.rec.inlineDepth())) - 1;
     if (vm.frames_len != expected) {
+        abort_nesting += 1;
         abort(vm);
         return;
     }
     r.rec.setIp(@intCast(ip));
     observeOp(vm, &r.rec, frame, code, ip, op) catch {
+        abort_error += 1;
         abort(vm);
         return;
     };
@@ -189,18 +220,27 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
             try rec.getAttr(readU16(code, ip + 2));
         },
         .call => {
-            const callee = inlinableCallee(vm) orelse return rec.abort();
+            const callee = inlinableCallee(vm) orelse {
+                abort_call += 1;
+                return rec.abort();
+            };
             try rec.enterCall(callee.chunk, callee.local_count);
         },
         .tail_call => {
-            const callee = inlinableCallee(vm) orelse return rec.abort();
+            const callee = inlinableCallee(vm) orelse {
+                abort_call += 1;
+                return rec.abort();
+            };
             try rec.replaceTail(callee.chunk, callee.local_count);
         },
         .ret => try rec.ret(),
         // Everything else (call_n/tail_call_n, jumps, allocations,
         // thunk/closure creation, set_cell_local, …) needs handling we don't
         // do yet — abort the trace.
-        else => rec.abort(),
+        else => {
+            abort_op[@intFromEnum(op)] += 1;
+            rec.abort();
+        },
     }
 }
 
