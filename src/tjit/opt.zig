@@ -41,6 +41,9 @@ pub fn optimize(trace: *Trace, allocator: std.mem.Allocator) !void {
 /// Count of thunks eliminated by sinking (diagnostic, printed via
 /// --print-sched-stats from record.zig).
 pub var sink_count: u64 = 0;
+/// Alloc_thunks whose only uses are value-only (forcing) — i.e. that WOULD be
+/// sinkable if every force of them were inlined (P4). The ceiling on sinking.
+pub var sink_ceiling: u64 = 0;
 
 fn sinkThunks(trace: *Trace) void {
     const instrs = trace.instrs.items;
@@ -53,6 +56,11 @@ fn sinkThunks(trace: *Trace) void {
         var claim: ?usize = null;
         var resolve: ?usize = null;
         var escapes = false;
+        // `genuine_escape` ignores value-only forcing uses (get_attr/binop/force/
+        // …): a thunk used only by those COULD be sunk if every such force were
+        // inlined (the P4 ceiling). `escapes` is stricter — it's what the CURRENT
+        // sink needs (only claim/resolve/upvalue uses).
+        var genuine_escape = false;
         for (instrs, 0..) |u, j| {
             const uses_t =
                 (ir.usesA(u.op) and u.a == tref) or
@@ -63,23 +71,56 @@ fn sinkThunks(trace: *Trace) void {
                 },
                 .thunk_resolve => {
                     if (u.a == tref) resolve = j;
-                    if (u.b == tref) escapes = true; // resolving *with* the thunk
+                    if (u.b == tref) {
+                        escapes = true;
+                        genuine_escape = true; // published as a value
+                    }
                 },
                 .load_upvalue_of => {
-                    // a==tref is a body upvalue read (rewritten below); any other
-                    // slot referencing it (there is none) would escape.
-                    if (uses_t and u.a != tref) escapes = true;
+                    if (uses_t and u.a != tref) {
+                        escapes = true;
+                        genuine_escape = true;
+                    }
                 },
                 .alloc_thunk => {
                     for (trace.extra.items[u.a .. u.a + u.b]) |r| {
-                        if (r == tref) escapes = true; // captured into another thunk
+                        if (r == tref) {
+                            escapes = true;
+                            genuine_escape = true; // captured into another thunk
+                        }
+                    }
+                },
+                .ret => {
+                    if (u.a == tref) {
+                        escapes = true;
+                        genuine_escape = true; // returned (identity escapes)
                     }
                 },
                 else => {
+                    // get_attr / binops / force / guard: value-only — sinkable in
+                    // principle, but only with the (current) claim+resolve pattern.
                     if (uses_t) escapes = true;
                 },
             }
         }
+        // A thunk handed back to the interpreter at a side-exit must exist there.
+        for (trace.snapshots.items) |s| {
+            for (s.frames) |fr| {
+                if (fr.upvalue_src == tref) {
+                    escapes = true;
+                    genuine_escape = true;
+                }
+                for (fr.local_entries) |e| if (e.ref == tref) {
+                    escapes = true;
+                    genuine_escape = true;
+                };
+                for (fr.operand_entries) |e| if (e.ref == tref) {
+                    escapes = true;
+                    genuine_escape = true;
+                };
+            }
+        }
+        if (!genuine_escape) sink_ceiling += 1;
         // Only force-inlined thunks (claimed + resolved here) are sinkable; a
         // bare alloc_thunk with no claim is forced elsewhere and must be built.
         if (escapes or claim == null or resolve == null) continue;

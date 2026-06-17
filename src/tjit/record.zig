@@ -53,7 +53,7 @@ pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
-    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK; {d} alloc_thunks in completed traces ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count, alloc_thunks_done });
+    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK; {d} alloc_thunks in completed traces; {d} SINK-CEILING ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count, alloc_thunks_done, opt.sink_ceiling });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
