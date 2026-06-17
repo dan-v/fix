@@ -47,12 +47,13 @@ var suppress_spans: u64 = 0; // implicit-force bodies skipped (recorded as re-fo
 var force_inlines: u64 = 0; // trace-built thunks inlined at a force site
 var force_inlines_in_done: u64 = 0; // ...that survived into a completed trace
 var truncated: u64 = 0; // traces finalized early via side_exit at an unhandled op
+var alloc_thunks_done: u64 = 0;
 
 pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
-    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count });
+    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK; {d} alloc_thunks in completed traces ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count, alloc_thunks_done });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
@@ -132,6 +133,7 @@ fn finish(vm: *VM) void {
     traces_done += 1;
     for (r.trace.instrs.items) |in| {
         if (in.op == .thunk_resolve) force_inlines_in_done += 1;
+        if (in.op == .alloc_thunk) alloc_thunks_done += 1;
     }
     const raw = r.trace.len();
     opt.optimize(&r.trace, vm.allocator) catch {};
