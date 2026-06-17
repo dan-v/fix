@@ -52,7 +52,7 @@ pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
-    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated ===\n", .{ force_inlines, force_inlines_in_done, truncated });
+    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
@@ -225,18 +225,16 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
         abort(vm);
     } else if (r.rec.truncate_requested) {
         r.rec.truncate_requested = false;
-        // Keep the handled prefix as a truncated trace if we're at anchor depth;
-        // otherwise (mid-inline) we can't reconstruct the frame, so abort.
-        if (r.rec.inlineDepth() == 1) {
-            r.rec.emitSideExit() catch {
-                abort(vm);
-                return;
-            };
-            truncated += 1;
-            finish(vm);
-        } else {
+        // Keep the handled prefix as a truncated trace by reconstructing the
+        // whole inlined CALL stack at the side-exit. emitSideExit self-aborts if
+        // a force-inline frame is still live (a mid-claim thunk body can't be
+        // reconstructed) — those don't enable the sink anyway.
+        r.rec.emitSideExit() catch {
             abort(vm);
-        }
+            return;
+        };
+        truncated += 1;
+        finish(vm);
     } else if (r.rec.done) {
         finish(vm);
     }
@@ -406,7 +404,7 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
                 abort_call += 1;
                 return rec.requestTruncate();
             };
-            try rec.enterCall(callee.chunk, callee.local_count);
+            try rec.enterCall(callee.chunk, callee.local_count, @intCast(ip + 1));
         },
         .tail_call => {
             const callee = inlinableCallee(vm) orelse {
@@ -425,7 +423,7 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
                 abort_op[@intFromEnum(op)] += 1;
                 return rec.requestTruncate();
             };
-            try rec.enterCallN(callee.chunk, callee.local_count, n, callee.strict_params);
+            try rec.enterCallN(callee.chunk, callee.local_count, n, callee.strict_params, @intCast(ip + 2));
         },
         // tail_call_n inlining (replaceTailN) is built but truncates for now: a
         // tail-call CHAIN + side_exit reorders evaluation enough to force a

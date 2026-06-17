@@ -41,40 +41,55 @@ const MAX_ALLOC_CAPTURES = 64;
 /// interpreter runs to its real `ret`). Errors from the resumed interpreter are
 /// real eval errors and propagate. Cap on snapshot width keeps the reconstruction
 /// buffers stack-allocated; an over-wide frame deopts (re-interpret whole chunk).
-const MAX_SNAPSHOT = 512;
+const MAX_FRAMES = 64; // == recorder MAX_INLINE_DEPTH
+const MAX_TOTAL = 1024; // flat cap on locals+operands across all frames
 
 /// Shared side-exit reconstruction, parameterised by how to read a trace `Ref`'s
-/// value: the exec.zig interpreter passes its `vals.ptr`, native codegen passes
-/// the live native stack-slot base (`Ref i` at `slots[i]`). Reconstructs the
-/// anchor frame from `snap` and resumes interpreting at `snap.ip`. `anchor_upv`
-/// is the trace's own upvalues (used when no tail call replaced the frame).
+/// value: exec.zig passes its `vals.ptr`, native codegen passes the live native
+/// stack-slot base (`Ref i` at `slots[i]`). Rebuilds the whole inlined CALL
+/// stack from `snap.frames` (anchor → deepest) and resumes the interpreter.
+/// `anchor_upv` is the trace's own upvalues (the anchor frame, which has no
+/// upvalue source Ref).
 pub fn sideExitImpl(vm: *VM, snap: *const ir.Snapshot, slots: [*]const Value, anchor_upv: []const Value) anyerror!?Value {
     const closures = @import("../vm/closures.zig");
-    const ch = vm.registry.get(snap.resume_chunk) orelse return null;
-    var resume_upvalues = anchor_upv;
-    if (snap.upvalue_src) |src| {
-        const c = force.forceValue(vm, slots[src]) catch return null;
-        if (!c.isClosure()) return null;
-        const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
-        resume_upvalues = cl.upvalues;
+    const D = snap.frames.len;
+    if (D == 0 or D > MAX_FRAMES) return null;
+    var fdescs: [MAX_FRAMES]closures.TraceFrame = undefined;
+    var locals_flat: [MAX_TOTAL]closures.TraceLocal = undefined;
+    var operands_flat: [MAX_TOTAL]Value = undefined;
+    var loff: usize = 0;
+    var ooff: usize = 0;
+    for (snap.frames, 0..) |sf, k| {
+        const ch = vm.registry.get(sf.chunk) orelse return null;
+        var upv = anchor_upv;
+        if (sf.upvalue_src) |src| {
+            const c = force.forceValue(vm, slots[src]) catch return null;
+            if (!c.isClosure()) return null;
+            const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
+            upv = cl.upvalues;
+        } else if (k != 0) return null; // only the anchor lacks an upvalue source
+        if (loff + sf.local_entries.len > MAX_TOTAL or ooff + sf.operand_entries.len > MAX_TOTAL) return null;
+        const ls = locals_flat[loff..][0..sf.local_entries.len];
+        for (sf.local_entries, 0..) |e, i| {
+            ls[i] = .{ .slot = switch (e.loc) {
+                .local => |s| s,
+                .stack => return null,
+            }, .value = slots[e.ref] };
+        }
+        loff += sf.local_entries.len;
+        const os = operands_flat[ooff..][0..sf.operand_entries.len];
+        for (sf.operand_entries) |e| {
+            const idx = switch (e.loc) {
+                .stack => |s| s,
+                .local => return null,
+            };
+            if (idx >= os.len) return null;
+            os[idx] = slots[e.ref];
+        }
+        ooff += sf.operand_entries.len;
+        fdescs[k] = .{ .chunk = ch, .chunk_id = sf.chunk, .upvalues = upv, .resume_ip = sf.resume_ip, .locals = ls, .operands = os };
     }
-    var locals_buf: [MAX_SNAPSHOT]closures.TraceLocal = undefined;
-    var operands_buf: [MAX_SNAPSHOT]Value = undefined;
-    var nl: usize = 0;
-    var nop_count: usize = 0;
-    for (snap.entries) |e| switch (e.loc) {
-        .local => |slot| {
-            if (nl >= MAX_SNAPSHOT) return null;
-            locals_buf[nl] = .{ .slot = slot, .value = slots[e.ref] };
-            nl += 1;
-        },
-        .stack => |idx| {
-            if (idx >= MAX_SNAPSHOT) return null;
-            operands_buf[idx] = slots[e.ref];
-            nop_count = @max(nop_count, @as(usize, idx) + 1);
-        },
-    };
-    return try closures.resumeTrace(vm, ch, snap.resume_chunk, snap.ip, resume_upvalues, locals_buf[0..nl], operands_buf[0..nop_count]);
+    return try closures.resumeTraceMulti(vm, fdescs[0..D]);
 }
 
 /// Captured upvalues of a (claimed, not-yet-resolved) bytecode thunk — for an

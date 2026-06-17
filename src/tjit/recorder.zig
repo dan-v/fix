@@ -56,6 +56,11 @@ const InlineFrame = struct {
     /// the recorder emits `thunk_resolve(thunk, result)`. Null for call frames
     /// and the anchor (a call/anchor `ret` just yields its value).
     resolve_thunk: ?Ref = null,
+    /// Bytecode ip where THIS frame resumes after its callee returns — set when
+    /// the frame is created by an inlined `call`/`call_n` (the op's continuation),
+    /// used by a mid-inline side-exit to rebuild the call stack. 0 for the anchor
+    /// / deepest frame (which uses the side-exit ip instead).
+    call_return_ip: u32 = 0,
 };
 
 pub const Recorder = struct {
@@ -131,14 +136,6 @@ pub const Recorder = struct {
     fn pop(self: *Recorder) !Ref {
         if (self.operand.items.len == 0) return error.TraceAborted;
         return self.operand.pop().?;
-    }
-
-    fn snapshot(self: *Recorder) !u32 {
-        const items = self.operand.items;
-        var entries = try self.allocator.alloc(ir.SnapshotEntry, items.len);
-        defer self.allocator.free(entries);
-        for (items, 0..) |ref, i| entries[i] = .{ .ref = ref, .loc = .{ .stack = @intCast(i) } };
-        return self.trace.addSnapshot(self.allocator, self.ip, entries);
     }
 
     // ---- inputs ----
@@ -264,20 +261,21 @@ pub const Recorder = struct {
     pub fn getAttr(self: *Recorder, name: InternId) !void {
         if (self.operand.items.len == 0) return error.TraceAborted;
         const attrs = self.operand.items[self.operand.items.len - 1];
-        const snap = try self.snapshot();
         _ = try self.pop();
-        _ = try self.emit(.{ .op = .guard, .a = attrs, .aux = @intFromEnum(GuardKind.attr_shape), .aux2 = name, .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = attrs, .aux = @intFromEnum(GuardKind.attr_shape), .aux2 = name, .snapshot = ir.NO_SNAPSHOT });
         try self.push(try self.emit(.{ .op = .get_attr, .a = attrs, .aux = name }));
     }
 
     /// Inline a call: pop func + arg, guard the callee chunk, push an inline
     /// frame whose local 0 is the arg Ref.
-    pub fn enterCall(self: *Recorder, callee_chunk: ChunkId, local_count: u16) !void {
+    pub fn enterCall(self: *Recorder, callee_chunk: ChunkId, local_count: u16, return_ip: u32) !void {
         if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
         const arg = try self.pop();
         const func = try self.pop();
-        const snap = try self.snapshot();
-        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = ir.NO_SNAPSHOT });
+        // Record where the CALLER (now second-from-top) resumes after this callee
+        // returns, for a mid-inline side-exit.
+        self.cur().call_return_ip = return_ip;
         const locals = try self.allocator.alloc(?Ref, local_count);
         @memset(locals, null);
         if (local_count >= 1) locals[0] = arg;
@@ -294,7 +292,7 @@ pub const Recorder = struct {
     /// the interpreter forces strict args (possibly nesting) before the callee
     /// frame exists, and the driver activates the frame only once that frame
     /// actually appears. Stack: `[func, a0..a(n-1)]` (a(n-1) on top).
-    pub fn enterCallN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16, strict_params: u8) !void {
+    pub fn enterCallN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16, strict_params: u8, return_ip: u32) !void {
         if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
         if (n > MAX_CALL_ARGS or n > local_count or self.pending_call != null) return error.TraceAborted;
         var pc: PendingCall = .{ .callee_chunk = callee_chunk, .local_count = local_count, .n = n, .strict_params = strict_params, .func = 0, .args = undefined };
@@ -304,8 +302,9 @@ pub const Recorder = struct {
             pc.args[i] = try self.pop();
         }
         pc.func = try self.pop();
-        const snap = try self.snapshot();
-        _ = try self.emit(.{ .op = .guard, .a = pc.func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = pc.func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = ir.NO_SNAPSHOT });
+        // The caller (current frame) resumes here once the deferred callee rets.
+        self.cur().call_return_ip = return_ip;
         self.pending_call = pc;
     }
 
@@ -354,8 +353,7 @@ pub const Recorder = struct {
             args[i] = try self.pop();
         }
         const func = try self.pop();
-        const snap = try self.snapshot();
-        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = ir.NO_SNAPSHOT });
         const f = self.cur();
         self.operand.shrinkRetainingCapacity(f.operand_base);
         const locals = try self.allocator.alloc(?Ref, local_count);
@@ -373,8 +371,7 @@ pub const Recorder = struct {
     pub fn replaceTail(self: *Recorder, callee_chunk: ChunkId, local_count: u16) !void {
         const arg = try self.pop();
         const func = try self.pop();
-        const snap = try self.snapshot();
-        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = ir.NO_SNAPSHOT });
         const f = self.cur();
         // Tail position: no live operands should remain above this frame's base.
         self.operand.shrinkRetainingCapacity(f.operand_base);
@@ -394,10 +391,9 @@ pub const Recorder = struct {
     pub fn guardBool(self: *Recorder, taken: bool) !void {
         if (self.operand.items.len == 0) return error.TraceAborted;
         const cond = self.operand.items[self.operand.items.len - 1];
-        const snap = try self.snapshot();
         // jump_if_false PEEKS the condition (the VM leaves it on the stack for
         // a later explicit `pop`), so we must not pop it here either.
-        _ = try self.emit(.{ .op = .guard, .a = cond, .aux = @intFromEnum(GuardKind.bool_is), .aux2 = @intFromBool(taken), .snapshot = snap });
+        _ = try self.emit(.{ .op = .guard, .a = cond, .aux = @intFromEnum(GuardKind.bool_is), .aux2 = @intFromBool(taken), .snapshot = ir.NO_SNAPSHOT });
     }
 
     /// Return from the current frame. At the anchor frame this finalizes the
@@ -431,26 +427,56 @@ pub const Recorder = struct {
         self.truncate_requested = true;
     }
 
-    /// Finalize a truncated trace: snapshot the live operand stack + anchor
-    /// locals at the current `ip`, emit `side_exit`, mark done. Only valid at
-    /// anchor depth (one frame) — reconstructing inlined frames isn't supported.
+    /// Finalize a truncated trace: snapshot the WHOLE inlined call stack at the
+    /// current `ip`, emit `side_exit`, mark done. Each frame becomes a real VM
+    /// frame at reconstruction; the deepest resumes at the unhandled op, the
+    /// rest at their call-return ip. A live force-inline frame (`resolve_thunk`)
+    /// can't be reconstructed (a mid-claim thunk body), so we abort instead —
+    /// those don't enable the sink anyway (no `thunk_resolve`).
     pub fn emitSideExit(self: *Recorder) !void {
-        if (self.frames.items.len != 1) return error.TraceAborted;
-        const f = &self.frames.items[0];
-        var entries: std.ArrayListUnmanaged(ir.SnapshotEntry) = .empty;
-        defer entries.deinit(self.allocator);
-        for (self.operand.items, 0..) |ref, i| {
-            try entries.append(self.allocator, .{ .ref = ref, .loc = .{ .stack = @intCast(i) } });
+        const D = self.frames.items.len;
+        for (self.frames.items) |fr| {
+            if (fr.resolve_thunk != null) return error.TraceAborted;
         }
-        for (f.locals, 0..) |maybe, slot| {
-            if (maybe) |ref| try entries.append(self.allocator, .{ .ref = ref, .loc = .{ .local = @intCast(slot) } });
+        var sframes = try self.allocator.alloc(ir.SnapshotFrame, D);
+        defer {
+            for (sframes) |sf| {
+                self.allocator.free(sf.local_entries);
+                self.allocator.free(sf.operand_entries);
+            }
+            self.allocator.free(sframes);
         }
-        const snap = try self.trace.addSnapshot(self.allocator, self.ip, entries.items);
-        // Resume the frame's *current* chunk (a tail call may have replaced it)
-        // with that chunk's own upvalues (anchor's own if no tail call happened).
-        self.trace.snapshots.items[snap].resume_chunk = f.chunk_id;
-        self.trace.snapshots.items[snap].upvalue_src = f.upvalue_src;
-        _ = try self.emit(.{ .op = .side_exit, .snapshot = snap });
+        // Mark as not-yet-allocated so the defer can free a partial build.
+        for (sframes) |*sf| sf.* = .{ .chunk = 0, .upvalue_src = null, .resume_ip = 0, .local_entries = &.{}, .operand_entries = &.{} };
+        for (self.frames.items, 0..) |fr, k| {
+            // Locals.
+            var nl: usize = 0;
+            for (fr.locals) |m| {
+                if (m != null) nl += 1;
+            }
+            const locals = try self.allocator.alloc(ir.SnapshotEntry, nl);
+            sframes[k].local_entries = locals;
+            var li: usize = 0;
+            for (fr.locals, 0..) |maybe, slot| {
+                if (maybe) |ref| {
+                    locals[li] = .{ .ref = ref, .loc = .{ .local = @intCast(slot) } };
+                    li += 1;
+                }
+            }
+            // Operands: operand[fr.operand_base .. next frame's base / end].
+            const lo = fr.operand_base;
+            const hi: u32 = if (k + 1 < D) self.frames.items[k + 1].operand_base else @intCast(self.operand.items.len);
+            const ops = try self.allocator.alloc(ir.SnapshotEntry, hi - lo);
+            sframes[k].operand_entries = ops;
+            for (lo..hi) |idx| {
+                ops[idx - lo] = .{ .ref = self.operand.items[idx], .loc = .{ .stack = @intCast(idx - lo) } };
+            }
+            sframes[k].chunk = fr.chunk_id;
+            sframes[k].upvalue_src = fr.upvalue_src;
+            sframes[k].resume_ip = if (k + 1 == D) self.ip else fr.call_return_ip;
+        }
+        const snap_idx = try self.trace.addSnapshot(self.allocator, sframes);
+        _ = try self.emit(.{ .op = .side_exit, .snapshot = snap_idx });
         self.done = true;
     }
 };
@@ -467,7 +493,7 @@ test "recorder: inlined call makes the callee param the caller arg" {
     try rec.startRoot(7, 1, true);
     try rec.getUpvalue(0); // func
     try rec.getUpvalue(1); // arg
-    try rec.enterCall(99, 1); // inline callee chunk 99 (1 local)
+    try rec.enterCall(99, 1, 0); // inline callee chunk 99 (1 local)
     // callee body: `local0` (its param) then ret
     try rec.getLocal(0);
     try rec.ret(); // returns from inlined frame
@@ -500,7 +526,7 @@ test "recorder: inlined upvalue reads the callee closure" {
     try rec.startRoot(7, 1, true);
     try rec.getUpvalue(0); // func  (%1 load_upvalue 0)
     try rec.getLocal(0); // arg = trace_arg (%0)
-    try rec.enterCall(42, 1);
+    try rec.enterCall(42, 1, 0);
     try rec.getUpvalue(3); // upvalue 3 of the *callee* closure
     try rec.ret();
     try rec.ret();

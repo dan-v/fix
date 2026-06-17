@@ -38,6 +38,10 @@ pub fn optimize(trace: *Trace, allocator: std.mem.Allocator) !void {
 /// optimization that removes the heavyweight per-thunk *work* (alloc + atomic
 /// claim + memo publish), not just dispatch — the reason the tracing JIT can
 /// beat the dispatch bound. See docs/tracing-jit.md.
+/// Count of thunks eliminated by sinking (diagnostic, printed via
+/// --print-sched-stats from record.zig).
+pub var sink_count: u64 = 0;
+
 fn sinkThunks(trace: *Trace) void {
     const instrs = trace.instrs.items;
     for (instrs, 0..) |alloc, t| {
@@ -94,6 +98,7 @@ fn sinkThunks(trace: *Trace) void {
         instrs[t] = .{ .op = .nop };
         instrs[claim.?] = .{ .op = .nop };
         instrs[resolve.?] = .{ .op = .nop };
+        sink_count += 1;
     }
 }
 
@@ -155,14 +160,22 @@ fn elideRedundantForces(trace: *Trace) void {
                 }
             }
         }
-        // A force named by a snapshot (side_exit / guard deopt state) is needed
-        // as-is when the interpreter resumes — never elide it.
+        // A force named by a side-exit snapshot (any frame's entries or upvalue
+        // source) is needed as-is when the interpreter resumes — never elide it.
         for (trace.snapshots.items) |s| {
-            for (s.entries) |e| {
-                if (e.ref == fref) {
+            for (s.frames) |fr| {
+                if (fr.upvalue_src == fref) {
                     uses += 1;
                     all_forcing = false;
                 }
+                for (fr.local_entries) |e| if (e.ref == fref) {
+                    uses += 1;
+                    all_forcing = false;
+                };
+                for (fr.operand_entries) |e| if (e.ref == fref) {
+                    uses += 1;
+                    all_forcing = false;
+                };
             }
         }
         if (uses == 0 or !all_forcing) continue;
@@ -281,15 +294,19 @@ fn deadCodeElim(trace: *Trace, allocator: std.mem.Allocator) !void {
                 if (r < n) live[r] = true;
             }
         }
-        // A side_exit hands the snapshot's values back to the interpreter, so
-        // every Ref it names is live.
+        // A side_exit hands every snapshot value (across all reconstructed
+        // frames) back to the interpreter, so every Ref it names is live.
         if (instr.op == .side_exit and instr.snapshot != ir.NO_SNAPSHOT) {
-            const snap = trace.snapshots.items[instr.snapshot];
-            for (snap.entries) |e| {
-                if (e.ref < n) live[e.ref] = true;
-            }
-            if (snap.upvalue_src) |src| {
-                if (src < n) live[src] = true;
+            for (trace.snapshots.items[instr.snapshot].frames) |fr| {
+                if (fr.upvalue_src) |src| {
+                    if (src < n) live[src] = true;
+                }
+                for (fr.local_entries) |e| if (e.ref < n) {
+                    live[e.ref] = true;
+                };
+                for (fr.operand_entries) |e| if (e.ref < n) {
+                    live[e.ref] = true;
+                };
             }
         }
     }

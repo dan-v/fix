@@ -158,17 +158,26 @@ pub const Loc = union(enum) {
 
 pub const SnapshotEntry = struct { ref: Ref, loc: Loc };
 
-/// The interpreter state to reconstruct at a side-exit: where to resume
-/// (bytecode `ip`) and which live trace values go where. `resume_chunk` is the
-/// frame's *current* chunk — it differs from the trace anchor when a tail call
-/// (`replaceTail`) reused the anchor frame for a callee, and the resume ip is in
-/// the callee's bytecode. `upvalue_src` is the Ref of the closure whose upvalues
-/// that callee runs with (null = the anchor's own upvalues).
+/// One reconstructed VM frame at a side-exit. Frames are ordered anchor →
+/// deepest; mid-inline truncation reconstructs the whole inlined CALL stack so
+/// the interpreter unwinds naturally. `chunk` is the frame's current chunk (a
+/// tail call may have replaced the anchor's). `upvalue_src` is the Ref of the
+/// closure whose upvalues this frame runs with (null = the anchor's own).
+/// `resume_ip` is where this frame continues — the call-return ip for a frame
+/// whose callee is deeper, or the unhandled-op ip for the deepest frame.
+pub const SnapshotFrame = struct {
+    chunk: ChunkId,
+    upvalue_src: ?Ref,
+    resume_ip: u32,
+    /// `loc = .local` entries (slot, ref).
+    local_entries: []const SnapshotEntry,
+    /// `loc = .stack` entries (slot = position), in operand-stack order.
+    operand_entries: []const SnapshotEntry,
+};
+
+/// The full interpreter state to reconstruct at a side-exit.
 pub const Snapshot = struct {
-    ip: u32,
-    entries: []SnapshotEntry,
-    resume_chunk: ChunkId = 0,
-    upvalue_src: ?Ref = null,
+    frames: []SnapshotFrame,
 };
 
 pub const Trace = struct {
@@ -191,7 +200,13 @@ pub const Trace = struct {
     pub fn deinit(self: *Trace, allocator: std.mem.Allocator) void {
         self.instrs.deinit(allocator);
         self.consts.deinit(allocator);
-        for (self.snapshots.items) |snap| allocator.free(snap.entries);
+        for (self.snapshots.items) |snap| {
+            for (snap.frames) |f| {
+                allocator.free(f.local_entries);
+                allocator.free(f.operand_entries);
+            }
+            allocator.free(snap.frames);
+        }
         self.snapshots.deinit(allocator);
         self.extra.deinit(allocator);
     }
@@ -217,9 +232,21 @@ pub const Trace = struct {
         return idx;
     }
 
-    pub fn addSnapshot(self: *Trace, allocator: std.mem.Allocator, ip: u32, entries: []const SnapshotEntry) !u32 {
+    /// Append a side-exit snapshot, deep-copying `frames` (and each frame's
+    /// entry slices) into trace-owned memory.
+    pub fn addSnapshot(self: *Trace, allocator: std.mem.Allocator, frames: []const SnapshotFrame) !u32 {
         const idx: u32 = @intCast(self.snapshots.items.len);
-        try self.snapshots.append(allocator, .{ .ip = ip, .entries = try allocator.dupe(SnapshotEntry, entries) });
+        const owned = try allocator.alloc(SnapshotFrame, frames.len);
+        for (frames, 0..) |f, i| {
+            owned[i] = .{
+                .chunk = f.chunk,
+                .upvalue_src = f.upvalue_src,
+                .resume_ip = f.resume_ip,
+                .local_entries = try allocator.dupe(SnapshotEntry, f.local_entries),
+                .operand_entries = try allocator.dupe(SnapshotEntry, f.operand_entries),
+            };
+        }
+        try self.snapshots.append(allocator, .{ .frames = owned });
         return idx;
     }
 
@@ -233,16 +260,21 @@ test "trace IR: build a small inlined force chain" {
     var trace = Trace.init(7, true);
     defer trace.deinit(allocator);
 
-    // arg; force(arg) guarded resolved; get_attr(forced, "foo"); ret
+    // arg; force(arg); get_attr(forced, "foo"); side_exit (1-frame snapshot)
     const arg = try trace.emit(allocator, .{ .op = .trace_arg });
-    const snap = try trace.addSnapshot(allocator, 0, &.{.{ .ref = arg, .loc = .{ .stack = 0 } }});
-    _ = try trace.emit(allocator, .{ .op = .guard, .a = arg, .aux = @intFromEnum(GuardKind.thunk_resolved), .snapshot = snap });
     const forced = try trace.emit(allocator, .{ .op = .force, .a = arg });
     const attr = try trace.emit(allocator, .{ .op = .get_attr, .a = forced, .aux = 42 });
-    _ = try trace.emit(allocator, .{ .op = .ret, .a = attr });
+    const snap = try trace.addSnapshot(allocator, &.{.{
+        .chunk = 7,
+        .upvalue_src = null,
+        .resume_ip = 3,
+        .local_entries = &.{},
+        .operand_entries = &.{.{ .ref = attr, .loc = .{ .stack = 0 } }},
+    }});
+    _ = try trace.emit(allocator, .{ .op = .side_exit, .snapshot = snap });
 
-    try std.testing.expectEqual(@as(usize, 5), trace.len());
-    try std.testing.expectEqual(Op.ret, trace.instrs.items[trace.len() - 1].op);
+    try std.testing.expectEqual(@as(usize, 4), trace.len());
+    try std.testing.expectEqual(Op.side_exit, trace.instrs.items[trace.len() - 1].op);
     try std.testing.expectEqual(@as(usize, 1), trace.snapshots.items.len);
-    try std.testing.expectEqual(@as(u32, 0), trace.snapshots.items[0].ip);
+    try std.testing.expectEqual(@as(u32, 3), trace.snapshots.items[0].frames[0].resume_ip);
 }

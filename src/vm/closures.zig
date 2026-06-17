@@ -723,45 +723,51 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
 /// A live local to restore when resuming a truncated trace.
 pub const TraceLocal = struct { slot: u16, value: Value };
 
-/// Resume interpretation of a tracing-JIT anchor chunk mid-body (`-Dtjit` trace
-/// side-exit). Reconstructs the frame from a trace snapshot — `locals` written
-/// into their slots, `operands` pushed onto the value stack in order — sets the
-/// instruction pointer to `resume_ip`, and runs to the chunk's real `ret`,
-/// returning its result. Mirrors `runIsolatedFrame`'s teardown on error.
-pub fn resumeTrace(
-    self: *VM,
-    ch: *const Chunk,
+/// One reconstructed VM frame for a tracing-JIT side-exit.
+pub const TraceFrame = struct {
+    chunk: *const Chunk,
     chunk_id: types.ChunkId,
-    resume_ip: u32,
     upvalues: ?[]const Value,
+    resume_ip: u32,
     locals: []const TraceLocal,
     operands: []const Value,
-) anyerror!Value {
+};
+
+/// Resume interpretation of a tracing-JIT trace mid-body (`-Dtjit` side-exit),
+/// reconstructing the WHOLE inlined call stack. `frames` are ordered anchor →
+/// deepest; each becomes a real VM frame (locals written into their slots,
+/// operands pushed above, ip set to its resume point). The interpreter then
+/// unwinds naturally: the deepest frame runs, its `ret` pushes its result to the
+/// parent (resuming at the parent's call-return ip), … until the anchor `ret`
+/// yields the trace result. Mirrors `runIsolatedFrame`'s teardown on error.
+pub fn resumeTraceMulti(self: *VM, frames: []const TraceFrame) anyerror!Value {
     const run_mod = @import("run.zig");
     const stop_depth = self.frames_len;
-    const frame_base = self.sp;
-    stack.pushFrame(self, ch, chunk_id, 0, upvalues) catch |err| {
-        self.sp = frame_base;
-        return err;
-    };
-    // pushFrame reserved `local_count` null slots; overwrite the live ones.
-    for (locals) |l| self.stack[frame_base + l.slot] = l.value;
-    // Operands sit directly above the locals, in capture order.
-    if (self.sp + operands.len > types.VM_STACK_CAP) {
-        self.frames_len = stop_depth;
-        self.sp = frame_base;
-        return error.StackOverflow;
-    }
-    for (operands) |v| {
-        self.stack[self.sp] = v;
-        self.sp += 1;
+    const base0 = self.sp;
+    for (frames) |fr| {
+        const fb = self.sp; // pushFrame(arg_count=0) sets frame_base = sp = fb
+        stack.pushFrame(self, fr.chunk, fr.chunk_id, 0, fr.upvalues) catch |err| {
+            self.frames_len = stop_depth;
+            self.sp = base0;
+            return err;
+        };
+        for (fr.locals) |l| self.stack[fb + l.slot] = l.value;
+        if (self.sp + fr.operands.len > types.VM_STACK_CAP) {
+            self.frames_len = stop_depth;
+            self.sp = base0;
+            return error.StackOverflow;
+        }
+        for (fr.operands) |v| {
+            self.stack[self.sp] = v;
+            self.sp += 1;
+        }
+        self.frames[self.frames_len - 1].ip = fr.resume_ip;
     }
     if (self.sp > self.sp_high_water) self.sp_high_water = self.sp;
-    self.frames[self.frames_len - 1].ip = resume_ip;
     return run_mod.runUntil(self, stop_depth) catch |err| {
         errors.captureErrorTrace(self, err) catch {};
         self.frames_len = stop_depth;
-        self.sp = frame_base;
+        self.sp = base0;
         return err;
     };
 }
