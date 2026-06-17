@@ -102,7 +102,7 @@ pub fn start(vm: *VM, anchor: ChunkId, local_count: u16, is_lambda: bool, root_d
         .root_depth = root_depth,
     };
     r.rec = Recorder.init(vm.allocator, &r.trace);
-    r.rec.startRoot(local_count, is_lambda) catch {
+    r.rec.startRoot(anchor, local_count, is_lambda) catch {
         r.rec.deinit();
         r.trace.deinit(vm.allocator);
         vm.allocator.destroy(r);
@@ -396,12 +396,9 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
         // still abort (the alloc_* IR + sinking layer on next).
         .thunk_captures => try recordThunkCaptures(vm, rec, readU16(code, ip + 1), code, ip + 5, readU16(code, ip + 3)),
         .thunk_captures_long => try recordThunkCaptures(vm, rec, readU32(code, ip + 1), code, ip + 7, readU16(code, ip + 5)),
-        // Frame-rebuilding tail/saturated calls: a side-exit here would resume
-        // into a tail_call_n that reuses our reconstructed frame — TODO, abort.
-        .call_n, .tail_call_n => rec.abort(),
-        // Everything else (jumps, list/attr builds, set_cell_local, …) is
-        // unsupported — truncate here (keep the prefix, resume interpreting at
-        // this op) rather than discarding the trace.
+        // Everything else (call_n/tail_call_n, jumps, list/attr builds,
+        // set_cell_local, …) is unsupported — truncate here (keep the prefix,
+        // resume interpreting at this op) rather than discarding the trace.
         else => {
             abort_op[@intFromEnum(op)] += 1;
             rec.requestTruncate();

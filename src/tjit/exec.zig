@@ -44,8 +44,17 @@ const MAX_ALLOC_CAPTURES = 64;
 const MAX_SNAPSHOT = 512;
 fn sideExit(vm: *VM, trace: *const ir.Trace, snap_idx: u32, vals: []const Value, upvalues: []const Value) anyerror!?Value {
     const closures = @import("../vm/closures.zig");
-    const ch = vm.registry.get(trace.anchor_chunk) orelse return null;
     const snap = trace.snapshots.items[snap_idx];
+    // Resume the frame's current chunk (a tail call may have replaced the anchor)
+    // with that chunk's upvalues — the tail-called closure's, or the anchor's own.
+    const ch = vm.registry.get(snap.resume_chunk) orelse return null;
+    var resume_upvalues = upvalues;
+    if (snap.upvalue_src) |src| {
+        const c = force.forceValue(vm, vals[src]) catch return null;
+        if (!c.isClosure()) return null;
+        const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
+        resume_upvalues = cl.upvalues;
+    }
     var locals_buf: [MAX_SNAPSHOT]closures.TraceLocal = undefined;
     var operands_buf: [MAX_SNAPSHOT]Value = undefined;
     var nl: usize = 0;
@@ -62,7 +71,7 @@ fn sideExit(vm: *VM, trace: *const ir.Trace, snap_idx: u32, vals: []const Value,
             nop_count = @max(nop_count, @as(usize, idx) + 1);
         },
     };
-    return try closures.resumeTrace(vm, ch, trace.anchor_chunk, snap.ip, upvalues, locals_buf[0..nl], operands_buf[0..nop_count]);
+    return try closures.resumeTrace(vm, ch, snap.resume_chunk, snap.ip, resume_upvalues, locals_buf[0..nl], operands_buf[0..nop_count]);
 }
 
 /// Captured upvalues of a (claimed, not-yet-resolved) bytecode thunk — for an

@@ -159,10 +159,16 @@ pub const Loc = union(enum) {
 pub const SnapshotEntry = struct { ref: Ref, loc: Loc };
 
 /// The interpreter state to reconstruct at a side-exit: where to resume
-/// (bytecode `ip`) and which live trace values go where.
+/// (bytecode `ip`) and which live trace values go where. `resume_chunk` is the
+/// frame's *current* chunk — it differs from the trace anchor when a tail call
+/// (`replaceTail`) reused the anchor frame for a callee, and the resume ip is in
+/// the callee's bytecode. `upvalue_src` is the Ref of the closure whose upvalues
+/// that callee runs with (null = the anchor's own upvalues).
 pub const Snapshot = struct {
     ip: u32,
     entries: []SnapshotEntry,
+    resume_chunk: ChunkId = 0,
+    upvalue_src: ?Ref = null,
 };
 
 pub const Trace = struct {

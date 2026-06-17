@@ -205,8 +205,12 @@ fn deadCodeElim(trace: *Trace, allocator: std.mem.Allocator) !void {
         // A side_exit hands the snapshot's values back to the interpreter, so
         // every Ref it names is live.
         if (instr.op == .side_exit and instr.snapshot != ir.NO_SNAPSHOT) {
-            for (trace.snapshots.items[instr.snapshot].entries) |e| {
+            const snap = trace.snapshots.items[instr.snapshot];
+            for (snap.entries) |e| {
                 if (e.ref < n) live[e.ref] = true;
+            }
+            if (snap.upvalue_src) |src| {
+                if (src < n) live[src] = true;
             }
         }
     }

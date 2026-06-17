@@ -38,6 +38,9 @@ const InlineFrame = struct {
     locals: []?Ref,
     upvalue_src: ?Ref,
     operand_base: u32,
+    /// The frame's current chunk (changes on a tail call). Needed so a side-exit
+    /// resumes the right bytecode, not the anchor's.
+    chunk_id: ChunkId = 0,
     /// For a *force-inlined thunk body*: the thunk's Ref. On this frame's `ret`
     /// the recorder emits `thunk_resolve(thunk, result)`. Null for call frames
     /// and the anchor (a call/anchor `ret` just yields its value).
@@ -74,10 +77,10 @@ pub const Recorder = struct {
 
     /// Push the anchor frame. For an arity-1 lambda, local 0 is the trace
     /// argument; a thunk anchor has no locals.
-    pub fn startRoot(self: *Recorder, local_count: u16, is_lambda: bool) !void {
+    pub fn startRoot(self: *Recorder, anchor_chunk: ChunkId, local_count: u16, is_lambda: bool) !void {
         const locals = try self.allocator.alloc(?Ref, local_count);
         @memset(locals, null);
-        try self.frames.append(self.allocator, .{ .locals = locals, .upvalue_src = null, .operand_base = 0 });
+        try self.frames.append(self.allocator, .{ .locals = locals, .upvalue_src = null, .operand_base = 0, .chunk_id = anchor_chunk });
         if (is_lambda and local_count >= 1) {
             locals[0] = try self.emit(.{ .op = .trace_arg });
         }
@@ -265,6 +268,7 @@ pub const Recorder = struct {
             .locals = locals,
             .upvalue_src = func,
             .operand_base = @intCast(self.operand.items.len),
+            .chunk_id = callee_chunk,
         });
     }
 
@@ -284,6 +288,7 @@ pub const Recorder = struct {
         self.allocator.free(f.locals);
         f.locals = locals;
         f.upvalue_src = func;
+        f.chunk_id = callee_chunk;
     }
 
     /// Specialize a conditional branch: pop the (forced bool) condition and
@@ -345,6 +350,10 @@ pub const Recorder = struct {
             if (maybe) |ref| try entries.append(self.allocator, .{ .ref = ref, .loc = .{ .local = @intCast(slot) } });
         }
         const snap = try self.trace.addSnapshot(self.allocator, self.ip, entries.items);
+        // Resume the frame's *current* chunk (a tail call may have replaced it)
+        // with that chunk's own upvalues (anchor's own if no tail call happened).
+        self.trace.snapshots.items[snap].resume_chunk = f.chunk_id;
+        self.trace.snapshots.items[snap].upvalue_src = f.upvalue_src;
         _ = try self.emit(.{ .op = .side_exit, .snapshot = snap });
         self.done = true;
     }
@@ -359,7 +368,7 @@ test "recorder: inlined call makes the callee param the caller arg" {
 
     // anchor lambda: local0 = arg. Body: push local0 as func-ish... model a
     // call `f x` where f and x are upvalues, callee body returns its param.
-    try rec.startRoot(1, true);
+    try rec.startRoot(7, 1, true);
     try rec.getUpvalue(0); // func
     try rec.getUpvalue(1); // arg
     try rec.enterCall(99, 1); // inline callee chunk 99 (1 local)
@@ -392,7 +401,7 @@ test "recorder: inlined upvalue reads the callee closure" {
     var rec = Recorder.init(allocator, &trace);
     defer rec.deinit();
 
-    try rec.startRoot(1, true);
+    try rec.startRoot(7, 1, true);
     try rec.getUpvalue(0); // func  (%1 load_upvalue 0)
     try rec.getLocal(0); // arg = trace_arg (%0)
     try rec.enterCall(42, 1);
@@ -420,6 +429,6 @@ test "recorder: get_local on uninitialized slot aborts" {
     defer trace.deinit(allocator);
     var rec = Recorder.init(allocator, &trace);
     defer rec.deinit();
-    try rec.startRoot(2, true); // local0 = arg, local1 = null
+    try rec.startRoot(1, 2, true); // local0 = arg, local1 = null
     try std.testing.expectError(error.TraceAborted, rec.getLocal(1));
 }
