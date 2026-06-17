@@ -17,6 +17,7 @@ const prof = @import("../prof.zig");
 const prof_path = @import("../prof_path.zig");
 const trace_probe = @import("trace_probe.zig");
 const tjit_exec = @import("../tjit/exec.zig");
+const tjit_record = @import("../tjit/record.zig");
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
@@ -290,6 +291,13 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 }
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
+                // Tracing-JIT force-inline hook: if we're recording and this is
+                // a thunk the trace built, inline its body (see record.zig).
+                if (comptime tjit_record.enabled) {
+                    if (self.tjit_rec != null and thunk.targetKind() == .bytecode) {
+                        tjit_record.onForceInline(self, thunk.payload.target.bytecode.chunk_id);
+                    }
+                }
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).

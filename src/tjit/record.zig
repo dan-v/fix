@@ -44,11 +44,14 @@ var abort_error: u64 = 0; // recorder error (stack underflow, depth/emit overflo
 var abort_op: [op_count]u64 = @splat(0); // unhandled opcode, by op
 var traces_done: u64 = 0;
 var suppress_spans: u64 = 0; // implicit-force bodies skipped (recorded as re-force)
+var force_inlines: u64 = 0; // trace-built thunks inlined at a force site
+var force_inlines_in_done: u64 = 0; // ...that survived into a completed trace
 
 pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
+    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces ===\n", .{ force_inlines, force_inlines_in_done });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
@@ -126,6 +129,9 @@ fn finish(vm: *VM) void {
     const r = state(vm) orelse return;
     const anchor = r.anchor;
     traces_done += 1;
+    for (r.trace.instrs.items) |in| {
+        if (in.op == .thunk_resolve) force_inlines_in_done += 1;
+    }
     const raw = r.trace.len();
     opt.optimize(&r.trace, vm.allocator) catch {};
     if (hot.report_enabled) printTrace(&r.trace, raw);
@@ -190,6 +196,11 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
         return;
     }
     r.suppressing = false;
+    // A pending force is only live for the gap between forceTop and the
+    // interpreter's immediate force; once we reach the next op it's resolved
+    // (or was consumed by the inline hook). Clear it so a later implicit force
+    // (e.g. inside get_attr) can't be mistaken for an inlinable explicit force.
+    r.rec.pending_force = null;
     r.rec.setIp(@intCast(ip));
     observeOp(vm, &r.rec, frame, code, ip, op) catch {
         abort_error += 1;
@@ -201,6 +212,25 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
     } else if (r.rec.done) {
         finish(vm);
     }
+}
+
+/// Force-site hook: the interpreter just claimed an unresolved bytecode thunk
+/// (chunk `chunk_id`) and is about to run its body. If we're recording and the
+/// thunk being forced is one this trace built (`alloc_thunk`), inline the body
+/// — push an inline frame reading the thunk's upvalues — so it becomes a sink
+/// candidate. Otherwise do nothing (the body nests and suppression re-forces it
+/// at execution). Called from `forceThunkImpl`.
+pub fn onForceInline(vm: *VM, chunk_id: ChunkId) void {
+    const r = state(vm) orelse return;
+    if (!r.rec.pendingForceIsTraceThunk()) return;
+    const ch = vm.registry.get(chunk_id) orelse return;
+    r.rec.beginForceInline(ch.local_count) catch {
+        // Couldn't set up the inline frame — abandon the trace cleanly (the
+        // interpreter still runs the body normally).
+        abort(vm);
+        return;
+    };
+    force_inlines += 1;
 }
 
 /// Resolve the callee of a `call`/`tail_call` (on the VM operand stack as

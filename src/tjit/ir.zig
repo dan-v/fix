@@ -46,6 +46,14 @@ pub const Op = enum(u8) {
     get_attr,
     /// `call(a=func, b=arg)`. Guarded by callee chunk-id; body inlined.
     call,
+    /// Atomically claim thunk `a` for evaluation (CAS unresolved→evaluating,
+    /// the interpreter's exact protocol). Deopt if it isn't ours to claim
+    /// (already resolved / busy / errored) — the interpreter then waits or
+    /// loads the memo. Precedes an inlined thunk body.
+    thunk_claim,
+    /// Publish value `b` as thunk `a`'s result (resolve + wake waiters + mark
+    /// demanded), matching `forceThunkImpl`. Closes an inlined thunk body.
+    thunk_resolve,
 
     // ---- pure ----
     add_int,
@@ -89,14 +97,14 @@ pub fn isPure(op: Op) bool {
 /// immediate like a const index or slot). Used by passes to walk the dataflow.
 pub fn usesA(op: Op) bool {
     return switch (op) {
-        .load_upvalue_of, .add_int, .sub_int, .mul_int, .eq, .lt, .not, .guard, .get_attr, .force, .call, .ret => true,
+        .load_upvalue_of, .add_int, .sub_int, .mul_int, .eq, .lt, .not, .guard, .get_attr, .force, .call, .ret, .thunk_claim, .thunk_resolve => true,
         else => false,
     };
 }
 
 pub fn usesB(op: Op) bool {
     return switch (op) {
-        .add_int, .sub_int, .mul_int, .eq, .lt, .call => true,
+        .add_int, .sub_int, .mul_int, .eq, .lt, .call, .thunk_resolve => true,
         else => false,
     };
 }

@@ -36,6 +36,15 @@ pub const enabled: bool = @import("build_options").tjit;
 /// Mirror of the recorder's capture cap (record.zig MAX_THUNK_CAPTURES).
 const MAX_ALLOC_CAPTURES = 64;
 
+/// Captured upvalues of a (claimed, not-yet-resolved) bytecode thunk — for an
+/// inlined thunk body's `load_upvalue_of`. Null if it isn't a bytecode thunk.
+fn bytecodeThunkUpvalues(vm: *VM, thunk_val: Value) ?[]const Value {
+    const thunk = vm.heap.getThunkAssumeValid(thunk_val.asObjectId());
+    const thunk_mod = @import("../runtime/thunk.zig");
+    if (thunk.targetKind() != thunk_mod.TargetKind.bytecode) return null;
+    return thunk.payload.target.bytecode.upvalues();
+}
+
 var native_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var exec_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var deopt_count: std.atomic.Value(u64) = .{ .raw = 0 };
@@ -118,11 +127,20 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                 vals[i] = upvalues[instr.aux];
             },
             .load_upvalue_of => {
-                const c = try force.forceValue(vm, vals[instr.a]);
-                if (!c.isClosure()) return null;
-                const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
-                if (instr.aux >= cl.upvalues.len) return null;
-                vals[i] = cl.upvalues[instr.aux];
+                const src = vals[instr.a];
+                // An inlined thunk body reads its captured upvalues from the
+                // (claimed, not-yet-resolved) thunk directly — don't force it.
+                if (src.isThunk()) {
+                    const ups = bytecodeThunkUpvalues(vm, src) orelse return null;
+                    if (instr.aux >= ups.len) return null;
+                    vals[i] = ups[instr.aux];
+                } else {
+                    const c = try force.forceValue(vm, src);
+                    if (!c.isClosure()) return null;
+                    const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
+                    if (instr.aux >= cl.upvalues.len) return null;
+                    vals[i] = cl.upvalues[instr.aux];
+                }
             },
             .trace_arg => vals[i] = arg,
             .force => vals[i] = try force.forceValue(vm, vals[instr.a]),
@@ -158,6 +176,27 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
             .get_attr => {
                 const attrs = try force.forceValue(vm, vals[instr.a]);
                 vals[i] = try access.getAttrValue(vm, attrs, @intCast(instr.aux));
+            },
+            // Claim a trace-built thunk for an inlined body (interpreter's exact
+            // protocol). Deopt unless we win the claim — the interpreter then
+            // waits / loads the published value.
+            .thunk_claim => {
+                const tv = vals[instr.a];
+                if (!tv.isThunk()) return null;
+                const thunk = vm.heap.getThunkAssumeValid(tv.asObjectId());
+                switch (thunk.tryForce(vm.claimer_id)) {
+                    .claimed => {},
+                    else => return null,
+                }
+            },
+            // Publish the inlined body's result to the thunk + mark demanded
+            // (mirrors forceThunkImpl's resolve).
+            .thunk_resolve => {
+                const tv = vals[instr.a];
+                if (!tv.isThunk()) return null;
+                const thunk = vm.heap.getThunkAssumeValid(tv.asObjectId());
+                thunk.resolve(vals[instr.b]);
+                thunk.markDemanded();
             },
             .alloc_thunk => {
                 // Build a bytecode thunk capturing the (unforced) operand values,

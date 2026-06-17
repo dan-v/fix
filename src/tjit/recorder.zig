@@ -38,6 +38,10 @@ const InlineFrame = struct {
     locals: []?Ref,
     upvalue_src: ?Ref,
     operand_base: u32,
+    /// For a *force-inlined thunk body*: the thunk's Ref. On this frame's `ret`
+    /// the recorder emits `thunk_resolve(thunk, result)`. Null for call frames
+    /// and the anchor (a call/anchor `ret` just yields its value).
+    resolve_thunk: ?Ref = null,
 };
 
 pub const Recorder = struct {
@@ -48,6 +52,11 @@ pub const Recorder = struct {
     ip: u32 = 0,
     aborted: bool = false,
     done: bool = false,
+    /// Set to the `force` instr Ref right after `forceTop` emits one. If the
+    /// interpreter then runs an unresolved thunk body (force-site hook), this
+    /// tells the recorder which `force` to convert into an inlined thunk body.
+    /// Cleared by the driver before each observed op.
+    pending_force: ?Ref = null,
 
     pub fn init(allocator: std.mem.Allocator, trace: *Trace) Recorder {
         return .{ .allocator = allocator, .trace = trace };
@@ -158,7 +167,44 @@ pub const Recorder = struct {
     /// `capture_*` opcodes intentionally skip this (closure captures stay lazy).
     pub fn forceTop(self: *Recorder) !void {
         const v = try self.pop();
-        try self.push(try self.emit(.{ .op = .force, .a = v }));
+        const f = try self.emit(.{ .op = .force, .a = v });
+        try self.push(f);
+        self.pending_force = f;
+    }
+
+    /// Is the operand of the pending `force` an `alloc_thunk` (a thunk built in
+    /// this trace)? Only those are worth force-inlining — inlining yields a
+    /// sink candidate; inlining a thunk created elsewhere is pure overhead.
+    pub fn pendingForceIsTraceThunk(self: *Recorder) bool {
+        const f = self.pending_force orelse return false;
+        const src = self.trace.instrs.items[f].a;
+        return self.trace.instrs.items[src].op == .alloc_thunk;
+    }
+
+    /// Begin inlining a forced thunk's body. Converts the pending `force` into
+    /// a `thunk_claim` (claims the thunk at run time), removes the force's
+    /// placeholder result from the operand stack, and pushes a new inline frame
+    /// whose upvalues read the thunk (`load_upvalue_of(thunk, slot)`). The
+    /// body's `ret` will emit `thunk_resolve` and leave the value on the stack.
+    pub fn beginForceInline(self: *Recorder, local_count: u16) !void {
+        if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
+        const f = self.pending_force orelse return error.TraceAborted;
+        self.pending_force = null;
+        const thunk_ref = self.trace.instrs.items[f].a;
+        // The force's pushed result must be the operand-stack top; drop it.
+        if (self.operand.items.len == 0 or self.operand.items[self.operand.items.len - 1] != f)
+            return error.TraceAborted;
+        _ = self.operand.pop();
+        // Repurpose the force instr as the claim of the thunk.
+        self.trace.instrs.items[f] = .{ .op = .thunk_claim, .a = thunk_ref };
+        const locals = try self.allocator.alloc(?Ref, local_count);
+        @memset(locals, null);
+        try self.frames.append(self.allocator, .{
+            .locals = locals,
+            .upvalue_src = thunk_ref,
+            .operand_base = @intCast(self.operand.items.len),
+            .resolve_thunk = thunk_ref,
+        });
     }
 
     // ---- stack shuffles ----
@@ -257,6 +303,12 @@ pub const Recorder = struct {
         const f = self.frames.pop().?;
         self.operand.shrinkRetainingCapacity(f.operand_base);
         self.allocator.free(f.locals);
+        // A force-inlined thunk body publishes its value to the thunk before
+        // the value flows on (sinking later removes both when the thunk doesn't
+        // escape).
+        if (f.resolve_thunk) |thunk_ref| {
+            _ = try self.emit(.{ .op = .thunk_resolve, .a = thunk_ref, .b = result });
+        }
         try self.push(result);
     }
 
