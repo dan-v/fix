@@ -125,6 +125,15 @@ pub const Emitter = struct {
     pub fn movRsiR15(self: *Emitter) void {
         self.bytes(&.{ 0x4c, 0x89, 0xfe });
     }
+    /// mov rsi, imm64 (48 BE imm64) — e.g. a stable snapshot pointer.
+    pub fn movRsiImm64(self: *Emitter, v: u64) void {
+        self.bytes(&.{ 0x48, 0xbe });
+        self.u64le(v);
+    }
+    /// mov rdx, rsp (48 89 E2) — the slot-array base for a side-exit helper.
+    pub fn movRdxRsp(self: *Emitter) void {
+        self.bytes(&.{ 0x48, 0x89, 0xe2 });
+    }
     pub fn xorEdxEdx(self: *Emitter) void {
         self.bytes(&.{ 0x31, 0xd2 });
     }

@@ -17,6 +17,7 @@ const force = @import("../vm/force.zig");
 const access = @import("../vm/access.zig");
 const numeric = @import("../runtime/numeric.zig");
 const strings = @import("../vm/strings.zig");
+const ir = @import("ir.zig");
 
 const VM = vm_mod.VM;
 const JitResult = jit.JitResult;
@@ -62,6 +63,17 @@ pub fn tjitMul(vm: *anyopaque, a: Value, b: Value) callconv(.c) JitResult {
     const av = force.forceValue(self, a) catch |e| return errResult(e);
     const bv = force.forceValue(self, b) catch |e| return errResult(e);
     return ok(numeric.mul(self.heap, av, bv) catch |e| return errResult(e));
+}
+
+/// Native `side_exit`: reconstruct the anchor frame from `snap` (reading live
+/// values from the trace's native stack slots `slots[ref]`) and resume the
+/// interpreter — the same logic the exec.zig interpreter runs. Returns the
+/// resumed result, `deopt()` if reconstruction can't proceed, or the eval error.
+pub fn tjitSideExit(vm: *anyopaque, snap: *const ir.Snapshot, slots: [*]const Value) callconv(.c) JitResult {
+    const self: *VM = @ptrCast(@alignCast(vm));
+    const exec = @import("exec.zig");
+    const result = exec.sideExitImpl(self, snap, slots, self.native_upvalues) catch |e| return errResult(e);
+    return if (result) |v| ok(v) else deopt();
 }
 
 /// Force `v` to WHNF (matches the interpreter's forcing loads). Errors

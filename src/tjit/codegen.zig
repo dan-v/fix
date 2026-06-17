@@ -31,7 +31,7 @@ const MAX_INSTRS: usize = 400;
 fn supported(trace: *const ir.Trace) bool {
     for (trace.instrs.items) |instr| {
         switch (instr.op) {
-            .nop, .const_val, .load_upvalue, .load_upvalue_of, .trace_arg, .force, .add_int, .sub_int, .mul_int, .get_attr, .ret => {},
+            .nop, .const_val, .load_upvalue, .load_upvalue_of, .trace_arg, .force, .add_int, .sub_int, .mul_int, .get_attr, .ret, .side_exit => {},
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
                 .attr_shape, .chunk_id, .bool_is => {},
                 else => return false,
@@ -130,6 +130,17 @@ pub fn compile(buf: *CodeBuffer, trace: *const ir.Trace) ?*const anyopaque {
                 e.loadStackToRax(instr.a);
                 e.xorEdxEdx();
                 e.jmpEpilogue();
+            },
+            .side_exit => {
+                // Hand the snapshot + the live slot array (rsp) to the helper,
+                // which reconstructs the frame and resumes interpreting. On
+                // success rax=value/rdx=0; deopt/error → nonzero rdx → epilogue.
+                e.movRdiRbx(); // vm
+                e.movRsiImm64(@intFromPtr(&trace.snapshots.items[instr.snapshot])); // snapshot
+                e.movRdxRsp(); // slots base
+                e.callHelper(@intFromPtr(&helpers.tjitSideExit));
+                e.errCheckToEpilogue(); // nonzero error_code (deopt/error) → epilogue
+                e.jmpEpilogue(); // success: rax=value, rdx=0
             },
             else => return null,
         }

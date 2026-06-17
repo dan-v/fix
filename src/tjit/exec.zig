@@ -42,15 +42,18 @@ const MAX_ALLOC_CAPTURES = 64;
 /// real eval errors and propagate. Cap on snapshot width keeps the reconstruction
 /// buffers stack-allocated; an over-wide frame deopts (re-interpret whole chunk).
 const MAX_SNAPSHOT = 512;
-fn sideExit(vm: *VM, trace: *const ir.Trace, snap_idx: u32, vals: []const Value, upvalues: []const Value) anyerror!?Value {
+
+/// Shared side-exit reconstruction, parameterised by how to read a trace `Ref`'s
+/// value: the exec.zig interpreter passes its `vals.ptr`, native codegen passes
+/// the live native stack-slot base (`Ref i` at `slots[i]`). Reconstructs the
+/// anchor frame from `snap` and resumes interpreting at `snap.ip`. `anchor_upv`
+/// is the trace's own upvalues (used when no tail call replaced the frame).
+pub fn sideExitImpl(vm: *VM, snap: *const ir.Snapshot, slots: [*]const Value, anchor_upv: []const Value) anyerror!?Value {
     const closures = @import("../vm/closures.zig");
-    const snap = trace.snapshots.items[snap_idx];
-    // Resume the frame's current chunk (a tail call may have replaced the anchor)
-    // with that chunk's upvalues — the tail-called closure's, or the anchor's own.
     const ch = vm.registry.get(snap.resume_chunk) orelse return null;
-    var resume_upvalues = upvalues;
+    var resume_upvalues = anchor_upv;
     if (snap.upvalue_src) |src| {
-        const c = force.forceValue(vm, vals[src]) catch return null;
+        const c = force.forceValue(vm, slots[src]) catch return null;
         if (!c.isClosure()) return null;
         const cl = vm.heap.getClosure(c.asObjectId()) catch return null;
         resume_upvalues = cl.upvalues;
@@ -62,12 +65,12 @@ fn sideExit(vm: *VM, trace: *const ir.Trace, snap_idx: u32, vals: []const Value,
     for (snap.entries) |e| switch (e.loc) {
         .local => |slot| {
             if (nl >= MAX_SNAPSHOT) return null;
-            locals_buf[nl] = .{ .slot = slot, .value = vals[e.ref] };
+            locals_buf[nl] = .{ .slot = slot, .value = slots[e.ref] };
             nl += 1;
         },
         .stack => |idx| {
             if (idx >= MAX_SNAPSHOT) return null;
-            operands_buf[idx] = vals[e.ref];
+            operands_buf[idx] = slots[e.ref];
             nop_count = @max(nop_count, @as(usize, idx) + 1);
         },
     };
@@ -113,7 +116,13 @@ pub fn tryRun(vm: *VM, chunk_id: ChunkId, upvalues: []const Value, arg: Value) a
     const nbits = h.nativeOf(chunk_id);
     if (nbits != 0) {
         const native: jit.LambdaCompiledFn = @ptrFromInt(nbits);
+        // A native side_exit reads the anchor upvalues' length from here (the
+        // ABI passes only the pointer). Save/restore so nested native traces
+        // (run by this trace's forces) don't clobber it.
+        const saved_upv = vm.native_upvalues;
+        vm.native_upvalues = upvalues;
         const r = native(@ptrCast(vm), upvalues.ptr, arg);
+        vm.native_upvalues = saved_upv;
         if (r.error_code == 0) {
             _ = native_count.fetchAdd(1, .monotonic);
             return r.value;
@@ -274,7 +283,7 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                 else => return null,
             },
             .ret => return vals[instr.a],
-            .side_exit => return try sideExit(vm, trace, instr.snapshot, vals, upvalues),
+            .side_exit => return try sideExitImpl(vm, &trace.snapshots.items[instr.snapshot], vals.ptr, upvalues),
             // Allocations / calls-as-nodes / unmodeled ops: deopt.
             else => return null,
         }

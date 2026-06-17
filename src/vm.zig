@@ -86,6 +86,11 @@ pub const VM = struct {
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
     /// are comptime-gated).
     tjit_rec: ?*anyopaque = null,
+    /// Anchor upvalues of the currently-executing native trace, so a native
+    /// `side_exit` (which only gets the upvalues *pointer* via the ABI, not the
+    /// length) can reconstruct the anchor frame. Set/restored around each native
+    /// call in `tjit/exec.zig`; only meaningful mid native-trace.
+    native_upvalues: []const Value = &.{},
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
