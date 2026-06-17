@@ -215,6 +215,42 @@ fn inlinableCallee(vm: *VM) ?struct { chunk: ChunkId, local_count: u16 } {
     return .{ .chunk = closure.chunk_id, .local_count = ch.local_count };
 }
 
+/// Record a `thunk_captures` whose body is a trivial shape — the interpreter
+/// pushes a value with no allocation, and so does the trace. `desc_start`/
+/// `count` locate the capture descriptors (kind:1, index:2 triples) within
+/// `code`. Non-trivial / unsupported shapes abort.
+fn recordThunkCaptures(vm: *VM, rec: *Recorder, chunk_id: u32, code: []const u8, desc_start: usize, count: u16) !void {
+    const ch = vm.registry.get(chunk_id) orelse return rec.abort();
+    const dlen = @as(usize, count) * 3;
+    if (desc_start + dlen > code.len) return rec.abort();
+    const descriptors = code[desc_start .. desc_start + dlen];
+    switch (ch.scheduling.trivial) {
+        // `get_upvalue N; ret` → forcing yields capture N's value, pushed
+        // unforced exactly as the interpreter's short-circuit does.
+        .identity_upvalue => |idx| try pushCaptureRef(rec, descriptors, idx),
+        .constant => |ci| try rec.pushConst(ch.constants[ci]),
+        .literal => |v| try rec.pushConst(v),
+        .builtins => try rec.pushConst(vm.builtins),
+        // closure_zero/closure_captures/attr_access build an object → need the
+        // alloc_* IR; .none is a real thunk. Both abort until that layer lands.
+        else => rec.abort(),
+    }
+}
+
+/// Resolve capture descriptor `idx` (kind:1, index:2) to its Ref against the
+/// recorder's current frame and push it — same dataflow as get_local /
+/// get_upvalue (unforced; a capture is closed over lazily).
+fn pushCaptureRef(rec: *Recorder, descriptors: []const u8, idx: u16) !void {
+    const off = @as(usize, idx) * 3;
+    if (off + 3 > descriptors.len) return rec.abort();
+    const cap_index = readU16(descriptors, off + 1);
+    switch (descriptors[off]) {
+        0 => try rec.getLocal(cap_index), // local capture
+        1 => try rec.getUpvalue(cap_index), // upvalue capture
+        else => rec.abort(),
+    }
+}
+
 fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize, op: OpCode) !void {
     switch (op) {
         .push_null => try rec.pushConst(Value.null_val),
@@ -284,9 +320,15 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
             try rec.replaceTail(callee.chunk, callee.local_count);
         },
         .ret => try rec.ret(),
-        // Everything else (call_n/tail_call_n, jumps, allocations,
-        // thunk/closure creation, set_cell_local, …) needs handling we don't
-        // do yet — abort the trace.
+        // Thunk creation. The interpreter short-circuits trivial bodies
+        // (`identity_upvalue`/`constant`/`literal`/`builtins`) by pushing a
+        // value directly with no allocation — the trace mirrors that as pure
+        // dataflow. Non-trivial (`.none`) thunks and closure/attr-access shapes
+        // still abort (the alloc_* IR + sinking layer on next).
+        .thunk_captures => try recordThunkCaptures(vm, rec, readU16(code, ip + 1), code, ip + 5, readU16(code, ip + 3)),
+        .thunk_captures_long => try recordThunkCaptures(vm, rec, readU32(code, ip + 1), code, ip + 7, readU16(code, ip + 5)),
+        // Everything else (call_n/tail_call_n, jumps, list/attr builds,
+        // set_cell_local, …) needs handling we don't do yet — abort the trace.
         else => {
             abort_op[@intFromEnum(op)] += 1;
             rec.abort();
