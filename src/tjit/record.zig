@@ -46,12 +46,13 @@ var traces_done: u64 = 0;
 var suppress_spans: u64 = 0; // implicit-force bodies skipped (recorded as re-force)
 var force_inlines: u64 = 0; // trace-built thunks inlined at a force site
 var force_inlines_in_done: u64 = 0; // ...that survived into a completed trace
+var truncated: u64 = 0; // traces finalized early via side_exit at an unhandled op
 
 pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
     std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
-    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces ===\n", .{ force_inlines, force_inlines_in_done });
+    std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated ===\n", .{ force_inlines, force_inlines_in_done, truncated });
     // Top unhandled ops.
     var shown: usize = 0;
     while (shown < 12) : (shown += 1) {
@@ -209,6 +210,20 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
     };
     if (r.rec.aborted) {
         abort(vm);
+    } else if (r.rec.truncate_requested) {
+        r.rec.truncate_requested = false;
+        // Keep the handled prefix as a truncated trace if we're at anchor depth;
+        // otherwise (mid-inline) we can't reconstruct the frame, so abort.
+        if (r.rec.inlineDepth() == 1) {
+            r.rec.emitSideExit() catch {
+                abort(vm);
+                return;
+            };
+            truncated += 1;
+            finish(vm);
+        } else {
+            abort(vm);
+        }
     } else if (r.rec.done) {
         finish(vm);
     }
@@ -362,14 +377,14 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
         .call => {
             const callee = inlinableCallee(vm) orelse {
                 abort_call += 1;
-                return rec.abort();
+                return rec.requestTruncate();
             };
             try rec.enterCall(callee.chunk, callee.local_count);
         },
         .tail_call => {
             const callee = inlinableCallee(vm) orelse {
                 abort_call += 1;
-                return rec.abort();
+                return rec.requestTruncate();
             };
             try rec.replaceTail(callee.chunk, callee.local_count);
         },
@@ -381,11 +396,15 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
         // still abort (the alloc_* IR + sinking layer on next).
         .thunk_captures => try recordThunkCaptures(vm, rec, readU16(code, ip + 1), code, ip + 5, readU16(code, ip + 3)),
         .thunk_captures_long => try recordThunkCaptures(vm, rec, readU32(code, ip + 1), code, ip + 7, readU16(code, ip + 5)),
-        // Everything else (call_n/tail_call_n, jumps, list/attr builds,
-        // set_cell_local, …) needs handling we don't do yet — abort the trace.
+        // Frame-rebuilding tail/saturated calls: a side-exit here would resume
+        // into a tail_call_n that reuses our reconstructed frame — TODO, abort.
+        .call_n, .tail_call_n => rec.abort(),
+        // Everything else (jumps, list/attr builds, set_cell_local, …) is
+        // unsupported — truncate here (keep the prefix, resume interpreting at
+        // this op) rather than discarding the trace.
         else => {
             abort_op[@intFromEnum(op)] += 1;
-            rec.abort();
+            rec.requestTruncate();
         },
     }
 }

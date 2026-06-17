@@ -78,6 +78,13 @@ pub const Op = enum(u8) {
     guard,
     /// Trace result is value `a`.
     ret,
+    /// Truncation point: the trace stops here and hands control back to the
+    /// interpreter mid-chunk. `snapshot` carries the operand-stack + live-local
+    /// Refs and the bytecode `ip` to resume at; the executor reconstructs the
+    /// anchor frame from it, then interprets to the chunk's real `ret`. Lets a
+    /// trace keep its handled prefix instead of aborting at the first
+    /// unsupported op. Only emitted at anchor depth (no inlined frames live).
+    side_exit,
     /// Deleted instruction (left in place by optimizer passes so SSA `Ref`s —
     /// which are array indices — don't need renumbering). Skipped by codegen.
     nop,

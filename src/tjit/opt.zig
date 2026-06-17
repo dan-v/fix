@@ -76,6 +76,16 @@ fn elideRedundantForces(trace: *Trace) void {
                 }
             }
         }
+        // A force named by a snapshot (side_exit / guard deopt state) is needed
+        // as-is when the interpreter resumes — never elide it.
+        for (trace.snapshots.items) |s| {
+            for (s.entries) |e| {
+                if (e.ref == fref) {
+                    uses += 1;
+                    all_forcing = false;
+                }
+            }
+        }
         if (uses == 0 or !all_forcing) continue;
         const src = instr.a;
         for (instrs) |*u| {
@@ -190,6 +200,13 @@ fn deadCodeElim(trace: *Trace, allocator: std.mem.Allocator) !void {
         if (instr.op == .alloc_thunk) {
             for (trace.extra.items[instr.a .. instr.a + instr.b]) |r| {
                 if (r < n) live[r] = true;
+            }
+        }
+        // A side_exit hands the snapshot's values back to the interpreter, so
+        // every Ref it names is live.
+        if (instr.op == .side_exit and instr.snapshot != ir.NO_SNAPSHOT) {
+            for (trace.snapshots.items[instr.snapshot].entries) |e| {
+                if (e.ref < n) live[e.ref] = true;
             }
         }
     }

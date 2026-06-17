@@ -720,6 +720,52 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
     return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
 }
 
+/// A live local to restore when resuming a truncated trace.
+pub const TraceLocal = struct { slot: u16, value: Value };
+
+/// Resume interpretation of a tracing-JIT anchor chunk mid-body (`-Dtjit` trace
+/// side-exit). Reconstructs the frame from a trace snapshot — `locals` written
+/// into their slots, `operands` pushed onto the value stack in order — sets the
+/// instruction pointer to `resume_ip`, and runs to the chunk's real `ret`,
+/// returning its result. Mirrors `runIsolatedFrame`'s teardown on error.
+pub fn resumeTrace(
+    self: *VM,
+    ch: *const Chunk,
+    chunk_id: types.ChunkId,
+    resume_ip: u32,
+    upvalues: ?[]const Value,
+    locals: []const TraceLocal,
+    operands: []const Value,
+) anyerror!Value {
+    const run_mod = @import("run.zig");
+    const stop_depth = self.frames_len;
+    const frame_base = self.sp;
+    stack.pushFrame(self, ch, chunk_id, 0, upvalues) catch |err| {
+        self.sp = frame_base;
+        return err;
+    };
+    // pushFrame reserved `local_count` null slots; overwrite the live ones.
+    for (locals) |l| self.stack[frame_base + l.slot] = l.value;
+    // Operands sit directly above the locals, in capture order.
+    if (self.sp + operands.len > types.VM_STACK_CAP) {
+        self.frames_len = stop_depth;
+        self.sp = frame_base;
+        return error.StackOverflow;
+    }
+    for (operands) |v| {
+        self.stack[self.sp] = v;
+        self.sp += 1;
+    }
+    if (self.sp > self.sp_high_water) self.sp_high_water = self.sp;
+    self.frames[self.frames_len - 1].ip = resume_ip;
+    return run_mod.runUntil(self, stop_depth) catch |err| {
+        errors.captureErrorTrace(self, err) catch {};
+        self.frames_len = stop_depth;
+        self.sp = frame_base;
+        return err;
+    };
+}
+
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
     const t = prof.start(.run_isolated_frame);
     defer prof.end(.run_isolated_frame, t);

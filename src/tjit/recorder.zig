@@ -52,6 +52,10 @@ pub const Recorder = struct {
     ip: u32 = 0,
     aborted: bool = false,
     done: bool = false,
+    /// Set by an op handler that can't continue the trace but reached a clean
+    /// op boundary — the driver finalizes a truncated trace (side-exit) if at
+    /// anchor depth, else aborts. Distinct from `aborted` (a broken state).
+    truncate_requested: bool = false,
     /// Set to the `force` instr Ref right after `forceTop` emits one. If the
     /// interpreter then runs an unresolved thunk body (force-site hook), this
     /// tells the recorder which `force` to convert into an inlined thunk body.
@@ -85,6 +89,10 @@ pub const Recorder = struct {
 
     pub fn inlineDepth(self: *const Recorder) usize {
         return self.frames.items.len;
+    }
+
+    pub fn operandLen(self: *const Recorder) usize {
+        return self.operand.items.len;
     }
 
     fn cur(self: *Recorder) *InlineFrame {
@@ -314,6 +322,31 @@ pub const Recorder = struct {
 
     pub fn abort(self: *Recorder) void {
         self.aborted = true;
+    }
+
+    /// Request a truncated finish at this op boundary (the op is unsupported but
+    /// the abstract state is clean). The driver turns this into a `side_exit`.
+    pub fn requestTruncate(self: *Recorder) void {
+        self.truncate_requested = true;
+    }
+
+    /// Finalize a truncated trace: snapshot the live operand stack + anchor
+    /// locals at the current `ip`, emit `side_exit`, mark done. Only valid at
+    /// anchor depth (one frame) — reconstructing inlined frames isn't supported.
+    pub fn emitSideExit(self: *Recorder) !void {
+        if (self.frames.items.len != 1) return error.TraceAborted;
+        const f = &self.frames.items[0];
+        var entries: std.ArrayListUnmanaged(ir.SnapshotEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        for (self.operand.items, 0..) |ref, i| {
+            try entries.append(self.allocator, .{ .ref = ref, .loc = .{ .stack = @intCast(i) } });
+        }
+        for (f.locals, 0..) |maybe, slot| {
+            if (maybe) |ref| try entries.append(self.allocator, .{ .ref = ref, .loc = .{ .local = @intCast(slot) } });
+        }
+        const snap = try self.trace.addSnapshot(self.allocator, self.ip, entries.items);
+        _ = try self.emit(.{ .op = .side_exit, .snapshot = snap });
+        self.done = true;
     }
 };
 

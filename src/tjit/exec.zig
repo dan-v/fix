@@ -36,6 +36,35 @@ pub const enabled: bool = @import("build_options").tjit;
 /// Mirror of the recorder's capture cap (record.zig MAX_THUNK_CAPTURES).
 const MAX_ALLOC_CAPTURES = 64;
 
+/// A trace hit a `side_exit`: reconstruct the anchor frame from the snapshot
+/// and resume interpreting at the unhandled op. Returns the chunk's result (the
+/// interpreter runs to its real `ret`). Errors from the resumed interpreter are
+/// real eval errors and propagate. Cap on snapshot width keeps the reconstruction
+/// buffers stack-allocated; an over-wide frame deopts (re-interpret whole chunk).
+const MAX_SNAPSHOT = 512;
+fn sideExit(vm: *VM, trace: *const ir.Trace, snap_idx: u32, vals: []const Value, upvalues: []const Value) anyerror!?Value {
+    const closures = @import("../vm/closures.zig");
+    const ch = vm.registry.get(trace.anchor_chunk) orelse return null;
+    const snap = trace.snapshots.items[snap_idx];
+    var locals_buf: [MAX_SNAPSHOT]closures.TraceLocal = undefined;
+    var operands_buf: [MAX_SNAPSHOT]Value = undefined;
+    var nl: usize = 0;
+    var nop_count: usize = 0;
+    for (snap.entries) |e| switch (e.loc) {
+        .local => |slot| {
+            if (nl >= MAX_SNAPSHOT) return null;
+            locals_buf[nl] = .{ .slot = slot, .value = vals[e.ref] };
+            nl += 1;
+        },
+        .stack => |idx| {
+            if (idx >= MAX_SNAPSHOT) return null;
+            operands_buf[idx] = vals[e.ref];
+            nop_count = @max(nop_count, @as(usize, idx) + 1);
+        },
+    };
+    return try closures.resumeTrace(vm, ch, trace.anchor_chunk, snap.ip, upvalues, locals_buf[0..nl], operands_buf[0..nop_count]);
+}
+
 /// Captured upvalues of a (claimed, not-yet-resolved) bytecode thunk — for an
 /// inlined thunk body's `load_upvalue_of`. Null if it isn't a bytecode thunk.
 fn bytecodeThunkUpvalues(vm: *VM, thunk_val: Value) ?[]const Value {
@@ -236,6 +265,7 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
                 else => return null,
             },
             .ret => return vals[instr.a],
+            .side_exit => return try sideExit(vm, trace, instr.snapshot, vals, upvalues),
             // Allocations / calls-as-nodes / unmodeled ops: deopt.
             else => return null,
         }
