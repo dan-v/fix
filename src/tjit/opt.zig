@@ -24,7 +24,86 @@ pub fn optimize(trace: *Trace, allocator: std.mem.Allocator) !void {
     constFold(trace, allocator);
     dedupeGuards(trace, allocator) catch {};
     elideRedundantForces(trace);
+    sinkThunks(trace);
     try deadCodeElim(trace, allocator);
+}
+
+/// Allocation sinking — the headline win. A force-inlined thunk (`alloc_thunk`
+/// followed by `thunk_claim` + an inlined body + `thunk_resolve`) whose object
+/// NEVER ESCAPES — i.e. its only uses are that claim/resolve and the body's
+/// `load_upvalue_of` reads — does not need to exist: nobody can observe it. So
+/// we delete the allocation, the claim, and the resolve, and rewrite each
+/// `load_upvalue_of(thunk, slot)` to the captured Ref directly. The thunk's
+/// value (the body result) still flows on unchanged. This is the one
+/// optimization that removes the heavyweight per-thunk *work* (alloc + atomic
+/// claim + memo publish), not just dispatch — the reason the tracing JIT can
+/// beat the dispatch bound. See docs/tracing-jit.md.
+fn sinkThunks(trace: *Trace) void {
+    const instrs = trace.instrs.items;
+    for (instrs, 0..) |alloc, t| {
+        if (alloc.op != .alloc_thunk) continue;
+        const tref: Ref = @intCast(t);
+        // Scan uses: the thunk may only be claimed, resolved, or read as the
+        // inlined body's upvalue source. Anything else means it escapes (stored
+        // in an attrset/list/another thunk, returned, compared, …) → keep it.
+        var claim: ?usize = null;
+        var resolve: ?usize = null;
+        var escapes = false;
+        for (instrs, 0..) |u, j| {
+            const uses_t =
+                (ir.usesA(u.op) and u.a == tref) or
+                (ir.usesB(u.op) and u.b == tref);
+            switch (u.op) {
+                .thunk_claim => {
+                    if (u.a == tref) claim = j;
+                },
+                .thunk_resolve => {
+                    if (u.a == tref) resolve = j;
+                    if (u.b == tref) escapes = true; // resolving *with* the thunk
+                },
+                .load_upvalue_of => {
+                    // a==tref is a body upvalue read (rewritten below); any other
+                    // slot referencing it (there is none) would escape.
+                    if (uses_t and u.a != tref) escapes = true;
+                },
+                .alloc_thunk => {
+                    for (trace.extra.items[u.a .. u.a + u.b]) |r| {
+                        if (r == tref) escapes = true; // captured into another thunk
+                    }
+                },
+                else => {
+                    if (uses_t) escapes = true;
+                },
+            }
+        }
+        // Only force-inlined thunks (claimed + resolved here) are sinkable; a
+        // bare alloc_thunk with no claim is forced elsewhere and must be built.
+        if (escapes or claim == null or resolve == null) continue;
+
+        // Sink: rewrite every load_upvalue_of(thunk, slot) to the captured Ref,
+        // then nop the alloc / claim / resolve. The captures live in extra[a..].
+        const cap_start = alloc.a;
+        const cap_count = alloc.b;
+        for (instrs, 0..) |u, j| {
+            if (u.op == .load_upvalue_of and u.a == tref and u.aux < cap_count) {
+                const cap = trace.extra.items[cap_start + u.aux];
+                redirectUses(instrs, @intCast(j), cap);
+                instrs[j] = .{ .op = .nop };
+            }
+        }
+        instrs[t] = .{ .op = .nop };
+        instrs[claim.?] = .{ .op = .nop };
+        instrs[resolve.?] = .{ .op = .nop };
+    }
+}
+
+/// Redirect every use of Ref `from` to Ref `to` (used by sinking when a load is
+/// replaced by the value it would have read).
+fn redirectUses(instrs: []ir.Instr, from: Ref, to: Ref) void {
+    for (instrs) |*u| {
+        if (ir.usesA(u.op) and u.a == from) u.a = to;
+        if (ir.usesB(u.op) and u.b == from) u.b = to;
+    }
 }
 
 /// True if executing `op` forces its operand in field slot 0=`a` / 1=`b`. The
@@ -223,6 +302,52 @@ pub fn liveLen(trace: *const Trace) usize {
         if (instr.op != .nop) c += 1;
     }
     return c;
+}
+
+test "non-escaping force-inlined thunk is sunk" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, false);
+    defer trace.deinit(allocator);
+    // load_upvalue 0 (the capture); alloc_thunk capturing it; claim; the body
+    // reads its upvalue 0 and doubles it; resolve; ret the doubled value.
+    const cap = try trace.emit(allocator, .{ .op = .load_upvalue, .aux = 0 });
+    const start = try trace.addExtra(allocator, &.{cap});
+    const th = try trace.emit(allocator, .{ .op = .alloc_thunk, .a = start, .b = 1, .aux = 42 });
+    _ = try trace.emit(allocator, .{ .op = .thunk_claim, .a = th });
+    const up = try trace.emit(allocator, .{ .op = .load_upvalue_of, .a = th, .aux = 0 });
+    const v = try trace.emit(allocator, .{ .op = .add_int, .a = up, .b = up });
+    _ = try trace.emit(allocator, .{ .op = .thunk_resolve, .a = th, .b = v });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = v });
+
+    try optimize(&trace, allocator);
+    const ops = trace.instrs.items;
+    // The allocation, claim, resolve, and the upvalue read are all gone.
+    try std.testing.expectEqual(Op.nop, ops[th].op);
+    try std.testing.expectEqual(Op.nop, ops[up].op);
+    // add_int now reads the captured Ref directly (the thunk never existed).
+    try std.testing.expectEqual(Op.add_int, ops[v].op);
+    try std.testing.expectEqual(cap, ops[v].a);
+    try std.testing.expectEqual(cap, ops[v].b);
+    // No alloc_thunk / thunk_claim / thunk_resolve survive.
+    for (ops) |o| {
+        try std.testing.expect(o.op != .alloc_thunk and o.op != .thunk_claim and o.op != .thunk_resolve);
+    }
+}
+
+test "escaping thunk is NOT sunk" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, false);
+    defer trace.deinit(allocator);
+    // A thunk that is claimed + resolved but ALSO returned (escapes) → keep it.
+    const cap = try trace.emit(allocator, .{ .op = .load_upvalue, .aux = 0 });
+    const start = try trace.addExtra(allocator, &.{cap});
+    const th = try trace.emit(allocator, .{ .op = .alloc_thunk, .a = start, .b = 1, .aux = 42 });
+    _ = try trace.emit(allocator, .{ .op = .thunk_claim, .a = th });
+    _ = try trace.emit(allocator, .{ .op = .thunk_resolve, .a = th, .b = cap });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = th }); // escapes via ret
+
+    try optimize(&trace, allocator);
+    try std.testing.expectEqual(Op.alloc_thunk, trace.instrs.items[th].op); // kept
 }
 
 test "redundant force feeding only forcing consumers is elided" {
