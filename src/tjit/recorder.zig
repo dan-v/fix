@@ -35,6 +35,7 @@ const PendingCall = struct {
     callee_chunk: ChunkId,
     local_count: u16,
     n: u16,
+    strict_params: u8,
     func: Ref,
     args: [MAX_CALL_ARGS]Ref,
 };
@@ -293,10 +294,10 @@ pub const Recorder = struct {
     /// the interpreter forces strict args (possibly nesting) before the callee
     /// frame exists, and the driver activates the frame only once that frame
     /// actually appears. Stack: `[func, a0..a(n-1)]` (a(n-1) on top).
-    pub fn enterCallN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16) !void {
+    pub fn enterCallN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16, strict_params: u8) !void {
         if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
         if (n > MAX_CALL_ARGS or n > local_count or self.pending_call != null) return error.TraceAborted;
-        var pc: PendingCall = .{ .callee_chunk = callee_chunk, .local_count = local_count, .n = n, .func = 0, .args = undefined };
+        var pc: PendingCall = .{ .callee_chunk = callee_chunk, .local_count = local_count, .n = n, .strict_params = strict_params, .func = 0, .args = undefined };
         var i: u16 = n;
         while (i > 0) {
             i -= 1;
@@ -322,12 +323,29 @@ pub const Recorder = struct {
             .operand_base = @intCast(self.operand.items.len),
             .chunk_id = pc.callee_chunk,
         });
+        try self.emitStrictArgForces(pc.strict_params, pc.n);
+    }
+
+    /// Eagerly force the strict-param args of the just-entered callee frame,
+    /// matching the interpreter's `forceStrictArgs` (which runs BEFORE the
+    /// callee body). Without this the inlined callee forces them lazily later,
+    /// which reorders evaluation and can force a recursive-let cell mid-build
+    /// (blackhole). The force results are unused (effect only).
+    fn emitStrictArgForces(self: *Recorder, strict_params: u8, n: u16) !void {
+        const f = self.cur();
+        var mask = strict_params;
+        while (mask != 0) {
+            const i = @ctz(mask);
+            mask &= mask - 1;
+            if (i >= n) break;
+            if (f.locals[i]) |ref| _ = try self.emit(.{ .op = .force, .a = ref });
+        }
     }
 
     /// Saturated multi-arg tail call (`tail_call_n`): reuses the current frame
     /// (no depth change), so the interpreter's pre-call `forceStrictArgs`
     /// nesting is naturally suppressed (no deferral needed).
-    pub fn replaceTailN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16) !void {
+    pub fn replaceTailN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16, strict_params: u8) !void {
         if (n > MAX_CALL_ARGS or n > local_count) return error.TraceAborted;
         var args: [MAX_CALL_ARGS]Ref = undefined;
         var i: u16 = n;
@@ -347,6 +365,7 @@ pub const Recorder = struct {
         f.locals = locals;
         f.upvalue_src = func;
         f.chunk_id = callee_chunk;
+        try self.emitStrictArgForces(strict_params, n);
     }
 
     /// Tail call: like `enterCall` but reuses the current frame (no depth
