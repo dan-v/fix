@@ -56,6 +56,10 @@ pub const Op = enum(u8) {
     not,
 
     // ---- allocation (sink candidates) ----
+    /// Build a bytecode thunk: `aux` = chunk id, `a` = start index into
+    /// `Trace.extra`, `b` = capture count. The capture value Refs live in
+    /// `extra[a .. a+b]` (a thunk can capture any number of upvalues, more than
+    /// the two Instr operand slots hold). `a`/`b` are NOT Refs (see usesA/usesB).
     alloc_thunk,
     alloc_attrs,
     alloc_list,
@@ -155,6 +159,9 @@ pub const Trace = struct {
     instrs: std.ArrayListUnmanaged(Instr) = .empty,
     consts: std.ArrayListUnmanaged(Value) = .empty,
     snapshots: std.ArrayListUnmanaged(Snapshot) = .empty,
+    /// Side array of Refs for ops with a variable operand count (`alloc_thunk`
+    /// captures, …) that don't fit the two Instr slots. Indexed by `[a .. a+b]`.
+    extra: std.ArrayListUnmanaged(Ref) = .empty,
 
     pub fn init(anchor_chunk: ChunkId, is_lambda: bool) Trace {
         return .{ .anchor_chunk = anchor_chunk, .is_lambda = is_lambda };
@@ -165,6 +172,14 @@ pub const Trace = struct {
         self.consts.deinit(allocator);
         for (self.snapshots.items) |snap| allocator.free(snap.entries);
         self.snapshots.deinit(allocator);
+        self.extra.deinit(allocator);
+    }
+
+    /// Append `refs` to the side array, returning the start index.
+    pub fn addExtra(self: *Trace, allocator: std.mem.Allocator, refs: []const Ref) !u32 {
+        const start: u32 = @intCast(self.extra.items.len);
+        try self.extra.appendSlice(allocator, refs);
+        return start;
     }
 
     /// Append an instruction, returning its SSA `Ref`.

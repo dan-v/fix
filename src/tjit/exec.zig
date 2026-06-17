@@ -33,6 +33,9 @@ const helpers = @import("jit_helpers.zig");
 
 pub const enabled: bool = @import("build_options").tjit;
 
+/// Mirror of the recorder's capture cap (record.zig MAX_THUNK_CAPTURES).
+const MAX_ALLOC_CAPTURES = 64;
+
 var native_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var exec_count: std.atomic.Value(u64) = .{ .raw = 0 };
 var deopt_count: std.atomic.Value(u64) = .{ .raw = 0 };
@@ -155,6 +158,17 @@ pub fn execute(vm: *VM, trace: *const ir.Trace, upvalues: []const Value, arg: Va
             .get_attr => {
                 const attrs = try force.forceValue(vm, vals[instr.a]);
                 vals[i] = try access.getAttrValue(vm, attrs, @intCast(instr.aux));
+            },
+            .alloc_thunk => {
+                // Build a bytecode thunk capturing the (unforced) operand values,
+                // exactly as makeBytecodeThunkFromCaptures' .none path does.
+                const count: usize = instr.b;
+                if (count > MAX_ALLOC_CAPTURES) return null;
+                var buf: [MAX_ALLOC_CAPTURES]Value = undefined;
+                var k: usize = 0;
+                while (k < count) : (k += 1) buf[k] = vals[trace.extra.items[instr.a + k]];
+                const id = vm.heap.addBytecodeThunk(@intCast(instr.aux), buf[0..count]) catch return null;
+                vals[i] = Value.thunk(id);
             },
             .guard => switch (@as(GuardKind, @enumFromInt(@as(u8, @intCast(instr.aux))))) {
                 // Validate the recorded attr shape: the operand must force to an

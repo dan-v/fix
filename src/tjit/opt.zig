@@ -65,6 +65,16 @@ fn elideRedundantForces(trace: *Trace) void {
                 uses += 1;
                 if (!forcesOperand(u.op, 1)) all_forcing = false;
             }
+            // Capture into an allocation keeps the value lazy/raw → a
+            // non-forcing use, so the force must be kept.
+            if (u.op == .alloc_thunk) {
+                for (trace.extra.items[u.a .. u.a + u.b]) |r| {
+                    if (r == fref) {
+                        uses += 1;
+                        all_forcing = false;
+                    }
+                }
+            }
         }
         if (uses == 0 or !all_forcing) continue;
         const src = instr.a;
@@ -176,6 +186,12 @@ fn deadCodeElim(trace: *Trace, allocator: std.mem.Allocator) !void {
         }
         if (ir.usesA(instr.op) and instr.a < n) live[instr.a] = true;
         if (ir.usesB(instr.op) and instr.b < n) live[instr.b] = true;
+        // alloc_thunk's captured operands live in the `extra` side-array.
+        if (instr.op == .alloc_thunk) {
+            for (trace.extra.items[instr.a .. instr.a + instr.b]) |r| {
+                if (r < n) live[r] = true;
+            }
+        }
     }
 }
 

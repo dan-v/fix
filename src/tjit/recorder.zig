@@ -111,11 +111,16 @@ pub const Recorder = struct {
         try self.push(try self.emit(.{ .op = .const_val, .aux = cidx }));
     }
 
-    pub fn getLocal(self: *Recorder, slot: u16) !void {
+    /// Resolve a frame local to its current Ref without pushing (for collecting
+    /// capture operands). Aborts if the slot was never written in the trace.
+    pub fn localRef(self: *Recorder, slot: u16) !Ref {
         const f = self.cur();
         if (slot >= f.locals.len) return error.TraceAborted;
-        const ref = f.locals[slot] orelse return error.TraceAborted;
-        try self.push(ref);
+        return f.locals[slot] orelse error.TraceAborted;
+    }
+
+    pub fn getLocal(self: *Recorder, slot: u16) !void {
+        try self.push(try self.localRef(slot));
     }
 
     pub fn setLocal(self: *Recorder, slot: u16) !void {
@@ -124,13 +129,25 @@ pub const Recorder = struct {
         f.locals[slot] = try self.pop();
     }
 
-    pub fn getUpvalue(self: *Recorder, slot: u16) !void {
+    /// Resolve an upvalue to a Ref without pushing (for collecting captures).
+    pub fn upvalueRef(self: *Recorder, slot: u16) !Ref {
         const f = self.cur();
         if (f.upvalue_src) |src| {
-            try self.push(try self.emit(.{ .op = .load_upvalue_of, .a = src, .aux = slot }));
-        } else {
-            try self.push(try self.emit(.{ .op = .load_upvalue, .aux = slot }));
+            return self.emit(.{ .op = .load_upvalue_of, .a = src, .aux = slot });
         }
+        return self.emit(.{ .op = .load_upvalue, .aux = slot });
+    }
+
+    pub fn getUpvalue(self: *Recorder, slot: u16) !void {
+        try self.push(try self.upvalueRef(slot));
+    }
+
+    /// Emit `alloc_thunk` capturing `refs` (in upvalue order) for body `chunk_id`,
+    /// pushing the new thunk's Ref. The captures live in the trace's `extra`
+    /// side-array so a thunk can close over any number of upvalues.
+    pub fn allocThunk(self: *Recorder, chunk_id: ChunkId, refs: []const Ref) !void {
+        const start = try self.trace.addExtra(self.allocator, refs);
+        try self.push(try self.emit(.{ .op = .alloc_thunk, .a = start, .b = @intCast(refs.len), .aux = chunk_id }));
     }
 
     /// Force the top-of-stack value to WHNF, replacing it with the forced Ref.

@@ -231,10 +231,34 @@ fn recordThunkCaptures(vm: *VM, rec: *Recorder, chunk_id: u32, code: []const u8,
         .constant => |ci| try rec.pushConst(ch.constants[ci]),
         .literal => |v| try rec.pushConst(v),
         .builtins => try rec.pushConst(vm.builtins),
-        // closure_zero/closure_captures/attr_access build an object → need the
-        // alloc_* IR; .none is a real thunk. Both abort until that layer lands.
+        // A real (non-trivial) thunk: emit `alloc_thunk` capturing the same
+        // upvalues. This is the sink candidate — escape analysis + force-inline
+        // can later make the allocation vanish.
+        .none => try recordAllocThunk(rec, chunk_id, descriptors, count),
+        // closure_zero/closure_captures/attr_access build a closure/attr-access
+        // thunk → need their own alloc IR; abort until that lands.
         else => rec.abort(),
     }
+}
+
+/// Cap on captures we model in one `alloc_thunk` (stack buffer for the Refs).
+const MAX_THUNK_CAPTURES = 64;
+
+/// Resolve all `count` capture descriptors to Refs and emit `alloc_thunk`.
+fn recordAllocThunk(rec: *Recorder, chunk_id: u32, descriptors: []const u8, count: u16) !void {
+    if (count > MAX_THUNK_CAPTURES) return rec.abort();
+    var refs: [MAX_THUNK_CAPTURES]ir.Ref = undefined;
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        const off = k * 3;
+        const cap_index = readU16(descriptors, off + 1);
+        refs[k] = switch (descriptors[off]) {
+            0 => try rec.localRef(cap_index),
+            1 => try rec.upvalueRef(cap_index),
+            else => return rec.abort(),
+        };
+    }
+    try rec.allocThunk(chunk_id, refs[0..count]);
 }
 
 /// Resolve capture descriptor `idx` (kind:1, index:2) to its Ref against the
