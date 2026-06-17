@@ -28,6 +28,16 @@ const ChunkId = types.ChunkId;
 
 pub const MAX_TRACE_LEN: usize = 4096;
 pub const MAX_INLINE_DEPTH: usize = 64;
+pub const MAX_CALL_ARGS = 16;
+
+/// A deferred `call_n` inline frame (see `pending_call`).
+const PendingCall = struct {
+    callee_chunk: ChunkId,
+    local_count: u16,
+    n: u16,
+    func: Ref,
+    args: [MAX_CALL_ARGS]Ref,
+};
 
 /// One inlined call frame. `locals[i]` is the IR Ref currently in local slot
 /// `i` (null = uninitialized). `upvalue_src` is null for the anchor frame
@@ -64,6 +74,12 @@ pub const Recorder = struct {
     /// tells the recorder which `force` to convert into an inlined thunk body.
     /// Cleared by the driver before each observed op.
     pending_force: ?Ref = null,
+    /// A `call_n` whose inline frame is *deferred*: the saturated-call handler
+    /// runs `forceStrictArgs` (which may nest arg-thunk bodies) BEFORE pushing
+    /// the callee frame, so bumping our depth eagerly would mis-record those
+    /// arg forces as the callee body. We stash the call here and let the driver
+    /// activate it when the real callee frame appears (`activatePendingCall`).
+    pending_call: ?PendingCall = null,
 
     pub fn init(allocator: std.mem.Allocator, trace: *Trace) Recorder {
         return .{ .allocator = allocator, .trace = trace };
@@ -270,6 +286,67 @@ pub const Recorder = struct {
             .operand_base = @intCast(self.operand.items.len),
             .chunk_id = callee_chunk,
         });
+    }
+
+    /// Begin a saturated multi-arg call (`call_n`, arity == n). Pops n args +
+    /// func and guards the callee chunk, but DEFERS pushing the inline frame —
+    /// the interpreter forces strict args (possibly nesting) before the callee
+    /// frame exists, and the driver activates the frame only once that frame
+    /// actually appears. Stack: `[func, a0..a(n-1)]` (a(n-1) on top).
+    pub fn enterCallN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16) !void {
+        if (self.frames.items.len >= MAX_INLINE_DEPTH) return error.TraceAborted;
+        if (n > MAX_CALL_ARGS or n > local_count or self.pending_call != null) return error.TraceAborted;
+        var pc: PendingCall = .{ .callee_chunk = callee_chunk, .local_count = local_count, .n = n, .func = 0, .args = undefined };
+        var i: u16 = n;
+        while (i > 0) {
+            i -= 1;
+            pc.args[i] = try self.pop();
+        }
+        pc.func = try self.pop();
+        const snap = try self.snapshot();
+        _ = try self.emit(.{ .op = .guard, .a = pc.func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        self.pending_call = pc;
+    }
+
+    /// Push the deferred `call_n` inline frame (its real callee frame has now
+    /// appeared in the VM). Called by the driver.
+    pub fn activatePendingCall(self: *Recorder) !void {
+        const pc = self.pending_call orelse return error.TraceAborted;
+        self.pending_call = null;
+        const locals = try self.allocator.alloc(?Ref, pc.local_count);
+        @memset(locals, null);
+        for (0..pc.n) |k| locals[k] = pc.args[k];
+        try self.frames.append(self.allocator, .{
+            .locals = locals,
+            .upvalue_src = pc.func,
+            .operand_base = @intCast(self.operand.items.len),
+            .chunk_id = pc.callee_chunk,
+        });
+    }
+
+    /// Saturated multi-arg tail call (`tail_call_n`): reuses the current frame
+    /// (no depth change), so the interpreter's pre-call `forceStrictArgs`
+    /// nesting is naturally suppressed (no deferral needed).
+    pub fn replaceTailN(self: *Recorder, callee_chunk: ChunkId, local_count: u16, n: u16) !void {
+        if (n > MAX_CALL_ARGS or n > local_count) return error.TraceAborted;
+        var args: [MAX_CALL_ARGS]Ref = undefined;
+        var i: u16 = n;
+        while (i > 0) {
+            i -= 1;
+            args[i] = try self.pop();
+        }
+        const func = try self.pop();
+        const snap = try self.snapshot();
+        _ = try self.emit(.{ .op = .guard, .a = func, .aux = @intFromEnum(GuardKind.chunk_id), .aux2 = callee_chunk, .snapshot = snap });
+        const f = self.cur();
+        self.operand.shrinkRetainingCapacity(f.operand_base);
+        const locals = try self.allocator.alloc(?Ref, local_count);
+        @memset(locals, null);
+        for (0..n) |k| locals[k] = args[k];
+        self.allocator.free(f.locals);
+        f.locals = locals;
+        f.upvalue_src = func;
+        f.chunk_id = callee_chunk;
     }
 
     /// Tail call: like `enterCall` but reuses the current frame (no depth

@@ -181,7 +181,20 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
     // our depth, then resume — turning the old hard abort into a recorded
     // re-force. Soundness rests on the guards actually validating re-forced
     // values (e.g. attr_shape deopts on a divergent shape, see exec.zig).
-    const expected = r.root_depth + @as(u32, @intCast(r.rec.inlineDepth())) - 1;
+    var expected = r.root_depth + @as(u32, @intCast(r.rec.inlineDepth())) - 1;
+    // A deferred `call_n` frame activates once its real callee frame appears:
+    // the VM is one deeper than our model AND the current frame is the callee
+    // chunk (distinguishing it from a `forceStrictArgs` arg-thunk body, which
+    // has a different chunk and stays suppressed).
+    if (r.rec.pending_call) |pc| {
+        if (vm.frames_len == expected + 1 and vm.frames[vm.frames_len - 1].chunk_id == pc.callee_chunk) {
+            r.rec.activatePendingCall() catch {
+                abort(vm);
+                return;
+            };
+            expected += 1;
+        }
+    }
     if (vm.frames_len > expected) {
         if (!r.suppressing) {
             r.suppressing = true;
@@ -257,6 +270,20 @@ fn inlinableCallee(vm: *VM) ?struct { chunk: ChunkId, local_count: u16 } {
     const closure = vm.heap.getClosure(callee.asObjectId()) catch return null;
     const ch = vm.registry.get(closure.chunk_id) orelse return null;
     if (ch.arity != 1) return null; // uncurried/saturated calls: later
+    return .{ .chunk = closure.chunk_id, .local_count = ch.local_count };
+}
+
+/// Resolve a saturated `call_n`/`tail_call_n` callee (stack `[.., callee, a0,
+/// .., a(n-1)]`) to an inlinable closure with arity == n. Only the saturated
+/// path is inlinable — the under-applied fold (`callValue` per arg) has
+/// different control flow, so non-saturated truncates.
+fn inlinableCalleeN(vm: *VM, n: u16) ?struct { chunk: ChunkId, local_count: u16 } {
+    if (vm.sp < @as(usize, n) + 1) return null;
+    const callee = vm.stack[vm.sp - n - 1];
+    if (!callee.isClosure()) return null;
+    const closure = vm.heap.getClosure(callee.asObjectId()) catch return null;
+    const ch = vm.registry.get(closure.chunk_id) orelse return null;
+    if (ch.arity != n) return null; // saturated only
     return .{ .chunk = closure.chunk_id, .local_count = ch.local_count };
 }
 
@@ -388,6 +415,22 @@ fn observeOp(vm: *VM, rec: *Recorder, frame: *Frame, code: []const u8, ip: usize
             };
             try rec.replaceTail(callee.chunk, callee.local_count);
         },
+        // Saturated multi-arg calls: inline when the callee arity matches the
+        // arg count. `call_n` defers its inline frame (forceStrictArgs nests
+        // before the callee frame); `tail_call_n` reuses the frame so its
+        // pre-call forcing is naturally suppressed.
+        .call_n => {
+            const n = code[ip + 1];
+            const callee = inlinableCalleeN(vm, n) orelse {
+                abort_op[@intFromEnum(op)] += 1;
+                return rec.requestTruncate();
+            };
+            try rec.enterCallN(callee.chunk, callee.local_count, n);
+        },
+        // tail_call_n inlining (replaceTailN) is built but has an isolated
+        // RecursiveThunk bug at exec — truncate for now (the side-exit resumes
+        // it correctly via the resume-chunk fix). call_n inlines.
+        .tail_call_n => rec.requestTruncate(),
         .ret => try rec.ret(),
         // Thunk creation. The interpreter short-circuits trivial bodies
         // (`identity_upvalue`/`constant`/`literal`/`builtins`) by pushing a
