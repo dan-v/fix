@@ -158,6 +158,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         @import("vm/trace_probe.zig").report();
+        @import("runtime/struct_census.zig").report();
         @import("vm/ngram_probe.zig").report();
         if (comptime @import("tjit/hot.zig").enabled) self.reportHotAnchors();
         if (comptime @import("tjit/exec.zig").enabled) @import("tjit/exec.zig").report();
@@ -364,6 +365,7 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         @import("vm/trace_probe.zig").init(self.allocator);
+        @import("runtime/struct_census.zig").init(self.allocator);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
