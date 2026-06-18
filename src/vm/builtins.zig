@@ -1,6 +1,7 @@
 //! Builtin dispatch and builtin implementations for the bytecode VM.
 
 const Value = @import("../runtime/value.zig").Value;
+const struct_census = @import("../runtime/struct_census.zig");
 const builtins_mod = @import("../builtins.zig");
 const BuiltinId = builtins_mod.BuiltinId;
 const shared = @import("builtins/shared.zig");
@@ -26,6 +27,8 @@ pub const writeLazyXmlValue = serial.writeLazyXmlValue;
 pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value {
     const t = prof.startBuiltin(builtin_id);
     defer prof.end(.apply_builtin, t);
+    const census_sp = struct_census.setProducer(struct_census.BUILTIN_BASE + builtin_id);
+    defer struct_census.restoreProducer(census_sp);
     const id: BuiltinId = @enumFromInt(builtin_id);
     const arity = builtins_mod.arity(id);
     if (args.len < arity) return shared.makeBuiltinClosure(self, builtin_id, args);
