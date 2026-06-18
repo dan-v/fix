@@ -431,6 +431,19 @@ pub fn bodyMustForceName(
 const Compiler = @import("../compiler.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {
+    const _pt = @import("../prof.zig").start(.strictness);
+    defer @import("../prof.zig").end(.strictness, _pt);
+
+    // The strictness signature is purely an upvalue (capture) mask:
+    // `nameSetToMask` only sets bits for names that match a capture slot.
+    // A chunk with no captures therefore has an all-zero signature — the
+    // ChunkStrictness default — so the entire `analyzeChunkBody` AST walk
+    // is wasted work. Skip it. Byte-identical by construction.
+    if (c.captures.items.len == 0) {
+        c.builder.strictness = .{};
+        return;
+    }
+
     var params: std.ArrayListUnmanaged(InternId) = .empty;
     defer params.deinit(c.allocator);
     try params.ensureTotalCapacity(c.allocator, c.locals.items.len);

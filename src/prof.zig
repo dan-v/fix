@@ -75,6 +75,10 @@ pub const Path = enum {
     parse,
     /// `Compiler.compileAndFinish` — AST → bytecode for an imported file.
     compile,
+    /// `strictness.stampOnBuilder` — per-chunk strictness analysis (a
+    /// second AST walk building NameSets). Sub-phase of `compile`; its
+    /// exclusive cycles are carved out of the `compile` bucket.
+    strictness,
 };
 
 pub const Sample = struct {
