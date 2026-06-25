@@ -158,10 +158,13 @@ pub fn report() void {
     var lists: Hist = .{};
     var attrs: Hist = .{};
 
-    // Per-producer single-use structure counts (combined list+attrs).
+    // Per-producer / per-consumer single-use structure counts (list+attrs).
     var prod_single = std.heap.page_allocator.alloc(u64, TAG_SLOTS) catch return;
     defer std.heap.page_allocator.free(prod_single);
     @memset(prod_single, 0);
+    var cons_single = std.heap.page_allocator.alloc(u64, TAG_SLOTS) catch return;
+    defer std.heap.page_allocator.free(cons_single);
+    @memset(cons_single, 0);
 
     // Top producer→consumer pairs among single-use structures.
     var pairs = std.AutoHashMap(u32, u64).init(std.heap.page_allocator);
@@ -176,6 +179,7 @@ pub fn report() void {
         }
         if (r <= 1) {
             if (p < TAG_SLOTS) prod_single[p] += 1;
+            if (c < TAG_SLOTS) cons_single[c] += 1;
             const key = (@as(u32, p) << 16) | @as(u32, c);
             (pairs.getOrPutValue(key, 0) catch continue).value_ptr.* += 1;
         }
@@ -219,5 +223,57 @@ pub fn report() void {
         std.debug.print("  {s:<20} -> {s:<20} {d:>9} ({d:.1}%)\n", .{ tagName(p), tagName(c), best_n, pct(best_n, total_single) });
         _ = pairs.remove(best_key);
     }
+    std.debug.print("\nsingle-use consumers (top 15):\n", .{});
+    for (0..15) |_| {
+        var best: usize = 0;
+        var best_n: u64 = 0;
+        for (cons_single, 0..) |n, t| {
+            if (n > best_n) {
+                best_n = n;
+                best = t;
+            }
+        }
+        if (best_n == 0) break;
+        std.debug.print("  {s:<22} {d:>9} ({d:.1}%) [{s}]\n", .{ tagName(@intCast(best)), best_n, pct(best_n, total_single), @tagName(consumerClass(@intCast(best))) });
+        cons_single[best] = 0;
+    }
+
+    // True-fusion ceiling: single-use structures split by consumer class.
+    // Only SHALLOW (consumer needs < full content) and COMPOSING (consumer
+    // is itself a fusable producer) are work-avoidable; MATERIALIZING
+    // consumers need the whole structure so fusion can't elide work.
+    @memset(cons_single, 0); // reused: recompute (top-15 loop zeroed entries)
+    var shallow: u64 = 0;
+    var composing: u64 = 0;
+    var materializing: u64 = 0;
+    for (state.kinds, state.reads, state.consumers) |k, r, c| {
+        if (@as(Kind, @enumFromInt(k)) == .none) continue;
+        if (r > 1) continue;
+        switch (consumerClass(c)) {
+            .shallow => shallow += 1,
+            .composing => composing += 1,
+            .materializing => materializing += 1,
+        }
+    }
+    std.debug.print("\n=== TRUE-FUSION CEILING (single-use by consumer class) ===\n", .{});
+    std.debug.print("  shallow (needs < full content):  {d:>9} ({d:.1}%)\n", .{ shallow, pct(shallow, total_single) });
+    std.debug.print("  composing (fusable producer):    {d:>9} ({d:.1}%)\n", .{ composing, pct(composing, total_single) });
+    std.debug.print("  materializing (needs whole):     {d:>9} ({d:.1}%)\n", .{ materializing, pct(materializing, total_single) });
+    std.debug.print("  => work-avoidable (shallow+composing): {d} of {d} single-use ({d:.1}%)\n", .{ shallow + composing, total_single, pct(shallow + composing, total_single) });
     std.debug.print("note: run at --workers=1 for an unraced single-thread (serial-eval) picture.\n", .{});
+}
+
+const ConsumerClass = enum { shallow, composing, materializing };
+
+/// Classify a consumer op by how much of the structure it needs. Shallow =
+/// length/index/keys (work-avoidable). Composing = a producer op that
+/// iterates but could itself be fused into the chain. Everything else
+/// materializes the whole structure (fusion can't elide its contents).
+fn consumerClass(tag: u16) ConsumerClass {
+    const name = tagName(tag);
+    const shallow = [_][]const u8{ "length", "elemAt", "head", "tail", "attrNames", "functionArgs", "isAttrs", "isList", "hasAttr" };
+    for (shallow) |s| if (std.mem.eql(u8, name, s)) return .shallow;
+    const composing = [_][]const u8{ "map", "filter", "mapAttrs", "concatMap", "catAttrs", "attrValues", "foldl'", "any", "all", "++concat", "concatLists" };
+    for (composing) |s| if (std.mem.eql(u8, name, s)) return .composing;
+    return .materializing;
 }
