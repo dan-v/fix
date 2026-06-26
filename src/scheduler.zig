@@ -271,6 +271,11 @@ pub const Scheduler = struct {
     threads: []std.Thread,
     wake_words: []std.atomic.Value(u32),
     shutdown_flag: std.atomic.Value(bool),
+    /// Count of helper threads that have stopped forcing (exited `run`)
+    /// at shutdown. The quiescence barrier (`awaitHelpersQuiescent`) waits
+    /// on this so no helper destroys its fibers while another could still
+    /// resolve a thunk and wake a just-freed enrolled fiber.
+    stopped_helpers: std.atomic.Value(u32) = .init(0),
     next_victim: std.atomic.Value(u32),
     /// Monotonic counter handing out fresh fiber ids at allocation.
     /// Fiber ids are scheduler-global so a fiber's identity doesn't
@@ -495,6 +500,21 @@ pub const Scheduler = struct {
             });
             spawned += 1;
         }
+    }
+
+    /// Quiescence barrier for shutdown: each helper calls this AFTER its
+    /// `run` loop exits and BEFORE it destroys its fibers, so all forcing
+    /// has stopped before any fiber is freed. Without it, a helper could
+    /// `Worker.deinit` (free) a still-enrolled speculative fiber while
+    /// another helper, finishing its last quantum, resolves that fiber's
+    /// thunk and wakes the freed fiber → use-after-free. Once every helper
+    /// is past this point, no `wakeFiberWaiters` can run, so the orphaned
+    /// dangling waiters are never walked.
+    pub fn awaitHelpersQuiescent(self: *Scheduler) void {
+        const helpers: u32 = self.worker_count - 1;
+        if (helpers == 0) return;
+        _ = self.stopped_helpers.fetchAdd(1, .acq_rel);
+        while (self.stopped_helpers.load(.acquire) < helpers) std.atomic.spinLoopHint();
     }
 
     /// Signal helpers to exit and wait for them. Idempotent.

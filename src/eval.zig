@@ -656,9 +656,17 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
         worker_id,
         ev,
         initVmForWorkerSlot,
-    ) catch return;
-    defer worker.deinit();
+    ) catch {
+        // Still pass the quiescence barrier so peers don't wait forever.
+        sched.awaitHelpersQuiescent();
+        return;
+    };
     worker.run();
+    // Wait until ALL helpers have stopped forcing before destroying any
+    // fibers — a still-running helper could resolve a thunk and wake a
+    // just-freed enrolled fiber (shutdown UAF). See awaitHelpersQuiescent.
+    sched.awaitHelpersQuiescent();
+    worker.deinit();
 }
 
 fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32) anyerror!VM {
