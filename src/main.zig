@@ -12,6 +12,7 @@ const inspect_cmd = @import("cli/inspect.zig");
 const trace_cmd = @import("cli/trace.zig");
 const thunks_cmd = @import("cli/thunks.zig");
 const vm_trace_mod = @import("vm/trace_log.zig");
+const timeline = @import("timeline.zig");
 const thunk_trace_mod = @import("eval/thunk_trace.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
@@ -77,6 +78,7 @@ const Options = struct {
     disable_spec_thunks: bool = false,
     disable_fanout: bool = false,
     print_sched_stats: bool = false,
+    timeline_path: ?[]const u8 = null,
 
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
@@ -203,8 +205,18 @@ pub fn main(init: std.process.Init) !void {
         @import("tjit/hot.zig").report_enabled = options.print_sched_stats;
     }
 
+    if (comptime timeline.enabled) {
+        if (options.timeline_path != null) timeline.init(allocator, worker_count, 1 << 21);
+    } else if (options.timeline_path != null) {
+        std.debug.print("warning: --timeline requires a build with -Dtimeline; ignoring\n", .{});
+    }
+
     const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
+
+    if (comptime timeline.enabled) {
+        if (options.timeline_path) |p| timeline.dump(init.io, p, worker_count);
+    }
     trace_setup.finish();
     thunks_setup.finish();
     if (options.print_sched_stats) {
@@ -580,6 +592,10 @@ fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Op
             options.disable_fanout = true;
         } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
             options.print_sched_stats = true;
+        } else if (std.mem.eql(u8, arg, "--timeline")) {
+            options.timeline_path = "fix-timeline.json";
+        } else if (std.mem.startsWith(u8, arg, "--timeline=")) {
+            options.timeline_path = arg["--timeline=".len..];
         } else {
             return error.UnknownOption;
         }

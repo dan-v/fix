@@ -27,6 +27,7 @@ const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
 const eval_trace = @import("eval/trace.zig");
 const eval_progress = @import("eval/progress.zig");
+const timeline = @import("timeline.zig");
 const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
@@ -283,6 +284,8 @@ pub const Evaluator = struct {
         const ast_node = blk: {
             self.progressBegin(.parse, subject);
             defer self.progressEnd(.parse, subject);
+            timeline.begin(.parse, subject, 0);
+            defer timeline.end(.parse);
             const pt = @import("prof.zig").start(.parse);
             defer @import("prof.zig").end(.parse, pt);
             break :blk parser.parse() catch {
@@ -309,6 +312,8 @@ pub const Evaluator = struct {
         {
             self.progressBegin(.compile, subject);
             defer self.progressEnd(.compile, subject);
+            timeline.begin(.compile, subject, 0);
+            defer timeline.end(.compile);
             const ct = @import("prof.zig").start(.compile);
             defer @import("prof.zig").end(.compile, ct);
             compiler.compileAndFinish(ast_node, scope) catch |err| {
@@ -388,6 +393,7 @@ pub const Evaluator = struct {
         const subject = source_path orelse "expression";
         self.progressBegin(.evaluate, subject);
         defer self.progressEnd(.evaluate, subject);
+        timeline.instant(.evaluate, subject);
         // Only the top-level eval (no scope, no source_path) goes
         // through a main-thread fiber so the main thread can yield on
         // a `.busy` thunk; nested invocations (imports, scoped
@@ -451,6 +457,7 @@ pub const Evaluator = struct {
 
     pub fn writeJsonValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
+        timeline.instant(.render, "result");
         defer self.progressEnd(.render, "result");
         self.run.trace.clear();
         return self.runWithVm(vm_builtins.writeJsonValue, .{ writer, value });
@@ -458,6 +465,7 @@ pub const Evaluator = struct {
 
     pub fn writeXmlValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
+        timeline.instant(.render, "result");
         defer self.progressEnd(.render, "result");
         self.run.trace.clear();
         return self.runWithVm(vm_builtins.writeLazyXmlValue, .{ writer, value });
@@ -471,6 +479,7 @@ pub const Evaluator = struct {
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         self.progressBegin(.render, "strict result");
         defer self.progressEnd(.render, "strict result");
+        timeline.instant(.render, "strict result");
         self.run.trace.clear();
         return self.runWithVm(vm_force.forceDeep, .{value});
     }
@@ -576,6 +585,7 @@ pub const Evaluator = struct {
 
     pub fn writeValue(self: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
         self.progressBegin(.render, "result");
+        timeline.instant(.render, "result");
         defer self.progressEnd(.render, "result");
         return self.runWithVm(writeValueBody, .{ self, writer, value });
     }

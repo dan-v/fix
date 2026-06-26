@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
     const struct_census = b.option(bool, "struct-census", "Measure deforestation headroom: per-list/attrset consume-count histogram (single-use vs shared). Run at --workers=1.") orelse false;
     const opcode_ngram = b.option(bool, "opcode-ngram", "Profile hottest adjacent (fall-through) opcode pairs for superinstruction fusion. Run at --workers=1.") orelse false;
     const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
+    const timeline = b.option(bool, "timeline", "Record a wall-clock event timeline (parse/compile/import phases, fiber-run quanta, idle parks) per worker; write Perfetto JSON via --timeline[=path].") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
@@ -57,6 +58,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "struct_census", struct_census);
     build_options.addOption(bool, "opcode_ngram", opcode_ngram);
     build_options.addOption(bool, "tjit", tjit);
+    build_options.addOption(bool, "timeline", timeline);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
