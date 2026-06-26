@@ -79,8 +79,14 @@ pub const ImportHost = struct {
 /// Per-thread VM state. Each worker thread has one of these.
 pub const VM = struct {
     allocator: std.mem.Allocator,
-    /// Global chunk registry (shared across all VMs).
-    registry: *const ChunkRegistry,
+    /// Global chunk registry (shared across all VMs). Mutable: the
+    /// deferred-attr force path registers freshly-compiled chunks at
+    /// runtime (`register` is internally thread-safe).
+    registry: *ChunkRegistry,
+    /// Lazy per-attr compilation: deferred bodies + their compile cache.
+    /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
+    /// (which never create `.deferred` thunks). See `deferred.zig`.
+    deferred_table: ?*@import("deferred.zig").Table = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
@@ -161,7 +167,7 @@ pub const VM = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        registry: *const ChunkRegistry,
+        registry: *ChunkRegistry,
         intern: *InternTable,
         heap: *ObjectHeap,
         files: *FileCache,

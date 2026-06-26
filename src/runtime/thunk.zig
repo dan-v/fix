@@ -120,6 +120,39 @@ pub const BytecodeThunk = struct {
     }
 };
 
+/// A thunk whose body has NOT been compiled to bytecode yet — its value
+/// is the result of compiling an AST node (named by `deferred_id` into
+/// the evaluator's `DeferredTable`) against the captured environment
+/// `env`, then running it. Used by lazy per-attr compilation: a large
+/// generated attrset (e.g. nixpkgs hackage-packages.nix) emits these for
+/// its value bodies instead of compiling thousands of never-forced
+/// bodies up front. On first force the body is compiled, the resulting
+/// ChunkId is cached on the `DeferredTable` entry (shared across
+/// instantiations), and execution falls into the same path as a
+/// `.bytecode` thunk with `env` as its upvalues.
+///
+/// Mirrors `BytecodeThunk`'s inline(≤2)/spilled storage so the (hot,
+/// millions-live) `Thunk` union is not widened — same 24-byte arm.
+pub const DeferredThunk = struct {
+    deferred_id: u32,
+    env_count: u32,
+    storage: Storage,
+
+    pub const INLINE_CAP: u32 = BytecodeThunk.INLINE_CAP;
+
+    const Storage = union {
+        inline_vals: [INLINE_CAP]Value,
+        spilled: []const Value,
+    };
+
+    /// The captured environment (the enclosing-scope snapshot). Same
+    /// stable-pointer contract as `BytecodeThunk.upvalues`.
+    pub fn env(self: *const DeferredThunk) []const Value {
+        if (self.env_count <= INLINE_CAP) return self.storage.inline_vals[0..self.env_count];
+        return self.storage.spilled;
+    }
+};
+
 /// What a thunk evaluates when forced.
 ///
 ///   - `.closure` and `.bytecode` are computed targets: forcing invokes
@@ -145,7 +178,7 @@ pub const AttrAccess = struct {
 /// tag would round the whole target up by 8 bytes. Externalizing the
 /// 1-byte discriminant into otherwise-wasted padding shrinks the
 /// (millions-live) Thunk by 8 bytes.
-pub const TargetKind = enum(u8) { closure, bytecode, pass_through, attr_access };
+pub const TargetKind = enum(u8) { closure, bytecode, pass_through, attr_access, deferred };
 
 /// Bare (untagged) union — the active arm is named by `Future.target_kind`,
 /// set at construction and immutable thereafter (a target is never
@@ -156,6 +189,7 @@ pub const ThunkTarget = union {
     bytecode: BytecodeThunk,
     pass_through: Value,
     attr_access: AttrAccess,
+    deferred: DeferredThunk,
 };
 
 /// Captured failure of a thunk's deterministic body, replayed on
@@ -459,6 +493,28 @@ pub const Thunk = struct {
             .payload = .{ .target = .{ .bytecode = .{
                 .chunk_id = chunk_id,
                 .upvalue_count = @intCast(upvalues.len),
+                .storage = storage,
+            } } },
+        };
+    }
+
+    /// A deferred-compile thunk (see `DeferredThunk`). `env` of length
+    /// <= `INLINE_CAP` is copied inline; wider snapshots keep the passed
+    /// slice (caller owns its stable `values` storage).
+    pub fn initDeferred(deferred_id: u32, env: []const Value) Thunk {
+        var storage: DeferredThunk.Storage = undefined;
+        if (env.len <= DeferredThunk.INLINE_CAP) {
+            var arr: [DeferredThunk.INLINE_CAP]Value = undefined;
+            @memcpy(arr[0..env.len], env);
+            storage = .{ .inline_vals = arr };
+        } else {
+            storage = .{ .spilled = env };
+        }
+        return .{
+            .future = Future.initFor(.deferred),
+            .payload = .{ .target = .{ .deferred = .{
+                .deferred_id = deferred_id,
+                .env_count = @intCast(env.len),
                 .storage = storage,
             } } },
         };

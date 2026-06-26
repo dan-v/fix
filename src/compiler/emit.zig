@@ -279,6 +279,17 @@ pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const 
     try emitCaptureDescriptors(self, captures);
 }
 
+/// Emit `defer_attr_value` (lazy per-attr compilation): a deferred-table
+/// id plus the enclosing-scope snapshot as capture descriptors. Mirrors
+/// `emitApplyArg`'s always-wide-id layout.
+pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capture) !void {
+    const env_count = try captureCount(scope.len);
+    try emitOp(self, .defer_attr_value);
+    try self.builder.writeU32(self.allocator, deferred_id);
+    try self.builder.writeU16(self.allocator, env_count);
+    try emitCaptureDescriptors(self, scope);
+}
+
 pub fn emitCaptureDescriptors(self: *Compiler, captures: []const Capture) !void {
     for (captures) |capture| {
         try self.builder.writeByte(self.allocator, switch (capture.kind) {

@@ -16,6 +16,7 @@ const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
 const access = @import("access.zig");
+const deferred_mod = @import("../deferred.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -310,6 +311,122 @@ pub fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !
     try compileAttrEntriesThunk(self, &views, false);
 }
 
+// ---- lazy per-attr compilation (see deferred.zig) ----
+
+fn rootCompiler(self: *Compiler) *Compiler {
+    var c = self;
+    while (c.parent) |p| c = p;
+    return c;
+}
+
+/// Any `with` scope active at this point (in self or any ancestor)?
+/// Deferral is disabled under an enclosing `with` — the flat snapshot
+/// can't model its dynamic lookups (the with itself, INSIDE a value body,
+/// is fine; it compiles at force time).
+fn hasAnyWithScope(self: *Compiler) bool {
+    var c: ?*Compiler = self;
+    while (c) |comp| : (c = comp.parent) {
+        if (comp.with_scopes.items.len > 0) return true;
+    }
+    return false;
+}
+
+/// A value body is deferrable iff it is NOT an immediate/trivial shape —
+/// i.e. iff it would otherwise go through `compileThunkEager`. Deferring
+/// exactly replaces that thunk, so output stays byte-identical. (The
+/// immediate set mirrors `access.compileImmediateContainerValue`.)
+fn isDeferrableBody(node: *const Node) bool {
+    return switch (ast.unwrapParens(node).tag) {
+        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null, .list, .attr_set, .lambda, .lambda_attrs => false,
+        else => true,
+    };
+}
+
+/// Source-span size of a body, the compile-cost proxy for the gate.
+fn bodySpanBytes(node: *const Node) usize {
+    return if (node.span) |s| s.len else 0;
+}
+
+/// A single clean leaf qualifies for deferral if its body is a
+/// substantial, expensive-to-compile shape.
+fn leafDeferrable(leaf: AttrEntryView) bool {
+    if (leaf.path.len != 1 or leaf.inherit_outer) return false;
+    if (!isDeferrableBody(leaf.expr)) return false;
+    return bodySpanBytes(leaf.expr) >= deferred_mod.MIN_BODY_BYTES;
+}
+
+/// Does this set contain at least one deferrable leaf? Used to avoid
+/// building the scope snapshot (which mutates parent captures) for sets
+/// where nothing will actually defer.
+fn setHasDeferrableLeaf(groups: []const AttrEntryGroup) bool {
+    for (groups) |group| {
+        if (group.leaf) |leaf| {
+            if (group.leaf_count <= 1 and group.tails.len == 0 and leafDeferrable(leaf)) return true;
+        }
+    }
+    return false;
+}
+
+fn containsNameId(items: []const Capture, name_id: InternId) bool {
+    for (items) |c| if (c.name_id == name_id) return true;
+    return false;
+}
+
+/// Whether this plain attrset qualifies for lazy per-attr compilation.
+fn shouldDeferSet(self: *Compiler, group_count: usize) bool {
+    if (rootCompiler(self).deferred_table == null) return false;
+    if (group_count < deferred_mod.MIN_ENTRIES) return false;
+    // File/import compiles only: source + (retained) arena are
+    // evaluator-lived; sidesteps top-level-string source ownership.
+    if (self.source_path == null) return false;
+    if (hasAnyWithScope(self)) return false;
+    return true;
+}
+
+/// Build the enclosing-scope snapshot: every lexically visible binding,
+/// each as a `Capture` describing how to fetch it from the CURRENT frame
+/// (`.local` slot / `.upvalue` index). Returns false (and the set falls
+/// back to eager compile) if the scope exceeds `MAX_SCOPE` or any visible
+/// name can't be resolved. Side effect: resolving up-scope names adds the
+/// corresponding upvalues to this chunk — exactly what a body referencing
+/// them would do, so the deferred thunk can capture them.
+fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)) !bool {
+    var comp: ?*Compiler = self;
+    while (comp) |c| : (comp = c.parent) {
+        var i = c.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const local = c.locals.items[i];
+            if (containsNameId(out.items, local.name_id)) continue;
+            const cap: Capture = if (scope.resolveLocalId(self, local.name_id)) |slot|
+                .{ .name = local.name, .name_id = local.name_id, .kind = .local, .index = slot }
+            else if (try scope.resolveCaptureId(self, local.name, local.name_id)) |up|
+                .{ .name = local.name, .name_id = local.name_id, .kind = .upvalue, .index = up }
+            else
+                return false; // visible but unresolvable — bail conservatively
+            if (out.items.len >= deferred_mod.MAX_SCOPE) return false;
+            try out.append(self.allocator, cap);
+        }
+    }
+    return true;
+}
+
+/// Register a deferred value body and emit `defer_attr_value`.
+fn deferLeaf(self: *Compiler, body: *const Node, snapshot: []const Capture) !void {
+    const root = rootCompiler(self);
+    const table = root.deferred_table.?;
+    const id = try table.register(.{
+        .node = body,
+        .scope = snapshot,
+        .source = self.source,
+        .base_path = self.base_path,
+        .source_path = self.source_path,
+        .source_file_id = self.source_file_id,
+    });
+    try emit.emitDeferAttrValue(self, id, snapshot);
+    root.deferred_count += 1;
+}
+
 pub fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
     var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
@@ -317,8 +434,18 @@ pub fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) 
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
+    // Lazy per-attr compilation: build the enclosing-scope snapshot once
+    // (shared by every deferred value body — non-recursive, so they all
+    // see the same scope). Null if the set doesn't qualify.
+    var snapshot: std.ArrayListUnmanaged(Capture) = .empty;
+    defer snapshot.deinit(self.allocator);
+    var defer_scope: ?[]const Capture = null;
+    if (shouldDeferSet(self, grouped.groups.len) and setHasDeferrableLeaf(grouped.groups)) {
+        if (try buildEnclosingSnapshot(self, &snapshot)) defer_scope = snapshot.items;
+    }
+
     for (grouped.groups) |group| {
-        try compilePlainAttrGroup(self, &positions, group);
+        try compilePlainAttrGroup(self, &positions, group, defer_scope);
     }
 
     const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
@@ -342,6 +469,7 @@ pub fn compilePlainAttrGroup(
     self: *Compiler,
     positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
     group: AttrEntryGroup,
+    defer_scope: ?[]const Capture,
 ) anyerror!void {
     const leaf = group.leaf;
     if (leaf == null) {
@@ -364,6 +492,18 @@ pub fn compilePlainAttrGroup(
         try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
         try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
+    }
+
+    // Lazy per-attr compilation: a clean single-leaf body (path.len == 1,
+    // not an inherit) whose shape is substantial defers its compile to
+    // first force instead of emitting bytecode now.
+    if (defer_scope) |dscope| {
+        if (leafDeferrable(leaf.?)) {
+            try emitAttrNameId(self, group.name_id);
+            try deferLeaf(self, leaf.?.expr, dscope);
+            try appendAttrPosition(self, positions, group.first, group.name_id);
+            return;
+        }
     }
 
     try emitAttrNameId(self, group.name_id);

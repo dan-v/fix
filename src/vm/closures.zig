@@ -11,6 +11,7 @@ const heap_mod = @import("../runtime/heap.zig");
 const Closure = heap_mod.Closure;
 const BytecodeThunk = @import("../runtime/thunk.zig").BytecodeThunk;
 const Thunk = @import("../runtime/thunk.zig").Thunk;
+const deferred_mod = @import("../deferred.zig");
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -91,6 +92,20 @@ pub fn fillCaptureValues(self: *VM, descriptors: []const u8, frame: *const Frame
 pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
     const upvalue_count = try stageCaptureDescriptors(self, descriptors, frame);
     try makeClosure(self, chunk_id, upvalue_count);
+}
+
+/// Materialise a `.deferred` thunk (lazy per-attr compilation): gather
+/// the enclosing-scope snapshot into the thunk's `env` from the capture
+/// descriptors (exactly as a bytecode thunk gathers upvalues), tagged
+/// with `deferred_id`. The body is compiled on first force. Not
+/// speculatively submitted — deferred thunks are pull-only.
+pub fn makeDeferredThunkFromCaptures(self: *VM, deferred_id: u32, descriptors: []const u8, frame: *const Frame) !void {
+    const count = descriptors.len / 3;
+    if (count > deferred_mod.MAX_SCOPE) return error.InvalidBytecode;
+    var buf: [deferred_mod.MAX_SCOPE]Value = undefined;
+    try fillCaptureValues(self, descriptors, frame, buf[0..count]);
+    const id = try self.heap.addDeferredThunk(deferred_id, buf[0..count]);
+    try stack.push(self, Value.thunk(id));
 }
 
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {

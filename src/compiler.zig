@@ -70,6 +70,21 @@ pub const Compiler = struct {
     skip_local_slot: ?u16,
     scope_depth: u8,
     slot_count: u16,
+    /// Count of attr value bodies deferred during this compile (lazy
+    /// per-attr compilation). Tracked on the ROOT compiler (children
+    /// bump the root); `parseAndCompile` reads it to decide whether to
+    /// retain the file's AST arena. See `compiler/attrs.zig`.
+    deferred_count: u32,
+    /// Deferred-attr table to register bodies into, set on the ROOT
+    /// compiler by `parseAndCompile`. Null disables deferral (e.g. the
+    /// synthetic parent used by force-time deferred compilation, so
+    /// nested attrsets there compile eagerly). See `deferred.zig`.
+    deferred_table: ?*@import("deferred.zig").Table = null,
+    /// A pre-built line index to use instead of building one over
+    /// `source`. Set on the synthetic root of a force-time deferred
+    /// compile so it doesn't rebuild the index over the whole (possibly
+    /// huge) file per body. Not owned — never freed by `deinit`.
+    external_line_index: ?*diagnostic.LineIndex = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -100,6 +115,7 @@ pub const Compiler = struct {
             .skip_local_slot = null,
             .scope_depth = 0,
             .slot_count = 0,
+            .deferred_count = 0,
         };
     }
 

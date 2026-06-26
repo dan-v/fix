@@ -18,6 +18,9 @@ const prof_path = @import("../prof_path.zig");
 const trace_probe = @import("trace_probe.zig");
 const tjit_exec = @import("../tjit/exec.zig");
 const tjit_record = @import("../tjit/record.zig");
+const Chunk = @import("../bytecode.zig").chunk.Chunk;
+const ChunkId = types.ChunkId;
+const deferred_compile = @import("../compiler/deferred.zig");
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
@@ -34,6 +37,7 @@ inline fn pathKey(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetK
         },
         .pass_through => prof_path.KEY_PASS_THROUGH,
         .attr_access => prof_path.KEY_OTHER,
+        .deferred => prof_path.KEY_OTHER,
     };
 }
 
@@ -355,25 +359,7 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
         .bytecode => blk: {
             const bytecode = &target.bytecode;
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
-            const upvalues = bytecode.upvalues();
-            // Tracing-JIT: run an installed trace for this thunk body instead
-            // of interpreting it. A guard side-exit returns null → fall through.
-            if (comptime tjit_exec.enabled) {
-                if (try tjit_exec.tryRun(self, bytecode.chunk_id, upvalues, Value.null_val)) |result| break :blk result;
-            }
-            // JIT fast path: if the registry produced a native-code
-            // entry for this chunk, call it instead of pushing a
-            // frame and dispatching. Null jit_code (the universal
-            // case, including any build without `-Djit`) falls
-            // through to the interpreter.
-            if (ch.jit_code) |jit_fn| {
-                const result = jit_fn(@ptrCast(self), upvalues.ptr, upvalues.len);
-                if (result.error_code != 0) {
-                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
-                }
-                break :blk result.value;
-            }
-            break :blk closures.runIsolatedFrame(self, ch, bytecode.chunk_id, 0, upvalues);
+            break :blk runBytecodeChunk(self, ch, bytecode.chunk_id, bytecode.upvalues());
         },
         .pass_through => forceValueImpl(self, target.pass_through, true),
         // Frameless `someUpvalue.attr`: skip the isolated frame +
@@ -381,7 +367,54 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
         // as the `get_upvalue_attr; ret` body would (getAttrValue forces
         // the attrs operand and the result).
         .attr_access => access.getAttrValue(self, target.attr_access.base, target.attr_access.name),
+        // Lazy per-attr compilation: compile the body now (or reuse the
+        // cached ChunkId), then run it exactly like a `.bytecode` thunk
+        // with the captured snapshot as upvalues.
+        .deferred => blk: {
+            const d = &target.deferred;
+            const table = self.deferred_table orelse return error.InvalidChunk;
+            const entry = table.get(d.deferred_id);
+            var slot = entry.compiled.load(.acquire);
+            if (slot == 0) {
+                const line_index = try table.lineIndexFor(entry.source);
+                const new_id = try deferred_compile.compile(table.allocator, self.registry, self.intern, self.heap, entry, line_index);
+                // Publish once; a concurrent racer may have won — then our
+                // chunk is orphaned-but-correct and `slot` is the canonical id.
+                if (entry.compiled.cmpxchgStrong(0, new_id + 1, .acq_rel, .acquire)) |winner| {
+                    slot = winner;
+                } else {
+                    slot = new_id + 1;
+                }
+            }
+            const chunk_id = slot - 1;
+            const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+            break :blk runBytecodeChunk(self, ch, chunk_id, d.env());
+        },
     };
+}
+
+/// Execute a compiled chunk body with `upvalues`, honoring the tracing
+/// JIT and native JIT fast paths. Shared by the `.bytecode` and
+/// `.deferred` thunk arms (a deferred thunk is a bytecode thunk whose
+/// ChunkId is computed lazily).
+fn runBytecodeChunk(self: *VM, ch: *const Chunk, chunk_id: ChunkId, upvalues: []const Value) anyerror!Value {
+    // Tracing-JIT: run an installed trace for this thunk body instead
+    // of interpreting it. A guard side-exit returns null → fall through.
+    if (comptime tjit_exec.enabled) {
+        if (try tjit_exec.tryRun(self, chunk_id, upvalues, Value.null_val)) |result| return result;
+    }
+    // JIT fast path: if the registry produced a native-code entry for
+    // this chunk, call it instead of pushing a frame and dispatching.
+    // Null jit_code (the universal case, including any build without
+    // `-Djit`) falls through to the interpreter.
+    if (ch.jit_code) |jit_fn| {
+        const result = jit_fn(@ptrCast(self), upvalues.ptr, upvalues.len);
+        if (result.error_code != 0) {
+            return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
+        }
+        return result.value;
+    }
+    return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues);
 }
 
 pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {

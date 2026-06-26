@@ -28,6 +28,8 @@ const diagnostic = @import("diagnostic.zig");
 const eval_trace = @import("eval/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const timeline = @import("timeline.zig");
+const ast_mod = @import("ast.zig");
+const deferred_mod = @import("deferred.zig");
 const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
@@ -77,6 +79,15 @@ pub const Evaluator = struct {
     /// import error paths serialize on `run.mu`.
     run: Run,
     vm_opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
+    /// Lazy per-attr compilation: deferred attrset value bodies, compiled
+    /// on first force. See `deferred.zig`.
+    deferred_table: deferred_mod.Table,
+    /// AST arenas kept alive because a deferred body retains nodes into
+    /// them (force-time compile re-walks the node). Files that defer
+    /// nothing free their arena immediately (the common case). Appended
+    /// concurrently by helper-thread import compiles, hence the mutex.
+    retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
+    retained_arenas_mu: @import("runtime/stable_segments.zig").SpinMutex,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -118,6 +129,9 @@ pub const Evaluator = struct {
             .main_worker = null,
             .run = Run.init(allocator),
             .vm_opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
+            .deferred_table = deferred_mod.Table.init(allocator),
+            .retained_arenas = .empty,
+            .retained_arenas_mu = .{},
         };
     }
 
@@ -182,6 +196,14 @@ pub const Evaluator = struct {
         self.heap.deinit();
         for (self.worker_arenas) |*arena| arena.deinit();
         self.allocator.free(self.worker_arenas);
+        // Free deferred-compile state after the heap (whose thunks
+        // referenced entries) and workers (no force-compile can be in
+        // flight) are gone. The retained arenas own the AST nodes the
+        // entries point at; the registered chunks are self-contained
+        // bytecode and don't reference them, so order vs registry is free.
+        self.deferred_table.deinit();
+        for (self.retained_arenas.items) |*arena| arena.deinit();
+        self.retained_arenas.deinit(self.allocator);
         self.registry.deinit();
         self.intern.deinit();
     }
@@ -275,8 +297,11 @@ pub const Evaluator = struct {
     ) !ChunkId {
         const subject = source_path orelse "expression";
 
-        var arena = @import("ast.zig").AstArena.init(self.allocator);
-        defer arena.deinit();
+        var arena = ast_mod.AstArena.init(self.allocator);
+        // Freed here unless a deferred attr body retains nodes into it
+        // (then the arena is moved into `retained_arenas`, below).
+        var retain_arena = false;
+        defer if (!retain_arena) arena.deinit();
 
         var parser = parser_mod.Parser.init(self.allocator, &arena, source);
         defer parser.deinit();
@@ -307,6 +332,7 @@ pub const Evaluator = struct {
         );
         compiler.base_path = base_path;
         compiler.source_path = source_path;
+        compiler.deferred_table = &self.deferred_table;
         defer compiler.deinit();
 
         {
@@ -323,7 +349,20 @@ pub const Evaluator = struct {
         }
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
-        return self.registry.register(chunk);
+        const chunk_id = try self.registry.register(chunk);
+
+        // If any attr body in this file was deferred, its AST nodes are
+        // referenced by `deferred_table` entries and must outlive the
+        // compile — keep the arena alive for the evaluator's lifetime.
+        if (compiler.deferred_count > 0) {
+            retain_arena = true; // nodes are referenced; never free here
+            self.retained_arenas_mu.lock();
+            defer self.retained_arenas_mu.unlock();
+            // Best-effort: on OOM we intentionally leak (don't free AST a
+            // deferred entry still points at) rather than risk a dangling node.
+            self.retained_arenas.append(self.allocator, arena) catch {};
+        }
+        return chunk_id;
     }
 
     /// Read-only access to compiled chunks for tools.
@@ -452,6 +491,7 @@ pub const Evaluator = struct {
             vm.claimer_id = wf.vm.claimer_id;
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
+        vm.deferred_table = &self.deferred_table;
         return vm;
     }
 

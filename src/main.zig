@@ -226,6 +226,13 @@ pub fn main(init: std.process.Init) !void {
             .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks },
         );
         std.debug.print("registry: chunks={d}\n", .{ev.chunkStats().chunks});
+        {
+            const d = ev.deferred_table.stats();
+            std.debug.print("deferred: registered={d} compiled={d} ({d:.1}% forced)\n", .{
+                d.registered, d.compiled,
+                if (d.registered == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(d.compiled)) / @as(f64, @floatFromInt(d.registered)),
+            });
+        }
         // Total CPU time across all workers (fiber resume vs futex
         // park). At workers=N the ratio busy/(busy+idle) is the
         // average worker utilisation; a high idle share means

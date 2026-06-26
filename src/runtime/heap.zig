@@ -22,6 +22,7 @@ const struct_census = @import("struct_census.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
+const DeferredThunk = @import("thunk.zig").DeferredThunk;
 
 pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
@@ -1081,6 +1082,17 @@ pub const ObjectHeap = struct {
         const range = try self.appendValues(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });
+    }
+
+    /// A deferred-compile thunk (lazy per-attr compilation). Same inline
+    /// (<= INLINE_CAP) vs. spilled-slice storage split as `addBytecodeThunk`.
+    pub fn addDeferredThunk(self: *ObjectHeap, deferred_id: u32, env: []const Value) !ObjectId {
+        if (env.len <= DeferredThunk.INLINE_CAP) {
+            return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
+        }
+        const range = try self.appendValues(env);
+        errdefer self.values.rollback(range);
+        return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, self.values.slice(range)) });
     }
 
     /// Wrap `value` in a pre-resolved, undemanded thunk. Used by the

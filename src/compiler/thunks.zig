@@ -10,6 +10,21 @@ const Node = compiler_mod.Node;
 const ChunkBuilder = chunk.ChunkBuilder;
 const strictness = @import("strictness.zig");
 
+const ChunkId = @import("../runtime/types.zig").ChunkId;
+
+/// Shared tail of every child-body compile (eager thunks, apply-args, and
+/// the force-time deferred-attr compile): stamp strictness, terminate,
+/// finish, register. The caller has already run `child.compileNode(expr)`
+/// (and handled diagnostics). Returns the registered ChunkId. This is the
+/// "one funnel" so deferred compilation reuses the exact eager path.
+pub fn finishCompiledChild(child: *Compiler, child_builder: *ChunkBuilder, expr: *const Node) !ChunkId {
+    try strictness.stampOnBuilder(child, expr);
+    try emit.emitRet(child);
+    try emit.emitOp(child, .halt);
+    const child_chunk = try child_builder.finish(child.allocator, child.slot_count);
+    return try child.registry.register(child_chunk);
+}
+
 pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
     return compileThunkEager(self, expr, false);
 }
@@ -41,12 +56,7 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
-    try strictness.stampOnBuilder(&child, expr);
-    try emit.emitRet(&child);
-    try emit.emitOp(&child, .halt);
-
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
-    const child_id = try self.registry.register(child_chunk);
+    const child_id = try finishCompiledChild(&child, &child_builder, expr);
     if (eager) {
         try emit.emitEagerThunkWithCaptures(self, child_id, child.captures.items);
     } else {

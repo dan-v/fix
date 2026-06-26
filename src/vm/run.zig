@@ -610,6 +610,18 @@ fn opThunkCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop
     return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
 }
 
+fn opDeferAttrValue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const deferred_id: u32 = readU32(code, ip);
+    const env_count = readU16(code, ip + 4);
+    const descriptors_start = ip + 6;
+    const descriptor_len = @as(usize, env_count) * 3;
+    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    try closures.makeDeferredThunkFromCaptures(vm, deferred_id, descriptors, frame);
+    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
 fn opThunkCapturesEager(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const ch_id = readU16(code, ip);
@@ -1206,6 +1218,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.validate_attrs_long)] = opValidateAttrsLong;
     table[@intFromEnum(OpCode.lookup_with)] = opLookupWith;
     table[@intFromEnum(OpCode.lookup_with_long)] = opLookupWithLong;
+    table[@intFromEnum(OpCode.defer_attr_value)] = opDeferAttrValue;
     table[@intFromEnum(OpCode.ret)] = opRet;
     table[@intFromEnum(OpCode.halt)] = opHalt;
     break :blk table;

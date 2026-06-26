@@ -287,6 +287,16 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
+        .defer_attr_value => {
+            // Operand: 4-byte deferred-table id, 2-byte env count, then
+            // env_count capture descriptors. No chunk id (compiled lazily).
+            const id: u32 = readU32(code, ip);
+            ip += 4;
+            const env_count = readU16(code, ip);
+            ip += 2;
+            try writer.print("deferred #{d}, {d} env", .{ id, env_count });
+            ip += @as(usize, env_count) * 3;
+        },
 
         .get_attr => {
             const id: InternId = @intCast(readU16(code, ip));
