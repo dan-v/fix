@@ -25,7 +25,7 @@ const InternTable = @import("../runtime/intern.zig").InternTable;
 const ObjectHeap = @import("../runtime/heap.zig").ObjectHeap;
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
-const deferred = @import("../deferred.zig");
+const deferred = @import("deferred_table.zig");
 
 /// Compile one deferred body and return its registered ChunkId. Uses the
 /// long-lived `allocator` (evaluator lifetime) so the registered chunk's

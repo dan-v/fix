@@ -28,7 +28,7 @@ const ObjectHeap = heap_mod.ObjectHeap;
 const FileCache = @import("file_cache.zig").FileCache;
 const FetchCache = @import("fetch_cache.zig").FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
-const eval_trace = @import("eval/trace.zig");
+const eval_trace = @import("support/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime/thunk.zig");
@@ -86,7 +86,7 @@ pub const VM = struct {
     /// Lazy per-attr compilation: deferred bodies + their compile cache.
     /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
     /// (which never create `.deferred` thunks). See `deferred.zig`.
-    deferred_table: ?*@import("deferred.zig").Table = null,
+    deferred_table: ?*@import("compiler/deferred_table.zig").Table = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses

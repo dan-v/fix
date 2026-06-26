@@ -79,7 +79,7 @@ pub const Compiler = struct {
     /// compiler by `parseAndCompile`. Null disables deferral (e.g. the
     /// synthetic parent used by force-time deferred compilation, so
     /// nested attrsets there compile eagerly). See `deferred.zig`.
-    deferred_table: ?*@import("deferred.zig").Table = null,
+    deferred_table: ?*@import("compiler/deferred_table.zig").Table = null,
     /// A pre-built line index to use instead of building one over
     /// `source`. Set on the synthetic root of a force-time deferred
     /// compile so it doesn't rebuild the index over the whole (possibly

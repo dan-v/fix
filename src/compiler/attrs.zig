@@ -16,7 +16,7 @@ const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
 const access = @import("access.zig");
-const deferred_mod = @import("../deferred.zig");
+const deferred_mod = @import("deferred_table.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;

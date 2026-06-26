@@ -32,22 +32,22 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("runtime/types.zig");
-const Value = @import("runtime/value.zig").Value;
-const thunk_mod = @import("runtime/thunk.zig");
-const stable = @import("runtime/stable_segments.zig");
-const scheduler_mod = @import("scheduler.zig");
+const types = @import("../runtime/types.zig");
+const Value = @import("../runtime/value.zig").Value;
+const thunk_mod = @import("../runtime/thunk.zig");
+const stable = @import("../runtime/stable_segments.zig");
+const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
-const vm_mod = @import("vm.zig");
+const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
-const vm_force = @import("vm/force.zig");
-const fiber_mod = @import("fiber.zig");
+const vm_force = @import("../vm/force.zig");
+const fiber_mod = @import("../fiber.zig");
 const InnerFiber = fiber_mod.Fiber;
-const worker_id_mod = @import("runtime/worker_id.zig");
-const eval_trace = @import("eval/trace.zig");
-const prof = @import("prof.zig");
-const timeline = @import("timeline.zig");
+const worker_id_mod = @import("../runtime/worker_id.zig");
+const eval_trace = @import("../support/trace.zig");
+const prof = @import("../prof.zig");
+const timeline = @import("../timeline.zig");
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker patches
@@ -554,12 +554,12 @@ test "Worker basic init/deinit" {
     defer sched.deinit();
 
     const TestCtx = struct {
-        registry: @import("bytecode.zig").ChunkRegistry,
-        intern: @import("runtime/intern.zig").InternTable,
-        heap: @import("runtime/heap.zig").ObjectHeap,
-        files: @import("file_cache.zig").FileCache,
-        fetchers: @import("fetch_cache.zig").FetchCache,
-        derivations: @import("derivation.zig").DerivationStore,
+        registry: @import("../bytecode.zig").ChunkRegistry,
+        intern: @import("../runtime/intern.zig").InternTable,
+        heap: @import("../runtime/heap.zig").ObjectHeap,
+        files: @import("../file_cache.zig").FileCache,
+        fetchers: @import("../fetch_cache.zig").FetchCache,
+        derivations: @import("../derivation.zig").DerivationStore,
         sched: *Scheduler,
         arena: std.heap.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
@@ -587,15 +587,15 @@ test "Worker basic init/deinit" {
     };
 
     var ctx: TestCtx = .{
-        .registry = try @import("bytecode.zig").ChunkRegistry.init(testing.allocator),
-        .intern = try @import("runtime/intern.zig").InternTable.init(testing.allocator),
-        .heap = try @import("runtime/heap.zig").ObjectHeap.init(testing.allocator, 2),
-        .files = @import("file_cache.zig").FileCache.init(testing.allocator),
-        .fetchers = @import("fetch_cache.zig").FetchCache.init(testing.allocator),
-        .derivations = @import("derivation.zig").DerivationStore.init(testing.allocator),
+        .registry = try @import("../bytecode.zig").ChunkRegistry.init(testing.allocator),
+        .intern = try @import("../runtime/intern.zig").InternTable.init(testing.allocator),
+        .heap = try @import("../runtime/heap.zig").ObjectHeap.init(testing.allocator, 2),
+        .files = @import("../file_cache.zig").FileCache.init(testing.allocator),
+        .fetchers = @import("../fetch_cache.zig").FetchCache.init(testing.allocator),
+        .derivations = @import("../derivation.zig").DerivationStore.init(testing.allocator),
         .sched = &sched,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
-        .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** @import("bytecode.zig").opcode.count else {},
+        .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** @import("../bytecode.zig").opcode.count else {},
     };
     defer {
         ctx.registry.deinit();

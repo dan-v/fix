@@ -7,7 +7,7 @@ const thunk_mod = @import("../runtime/thunk.zig");
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const fiber_mod = @import("../fiber.zig");
-const worker_mod = @import("../worker.zig");
+const worker_mod = @import("../eval/worker.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");

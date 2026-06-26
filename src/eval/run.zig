@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
-const trace_mod = @import("trace.zig");
+const trace_mod = @import("../support/trace.zig");
 const stable = @import("../runtime/stable_segments.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;

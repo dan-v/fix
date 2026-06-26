@@ -15,11 +15,11 @@
 //! time, possibly concurrent across workers compiling different files).
 
 const std = @import("std");
-const ast = @import("ast.zig");
-const types = @import("runtime/types.zig");
-const Capture = @import("compiler/types.zig").Capture;
-const stable = @import("runtime/stable_segments.zig");
-const diagnostic = @import("diagnostic.zig");
+const ast = @import("../ast.zig");
+const types = @import("../runtime/types.zig");
+const Capture = @import("types.zig").Capture;
+const stable = @import("../runtime/stable_segments.zig");
+const diagnostic = @import("../diagnostic.zig");
 
 const InternId = types.InternId;
 

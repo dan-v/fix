@@ -25,18 +25,18 @@ const Value = @import("runtime/value.zig").Value;
 const builtins = @import("builtins.zig");
 const parser_mod = @import("parser.zig");
 const diagnostic = @import("diagnostic.zig");
-const eval_trace = @import("eval/trace.zig");
+const eval_trace = @import("support/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const timeline = @import("timeline.zig");
 const ast_mod = @import("ast.zig");
-const deferred_mod = @import("deferred.zig");
+const deferred_mod = @import("compiler/deferred_table.zig");
 const Run = @import("eval/run.zig").Run;
 const path_ops = @import("runtime/paths.zig");
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 
-const worker_mod = @import("worker.zig");
+const worker_mod = @import("eval/worker.zig");
 const fiber_mod = @import("fiber.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;

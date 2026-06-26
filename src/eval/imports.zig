@@ -24,7 +24,7 @@ const std = @import("std");
 const Value = @import("../runtime/value.zig").Value;
 const thunk_mod = @import("../runtime/thunk.zig");
 const fiber_mod = @import("../fiber.zig");
-const worker_mod = @import("../worker.zig");
+const worker_mod = @import("worker.zig");
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
 /// during lookup/insert; the entry's own `Future` coordinates the
