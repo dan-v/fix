@@ -289,6 +289,8 @@ pub const Worker = struct {
         arg: *anyopaque,
     ) !void {
         worker_id_mod.current = self.worker_id;
+        // Each top-level entry begins able to start background work.
+        self.scheduler.setSuppressBackground(false);
         const top = try self.acquireFreeFiber();
         top.current_task = null;
         top.inner.reset(entry, arg);
@@ -296,9 +298,15 @@ pub const Worker = struct {
         self.runFiber(top);
 
         while (top.state != .free or self.anyFiberSuspended()) {
+            // The demanded result is ready; stop pulling new background
+            // tasks and just drain the in-flight suspended fibers. Without
+            // this, dead speculation in the backlog keeps running and
+            // extends wall time past the answer.
+            if (top.state == .free) self.scheduler.setSuppressBackground(true);
             if (try self.drainStep()) continue;
             self.parkAndAccount();
         }
+        self.scheduler.setSuppressBackground(false);
         // runTopLevel may exit without ever parking (helpers handle
         // background work; this thread spins through ready fibers and
         // returns). Flush so its timing is visible to schedulerStats()
@@ -389,7 +397,10 @@ pub const Worker = struct {
         const SPIN_ITERATIONS: u32 = 1024;
         var i: u32 = 0;
         while (i < SPIN_ITERATIONS) : (i += 1) {
-            if (self.scheduler.pending_tasks.load(.monotonic) > 0) return;
+            // When background work is suppressed (result ready, draining the
+            // tail), the queued backlog won't be pulled — don't treat it as
+            // available work and busy-spin on it.
+            if (!self.scheduler.backgroundSuppressed() and self.scheduler.pending_tasks.load(.monotonic) > 0) return;
             if (self.shouldStop()) return;
             std.atomic.spinLoopHint();
         }
@@ -406,6 +417,10 @@ pub const Worker = struct {
     }
 
     fn pickTask(self: *Worker) ?Task {
+        // Once a top-level result is ready, don't start new background
+        // work — only drive already-suspended fibers to completion. Bounds
+        // the dead-speculation tail (see Scheduler.suppress_background).
+        if (self.scheduler.backgroundSuppressed()) return null;
         if (self.scheduler.pop(self.worker_id)) |t| return t;
         if (self.scheduler.stealAny(self.worker_id)) |t| return t;
         return null;

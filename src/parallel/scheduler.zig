@@ -318,6 +318,18 @@ pub const Scheduler = struct {
     disable_speculation: bool,
     disable_fanout: bool,
 
+    /// Set once a top-level demanded result is ready, to stop workers
+    /// from *starting* new background (speculative / fan-out) tasks while
+    /// the drain loop waits for already-suspended fibers to retire. Bounds
+    /// the worst case where speculation guessed a large, never-demanded
+    /// body: without it, helpers keep pulling the dead backlog and extend
+    /// wall time past when the answer was computed (a self-inflicted
+    /// pathology — see docs/parallel-redesign-plan.md). In-flight fibers
+    /// still drain to completion (a suspended fiber only waits on an
+    /// already-claimed thunk, never on a queued task), so correctness is
+    /// unaffected; only un-started backlog work is skipped.
+    suppress_background: std.atomic.Value(bool),
+
     /// `worker_count` includes the main thread (worker 0). The
     /// scheduler spawns `worker_count - 1` helper threads in `start()`;
     /// worker 0 runs on the calling thread.
@@ -384,7 +396,19 @@ pub const Scheduler = struct {
             .n_busy_ns = .init(0),
             .disable_speculation = false,
             .disable_fanout = false,
+            .suppress_background = .init(false),
         };
+    }
+
+    /// Toggle whether workers may start new background tasks. Set true
+    /// once a demanded result is ready (see `suppress_background`); reset
+    /// to false at the start of each top-level entry.
+    pub inline fn setSuppressBackground(self: *Scheduler, v: bool) void {
+        self.suppress_background.store(v, .release);
+    }
+
+    pub inline fn backgroundSuppressed(self: *const Scheduler) bool {
+        return self.suppress_background.load(.acquire);
     }
 
     /// Allocate a fresh globally-unique fiber id. Called from
