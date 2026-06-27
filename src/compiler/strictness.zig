@@ -37,7 +37,7 @@
 //! `lambda_attrs` bodies — those are separate chunks.
 
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const types = @import("../runtime/types.zig");
 const intern_mod = @import("../runtime/intern.zig");
 const chunk_mod = @import("../bytecode/chunk.zig");

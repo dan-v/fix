@@ -1,6 +1,6 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;
 const heap_mod = @import("../runtime/heap.zig");

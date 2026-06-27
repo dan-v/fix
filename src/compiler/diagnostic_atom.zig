@@ -1,4 +1,4 @@
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const compiler_types = @import("types.zig");
 
 const Node = ast.Node;

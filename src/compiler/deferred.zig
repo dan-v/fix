@@ -38,7 +38,7 @@ pub fn compile(
     intern: *InternTable,
     heap: *ObjectHeap,
     entry: *const deferred.Entry,
-    line_index: *@import("../diagnostic.zig").LineIndex,
+    line_index: *@import("syntax").diagnostic.LineIndex,
 ) !ChunkId {
     // Synthetic parent: snapshot names as locals 0..k-1, in order.
     var parent_builder = try ChunkBuilder.init(allocator);

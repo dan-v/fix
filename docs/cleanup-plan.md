@@ -6,7 +6,42 @@ not `@import("../../runtime/value.zig")`), no inline `@import` in function
 bodies, a top-level `main.zig` that is pure composition, and files/functions
 that each do one thing.
 
-## Validated module DAG (bottom → top, provably acyclic)
+## Mechanism (decided 2026-06-26, revised)
+
+NOT "every subsystem is a build module" — that acyclic constraint distorted the
+design (invented a `support` junk-drawer sink; collapsed compiler/vm/jit into one
+blob). Instead:
+
+- **Real `build.zig` modules only at the genuinely-acyclic clean cuts**:
+  `syntax`, `runtime`, `derivation`, `parallel`. These don't participate in the
+  engine's dependency cycle, so they isolate cleanly and get `@import("syntax")`.
+- **One facade-organized module for the coupled engine** (`core`) + the
+  orchestrator (`evaluate`). The engine is a genuine strongly-connected
+  component (chunk↔jit, force↔compiler, worker↔vm), so it stays one module;
+  Zig allows file cycles within a module.
+- **The exposure pattern (one rule)**: a file imports only (a) files in its own
+  subsystem folder, or (b) another subsystem's facade file — never another
+  subsystem's internals. Enforced by a small lint test, not the build graph.
+- Deep `../../facade.zig` paths are fine as long as they target a facade.
+
+### Module map
+
+| module | kind | contents |
+|---|---|---|
+| `syntax` | build module (leaf) | token, scanner, string_syntax, diagnostic, ast, parser/ |
+| `runtime` | build module (leaf) | value, types, heap, thunk, intern, numeric, int, hash, version, nar, regex, toml, paths, worker_id, stable_segments, file_cache, fetch_cache, builtins, struct_census, prof, prof_path, timeline |
+| `derivation` | build module | drv, aterm, store, paths, sort, types, value, debug_record, source_path |
+| `parallel` | build module | scheduler, fiber |
+| `core` | one module, facades inside | bytecode/, compiler/(+deferred_table), jit/(jit, jit_linear, tjit/, hot), vm/(+force, closures), worker, trace(EvalTrace), progress, thunk_trace, ngram_probe, trace_probe |
+| `evaluate` | one module | evaluator (was eval.zig), imports, search_path, print, run |
+| `cli` | exe-side | args, run, render, repl, style, stats, subcommands, derivation_debug |
+| `main` | exe root | composition only |
+
+Order of work: reorganize folders + facades first (single module, green per
+subsystem), then flip the four clean cuts to real build modules last (avoids
+rewriting imports twice).
+
+## (superseded) earlier 9-module DAG
 
 Verified by static import analysis (2026-06-26): with the assignment below,
 **zero** cross-module back-edges against this order.

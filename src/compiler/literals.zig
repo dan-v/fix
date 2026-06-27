@@ -1,12 +1,12 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const builtins = @import("../builtins.zig");
 const chunk = bytecode.chunk;
-const diagnostic = @import("../diagnostic.zig");
+const diagnostic = @import("syntax").diagnostic;
 const heap_mod = @import("../runtime/heap.zig");
-const string_syntax = @import("../string_syntax.zig");
+const string_syntax = @import("syntax").string_syntax;
 const types = @import("../runtime/types.zig");
 const Value = @import("../runtime/value.zig").Value;
 const OpCode = bytecode.OpCode;
@@ -100,7 +100,7 @@ pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_
     var arena = ast.AstArena.init(self.allocator);
     defer arena.deinit();
 
-    var parser = @import("../parser.zig").Parser.init(self.allocator, &arena, expr_source);
+    var parser = @import("syntax").parser.Parser.init(self.allocator, &arena, expr_source);
     defer parser.deinit();
     const expr = parser.parse() catch |err| {
         try diagnostics.absorbParserDiagnostics(self, parser.diagnostics.items, source_offset);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const base_types = @import("../runtime/types.zig");
 
 const InternId = base_types.InternId;

@@ -1,12 +1,12 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const builtins = @import("../builtins.zig");
 const chunk = bytecode.chunk;
-const diagnostic = @import("../diagnostic.zig");
+const diagnostic = @import("syntax").diagnostic;
 const heap_mod = @import("../runtime/heap.zig");
-const string_syntax = @import("../string_syntax.zig");
+const string_syntax = @import("syntax").string_syntax;
 const types = @import("../runtime/types.zig");
 const Value = @import("../runtime/value.zig").Value;
 const OpCode = bytecode.OpCode;
@@ -438,10 +438,10 @@ pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void 
 /// does — resolved at the call site. `null` when the body is not this
 /// exact shape.
 fn forwardingUpvalue(self: *Compiler, child: *Compiler, body: *const Node, param_name: []const u8) ?u16 {
-    const b = @import("../ast.zig").unwrapParens(body);
+    const b = @import("syntax").ast.unwrapParens(body);
     if (b.tag != .apply) return null;
-    const func = @import("../ast.zig").unwrapParens(b.data.apply.func);
-    const arg = @import("../ast.zig").unwrapParens(b.data.apply.arg);
+    const func = @import("syntax").ast.unwrapParens(b.data.apply.func);
+    const arg = @import("syntax").ast.unwrapParens(b.data.apply.arg);
     if (func.tag != .identifier or arg.tag != .identifier) return null;
     const arg_name = self.source[arg.data.atom.offset .. arg.data.atom.offset + arg.data.atom.len];
     if (!std.mem.eql(u8, arg_name, param_name)) return null;

@@ -19,7 +19,7 @@ const operand = @import("compiler/operand.zig");
 const compiler_types = @import("compiler/types.zig");
 const captureCount = operand.captureCount;
 const u16Count = operand.u16Count;
-const ast = @import("ast.zig");
+const ast = @import("syntax").ast;
 pub const Node = ast.Node;
 pub const NodeTag = ast.NodeTag;
 pub const BinaryOp = ast.BinaryOp;
@@ -29,7 +29,7 @@ const chunk = bytecode.chunk;
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
 const types = @import("runtime/types.zig");
-const diagnostic = @import("diagnostic.zig");
+const diagnostic = @import("syntax").diagnostic;
 const Diagnostic = diagnostic.Diagnostic;
 const Value = @import("runtime/value.zig").Value;
 

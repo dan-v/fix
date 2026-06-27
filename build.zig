@@ -60,6 +60,18 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
 
+    // Clean-cut subsystem modules: genuinely-acyclic subsystems are real
+    // modules so consumers import them by name (`@import("syntax")`) and the
+    // compiler enforces that nothing reaches into their internals. The coupled
+    // evaluator engine stays in the main module (see docs/cleanup-plan.md).
+    const syntax_mod = b.addModule("syntax", .{
+        .root_source_file = b.path("src/syntax.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -76,6 +88,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     mod.addOptions("build_options", build_options);
+    mod.addImport("syntax", syntax_mod);
 
     // Fiber stack-switching primitive. The .S file is per-arch; pick one
     // by the resolved target.
@@ -125,6 +138,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_mod.addOptions("build_options", build_options);
+    exe_mod.addImport("syntax", syntax_mod);
 
     const exe = b.addExecutable(.{
         .name = "fix",
