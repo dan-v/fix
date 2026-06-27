@@ -136,7 +136,7 @@ fn tagName(tag: u16) []const u8 {
         TAG_MERGE_STRICT => "//merge-strict",
         TAG_CONCAT => "++concat",
         else => if (tag >= BUILTIN_BASE)
-            @tagName(@as(@import("../builtins.zig").BuiltinId, @enumFromInt(tag - BUILTIN_BASE)))
+            @tagName(@as(@import("builtins.zig").BuiltinId, @enumFromInt(tag - BUILTIN_BASE)))
         else
             "?",
     };

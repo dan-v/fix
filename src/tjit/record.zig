@@ -25,8 +25,8 @@ const codegen = @import("codegen.zig");
 const hot = @import("hot.zig");
 const jit = @import("../jit.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;
-const Value = @import("../runtime/value.zig").Value;
-const types = @import("../runtime/types.zig");
+const Value = @import("runtime").value.Value;
+const types = @import("runtime").types;
 
 pub const enabled: bool = build_options.tjit;
 

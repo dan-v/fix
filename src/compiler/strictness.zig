@@ -38,8 +38,8 @@
 
 const std = @import("std");
 const ast = @import("syntax").ast;
-const types = @import("../runtime/types.zig");
-const intern_mod = @import("../runtime/intern.zig");
+const types = @import("runtime").types;
+const intern_mod = @import("runtime").intern;
 const chunk_mod = @import("../bytecode/chunk.zig");
 
 const Node = ast.Node;

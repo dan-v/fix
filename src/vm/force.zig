@@ -1,9 +1,9 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
-const thunk_mod = @import("../runtime/thunk.zig");
+const thunk_mod = @import("runtime").thunk;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const fiber_mod = @import("../fiber.zig");
@@ -12,7 +12,7 @@ const worker_mod = @import("../eval/worker.zig");
 const access = @import("access.zig");
 const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
-const BuiltinId = @import("../builtins.zig").BuiltinId;
+const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("../prof.zig");
 const prof_path = @import("../prof_path.zig");
 const trace_probe = @import("trace_probe.zig");
@@ -219,7 +219,7 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
     }
 }
 
-pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("../runtime/heap.zig").AttrEntry) void {
+pub fn fanOutAttrsShallow(self: *VM, entries: []const @import("runtime").heap.AttrEntry) void {
     // Symmetric with `fanOutListShallow`: speculative helpers may
     // cascade attr traversal further. NixOS module evaluation walks
     // attrsets at every level (option merging via `mapAttrs`, the
@@ -537,7 +537,7 @@ pub fn makeBindingCell(self: *VM) !Value {
     return Value.thunk(id);
 }
 
-const CreatorFrame = struct { chunk_id: @import("../runtime/types.zig").ChunkId, ip: u32 };
+const CreatorFrame = struct { chunk_id: @import("runtime").types.ChunkId, ip: u32 };
 
 fn creatorFrame(self: *VM) CreatorFrame {
     if (self.frames_len == 0) return .{ .chunk_id = 0, .ip = 0 };
@@ -587,7 +587,7 @@ inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
             .builtin_closure => .builtin_closure,
             else => .closure,
         };
-        const ckid: ?@import("../runtime/types.zig").ChunkId = if (closure.isClosure()) blk: {
+        const ckid: ?@import("runtime").types.ChunkId = if (closure.isClosure()) blk: {
             const c = self.heap.getClosure(closure.asObjectId()) catch break :blk null;
             break :blk c.chunk_id;
         } else null;

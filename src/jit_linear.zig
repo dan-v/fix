@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const jit = @import("jit.zig");
-const Value = @import("runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 const Chunk = @import("bytecode/chunk.zig").Chunk;
 const OpCode = @import("bytecode/opcode.zig").OpCode;
 

@@ -16,9 +16,9 @@
 
 const std = @import("std");
 const ast = @import("syntax").ast;
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 const Capture = @import("types.zig").Capture;
-const stable = @import("../runtime/stable_segments.zig");
+const stable = @import("runtime").stable_segments;
 const diagnostic = @import("syntax").diagnostic;
 
 const InternId = types.InternId;

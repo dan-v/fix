@@ -7,7 +7,7 @@
 const std = @import("std");
 const eval = @import("../eval.zig");
 const bytecode = @import("../bytecode.zig");
-const intern_mod = @import("../runtime/intern.zig");
+const intern_mod = @import("runtime").intern;
 const cli = @import("../cli.zig");
 const builtin = @import("builtin");
 

@@ -59,6 +59,10 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "opcode_ngram", opcode_ngram);
     build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
+    // One shared module instance — importing the same `build_options` into
+    // several modules (runtime, fix, exe) within one compilation requires the
+    // SAME module object, else Zig sees the generated file in two modules.
+    const build_options_mod = build_options.createModule();
 
     // Clean-cut subsystem modules: genuinely-acyclic subsystems are real
     // modules so consumers import them by name (`@import("syntax")`) and the
@@ -71,6 +75,15 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
+
+    const runtime_mod = b.addModule("runtime", .{
+        .root_source_file = b.path("src/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    runtime_mod.addImport("build_options", build_options_mod);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
@@ -87,8 +100,9 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    mod.addOptions("build_options", build_options);
+    mod.addImport("build_options", build_options_mod);
     mod.addImport("syntax", syntax_mod);
+    mod.addImport("runtime", runtime_mod);
 
     // Fiber stack-switching primitive. The .S file is per-arch; pick one
     // by the resolved target.
@@ -137,8 +151,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "fix", .module = mod },
         },
     });
-    exe_mod.addOptions("build_options", build_options);
+    exe_mod.addImport("build_options", build_options_mod);
     exe_mod.addImport("syntax", syntax_mod);
+    exe_mod.addImport("runtime", runtime_mod);
 
     const exe = b.addExecutable(.{
         .name = "fix",

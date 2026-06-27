@@ -12,16 +12,16 @@
 const std = @import("std");
 const jit = @import("../jit.zig");
 const vm_mod = @import("../vm.zig");
-const Value = @import("../runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 const force = @import("../vm/force.zig");
 const access = @import("../vm/access.zig");
-const numeric = @import("../runtime/numeric.zig");
+const numeric = @import("runtime").numeric;
 const strings = @import("../vm/strings.zig");
 const ir = @import("ir.zig");
 
 const VM = vm_mod.VM;
 const JitResult = jit.JitResult;
-const InternId = @import("../runtime/types.zig").InternId;
+const InternId = @import("runtime").types.InternId;
 
 /// Reserved `error_code` meaning "guard failed, deopt" (distinct from any
 /// real `@intFromError`, which are small).

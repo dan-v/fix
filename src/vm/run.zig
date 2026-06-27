@@ -19,15 +19,15 @@
 
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const bytecode_mod = @import("../bytecode.zig");
 const opcode = bytecode_mod.opcode;
 const OpCode = opcode.OpCode;
-const heap_mod = @import("../runtime/heap.zig");
-const numeric = @import("../runtime/numeric.zig");
+const heap_mod = @import("runtime").heap;
+const numeric = @import("runtime").numeric;
 const prof = @import("../prof.zig");
 
 const access = @import("access.zig");

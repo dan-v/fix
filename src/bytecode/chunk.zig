@@ -4,12 +4,12 @@
 //! in a global table, enabling cheap interning and cross-thread referencing.
 
 const std = @import("std");
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
-const Value = @import("../runtime/value.zig").Value;
-const AttrEntry = @import("../runtime/heap.zig").AttrEntry;
-const stable = @import("../runtime/stable_segments.zig");
+const Value = @import("runtime").value.Value;
+const AttrEntry = @import("runtime").heap.AttrEntry;
+const stable = @import("runtime").stable_segments;
 const hot_mod = @import("../tjit/hot.zig");
 const HotTable = hot_mod.HotTable;
 const ChunkId = types.ChunkId;
@@ -17,7 +17,7 @@ const ConstIdx = types.ConstIdx;
 
 pub const Chunk = struct {
     pub const SourceSpan = struct {
-        file: ?@import("../runtime/types.zig").InternId,
+        file: ?@import("runtime").types.InternId,
         offset: u32,
         len: u32,
         line: u32,

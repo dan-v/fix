@@ -1,13 +1,13 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
-const heap_mod = @import("../runtime/heap.zig");
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
+const heap_mod = @import("runtime").heap;
 
 const force = @import("force.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
-const struct_census = @import("../runtime/struct_census.zig");
+const struct_census = @import("runtime").struct_census;
 
 const VM = vm_mod.VM;
 

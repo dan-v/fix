@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const drv_paths = @import("paths.zig");
-const FileCache = @import("../file_cache.zig").FileCache;
-const nar = @import("../runtime/nar.zig");
-const path_ops = @import("../runtime/paths.zig");
+const FileCache = @import("runtime").file_cache.FileCache;
+const nar = @import("runtime").nar;
+const path_ops = @import("runtime").paths;
 
 pub fn storePathForSource(
     allocator: std.mem.Allocator,

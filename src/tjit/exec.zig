@@ -18,16 +18,16 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const vm_mod = @import("../vm.zig");
-const Value = @import("../runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 const force = @import("../vm/force.zig");
 const access = @import("../vm/access.zig");
 const equality = @import("../vm/equality.zig");
-const numeric = @import("../runtime/numeric.zig");
+const numeric = @import("runtime").numeric;
 const strings = @import("../vm/strings.zig");
 
 const VM = vm_mod.VM;
 const GuardKind = ir.GuardKind;
-const ChunkId = @import("../runtime/types.zig").ChunkId;
+const ChunkId = @import("runtime").types.ChunkId;
 const jit = @import("../jit.zig");
 const helpers = @import("jit_helpers.zig");
 
@@ -96,7 +96,7 @@ pub fn sideExitImpl(vm: *VM, snap: *const ir.Snapshot, slots: [*]const Value, an
 /// inlined thunk body's `load_upvalue_of`. Null if it isn't a bytecode thunk.
 fn bytecodeThunkUpvalues(vm: *VM, thunk_val: Value) ?[]const Value {
     const thunk = vm.heap.getThunkAssumeValid(thunk_val.asObjectId());
-    const thunk_mod = @import("../runtime/thunk.zig");
+    const thunk_mod = @import("runtime").thunk;
     if (thunk.targetKind() != thunk_mod.TargetKind.bytecode) return null;
     return thunk.payload.target.bytecode.upvalues();
 }

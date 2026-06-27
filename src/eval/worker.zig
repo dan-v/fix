@@ -32,10 +32,10 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
-const thunk_mod = @import("../runtime/thunk.zig");
-const stable = @import("../runtime/stable_segments.zig");
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
+const thunk_mod = @import("runtime").thunk;
+const stable = @import("runtime").stable_segments;
 const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
@@ -44,7 +44,7 @@ const VM = vm_mod.VM;
 const vm_force = @import("../vm/force.zig");
 const fiber_mod = @import("../fiber.zig");
 const InnerFiber = fiber_mod.Fiber;
-const worker_id_mod = @import("../runtime/worker_id.zig");
+const worker_id_mod = @import("runtime").worker_id;
 const eval_trace = @import("../support/trace.zig");
 const prof = @import("../prof.zig");
 const timeline = @import("../timeline.zig");
@@ -555,10 +555,10 @@ test "Worker basic init/deinit" {
 
     const TestCtx = struct {
         registry: @import("../bytecode.zig").ChunkRegistry,
-        intern: @import("../runtime/intern.zig").InternTable,
-        heap: @import("../runtime/heap.zig").ObjectHeap,
-        files: @import("../file_cache.zig").FileCache,
-        fetchers: @import("../fetch_cache.zig").FetchCache,
+        intern: @import("runtime").intern.InternTable,
+        heap: @import("runtime").heap.ObjectHeap,
+        files: @import("runtime").file_cache.FileCache,
+        fetchers: @import("runtime").fetch_cache.FetchCache,
         derivations: @import("../derivation.zig").DerivationStore,
         sched: *Scheduler,
         arena: std.heap.ArenaAllocator,
@@ -588,10 +588,10 @@ test "Worker basic init/deinit" {
 
     var ctx: TestCtx = .{
         .registry = try @import("../bytecode.zig").ChunkRegistry.init(testing.allocator),
-        .intern = try @import("../runtime/intern.zig").InternTable.init(testing.allocator),
-        .heap = try @import("../runtime/heap.zig").ObjectHeap.init(testing.allocator, 2),
-        .files = @import("../file_cache.zig").FileCache.init(testing.allocator),
-        .fetchers = @import("../fetch_cache.zig").FetchCache.init(testing.allocator),
+        .intern = try @import("runtime").intern.InternTable.init(testing.allocator),
+        .heap = try @import("runtime").heap.ObjectHeap.init(testing.allocator, 2),
+        .files = @import("runtime").file_cache.FileCache.init(testing.allocator),
+        .fetchers = @import("runtime").fetch_cache.FetchCache.init(testing.allocator),
         .derivations = @import("../derivation.zig").DerivationStore.init(testing.allocator),
         .sched = &sched,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),

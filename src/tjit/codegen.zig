@@ -19,7 +19,7 @@ const ir = @import("ir.zig");
 const jit = @import("../jit.zig");
 const helpers = @import("jit_helpers.zig");
 const Emitter = @import("../jit_linear.zig").Emitter;
-const Value = @import("../runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 
 const CodeBuffer = jit.CodeBuffer;
 const GuardKind = ir.GuardKind;

@@ -23,8 +23,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 
-const Value = @import("runtime/value.zig").Value;
-const types = @import("runtime/types.zig");
+const Value = @import("runtime").value.Value;
+const types = @import("runtime").types;
 const chunk_mod = @import("bytecode/chunk.zig");
 const Chunk = chunk_mod.Chunk;
 const OpCode = @import("bytecode/opcode.zig").OpCode;
@@ -293,7 +293,7 @@ pub const CodeBuffer = struct {
     base: [*]u8,
     capacity: usize,
     len: usize,
-    mu: @import("runtime/stable_segments.zig").SpinMutex,
+    mu: @import("runtime").stable_segments.SpinMutex,
 
     pub fn init(capacity: usize) !CodeBuffer {
         if (!code_enabled) @compileError("CodeBuffer used in a build without -Djit/-Dtjit");

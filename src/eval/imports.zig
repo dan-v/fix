@@ -21,8 +21,8 @@
 //! don't introduce a cycle in the @import graph.
 
 const std = @import("std");
-const Value = @import("../runtime/value.zig").Value;
-const thunk_mod = @import("../runtime/thunk.zig");
+const Value = @import("runtime").value.Value;
+const thunk_mod = @import("runtime").thunk;
 const fiber_mod = @import("../fiber.zig");
 const worker_mod = @import("worker.zig");
 
@@ -31,7 +31,7 @@ const worker_mod = @import("worker.zig");
 /// actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
-    mu: @import("../runtime/stable_segments.zig").SpinMutex = .{},
+    mu: @import("runtime").stable_segments.SpinMutex = .{},
 
     pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
         var it = self.entries.iterator();

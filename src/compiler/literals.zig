@@ -2,13 +2,13 @@ const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
-const builtins = @import("../builtins.zig");
+const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
 const diagnostic = @import("syntax").diagnostic;
-const heap_mod = @import("../runtime/heap.zig");
+const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
@@ -39,7 +39,7 @@ pub fn compileInt(self: *Compiler, node: *const Node) !void {
         try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid integer literal");
         return error.InvalidNumber;
     };
-    try self.builder.emitConstant(self.allocator, try @import("../runtime/int.zig").make(self.heap, val));
+    try self.builder.emitConstant(self.allocator, try @import("runtime").int.make(self.heap, val));
 }
 
 pub fn compileFloat(self: *Compiler, node: *const Node) !void {

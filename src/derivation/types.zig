@@ -1,6 +1,6 @@
 const std = @import("std");
-const heap_mod = @import("../runtime/heap.zig");
-const InternId = @import("../runtime/types.zig").InternId;
+const heap_mod = @import("runtime").heap;
+const InternId = @import("runtime").types.InternId;
 
 const AttrEntry = heap_mod.AttrEntry;
 

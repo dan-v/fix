@@ -3,7 +3,7 @@ const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
 const chunk = @import("../bytecode.zig").chunk;
 const diagnostic = @import("syntax").diagnostic;
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 const attrs = @import("attrs.zig");
 
 const Compiler = compiler_mod.Compiler;

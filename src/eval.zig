@@ -4,10 +4,10 @@
 //! the worker threads that execute bytecode.
 
 const std = @import("std");
-const types = @import("runtime/types.zig");
+const types = @import("runtime").types;
 const bytecode = @import("bytecode.zig");
 const opcode = bytecode.opcode;
-const InternTable = @import("runtime/intern.zig").InternTable;
+const InternTable = @import("runtime").intern.InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
 const ChunkId = types.ChunkId;
@@ -16,13 +16,13 @@ const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
 const vm_builtins = @import("vm/builtins.zig");
-const ObjectHeap = @import("runtime/heap.zig").ObjectHeap;
-const FileCache = @import("file_cache.zig").FileCache;
-const FetchCache = @import("fetch_cache.zig").FetchCache;
+const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const FileCache = @import("runtime").file_cache.FileCache;
+const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const DerivationStore = @import("derivation.zig").DerivationStore;
 const derivation = @import("derivation.zig");
-const Value = @import("runtime/value.zig").Value;
-const builtins = @import("builtins.zig");
+const Value = @import("runtime").value.Value;
+const builtins = @import("runtime").builtins;
 const parser_mod = @import("syntax").parser;
 const diagnostic = @import("syntax").diagnostic;
 const eval_trace = @import("support/trace.zig");
@@ -31,7 +31,7 @@ const timeline = @import("timeline.zig");
 const ast_mod = @import("syntax").ast;
 const deferred_mod = @import("compiler/deferred_table.zig");
 const Run = @import("eval/run.zig").Run;
-const path_ops = @import("runtime/paths.zig");
+const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
@@ -87,7 +87,7 @@ pub const Evaluator = struct {
     /// nothing free their arena immediately (the common case). Appended
     /// concurrently by helper-thread import compiles, hence the mutex.
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
-    retained_arenas_mu: @import("runtime/stable_segments.zig").SpinMutex,
+    retained_arenas_mu: @import("runtime").stable_segments.SpinMutex,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -173,7 +173,7 @@ pub const Evaluator = struct {
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         @import("vm/trace_probe.zig").report();
-        @import("runtime/struct_census.zig").report();
+        @import("runtime").struct_census.report();
         @import("vm/ngram_probe.zig").report();
         if (comptime @import("tjit/hot.zig").enabled) self.reportHotAnchors();
         if (comptime @import("tjit/exec.zig").enabled) @import("tjit/exec.zig").report();
@@ -409,7 +409,7 @@ pub const Evaluator = struct {
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
         @import("vm/trace_probe.zig").init(self.allocator);
-        @import("runtime/struct_census.zig").init(self.allocator);
+        @import("runtime").struct_census.init(self.allocator);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only

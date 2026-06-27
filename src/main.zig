@@ -16,7 +16,7 @@ const timeline = @import("timeline.zig");
 const thunk_trace_mod = @import("eval/thunk_trace.zig");
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
-const Value = @import("runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 
 const usage =
     \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)
@@ -317,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
                     top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
                 }
             }
-            const BuiltinId = @import("builtins.zig").BuiltinId;
+            const BuiltinId = @import("runtime").builtins.BuiltinId;
             std.debug.print("prof builtins (top-20 by EXCL cycles — own-body cost):\n", .{});
             for (top_b) |entry| {
                 if (entry.cycles == 0) break;

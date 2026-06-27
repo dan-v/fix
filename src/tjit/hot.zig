@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 
 pub const enabled: bool = build_options.tjit;
 

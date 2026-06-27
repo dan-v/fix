@@ -10,7 +10,7 @@ const Node = compiler_mod.Node;
 const ChunkBuilder = chunk.ChunkBuilder;
 const strictness = @import("strictness.zig");
 
-const ChunkId = @import("../runtime/types.zig").ChunkId;
+const ChunkId = @import("runtime").types.ChunkId;
 
 /// Shared tail of every child-body compile (eager thunks, apply-args, and
 /// the force-time deferred-attr compile): stamp strictness, terminate,

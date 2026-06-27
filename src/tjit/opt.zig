@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const ir = @import("ir.zig");
-const Value = @import("../runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 
 const Trace = ir.Trace;
 const Op = ir.Op;

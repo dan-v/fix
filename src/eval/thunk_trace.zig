@@ -24,14 +24,14 @@
 //! are not stable, so the diff tool matches by source location.
 
 const std = @import("std");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const InternTable = @import("../runtime/intern.zig").InternTable;
-const heap_mod = @import("../runtime/heap.zig");
+const InternTable = @import("runtime").intern.InternTable;
+const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
-const stable = @import("../runtime/stable_segments.zig");
+const stable = @import("runtime").stable_segments;
 const bytecode = @import("../bytecode.zig");
 const ChunkRegistry = bytecode.ChunkRegistry;
 const Chunk = bytecode.chunk.Chunk;

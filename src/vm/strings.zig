@@ -1,10 +1,10 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
-const heap_mod = @import("../runtime/heap.zig");
+const heap_mod = @import("runtime").heap;
 const source_paths = @import("../derivation/source_path.zig");
 
 const closures = @import("closures.zig");

@@ -12,8 +12,8 @@
 //! compiles in every build; the `-Dtjit` gate lives at the call sites.
 
 const std = @import("std");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;

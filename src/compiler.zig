@@ -28,10 +28,10 @@ const OpCode = bytecode.OpCode;
 const chunk = bytecode.chunk;
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
-const types = @import("runtime/types.zig");
+const types = @import("runtime").types;
 const diagnostic = @import("syntax").diagnostic;
 const Diagnostic = diagnostic.Diagnostic;
-const Value = @import("runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 
 const InternId = types.InternId;
 
@@ -53,9 +53,9 @@ pub const Compiler = struct {
     /// resulting boxed object lives in the heap for the same span as
     /// the chunk constants that reference it — i.e. the evaluator
     /// lifetime, which always outlives any chunk execution.
-    heap: *@import("runtime/heap.zig").ObjectHeap,
+    heap: *@import("runtime").heap.ObjectHeap,
     source: []const u8,
-    intern: *@import("runtime/intern.zig").InternTable,
+    intern: *@import("runtime").intern.InternTable,
     base_path: ?[]const u8,
     source_path: ?[]const u8,
     source_file_id: ?InternId,
@@ -91,8 +91,8 @@ pub const Compiler = struct {
         builder: *ChunkBuilder,
         registry: *ChunkRegistry,
         source: []const u8,
-        intern: *@import("runtime/intern.zig").InternTable,
-        heap: *@import("runtime/heap.zig").ObjectHeap,
+        intern: *@import("runtime").intern.InternTable,
+        heap: *@import("runtime").heap.ObjectHeap,
     ) Compiler {
         return .{
             .allocator = allocator,
