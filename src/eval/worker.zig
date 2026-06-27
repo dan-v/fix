@@ -48,6 +48,13 @@ const worker_id_mod = @import("runtime").worker_id;
 const eval_trace = @import("../support/trace.zig");
 const prof = @import("../prof.zig");
 const timeline = @import("../timeline.zig");
+// Used only by the test fixture below.
+const bytecode = @import("../bytecode.zig");
+const InternTable = @import("runtime").intern.InternTable;
+const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const FileCache = @import("runtime").file_cache.FileCache;
+const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const DerivationStore = @import("derivation").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker patches
@@ -554,12 +561,12 @@ test "Worker basic init/deinit" {
     defer sched.deinit();
 
     const TestCtx = struct {
-        registry: @import("../bytecode.zig").ChunkRegistry,
-        intern: @import("runtime").intern.InternTable,
-        heap: @import("runtime").heap.ObjectHeap,
-        files: @import("runtime").file_cache.FileCache,
-        fetchers: @import("runtime").fetch_cache.FetchCache,
-        derivations: @import("derivation").DerivationStore,
+        registry: bytecode.ChunkRegistry,
+        intern: InternTable,
+        heap: ObjectHeap,
+        files: FileCache,
+        fetchers: FetchCache,
+        derivations: DerivationStore,
         sched: *Scheduler,
         arena: std.heap.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
@@ -587,15 +594,15 @@ test "Worker basic init/deinit" {
     };
 
     var ctx: TestCtx = .{
-        .registry = try @import("../bytecode.zig").ChunkRegistry.init(testing.allocator),
-        .intern = try @import("runtime").intern.InternTable.init(testing.allocator),
-        .heap = try @import("runtime").heap.ObjectHeap.init(testing.allocator, 2),
-        .files = @import("runtime").file_cache.FileCache.init(testing.allocator),
-        .fetchers = @import("runtime").fetch_cache.FetchCache.init(testing.allocator),
-        .derivations = @import("derivation").DerivationStore.init(testing.allocator),
+        .registry = try bytecode.ChunkRegistry.init(testing.allocator),
+        .intern = try InternTable.init(testing.allocator),
+        .heap = try ObjectHeap.init(testing.allocator, 2),
+        .files = FileCache.init(testing.allocator),
+        .fetchers = FetchCache.init(testing.allocator),
+        .derivations = DerivationStore.init(testing.allocator),
         .sched = &sched,
         .arena = std.heap.ArenaAllocator.init(testing.allocator),
-        .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** @import("../bytecode.zig").opcode.count else {},
+        .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** bytecode.opcode.count else {},
     };
     defer {
         ctx.registry.deinit();

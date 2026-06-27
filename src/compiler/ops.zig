@@ -11,6 +11,7 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
+const int_ops = @import("runtime").int;
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -105,7 +106,7 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
         .integer => {
             const span = self.source[n.data.atom.offset .. n.data.atom.offset + n.data.atom.len];
             const val = std.fmt.parseInt(i64, span, 10) catch return null;
-            return try @import("runtime").int.make(self.heap, val);
+            return try int_ops.make(self.heap, val);
         },
         .float_val => {
             const span = self.source[n.data.atom.offset .. n.data.atom.offset + n.data.atom.len];
@@ -165,12 +166,12 @@ fn tryFoldUnaryOp(self: *Compiler, op: ast.UnaryOp, expr: *const Node) anyerror!
                 // i64.min has no positive counterpart — let runtime
                 // handle the saturation/error semantics.
                 if (i == std.math.minInt(i64)) break :blk null;
-                break :blk try @import("runtime").int.make(self.heap, -i);
+                break :blk try int_ops.make(self.heap, -i);
             },
             .boxed_int => blk: {
                 const i = self.heap.getBoxedInt(v.asObjectId()) catch break :blk null;
                 if (i == std.math.minInt(i64)) break :blk null;
-                break :blk try @import("runtime").int.make(self.heap, -i);
+                break :blk try int_ops.make(self.heap, -i);
             },
             .float => Value.float(-v.asFloat()),
             else => null,
@@ -207,7 +208,7 @@ fn foldArith(self: *Compiler, a: Value, b: Value, op: ArithOp) ?Value {
         // Don't fold across an overflow — leave it to runtime so the
         // error site matches the user's source.
         if (result[1] != 0) return null;
-        return @import("runtime").int.make(self.heap, result[0]) catch null;
+        return int_ops.make(self.heap, result[0]) catch null;
     }
     return null;
 }
@@ -377,7 +378,7 @@ pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 /// recovering eager-arg behavior with the callee actually known.
 fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
     if (try access.compileImmediateContainerValue(self, arg, .{})) return;
-    try @import("thunks.zig").compileThunk(self, arg);
+    try thunks.compileThunk(self, arg);
 }
 
 pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
@@ -427,7 +428,7 @@ pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void 
     } else {
         // Dynamically-dispatched call: defer the thunk-vs-eager decision
         // to runtime via `apply_arg`, which reads the callee's strictness.
-        try @import("thunks.zig").compileApplyArgThunk(self, ap.arg);
+        try thunks.compileApplyArgThunk(self, ap.arg);
     }
     try emit.emitOp(self, op);
 }
@@ -798,10 +799,10 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     defer self.allocator.free(eager_flags);
     const must_force_flags = try self.allocator.alloc(bool, let_in.bindings.len);
     defer self.allocator.free(must_force_flags);
-    try @import("strictness.zig").analyzeLetEagerness(
+    try strictness.analyzeLetEagerness(
         self.allocator, self.intern, self.source, let_in.body, binding_name_ids, eager_flags,
     );
-    try @import("strictness.zig").analyzeLetMustForce(
+    try strictness.analyzeLetMustForce(
         self.allocator, self.intern, self.source, let_in.body, binding_name_ids, must_force_flags,
     );
 
