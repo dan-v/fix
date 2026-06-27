@@ -101,6 +101,15 @@ pub fn build(b: *std.Build) void {
         else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
     }
 
+    const derivation_mod = b.addModule("derivation", .{
+        .root_source_file = b.path("src/derivation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    derivation_mod.addImport("runtime", runtime_mod);
+
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -120,6 +129,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("syntax", syntax_mod);
     mod.addImport("runtime", runtime_mod);
     mod.addImport("parallel", parallel_mod);
+    mod.addImport("derivation", derivation_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -165,6 +175,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("syntax", syntax_mod);
     exe_mod.addImport("runtime", runtime_mod);
     exe_mod.addImport("parallel", parallel_mod);
+    exe_mod.addImport("derivation", derivation_mod);
 
     const exe = b.addExecutable(.{
         .name = "fix",

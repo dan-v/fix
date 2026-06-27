@@ -24,7 +24,7 @@ pub const file_cache = @import("runtime").file_cache;
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
 pub const builtins = @import("runtime").builtins;
-pub const derivation = @import("derivation.zig");
+pub const derivation = @import("derivation");
 pub const diagnostic = @import("syntax").diagnostic;
 
 pub const Evaluator = eval.Evaluator;

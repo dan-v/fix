@@ -13,6 +13,9 @@ const store_mod = @import("derivation/store.zig");
 const value_builder = @import("derivation/value.zig");
 const std = @import("std");
 
+/// Store-path realization for `path`/`filterSource`-style source imports.
+pub const source_path = @import("derivation/source_path.zig");
+
 pub const Output = dtypes.Output;
 pub const DrvOutput = dtypes.DrvOutput;
 pub const DrvInput = dtypes.DrvInput;
