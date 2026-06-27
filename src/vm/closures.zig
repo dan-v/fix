@@ -21,7 +21,7 @@ const trace = @import("trace.zig");
 const force = @import("force.zig");
 const jit_mod = @import("../jit/native.zig");
 const trace_log = @import("trace_log.zig");
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;

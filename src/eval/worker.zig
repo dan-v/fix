@@ -46,8 +46,8 @@ const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
 const eval_trace = @import("../support/trace.zig");
-const prof = @import("../prof.zig");
-const timeline = @import("../timeline.zig");
+const prof = @import("../probe/prof.zig");
+const timeline = @import("../probe/timeline.zig");
 // Used only by the test fixture below.
 const bytecode = @import("../bytecode.zig");
 const InternTable = @import("runtime").intern.InternTable;

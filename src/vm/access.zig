@@ -9,7 +9,7 @@ const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 const VM = vm_mod.VM;
 const readU32 = vm_mod.readU32;

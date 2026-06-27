@@ -35,7 +35,7 @@ const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
 const tjit_record = @import("jit/record.zig");
 const DeferredTable = @import("compiler/deferred_table.zig").Table;
-const ThunkTrace = @import("eval/thunk_trace.zig").ThunkTrace;
+const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");

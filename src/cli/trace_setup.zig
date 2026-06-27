@@ -9,7 +9,7 @@ const eval = @import("../eval.zig");
 const Evaluator = eval.Evaluator;
 const Options = @import("args.zig").Options;
 const vm_trace_mod = @import("../vm/trace_log.zig");
-const thunk_trace_mod = @import("../eval/thunk_trace.zig");
+const thunk_trace_mod = @import("../probe/thunk_trace.zig");
 const thunks_log_enabled = @import("../vm.zig").thunks_log_enabled;
 
 pub const ThunkTraceSetup = struct {

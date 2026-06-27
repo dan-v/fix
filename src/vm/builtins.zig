@@ -19,7 +19,7 @@ const paths = @import("builtins/paths.zig");
 const io = @import("builtins/io.zig");
 const hash = @import("builtins/hash.zig");
 const vm_force = @import("force.zig");
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;

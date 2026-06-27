@@ -28,7 +28,7 @@ const opcode = bytecode_mod.opcode;
 const OpCode = opcode.OpCode;
 const heap_mod = @import("runtime").heap;
 const numeric = @import("runtime").numeric;
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
@@ -39,7 +39,7 @@ const objects = @import("objects.zig");
 const stack = @import("stack.zig");
 const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
-const ngram_probe = @import("ngram_probe.zig");
+const ngram_probe = @import("../probe/ngram_probe.zig");
 const tjit_record = @import("../jit/record.zig");
 
 const VM = vm_mod.VM;
