@@ -48,9 +48,11 @@ pub fn report(ev: *Evaluator) void {
         const dem = h.resolved_demanded;
         const undem = h.resolved_undemanded;
         const tot = dem + undem;
+        var created: u64 = 0;
+        for (h.thunk_states) |c| created += c;
         std.debug.print(
-            "spec-census: resolved={d} demanded={d} undemanded={d} ({d:.1}% undemanded)\n",
-            .{ tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
+            "spec-census: thunks={d} resolved={d} demanded={d} undemanded={d} ({d:.1}% undemanded)\n",
+            .{ created, tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
         );
     }
     if (comptime jit.enabled) reportJit();
