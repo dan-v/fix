@@ -46,7 +46,7 @@ pub const TargetKind = enum {
 pub const ThunkTrace = struct {
     writer: *std.Io.Writer,
     intern: *const InternTable,
-    heap: *const ObjectHeap,
+    heap: *ObjectHeap,
     registry: *const ChunkRegistry,
     mu: stable.SpinMutex = .{},
     seq: std.atomic.Value(u64) = .init(0),
@@ -54,7 +54,7 @@ pub const ThunkTrace = struct {
     pub fn init(
         writer: *std.Io.Writer,
         intern: *const InternTable,
-        heap: *const ObjectHeap,
+        heap: *ObjectHeap,
         registry: *const ChunkRegistry,
     ) ThunkTrace {
         return .{ .writer = writer, .intern = intern, .heap = heap, .registry = registry };
@@ -232,7 +232,7 @@ fn writeLoc(
 fn writeValueInner(
     writer: *std.Io.Writer,
     intern: *const InternTable,
-    heap: *const ObjectHeap,
+    heap: *ObjectHeap,
     value: Value,
     depth: u8,
 ) !void {
