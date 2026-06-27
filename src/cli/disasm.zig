@@ -7,7 +7,7 @@ const cli = @import("../cli.zig");
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;
-const ChunkId = @import("../runtime/types.zig").ChunkId;
+const ChunkId = @import("runtime").types.ChunkId;
 
 const usage =
     \\usage: fix disasm [options] (-e <expression> | --file <path>)

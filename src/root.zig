@@ -2,30 +2,30 @@
 //!
 //! Public API surface. Re-exports the evaluator and types for consumers.
 
-pub const types = @import("runtime/types.zig");
-pub const value = @import("runtime/value.zig");
-pub const stable_segments = @import("runtime/stable_segments.zig");
-pub const token = @import("token.zig");
-pub const scanner = @import("scanner.zig");
-pub const string_syntax = @import("string_syntax.zig");
-pub const ast = @import("ast.zig");
-pub const parser = @import("parser.zig");
+pub const types = @import("runtime").types;
+pub const value = @import("runtime").value;
+pub const stable_segments = @import("runtime").stable_segments;
+pub const token = @import("syntax").token;
+pub const scanner = @import("syntax").scanner;
+pub const string_syntax = @import("syntax").string_syntax;
+pub const ast = @import("syntax").ast;
+pub const parser = @import("syntax").parser;
 pub const bytecode = @import("bytecode.zig");
 pub const opcode = bytecode.opcode;
 pub const chunk = bytecode.chunk;
-pub const heap = @import("runtime/heap.zig");
+pub const heap = @import("runtime").heap;
 pub const compiler = @import("compiler.zig");
-pub const intern = @import("runtime/intern.zig");
-pub const thunk = @import("runtime/thunk.zig");
-pub const scheduler = @import("scheduler.zig");
-pub const fiber = @import("fiber.zig");
-pub const worker = @import("worker.zig");
-pub const file_cache = @import("file_cache.zig");
+pub const intern = @import("runtime").intern;
+pub const thunk = @import("runtime").thunk;
+pub const scheduler = @import("parallel").scheduler;
+pub const fiber = @import("parallel").fiber;
+pub const worker = @import("eval/worker.zig");
+pub const file_cache = @import("runtime").file_cache;
 pub const vm = @import("vm.zig");
 pub const eval = @import("eval.zig");
-pub const builtins = @import("builtins.zig");
-pub const derivation = @import("derivation.zig");
-pub const diagnostic = @import("diagnostic.zig");
+pub const builtins = @import("runtime").builtins;
+pub const derivation = @import("derivation");
+pub const diagnostic = @import("syntax").diagnostic;
 
 pub const Evaluator = eval.Evaluator;
 pub const Value = value.Value;

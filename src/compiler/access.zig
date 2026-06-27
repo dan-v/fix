@@ -1,14 +1,14 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
-const builtins = @import("../builtins.zig");
+const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
-const diagnostic = @import("../diagnostic.zig");
-const heap_mod = @import("../runtime/heap.zig");
-const string_syntax = @import("../string_syntax.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const diagnostic = @import("syntax").diagnostic;
+const heap_mod = @import("runtime").heap;
+const string_syntax = @import("syntax").string_syntax;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
@@ -16,6 +16,7 @@ const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const literals = @import("literals.zig");
+const ops = @import("ops.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -236,15 +237,15 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // fix-point race.
             if (!options.eager) return false;
             if (unwrapped.data.attr_set.recursive) return false;
-            try @import("attrs.zig").compileAttrSet(self, unwrapped);
+            try attrs.compileAttrSet(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .lambda => {
-            try @import("ops.zig").compileLambda(self, unwrapped);
+            try ops.compileLambda(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .lambda_attrs => {
-            try @import("ops.zig").compileLambdaAttrs(self, unwrapped);
+            try ops.compileLambdaAttrs(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .identifier => {

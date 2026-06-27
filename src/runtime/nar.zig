@@ -1,7 +1,7 @@
 //! Minimal NAR serialization for hashing source paths.
 
 const std = @import("std");
-const FileCache = @import("../file_cache.zig").FileCache;
+const FileCache = @import("file_cache.zig").FileCache;
 
 pub const Filter = struct {
     context: *anyopaque,

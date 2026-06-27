@@ -59,6 +59,56 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "opcode_ngram", opcode_ngram);
     build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
+    // One shared module instance — importing the same `build_options` into
+    // several modules (runtime, fix, exe) within one compilation requires the
+    // SAME module object, else Zig sees the generated file in two modules.
+    const build_options_mod = build_options.createModule();
+
+    // Clean-cut subsystem modules: genuinely-acyclic subsystems are real
+    // modules so consumers import them by name (`@import("syntax")`) and the
+    // compiler enforces that nothing reaches into their internals. The coupled
+    // evaluator engine stays in the main module (see docs/cleanup-plan.md).
+    const syntax_mod = b.addModule("syntax", .{
+        .root_source_file = b.path("src/syntax.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+
+    const runtime_mod = b.addModule("runtime", .{
+        .root_source_file = b.path("src/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    runtime_mod.addImport("build_options", build_options_mod);
+
+    const parallel_mod = b.addModule("parallel", .{
+        .root_source_file = b.path("src/parallel.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    parallel_mod.addImport("build_options", build_options_mod);
+    parallel_mod.addImport("runtime", runtime_mod);
+    // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
+    // resolved target. Lives with the fiber code in the parallel module.
+    switch (target.result.cpu.arch) {
+        .x86_64 => parallel_mod.addAssemblyFile(b.path("src/parallel/fiber/swap_x86_64.S")),
+        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
+    }
+
+    const derivation_mod = b.addModule("derivation", .{
+        .root_source_file = b.path("src/derivation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    derivation_mod.addImport("runtime", runtime_mod);
 
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
@@ -75,14 +125,11 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    mod.addOptions("build_options", build_options);
-
-    // Fiber stack-switching primitive. The .S file is per-arch; pick one
-    // by the resolved target.
-    switch (target.result.cpu.arch) {
-        .x86_64 => mod.addAssemblyFile(b.path("src/fiber/swap_x86_64.S")),
-        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
-    }
+    mod.addImport("build_options", build_options_mod);
+    mod.addImport("syntax", syntax_mod);
+    mod.addImport("runtime", runtime_mod);
+    mod.addImport("parallel", parallel_mod);
+    mod.addImport("derivation", derivation_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -124,7 +171,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "fix", .module = mod },
         },
     });
-    exe_mod.addOptions("build_options", build_options);
+    exe_mod.addImport("build_options", build_options_mod);
+    exe_mod.addImport("syntax", syntax_mod);
+    exe_mod.addImport("runtime", runtime_mod);
+    exe_mod.addImport("parallel", parallel_mod);
+    exe_mod.addImport("derivation", derivation_mod);
 
     const exe = b.addExecutable(.{
         .name = "fix",
@@ -195,7 +246,23 @@ pub fn build(b: *std.Build) void {
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
+    // Module-boundary import lint (tools/lint_imports.zig). Catches relative
+    // imports that reach into a clean-cut module's files instead of going
+    // through `@import("<module>")` — those silently duplicate-compile.
+    const lint_exe = b.addExecutable(.{
+        .name = "lint-imports",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lint_imports.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_lint = b.addRunArtifact(lint_exe);
+    const lint_step = b.step("lint", "Check module-boundary import hygiene");
+    lint_step.dependOn(&run_lint.step);
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_lint.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 

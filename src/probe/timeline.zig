@@ -33,7 +33,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const worker_id_mod = @import("runtime/worker_id.zig");
+const worker_id_mod = @import("runtime").worker_id;
 
 pub const enabled: bool = build_options.timeline;
 

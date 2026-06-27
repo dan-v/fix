@@ -12,7 +12,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;

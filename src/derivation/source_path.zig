@@ -1,10 +1,10 @@
 //! Source path realization helpers.
 
 const std = @import("std");
-const derivation = @import("../derivation.zig");
-const FileCache = @import("../file_cache.zig").FileCache;
-const nar = @import("nar.zig");
-const path_ops = @import("paths.zig");
+const drv_paths = @import("paths.zig");
+const FileCache = @import("runtime").file_cache.FileCache;
+const nar = @import("runtime").nar;
+const path_ops = @import("runtime").paths;
 
 pub fn storePathForSource(
     allocator: std.mem.Allocator,
@@ -27,7 +27,7 @@ pub fn storePathForSourceName(
 ) ![]u8 {
     const hash = try nar.hashPath(allocator, files, path);
     defer allocator.free(hash);
-    return derivation.sourcePath(allocator, store_dir, name, hash);
+    return drv_paths.sourcePath(allocator, store_dir, name, hash);
 }
 
 pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {

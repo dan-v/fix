@@ -4,40 +4,51 @@
 //! the worker threads that execute bytecode.
 
 const std = @import("std");
-const types = @import("runtime/types.zig");
+const types = @import("runtime").types;
 const bytecode = @import("bytecode.zig");
 const opcode = bytecode.opcode;
-const InternTable = @import("runtime/intern.zig").InternTable;
+const InternTable = @import("runtime").intern.InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
 const ChunkId = types.ChunkId;
-const Scheduler = @import("scheduler.zig").Scheduler;
+const Scheduler = @import("parallel").scheduler.Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
 const vm_builtins = @import("vm/builtins.zig");
-const ObjectHeap = @import("runtime/heap.zig").ObjectHeap;
-const FileCache = @import("file_cache.zig").FileCache;
-const FetchCache = @import("fetch_cache.zig").FetchCache;
-const DerivationStore = @import("derivation.zig").DerivationStore;
-const derivation = @import("derivation.zig");
-const Value = @import("runtime/value.zig").Value;
-const builtins = @import("builtins.zig");
-const parser_mod = @import("parser.zig");
-const diagnostic = @import("diagnostic.zig");
-const eval_trace = @import("eval/trace.zig");
+const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const FileCache = @import("runtime").file_cache.FileCache;
+const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const DerivationStore = @import("derivation").DerivationStore;
+const derivation = @import("derivation");
+const Value = @import("runtime").value.Value;
+const builtins = @import("runtime").builtins;
+const parser_mod = @import("syntax").parser;
+const diagnostic = @import("syntax").diagnostic;
+const eval_trace = @import("support/trace.zig");
 const eval_progress = @import("eval/progress.zig");
-const timeline = @import("timeline.zig");
-const ast_mod = @import("ast.zig");
-const deferred_mod = @import("deferred.zig");
+const timeline = @import("probe/timeline.zig");
+const ast_mod = @import("syntax").ast;
+const deferred_mod = @import("compiler/deferred_table.zig");
 const Run = @import("eval/run.zig").Run;
-const path_ops = @import("runtime/paths.zig");
+const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 
-const worker_mod = @import("worker.zig");
-const fiber_mod = @import("fiber.zig");
+const worker_mod = @import("eval/worker.zig");
+const fiber_mod = @import("parallel").fiber;
+const prof = @import("probe/prof.zig");
+const compiler_mod = @import("compiler.zig");
+const VmTrace = @import("vm/trace_log.zig").VmTrace;
+const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
+const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const struct_census = @import("runtime").struct_census;
+const trace_probe = @import("probe/trace_probe.zig");
+const ngram_probe = @import("probe/ngram_probe.zig");
+const tjit_hot = @import("jit/hot.zig");
+const tjit_exec = @import("jit/exec.zig");
+const tjit_record = @import("jit/record.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
@@ -65,8 +76,8 @@ pub const Evaluator = struct {
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
-    vm_trace: ?*@import("vm/trace_log.zig").VmTrace,
-    thunk_trace: if (vm_mod.thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
+    vm_trace: ?*VmTrace,
+    thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
     worker_count: u8,
     /// Persistent worker for worker_id 0 (the main / calling thread).
     /// Lazily created on first `runWithVm`, kept alive for the
@@ -87,7 +98,7 @@ pub const Evaluator = struct {
     /// nothing free their arena immediately (the common case). Appended
     /// concurrently by helper-thread import compiles, hence the mutex.
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
-    retained_arenas_mu: @import("runtime/stable_segments.zig").SpinMutex,
+    retained_arenas_mu: SpinMutex,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -139,7 +150,7 @@ pub const Evaluator = struct {
     /// Resolves each armed/traced chunk to its source location so we can see
     /// the recorder's targets on the real workload.
     fn reportHotAnchors(self: *Evaluator) void {
-        if (!@import("tjit/hot.zig").report_enabled) return;
+        if (!tjit_hot.report_enabled) return;
         const h = self.registry.hot orelse return;
         var armed: usize = 0;
         var traced: usize = 0;
@@ -172,12 +183,12 @@ pub const Evaluator = struct {
 
     pub fn deinit(self: *Evaluator) void {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
-        @import("vm/trace_probe.zig").report();
-        @import("runtime/struct_census.zig").report();
-        @import("vm/ngram_probe.zig").report();
-        if (comptime @import("tjit/hot.zig").enabled) self.reportHotAnchors();
-        if (comptime @import("tjit/exec.zig").enabled) @import("tjit/exec.zig").report();
-        if (comptime @import("tjit/record.zig").enabled) @import("tjit/record.zig").report();
+        trace_probe.report();
+        struct_census.report();
+        ngram_probe.report();
+        if (comptime tjit_hot.enabled) self.reportHotAnchors();
+        if (comptime tjit_exec.enabled) tjit_exec.report();
+        if (comptime tjit_record.enabled) tjit_record.report();
         // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
         // them down (which joins on `defer vm.deinit()` inside helperLoop)
         // before freeing the arenas they borrow from.
@@ -240,11 +251,11 @@ pub const Evaluator = struct {
         self.env_map = env_map;
     }
 
-    pub fn setVmTrace(self: *Evaluator, vm_trace: ?*@import("vm/trace_log.zig").VmTrace) void {
+    pub fn setVmTrace(self: *Evaluator, vm_trace: ?*VmTrace) void {
         self.vm_trace = vm_trace;
     }
 
-    pub fn setThunkTrace(self: *Evaluator, thunk_trace: ?*@import("eval/thunk_trace.zig").ThunkTrace) void {
+    pub fn setThunkTrace(self: *Evaluator, thunk_trace: ?*ThunkTrace) void {
         // No-op when the trace is compiled out; callers don't need to
         // comptime-gate. `--thunks-log` users get a heads-up at the CLI
         // layer.
@@ -311,8 +322,8 @@ pub const Evaluator = struct {
             defer self.progressEnd(.parse, subject);
             timeline.begin(.parse, subject, 0);
             defer timeline.end(.parse);
-            const pt = @import("prof.zig").start(.parse);
-            defer @import("prof.zig").end(.parse, pt);
+            const pt = prof.start(.parse);
+            defer prof.end(.parse, pt);
             break :blk parser.parse() catch {
                 try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
                 return error.ParseError;
@@ -322,7 +333,7 @@ pub const Evaluator = struct {
         var builder = try ChunkBuilder.init(self.allocator);
         defer builder.deinit(self.allocator);
 
-        var compiler = @import("compiler.zig").Compiler.init(
+        var compiler = compiler_mod.Compiler.init(
             self.allocator,
             &builder,
             &self.registry,
@@ -340,8 +351,8 @@ pub const Evaluator = struct {
             defer self.progressEnd(.compile, subject);
             timeline.begin(.compile, subject, 0);
             defer timeline.end(.compile);
-            const ct = @import("prof.zig").start(.compile);
-            defer @import("prof.zig").end(.compile, ct);
+            const ct = prof.start(.compile);
+            defer prof.end(.compile, ct);
             compiler.compileAndFinish(ast_node, scope) catch |err| {
                 try self.copyDiagnostics(compiler.diagnostics.items, source, source_path);
                 return err;
@@ -366,7 +377,7 @@ pub const Evaluator = struct {
     }
 
     /// Read-only access to compiled chunks for tools.
-    pub fn getChunk(self: *const Evaluator, id: ChunkId) ?*const @import("bytecode.zig").Chunk {
+    pub fn getChunk(self: *const Evaluator, id: ChunkId) ?*const bytecode.Chunk {
         return self.registry.get(id);
     }
 
@@ -408,8 +419,8 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
-        @import("vm/trace_probe.zig").init(self.allocator);
-        @import("runtime/struct_census.zig").init(self.allocator);
+        trace_probe.init(self.allocator);
+        struct_census.init(self.allocator);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only

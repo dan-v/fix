@@ -45,7 +45,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const worker_id = @import("runtime/worker_id.zig");
+const worker_id = @import("runtime").worker_id;
 
 pub const enabled: bool = build_options.prof_path and builtin.cpu.arch == .x86_64;
 
@@ -234,7 +234,7 @@ fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
     if (key == KEY_PASS_THROUGH) return "<pass_through cell>";
     if (key == KEY_OTHER) return "<other>";
     if (key >= BUILTIN_BASE) {
-        const BuiltinId = @import("builtins.zig").BuiltinId;
+        const BuiltinId = @import("runtime").builtins.BuiltinId;
         const id: u16 = @intCast(key - BUILTIN_BASE);
         return std.fmt.bufPrint(&name_scratch, "<builtin {s}>", .{@tagName(@as(BuiltinId, @enumFromInt(id)))}) catch "<builtin>";
     }

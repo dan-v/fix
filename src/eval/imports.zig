@@ -21,17 +21,18 @@
 //! don't introduce a cycle in the @import graph.
 
 const std = @import("std");
-const Value = @import("../runtime/value.zig").Value;
-const thunk_mod = @import("../runtime/thunk.zig");
-const fiber_mod = @import("../fiber.zig");
-const worker_mod = @import("../worker.zig");
+const Value = @import("runtime").value.Value;
+const thunk_mod = @import("runtime").thunk;
+const fiber_mod = @import("parallel").fiber;
+const worker_mod = @import("worker.zig");
+const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
 /// during lookup/insert; the entry's own `Future` coordinates the
 /// actual evaluation.
 pub const Registry = struct {
     entries: std.StringHashMapUnmanaged(*ImportEntry) = .empty,
-    mu: @import("../runtime/stable_segments.zig").SpinMutex = .{},
+    mu: SpinMutex = .{},
 
     pub fn deinit(self: *Registry, allocator: std.mem.Allocator) void {
         var it = self.entries.iterator();

@@ -12,9 +12,9 @@ const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
 const opcode_mod = @import("opcode.zig");
 const OpCode = opcode_mod.OpCode;
 const encoding = @import("encoding.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
-const intern_mod = @import("../runtime/intern.zig");
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
+const intern_mod = @import("runtime").intern;
 const InternTable = intern_mod.InternTable;
 
 const InternId = types.InternId;

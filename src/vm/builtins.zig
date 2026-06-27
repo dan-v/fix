@@ -1,8 +1,8 @@
 //! Builtin dispatch and builtin implementations for the bytecode VM.
 
-const Value = @import("../runtime/value.zig").Value;
-const struct_census = @import("../runtime/struct_census.zig");
-const builtins_mod = @import("../builtins.zig");
+const Value = @import("runtime").value.Value;
+const struct_census = @import("runtime").struct_census;
+const builtins_mod = @import("runtime").builtins;
 const BuiltinId = builtins_mod.BuiltinId;
 const shared = @import("builtins/shared.zig");
 const strings = @import("builtins/strings.zig");
@@ -19,7 +19,7 @@ const paths = @import("builtins/paths.zig");
 const io = @import("builtins/io.zig");
 const hash = @import("builtins/hash.zig");
 const vm_force = @import("force.zig");
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;

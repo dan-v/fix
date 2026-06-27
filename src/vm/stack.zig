@@ -1,12 +1,12 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
-const hot_mod = @import("../tjit/hot.zig");
-const record_mod = @import("../tjit/record.zig");
+const hot_mod = @import("../jit/hot.zig");
+const record_mod = @import("../jit/record.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;

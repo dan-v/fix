@@ -19,7 +19,7 @@ const operand = @import("compiler/operand.zig");
 const compiler_types = @import("compiler/types.zig");
 const captureCount = operand.captureCount;
 const u16Count = operand.u16Count;
-const ast = @import("ast.zig");
+const ast = @import("syntax").ast;
 pub const Node = ast.Node;
 pub const NodeTag = ast.NodeTag;
 pub const BinaryOp = ast.BinaryOp;
@@ -28,10 +28,13 @@ const OpCode = bytecode.OpCode;
 const chunk = bytecode.chunk;
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
-const types = @import("runtime/types.zig");
-const diagnostic = @import("diagnostic.zig");
+const types = @import("runtime").types;
+const diagnostic = @import("syntax").diagnostic;
 const Diagnostic = diagnostic.Diagnostic;
-const Value = @import("runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
+const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const InternTable = @import("runtime").intern.InternTable;
+const DeferredTable = @import("compiler/deferred_table.zig").Table;
 
 const InternId = types.InternId;
 
@@ -53,9 +56,9 @@ pub const Compiler = struct {
     /// resulting boxed object lives in the heap for the same span as
     /// the chunk constants that reference it — i.e. the evaluator
     /// lifetime, which always outlives any chunk execution.
-    heap: *@import("runtime/heap.zig").ObjectHeap,
+    heap: *ObjectHeap,
     source: []const u8,
-    intern: *@import("runtime/intern.zig").InternTable,
+    intern: *InternTable,
     base_path: ?[]const u8,
     source_path: ?[]const u8,
     source_file_id: ?InternId,
@@ -79,7 +82,7 @@ pub const Compiler = struct {
     /// compiler by `parseAndCompile`. Null disables deferral (e.g. the
     /// synthetic parent used by force-time deferred compilation, so
     /// nested attrsets there compile eagerly). See `deferred.zig`.
-    deferred_table: ?*@import("deferred.zig").Table = null,
+    deferred_table: ?*DeferredTable = null,
     /// A pre-built line index to use instead of building one over
     /// `source`. Set on the synthetic root of a force-time deferred
     /// compile so it doesn't rebuild the index over the whole (possibly
@@ -91,8 +94,8 @@ pub const Compiler = struct {
         builder: *ChunkBuilder,
         registry: *ChunkRegistry,
         source: []const u8,
-        intern: *@import("runtime/intern.zig").InternTable,
-        heap: *@import("runtime/heap.zig").ObjectHeap,
+        intern: *InternTable,
+        heap: *ObjectHeap,
     ) Compiler {
         return .{
             .allocator = allocator,

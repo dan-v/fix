@@ -1,7 +1,7 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const bytecode_mod = @import("../bytecode.zig");
 
@@ -9,7 +9,7 @@ const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
-const prof = @import("../prof.zig");
+const prof = @import("../probe/prof.zig");
 
 const VM = vm_mod.VM;
 const readU32 = vm_mod.readU32;

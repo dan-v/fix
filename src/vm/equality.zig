@@ -1,11 +1,11 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
-const heap_mod = @import("../runtime/heap.zig");
-const numeric = @import("../runtime/numeric.zig");
-const int_mod = @import("../runtime/int.zig");
+const heap_mod = @import("runtime").heap;
+const numeric = @import("runtime").numeric;
+const int_mod = @import("runtime").int;
 
 const force = @import("force.zig");
 const strings = @import("strings.zig");

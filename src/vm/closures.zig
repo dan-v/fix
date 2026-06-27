@@ -1,17 +1,17 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
-const tjit_exec = @import("../tjit/exec.zig");
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
+const tjit_exec = @import("../jit/exec.zig");
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
 const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
-const heap_mod = @import("../runtime/heap.zig");
+const heap_mod = @import("runtime").heap;
 const Closure = heap_mod.Closure;
-const BytecodeThunk = @import("../runtime/thunk.zig").BytecodeThunk;
-const Thunk = @import("../runtime/thunk.zig").Thunk;
-const deferred_mod = @import("../deferred.zig");
+const BytecodeThunk = @import("runtime").thunk.BytecodeThunk;
+const Thunk = @import("runtime").thunk.Thunk;
+const deferred_mod = @import("../compiler/deferred_table.zig");
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -19,8 +19,9 @@ const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
-const jit_mod = @import("../jit.zig");
-const prof = @import("../prof.zig");
+const jit_mod = @import("../jit/native.zig");
+const trace_log = @import("trace_log.zig");
+const prof = @import("../probe/prof.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -578,7 +579,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
-    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+    trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 /// Like `replaceCurrentFrame` but for an uncurried (arity>1) callee:
@@ -612,7 +613,7 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrameMulti");
-    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+    trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 /// `call_n`: apply `callee` to `n` args, all already on the stack as

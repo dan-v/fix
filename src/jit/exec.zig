@@ -18,20 +18,22 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const vm_mod = @import("../vm.zig");
-const Value = @import("../runtime/value.zig").Value;
+const Value = @import("runtime").value.Value;
 const force = @import("../vm/force.zig");
 const access = @import("../vm/access.zig");
 const equality = @import("../vm/equality.zig");
-const numeric = @import("../runtime/numeric.zig");
+const numeric = @import("runtime").numeric;
 const strings = @import("../vm/strings.zig");
 
 const VM = vm_mod.VM;
 const GuardKind = ir.GuardKind;
-const ChunkId = @import("../runtime/types.zig").ChunkId;
-const jit = @import("../jit.zig");
+const ChunkId = @import("runtime").types.ChunkId;
+const jit = @import("native.zig");
 const helpers = @import("jit_helpers.zig");
+const build_options = @import("build_options");
+const hot = @import("hot.zig");
 
-pub const enabled: bool = @import("build_options").tjit;
+pub const enabled: bool = build_options.tjit;
 
 /// Mirror of the recorder's capture cap (record.zig MAX_THUNK_CAPTURES).
 const MAX_ALLOC_CAPTURES = 64;
@@ -96,7 +98,7 @@ pub fn sideExitImpl(vm: *VM, snap: *const ir.Snapshot, slots: [*]const Value, an
 /// inlined thunk body's `load_upvalue_of`. Null if it isn't a bytecode thunk.
 fn bytecodeThunkUpvalues(vm: *VM, thunk_val: Value) ?[]const Value {
     const thunk = vm.heap.getThunkAssumeValid(thunk_val.asObjectId());
-    const thunk_mod = @import("../runtime/thunk.zig");
+    const thunk_mod = @import("runtime").thunk;
     if (thunk.targetKind() != thunk_mod.TargetKind.bytecode) return null;
     return thunk.payload.target.bytecode.upvalues();
 }
@@ -108,7 +110,7 @@ var err_deopt_count: std.atomic.Value(u64) = .{ .raw = 0 }; // deopts from a tra
 
 pub fn report() void {
     if (comptime !enabled) return;
-    if (!@import("hot.zig").report_enabled) return;
+    if (!hot.report_enabled) return;
     const nat = native_count.load(.monotonic);
     const e = exec_count.load(.monotonic);
     const d = deopt_count.load(.monotonic);

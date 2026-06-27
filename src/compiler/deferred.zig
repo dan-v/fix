@@ -20,12 +20,13 @@ const Compiler = compiler_mod.Compiler;
 const bytecode = @import("../bytecode.zig");
 const ChunkBuilder = bytecode.chunk.ChunkBuilder;
 const ChunkRegistry = bytecode.chunk.ChunkRegistry;
-const ChunkId = @import("../runtime/types.zig").ChunkId;
-const InternTable = @import("../runtime/intern.zig").InternTable;
-const ObjectHeap = @import("../runtime/heap.zig").ObjectHeap;
+const ChunkId = @import("runtime").types.ChunkId;
+const InternTable = @import("runtime").intern.InternTable;
+const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
-const deferred = @import("../deferred.zig");
+const deferred = @import("deferred_table.zig");
+const LineIndex = @import("syntax").diagnostic.LineIndex;
 
 /// Compile one deferred body and return its registered ChunkId. Uses the
 /// long-lived `allocator` (evaluator lifetime) so the registered chunk's
@@ -38,7 +39,7 @@ pub fn compile(
     intern: *InternTable,
     heap: *ObjectHeap,
     entry: *const deferred.Entry,
-    line_index: *@import("../diagnostic.zig").LineIndex,
+    line_index: *LineIndex,
 ) !ChunkId {
     // Synthetic parent: snapshot names as locals 0..k-1, in order.
     var parent_builder = try ChunkBuilder.init(allocator);

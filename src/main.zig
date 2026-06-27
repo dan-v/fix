@@ -4,94 +4,20 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const eval = @import("eval.zig");
-const derivation_debug = @import("derivation/debug.zig");
-const diagnostic = @import("diagnostic.zig");
-const repl_line = @import("cli/repl.zig");
+const repl = @import("cli/repl.zig");
 const disasm_cmd = @import("cli/disasm.zig");
 const inspect_cmd = @import("cli/inspect.zig");
 const trace_cmd = @import("cli/trace.zig");
 const thunks_cmd = @import("cli/thunks.zig");
-const vm_trace_mod = @import("vm/trace_log.zig");
-const timeline = @import("timeline.zig");
-const thunk_trace_mod = @import("eval/thunk_trace.zig");
+const timeline = @import("probe/timeline.zig");
+const stats = @import("cli/stats.zig");
+const args = @import("cli/args.zig");
+const run = @import("cli/run.zig");
+const trace_setup = @import("cli/trace_setup.zig");
+const tjit_hot = @import("jit/hot.zig");
 const Evaluator = eval.Evaluator;
-const EvalTrace = eval.EvalTrace;
-const Value = @import("runtime/value.zig").Value;
 
-const usage =
-    \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)
-    \\
-    \\options:
-    \\  --repl                 read and evaluate expressions interactively
-    \\  -e, --expr EXPR        evaluate expression text
-    \\  --json                 write the evaluated value as JSON
-    \\  --xml                  write the evaluated value as XML
-    \\  --strict               recursively force attr values and list items before writing
-    \\  --debug-derivations[=MODE]
-    \\                         write derivation debug records to stderr: summary, full
-    \\  --debug-derivation-filter TEXT
-    \\                         only show derivations whose name/path/input mentions TEXT
-    \\  --debug-derivation-name NAME
-    \\                         only show derivations with exactly NAME
-    \\  --debug-derivation-drv PATH
-    \\                         only show the derivation with exactly PATH
-    \\  --show-trace           show full evaluation traces
-    \\  --color[=when]         color diagnostics: auto, always, never
-    \\  --no-color             disable color diagnostics
-    \\  --progress[=when]      show evaluation progress on stderr: auto, always, never
-    \\  --no-progress          disable evaluation progress
-    \\  -h, --help             show this help
-    \\
-;
-
-const OutputFormat = enum {
-    nix,
-    json,
-    xml,
-};
-
-const EvaluationMode = struct {
-    output: OutputFormat = .nix,
-    strict: bool = false,
-};
-
-const SourceArg = union(enum) {
-    expr: []const u8,
-    file: []const u8,
-};
-
-const Options = struct {
-    output: OutputFormat = .nix,
-    strict: bool = false,
-    color: cli.When = .auto,
-    progress: cli.When = .auto,
-    show_trace: bool = false,
-    derivation_debug: derivation_debug.Options = .{},
-    repl: bool = false,
-    source: ?SourceArg = null,
-    vm_trace_path: ?[:0]const u8 = null,
-    vm_trace_format: enum { text, binary } = .text,
-    vm_trace_max_events: u64 = 0,
-    vm_trace_main_only: bool = false,
-    thunks_log_path: ?[:0]const u8 = null,
-    workers: ?u8 = null,
-    disable_spec_thunks: bool = false,
-    disable_fanout: bool = false,
-    print_sched_stats: bool = false,
-    timeline_path: ?[]const u8 = null,
-
-    fn setSource(self: *Options, source: SourceArg) !void {
-        if (self.source != null) return error.TooManySources;
-        self.source = source;
-    }
-
-    fn evaluationMode(self: Options) EvaluationMode {
-        return .{
-            .output = self.output,
-            .strict = self.strict,
-        };
-    }
-};
+const usage = args.usage;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -137,8 +63,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const options = parseOptions(&args_iter, first_arg) catch |err| {
-        std.debug.print("error: {s}\n\n{s}", .{ optionErrorMessage(err), usage });
+    const options = args.parse(&args_iter, first_arg) catch |err| {
+        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
         std.process.exit(1);
     };
 
@@ -170,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         var repl_ok = false;
         defer progress.deinit(repl_ok);
         ev.setProgressSink(progress.sink());
-        try runRepl(allocator, init.io, options, use_color, &ev);
+        try repl.run_loop(allocator, init.io, options, use_color, &ev);
         repl_ok = true;
         return;
     }
@@ -180,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
-    const source = getSource(&ev, source_arg) catch |err| {
+    const source = run.getSource(&ev, source_arg) catch |err| {
         std.debug.print("Error reading source: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -189,11 +115,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer progress.deinit(false);
     ev.setProgressSink(progress.sink());
 
-    var trace_setup = try setupVmTrace(allocator, init.io, options);
-    defer trace_setup.deinit(allocator);
-    if (trace_setup.trace) |t| ev.setVmTrace(t);
+    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
+    defer vm_trace.deinit(allocator);
+    if (vm_trace.trace) |t| ev.setVmTrace(t);
 
-    var thunks_setup = try setupThunkTrace(allocator, init.io, &ev, options);
+    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, options);
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
 
@@ -201,8 +127,8 @@ pub fn main(init: std.process.Init) !void {
     // print during/after eval only when stats are requested; otherwise a
     // `-Dtjit` build stays quiet. Must be set before evaluation since traces
     // are dumped as they're recorded.
-    if (comptime @import("tjit/hot.zig").enabled) {
-        @import("tjit/hot.zig").report_enabled = options.print_sched_stats;
+    if (comptime tjit_hot.enabled) {
+        tjit_hot.report_enabled = options.print_sched_stats;
     }
 
     if (comptime timeline.enabled) {
@@ -211,614 +137,16 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("warning: --timeline requires a build with -Dtimeline; ignoring\n", .{});
     }
 
-    const ok = try evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
+    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
 
     if (comptime timeline.enabled) {
         if (options.timeline_path) |p| timeline.dump(init.io, p, worker_count);
     }
-    trace_setup.finish();
+    vm_trace.finish();
     thunks_setup.finish();
-    if (options.print_sched_stats) {
-        const s = ev.schedulerStats();
-        std.debug.print(
-            "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d}\n",
-            .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks },
-        );
-        std.debug.print("registry: chunks={d}\n", .{ev.chunkStats().chunks});
-        {
-            const d = ev.deferred_table.stats();
-            std.debug.print("deferred: registered={d} compiled={d} ({d:.1}% forced)\n", .{
-                d.registered, d.compiled,
-                if (d.registered == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(d.compiled)) / @as(f64, @floatFromInt(d.registered)),
-            });
-        }
-        // Total CPU time across all workers (fiber resume vs futex
-        // park). At workers=N the ratio busy/(busy+idle) is the
-        // average worker utilisation; a high idle share means
-        // helpers are starved for work even though wall time hasn't
-        // converged.
-        std.debug.print(
-            "sched: busy_ms={d} idle_ms={d} util={d:.2}%\n",
-            .{
-                s.busy_ns / std.time.ns_per_ms,
-                s.idle_ns / std.time.ns_per_ms,
-                if (s.busy_ns + s.idle_ns == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(s.busy_ns)) / @as(f64, @floatFromInt(s.busy_ns + s.idle_ns)),
-            },
-        );
-        if (comptime @import("jit.zig").enabled) {
-            const c = @import("jit.zig").compile_counts;
-            std.debug.print(
-                "jit: constant_ret={d} push_lit_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} get_upvalue_attr3_ret={d} eq_null={d} neq_null={d} not={d} builtin_attr_ret={d} upvalue_call_const_ret={d} upvalue_call_upvalue_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
-                .{ c.constant_ret, c.push_lit_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.get_upvalue_attr3_ret, c.get_upvalue_eq_null_ret, c.get_upvalue_neq_null_ret, c.get_upvalue_not_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.upvalue_call_upvalue_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
-            );
-            std.debug.print(
-                "jit lambdas: identity={d} local_attr_ret={d} local_eq_null={d} local_neq_null={d} local_not={d} as_thunk={d} unsupported={d}\n",
-                .{ c.lambda_identity, c.lambda_local_attr_ret, c.lambda_local_eq_null_ret, c.lambda_local_neq_null_ret, c.lambda_local_not_ret, c.lambda_as_thunk, c.unsupported_lambda },
-            );
-            // Top-10 unsupported chunks by first opcode — useful
-            // for picking the next shape to JIT.
-            const OpCode = @import("bytecode/opcode.zig").OpCode;
-            const Slot = struct { op: u8, n: u32 };
-            var top: [10]Slot = .{Slot{ .op = 0, .n = 0 }} ** 10;
-            for (c.unsupported_by_first_op, 0..) |n, op| {
-                if (n == 0) continue;
-                var slot: usize = 10;
-                for (top, 0..) |t, i| {
-                    if (n > t.n) {
-                        slot = i;
-                        break;
-                    }
-                }
-                if (slot < 10) {
-                    var j: usize = 9;
-                    while (j > slot) : (j -= 1) top[j] = top[j - 1];
-                    top[slot] = .{ .op = @intCast(op), .n = n };
-                }
-            }
-            std.debug.print("jit unsupported by first op:", .{});
-            for (top) |t| {
-                if (t.n == 0) break;
-                const name = @tagName(@as(OpCode, @enumFromInt(t.op)));
-                std.debug.print(" {s}={d}", .{ name, t.n });
-            }
-            std.debug.print("\n", .{});
-        }
-        if (comptime @import("prof.zig").enabled) {
-            const prof = @import("prof.zig");
-            inline for (@typeInfo(prof.Path).@"enum".fields) |f| {
-                const samp = prof.samples[f.value];
-                if (samp.calls != 0) {
-                    std.debug.print("prof: {s}: excl_cy={d} incl_cy={d} calls={d} avg_excl={d}\n", .{
-                        f.name,
-                        samp.cycles,
-                        samp.cycles_inclusive,
-                        samp.calls,
-                        samp.cycles / samp.calls,
-                    });
-                }
-            }
-            // Top builtins by inclusive cycles on main.
-            const N = 20;
-            const BSlot = struct { id: u16, cycles: u64, incl: u64, calls: u64 };
-            var top_b: [N]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** N;
-            for (prof.builtin_samples, 0..) |samp, id| {
-                if (samp.calls == 0) continue;
-                var slot: usize = N;
-                for (top_b, 0..) |entry, i| {
-                    if (samp.cycles > entry.cycles) {
-                        slot = i;
-                        break;
-                    }
-                }
-                if (slot < N) {
-                    var j: usize = N - 1;
-                    while (j > slot) : (j -= 1) top_b[j] = top_b[j - 1];
-                    top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
-                }
-            }
-            const BuiltinId = @import("builtins.zig").BuiltinId;
-            std.debug.print("prof builtins (top-20 by EXCL cycles — own-body cost):\n", .{});
-            for (top_b) |entry| {
-                if (entry.cycles == 0) break;
-                const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
-                std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
-            }
-        }
-        if (comptime @import("prof_path.zig").enabled) {
-            @import("prof_path.zig").report(ev.chunkRegistry(), ev.internTable());
-        }
-    }
+    if (options.print_sched_stats) stats.report(&ev);
     if (!ok) {
         std.process.exit(1);
     }
-}
-
-const ThunkTraceSetup = struct {
-    trace: ?*thunk_trace_mod.ThunkTrace = null,
-    file: ?std.Io.File = null,
-    io: ?std.Io = null,
-    writer: ?*std.Io.File.Writer = null,
-    buffer: []u8 = &.{},
-
-    pub fn deinit(self: *ThunkTraceSetup, allocator: std.mem.Allocator) void {
-        if (self.writer) |w| allocator.destroy(w);
-        if (self.trace) |t| allocator.destroy(t);
-        if (self.buffer.len > 0) allocator.free(self.buffer);
-        if (self.file) |f| if (self.io) |io| f.close(io);
-    }
-
-    pub fn finish(self: *ThunkTraceSetup) void {
-        if (self.trace) |t| t.flush() catch {};
-    }
-};
-
-fn setupThunkTrace(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    ev: *Evaluator,
-    options: Options,
-) !ThunkTraceSetup {
-    var setup: ThunkTraceSetup = .{};
-    const path = options.thunks_log_path orelse return setup;
-    if (comptime !@import("vm.zig").thunks_log_enabled) {
-        std.debug.print(
-            "warning: --thunks-log requested but binary was built without -Dthunks-log; the log will be empty\n",
-            .{},
-        );
-        return setup;
-    }
-
-    setup.buffer = try allocator.alloc(u8, 64 * 1024);
-    errdefer allocator.free(setup.buffer);
-
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    setup.file = file;
-    setup.io = io;
-    const writer_ptr = try allocator.create(std.Io.File.Writer);
-    errdefer allocator.destroy(writer_ptr);
-    writer_ptr.* = file.writerStreaming(io, setup.buffer);
-    setup.writer = writer_ptr;
-
-    const trace_ptr = try allocator.create(thunk_trace_mod.ThunkTrace);
-    errdefer allocator.destroy(trace_ptr);
-    trace_ptr.* = thunk_trace_mod.ThunkTrace.init(
-        &writer_ptr.interface,
-        ev.internTable(),
-        &ev.heap,
-        &ev.registry,
-    );
-    setup.trace = trace_ptr;
-    return setup;
-}
-
-const VmTraceSetup = struct {
-    trace: ?*vm_trace_mod.VmTrace = null,
-    trace_storage: ?*vm_trace_mod.VmTrace = null,
-    file: ?std.Io.File = null,
-    io: ?std.Io = null,
-    writer: ?*std.Io.File.Writer = null,
-    buffer: []u8 = &.{},
-
-    pub fn deinit(self: *VmTraceSetup, allocator: std.mem.Allocator) void {
-        if (self.writer) |w| allocator.destroy(w);
-        if (self.trace_storage) |t| allocator.destroy(t);
-        if (self.buffer.len > 0) allocator.free(self.buffer);
-        if (self.file) |f| if (self.io) |io| f.close(io);
-    }
-
-    pub fn finish(self: *VmTraceSetup) void {
-        if (self.trace) |t| t.flush() catch {};
-    }
-};
-
-fn setupVmTrace(allocator: std.mem.Allocator, io: std.Io, options: Options) !VmTraceSetup {
-    var setup: VmTraceSetup = .{};
-    const path = options.vm_trace_path orelse return setup;
-
-    if (!vm_trace_mod.enabled) {
-        std.debug.print("warning: --vm-trace requested but binary was built without -Dvm-trace=true\n", .{});
-        return setup;
-    }
-
-    setup.buffer = try allocator.alloc(u8, 64 * 1024);
-    errdefer allocator.free(setup.buffer);
-
-    if (std.mem.eql(u8, path, "-")) {
-        const writer_ptr = try allocator.create(std.Io.File.Writer);
-        errdefer allocator.destroy(writer_ptr);
-        writer_ptr.* = std.Io.File.stderr().writerStreaming(io, setup.buffer);
-        setup.writer = writer_ptr;
-    } else {
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-        setup.file = file;
-        setup.io = io;
-        const writer_ptr = try allocator.create(std.Io.File.Writer);
-        errdefer allocator.destroy(writer_ptr);
-        writer_ptr.* = file.writerStreaming(io, setup.buffer);
-        setup.writer = writer_ptr;
-    }
-
-    const trace_ptr = try allocator.create(vm_trace_mod.VmTrace);
-    errdefer allocator.destroy(trace_ptr);
-    trace_ptr.* = vm_trace_mod.VmTrace.init(&setup.writer.?.interface, switch (options.vm_trace_format) {
-        .text => .text,
-        .binary => .binary,
-    });
-    trace_ptr.setMaxEvents(options.vm_trace_max_events);
-    trace_ptr.setMainOnly(options.vm_trace_main_only);
-    setup.trace_storage = trace_ptr;
-    setup.trace = trace_ptr;
-    return setup;
-}
-
-fn evaluateAndWrite(
-    io: std.Io,
-    mode: EvaluationMode,
-    use_color: bool,
-    show_trace: bool,
-    debug_options: derivation_debug.Options,
-    ev: *Evaluator,
-    source: []const u8,
-) !bool {
-    const result = ev.evaluate(source) catch |err| {
-        try writeEvalFailure(io, use_color, show_trace, ev, source, err);
-        return false;
-    };
-
-    writeResult(io, mode, ev, result) catch |err| {
-        try writeEvaluationError(io, use_color, show_trace, ev, source, err);
-        return false;
-    };
-    try derivation_debug.write(io, use_color, ev.allocator, debug_options, ev.derivationDebugRecords());
-    return true;
-}
-
-fn writeEvalFailure(
-    io: std.Io,
-    use_color: bool,
-    show_trace: bool,
-    ev: *Evaluator,
-    source: []const u8,
-    err: anyerror,
-) !void {
-    if (ev.getDiagnostics().len > 0) {
-        var stderr_buffer: [4096]u8 = undefined;
-        var stderr = try cli.lockStderr(io, &stderr_buffer);
-        defer stderr.deinit();
-        try diagnostic.writeAllWithOptions(stderr.writer(), source, ev.getDiagnostics(), .{ .color = use_color });
-        try stderr.flush();
-    } else {
-        try writeEvaluationError(io, use_color, show_trace, ev, source, err);
-    }
-}
-
-fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) !void {
-    if (mode.strict) try ev.forceDeep(result);
-
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    switch (mode.output) {
-        .nix => try ev.writeValue(&stdout.interface, result),
-        .json => try ev.writeJsonValue(&stdout.interface, result),
-        .xml => try ev.writeXmlValue(&stdout.interface, result),
-    }
-    if (mode.output != .xml) try stdout.interface.writeByte('\n');
-    try stdout.interface.flush();
-}
-
-const Source = struct {
-    text: []const u8,
-};
-
-fn getSource(
-    ev: *Evaluator,
-    source: SourceArg,
-) !Source {
-    return switch (source) {
-        .expr => |text| .{ .text = text },
-        .file => |path| .{ .text = try ev.readSourceFile(path) },
-    };
-}
-
-fn parseOptions(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
-    var options: Options = .{};
-
-    var carried = first;
-    while (true) {
-        const arg = if (carried) |c| blk: {
-            carried = null;
-            break :blk c;
-        } else (args_iter.next() orelse break);
-        if (std.mem.eql(u8, arg, "--repl")) {
-            options.repl = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            options.output = .json;
-        } else if (std.mem.eql(u8, arg, "--xml")) {
-            options.output = .xml;
-        } else if (std.mem.eql(u8, arg, "--strict")) {
-            options.strict = true;
-        } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
-            options.derivation_debug.mode = .summary;
-        } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
-            options.derivation_debug.mode = derivation_debug.parseMode(arg["--debug-derivations=".len..]) orelse return error.InvalidDerivationDebugMode;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-filter")) {
-            options.derivation_debug.filter = args_iter.next() orelse return error.MissingDerivationDebugFilter;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-name")) {
-            options.derivation_debug.name = args_iter.next() orelse return error.MissingDerivationDebugName;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-drv")) {
-            options.derivation_debug.drv_path = args_iter.next() orelse return error.MissingDerivationDebugDrv;
-        } else if (std.mem.eql(u8, arg, "--show-trace")) {
-            options.show_trace = true;
-        } else if (std.mem.eql(u8, arg, "--color")) {
-            options.color = .always;
-        } else if (std.mem.startsWith(u8, arg, "--color=")) {
-            options.color = cli.parseWhen(arg["--color=".len..]) orelse return error.InvalidColorMode;
-        } else if (std.mem.eql(u8, arg, "--no-color")) {
-            options.color = .never;
-        } else if (std.mem.eql(u8, arg, "--progress")) {
-            options.progress = .always;
-        } else if (std.mem.startsWith(u8, arg, "--progress=")) {
-            options.progress = cli.parseWhen(arg["--progress=".len..]) orelse return error.InvalidProgressMode;
-        } else if (std.mem.eql(u8, arg, "--no-progress")) {
-            options.progress = .never;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print("{s}", .{usage});
-            std.process.exit(0);
-        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
-            try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
-        } else if (std.mem.eql(u8, arg, "--file")) {
-            try options.setSource(.{ .file = args_iter.next() orelse return error.MissingPath });
-        } else if (std.mem.eql(u8, arg, "--vm-trace")) {
-            options.vm_trace_path = "-"; // stderr
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace=")) {
-            options.vm_trace_path = arg["--vm-trace=".len..];
-        } else if (std.mem.eql(u8, arg, "--vm-trace-format")) {
-            const text = args_iter.next() orelse return error.MissingVmTraceFormat;
-            options.vm_trace_format = parseVmTraceFormat(text) orelse return error.InvalidVmTraceFormat;
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace-format=")) {
-            options.vm_trace_format = parseVmTraceFormat(arg["--vm-trace-format=".len..]) orelse return error.InvalidVmTraceFormat;
-        } else if (std.mem.eql(u8, arg, "--vm-trace-max-events")) {
-            const text = args_iter.next() orelse return error.MissingVmTraceMaxEvents;
-            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
-            const text = arg["--vm-trace-max-events=".len..];
-            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
-        } else if (std.mem.eql(u8, arg, "--vm-trace-main-only")) {
-            options.vm_trace_main_only = true;
-        } else if (std.mem.eql(u8, arg, "--workers")) {
-            const text = args_iter.next() orelse return error.MissingWorkers;
-            options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
-        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
-            options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
-        } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
-            options.thunks_log_path = arg["--thunks-log=".len..];
-        } else if (std.mem.eql(u8, arg, "--no-spec-thunks")) {
-            options.disable_spec_thunks = true;
-        } else if (std.mem.eql(u8, arg, "--no-fanout")) {
-            options.disable_fanout = true;
-        } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
-            options.print_sched_stats = true;
-        } else if (std.mem.eql(u8, arg, "--timeline")) {
-            options.timeline_path = "fix-timeline.json";
-        } else if (std.mem.startsWith(u8, arg, "--timeline=")) {
-            options.timeline_path = arg["--timeline=".len..];
-        } else {
-            return error.UnknownOption;
-        }
-    }
-
-    return options;
-}
-
-fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trace_format) {
-    if (std.mem.eql(u8, text, "binary")) return .binary;
-    if (std.mem.eql(u8, text, "text")) return .text;
-    return null;
-}
-
-fn optionErrorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.MissingExpression => "missing expression after -e or --expr",
-        error.MissingPath => "missing path after --file",
-        error.MissingDerivationDebugFilter => "missing text after --debug-derivation-filter",
-        error.MissingDerivationDebugName => "missing name after --debug-derivation-name",
-        error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
-        error.TooManySources => "provide only one expression or file",
-        error.InvalidColorMode => "expected --color to be auto, always, or never",
-        error.InvalidProgressMode => "expected --progress to be auto, always, or never",
-        error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
-        error.MissingVmTraceFormat => "missing format after --vm-trace-format",
-        error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
-        error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
-        error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
-        error.MissingWorkers => "missing N after --workers",
-        error.InvalidWorkers => "expected --workers to be a non-negative integer",
-        error.UnknownOption => "unknown option",
-        else => @errorName(err),
-    };
-}
-
-fn runRepl(allocator: std.mem.Allocator, io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
-    const interactive = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
-
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-
-    if (interactive) {
-        try stdout.interface.writeAll("fix repl\n");
-        try stdout.interface.flush();
-    }
-
-    var history = repl_line.History.init(allocator);
-    defer history.deinit();
-    var raw_editor = interactive;
-
-    while (true) {
-        var owned_line: ?[]u8 = null;
-        const line = if (raw_editor) line: {
-            const maybe_line = repl_line.readInteractiveAlloc(allocator, io, "fix> ", use_color, &history) catch |err| switch (err) {
-                error.UnsupportedTerminal => {
-                    raw_editor = false;
-                    break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
-                },
-                else => return err,
-            };
-            owned_line = maybe_line orelse break;
-            break :line owned_line.?;
-        } else line: {
-            break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
-        };
-        defer if (owned_line) |owned| allocator.free(owned);
-
-        const source = std.mem.trim(u8, line, " \t\r");
-        if (source.len == 0) continue;
-
-        if (!raw_editor) {
-            try history.add(source);
-        }
-
-        if (std.mem.eql(u8, source, ":q") or
-            std.mem.eql(u8, source, ":quit") or
-            std.mem.eql(u8, source, ":exit"))
-        {
-            break;
-        }
-        if (std.mem.eql(u8, source, ":help")) {
-            try writeReplHelp(&stdout.interface);
-            try stdout.interface.flush();
-            continue;
-        }
-
-        _ = try evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source);
-    }
-}
-
-fn readCanonicalReplLine(
-    io: std.Io,
-    use_color: bool,
-    interactive: bool,
-    stdin: *std.Io.Reader,
-    stdout: *std.Io.Writer,
-) !?[]const u8 {
-    if (interactive) {
-        try cli.style(stdout, use_color, .trace_label);
-        try stdout.writeAll("fix> ");
-        try cli.reset(stdout, use_color);
-        try stdout.flush();
-    }
-
-    const raw_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
-        error.StreamTooLong => {
-            try writeReplInputError(io, use_color, "input line is too long");
-            _ = stdin.discardDelimiterInclusive('\n') catch {};
-            return "";
-        },
-        else => return err,
-    };
-    return raw_line;
-}
-
-fn writeReplHelp(writer: *std.Io.Writer) !void {
-    try writer.writeAll(
-        \\:help   show commands
-        \\:q      exit
-        \\:quit   exit
-        \\
-    );
-}
-
-fn writeReplInputError(io: std.Io, use_color: bool, message: []const u8) !void {
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr = try cli.lockStderr(io, &stderr_buffer);
-    defer stderr.deinit();
-    const writer = stderr.writer();
-    try cli.style(writer, use_color, .error_label);
-    try writer.writeAll("error");
-    try cli.reset(writer, use_color);
-    try writer.print(": {s}\n", .{message});
-    try stderr.flush();
-}
-
-const default_trace_limit = 8;
-
-fn writeEvaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !void {
-    var stderr_buffer: [4096]u8 = undefined;
-    var stderr = try cli.lockStderr(io, &stderr_buffer);
-    defer stderr.deinit();
-    const writer = stderr.writer();
-    const trace = ev.getTrace();
-
-    try cli.style(writer, use_color, .error_label);
-    try writer.writeAll("error");
-    try cli.reset(writer, use_color);
-    if (trace.message) |message| {
-        try writer.print(": {s}\n", .{message});
-    } else {
-        try writer.print(": evaluation failed with {s}\n", .{@errorName(err)});
-    }
-
-    try writeTraceFrames(writer, use_color, show_trace, ev, source, trace.frames.items);
-    try stderr.flush();
-}
-
-fn writeTraceFrames(
-    writer: *std.Io.Writer,
-    use_color: bool,
-    show_trace: bool,
-    ev: *Evaluator,
-    source: []const u8,
-    frames: []const EvalTrace.Frame,
-) !void {
-    if (frames.len == 0) return;
-
-    try cli.style(writer, use_color, .dim);
-    try writer.writeAll("\ntrace:\n");
-    try cli.reset(writer, use_color);
-
-    if (show_trace or frames.len <= default_trace_limit) {
-        for (frames) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
-        return;
-    }
-
-    const head_count = default_trace_limit / 2;
-    const tail_count = default_trace_limit - head_count;
-    for (frames[0..head_count]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
-
-    try cli.style(writer, use_color, .dim);
-    try writer.print("  ... {d} frames omitted; use --show-trace to show all\n", .{frames.len - default_trace_limit});
-    try cli.reset(writer, use_color);
-
-    for (frames[frames.len - tail_count ..]) |frame| try writeTraceFrame(writer, use_color, ev, source, frame);
-}
-
-fn writeTraceFrame(writer: *std.Io.Writer, use_color: bool, ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) !void {
-    if (frame.diagnostic) |diag| {
-        if (traceFrameSource(ev, source, frame)) |frame_source| {
-            try diagnostic.writeAllWithOptions(writer, frame_source, &.{diag}, .{ .color = use_color });
-            return;
-        }
-        if (frame.source_path) |path| {
-            try writer.print("  {s}:{d}:{d}: {s}\n", .{ path, diag.line, diag.column, frame.message });
-            return;
-        }
-        try writer.print("  expression:{d}:{d}: {s}\n", .{ diag.line, diag.column, frame.message });
-        return;
-    }
-
-    try writer.writeAll("  ");
-    try cli.style(writer, use_color, .trace_label);
-    try writer.writeAll("while evaluating");
-    try cli.reset(writer, use_color);
-    try writer.print(": {s}\n", .{frame.message});
-}
-
-fn traceFrameSource(ev: *Evaluator, source: []const u8, frame: EvalTrace.Frame) ?[]const u8 {
-    if (frame.source_path) |path| {
-        return ev.readSourceFile(path) catch null;
-    }
-    return source;
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 const cli = @import("../cli.zig");
-const derivation = @import("../derivation.zig");
+const derivation = @import("derivation");
 
 pub const Mode = enum {
     off,

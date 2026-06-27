@@ -3,15 +3,18 @@
 //! Public API surface for derivation IR, hashing, path construction, and
 //! evaluator-facing value construction.
 
-const heap_mod = @import("runtime/heap.zig");
-const InternTable = @import("runtime/intern.zig").InternTable;
-const Value = @import("runtime/value.zig").Value;
+const heap_mod = @import("runtime").heap;
+const InternTable = @import("runtime").intern.InternTable;
+const Value = @import("runtime").value.Value;
 const dtypes = @import("derivation/types.zig");
 const drv_mod = @import("derivation/drv.zig");
 const path_mod = @import("derivation/paths.zig");
 const store_mod = @import("derivation/store.zig");
 const value_builder = @import("derivation/value.zig");
 const std = @import("std");
+
+/// Store-path realization for `path`/`filterSource`-style source imports.
+pub const source_path = @import("derivation/source_path.zig");
 
 pub const Output = dtypes.Output;
 pub const DrvOutput = dtypes.DrvOutput;

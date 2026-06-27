@@ -10,9 +10,9 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const types = @import("../runtime/types.zig");
+const types = @import("runtime").types;
 const bytecode = @import("../bytecode.zig");
-const stable = @import("../runtime/stable_segments.zig");
+const stable = @import("runtime").stable_segments;
 
 const OpCode = bytecode.OpCode;
 const ChunkId = types.ChunkId;

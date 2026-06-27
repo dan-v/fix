@@ -11,8 +11,8 @@
 //!   - Atomic thunk integration for lazy evaluation
 
 const std = @import("std");
-const types = @import("runtime/types.zig");
-const Value = @import("runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ChunkId = types.ChunkId;
 const bytecode_mod = @import("bytecode.zig");
@@ -21,17 +21,21 @@ const build_options = @import("build_options");
 const chunk = bytecode_mod.chunk;
 const Chunk = chunk.Chunk;
 const ChunkRegistry = chunk.ChunkRegistry;
-const InternTable = @import("runtime/intern.zig").InternTable;
-const Scheduler = @import("scheduler.zig").Scheduler;
-const heap_mod = @import("runtime/heap.zig");
+const InternTable = @import("runtime").intern.InternTable;
+const Scheduler = @import("parallel").scheduler.Scheduler;
+const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
-const FileCache = @import("file_cache.zig").FileCache;
-const FetchCache = @import("fetch_cache.zig").FetchCache;
-const DerivationStore = @import("derivation.zig").DerivationStore;
-const eval_trace = @import("eval/trace.zig");
+const FileCache = @import("runtime").file_cache.FileCache;
+const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const DerivationStore = @import("derivation").DerivationStore;
+const eval_trace = @import("support/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
-const thunk_mod = @import("runtime/thunk.zig");
+const thunk_mod = @import("runtime").thunk;
+const worker_id_mod = @import("runtime").worker_id;
+const tjit_record = @import("jit/record.zig");
+const DeferredTable = @import("compiler/deferred_table.zig").Table;
+const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
@@ -86,7 +90,7 @@ pub const VM = struct {
     /// Lazy per-attr compilation: deferred bodies + their compile cache.
     /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
     /// (which never create `.deferred` thunks). See `deferred.zig`.
-    deferred_table: ?*@import("deferred.zig").Table = null,
+    deferred_table: ?*DeferredTable = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
@@ -120,7 +124,7 @@ pub const VM = struct {
     /// trace; writes serialize on its internal mutex. The field is
     /// compiled out entirely unless `-Dthunks-log` is set so the
     /// per-thunk null-check overhead doesn't burden default builds.
-    thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
+    thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -177,7 +181,7 @@ pub const VM = struct {
         trace_sink: ?*eval_trace.Trace,
         progress: ?eval_progress.Sink,
         vm_trace: ?*VmTrace,
-        thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
+        thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
         import_host: ?ImportHost,
         builtins_value: Value,
         opcode_profile_sink: OpcodeProfileSink,
@@ -224,12 +228,12 @@ pub const VM = struct {
     /// because fibers migrate across workers (F1.4).
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
-        return @import("runtime/worker_id.zig").current;
+        return worker_id_mod.current;
     }
 
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
-        if (comptime @import("tjit/record.zig").enabled) @import("tjit/record.zig").cleanup(self);
+        if (comptime tjit_record.enabled) tjit_record.cleanup(self);
         self.allocator.free(self.stack);
         self.allocator.free(self.frames);
     }

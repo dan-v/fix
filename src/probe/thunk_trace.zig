@@ -24,14 +24,14 @@
 //! are not stable, so the diff tool matches by source location.
 
 const std = @import("std");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
-const InternTable = @import("../runtime/intern.zig").InternTable;
-const heap_mod = @import("../runtime/heap.zig");
+const InternTable = @import("runtime").intern.InternTable;
+const heap_mod = @import("runtime").heap;
 const ObjectHeap = heap_mod.ObjectHeap;
-const stable = @import("../runtime/stable_segments.zig");
+const stable = @import("runtime").stable_segments;
 const bytecode = @import("../bytecode.zig");
 const ChunkRegistry = bytecode.ChunkRegistry;
 const Chunk = bytecode.chunk.Chunk;
@@ -46,7 +46,7 @@ pub const TargetKind = enum {
 pub const ThunkTrace = struct {
     writer: *std.Io.Writer,
     intern: *const InternTable,
-    heap: *const ObjectHeap,
+    heap: *ObjectHeap,
     registry: *const ChunkRegistry,
     mu: stable.SpinMutex = .{},
     seq: std.atomic.Value(u64) = .init(0),
@@ -54,7 +54,7 @@ pub const ThunkTrace = struct {
     pub fn init(
         writer: *std.Io.Writer,
         intern: *const InternTable,
-        heap: *const ObjectHeap,
+        heap: *ObjectHeap,
         registry: *const ChunkRegistry,
     ) ThunkTrace {
         return .{ .writer = writer, .intern = intern, .heap = heap, .registry = registry };
@@ -232,7 +232,7 @@ fn writeLoc(
 fn writeValueInner(
     writer: *std.Io.Writer,
     intern: *const InternTable,
-    heap: *const ObjectHeap,
+    heap: *ObjectHeap,
     value: Value,
     depth: u8,
 ) !void {
@@ -297,6 +297,7 @@ fn writeValueInner(
             try writer.writeByte('}');
         },
         .closure => try writer.writeAll("<closure>"),
+        .partial_app => try writer.writeAll("<partial-app>"),
         .thunk => try writer.print("<thunk {d}>", .{value.asObjectId()}),
         .builtin => try writer.writeAll("<builtin>"),
         .builtin_closure => try writer.writeAll("<builtin_closure>"),

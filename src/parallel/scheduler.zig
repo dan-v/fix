@@ -27,8 +27,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("runtime/types.zig");
-const stable = @import("runtime/stable_segments.zig");
+const types = @import("runtime").types;
+const stable = @import("runtime").stable_segments;
 
 pub const Task = union(enum) {
     /// Speculatively force a thunk to its result. The thunk lives in the

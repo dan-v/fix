@@ -1,8 +1,11 @@
-//! Minimal raw-mode line editor for the interactive REPL.
+//! Interactive REPL: the raw-mode line editor and the read-eval-print loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("../cli.zig");
+const run = @import("run.zig");
+const Options = @import("args.zig").Options;
+const Evaluator = @import("../eval.zig").Evaluator;
 
 pub const History = struct {
     allocator: std.mem.Allocator,
@@ -252,4 +255,110 @@ fn readByte() !u8 {
         if (n == 0) return error.EndOfStream;
         return buf[0];
     }
+}
+
+/// The read-eval-print loop. Uses the raw-mode editor when stdin/stdout are a
+/// TTY, falling back to canonical line reads otherwise.
+pub fn run_loop(allocator: std.mem.Allocator, io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
+    const interactive = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
+
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+
+    if (interactive) {
+        try stdout.interface.writeAll("fix repl\n");
+        try stdout.interface.flush();
+    }
+
+    var history = History.init(allocator);
+    defer history.deinit();
+    var raw_editor = interactive;
+
+    while (true) {
+        var owned_line: ?[]u8 = null;
+        const line = if (raw_editor) line: {
+            const maybe_line = readInteractiveAlloc(allocator, io, "fix> ", use_color, &history) catch |err| switch (err) {
+                error.UnsupportedTerminal => {
+                    raw_editor = false;
+                    break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
+                },
+                else => return err,
+            };
+            owned_line = maybe_line orelse break;
+            break :line owned_line.?;
+        } else line: {
+            break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
+        };
+        defer if (owned_line) |owned| allocator.free(owned);
+
+        const source = std.mem.trim(u8, line, " \t\r");
+        if (source.len == 0) continue;
+
+        if (!raw_editor) {
+            try history.add(source);
+        }
+
+        if (std.mem.eql(u8, source, ":q") or
+            std.mem.eql(u8, source, ":quit") or
+            std.mem.eql(u8, source, ":exit"))
+        {
+            break;
+        }
+        if (std.mem.eql(u8, source, ":help")) {
+            try writeReplHelp(&stdout.interface);
+            try stdout.interface.flush();
+            continue;
+        }
+
+        _ = try run.evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source);
+    }
+}
+
+fn readCanonicalReplLine(
+    io: std.Io,
+    use_color: bool,
+    interactive: bool,
+    stdin: *std.Io.Reader,
+    stdout: *std.Io.Writer,
+) !?[]const u8 {
+    if (interactive) {
+        try cli.style(stdout, use_color, .trace_label);
+        try stdout.writeAll("fix> ");
+        try cli.reset(stdout, use_color);
+        try stdout.flush();
+    }
+
+    const raw_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => {
+            try writeReplInputError(io, use_color, "input line is too long");
+            _ = stdin.discardDelimiterInclusive('\n') catch {};
+            return "";
+        },
+        else => return err,
+    };
+    return raw_line;
+}
+
+fn writeReplHelp(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
+        \\:help   show commands
+        \\:q      exit
+        \\:quit   exit
+        \\
+    );
+}
+
+fn writeReplInputError(io: std.Io, use_color: bool, message: []const u8) !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr = try cli.lockStderr(io, &stderr_buffer);
+    defer stderr.deinit();
+    const writer = stderr.writer();
+    try cli.style(writer, use_color, .error_label);
+    try writer.writeAll("error");
+    try cli.reset(writer, use_color);
+    try writer.print(": {s}\n", .{message});
+    try stderr.flush();
 }

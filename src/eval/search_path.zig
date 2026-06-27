@@ -2,11 +2,11 @@
 //! `<channel>`-style imports and `builtins.findFile`.
 
 const std = @import("std");
-const builtins = @import("../builtins.zig");
-const path_ops = @import("../runtime/paths.zig");
-const FileCache = @import("../file_cache.zig").FileCache;
-const InternTable = @import("../runtime/intern.zig").InternTable;
-const Value = @import("../runtime/value.zig").Value;
+const builtins = @import("runtime").builtins;
+const path_ops = @import("runtime").paths;
+const FileCache = @import("runtime").file_cache.FileCache;
+const InternTable = @import("runtime").intern.InternTable;
+const Value = @import("runtime").value.Value;
 
 pub const Entry = struct {
     prefix: []u8,

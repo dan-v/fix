@@ -1,5 +1,5 @@
-const Value = @import("../../runtime/value.zig").Value;
-const ValueType = @import("../../runtime/value.zig").ValueType;
+const Value = @import("runtime").value.Value;
+const ValueType = @import("runtime").value.ValueType;
 const vm_force = @import("../force.zig");
 
 pub fn builtinTypePredicate(self: anytype, arg: Value, expected: ValueType) !Value {

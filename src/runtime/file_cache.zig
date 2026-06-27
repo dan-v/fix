@@ -15,7 +15,7 @@
 //! single-file-at-a-time pipeline and a fan-out.
 
 const std = @import("std");
-const stable = @import("runtime/stable_segments.zig");
+const stable = @import("stable_segments.zig");
 
 pub const FileCache = struct {
     allocator: std.mem.Allocator,

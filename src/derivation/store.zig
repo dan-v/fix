@@ -2,7 +2,7 @@ const std = @import("std");
 const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
-const stable = @import("../runtime/stable_segments.zig");
+const stable = @import("runtime").stable_segments;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const chunk = @import("../bytecode.zig").chunk;
-const diagnostic = @import("../diagnostic.zig");
+const diagnostic = @import("syntax").diagnostic;
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;

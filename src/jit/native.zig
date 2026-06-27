@@ -23,11 +23,20 @@ const std = @import("std");
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 
-const Value = @import("runtime/value.zig").Value;
-const types = @import("runtime/types.zig");
-const chunk_mod = @import("bytecode/chunk.zig");
+const Value = @import("runtime").value.Value;
+const types = @import("runtime").types;
+const chunk_mod = @import("../bytecode/chunk.zig");
 const Chunk = chunk_mod.Chunk;
-const OpCode = @import("bytecode/opcode.zig").OpCode;
+const OpCode = @import("../bytecode/opcode.zig").OpCode;
+// The interpreter pieces the JIT reads. Hoisted here rather than re-imported
+// inside each compiler function; within this one module the file cycle
+// (vm ↔ jit) is resolved lazily by Zig.
+const VM = @import("../vm.zig").VM;
+const force = @import("../vm/force.zig");
+const closures = @import("../vm/closures.zig");
+const access = @import("../vm/access.zig");
+const run = @import("../vm/run.zig");
+const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 
 /// Compile-time switch. `false` when `-Djit` wasn't passed, or when
 /// the target isn't a JIT-supported platform.
@@ -78,8 +87,6 @@ pub const LambdaCompiledFn = *const fn (vm: *anyopaque, upvalues_ptr: [*]const V
 /// directly.
 pub fn jitForceValue(vm: *anyopaque, value: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const force = @import("vm/force.zig");
-    const VM = @import("vm.zig").VM;
     const v = force.forceValue(@as(*VM, @ptrCast(@alignCast(vm))), value) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
     };
@@ -88,8 +95,6 @@ pub fn jitForceValue(vm: *anyopaque, value: Value) callconv(.c) JitResult {
 
 pub fn jitGetAttr(vm: *anyopaque, attrs_val: Value, name_id: types.InternId) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const access = @import("vm/access.zig");
-    const VM = @import("vm.zig").VM;
     const v = access.getAttrValue(@as(*VM, @ptrCast(@alignCast(vm))), attrs_val, name_id) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
     };
@@ -100,8 +105,6 @@ pub fn jitGetAttr(vm: *anyopaque, attrs_val: Value, name_id: types.InternId) cal
 /// Bytecode shape: `push_builtins; get_attr N; ret; halt`.
 pub fn jitBuiltinAttr(vm: *anyopaque, name_id: types.InternId) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const access = @import("vm/access.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const result = access.getAttrValue(v, v.builtins, name_id) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -113,8 +116,6 @@ pub fn jitBuiltinAttr(vm: *anyopaque, name_id: types.InternId) callconv(.c) JitR
 /// `get_upvalue_attr N M; get_attr P; ret; halt`.
 pub fn jitGetUpvalueAttrAttr(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u32) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const access = @import("vm/access.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const mid = access.getAttrValue(v, attrs_val, name1) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -130,9 +131,6 @@ pub fn jitGetUpvalueAttrAttr(vm: *anyopaque, attrs_val: Value, name1: u32, name2
 /// ret; halt`.
 pub fn jitForceCallConst(vm: *anyopaque, func_unforced: Value, arg: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const force = @import("vm/force.zig");
-    const closures = @import("vm/closures.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const func = force.forceValue(v, func_unforced) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -149,9 +147,6 @@ pub fn jitForceCallConst(vm: *anyopaque, func_unforced: Value, arg: Value) callc
 /// `get_upvalue N; get_upvalue M; call; ret; halt`.
 pub fn jitForceCallUpvalue(vm: *anyopaque, func_unforced: Value, arg: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const force = @import("vm/force.zig");
-    const closures = @import("vm/closures.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const func = force.forceValue(v, func_unforced) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -168,8 +163,6 @@ pub fn jitForceCallUpvalue(vm: *anyopaque, func_unforced: Value, arg: Value) cal
 /// which are pervasive defaulting idioms in Nix.
 pub fn jitForceEqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const force = @import("vm/force.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const forced = force.forceValue(v, val_unforced) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -179,8 +172,6 @@ pub fn jitForceEqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResul
 
 pub fn jitForceNeqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const force = @import("vm/force.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const forced = force.forceValue(v, val_unforced) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -192,8 +183,6 @@ pub fn jitForceNeqNull(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResu
 /// boolean, return its negation. Common as a thunk body for `!x`.
 pub fn jitForceNot(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const run = @import("vm/run.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const b = run.expectBool(v, val_unforced) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -206,8 +195,6 @@ pub fn jitForceNot(vm: *anyopaque, val_unforced: Value) callconv(.c) JitResult {
 /// Examples: `config.foo.bar.baz`, `pkgs.lib.attrsets.zipAttrs`.
 pub fn jitGetUpvalueAttr3(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u32, name3: u32) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const access = @import("vm/access.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const a = access.getAttrValue(v, attrs_val, name1) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -229,8 +216,6 @@ pub fn jitGetUpvalueAttr3(vm: *anyopaque, attrs_val: Value, name1: u32, name2: u
 /// interpreter's frame-based `call` for a value-producing body.
 pub fn jitCallValue(vm: *anyopaque, callee: Value, arg: Value) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
-    const closures = @import("vm/closures.zig");
-    const VM = @import("vm.zig").VM;
     const v: *VM = @ptrCast(@alignCast(vm));
     const result = closures.callValue(v, callee, arg) catch |err| {
         return .{ .value = Value.null_val, .error_code = @intFromError(err) };
@@ -247,8 +232,6 @@ pub fn jitCallValue(vm: *anyopaque, callee: Value, arg: Value) callconv(.c) JitR
 pub fn jitMapAttrsApply(vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_len: usize) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
     _ = upvalues_len;
-    const VM = @import("vm.zig").VM;
-    const closures = @import("vm/closures.zig");
     const v: *VM = @ptrCast(@alignCast(vm));
     const func = upvalues_ptr[0];
     const name = upvalues_ptr[1];
@@ -268,8 +251,6 @@ pub fn jitMapAttrsApply(vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_l
 pub fn jitGenListApply(vm: *anyopaque, upvalues_ptr: [*]const Value, upvalues_len: usize) callconv(.c) JitResult {
     if (!enabled) return .{ .value = Value.null_val, .error_code = 0 };
     _ = upvalues_len;
-    const VM = @import("vm.zig").VM;
-    const closures = @import("vm/closures.zig");
     const v: *VM = @ptrCast(@alignCast(vm));
     const func = upvalues_ptr[0];
     const arg = upvalues_ptr[1];
@@ -293,7 +274,7 @@ pub const CodeBuffer = struct {
     base: [*]u8,
     capacity: usize,
     len: usize,
-    mu: @import("runtime/stable_segments.zig").SpinMutex,
+    mu: SpinMutex,
 
     pub fn init(capacity: usize) !CodeBuffer {
         if (!code_enabled) @compileError("CodeBuffer used in a build without -Djit/-Dtjit");

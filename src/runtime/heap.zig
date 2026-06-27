@@ -23,6 +23,7 @@ const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
+const ErrorInfo = @import("thunk.zig").ErrorInfo;
 
 pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
@@ -232,7 +233,7 @@ pub const ObjectHeap = struct {
     /// rather than walking every object slot. Almost always tiny — a
     /// realistic NixOS toplevel produces ~hundreds of entries against a
     /// heap of millions of objects.
-    errored_infos: std.ArrayListUnmanaged(*@import("thunk.zig").ErrorInfo),
+    errored_infos: std.ArrayListUnmanaged(*ErrorInfo),
     errored_infos_mu: stable.SpinMutex,
     /// Unique-per-init id for cache invalidation. Same trick as the
     /// intern table: thread-local caches outlive an Evaluator, and the
@@ -270,7 +271,7 @@ pub const ObjectHeap = struct {
     /// Record a freshly-allocated `ErrorInfo` so `deinit` can release it
     /// without scanning the object store. Called by `Thunk.errored` via
     /// the heap's tracker — see `vm/force.zig`'s `publishThunkFailure`.
-    pub fn trackErroredInfo(self: *ObjectHeap, info: *@import("thunk.zig").ErrorInfo) !void {
+    pub fn trackErroredInfo(self: *ObjectHeap, info: *ErrorInfo) !void {
         self.errored_infos_mu.lock();
         defer self.errored_infos_mu.unlock();
         try self.errored_infos.append(self.allocator, info);

@@ -1,5 +1,5 @@
-const Value = @import("../../runtime/value.zig").Value;
-const BuiltinId = @import("../../builtins.zig").BuiltinId;
+const Value = @import("runtime").value.Value;
+const BuiltinId = @import("runtime").builtins.BuiltinId;
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_equality = @import("../equality.zig");

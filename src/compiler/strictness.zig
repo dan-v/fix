@@ -37,10 +37,11 @@
 //! `lambda_attrs` bodies — those are separate chunks.
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const types = @import("../runtime/types.zig");
-const intern_mod = @import("../runtime/intern.zig");
+const ast = @import("syntax").ast;
+const types = @import("runtime").types;
+const intern_mod = @import("runtime").intern;
 const chunk_mod = @import("../bytecode/chunk.zig");
+const prof = @import("../probe/prof.zig");
 
 const Node = ast.Node;
 const InternId = types.InternId;
@@ -431,8 +432,8 @@ pub fn bodyMustForceName(
 const Compiler = @import("../compiler.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {
-    const _pt = @import("../prof.zig").start(.strictness);
-    defer @import("../prof.zig").end(.strictness, _pt);
+    const _pt = prof.start(.strictness);
+    defer prof.end(.strictness, _pt);
 
     // The strictness signature is purely an upvalue (capture) mask:
     // `nameSetToMask` only sets bits for names that match a capture slot.

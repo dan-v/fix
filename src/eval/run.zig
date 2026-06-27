@@ -10,9 +10,9 @@
 //! quiesced by then.
 
 const std = @import("std");
-const diagnostic = @import("../diagnostic.zig");
-const trace_mod = @import("trace.zig");
-const stable = @import("../runtime/stable_segments.zig");
+const diagnostic = @import("syntax").diagnostic;
+const trace_mod = @import("../support/trace.zig");
+const stable = @import("runtime").stable_segments;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const Trace = trace_mod.Trace;

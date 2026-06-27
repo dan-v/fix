@@ -19,7 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const worker_id = @import("runtime/worker_id.zig");
+const worker_id = @import("runtime").worker_id;
 
 /// Compile-time switch. False when `-Dprof-main` wasn't passed.
 /// `rdtsc` is x86_64-only, so we additionally gate on arch.

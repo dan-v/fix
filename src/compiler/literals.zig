@@ -1,19 +1,21 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
-const ast = @import("../ast.zig");
+const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
-const builtins = @import("../builtins.zig");
+const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
-const diagnostic = @import("../diagnostic.zig");
-const heap_mod = @import("../runtime/heap.zig");
-const string_syntax = @import("../string_syntax.zig");
-const types = @import("../runtime/types.zig");
-const Value = @import("../runtime/value.zig").Value;
+const diagnostic = @import("syntax").diagnostic;
+const heap_mod = @import("runtime").heap;
+const string_syntax = @import("syntax").string_syntax;
+const types = @import("runtime").types;
+const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
+const int_ops = @import("runtime").int;
+const parser_mod = @import("syntax").parser;
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -39,7 +41,7 @@ pub fn compileInt(self: *Compiler, node: *const Node) !void {
         try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid integer literal");
         return error.InvalidNumber;
     };
-    try self.builder.emitConstant(self.allocator, try @import("../runtime/int.zig").make(self.heap, val));
+    try self.builder.emitConstant(self.allocator, try int_ops.make(self.heap, val));
 }
 
 pub fn compileFloat(self: *Compiler, node: *const Node) !void {
@@ -100,7 +102,7 @@ pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_
     var arena = ast.AstArena.init(self.allocator);
     defer arena.deinit();
 
-    var parser = @import("../parser.zig").Parser.init(self.allocator, &arena, expr_source);
+    var parser = parser_mod.Parser.init(self.allocator, &arena, expr_source);
     defer parser.deinit();
     const expr = parser.parse() catch |err| {
         try diagnostics.absorbParserDiagnostics(self, parser.diagnostics.items, source_offset);

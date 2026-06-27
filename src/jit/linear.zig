@@ -19,10 +19,10 @@
 //! the shared epilogue (restore rsp + callee-saved regs + `ret`).
 
 const std = @import("std");
-const jit = @import("jit.zig");
-const Value = @import("runtime/value.zig").Value;
-const Chunk = @import("bytecode/chunk.zig").Chunk;
-const OpCode = @import("bytecode/opcode.zig").OpCode;
+const jit = @import("native.zig");
+const Value = @import("runtime").value.Value;
+const Chunk = @import("../bytecode/chunk.zig").Chunk;
+const OpCode = @import("../bytecode/opcode.zig").OpCode;
 
 const CodeBuffer = jit.CodeBuffer;
 
