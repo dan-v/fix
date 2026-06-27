@@ -89,17 +89,18 @@ pub const VM = struct {
     registry: *ChunkRegistry,
     /// Lazy per-attr compilation: deferred bodies + their compile cache.
     /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
-    /// (which never create `.deferred` thunks). See `deferred.zig`.
+    /// (which never create `.deferred` thunks). See
+    /// `compiler/deferred_table.zig`.
     deferred_table: ?*DeferredTable = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
-    /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
+    /// recording. Typed `?*anyopaque` (cast in `jit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
     /// are comptime-gated).
     tjit_rec: ?*anyopaque = null,
     /// Anchor upvalues of the currently-executing native trace, so a native
     /// `side_exit` (which only gets the upvalues *pointer* via the ABI, not the
     /// length) can reconstruct the anchor frame. Set/restored around each native
-    /// call in `tjit/exec.zig`; only meaningful mid native-trace.
+    /// call in `jit/exec.zig`; only meaningful mid native-trace.
     native_upvalues: []const Value = &.{},
     /// Global intern table (shared).
     intern: *InternTable,
@@ -119,7 +120,7 @@ pub const VM = struct {
     progress: ?eval_progress.Sink,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
-    /// Optional per-thunk lifecycle event log (see eval/thunk_trace.zig).
+    /// Optional per-thunk lifecycle event log (see `probe/thunk_trace.zig`).
     /// Recording is disabled when null. All workers share a single
     /// trace; writes serialize on its internal mutex. The field is
     /// compiled out entirely unless `-Dthunks-log` is set so the

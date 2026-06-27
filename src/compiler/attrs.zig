@@ -2,32 +2,25 @@ const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
-const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
-const diagnostic = @import("syntax").diagnostic;
 const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const literals = @import("literals.zig");
 const access = @import("access.zig");
-const deferred_mod = @import("deferred_table.zig");
+const deferred_table = @import("deferred_table.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
-const NodeTag = compiler_mod.NodeTag;
-const BinaryOp = compiler_mod.BinaryOp;
 const Capture = compiler_mod.Capture;
 const AttrEntryView = compiler_mod.AttrEntryView;
 const AttrEntryGroup = compiler_mod.AttrEntryGroup;
 const AttrEntryGroups = compiler_mod.AttrEntryGroups;
-const ContainerValueOptions = compiler_mod.ContainerValueOptions;
-const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const ChunkBuilder = chunk.ChunkBuilder;
 const diagnostic_atom = @import("diagnostic_atom.zig");
@@ -46,7 +39,7 @@ pub fn compileAttrSet(self: *Compiler, node: *const Node) !void {
     try compileAttrEntries(self, entries, aset.recursive);
 }
 
-pub fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
+fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
     if (recursive) return compileMixedRecursiveAttrSet(self, entries);
 
     const static_count = staticAttrEntryCount(self, entries);
@@ -78,7 +71,7 @@ pub fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, 
     }
 }
 
-pub fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry) !void {
+fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry) !void {
     const static_count = staticAttrEntryCount(self, entries);
     const static_entries = try self.allocator.alloc(Node.AttrSetEntry, static_count);
     defer self.allocator.free(static_entries);
@@ -115,14 +108,14 @@ pub fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrS
     scope.endScope(self);
 }
 
-pub fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
+fn hasDynamicAttrEntries(self: *const Compiler, entries: []const Node.AttrSetEntry) bool {
     for (entries) |entry| {
         if (isDynamicAttrEntry(self, entry)) return true;
     }
     return false;
 }
 
-pub fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSetEntry) usize {
+fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSetEntry) usize {
     var count: usize = 0;
     for (entries) |entry| {
         if (!isDynamicAttrEntry(self, entry)) count += 1;
@@ -130,11 +123,11 @@ pub fn staticAttrEntryCount(self: *const Compiler, entries: []const Node.AttrSet
     return count;
 }
 
-pub fn isDynamicAttrEntry(self: *const Compiler, entry: Node.AttrSetEntry) bool {
+fn isDynamicAttrEntry(self: *const Compiler, entry: Node.AttrSetEntry) bool {
     return entry.dynamic_name != null or (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0]));
 }
 
-pub fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
+fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
     if (entry.dynamic_name) |name| return self.compileNode(name);
     if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
         return literals.compileStringAtom(self, entry.path[0]);
@@ -142,7 +135,7 @@ pub fn compileDynamicAttrName(self: *Compiler, entry: Node.AttrSetEntry) !void {
     return error.InvalidAttributePath;
 }
 
-pub fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void {
+fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void {
     if (entry.dynamic_name) |_| {
         if (entry.path.len == 0) return thunks.compileThunk(self, entry.expr);
 
@@ -166,7 +159,7 @@ pub fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !
     return error.InvalidAttributePath;
 }
 
-pub fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
+fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
 
@@ -196,7 +189,7 @@ pub fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSe
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
-pub fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
+fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
     if (hasDynamicAttrEntryViews(self, entries)) {
         return compileMixedAttrEntryViews(self, entries, recursive);
     }
@@ -208,7 +201,7 @@ pub fn compileAttrEntries(self: *Compiler, entries: []const AttrEntryView, recur
     }
 }
 
-pub fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, recursive: bool) !void {
+fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, recursive: bool) !void {
     if (recursive) return compileMixedRecursiveAttrEntryViews(self, entries);
 
     const static_count = staticAttrEntryViewCount(self, entries);
@@ -238,7 +231,7 @@ pub fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryVie
     }
 }
 
-pub fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEntryView) !void {
+fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEntryView) !void {
     const static_count = staticAttrEntryViewCount(self, entries);
     const static_entries = try self.allocator.alloc(AttrEntryView, static_count);
     defer self.allocator.free(static_entries);
@@ -272,14 +265,14 @@ pub fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const Att
     scope.endScope(self);
 }
 
-pub fn hasDynamicAttrEntryViews(self: *const Compiler, entries: []const AttrEntryView) bool {
+fn hasDynamicAttrEntryViews(self: *const Compiler, entries: []const AttrEntryView) bool {
     for (entries) |entry| {
         if (isDynamicAttrEntryView(self, entry)) return true;
     }
     return false;
 }
 
-pub fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntryView) usize {
+fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntryView) usize {
     var count: usize = 0;
     for (entries) |entry| {
         if (!isDynamicAttrEntryView(self, entry)) count += 1;
@@ -287,18 +280,18 @@ pub fn staticAttrEntryViewCount(self: *const Compiler, entries: []const AttrEntr
     return count;
 }
 
-pub fn isDynamicAttrEntryView(self: *const Compiler, entry: AttrEntryView) bool {
+fn isDynamicAttrEntryView(self: *const Compiler, entry: AttrEntryView) bool {
     return entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0]);
 }
 
-pub fn compileDynamicAttrViewName(self: *Compiler, entry: AttrEntryView) !void {
+fn compileDynamicAttrViewName(self: *Compiler, entry: AttrEntryView) !void {
     if (entry.path.len > 0 and attrSegmentHasInterpolation(self, entry.path[0])) {
         return literals.compileStringAtom(self, entry.path[0]);
     }
     return error.InvalidAttributePath;
 }
 
-pub fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void {
+fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !void {
     if (entry.path.len == 1) return thunks.compileThunk(self, entry.expr);
 
     const views = [_]AttrEntryView{
@@ -311,7 +304,7 @@ pub fn compileDynamicAttrViewValueThunk(self: *Compiler, entry: AttrEntryView) !
     try compileAttrEntriesThunk(self, &views, false);
 }
 
-// ---- lazy per-attr compilation (see deferred.zig) ----
+// ---- lazy per-attr compilation (see deferred_table.zig) ----
 
 fn rootCompiler(self: *Compiler) *Compiler {
     var c = self;
@@ -352,7 +345,7 @@ fn bodySpanBytes(node: *const Node) usize {
 fn leafDeferrable(leaf: AttrEntryView) bool {
     if (leaf.path.len != 1 or leaf.inherit_outer) return false;
     if (!isDeferrableBody(leaf.expr)) return false;
-    return bodySpanBytes(leaf.expr) >= deferred_mod.MIN_BODY_BYTES;
+    return bodySpanBytes(leaf.expr) >= deferred_table.MIN_BODY_BYTES;
 }
 
 /// Does this set contain at least one deferrable leaf? Used to avoid
@@ -375,7 +368,7 @@ fn containsNameId(items: []const Capture, name_id: InternId) bool {
 /// Whether this plain attrset qualifies for lazy per-attr compilation.
 fn shouldDeferSet(self: *Compiler, group_count: usize) bool {
     if (rootCompiler(self).deferred_table == null) return false;
-    if (group_count < deferred_mod.MIN_ENTRIES) return false;
+    if (group_count < deferred_table.MIN_ENTRIES) return false;
     // File/import compiles only: source + (retained) arena are
     // evaluator-lived; sidesteps top-level-string source ownership.
     if (self.source_path == null) return false;
@@ -404,7 +397,7 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
                 .{ .name = local.name, .name_id = local.name_id, .kind = .upvalue, .index = up }
             else
                 return false; // visible but unresolvable — bail conservatively
-            if (out.items.len >= deferred_mod.MAX_SCOPE) return false;
+            if (out.items.len >= deferred_table.MAX_SCOPE) return false;
             try out.append(self.allocator, cap);
         }
     }
@@ -427,7 +420,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, snapshot: []const Capture) !voi
     root.deferred_count += 1;
 }
 
-pub fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
+fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
     var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
 
@@ -452,7 +445,7 @@ pub fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) 
     try emit.emitBuildAttrs(self, count, positions.items);
 }
 
-pub fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
+fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
     var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
 
@@ -465,7 +458,7 @@ pub fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryVi
     scope.endScope(self);
 }
 
-pub fn compilePlainAttrGroup(
+fn compilePlainAttrGroup(
     self: *Compiler,
     positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
     group: AttrEntryGroup,
@@ -480,10 +473,7 @@ pub fn compilePlainAttrGroup(
     }
 
     if (group.leaf_count > 1 or group.tails.len > 0) {
-        const duplicate = if (leaf.?.expr.tag != .attr_set)
-            group.duplicate_leaf orelse group.first_nested
-        else
-            nonAttrSetDuplicateLeaf(self, group);
+        const duplicate = duplicateExtendedLeaf(group, leaf.?);
         if (duplicate) |entry| {
             try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
             return error.DuplicateAttribute;
@@ -511,14 +501,14 @@ pub fn compilePlainAttrGroup(
     try appendAttrPosition(self, positions, group.first, group.name_id);
 }
 
-pub fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     for (groups) |group| {
         const slot = try scope.declareLocal(self, group.name, group.name_id);
         try emit.emitInitCellSlot(self, slot);
     }
 }
 
-pub fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     for (groups) |group| {
         const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
         const leaf = group.leaf;
@@ -529,10 +519,7 @@ pub fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup
         }
 
         if (group.leaf_count > 1 or group.tails.len > 0) {
-            const duplicate = if (leaf.?.expr.tag != .attr_set)
-                group.duplicate_leaf orelse group.first_nested
-            else
-                nonAttrSetDuplicateLeaf(self, group);
+            const duplicate = duplicateExtendedLeaf(group, leaf.?);
             if (duplicate) |entry| {
                 try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
                 return error.DuplicateAttribute;
@@ -550,7 +537,7 @@ pub fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup
     }
 }
 
-pub fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
@@ -597,8 +584,12 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
     try compileNodeAttrEntriesThunk(self, merged, first_attr_set.recursive);
 }
 
-pub fn nonAttrSetDuplicateLeaf(self: *Compiler, group: AttrEntryGroup) ?AttrEntryView {
-    _ = self;
+fn duplicateExtendedLeaf(group: AttrEntryGroup, leaf: AttrEntryView) ?AttrEntryView {
+    if (leaf.expr.tag != .attr_set) return group.duplicate_leaf orelse group.first_nested;
+    return nonAttrSetDuplicateLeaf(group);
+}
+
+fn nonAttrSetDuplicateLeaf(group: AttrEntryGroup) ?AttrEntryView {
     if (group.leaves.len <= 1) return null;
     for (group.leaves[1..]) |leaf| {
         if (leaf.expr.tag != .attr_set) return leaf;
@@ -636,7 +627,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
-pub fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {
+fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]AttrEntryView {
     const views = try self.allocator.alloc(AttrEntryView, entries.len);
     for (entries, views) |entry, *view| {
         std.debug.assert(entry.dynamic_name == null);
@@ -645,7 +636,7 @@ pub fn attrEntryViews(self: *Compiler, entries: []const Node.AttrSetEntry) ![]At
     return views;
 }
 
-pub fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGroups {
+fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGroups {
     var group_index: std.AutoHashMapUnmanaged(InternId, usize) = .empty;
     defer group_index.deinit(self.allocator);
 

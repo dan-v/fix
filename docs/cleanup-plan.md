@@ -29,10 +29,10 @@ blob). Instead:
 | module | kind | contents |
 |---|---|---|
 | `syntax` | build module (leaf) | token, scanner, string_syntax, diagnostic, ast, parser/ |
-| `runtime` | build module (leaf) | value, types, heap, thunk, intern, numeric, int, hash, version, nar, regex, toml, paths, worker_id, stable_segments, file_cache, fetch_cache, builtins, struct_census, prof, prof_path, timeline |
+| `runtime` | build module (leaf) | value, types, heap, thunk, intern, numeric, int, hash, version, nar, regex, toml, paths, worker_id, stable_segments, file_cache, fetch_cache, builtins, struct_census |
 | `derivation` | build module | drv, aterm, store, paths, sort, types, value, debug_record, source_path |
 | `parallel` | build module | scheduler, fiber |
-| `core` | one module, facades inside | bytecode/, compiler/(+deferred_table), jit/(jit, jit_linear, tjit/, hot), vm/(+force, closures), worker, trace(EvalTrace), progress, thunk_trace, ngram_probe, trace_probe |
+| `core` | one module, facades inside | bytecode/, compiler/(+deferred_table), jit/, vm/(+force, closures), eval/worker, support/trace, eval/progress, probe/ |
 | `evaluate` | one module | evaluator (was eval.zig), imports, search_path, print, run |
 | `cli` | exe-side | args, run, render, repl, style, stats, subcommands, derivation_debug |
 | `main` | exe root | composition only |
@@ -107,14 +107,14 @@ Reclassifications realized as folder moves in P2: `builtins.zig`→runtime,
 - [x] **P2d — `derivation` build module** (commit 28b32bb): renderer debug.zig → cli.
 - [x] **P4 — slim main.zig** (commit faf6291): 824 → 151 lines, composition only.
       Extracted cli/{args,stats,render,run,trace_setup} + repl driver into cli/repl.
-- [x] **P5 — kill inline @imports** (commits 3c0cdf1, 929ee68): production code now
-      has ZERO @import in function bodies / struct-field types. Confirmed the
-      vm↔jit and intra-compiler file cycles resolve lazily within a module.
+- [x] **P5 — kill inline @imports** (commits 3c0cdf1, 929ee68): production code
+      no longer relies on broad in-body imports in ordinary paths. A few
+      same-module cycle breakers remain local and explicit.
 - [x] **P2g — import lint** (commit): tools/lint_imports.zig + `zig build lint`,
       depended on by `test`. Catches relative imports into a clean-cut module.
       Negative-tested. The facade convention is now self-enforcing.
-- [x] **P2e — JIT + instrumentation consolidation** (commits): jit.zig +
-      jit_linear.zig + tjit/ → `src/jit/`; prof + prof_path + timeline +
+- [x] **P2e — JIT + instrumentation consolidation** (commits): legacy JIT
+      files → `src/jit/`; prof + prof_path + timeline +
       ngram_probe + trace_probe + thunk_trace → `src/probe/`. All cross-refs
       recomputed by resolving against old layout. Default/-Djit/-Dtjit/all-probe
       builds green. Surfaced + fixed two pre-existing `-Dthunks-log` rot bugs
@@ -126,16 +126,9 @@ Reclassifications realized as folder moves in P2: `builtins.zig`→runtime,
 - [ ] **P6 — split overgrown files** (optional): compile-time files (ops.zig
       1208, attrs.zig 829) are safe-ish; heap.zig/thunk.zig/vm/run.zig are hot —
       leave the dispatch loop alone. Judgment-heavy, marginal structural gain.
-- [ ] **P4 — slim main.zig**: extract `cli/args`, `cli/run`, `cli/render`,
-      `cli/stats`; each subsystem exposes its own `reportStats(writer)`.
-- [ ] **P5 — kill inline `@import`**: hoist the 96 in-body imports to top-of-file
-      (or module facade) decls.
-- [ ] **P6 — split overgrown files** that do several things (NOT the hot dispatch
-      loop): focused single-purpose files, small functions.
 
 ## Invariants
 
 - `zig build` and `zig build test` green after every phase.
 - `.drv` output byte-identical (this is a perf-tuned evaluator; reorg must be
   behavior-preserving). Spot-check with `test/nixos_toplevel.nix`.
-</content>

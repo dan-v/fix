@@ -77,7 +77,7 @@ shared mutable state*:
     ▼
  OPTIMIZER ── guard CSE · force CSE · allocation sinking · const-fold · DCE
     ▼
- BACKEND (extends jit_linear x86-64 emitter) ── linear-scan regalloc ──► native
+ BACKEND (extends src/jit/linear.zig emitter) ── linear-scan regalloc ──► native
     │  install: chunk.tjit_code = fn; interpreter dispatches it next entry
     ▼
  EXECUTE ── guards pass → straight-line native; guard fails → SIDE-EXIT
@@ -124,7 +124,7 @@ on-exit** (the standard "sink, but rebuild if you deopt" trick).
 
 ## Build-out order
 
-1. **Foundation**: `-Dtjit` flag; `src/tjit/ir.zig` (IR + snapshot types);
+1. **Foundation**: `-Dtjit` flag; `src/jit/ir.zig` (IR + snapshot types);
    per-chunk hot counters + anchor detection; `tjit_code` field + dispatch
    hook (mirrors `jit_code` at `force.zig:355`, but always-compiled when tjit
    is on). Recorder records → prints IR (no codegen yet); validate trace shapes

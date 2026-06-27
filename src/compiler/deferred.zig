@@ -1,5 +1,5 @@
 //! Force-time compilation of a deferred attrset value body (lazy
-//! per-attr compilation). See `deferred.zig` for the table and the
+//! per-attr compilation). See `deferred_table.zig` for the table and the
 //! overall design.
 //!
 //! The body was NOT compiled when its attrset was built; instead the

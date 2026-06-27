@@ -298,7 +298,8 @@ pub const OpCode = enum(u8) {
     lookup_with_long,
     /// Lazy per-attr compilation: create a `.deferred` thunk for an
     /// attrset value body whose bytecode has NOT been compiled. The body
-    /// is compiled on first force (see `deferred.zig`, `compiler/deferred.zig`).
+    /// is compiled on first force (see `compiler/deferred_table.zig` and
+    /// `compiler/deferred.zig`).
     /// Operand: 4-byte deferred-table id, 2-byte env count, then `env`
     /// capture descriptors (kind:1, index:2) — same format as thunk_captures.
     defer_attr_value,

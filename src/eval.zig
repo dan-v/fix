@@ -91,7 +91,7 @@ pub const Evaluator = struct {
     run: Run,
     vm_opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
     /// Lazy per-attr compilation: deferred attrset value bodies, compiled
-    /// on first force. See `deferred.zig`.
+    /// on first force. See `compiler/deferred_table.zig`.
     deferred_table: deferred_mod.Table,
     /// AST arenas kept alive because a deferred body retains nodes into
     /// them (force-time compile re-walks the node). Files that defer
@@ -270,7 +270,6 @@ pub const Evaluator = struct {
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
         try self.search_paths.set(self.allocator, nix_path, self, resolveHostPath);
     }
-
 
     pub fn readSourceFile(self: *Evaluator, path: []const u8) ![]const u8 {
         const resolved = try self.resolveHostPath(path);

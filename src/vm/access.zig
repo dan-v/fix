@@ -7,6 +7,7 @@ const bytecode_mod = @import("../bytecode.zig");
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");
+const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
 const prof = @import("../probe/prof.zig");
@@ -227,7 +228,6 @@ pub fn validateAttrs(self: *VM, attrs_val: Value, allow_extra: bool, encoded_nam
 }
 
 pub fn lookupWith(self: *VM, name_id: InternId, scope_count: u8) !void {
-    const stack = @import("stack.zig");
     const start = self.sp - scope_count;
     const scopes = self.stack[start..self.sp];
 

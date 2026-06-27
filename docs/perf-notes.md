@@ -273,7 +273,7 @@ different evaluation model, not VM micro-architecture.
 ## Method-JIT (per-body) is measured-dead — the cost is in the call graph
 
 Built the ambitious version the prof-main profile pointed at: a real
-**linear whole-body JIT compiler** (`jit_linear.zig`, committed 09ebe5f) —
+**linear whole-body JIT compiler** (`src/jit/linear.zig`, committed 09ebe5f) —
 a stack machine that emits native code for an arbitrary straight-line chunk
 body op-by-op (operand stack in native-stack memory, no VM-layout coupling;
 `rbx`=vm/`r14`=upvalues/`r15`=arg; complex ops tail into the existing C-ABI

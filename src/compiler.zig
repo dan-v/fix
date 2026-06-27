@@ -15,16 +15,12 @@ pub const scope = @import("compiler/scope.zig");
 pub const thunks = @import("compiler/thunks.zig");
 pub const diagnostics = @import("compiler/diagnostics.zig");
 pub const strictness = @import("compiler/strictness.zig");
-const operand = @import("compiler/operand.zig");
 const compiler_types = @import("compiler/types.zig");
-const captureCount = operand.captureCount;
-const u16Count = operand.u16Count;
 const ast = @import("syntax").ast;
 pub const Node = ast.Node;
 pub const NodeTag = ast.NodeTag;
 pub const BinaryOp = ast.BinaryOp;
 const bytecode = @import("bytecode.zig");
-const OpCode = bytecode.OpCode;
 const chunk = bytecode.chunk;
 const ChunkBuilder = chunk.ChunkBuilder;
 const ChunkRegistry = chunk.ChunkRegistry;
@@ -81,7 +77,7 @@ pub const Compiler = struct {
     /// Deferred-attr table to register bodies into, set on the ROOT
     /// compiler by `parseAndCompile`. Null disables deferral (e.g. the
     /// synthetic parent used by force-time deferred compilation, so
-    /// nested attrsets there compile eagerly). See `deferred.zig`.
+    /// nested attrsets there compile eagerly). See `deferred_table.zig`.
     deferred_table: ?*DeferredTable = null,
     /// A pre-built line index to use instead of building one over
     /// `source`. Set on the synthetic root of a force-time deferred

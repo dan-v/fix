@@ -1,15 +1,7 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
-const bytecode = @import("../bytecode.zig");
-const builtins = @import("runtime").builtins;
-const chunk = bytecode.chunk;
-const diagnostic = @import("syntax").diagnostic;
-const heap_mod = @import("runtime").heap;
-const string_syntax = @import("syntax").string_syntax;
 const types = @import("runtime").types;
-const Value = @import("runtime").value.Value;
-const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
@@ -20,14 +12,8 @@ const ops = @import("ops.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
-const NodeTag = compiler_mod.NodeTag;
-const BinaryOp = compiler_mod.BinaryOp;
-const Capture = compiler_mod.Capture;
 const AttrEntryView = compiler_mod.AttrEntryView;
-const AttrEntryGroup = compiler_mod.AttrEntryGroup;
-const AttrEntryGroups = compiler_mod.AttrEntryGroups;
 const ContainerValueOptions = compiler_mod.ContainerValueOptions;
-const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const diagnostic_atom = @import("diagnostic_atom.zig");
 const diagnosticAtom = diagnostic_atom.diagnosticAtom;
@@ -102,7 +88,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
     try emit.writeStaticAttrPathOperand(self, apath.segments, attrPathDiagnosticAtom(apath), wide);
 }
 
-pub fn attrPathHasInterpolation(self: *Compiler, path: Node.AttrPath) bool {
+fn attrPathHasInterpolation(self: *Compiler, path: Node.AttrPath) bool {
     for (path.segments) |seg| {
         if (attrs.attrSegmentHasInterpolation(self, seg)) return true;
     }
@@ -160,7 +146,7 @@ pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
     try emit.writeHasAttrMixedOperand(self, has_attr.segments, dynamic_count, hasAttrMixedDiagnosticAtom(has_attr));
 }
 
-pub fn hasAttrSegmentsHaveInterpolation(self: *Compiler, segments: []const Node.Atom) bool {
+fn hasAttrSegmentsHaveInterpolation(self: *Compiler, segments: []const Node.Atom) bool {
     for (segments) |segment| {
         if (attrs.attrSegmentHasInterpolation(self, segment)) return true;
     }
@@ -257,7 +243,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
     return true;
 }
 
-pub fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
+fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     const name_id = try self.intern.intern(span);
     if (scope.resolveLocalId(self, name_id)) |slot| {
@@ -271,13 +257,13 @@ pub fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
     return false;
 }
 
-pub fn stringHasInterpolation(self: *Compiler, node: *const Node) bool {
+fn stringHasInterpolation(self: *Compiler, node: *const Node) bool {
     const atom = node.data.atom;
     const span = self.source[atom.offset .. atom.offset + atom.len];
     return std.mem.indexOf(u8, span, "${") != null;
 }
 
-pub fn pathHasInterpolation(self: *Compiler, node: *const Node) bool {
+fn pathHasInterpolation(self: *Compiler, node: *const Node) bool {
     const atom = node.data.atom;
     const span = self.source[atom.offset .. atom.offset + atom.len];
     return std.mem.indexOf(u8, span, "${") != null;

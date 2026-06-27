@@ -2,11 +2,8 @@ const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
-const builtins = @import("runtime").builtins;
 const chunk = bytecode.chunk;
-const diagnostic = @import("syntax").diagnostic;
 const heap_mod = @import("runtime").heap;
-const string_syntax = @import("syntax").string_syntax;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const OpCode = bytecode.OpCode;
@@ -22,14 +19,8 @@ const strictness = @import("strictness.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
-const NodeTag = compiler_mod.NodeTag;
 const BinaryOp = compiler_mod.BinaryOp;
-const Capture = compiler_mod.Capture;
 const AttrEntryView = compiler_mod.AttrEntryView;
-const AttrEntryGroup = compiler_mod.AttrEntryGroup;
-const AttrEntryGroups = compiler_mod.AttrEntryGroups;
-const ContainerValueOptions = compiler_mod.ContainerValueOptions;
-const WithScope = compiler_mod.WithScope;
 const InternId = types.InternId;
 const ChunkBuilder = chunk.ChunkBuilder;
 const diagnostic_atom = @import("diagnostic_atom.zig");
@@ -227,13 +218,19 @@ fn foldCompare(a: Value, b: Value, op: CmpOp) ?Value {
             const af: f64 = if (a_kind == .float) a.asFloat() else @floatFromInt(a.asInt());
             const bf: f64 = if (b_kind == .float) b.asFloat() else @floatFromInt(b.asInt());
             return Value.boolVal(switch (op) {
-                .lt => af < bf, .lte => af <= bf, .gt => af > bf, .gte => af >= bf,
+                .lt => af < bf,
+                .lte => af <= bf,
+                .gt => af > bf,
+                .gte => af >= bf,
             });
         }
         const ai = a.asInt();
         const bi = b.asInt();
         return Value.boolVal(switch (op) {
-            .lt => ai < bi, .lte => ai <= bi, .gt => ai > bi, .gte => ai >= bi,
+            .lt => ai < bi,
+            .lte => ai <= bi,
+            .gt => ai > bi,
+            .gte => ai >= bi,
         });
     }
     return null;
@@ -278,7 +275,7 @@ fn toFloat(self: *Compiler, v: Value) ?f64 {
     };
 }
 
-pub fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void {
+fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const end_jump = self.builder.code.items.len;
@@ -289,7 +286,7 @@ pub fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void 
     emit.patchJump(self, end_jump, self.builder.code.items.len);
 }
 
-pub fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
+fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
@@ -305,7 +302,7 @@ pub fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
     emit.patchJump(self, end_jump, self.builder.code.items.len);
 }
 
-pub fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
+fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
@@ -357,7 +354,7 @@ pub fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
     }
 }
 
-pub fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
+fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
     switch (node.tag) {
         .apply => try compileApplyWithOp(self, node, .tail_call),
         .if_else => try control.compileIfElseTail(self, node),
@@ -381,7 +378,7 @@ fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
     try thunks.compileThunk(self, arg);
 }
 
-pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
+fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
     // Flatten the application spine `f a1 a2 ... aK` and, for K >= 2, emit
     // one `call_n K` instead of K nested `call`s. When the callee is an
     // uncurried (merged) closure of arity K this runs the body in a single
@@ -439,10 +436,10 @@ pub fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void 
 /// does — resolved at the call site. `null` when the body is not this
 /// exact shape.
 fn forwardingUpvalue(self: *Compiler, child: *Compiler, body: *const Node, param_name: []const u8) ?u16 {
-    const b = @import("syntax").ast.unwrapParens(body);
+    const b = unwrapParens(body);
     if (b.tag != .apply) return null;
-    const func = @import("syntax").ast.unwrapParens(b.data.apply.func);
-    const arg = @import("syntax").ast.unwrapParens(b.data.apply.arg);
+    const func = unwrapParens(b.data.apply.func);
+    const arg = unwrapParens(b.data.apply.arg);
     if (func.tag != .identifier or arg.tag != .identifier) return null;
     const arg_name = self.source[arg.data.atom.offset .. arg.data.atom.offset + arg.data.atom.len];
     if (!std.mem.eql(u8, arg_name, param_name)) return null;
@@ -696,7 +693,7 @@ fn attrParamsNeedCells(self: *Compiler, params: []const Node.LambdaAttrParam) bo
     return false;
 }
 
-pub fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
+fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
 
@@ -736,11 +733,11 @@ pub fn compileLetIn(self: *Compiler, node: *const Node) !void {
     try compileLetInBody(self, node, false);
 }
 
-pub fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!void {
+fn compileLetInWithTailBody(self: *Compiler, node: *const Node) anyerror!void {
     try compileLetInBody(self, node, true);
 }
 
-pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
+fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerror!void {
     const let_in = node.data.let_in;
 
     scope.beginScope(self);
@@ -800,10 +797,20 @@ pub fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) any
     const must_force_flags = try self.allocator.alloc(bool, let_in.bindings.len);
     defer self.allocator.free(must_force_flags);
     try strictness.analyzeLetEagerness(
-        self.allocator, self.intern, self.source, let_in.body, binding_name_ids, eager_flags,
+        self.allocator,
+        self.intern,
+        self.source,
+        let_in.body,
+        binding_name_ids,
+        eager_flags,
     );
     try strictness.analyzeLetMustForce(
-        self.allocator, self.intern, self.source, let_in.body, binding_name_ids, must_force_flags,
+        self.allocator,
+        self.intern,
+        self.source,
+        let_in.body,
+        binding_name_ids,
+        must_force_flags,
     );
 
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
@@ -1091,7 +1098,7 @@ fn singleLeafBinding(self: *Compiler, bindings: []const Node.Binding, root: Node
     return found;
 }
 
-pub fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool) !void {
+fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: Node.Atom, slot: u16, eager: bool) !void {
     var leaf: ?Node.Binding = null;
     var tail_count: usize = 0;
 
@@ -1201,7 +1208,7 @@ fn rhsHasForwardRef(
     return false;
 }
 
-pub fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
+fn bindingRootSeen(self: *const Compiler, bindings: []const Node.Binding, root: Node.Atom) bool {
     for (bindings) |binding| {
         if (binding.path.len > 0 and attrs.attrSegmentsEqual(self, binding.path[0], root)) return true;
     }
