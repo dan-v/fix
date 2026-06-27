@@ -110,12 +110,22 @@ Reclassifications realized as folder moves in P2: `builtins.zig`→runtime,
 - [x] **P5 — kill inline @imports** (commits 3c0cdf1, 929ee68): production code now
       has ZERO @import in function bodies / struct-field types. Confirmed the
       vm↔jit and intra-compiler file cycles resolve lazily within a module.
-- [ ] **P2e — `core` reorg** (single module, facades inside): group bytecode/ compiler/
-      jit/ vm/ worker + exec-instrumentation under a coherent tree with facades.
-      (Lower priority — one-module-internal organization; folders already exist.)
-- [ ] **P2f — `evaluate`**: evaluator + imports + search_path + print.
-- [ ] **P2g — lint**: test that fails if a file imports another subsystem's non-facade.
-- [ ] **P6 — split overgrown files** (NOT the hot vm/run.zig dispatch loop).
+- [x] **P2g — import lint** (commit): tools/lint_imports.zig + `zig build lint`,
+      depended on by `test`. Catches relative imports into a clean-cut module.
+      Negative-tested. The facade convention is now self-enforcing.
+- [x] **P2e — JIT + instrumentation consolidation** (commits): jit.zig +
+      jit_linear.zig + tjit/ → `src/jit/`; prof + prof_path + timeline +
+      ngram_probe + trace_probe + thunk_trace → `src/probe/`. All cross-refs
+      recomputed by resolving against old layout. Default/-Djit/-Dtjit/all-probe
+      builds green. Surfaced + fixed two pre-existing `-Dthunks-log` rot bugs
+      (partial_app switch case; `*const`→`*ObjectHeap` after layered-merge made
+      getAttrs non-const).
+- [ ] **P2f — `evaluate` module** (optional, delicate): would give a 5th enforced
+      boundary, but needs `worker` (SCC-coupled with vm/force) and `progress`
+      relocated out of eval/ into the engine first. Higher risk, marginal gain.
+- [ ] **P6 — split overgrown files** (optional): compile-time files (ops.zig
+      1208, attrs.zig 829) are safe-ish; heap.zig/thunk.zig/vm/run.zig are hot —
+      leave the dispatch loop alone. Judgment-heavy, marginal structural gain.
 - [ ] **P4 — slim main.zig**: extract `cli/args`, `cli/run`, `cli/render`,
       `cli/stats`; each subsystem exposes its own `reportStats(writer)`.
 - [ ] **P5 — kill inline `@import`**: hoist the 96 in-body imports to top-of-file
