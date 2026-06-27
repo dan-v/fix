@@ -444,6 +444,9 @@ pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
     const apply_chunk_id = self.registry.well_known.genlist_apply;
     const speculatable = isSpeculatableUserFunc(self, func);
     for (out, 0..) |*value, i| {
+        // Abandon a speculative genList of a never-demanded result rather
+        // than allocate the whole list (see force.specBailRequested).
+        if (i & 8191 == 0 and vm_force.specBailRequested(self)) return error.SpeculativeBail;
         const tid = try self.heap.addBytecodeThunk(apply_chunk_id, &.{ func, Value.int(@intCast(i)) });
         if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
         value.* = Value.thunk(tid);

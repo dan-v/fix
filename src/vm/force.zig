@@ -250,6 +250,16 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
     return forceThunkImpl(self, thunk_val, true);
 }
 
+/// True when an in-flight speculative computation should abandon itself:
+/// we're on the speculative path and the demanded result is already in
+/// hand. Builtins with large internal loops (genList/map/...) poll this
+/// periodically and `return error.SpeculativeBail` so a single huge,
+/// never-demanded body can't run an allocation loop to completion. Off the
+/// demand path entirely (the `in_speculation` check short-circuits).
+pub inline fn specBailRequested(self: *const VM) bool {
+    return self.in_speculation and self.scheduler.backgroundSuppressed();
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     const t = prof.start(.force_thunk_slow);
     defer prof.end(.force_thunk_slow, t);
