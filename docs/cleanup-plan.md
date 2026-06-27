@@ -99,10 +99,16 @@ Reclassifications realized as folder moves in P2: `builtins.zig`→runtime,
       moved the 4 misfiled files. Static analysis confirms the 9-module
       assignment is a clean DAG. No `BuiltinId` extraction needed (builtins is a
       runtime file; its apparent cycles were intra-runtime).
-- [ ] **P2 — folder hierarchy**: move remaining files into `support/ frontend/
-      runtime/ derivation/ concurrency/ core/ eval/ cli/`. Fix relative imports.
-- [ ] **P3 — named modules**: register the 9 modules in `build.zig`, rewrite
-      cross-module `@import` to `@import("<module>")`. Compiler enforces the DAG.
+- [x] **P2a — `syntax` build module** (commit 36c8883): token/scanner/string_syntax/
+      diagnostic/ast/parser → src/syntax/ + facade; ~44 sites → `@import("syntax")`.
+- [x] **P2b — `runtime` build module** (commit d93e22b): + builtins/file_cache/
+      fetch_cache moved in; ~250 sites → `@import("runtime")`. Shared build_options module.
+- [x] **P2c — `parallel` build module** (commit de530b9): scheduler/fiber + swap asm.
+- [x] **P2d — `derivation` build module** (commit 28b32bb): renderer debug.zig → cli.
+- [ ] **P2e — `core` reorg** (single module, facades inside): group bytecode/ compiler/
+      jit/ vm/ worker + exec-instrumentation under a coherent tree with facades.
+- [ ] **P2f — `evaluate`**: evaluator + imports + search_path + print.
+- [ ] **P2g — lint**: test that fails if a file imports another subsystem's non-facade.
 - [ ] **P4 — slim main.zig**: extract `cli/args`, `cli/run`, `cli/render`,
       `cli/stats`; each subsystem exposes its own `reportStats(writer)`.
 - [ ] **P5 — kill inline `@import`**: hoist the 96 in-body imports to top-of-file
