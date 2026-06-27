@@ -306,7 +306,10 @@ pub const Worker = struct {
             if (try self.drainStep()) continue;
             self.parkAndAccount();
         }
-        self.scheduler.setSuppressBackground(false);
+        // Leave `suppress_background` as-is on exit: the next top-level
+        // entry resets it to false, but until then (and through shutdown)
+        // it keeps in-flight speculation from outliving the demanded
+        // result. (Don't clear it here, or a helper mid-force never bails.)
         // runTopLevel may exit without ever parking (helpers handle
         // background work; this thread spins through ready fibers and
         // returns). Flush so its timing is visible to schedulerStats()

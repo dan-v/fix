@@ -271,6 +271,18 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
+                // Bail out of in-flight speculation once the demanded
+                // result is ready: rather than run a (possibly large,
+                // never-needed) body to completion, abandon it at this safe
+                // checkpoint and reset the thunk so a later real demand
+                // recomputes it. Bounds the cost of a single wrong
+                // speculative guess (see docs/parallel-redesign-plan.md).
+                // Speculative path only — demand never bails — and the
+                // atomic load is off the resolved fast path.
+                if (self.in_speculation and self.scheduler.backgroundSuppressed()) {
+                    publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
+                    return error.SpeculativeBail;
+                }
                 // Thunk-result memo: reuse a previous identical pure
                 // computation on this worker, skipping re-running the body.
                 const memo_key: ?MemoKey = switch (thunk.targetKind()) {
@@ -618,6 +630,12 @@ fn isTransientThunkError(err: anyerror) bool {
     return switch (err) {
         error.OutOfMemory,
         error.StackOverflow,
+        // A speculative force that bailed because the demanded result is
+        // already in hand. Transient: reset to `.unresolved` so a later
+        // real demand recomputes the body cleanly. Only ever raised on the
+        // speculative path (gated by `in_speculation`), which `slotEntry`
+        // swallows, so it never reaches a real caller.
+        error.SpeculativeBail,
         => true,
         else => false,
     };

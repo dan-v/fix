@@ -184,6 +184,43 @@ chain feeding a demanded value lifts to demand priority automatically.
   fraction of demanded thunks that were mid-speculation, contagion depth.
   Validates the mechanism and guards byte-identity.
 
+## 7. Progress log
+
+**2026-06-27 — I1 landed + pathology bounded.**
+
+- **I1 spec-census** (commits 5091fe7, f0e8afd): teardown census splits resolved
+  thunks by `Future.demanded`, reports total created. Result OVERTURNS the
+  misprediction premise: undemanded (forced-but-never-needed) is **0.2%** —
+  speculation's guesses are ~perfect on nixos_toplevel. The cost is **churn +
+  cross-worker duplication**: spec inflates thunk creation +38% (7.86M→10.84M)
+  and resolves +1.16M *demanded* duplicates (thread-local memo doesn't cross
+  workers; its own comment: 10.8% of bytecode forces are duplicates). So P3
+  (fair/preemptible spec) is NOT a benchmark lever — there's no wrong-path work
+  to throttle here.
+
+- **BUT the misprediction case must not be a self-inflicted pathology for some
+  FUTURE workload** (user steer). Demonstrated it (test/spec_pathology.nix): a
+  lazy list of 256 substantial-but-never-demanded bodies made w=32 **4× slower
+  than serial w=1** — speculation gates only on static body SIZE
+  (`body_is_substantial` ≥ 256 bytecode bytes), never runtime cost or
+  demand-likelihood, and the drain loop pulled the whole dead backlog before
+  shutdown.
+
+- **Fix landed** (commit e0a0528): `Scheduler.suppress_background`, set once a
+  top-level result is ready, stops workers STARTING new spec/fan-out tasks while
+  the drain loop finishes already-suspended fibers. Safe (a suspended fiber only
+  waits on an already-claimed thunk, never a queued task — no teardown-race
+  surgery). Pathology 0.160→0.091s (4×→1.4×); nixos_toplevel neutral +
+  byte-identical.
+
+- **Residual / next robustness step:** the ~1.4× tail is the spec elements
+  already in-flight when the result completed — they must drain (correctness).
+  Eliminating them needs either (a) safely retiring suspended speculative fibers
+  at teardown (the fiber-lifecycle-race minefield — see worker.zig:282-285), or
+  (b) fuel-bounding a speculative force so a single dead body can't run long.
+  (b) is the lower-risk path and is the real "clean up speculation" follow-up.
+  Also possible: gate speculation on a runtime-cost signal, not just body size.
+
 ## 6. Honest success criteria
 
 This redesign's win is **robustness + freed CPU + non-overfit + bounded demand

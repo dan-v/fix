@@ -553,6 +553,11 @@ pub const Scheduler = struct {
     /// Signal helpers to exit and wait for them. Idempotent.
     pub fn shutdown(self: *Scheduler) void {
         if (!self.started.swap(false, .acq_rel)) return;
+        // Tell any in-flight speculative force to bail at its next
+        // checkpoint instead of running a possibly-huge body to completion
+        // — otherwise shutdown blocks on a helper finishing dead work the
+        // result never needed (see force.zig SpeculativeBail).
+        self.setSuppressBackground(true);
         self.shutdown_flag.store(true, .release);
         var i: u8 = 1;
         while (i < self.worker_count) : (i += 1) self.wakeWorker(i);
