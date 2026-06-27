@@ -214,6 +214,14 @@ const TaskQueue = struct {
     }
 };
 
+// Demand-driven fanout arrives in bursts: when the urgent queue rejects,
+// the caller falls back to serially forcing the rest of the list/attrset.
+// Keep enough room that a NixOS toplevel fanout wave does not collapse
+// back onto the critical path at 32 workers.
+const urgent_queue_capacity: u32 = 4096;
+const spec_queue_capacity: u32 = 4096;
+const spec_backlog_per_helper: u32 = 128;
+
 pub const Scheduler = struct {
     /// Cumulative scheduler activity counters. Read via `stats()`.
     /// All values are advisory — monotonic loads are fine.
@@ -324,7 +332,7 @@ pub const Scheduler = struct {
         var urgent_init: usize = 0;
         errdefer for (urgent_queues[0..urgent_init]) |*q| q.deinit(allocator);
         for (urgent_queues) |*q| {
-            q.* = try TaskQueue.init(allocator, 1024);
+            q.* = try TaskQueue.init(allocator, urgent_queue_capacity);
             urgent_init += 1;
         }
 
@@ -333,7 +341,7 @@ pub const Scheduler = struct {
         var spec_init: usize = 0;
         errdefer for (spec_queues[0..spec_init]) |*q| q.deinit(allocator);
         for (spec_queues) |*q| {
-            q.* = try TaskQueue.init(allocator, 1024);
+            q.* = try TaskQueue.init(allocator, spec_queue_capacity);
             spec_init += 1;
         }
 
@@ -536,7 +544,7 @@ pub const Scheduler = struct {
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;
-        const cap: u32 = @as(u32, self.worker_count - 1) * 64;
+        const cap: u32 = @as(u32, self.worker_count - 1) * spec_backlog_per_helper;
         if (self.pending_tasks.load(.monotonic) >= cap) {
             _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
             return false;
@@ -732,10 +740,10 @@ test "submitUrgent bypasses the speculation backlog cap" {
     defer sched.deinit();
     try std.testing.expectEqual(@as(u8, 2), sched.worker_count);
 
-    // The speculation cap is (worker_count - 1) * 64 = 64. Fill it up
-    // via `submit` and confirm the next `submit` is rejected.
+    // Fill the speculation cap via `submit` and confirm the next
+    // speculative task is rejected.
     var i: types.ObjectId = 0;
-    while (i < 64) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
+    while (i < spec_backlog_per_helper) : (i += 1) try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
     try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }, 0));
 
     // `submitUrgent` should still go through — it lives on a separate
