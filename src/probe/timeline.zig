@@ -20,7 +20,7 @@
 //!   * a *park* — the worker is blocked, no fiber running;
 //!   * *parse* / *compile* — synchronous (no thunk force → no yield),
 //!     so they nest cleanly inside the quantum that ran the import.
-//! Anything that *does* span a yield (render, the eval of an import) is
+//! Anything that *does* span a yield (render, import evaluation) is
 //! recorded as an instantaneous marker instead of a span.
 //!
 //! A per-worker stack pairs begin/end and computes each span's duration;

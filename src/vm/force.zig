@@ -484,9 +484,12 @@ fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
         // resolution.
         .mapValue, .mapAttrValue, .zipAttrsValue => bc.args.len > 0 and
             isSpeculatableMapFunc(self, bc.args[0]),
-        // Derivation lazy attrs resolve drv/outPath via hashing —
-        // never trivial.
-        .derivationLazyAttr => true,
+        // A single lazy derivation attr is not trivial, but forcing it can
+        // recursively evaluate arbitrary package inputs. Keep these
+        // demand-driven so speculation does not wander into unobserved
+        // package graphs (for example pandoc -> luaPackages on the NixOS
+        // toplevel).
+        .derivationLazyAttr => false,
         else => false,
     };
 }

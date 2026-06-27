@@ -26,6 +26,7 @@ const thunk_mod = @import("runtime").thunk;
 const fiber_mod = @import("parallel").fiber;
 const worker_mod = @import("worker.zig");
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const timeline = @import("../probe/timeline.zig");
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
 /// during lookup/insert; the entry's own `Future` coordinates the
@@ -195,6 +196,7 @@ pub fn compileImportPath(ev: anytype, path: []const u8) anyerror!Value {
 
     ev.progressBegin(.import, stable_path);
     defer ev.progressEnd(.import, stable_path);
+    timeline.instant(.import, stable_path);
 
     const source = if (corepkgsSource(stable_path)) |core_source|
         core_source
@@ -224,6 +226,7 @@ pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8) any
 
     ev.progressBegin(.import, stable_path);
     defer ev.progressEnd(.import, stable_path);
+    timeline.instant(.import, stable_path);
 
     const source = if (corepkgsSource(stable_path)) |core_source|
         core_source
