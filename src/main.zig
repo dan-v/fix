@@ -18,6 +18,16 @@ const tjit_hot = @import("jit/hot.zig");
 const Evaluator = eval.Evaluator;
 
 const usage = args.usage;
+const ArgsIterator = std.process.Args.Iterator;
+const SubcommandRun = *const fn (std.process.Init, *ArgsIterator) anyerror!u8;
+const Subcommand = struct { name: []const u8, run: SubcommandRun };
+
+const subcommands = [_]Subcommand{
+    .{ .name = "disasm", .run = disasm_cmd.run },
+    .{ .name = "inspect", .run = inspect_cmd.run },
+    .{ .name = "trace", .run = trace_cmd.run },
+    .{ .name = "thunks", .run = thunks_cmd.run },
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -33,34 +43,11 @@ pub fn main(init: std.process.Init) !void {
 
     const first_arg = args_iter.next();
     if (first_arg) |first| {
-        if (std.mem.eql(u8, first, "disasm")) {
-            const code = disasm_cmd.run(init, &args_iter) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
-            std.process.exit(code);
-        }
-        if (std.mem.eql(u8, first, "inspect")) {
-            const code = inspect_cmd.run(init, &args_iter) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
-            std.process.exit(code);
-        }
-        if (std.mem.eql(u8, first, "trace")) {
-            const code = trace_cmd.run(init, &args_iter) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
-            std.process.exit(code);
-        }
-        if (std.mem.eql(u8, first, "thunks")) {
-            const code = thunks_cmd.run(init, &args_iter) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
-            std.process.exit(code);
-        }
+        const code = runSubcommand(first, init, &args_iter) catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        if (code) |exit_code| std.process.exit(exit_code);
     }
 
     const options = args.parse(&args_iter, first_arg) catch |err| {
@@ -149,4 +136,13 @@ pub fn main(init: std.process.Init) !void {
     if (!ok) {
         std.process.exit(1);
     }
+}
+
+fn runSubcommand(name: []const u8, init: std.process.Init, args_iter: *ArgsIterator) !?u8 {
+    inline for (subcommands) |subcommand| {
+        if (std.mem.eql(u8, name, subcommand.name)) {
+            return try subcommand.run(init, args_iter);
+        }
+    }
+    return null;
 }
