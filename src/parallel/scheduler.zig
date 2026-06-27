@@ -221,6 +221,7 @@ const TaskQueue = struct {
 const urgent_queue_capacity: u32 = 4096;
 const spec_queue_capacity: u32 = 4096;
 const spec_backlog_per_helper: u32 = 128;
+const burst_wake_budget: u32 = 4;
 
 pub const Scheduler = struct {
     /// Cumulative scheduler activity counters. Read via `stats()`.
@@ -578,12 +579,17 @@ pub const Scheduler = struct {
         // submission path.
         if (submitter_id >= self.worker_count) return false;
         if (!queues[submitter_id].push(task)) return false;
-        // Wake a peer if the system was previously idle. Wake a
-        // *different* worker (round-robin) so the task doesn't just
-        // sit on our queue if we're CPU-bound — peers will steal it
-        // once they wake.
+        // Ramp worker wakeups at the start of a burst. A single submit
+        // only needs one wake, but fanout submits dozens or thousands of
+        // tasks back-to-back; waking only on 0 -> 1 leaves the burst at
+        // the mercy of whichever helpers happened to be awake already.
+        //
+        // Bound this so steady backlog does not turn every submit into
+        // a futex wake. These wake words also pre-signal workers that
+        // are between the pre-park spin and the futex call.
         const prev = self.pending_tasks.fetchAdd(1, .release);
-        if (prev == 0) {
+        const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
+        if (prev < wake_budget) {
             const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
             const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
             self.wakeWorker(target);
