@@ -297,6 +297,7 @@ fn writeValueInner(
             try writer.writeByte('}');
         },
         .closure => try writer.writeAll("<closure>"),
+        .partial_app => try writer.writeAll("<partial-app>"),
         .thunk => try writer.print("<thunk {d}>", .{value.asObjectId()}),
         .builtin => try writer.writeAll("<builtin>"),
         .builtin_closure => try writer.writeAll("<builtin_closure>"),
