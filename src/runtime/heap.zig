@@ -293,6 +293,13 @@ pub const ObjectHeap = struct {
         attr_positions: u32,
         variant_counts: [9]u32,
         thunk_states: [5]u32,
+        /// Of the `resolved` thunks (thunk_states[2]), the split by
+        /// `Future.demanded`: `resolved_demanded` were observed by a real
+        /// (demand) caller; `resolved_undemanded` were pre-forced by
+        /// speculation / fan-out and never observed — the speculative-waste
+        /// fraction. See docs/parallel-redesign-plan.md (instrument I1).
+        resolved_demanded: u32,
+        resolved_undemanded: u32,
         /// Magnitude histogram for inline `.int` values found in the
         /// values + attrs stores. Buckets are chosen to inform a 16→8
         /// byte Value migration: a NaN-boxed Value can hold a 48-bit
@@ -364,6 +371,8 @@ pub const ObjectHeap = struct {
             .attr_positions = self.attr_positions.count(),
             .variant_counts = [_]u32{0} ** 9,
             .thunk_states = [_]u32{0} ** 5,
+            .resolved_demanded = 0,
+            .resolved_undemanded = 0,
             .int_buckets = [_]u32{0} ** 5,
         };
 
@@ -392,6 +401,15 @@ pub const ObjectHeap = struct {
                     const state = t.future.state.load(.acquire);
                     const s_index: usize = @intCast(@min(state, 4));
                     result.thunk_states[s_index] += 1;
+                    // Split resolved thunks by whether a real caller ever
+                    // demanded the value (vs. pre-forced and unobserved).
+                    if (s_index == 2) {
+                        if (t.future.isDemanded()) {
+                            result.resolved_demanded += 1;
+                        } else {
+                            result.resolved_undemanded += 1;
+                        }
+                    }
                     break :blk 4;
                 },
                 .context_string => 5,

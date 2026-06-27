@@ -39,6 +39,20 @@ pub fn report(ev: *Evaluator) void {
             if (s.busy_ns + s.idle_ns == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(s.busy_ns)) / @as(f64, @floatFromInt(s.busy_ns + s.idle_ns)),
         },
     );
+    // Speculation precision (instrument I1, docs/parallel-redesign-plan.md):
+    // of all thunks that reached `.resolved`, how many were ever demanded by
+    // a real caller vs. pre-forced (speculation / fan-out) and never observed.
+    // The undemanded share is the speculative-waste fraction by COUNT.
+    {
+        const h = ev.heapStats();
+        const dem = h.resolved_demanded;
+        const undem = h.resolved_undemanded;
+        const tot = dem + undem;
+        std.debug.print(
+            "spec-census: resolved={d} demanded={d} undemanded={d} ({d:.1}% undemanded)\n",
+            .{ tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
+        );
+    }
     if (comptime jit.enabled) reportJit();
     if (comptime prof.enabled) reportProf();
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
