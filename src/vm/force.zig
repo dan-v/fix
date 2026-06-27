@@ -6,7 +6,7 @@ const ObjectId = types.ObjectId;
 const thunk_mod = @import("runtime").thunk;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
-const fiber_mod = @import("../fiber.zig");
+const fiber_mod = @import("parallel").fiber;
 const worker_mod = @import("../eval/worker.zig");
 
 const access = @import("access.zig");

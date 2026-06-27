@@ -23,7 +23,7 @@
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
-const fiber_mod = @import("../fiber.zig");
+const fiber_mod = @import("parallel").fiber;
 const worker_mod = @import("worker.zig");
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly

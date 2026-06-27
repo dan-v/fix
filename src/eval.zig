@@ -11,7 +11,7 @@ const InternTable = @import("runtime").intern.InternTable;
 const ChunkRegistry = bytecode.ChunkRegistry;
 const ChunkBuilder = bytecode.ChunkBuilder;
 const ChunkId = types.ChunkId;
-const Scheduler = @import("scheduler.zig").Scheduler;
+const Scheduler = @import("parallel").scheduler.Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
@@ -37,7 +37,7 @@ const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 
 const worker_mod = @import("eval/worker.zig");
-const fiber_mod = @import("fiber.zig");
+const fiber_mod = @import("parallel").fiber;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;

@@ -85,6 +85,22 @@ pub fn build(b: *std.Build) void {
     });
     runtime_mod.addImport("build_options", build_options_mod);
 
+    const parallel_mod = b.addModule("parallel", .{
+        .root_source_file = b.path("src/parallel.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    parallel_mod.addImport("build_options", build_options_mod);
+    parallel_mod.addImport("runtime", runtime_mod);
+    // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
+    // resolved target. Lives with the fiber code in the parallel module.
+    switch (target.result.cpu.arch) {
+        .x86_64 => parallel_mod.addAssemblyFile(b.path("src/parallel/fiber/swap_x86_64.S")),
+        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
+    }
+
     const mod = b.addModule("fix", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
@@ -103,13 +119,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("build_options", build_options_mod);
     mod.addImport("syntax", syntax_mod);
     mod.addImport("runtime", runtime_mod);
-
-    // Fiber stack-switching primitive. The .S file is per-arch; pick one
-    // by the resolved target.
-    switch (target.result.cpu.arch) {
-        .x86_64 => mod.addAssemblyFile(b.path("src/fiber/swap_x86_64.S")),
-        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
-    }
+    mod.addImport("parallel", parallel_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -154,6 +164,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("build_options", build_options_mod);
     exe_mod.addImport("syntax", syntax_mod);
     exe_mod.addImport("runtime", runtime_mod);
+    exe_mod.addImport("parallel", parallel_mod);
 
     const exe = b.addExecutable(.{
         .name = "fix",
