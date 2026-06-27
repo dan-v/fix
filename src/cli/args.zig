@@ -1,0 +1,198 @@
+//! Command-line option parsing for `fix`.
+
+const std = @import("std");
+const cli = @import("../cli.zig");
+const derivation_debug = @import("derivation_debug.zig");
+
+pub const usage =
+    \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)
+    \\
+    \\options:
+    \\  --repl                 read and evaluate expressions interactively
+    \\  -e, --expr EXPR        evaluate expression text
+    \\  --json                 write the evaluated value as JSON
+    \\  --xml                  write the evaluated value as XML
+    \\  --strict               recursively force attr values and list items before writing
+    \\  --debug-derivations[=MODE]
+    \\                         write derivation debug records to stderr: summary, full
+    \\  --debug-derivation-filter TEXT
+    \\                         only show derivations whose name/path/input mentions TEXT
+    \\  --debug-derivation-name NAME
+    \\                         only show derivations with exactly NAME
+    \\  --debug-derivation-drv PATH
+    \\                         only show the derivation with exactly PATH
+    \\  --show-trace           show full evaluation traces
+    \\  --color[=when]         color diagnostics: auto, always, never
+    \\  --no-color             disable color diagnostics
+    \\  --progress[=when]      show evaluation progress on stderr: auto, always, never
+    \\  --no-progress          disable evaluation progress
+    \\  -h, --help             show this help
+    \\
+;
+
+pub const OutputFormat = enum {
+    nix,
+    json,
+    xml,
+};
+
+pub const EvaluationMode = struct {
+    output: OutputFormat = .nix,
+    strict: bool = false,
+};
+
+pub const SourceArg = union(enum) {
+    expr: []const u8,
+    file: []const u8,
+};
+
+pub const Options = struct {
+    output: OutputFormat = .nix,
+    strict: bool = false,
+    color: cli.When = .auto,
+    progress: cli.When = .auto,
+    show_trace: bool = false,
+    derivation_debug: derivation_debug.Options = .{},
+    repl: bool = false,
+    source: ?SourceArg = null,
+    vm_trace_path: ?[:0]const u8 = null,
+    vm_trace_format: enum { text, binary } = .text,
+    vm_trace_max_events: u64 = 0,
+    vm_trace_main_only: bool = false,
+    thunks_log_path: ?[:0]const u8 = null,
+    workers: ?u8 = null,
+    disable_spec_thunks: bool = false,
+    disable_fanout: bool = false,
+    print_sched_stats: bool = false,
+    timeline_path: ?[]const u8 = null,
+
+    fn setSource(self: *Options, source: SourceArg) !void {
+        if (self.source != null) return error.TooManySources;
+        self.source = source;
+    }
+
+    pub fn evaluationMode(self: Options) EvaluationMode {
+        return .{
+            .output = self.output,
+            .strict = self.strict,
+        };
+    }
+};
+
+pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
+    var options: Options = .{};
+
+    var carried = first;
+    while (true) {
+        const arg = if (carried) |c| blk: {
+            carried = null;
+            break :blk c;
+        } else (args_iter.next() orelse break);
+        if (std.mem.eql(u8, arg, "--repl")) {
+            options.repl = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            options.output = .json;
+        } else if (std.mem.eql(u8, arg, "--xml")) {
+            options.output = .xml;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            options.strict = true;
+        } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
+            options.derivation_debug.mode = .summary;
+        } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
+            options.derivation_debug.mode = derivation_debug.parseMode(arg["--debug-derivations=".len..]) orelse return error.InvalidDerivationDebugMode;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-filter")) {
+            options.derivation_debug.filter = args_iter.next() orelse return error.MissingDerivationDebugFilter;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-name")) {
+            options.derivation_debug.name = args_iter.next() orelse return error.MissingDerivationDebugName;
+        } else if (std.mem.eql(u8, arg, "--debug-derivation-drv")) {
+            options.derivation_debug.drv_path = args_iter.next() orelse return error.MissingDerivationDebugDrv;
+        } else if (std.mem.eql(u8, arg, "--show-trace")) {
+            options.show_trace = true;
+        } else if (std.mem.eql(u8, arg, "--color")) {
+            options.color = .always;
+        } else if (std.mem.startsWith(u8, arg, "--color=")) {
+            options.color = cli.parseWhen(arg["--color=".len..]) orelse return error.InvalidColorMode;
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            options.color = .never;
+        } else if (std.mem.eql(u8, arg, "--progress")) {
+            options.progress = .always;
+        } else if (std.mem.startsWith(u8, arg, "--progress=")) {
+            options.progress = cli.parseWhen(arg["--progress=".len..]) orelse return error.InvalidProgressMode;
+        } else if (std.mem.eql(u8, arg, "--no-progress")) {
+            options.progress = .never;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            std.debug.print("{s}", .{usage});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
+            try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            try options.setSource(.{ .file = args_iter.next() orelse return error.MissingPath });
+        } else if (std.mem.eql(u8, arg, "--vm-trace")) {
+            options.vm_trace_path = "-"; // stderr
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace=")) {
+            options.vm_trace_path = arg["--vm-trace=".len..];
+        } else if (std.mem.eql(u8, arg, "--vm-trace-format")) {
+            const text = args_iter.next() orelse return error.MissingVmTraceFormat;
+            options.vm_trace_format = parseVmTraceFormat(text) orelse return error.InvalidVmTraceFormat;
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace-format=")) {
+            options.vm_trace_format = parseVmTraceFormat(arg["--vm-trace-format=".len..]) orelse return error.InvalidVmTraceFormat;
+        } else if (std.mem.eql(u8, arg, "--vm-trace-max-events")) {
+            const text = args_iter.next() orelse return error.MissingVmTraceMaxEvents;
+            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
+        } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
+            const text = arg["--vm-trace-max-events=".len..];
+            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
+        } else if (std.mem.eql(u8, arg, "--vm-trace-main-only")) {
+            options.vm_trace_main_only = true;
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            const text = args_iter.next() orelse return error.MissingWorkers;
+            options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
+        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
+            options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
+        } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
+            options.thunks_log_path = arg["--thunks-log=".len..];
+        } else if (std.mem.eql(u8, arg, "--no-spec-thunks")) {
+            options.disable_spec_thunks = true;
+        } else if (std.mem.eql(u8, arg, "--no-fanout")) {
+            options.disable_fanout = true;
+        } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
+            options.print_sched_stats = true;
+        } else if (std.mem.eql(u8, arg, "--timeline")) {
+            options.timeline_path = "fix-timeline.json";
+        } else if (std.mem.startsWith(u8, arg, "--timeline=")) {
+            options.timeline_path = arg["--timeline=".len..];
+        } else {
+            return error.UnknownOption;
+        }
+    }
+
+    return options;
+}
+
+fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trace_format) {
+    if (std.mem.eql(u8, text, "binary")) return .binary;
+    if (std.mem.eql(u8, text, "text")) return .text;
+    return null;
+}
+
+pub fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingExpression => "missing expression after -e or --expr",
+        error.MissingPath => "missing path after --file",
+        error.MissingDerivationDebugFilter => "missing text after --debug-derivation-filter",
+        error.MissingDerivationDebugName => "missing name after --debug-derivation-name",
+        error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
+        error.TooManySources => "provide only one expression or file",
+        error.InvalidColorMode => "expected --color to be auto, always, or never",
+        error.InvalidProgressMode => "expected --progress to be auto, always, or never",
+        error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
+        error.MissingVmTraceFormat => "missing format after --vm-trace-format",
+        error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
+        error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
+        error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
+        error.MissingWorkers => "missing N after --workers",
+        error.InvalidWorkers => "expected --workers to be a non-negative integer",
+        error.UnknownOption => "unknown option",
+        else => @errorName(err),
+    };
+}
