@@ -30,8 +30,10 @@ const GuardKind = ir.GuardKind;
 const ChunkId = @import("runtime").types.ChunkId;
 const jit = @import("../jit.zig");
 const helpers = @import("jit_helpers.zig");
+const build_options = @import("build_options");
+const hot = @import("hot.zig");
 
-pub const enabled: bool = @import("build_options").tjit;
+pub const enabled: bool = build_options.tjit;
 
 /// Mirror of the recorder's capture cap (record.zig MAX_THUNK_CAPTURES).
 const MAX_ALLOC_CAPTURES = 64;
@@ -108,7 +110,7 @@ var err_deopt_count: std.atomic.Value(u64) = .{ .raw = 0 }; // deopts from a tra
 
 pub fn report() void {
     if (comptime !enabled) return;
-    if (!@import("hot.zig").report_enabled) return;
+    if (!hot.report_enabled) return;
     const nat = native_count.load(.monotonic);
     const e = exec_count.load(.monotonic);
     const d = deopt_count.load(.monotonic);

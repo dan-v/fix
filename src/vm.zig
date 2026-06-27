@@ -32,6 +32,10 @@ const eval_trace = @import("support/trace.zig");
 const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime").thunk;
+const worker_id_mod = @import("runtime").worker_id;
+const tjit_record = @import("tjit/record.zig");
+const DeferredTable = @import("compiler/deferred_table.zig").Table;
+const ThunkTrace = @import("eval/thunk_trace.zig").ThunkTrace;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
@@ -86,7 +90,7 @@ pub const VM = struct {
     /// Lazy per-attr compilation: deferred bodies + their compile cache.
     /// Set post-init by `Evaluator.initVm`; null in standalone test VMs
     /// (which never create `.deferred` thunks). See `deferred.zig`.
-    deferred_table: ?*@import("compiler/deferred_table.zig").Table = null,
+    deferred_table: ?*DeferredTable = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `tjit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
@@ -120,7 +124,7 @@ pub const VM = struct {
     /// trace; writes serialize on its internal mutex. The field is
     /// compiled out entirely unless `-Dthunks-log` is set so the
     /// per-thunk null-check overhead doesn't burden default builds.
-    thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
+    thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
@@ -177,7 +181,7 @@ pub const VM = struct {
         trace_sink: ?*eval_trace.Trace,
         progress: ?eval_progress.Sink,
         vm_trace: ?*VmTrace,
-        thunk_trace: if (thunks_log_enabled) ?*@import("eval/thunk_trace.zig").ThunkTrace else void,
+        thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
         import_host: ?ImportHost,
         builtins_value: Value,
         opcode_profile_sink: OpcodeProfileSink,
@@ -224,12 +228,12 @@ pub const VM = struct {
     /// because fibers migrate across workers (F1.4).
     pub inline fn workerId(self: *const VM) u8 {
         _ = self;
-        return @import("runtime").worker_id.current;
+        return worker_id_mod.current;
     }
 
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
-        if (comptime @import("tjit/record.zig").enabled) @import("tjit/record.zig").cleanup(self);
+        if (comptime tjit_record.enabled) tjit_record.cleanup(self);
         self.allocator.free(self.stack);
         self.allocator.free(self.frames);
     }

@@ -20,6 +20,7 @@ const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
 const jit_mod = @import("../jit.zig");
+const trace_log = @import("trace_log.zig");
 const prof = @import("../prof.zig");
 
 const VM = vm_mod.VM;
@@ -578,7 +579,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrame");
-    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+    trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 /// Like `replaceCurrentFrame` but for an uncurried (arity>1) callee:
@@ -612,7 +613,7 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
         .upvalues = upvalues,
     };
     debug.checkFrameSync(self, frame, ch.code, "replaceCurrentFrameMulti");
-    @import("trace_log.zig").framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
+    trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
 }
 
 /// `call_n`: apply `callee` to `n` args, all already on the stack as

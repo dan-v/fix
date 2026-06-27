@@ -16,6 +16,7 @@ const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const literals = @import("literals.zig");
+const ops = @import("ops.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -236,15 +237,15 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // fix-point race.
             if (!options.eager) return false;
             if (unwrapped.data.attr_set.recursive) return false;
-            try @import("attrs.zig").compileAttrSet(self, unwrapped);
+            try attrs.compileAttrSet(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .lambda => {
-            try @import("ops.zig").compileLambda(self, unwrapped);
+            try ops.compileLambda(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .lambda_attrs => {
-            try @import("ops.zig").compileLambdaAttrs(self, unwrapped);
+            try ops.compileLambdaAttrs(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },
         .identifier => {

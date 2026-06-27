@@ -14,6 +14,8 @@ const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
+const int_ops = @import("runtime").int;
+const parser_mod = @import("syntax").parser;
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -39,7 +41,7 @@ pub fn compileInt(self: *Compiler, node: *const Node) !void {
         try diagnostics.reportCompileError(self, node.data.atom.offset, node.data.atom.len, "invalid integer literal");
         return error.InvalidNumber;
     };
-    try self.builder.emitConstant(self.allocator, try @import("runtime").int.make(self.heap, val));
+    try self.builder.emitConstant(self.allocator, try int_ops.make(self.heap, val));
 }
 
 pub fn compileFloat(self: *Compiler, node: *const Node) !void {
@@ -100,7 +102,7 @@ pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_
     var arena = ast.AstArena.init(self.allocator);
     defer arena.deinit();
 
-    var parser = @import("syntax").parser.Parser.init(self.allocator, &arena, expr_source);
+    var parser = parser_mod.Parser.init(self.allocator, &arena, expr_source);
     defer parser.deinit();
     const expr = parser.parse() catch |err| {
         try diagnostics.absorbParserDiagnostics(self, parser.diagnostics.items, source_offset);

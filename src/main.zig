@@ -14,6 +14,7 @@ const stats = @import("cli/stats.zig");
 const args = @import("cli/args.zig");
 const run = @import("cli/run.zig");
 const trace_setup = @import("cli/trace_setup.zig");
+const tjit_hot = @import("tjit/hot.zig");
 const Evaluator = eval.Evaluator;
 
 const usage = args.usage;
@@ -126,8 +127,8 @@ pub fn main(init: std.process.Init) !void {
     // print during/after eval only when stats are requested; otherwise a
     // `-Dtjit` build stays quiet. Must be set before evaluation since traces
     // are dumped as they're recorded.
-    if (comptime @import("tjit/hot.zig").enabled) {
-        @import("tjit/hot.zig").report_enabled = options.print_sched_stats;
+    if (comptime tjit_hot.enabled) {
+        tjit_hot.report_enabled = options.print_sched_stats;
     }
 
     if (comptime timeline.enabled) {

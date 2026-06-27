@@ -36,6 +36,7 @@ const force = @import("vm/force.zig");
 const closures = @import("vm/closures.zig");
 const access = @import("vm/access.zig");
 const run = @import("vm/run.zig");
+const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 
 /// Compile-time switch. `false` when `-Djit` wasn't passed, or when
 /// the target isn't a JIT-supported platform.
@@ -273,7 +274,7 @@ pub const CodeBuffer = struct {
     base: [*]u8,
     capacity: usize,
     len: usize,
-    mu: @import("runtime").stable_segments.SpinMutex,
+    mu: SpinMutex,
 
     pub fn init(capacity: usize) !CodeBuffer {
         if (!code_enabled) @compileError("CodeBuffer used in a build without -Djit/-Dtjit");

@@ -12,12 +12,13 @@ const AttrEntry = @import("runtime").heap.AttrEntry;
 const stable = @import("runtime").stable_segments;
 const hot_mod = @import("../tjit/hot.zig");
 const HotTable = hot_mod.HotTable;
+const jit_mod = @import("../jit.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
 pub const Chunk = struct {
     pub const SourceSpan = struct {
-        file: ?@import("runtime").types.InternId,
+        file: ?types.InternId,
         offset: u32,
         len: u32,
         line: u32,
@@ -67,7 +68,7 @@ pub const Chunk = struct {
     /// Optional native-code entry point produced by the JIT. Null
     /// means "interpret the bytecode normally" — the canonical path
     /// and the only one available without `-Djit`. See `src/jit.zig`.
-    jit_code: ?@import("../jit.zig").CompiledFn = null,
+    jit_code: ?jit_mod.CompiledFn = null,
     /// Native-code entry point for *lambda bodies* (chunks called via
     /// `doCall`/`doTailCall`/`callValue`). Distinct ABI from
     /// `jit_code` because the caller passes the argument as a Value
@@ -76,7 +77,7 @@ pub const Chunk = struct {
     /// with `jit_code` at most: thunk bodies have `local_count == 0`
     /// and lambda bodies have `local_count >= 1`, so a chunk is
     /// classified one way or the other (never both).
-    jit_lambda_code: ?@import("../jit.zig").LambdaCompiledFn = null,
+    jit_lambda_code: ?jit_mod.LambdaCompiledFn = null,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);

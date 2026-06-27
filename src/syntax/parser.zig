@@ -14,6 +14,7 @@ const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const prefix = @import("parser/prefix.zig");
 const infix = @import("parser/infix.zig");
+const Scanner = @import("scanner.zig").Scanner;
 
 pub const Precedence = enum(u8) {
     none,
@@ -53,7 +54,7 @@ pub const Rule = struct {
 pub const Parser = struct {
     allocator: std.mem.Allocator,
     arena: *ast.AstArena,
-    scanner: @import("scanner.zig").Scanner,
+    scanner: Scanner,
     source: []const u8,
     current: Token,
     previous: Token,
@@ -64,7 +65,7 @@ pub const Parser = struct {
         return .{
             .allocator = allocator,
             .arena = arena,
-            .scanner = @import("scanner.zig").Scanner.init(source),
+            .scanner = Scanner.init(source),
             .source = source,
             .current = undefined,
             .previous = undefined,
