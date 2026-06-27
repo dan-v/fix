@@ -105,10 +105,17 @@ Reclassifications realized as folder moves in P2: `builtins.zig`→runtime,
       fetch_cache moved in; ~250 sites → `@import("runtime")`. Shared build_options module.
 - [x] **P2c — `parallel` build module** (commit de530b9): scheduler/fiber + swap asm.
 - [x] **P2d — `derivation` build module** (commit 28b32bb): renderer debug.zig → cli.
+- [x] **P4 — slim main.zig** (commit faf6291): 824 → 151 lines, composition only.
+      Extracted cli/{args,stats,render,run,trace_setup} + repl driver into cli/repl.
+- [x] **P5 — kill inline @imports** (commits 3c0cdf1, 929ee68): production code now
+      has ZERO @import in function bodies / struct-field types. Confirmed the
+      vm↔jit and intra-compiler file cycles resolve lazily within a module.
 - [ ] **P2e — `core` reorg** (single module, facades inside): group bytecode/ compiler/
       jit/ vm/ worker + exec-instrumentation under a coherent tree with facades.
+      (Lower priority — one-module-internal organization; folders already exist.)
 - [ ] **P2f — `evaluate`**: evaluator + imports + search_path + print.
 - [ ] **P2g — lint**: test that fails if a file imports another subsystem's non-facade.
+- [ ] **P6 — split overgrown files** (NOT the hot vm/run.zig dispatch loop).
 - [ ] **P4 — slim main.zig**: extract `cli/args`, `cli/run`, `cli/render`,
       `cli/stats`; each subsystem exposes its own `reportStats(writer)`.
 - [ ] **P5 — kill inline `@import`**: hoist the 96 in-body imports to top-of-file
