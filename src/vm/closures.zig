@@ -2,7 +2,7 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const tjit_exec = @import("../tjit/exec.zig");
+const tjit_exec = @import("../jit/exec.zig");
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
 const chunk = @import("../bytecode.zig").chunk;
@@ -19,7 +19,7 @@ const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
-const jit_mod = @import("../jit.zig");
+const jit_mod = @import("../jit/native.zig");
 const trace_log = @import("trace_log.zig");
 const prof = @import("../prof.zig");
 

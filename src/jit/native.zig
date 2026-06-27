@@ -25,17 +25,17 @@ const builtin = @import("builtin");
 
 const Value = @import("runtime").value.Value;
 const types = @import("runtime").types;
-const chunk_mod = @import("bytecode/chunk.zig");
+const chunk_mod = @import("../bytecode/chunk.zig");
 const Chunk = chunk_mod.Chunk;
-const OpCode = @import("bytecode/opcode.zig").OpCode;
+const OpCode = @import("../bytecode/opcode.zig").OpCode;
 // The interpreter pieces the JIT reads. Hoisted here rather than re-imported
 // inside each compiler function; within this one module the file cycle
 // (vm ↔ jit) is resolved lazily by Zig.
-const VM = @import("vm.zig").VM;
-const force = @import("vm/force.zig");
-const closures = @import("vm/closures.zig");
-const access = @import("vm/access.zig");
-const run = @import("vm/run.zig");
+const VM = @import("../vm.zig").VM;
+const force = @import("../vm/force.zig");
+const closures = @import("../vm/closures.zig");
+const access = @import("../vm/access.zig");
+const run = @import("../vm/run.zig");
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 
 /// Compile-time switch. `false` when `-Djit` wasn't passed, or when

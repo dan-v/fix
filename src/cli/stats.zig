@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const Evaluator = @import("../eval.zig").Evaluator;
-const jit = @import("../jit.zig");
+const jit = @import("../jit/native.zig");
 const prof = @import("../prof.zig");
 const prof_path = @import("../prof_path.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;

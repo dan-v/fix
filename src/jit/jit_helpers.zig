@@ -10,7 +10,7 @@
 //! distinguishes deopt from error.
 
 const std = @import("std");
-const jit = @import("../jit.zig");
+const jit = @import("native.zig");
 const vm_mod = @import("../vm.zig");
 const Value = @import("runtime").value.Value;
 const force = @import("../vm/force.zig");

@@ -10,9 +10,9 @@ const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("runtime").value.Value;
 const AttrEntry = @import("runtime").heap.AttrEntry;
 const stable = @import("runtime").stable_segments;
-const hot_mod = @import("../tjit/hot.zig");
+const hot_mod = @import("../jit/hot.zig");
 const HotTable = hot_mod.HotTable;
-const jit_mod = @import("../jit.zig");
+const jit_mod = @import("../jit/native.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -517,8 +517,8 @@ pub const WellKnownChunks = struct {
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
     const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
-    const jit = @import("../jit.zig");
-    const jit_linear = @import("../jit_linear.zig");
+    const jit = @import("../jit/native.zig");
+    const jit_linear = @import("../jit/linear.zig");
     const JitCodeBuffer = if (jit.code_enabled) jit.CodeBuffer else void;
 
     allocator: std.mem.Allocator,

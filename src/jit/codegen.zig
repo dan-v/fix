@@ -16,9 +16,9 @@
 
 const std = @import("std");
 const ir = @import("ir.zig");
-const jit = @import("../jit.zig");
+const jit = @import("native.zig");
 const helpers = @import("jit_helpers.zig");
-const Emitter = @import("../jit_linear.zig").Emitter;
+const Emitter = @import("linear.zig").Emitter;
 const Value = @import("runtime").value.Value;
 
 const CodeBuffer = jit.CodeBuffer;

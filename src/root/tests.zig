@@ -5,8 +5,8 @@ test {
     _ = @import("tests/functions.zig");
     _ = @import("tests/builtins.zig");
     _ = @import("tests/parallel.zig");
-    _ = @import("../tjit/ir.zig");
-    _ = @import("../tjit/hot.zig");
-    _ = @import("../tjit/recorder.zig");
-    _ = @import("../tjit/opt.zig");
+    _ = @import("../jit/ir.zig");
+    _ = @import("../jit/hot.zig");
+    _ = @import("../jit/recorder.zig");
+    _ = @import("../jit/opt.zig");
 }

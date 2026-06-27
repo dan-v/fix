@@ -14,7 +14,7 @@ const stats = @import("cli/stats.zig");
 const args = @import("cli/args.zig");
 const run = @import("cli/run.zig");
 const trace_setup = @import("cli/trace_setup.zig");
-const tjit_hot = @import("tjit/hot.zig");
+const tjit_hot = @import("jit/hot.zig");
 const Evaluator = eval.Evaluator;
 
 const usage = args.usage;

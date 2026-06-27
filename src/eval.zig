@@ -46,9 +46,9 @@ const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
 const trace_probe = @import("vm/trace_probe.zig");
 const ngram_probe = @import("vm/ngram_probe.zig");
-const tjit_hot = @import("tjit/hot.zig");
-const tjit_exec = @import("tjit/exec.zig");
-const tjit_record = @import("tjit/record.zig");
+const tjit_hot = @import("jit/hot.zig");
+const tjit_exec = @import("jit/exec.zig");
+const tjit_record = @import("jit/record.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;

@@ -40,7 +40,7 @@ const stack = @import("stack.zig");
 const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
 const ngram_probe = @import("ngram_probe.zig");
-const tjit_record = @import("../tjit/record.zig");
+const tjit_record = @import("../jit/record.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
