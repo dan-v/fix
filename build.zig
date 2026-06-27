@@ -246,7 +246,23 @@ pub fn build(b: *std.Build) void {
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
+    // Module-boundary import lint (tools/lint_imports.zig). Catches relative
+    // imports that reach into a clean-cut module's files instead of going
+    // through `@import("<module>")` — those silently duplicate-compile.
+    const lint_exe = b.addExecutable(.{
+        .name = "lint-imports",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/lint_imports.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_lint = b.addRunArtifact(lint_exe);
+    const lint_step = b.step("lint", "Check module-boundary import hygiene");
+    lint_step.dependOn(&run_lint.step);
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&run_lint.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
