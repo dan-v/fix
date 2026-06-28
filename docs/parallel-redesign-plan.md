@@ -213,13 +213,33 @@ chain feeding a demanded value lifts to demand priority automatically.
   surgery). Pathology 0.160→0.091s (4×→1.4×); nixos_toplevel neutral +
   byte-identical.
 
-- **Residual / next robustness step:** the ~1.4× tail is the spec elements
-  already in-flight when the result completed — they must drain (correctness).
-  Eliminating them needs either (a) safely retiring suspended speculative fibers
-  at teardown (the fiber-lifecycle-race minefield — see worker.zig:282-285), or
-  (b) fuel-bounding a speculative force so a single dead body can't run long.
-  (b) is the lower-risk path and is the real "clean up speculation" follow-up.
-  Also possible: gate speculation on a runtime-cost signal, not just body size.
+- **Cooperative speculative bail landed** (commits c74b973, 9120af0). The
+  `suppress_background` "stop starting" wasn't enough: a *single* huge in-flight
+  speculative force still ran to completion. Demonstrated (cheap result + one
+  expensive never-demanded sibling): w=32 was **2000× slower** than serial (6.6s
+  vs 3ms). Fix — chose **(b)-style cooperative bail over fuel budgets**, because
+  it only fires *after* the demanded result exists, so it can never false-bail
+  legit pre-result speculation → guaranteed benchmark neutrality + byte-identity
+  (no budget to tune):
+  - `force.specBailRequested(vm)` = `in_speculation and backgroundSuppressed()`.
+  - `forceThunkImpl` claim path raises `error.SpeculativeBail` (a transient
+    error → `thunk.reset()`, recomputed cleanly on real demand; `slotEntry`
+    swallows it and resets per-task VM state, so no dirty-stack / StackOverflow-
+    class hazard — that was the *demand* retry path, this is speculation-only).
+  - `suppress_background` is held through shutdown and across `runTopLevel` exit
+    so in-flight forces actually observe it.
+  - Builtin allocation loops with no force checkpoint (genList) poll
+    `specBailRequested` every 8192 iters and bail.
+  - Results: single-huge-body 6.6s→**0.018s** (~1× vs serial); 256-body
+    0.16s→0.084s (2×, bounded — doesn't scale with count); nixos_toplevel
+    neutral (w=32 1.24s) + byte-identical. Tests pass. Artifact:
+    test/spec_pathology.nix.
+  - **Remaining (minor):** map/mapAttrs creation loops aren't checkpointed (a
+    huge map input must come from an already-checkpointed producer, so covered
+    transitively); pure non-forcing tail-recursion self-limits via FrameOverflow.
+    A non-flaky automated guard (assert bounded bail-count, not wall time) is a
+    possible follow-up. Could also gate speculation on a runtime-cost signal, not
+    just static body size.
 
 ## 6. Honest success criteria
 
