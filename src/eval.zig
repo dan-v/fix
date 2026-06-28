@@ -640,15 +640,34 @@ pub const Evaluator = struct {
         return self.runWithVm(writeValueBody, .{ self, writer, value });
     }
 
+    /// Progress is a single-threaded UI concern that must be driven only by
+    /// the demand path. Imports/compiles triggered off a speculative or
+    /// fan-out force run on arbitrary worker fibers and reentrantly
+    /// interleave begin/end pairs into the one std `Progress` tree, which
+    /// deadlocks inside `Io.Threaded.cancel` (`Progress.Node.end`). Every
+    /// task fiber forces via `forceValueSpeculative` (so `vm.in_speculation`
+    /// is set); only the top demand fiber has it clear and is never
+    /// concurrent with itself, so it alone may emit. begin and end share
+    /// this gate (the fiber's flag is stable across a single force), so
+    /// pairs stay balanced. No current fiber = early single-threaded setup.
+    fn progressEligible() bool {
+        const inner = fiber_mod.currentFiber() orelse return true;
+        const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+        return !wf.vm.in_speculation;
+    }
+
     pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (!progressEligible()) return;
         if (self.progress) |progress| progress.begin(stage, subject);
     }
 
     pub fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (!progressEligible()) return;
         if (self.progress) |progress| progress.end(stage, subject);
     }
 
     pub fn progressInstant(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
+        if (!progressEligible()) return;
         if (self.progress) |progress| progress.instant(stage, subject);
     }
 };
