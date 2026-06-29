@@ -95,6 +95,7 @@ pub const Table = struct {
         const total = self.entries.count();
         while (id < total) : (id += 1) {
             const e = self.entries.get(id).*;
+            for (e.scope) |cap| self.allocator.free(cap.name);
             self.allocator.free(e.scope);
             if (e.base_path) |p| self.allocator.free(p);
             if (e.source_path) |p| self.allocator.free(p);
@@ -124,16 +125,26 @@ pub const Table = struct {
     }
 
     /// Register a deferred body and return its id (the operand the
-    /// `defer_attr_value` op carries). `entry.scope` is duped into the
-    /// table's allocator; the caller may pass a temporary slice. The
-    /// `name` byte slices inside each `Capture` are NOT copied — they
-    /// point into the retained source and stay valid.
+    /// `defer_attr_value` op carries). `entry.scope` (and each `Capture`'s
+    /// `name` bytes) is duped into the table's allocator; the caller may
+    /// pass a temporary slice. The names must be owned here, not borrowed
+    /// from `source`: some come from `attrSegmentNameAlloc` (a fresh
+    /// allocation in the originating compile's scratch arena, e.g. parsed
+    /// `"a b" = ...` keys or `rec` attr names), which is freed when that
+    /// compile unit finishes. The force-time compile needs them later.
     pub fn register(self: *Table, entry: Entry) !u32 {
         const stored = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(stored);
         stored.* = entry;
-        stored.scope = try self.allocator.dupe(Capture, entry.scope);
-        errdefer self.allocator.free(stored.scope);
+        const scope_copy = try self.allocator.dupe(Capture, entry.scope);
+        errdefer self.allocator.free(scope_copy);
+        var named: usize = 0;
+        errdefer for (scope_copy[0..named]) |cap| self.allocator.free(cap.name);
+        for (scope_copy) |*cap| {
+            cap.name = try self.allocator.dupe(u8, cap.name);
+            named += 1;
+        }
+        stored.scope = scope_copy;
         // base_path / source_path are transient (freed with the import's
         // stable_path) — dupe so the force-time compile can use them.
         stored.base_path = if (entry.base_path) |p| try self.allocator.dupe(u8, p) else null;

@@ -165,6 +165,7 @@ fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEnt
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -184,7 +185,7 @@ fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEnt
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
@@ -603,6 +604,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -622,7 +624,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }

@@ -21,7 +21,7 @@ pub fn finishCompiledChild(child: *Compiler, child_builder: *ChunkBuilder, expr:
     try strictness.stampOnBuilder(child, expr);
     try emit.emitRet(child);
     try emit.emitOp(child, .halt);
-    const child_chunk = try child_builder.finish(child.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(child.persistent, child.slot_count);
     return try child.registry.register(child_chunk);
 }
 
@@ -40,6 +40,7 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -75,6 +76,7 @@ pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -95,7 +97,7 @@ pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const trivial = child_chunk.scheduling.trivial != .none;
     const child_id = try self.registry.register(child_chunk);
     if (trivial) {

@@ -331,10 +331,22 @@ pub const Evaluator = struct {
             };
         };
 
-        var builder = try ChunkBuilder.init(self.allocator);
-        defer builder.deinit(self.allocator);
+        // Per-compilation-unit scratch arena: all of the compiler's
+        // transient structures (builder buffers, locals/captures, strictness
+        // and name-resolution maps, diagnostics) allocate here and are freed
+        // wholesale when this returns. Only the emitted chunk is duped onto
+        // the long-lived allocator (at `builder.finish`). The AST arena above
+        // is separate — it may be retained for deferred bodies; this one never
+        // is, since nothing persistent points into it.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const scratch_alloc = scratch.allocator();
+
+        var builder = try ChunkBuilder.init(scratch_alloc);
+        defer builder.deinit(scratch_alloc);
 
         var compiler = compiler_mod.Compiler.init(
+            scratch_alloc,
             self.allocator,
             &builder,
             &self.registry,
@@ -362,6 +374,8 @@ pub const Evaluator = struct {
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registry.register(chunk);
+        // `chunk` now owns persistent copies of its bytecode; `scratch`
+        // (incl. `builder`'s buffers) is freed by the defers above.
 
         // If any attr body in this file was deferred, its AST nodes are
         // referenced by `deferred_table` entries and must outlive the

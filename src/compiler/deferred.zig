@@ -41,10 +41,17 @@ pub fn compile(
     entry: *const deferred.Entry,
     line_index: *LineIndex,
 ) !ChunkId {
+    // Per-body scratch arena: transient compile structures live here and are
+    // freed wholesale on return; only the registered chunk's bytecode is
+    // duped onto the long-lived `allocator` (at `finishCompiledChild`).
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
     // Synthetic parent: snapshot names as locals 0..k-1, in order.
-    var parent_builder = try ChunkBuilder.init(allocator);
-    defer parent_builder.deinit(allocator);
-    var parent = Compiler.init(allocator, &parent_builder, registry, entry.source, intern, heap);
+    var parent_builder = try ChunkBuilder.init(sa);
+    defer parent_builder.deinit(sa);
+    var parent = Compiler.init(sa, allocator, &parent_builder, registry, entry.source, intern, heap);
     parent.base_path = entry.base_path;
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
@@ -57,16 +64,16 @@ pub fn compile(
 
     // Child compiles the body against that parent. Pre-seed captures with
     // the snapshot names (in order) → upvalue index i == env index i.
-    var child_builder = try ChunkBuilder.init(allocator);
-    defer child_builder.deinit(allocator);
-    var child = Compiler.init(allocator, &child_builder, registry, entry.source, intern, heap);
+    var child_builder = try ChunkBuilder.init(sa);
+    defer child_builder.deinit(sa);
+    var child = Compiler.init(sa, allocator, &child_builder, registry, entry.source, intern, heap);
     child.parent = &parent;
     child.base_path = entry.base_path;
     child.source_path = entry.source_path;
     child.source_file_id = entry.source_file_id;
     defer child.deinit();
     for (entry.scope, 0..) |cap, i| {
-        try child.captures.append(allocator, .{
+        try child.captures.append(child.allocator, .{
             .name = cap.name,
             .name_id = cap.name_id,
             .kind = .local,

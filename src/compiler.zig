@@ -44,7 +44,22 @@ pub const ContainerValueOptions = compiler_types.ContainerValueOptions;
 pub const with_capture_name = compiler_types.with_capture_name;
 
 pub const Compiler = struct {
+    /// Per-compilation-unit SCRATCH allocator. Everything the compiler
+    /// builds while emitting a chunk — locals/captures/with-scope tracking,
+    /// strictness analysis maps, name-resolution sets, the ChunkBuilder's
+    /// growth buffers, diagnostics — lives here. It is an arena owned by the
+    /// unit root (`parseAndCompile` / `deferred.compile`) and freed wholesale
+    /// when the unit finishes, so individual structures never need per-node
+    /// frees. Child compilers share the root's arena.
+    ///
+    /// INVARIANT: anything that must outlive the compile (the emitted Chunk's
+    /// `code`/`constants`/etc.) is duped onto `persistent` instead — that
+    /// handoff happens only at `ChunkBuilder.finish`. Registry/deferred-table
+    /// entries and copied-out diagnostics carry their own persistent copies.
     allocator: std.mem.Allocator,
+    /// Long-lived allocator (evaluator lifetime) for compile OUTPUT only:
+    /// the bytecode the registered chunk owns. Never used for scratch.
+    persistent: std.mem.Allocator,
     builder: *ChunkBuilder,
     registry: *ChunkRegistry,
     /// Used by integer-literal compilation to box i64 values that
@@ -87,6 +102,7 @@ pub const Compiler = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        persistent: std.mem.Allocator,
         builder: *ChunkBuilder,
         registry: *ChunkRegistry,
         source: []const u8,
@@ -95,6 +111,7 @@ pub const Compiler = struct {
     ) Compiler {
         return .{
             .allocator = allocator,
+            .persistent = persistent,
             .builder = builder,
             .registry = registry,
             .heap = heap,

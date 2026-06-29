@@ -507,6 +507,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -558,7 +559,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitClosureWithCaptures(self, child_id, child.captures.items);
 }
@@ -571,6 +572,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -662,7 +664,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitClosureWithCaptures(self, child_id, child.captures.items);
 }
@@ -699,6 +701,7 @@ fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, defa
 
     var child = Compiler.init(
         self.allocator,
+        self.persistent,
         &child_builder,
         self.registry,
         self.source,
@@ -724,7 +727,7 @@ fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, defa
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
-    const child_chunk = try child_builder.finish(self.allocator, child.slot_count);
+    const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
