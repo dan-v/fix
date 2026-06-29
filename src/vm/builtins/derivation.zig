@@ -16,6 +16,8 @@ const vm_strings = @import("../strings.zig");
 const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
+const drv_probe = @import("../../probe/drv_probe.zig");
+const thunk_mod = @import("runtime").thunk;
 
 const allOutputsContextValue = string_context.allOutputsContextValue;
 const appendContextEntry = string_context.appendContextEntry;
@@ -169,6 +171,8 @@ fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
 }
 
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
+    drv_probe.buildEnter();
+    defer drv_probe.buildExit();
     const name_id = try self.intern.intern("name");
     const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
@@ -240,6 +244,24 @@ const NormalizedDerivation = struct {
     }
 };
 
+/// Peek an attr value's thunk state at the moment the derivation walk is
+/// about to force it, and report the classification to the drv-probe.
+/// No-op (and elided) unless `-Ddrv-probe` is set.
+fn probeAttr(self: anytype, value: Value) void {
+    if (comptime !drv_probe.enabled) return;
+    if (!value.isThunk()) {
+        drv_probe.recordAttr(.immediate);
+        return;
+    }
+    const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
+    const state: thunk_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+    drv_probe.recordAttr(switch (state) {
+        .resolved => .ahead,
+        .evaluating, .blackhole => .in_flight,
+        .unresolved, .errored => .inline_forced,
+    });
+}
+
 fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, output_names: DerivationOutputNames) !NormalizedDerivation {
     var owned_strings: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
@@ -287,13 +309,20 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         // the queues are full; main just forces those itself inline.
         for (original_attrs) |entry| {
             if (!entry.value.isThunk()) continue;
-            if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId())) break;
+            const ok = self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId());
+            drv_probe.recordFanout(ok);
+            if (!ok) break;
         }
         for (original_attrs) |entry| {
             const attr_name_text = self.intern.get(entry.name);
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
+            // Classify the attr's thunk state at first touch — before either
+            // force site below — to split resolved-ahead vs forced-inline.
+            // (Slight over-count: output/`outputs` attrs skipped below when
+            // !ignore_nulls are still classified; ~1 attr/build, negligible.)
+            probeAttr(self, entry.value);
             if (ignore_nulls and (try vm_force.forceValue(self, entry.value)).isNull()) continue;
             if (isDerivationOutputAttr(self, attr_name, output_names.names)) continue;
             if (std.mem.eql(u8, attr_name, "outputs")) {
@@ -312,6 +341,7 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         try env.append(self.allocator, .{ .name = output.name, .value = "" });
     }
 
+    drv_probe.recordFanin(inputs.input_drvs.items.len);
     const input_drvs = try inputs.input_drvs.toOwnedSlice(self.allocator);
     errdefer self.allocator.free(input_drvs);
     const input_srcs = try inputs.input_srcs.toOwnedSlice(self.allocator);

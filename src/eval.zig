@@ -45,6 +45,7 @@ const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
 const trace_probe = @import("probe/trace_probe.zig");
+const drv_probe = @import("probe/drv_probe.zig");
 const ngram_probe = @import("probe/ngram_probe.zig");
 const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
@@ -185,6 +186,7 @@ pub const Evaluator = struct {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         trace_probe.report();
         struct_census.report();
+        drv_probe.report();
         ngram_probe.report();
         if (comptime tjit_hot.enabled) self.reportHotAnchors();
         if (comptime tjit_exec.enabled) tjit_exec.report();

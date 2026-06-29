@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
     const prof_path = b.option(bool, "prof-path", "Record the force-call tree (workers=1) and report the critical path + source-attributed profile; print via --print-sched-stats") orelse false;
     const trace_probe = b.option(bool, "trace-probe", "Measure tracing-JIT headroom: per-thunk read-count histogram (single-use vs shared) + body-size distribution. Run at --workers=1.") orelse false;
     const struct_census = b.option(bool, "struct-census", "Measure deforestation headroom: per-list/attrset consume-count histogram (single-use vs shared). Run at --workers=1.") orelse false;
+    const drv_probe = b.option(bool, "drv-probe", "Measure derivation-build demand: per-attr resolved-ahead vs forced-inline, fanout ok/rej, and serial input-DAG depth/fan-in. Depth meaningful only at --workers=1.") orelse false;
     const opcode_ngram = b.option(bool, "opcode-ngram", "Profile hottest adjacent (fall-through) opcode pairs for superinstruction fusion. Run at --workers=1.") orelse false;
     const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
     const timeline = b.option(bool, "timeline", "Record a wall-clock event timeline (parse/compile/import phases, fiber-run quanta, idle parks) per worker; write Perfetto JSON via --timeline[=path].") orelse false;
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "prof_path", prof_path);
     build_options.addOption(bool, "trace_probe", trace_probe);
     build_options.addOption(bool, "struct_census", struct_census);
+    build_options.addOption(bool, "drv_probe", drv_probe);
     build_options.addOption(bool, "opcode_ngram", opcode_ngram);
     build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
