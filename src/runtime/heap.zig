@@ -15,6 +15,7 @@
 //!     they have a published ObjectId.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const types = @import("types.zig");
 const stable = @import("stable_segments.zig");
 const worker_id_mod = @import("worker_id.zig");
@@ -219,6 +220,15 @@ pub const HeapLocal = struct {
     attr_pos: LocalChunk = .{},
 };
 
+/// GC Phase 0 sampling hook (gated behind `-Dgc`). The heap can't reach
+/// the evaluator's roots, so the evaluator registers a callback the
+/// allocation path fires every `gc_sample_interval` object allocations.
+/// Type-erased to keep the heap free of an `eval`/`gc` import cycle.
+pub const GcHook = struct {
+    ctx: *anyopaque,
+    sample: *const fn (*anyopaque) void,
+};
+
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     objects: ObjectStore,
@@ -240,6 +250,11 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
+    /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
+    /// builds so there is zero footprint.
+    gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
+    gc_sample_interval: if (build_options.gc) u64 else void = if (build_options.gc) std.math.maxInt(u64) else {},
+    gc_alloc_counter: if (build_options.gc) u64 else void = if (build_options.gc) 0 else {},
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
@@ -568,6 +583,14 @@ pub const ObjectHeap = struct {
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
+    /// Register the GC Phase 0 sampler (no-op in non-`-Dgc` builds). The
+    /// hook fires from `add` every `interval` object allocations.
+    pub fn setGcHook(self: *ObjectHeap, hook: GcHook, interval: u64) void {
+        if (comptime !build_options.gc) return;
+        self.gc_hook = hook;
+        self.gc_sample_interval = interval;
+    }
+
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
         const id = try self.reserveObjectSlot();
         self.fillObjectSlot(id, object);
@@ -576,6 +599,12 @@ pub const ObjectHeap = struct {
                 .list => struct_census.recordAlloc(id, .list),
                 .attrs, .merge_attrs => struct_census.recordAlloc(id, .attrs),
                 else => {},
+            }
+        }
+        if (comptime build_options.gc) {
+            self.gc_alloc_counter += 1;
+            if (self.gc_alloc_counter % self.gc_sample_interval == 0) {
+                if (self.gc_hook) |h| h.sample(h.ctx);
             }
         }
         return id;

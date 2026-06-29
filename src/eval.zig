@@ -44,6 +44,8 @@ const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
+const gc = @import("runtime").gc;
+const thunk_mod = @import("runtime").thunk;
 const trace_probe = @import("probe/trace_probe.zig");
 const drv_probe = @import("probe/drv_probe.zig");
 const ngram_probe = @import("probe/ngram_probe.zig");
@@ -100,6 +102,9 @@ pub const Evaluator = struct {
     /// concurrently by helper-thread import compiles, hence the mutex.
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
     retained_arenas_mu: SpinMutex,
+    /// GC Phase 0 (`-Dgc`): reusable live-set marker driven by the heap's
+    /// periodic sample hook. `void` in normal builds.
+    gc_tracer: if (gc.enabled) gc.Tracer else void,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -144,6 +149,7 @@ pub const Evaluator = struct {
             .deferred_table = deferred_mod.Table.init(allocator),
             .retained_arenas = .empty,
             .retained_arenas_mu = .{},
+            .gc_tracer = if (gc.enabled) gc.Tracer.init(allocator) else {},
         };
     }
 
@@ -186,6 +192,12 @@ pub const Evaluator = struct {
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         trace_probe.report();
         struct_census.report();
+        if (comptime gc.enabled) {
+            gc.recordFinal(gc.totalStats(&self.heap));
+            self.gcBenchAtEnd();
+            gc.report();
+            self.gc_tracer.deinit();
+        }
         drv_probe.report();
         ngram_probe.report();
         if (comptime tjit_hot.enabled) self.reportHotAnchors();
@@ -602,7 +614,78 @@ pub const Evaluator = struct {
             initVmForWorkerSlot,
         );
         self.main_worker = w;
+        // GC Phase 0: register the live-set sampler now that `self` is at
+        // its final address (init returns by value). Fires from the heap's
+        // object-allocation path every SAMPLE_INTERVAL allocs.
+        if (comptime gc.enabled) self.heap.setGcHook(.{ .ctx = self, .sample = gcSampleThunk }, gc.SAMPLE_INTERVAL);
         return w;
+    }
+
+    /// Type-erased trampoline for the heap's GC sample hook.
+    fn gcSampleThunk(ctx: *anyopaque) void {
+        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        self.gcSample();
+    }
+
+    /// GC Phase 0: mark the live object graph from roots (no reclaim) and
+    /// record the live-set high-water. Runs inline on the lone mutator at
+    /// `--workers=1` — see docs/gc-plan.md for the root set.
+    fn gcSample(self: *Evaluator) void {
+        if (comptime !gc.enabled) return;
+        const tr = &self.gc_tracer;
+        tr.reset(self.heap.objects.count()) catch return;
+        self.gcMarkRoots(tr);
+        tr.drain(&self.heap);
+        gc.recordSample(tr.stats, gc.totalStats(&self.heap));
+    }
+
+    /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
+    fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
+        if (self.builtins_value) |b| tr.markValue(&self.heap, b);
+        // Every fiber's VM stack/frames/upvalues (main worker only — the
+        // probe runs single-threaded; helper workers own their VMs on
+        // their own stacks and aren't enumerable here).
+        if (self.main_worker) |w| {
+            for (w.fibers.items) |f| gcMarkVm(tr, &self.heap, &f.vm);
+        }
+        // Resolved import results.
+        var it = self.imports.entries.iterator();
+        while (it.next()) |e| {
+            const entry = e.value_ptr.*;
+            if (entry.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved))
+                tr.markValue(&self.heap, entry.result);
+        }
+        // Lazy-derivation cache (Value bits keyed by attrs id).
+        var dit = self.derivations.lazy_drv_cache.iterator();
+        while (dit.next()) |e| tr.markValue(&self.heap, .{ .bits = e.value_ptr.* });
+    }
+
+    /// GC Phase 0: at end of eval (clean single-threaded context, live set
+    /// at its plateau), time a serial mark then run the parallel-mark
+    /// scaling microbench — does dividing the ~live-object walk across
+    /// worker threads actually shrink the pause, or is it bandwidth-bound?
+    fn gcBenchAtEnd(self: *Evaluator) void {
+        if (comptime !gc.enabled) return;
+        const tr = &self.gc_tracer;
+        const t0 = gc.nowNs();
+        tr.reset(self.heap.objects.count()) catch return;
+        self.gcMarkRoots(tr);
+        tr.drain(&self.heap);
+        gc.recordSerialMark(gc.nowNs() - t0, tr.stats.objects);
+
+        const ids = tr.collectLiveIds(self.allocator) catch return;
+        defer self.allocator.free(ids);
+        gc.benchParallelMark(self.allocator, &self.heap, ids);
+    }
+
+    fn gcMarkVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *const VM) void {
+        if (comptime !gc.enabled) return;
+        tr.markValue(heap, vm.builtins);
+        for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
+        for (vm.frames[0..vm.frames_len]) |frame| {
+            if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
+        }
+        for (vm.native_upvalues) |v| tr.markValue(heap, v);
     }
 
     fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {

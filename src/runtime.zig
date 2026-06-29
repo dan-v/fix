@@ -22,6 +22,7 @@ pub const paths = @import("runtime/paths.zig");
 pub const worker_id = @import("runtime/worker_id.zig");
 pub const stable_segments = @import("runtime/stable_segments.zig");
 pub const struct_census = @import("runtime/struct_census.zig");
+pub const gc = @import("runtime/gc.zig");
 pub const builtins = @import("runtime/builtins.zig");
 pub const file_cache = @import("runtime/file_cache.zig");
 pub const fetch_cache = @import("runtime/fetch_cache.zig");
