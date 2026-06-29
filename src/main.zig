@@ -30,7 +30,17 @@ const subcommands = [_]Subcommand{
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    // The std-provided Debug `gpa` captures a DWARF stack trace on every
+    // alloc/free, under a global mutex. On an eval-heavy run that's a ~30x
+    // slowdown (w=1 nixos_toplevel: ~80s vs ~3s ReleaseSafe) — slow enough
+    // to look like a hang, and it masks any real parallelism behaviour
+    // because the allocator serialises everything. Use our own
+    // DebugAllocator with trace capture off: same double-free / leak
+    // detection, none of the per-alloc unwind cost. Release builds keep
+    // the fast std `gpa` untouched (perf numbers depend on it).
+    var debug_gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug_gpa.deinit();
+    const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else init.gpa;
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
     defer args_iter.deinit();
