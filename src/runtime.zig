@@ -36,4 +36,5 @@ pub const BuiltinId = builtins.BuiltinId;
 test {
     _ = heap;
     _ = stable_segments;
+    _ = gc;
 }

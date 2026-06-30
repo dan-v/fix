@@ -151,6 +151,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // The `runtime` module is a separate module, so its unit tests
+    // (stable_segments, gc reclaim, …) aren't collected by the root-module
+    // test artifacts above. Run them explicitly.
+    const runtime_tests = b.addTest(.{
+        .root_module = runtime_mod,
+        .use_llvm = true,
+    });
+    const run_runtime_tests = b.addRunArtifact(runtime_tests);
+
     // Module-boundary import lint (tools/lint_imports.zig). Catches relative
     // imports that reach into a clean-cut module's files instead of going
     // through `@import("<module>")` — those silently duplicate-compile.
@@ -170,6 +179,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lint.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_runtime_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);

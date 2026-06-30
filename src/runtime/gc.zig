@@ -516,3 +516,45 @@ pub fn report() void {
 
     std.debug.print("note: run at --workers=1 (driver scans the main worker's fibers only).\n", .{});
 }
+
+test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses them" {
+    if (comptime !enabled) return; // reclaim machinery is `-Dgc`-gated
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+    heap.gcEnableCollect();
+
+    // Live tree: outer list -> inner list. Garbage: two unreferenced lists.
+    const inner = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
+    const outer = try heap.addList(&.{Value.list(inner)});
+    const g1 = try heap.addList(&.{ Value.int(7), Value.int(8), Value.int(9) }); // same len as inner
+    const g2 = try heap.addList(&.{Value.int(42)});
+    _ = g1;
+    _ = g2;
+    const count_before = heap.objects.count();
+
+    // Mark from the single root `outer`; inner must survive transitively.
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(outer));
+    tr.drain(&heap);
+    try std.testing.expectEqual(@as(u64, 2), tr.stats.objects); // outer + inner live
+
+    const st = heap.sweep(tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 2), st.objects_freed); // g1 + g2 dead
+
+    // Live objects survive intact.
+    try std.testing.expectEqual(@as(usize, 1), try heap.getListLen(outer));
+    try std.testing.expectEqual(@as(usize, 3), try heap.getListLen(inner));
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getListItem(inner, 1)).asInt());
+
+    // A new len-3 list reuses g1's freed value range + a freed object slot,
+    // so neither the object store nor the value store grows.
+    const values_before = heap.values.count();
+    const reused = try heap.addList(&.{ Value.int(100), Value.int(200), Value.int(300) });
+    try std.testing.expectEqual(count_before, heap.objects.count()); // slot reused
+    try std.testing.expectEqual(values_before, heap.values.count()); // value range reused
+    try std.testing.expectEqual(@as(i64, 200), (try heap.getListItem(reused, 1)).asInt());
+}
+
