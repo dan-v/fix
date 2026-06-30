@@ -170,6 +170,11 @@ pub const VM = struct {
     /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
     lazy_shells_visible: bool,
 
+    /// GC (`-Dgc`): the value currently being forced, rooted across a
+    /// safepoint collection because it may be off the VM stack. `null_val`
+    /// outside a collection; `void` in normal builds.
+    gc_extra_root: if (build_options.gc) Value else void = if (build_options.gc) Value.null_val else {},
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *ChunkRegistry,

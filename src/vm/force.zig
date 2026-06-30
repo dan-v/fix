@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -261,6 +262,17 @@ pub inline fn specBailRequested(self: *const VM) bool {
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
+    // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
+    // boundary; collect here, never mid-allocation. The value being forced
+    // may be off the VM stack (passed by value), so root it explicitly
+    // across the collection. See docs/gc-plan.md.
+    if (comptime build_options.gc) {
+        if (demand and self.heap.gcCollectRequested()) {
+            self.gc_extra_root = thunk_val;
+            self.heap.gcRunCollect();
+            self.gc_extra_root = Value.null_val;
+        }
+    }
     const t = prof.start(.force_thunk_slow);
     defer prof.end(.force_thunk_slow, t);
     const thunk_id = thunk_val.asObjectId();

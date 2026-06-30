@@ -289,8 +289,11 @@ pub const ObjectHeap = struct {
     /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
     /// builds so there is zero footprint.
     gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
-    gc_sample_interval: if (build_options.gc) u64 else void = if (build_options.gc) std.math.maxInt(u64) else {},
     gc_alloc_counter: if (build_options.gc) u64 else void = if (build_options.gc) 0 else {},
+    /// Set by the allocation path when total reserved bytes cross
+    /// `gc_threshold_bytes`; consumed at the next safepoint poll.
+    gc_collect_requested: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    gc_threshold_bytes: if (build_options.gc) u64 else void = if (build_options.gc) std.math.maxInt(u64) else {},
     /// GC reclaim state (`-Dgc`). Inert until `gc_collect_enabled` is set
     /// (the evaluator turns it on only at `--workers=1` for now — the
     /// alloc-bitmap maintenance is not yet thread-safe). When off, the
@@ -654,12 +657,11 @@ pub const ObjectHeap = struct {
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
-    /// Register the GC Phase 0 sampler (no-op in non-`-Dgc` builds). The
-    /// hook fires from `add` every `interval` object allocations.
-    pub fn setGcHook(self: *ObjectHeap, hook: GcHook, interval: u64) void {
+    /// Register the collect callback (no-op in non-`-Dgc` builds). Fired at
+    /// a safepoint via `gcRunCollect` when a collection has been requested.
+    pub fn setGcHook(self: *ObjectHeap, hook: GcHook) void {
         if (comptime !build_options.gc) return;
         self.gc_hook = hook;
-        self.gc_sample_interval = interval;
     }
 
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
@@ -673,9 +675,15 @@ pub const ObjectHeap = struct {
             }
         }
         if (comptime build_options.gc) {
-            self.gc_alloc_counter += 1;
-            if (self.gc_alloc_counter % self.gc_sample_interval == 0) {
-                if (self.gc_hook) |h| h.sample(h.ctx);
+            if (self.gc_collect_enabled) {
+                self.gc_alloc_counter += 1;
+                // Cheap stride: check the byte threshold occasionally, not
+                // every alloc. Setting the flag is all we do here — the
+                // actual collect runs at the next safepoint (forceThunk),
+                // never mid-allocation (in-flight objects aren't rooted).
+                if (self.gc_alloc_counter & (GC_CHECK_STRIDE - 1) == 0 and !self.gc_collect_requested) {
+                    if (self.totalReservedBytes() > self.gc_threshold_bytes) self.gc_collect_requested = true;
+                }
             }
         }
         return id;
@@ -719,10 +727,60 @@ pub const ObjectHeap = struct {
 
     // --- GC reclaim (`-Dgc`, single-threaded for now) ---
 
+    /// Stride between threshold checks in the alloc path (power of two).
+    const GC_CHECK_STRIDE: u64 = 4096;
+    /// Floor on the collection threshold.
+    pub const GC_MIN_THRESHOLD: u64 = 64 << 20;
+    /// Headroom of genuinely-fresh committed pages between collections
+    /// (additive, anchored to the cursor at last collect — see
+    /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
+    pub const GC_HEADROOM: u64 = 32 << 20;
+
     /// Turn on reclaim (alloc-bitmap maintenance + free-list reuse +
-    /// sweep). The evaluator calls this only at `--workers=1`.
-    pub fn gcEnableCollect(self: *ObjectHeap) void {
-        if (comptime build_options.gc) self.gc_collect_enabled = true;
+    /// sweep) with an initial threshold. The evaluator calls this only at
+    /// `--workers=1` (alloc-bitmap maintenance isn't yet thread-safe).
+    pub fn gcEnableCollect(self: *ObjectHeap, initial_threshold: u64) void {
+        if (comptime !build_options.gc) return;
+        self.gc_collect_enabled = true;
+        self.gc_threshold_bytes = initial_threshold;
+    }
+
+    /// Total bytes ever reserved across the four stores — the committed-RSS
+    /// proxy. Reuse keeps the cursors (and this) from growing, so it
+    /// plateaus near the threshold once collection keeps up.
+    pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
+        return @as(u64, self.objects.count()) * @sizeOf(Object) +
+            @as(u64, self.values.count()) * @sizeOf(Value) +
+            @as(u64, self.attrs.count()) * @sizeOf(AttrEntry) +
+            @as(u64, self.attr_positions.count()) * @sizeOf(AttrPosEntry);
+    }
+
+    pub fn gcCollectRequested(self: *const ObjectHeap) bool {
+        if (comptime !build_options.gc) return false;
+        return self.gc_collect_requested;
+    }
+
+    /// Run a collection now via the registered callback (the evaluator's
+    /// mark+sweep). Caller must be at a safepoint.
+    pub fn gcRunCollect(self: *ObjectHeap) void {
+        if (comptime !build_options.gc) return;
+        if (self.gc_hook) |h| h.sample(h.ctx);
+    }
+
+    /// Called by the evaluator after a sweep: clear the request and set the
+    /// next threshold. The store cursors are monotonic — non-moving reuse
+    /// returns freed ranges to the free lists but never lowers
+    /// `totalReservedBytes` — so the threshold must be relative to the
+    /// CURSOR NOW, not the live set: collect again only once we've committed
+    /// another `GC_HEADROOM` of genuinely fresh pages (i.e. the free lists
+    /// drained and the cursor actually grew). Anchoring to live would leave
+    /// the threshold permanently below the cursor → collect every safepoint
+    /// (livelock). `live_bytes` is accepted for stats only.
+    pub fn gcAfterCollect(self: *ObjectHeap, live_bytes: u64) void {
+        if (comptime !build_options.gc) return;
+        _ = live_bytes;
+        self.gc_collect_requested = false;
+        self.gc_threshold_bytes = @max(GC_MIN_THRESHOLD, self.totalReservedBytes() + GC_HEADROOM);
     }
 
     fn gcSetAllocBit(self: *ObjectHeap, id: ObjectId) void {

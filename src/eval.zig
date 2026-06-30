@@ -193,8 +193,7 @@ pub const Evaluator = struct {
         trace_probe.report();
         struct_census.report();
         if (comptime gc.enabled) {
-            gc.recordFinal(gc.totalStats(&self.heap));
-            self.gcBenchAtEnd();
+            gc.recordFinalTotal(self.heap.totalReservedBytes());
             gc.report();
             self.gc_tracer.deinit();
         }
@@ -614,29 +613,44 @@ pub const Evaluator = struct {
             initVmForWorkerSlot,
         );
         self.main_worker = w;
-        // GC Phase 0: register the live-set sampler now that `self` is at
-        // its final address (init returns by value). Fires from the heap's
-        // object-allocation path every SAMPLE_INTERVAL allocs.
-        if (comptime gc.enabled) self.heap.setGcHook(.{ .ctx = self, .sample = gcSampleThunk }, gc.SAMPLE_INTERVAL);
+        // GC (`-Dgc`): register the collect callback now that `self` is at
+        // its final address (init returns by value), and enable reclaim —
+        // only at --workers=1 for now (alloc-bitmap maintenance isn't yet
+        // thread-safe). The collect runs at the forceThunk safepoint when
+        // the allocation path has crossed the byte threshold.
+        if (comptime gc.enabled) {
+            if (self.worker_count == 1) {
+                self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
+                self.heap.gcEnableCollect(ObjectHeap.GC_MIN_THRESHOLD);
+            }
+        }
         return w;
     }
 
-    /// Type-erased trampoline for the heap's GC sample hook.
-    fn gcSampleThunk(ctx: *anyopaque) void {
+    /// Type-erased trampoline for the heap's collect callback.
+    fn gcCollectThunk(ctx: *anyopaque) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        self.gcSample();
+        self.gcCollect();
     }
 
-    /// GC Phase 0: mark the live object graph from roots (no reclaim) and
-    /// record the live-set high-water. Runs inline on the lone mutator at
-    /// `--workers=1` — see docs/gc-plan.md for the root set.
-    fn gcSample(self: *Evaluator) void {
+    /// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
+    /// live graph from roots, sweep dead objects/ranges into the free
+    /// lists, set the next threshold from the surviving live set. Runs on
+    /// the lone mutator at --workers=1; see docs/gc-plan.md for the roots.
+    fn gcCollect(self: *Evaluator) void {
         if (comptime !gc.enabled) return;
         const tr = &self.gc_tracer;
-        tr.reset(self.heap.objects.count()) catch return;
+        tr.reset(self.heap.objects.count()) catch {
+            // Can't size the mark bitmap — skip this collection rather than
+            // risk an unmarked sweep. Bump the threshold so we don't spin.
+            self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+            return;
+        };
         self.gcMarkRoots(tr);
         tr.drain(&self.heap);
-        gc.recordSample(tr.stats, gc.totalStats(&self.heap));
+        const st = self.heap.sweep(tr.mark_bits);
+        self.heap.gcAfterCollect(tr.stats.bytes);
+        gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
     }
 
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
@@ -660,27 +674,10 @@ pub const Evaluator = struct {
         while (dit.next()) |e| tr.markValue(&self.heap, .{ .bits = e.value_ptr.* });
     }
 
-    /// GC Phase 0: at end of eval (clean single-threaded context, live set
-    /// at its plateau), time a serial mark then run the parallel-mark
-    /// scaling microbench — does dividing the ~live-object walk across
-    /// worker threads actually shrink the pause, or is it bandwidth-bound?
-    fn gcBenchAtEnd(self: *Evaluator) void {
-        if (comptime !gc.enabled) return;
-        const tr = &self.gc_tracer;
-        const t0 = gc.nowNs();
-        tr.reset(self.heap.objects.count()) catch return;
-        self.gcMarkRoots(tr);
-        tr.drain(&self.heap);
-        gc.recordSerialMark(gc.nowNs() - t0, tr.stats.objects);
-
-        const ids = tr.collectLiveIds(self.allocator) catch return;
-        defer self.allocator.free(ids);
-        gc.benchParallelMark(self.allocator, &self.heap, ids);
-    }
-
     fn gcMarkVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *const VM) void {
         if (comptime !gc.enabled) return;
         tr.markValue(heap, vm.builtins);
+        tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
         for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
         for (vm.frames[0..vm.frames_len]) |frame| {
             if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
