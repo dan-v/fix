@@ -90,6 +90,13 @@ pub const Tracer = struct {
         return true;
     }
 
+    /// Is `id` already marked? (Oracle: detect what precise roots missed.)
+    pub fn isMarked(self: *const Tracer, id: ObjectId) bool {
+        const word = id >> 6;
+        if (word >= self.mark_bits.len) return false;
+        return self.mark_bits[word] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+    }
+
     /// Mark the heap object a Value references, if any. Non-heap Values
     /// (int/float/bool/null/string/path/builtin) are ignored.
     pub fn markValue(self: *Tracer, heap: *const ObjectHeap, v: Value) void {
