@@ -27,15 +27,15 @@ pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
 }
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
-    // GC (`-Dgc`): mark that we're inside native builtin code. The
-    // collector only runs at native-call depth 0 (a bytecode-level force),
-    // where the root set is provably complete — the operand stack + frames.
-    // Inside a builtin, live values sit in Zig locals the collector can't
-    // see, so we never collect here; collection defers to the next
-    // depth-0 force. This is precise safepoint placement, not a scan.
-    if (comptime build_options.gc) self.native_depth += 1;
+    // GC (`-Dgc`): raise the per-thread native depth for the duration of the
+    // builtin. Collections only fire at depth 0, so while any builtin is
+    // active none of its Zig-local heap refs can be observed by a collection
+    // — builtins need no GC-rooting of their own (correct-by-default). The
+    // one exception, `import`/`scopedImport`, drops back to the caller's
+    // depth for the imported eval (see `Evaluator.evaluateSource`).
+    if (comptime build_options.gc) force.native_depth += 1;
     defer if (comptime build_options.gc) {
-        self.native_depth -= 1;
+        force.native_depth -= 1;
     };
     return vm_builtins.applyBuiltin(self, builtin_id, args);
 }

@@ -495,6 +495,16 @@ pub const Evaluator = struct {
         defer if (comptime gc.enabled) {
             _ = self.gc_import_vms.pop();
         };
+        // Depth-transparent import: we got here from inside the
+        // `import`/`scopedImport` builtin (which raised native_depth). Drop
+        // back to the caller's depth for the imported eval so that a
+        // top-level import still collects (depth 0), while an import nested
+        // inside another builtin stays gated (that builtin's depth). This is
+        // what keeps builtins correct-by-default. See vm/force.zig.
+        if (comptime gc.enabled) vm_force.native_depth -= 1;
+        defer if (comptime gc.enabled) {
+            vm_force.native_depth += 1;
+        };
         return vm.eval(chunk_id);
     }
 

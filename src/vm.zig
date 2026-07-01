@@ -175,12 +175,6 @@ pub const VM = struct {
     /// outside a collection; `void` in normal builds.
     gc_extra_root: if (build_options.gc) Value else void = if (build_options.gc) Value.null_val else {},
 
-    /// GC (`-Dgc`): native-builtin call depth. The collector only runs at
-    /// depth 0 (a bytecode-level force), where the root set is provably the
-    /// operand stack + frames. Inside builtins (depth > 0) live values hide
-    /// in Zig locals, so collection defers. `void` in normal builds.
-    native_depth: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
-
     /// GC (`-Dgc`): the chain of thunks currently being forced on this
     /// fiber (A forces B forces C …). Each is claimed/`.evaluating` and off
     /// the operand stack while its body runs, so without this a collection

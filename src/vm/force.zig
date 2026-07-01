@@ -261,6 +261,16 @@ pub inline fn specBailRequested(self: *const VM) bool {
     return self.in_speculation and self.scheduler.backgroundSuppressed();
 }
 
+/// GC (`-Dgc`): per-THREAD native-builtin call depth. Collections only run
+/// at depth 0 — a point where NO builtin frame is active anywhere on the
+/// thread, so a builtin may hold heap refs in Zig locals freely (they can
+/// never be observed by a collection). This is what makes writing a builtin
+/// correct-by-default. Per-thread (not per-VM) because imports evaluate on
+/// fresh VMs but the same OS thread; `import`/`scopedImport` are
+/// depth-transparent (see `Evaluator.evaluateSource`) so a top-level import
+/// still collects while an import nested inside another builtin does not.
+pub threadlocal var native_depth: u32 = 0;
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
@@ -270,7 +280,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
         // Collect only at native-call depth 0: a bytecode-level force where
         // the root set is provably complete (operand stack + frames). Never
         // inside a native builtin, whose intermediates live in Zig locals.
-        if (demand and self.native_depth == 0 and self.heap.gcCollectRequested()) {
+        if (demand and native_depth == 0 and self.heap.gcCollectRequested()) {
             self.gc_extra_root = thunk_val;
             self.heap.gcRunCollect();
             self.gc_extra_root = Value.null_val;

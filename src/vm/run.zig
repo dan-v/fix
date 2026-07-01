@@ -814,27 +814,32 @@ fn opInitCellSlotLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
 fn opGetAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const name_id = readU16(code, ip);
-    const attrs_val = stack.pop(vm);
+    // Keep attrs_val on the stack across getAttrValue (which forces the
+    // attrset AND the looked-up value — the second force would otherwise
+    // expose a popped attrs_val). Replace it in place with the result.
+    const attrs_val = vm.stack[vm.sp - 1];
     const result = try access.getAttrValue(vm, attrs_val, @intCast(name_id));
-    try stack.push(vm, result);
+    vm.stack[vm.sp - 1] = result;
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
 fn opGetAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const name_id: InternId = readU32(code, ip);
-    const attrs_val = stack.pop(vm);
+    const attrs_val = vm.stack[vm.sp - 1];
     const result = try access.getAttrValue(vm, attrs_val, name_id);
-    try stack.push(vm, result);
+    vm.stack[vm.sp - 1] = result;
     return dispatch(vm, frame, code, ip + 4, stop_depth);
 }
 
 fn opGetAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const name_val = try force.forceValue(vm, stack.pop(vm));
+    // [attrs, name] both stay on the stack across the forces.
+    const name_val = try force.forceValue(vm, vm.stack[vm.sp - 1]);
     if (!name_val.isString()) return error.TypeError;
-    const attrs_val = stack.pop(vm);
+    const attrs_val = vm.stack[vm.sp - 2];
     const result = try access.getAttrValue(vm, attrs_val, name_val.asInternId());
+    vm.sp -= 2;
     try stack.push(vm, result);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
@@ -954,8 +959,9 @@ fn opHasAttrPath(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 2;
-    const attrs_val = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], false)));
+    const attrs_val = vm.stack[vm.sp - 1]; // stays on stack across the path walk
+    const r = try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], false);
+    vm.stack[vm.sp - 1] = Value.boolVal(r);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
 
@@ -964,8 +970,9 @@ fn opHasAttrPathLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_d
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 4;
-    const attrs_val = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], true)));
+    const attrs_val = vm.stack[vm.sp - 1];
+    const r = try access.hasAttrPath(vm, attrs_val, code[names_start..names_end], true);
+    vm.stack[vm.sp - 1] = Value.boolVal(r);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
 
@@ -1003,15 +1010,14 @@ fn opHasAttrPathMixed(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
             else => return error.InvalidBytecode,
         }
     }
-    const dynamic_names = try vm.allocator.alloc(Value, dynamic_count);
-    defer vm.allocator.free(dynamic_names);
-    var dynamic_i: usize = dynamic_count;
-    while (dynamic_i > 0) {
-        dynamic_i -= 1;
-        dynamic_names[dynamic_i] = stack.pop(vm);
-    }
-    const attrs_val = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try access.hasAttrPathMixed(vm, attrs_val, dynamic_names, code[segments_start..cur_ip], segment_count)));
+    // [attrs, dyn0, …, dynN-1] stay on the stack across the (forcing) walk;
+    // pass a stack slice for the dynamic names (no heap alloc), drop after.
+    const dyn_base = vm.sp - dynamic_count;
+    const dynamic_names = vm.stack[dyn_base..vm.sp];
+    const attrs_val = vm.stack[dyn_base - 1];
+    const r = try access.hasAttrPathMixed(vm, attrs_val, dynamic_names, code[segments_start..cur_ip], segment_count);
+    vm.sp -= (1 + dynamic_count);
+    try stack.push(vm, Value.boolVal(r));
     return dispatch(vm, frame, code, cur_ip, stop_depth);
 }
 
