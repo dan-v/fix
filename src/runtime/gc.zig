@@ -231,6 +231,29 @@ var objects_freed_total: u64 = 0;
 var last_live_bytes: u64 = 0;
 var peak_total_bytes: u64 = 0;
 var final_total_bytes: u64 = 0;
+var mark_ns_total: u64 = 0;
+var sweep_ns_total: u64 = 0;
+
+pub const Breakdown = struct {
+    obj_live: u64,
+    obj_reserved: u64,
+    val_live: u64,
+    val_reserved: u64,
+    attr_live: u64,
+    attr_reserved: u64,
+};
+var last_breakdown: Breakdown = std.mem.zeroes(Breakdown);
+
+pub fn recordTiming(mark_ns: u64, sweep_ns: u64) void {
+    if (comptime !enabled) return;
+    mark_ns_total += mark_ns;
+    sweep_ns_total += sweep_ns;
+}
+
+pub fn recordBreakdown(b: Breakdown) void {
+    if (comptime !enabled) return;
+    last_breakdown = b;
+}
 
 /// Record one completed collection: objects freed, surviving live bytes,
 /// and total reserved bytes (the committed-RSS high-water for this cycle).
@@ -252,6 +275,11 @@ fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
+fn pct(live: u64, reserved: u64) f64 {
+    if (reserved == 0) return 0;
+    return 100.0 * @as(f64, @floatFromInt(live)) / @as(f64, @floatFromInt(reserved));
+}
+
 pub fn report() void {
     if (comptime !enabled) return;
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
@@ -263,6 +291,13 @@ pub fn report() void {
     std.debug.print("live after last collect: {d:.1} MB\n", .{mb(last_live_bytes)});
     std.debug.print("peak reserved (RSS ceiling held): {d:.1} MB\n", .{mb(peak_total_bytes)});
     std.debug.print("final reserved: {d:.1} MB\n", .{mb(final_total_bytes)});
+    std.debug.print("mark time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(mark_ns_total)) / 1e6});
+    std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
+    const b = last_breakdown;
+    std.debug.print("last-collect per-store (live / reserved):\n", .{});
+    std.debug.print("  objects: {d} / {d} ({d:.0}% live)\n", .{ b.obj_live, b.obj_reserved, pct(b.obj_live, b.obj_reserved) });
+    std.debug.print("  values:  {d} / {d} ({d:.0}% live)\n", .{ b.val_live, b.val_reserved, pct(b.val_live, b.val_reserved) });
+    std.debug.print("  attrs:   {d} / {d} ({d:.0}% live)\n", .{ b.attr_live, b.attr_reserved, pct(b.attr_live, b.attr_reserved) });
     if (collections == 0)
         std.debug.print("(no collection — eval stayed under the threshold)\n", .{});
 }

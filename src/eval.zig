@@ -671,11 +671,29 @@ pub const Evaluator = struct {
             self.heap.gcAfterCollect(self.heap.totalReservedBytes());
             return;
         };
+        const t0 = gcNowNs();
         self.gcMarkRoots(tr);
         tr.drain(&self.heap); // full precise closure
+        const t1 = gcNowNs();
         const st = self.heap.sweep(tr.mark_bits);
+        const t2 = gcNowNs();
         self.heap.gcAfterCollect(tr.stats.bytes);
         gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
+        gc.recordTiming(t1 - t0, t2 - t1);
+        gc.recordBreakdown(.{
+            .obj_live = tr.stats.objects,
+            .obj_reserved = self.heap.objects.count(),
+            .val_live = tr.stats.values,
+            .val_reserved = self.heap.values.count(),
+            .attr_live = tr.stats.attrs,
+            .attr_reserved = self.heap.attrs.count(),
+        });
+    }
+
+    fn gcNowNs() u64 {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
