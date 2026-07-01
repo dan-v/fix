@@ -684,7 +684,15 @@ pub const Evaluator = struct {
         // probe runs single-threaded; helper workers own their VMs on
         // their own stacks and aren't enumerable here).
         if (self.main_worker) |w| {
-            for (w.fibers.items) |f| gcMarkVm(tr, &self.heap, &f.vm);
+            for (w.fibers.items) |f| {
+                gcMarkVm(tr, &self.heap, &f.vm);
+                // A task assigned to a fiber is out of the scheduler queue
+                // but still a live reference until the fiber processes it.
+                if (f.current_task) |task| switch (task) {
+                    .force_thunk => |id| tr.markObject(&self.heap, id),
+                    .force_list_range => |r| tr.markObject(&self.heap, r.list_id),
+                };
+            }
         }
         // Transient import VMs (not in the fiber list).
         for (self.gc_import_vms.items) |ivm| gcMarkVm(tr, &self.heap, ivm);

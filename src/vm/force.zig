@@ -261,6 +261,25 @@ pub inline fn specBailRequested(self: *const VM) bool {
     return self.in_speculation and self.scheduler.backgroundSuppressed();
 }
 
+/// Force the operand at stack depth `depth` (0 = top) IN PLACE: force it
+/// while it stays in its stack slot, write the forced value back, and
+/// return it. This is the GC-safe replacement for `forceValue(pop())` —
+/// the value never leaves the operand stack, so it (and everything it
+/// reaches) is a precise root across the force, and remains rooted for the
+/// rest of the op. Callers pop only once they're done with all operands.
+/// Use this instead of pop-then-force anywhere an op forces a stack operand.
+pub inline fn forceAt(self: *VM, depth: u32) anyerror!Value {
+    const idx = self.sp - 1 - depth;
+    const v = try forceValue(self, self.stack[idx]);
+    self.stack[idx] = v;
+    return v;
+}
+
+/// Force the top operand in place (see `forceAt`).
+pub inline fn forceTop(self: *VM) anyerror!Value {
+    return forceAt(self, 0);
+}
+
 /// GC (`-Dgc`): per-THREAD native-builtin call depth. Collections only run
 /// at depth 0 — a point where NO builtin frame is active anywhere on the
 /// thread, so a builtin may hold heap refs in Zig locals freely (they can

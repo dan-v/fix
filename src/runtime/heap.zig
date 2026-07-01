@@ -840,6 +840,7 @@ pub const ObjectHeap = struct {
     pub fn sweep(self: *ObjectHeap, mark_bits: []const u64) SweepStats {
         var st: SweepStats = .{};
         if (comptime !build_options.gc) return st;
+        if (comptime gc_debug) self.gcVerifyMarkClosed(mark_bits);
         const n = self.objects.count();
         var id: ObjectId = 0;
         while (id < n) : (id += 1) {
@@ -855,6 +856,66 @@ pub const ObjectHeap = struct {
             st.objects_freed += 1;
         }
         return st;
+    }
+
+    /// Debug: verify the mark is closed — no MARKED object may reference an
+    /// unmarked filled object. A violation means the tracer missed an edge
+    /// (systematic bug); silence means marking is complete and any swept
+    /// object is genuinely unreachable (held only by a Zig local / untracked
+    /// root). Prints up to a few violations. STW-only.
+    fn gcVerifyMarkClosed(self: *ObjectHeap, mark_bits: []const u64) void {
+        const marked = struct {
+            fn f(mb: []const u64, ab: []const u64, id: ObjectId) bool {
+                const w = id >> 6;
+                const bit = @as(u64, 1) << @intCast(id & 63);
+                if (w >= ab.len or ab[w] & bit == 0) return false; // not filled
+                return w < mb.len and (mb[w] & bit != 0);
+            }
+        }.f;
+        const check = struct {
+            fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, shown: *u32) void {
+                if (!(child_v.isList() or child_v.isAttrs() or child_v.isThunk() or child_v.isClosure() or
+                    child_v.isBuiltinClosure() or child_v.isContextString() or child_v.isBoxedInt() or child_v.isPartialApp())) return;
+                const child = child_v.asObjectId();
+                const w = child >> 6;
+                const bit = @as(u64, 1) << @intCast(child & 63);
+                const filled = w < h.gc_alloc_bits.len and (h.gc_alloc_bits[w] & bit != 0);
+                if (!filled) return;
+                const cmarked = w < mb.len and (mb[w] & bit != 0);
+                if (!cmarked and shown.* < 8) {
+                    std.debug.print("  TRACER-MISSED EDGE: marked {d} ({s}) -> unmarked {d} ({s})\n", .{ parent, @tagName(h.objects.get(parent).*), child, @tagName(h.objects.get(child).*) });
+                    shown.* += 1;
+                }
+            }
+        }.f;
+        var shown: u32 = 0;
+        var id: ObjectId = 0;
+        const n = self.objects.count();
+        while (id < n and shown < 8) : (id += 1) {
+            if (!marked(mark_bits, self.gc_alloc_bits, id)) continue;
+            const obj = self.objects.get(id);
+            switch (obj.*) {
+                .list => |r| for (self.values.slice(r)) |v| check(self, mark_bits, id, v, &shown),
+                .attrs => |a| for (self.attrs.slice(a.range)) |e| check(self, mark_bits, id, e.value, &shown),
+                .closure => |c| for (self.values.slice(c.upvalues)) |v| check(self, mark_bits, id, v, &shown),
+                .builtin_closure => |c| for (self.values.slice(c.args)) |v| check(self, mark_bits, id, v, &shown),
+                .partial_app => |p| {
+                    check(self, mark_bits, id, p.func, &shown);
+                    for (self.values.slice(p.args)) |v| check(self, mark_bits, id, v, &shown);
+                },
+                .context_string => |c| for (self.attrs.slice(c.context)) |e| check(self, mark_bits, id, e.value, &shown),
+                .merge_attrs => |m| {
+                    check(self, mark_bits, id, Value.attrs(m.base), &shown);
+                    check(self, mark_bits, id, Value.attrs(m.overlay), &shown);
+                },
+                .thunk => |*t| {
+                    if (@as(@import("thunk.zig").FutureState, @enumFromInt(t.future.state.load(.monotonic))) == .resolved)
+                        check(self, mark_bits, id, t.payload.result, &shown);
+                },
+                else => {},
+            }
+        }
+        if (shown > 0) std.debug.print("=== ^ mark NOT closed: tracer missed edges (bug) ===\n", .{});
     }
 
     /// Return a dead object's owned store ranges to the free lists. Ranges

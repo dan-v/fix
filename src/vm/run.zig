@@ -242,11 +242,11 @@ fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
 
 fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    // Force both operands while they stay on the stack: forcing `b` leaves
-    // its (memoised) value reachable via the on-stack slot while `a` is
-    // forced, and vice-versa — so a GC at either force can't free them.
-    const b = try force.forceValue(vm, vm.stack[vm.sp - 1]);
-    const a = try force.forceValue(vm, vm.stack[vm.sp - 2]);
+    // Force both operands in place (they stay on the stack, so a GC at
+    // either force keeps both rooted); drop only after. `forceAt` is the
+    // GC-safe primitive — never `forceValue(pop())`. See vm/force.zig.
+    const b = try force.forceTop(vm);
+    const a = try force.forceAt(vm, 1);
     stack.dropBin(vm);
     if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
         try stack.push(vm, try numeric.add(vm.heap, a, b));
