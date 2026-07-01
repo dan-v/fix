@@ -385,12 +385,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // upvalues) for the duration of its body: a collection
                 // triggered by a nested force must not sweep it. See
                 // docs/gc-plan.md (the force-chain root).
-                if (comptime build_options.gc) {
-                    self.gc_force_chain.append(self.allocator, thunk_id) catch {};
-                }
-                defer if (comptime build_options.gc) {
-                    _ = self.gc_force_chain.pop();
-                };
+                // TEST: force chain removed — is the in-flight thunk already
+                // reachable via its container/cache/stack root?
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {

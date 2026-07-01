@@ -297,7 +297,6 @@ pub const ObjectHeap = struct {
     /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
     /// builds so there is zero footprint.
     gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
-    gc_alloc_counter: if (build_options.gc) u64 else void = if (build_options.gc) 0 else {},
     /// Set by the allocation path when total reserved bytes cross
     /// `gc_threshold_bytes`; consumed at the next safepoint poll.
     gc_collect_requested: if (build_options.gc) bool else void = if (build_options.gc) false else {},
@@ -686,18 +685,6 @@ pub const ObjectHeap = struct {
                 else => {},
             }
         }
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
-                self.gc_alloc_counter += 1;
-                // Cheap stride: check the byte threshold occasionally, not
-                // every alloc. Setting the flag is all we do here — the
-                // actual collect runs at the next safepoint (forceThunk),
-                // never mid-allocation (in-flight objects aren't rooted).
-                if (self.gc_alloc_counter & (GC_CHECK_STRIDE - 1) == 0 and !self.gc_collect_requested) {
-                    if (self.totalReservedBytes() > self.gc_threshold_bytes) self.gc_collect_requested = true;
-                }
-            }
-        }
         return id;
     }
 
@@ -726,6 +713,18 @@ pub const ObjectHeap = struct {
         chunk.segment = refilled.segment;
         chunk.cursor = refilled.offset;
         chunk.end = refilled.offset + refilled.len;
+        // GC threshold check lives here on the chunk-refill slow path (once
+        // per OBJECT_CHUNK_SIZE allocs), never on the per-alloc fast path.
+        // While the heap is growing (free lists empty) every chunk refills,
+        // so the byte threshold is sampled finely; once collecting starts
+        // and slots are reused, refills — and this check — go quiet.
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled and !self.gc_collect_requested and
+                self.totalReservedBytes() > self.gc_threshold_bytes)
+            {
+                self.gc_collect_requested = true;
+            }
+        }
         const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
         chunk.cursor += 1;
         return id;
@@ -733,15 +732,18 @@ pub const ObjectHeap = struct {
 
     pub fn fillObjectSlot(self: *ObjectHeap, id: ObjectId, object: Object) void {
         self.objects.getMut(id).* = object;
-        if (comptime build_options.gc) {
+        // In the UAF-detector build the alloc bitmap must be live between
+        // collections (every heap read asserts the bit), so set it per fill.
+        // In release builds the bitmap is reconstructed at collection time
+        // (`gcReconstructAllocBits`) from the id range minus the free lists,
+        // keeping this hot path free of GC work.
+        if (comptime gc_debug) {
             if (self.gc_collect_enabled) self.gcSetAllocBit(id);
         }
     }
 
     // --- GC reclaim (`-Dgc`, single-threaded for now) ---
 
-    /// Stride between threshold checks in the alloc path (power of two).
-    const GC_CHECK_STRIDE: u64 = 4096;
     /// Floor on the collection threshold.
     pub const GC_MIN_THRESHOLD: u64 = 64 << 20;
     /// Headroom of genuinely-fresh committed pages between collections
@@ -821,6 +823,56 @@ pub const ObjectHeap = struct {
         self.token = next_heap_token.fetchAdd(1, .monotonic);
     }
 
+    /// Rebuild the alloc bitmap (which slots are filled-and-live) from
+    /// scratch at a collection safepoint, so the per-alloc fast path needn't
+    /// set bits incrementally. Filled = every tracked id `[track_from,
+    /// count)` MINUS (a) each worker's reserved-but-unfilled object-chunk
+    /// tail and (b) the currently-free slots. Relies on the object id space
+    /// being dense with no gaps other than the per-worker current-chunk tail
+    /// — true at `--workers=1` (the only mode reclaim runs in), where the
+    /// lone worker fills each chunk fully before refilling. Release builds
+    /// only; the detector build keeps the incremental bitmap (it asserts
+    /// liveness on every read, between collections).
+    fn gcReconstructAllocBits(self: *ObjectHeap) void {
+        const n = self.objects.count();
+        const words = (@as(usize, n) + 63) >> 6;
+        if (self.gc_alloc_bits.len < words) {
+            const old_len = self.gc_alloc_bits.len;
+            self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch return;
+            @memset(self.gc_alloc_bits[old_len..words], 0);
+        }
+        @memset(self.gc_alloc_bits[0..words], 0);
+        gcSetBitRange(self.gc_alloc_bits, self.gc_track_from, n);
+        // Exclude each worker's reserved-but-unfilled current object chunk.
+        for (self.worker_locals) |*wl| {
+            const lo = ObjectStore.globalIdOf(wl.object.segment, wl.object.cursor);
+            const hi = ObjectStore.globalIdOf(wl.object.segment, wl.object.end);
+            if (hi > lo) gcClearBitRange(self.gc_alloc_bits, lo, hi);
+        }
+        // Exclude slots already on the object free list.
+        for (self.gc_free_objects.items) |id| {
+            const word = id >> 6;
+            if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+        }
+    }
+
+    /// Set alloc bits for the half-open id range `[lo, hi)`.
+    fn gcSetBitRange(bits: []u64, lo: ObjectId, hi: ObjectId) void {
+        var id = lo;
+        while (id < hi and (id & 63) != 0) : (id += 1) bits[id >> 6] |= @as(u64, 1) << @intCast(id & 63);
+        while (id + 64 <= hi) : (id += 64) bits[id >> 6] = ~@as(u64, 0);
+        while (id < hi) : (id += 1) bits[id >> 6] |= @as(u64, 1) << @intCast(id & 63);
+    }
+
+    /// Clear alloc bits for the half-open id range `[lo, hi)`.
+    fn gcClearBitRange(bits: []u64, lo: ObjectId, hi: ObjectId) void {
+        var id = lo;
+        while (id < hi) : (id += 1) {
+            const word = id >> 6;
+            if (word < bits.len) bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+        }
+    }
+
     fn gcSetAllocBit(self: *ObjectHeap, id: ObjectId) void {
         const word = id >> 6;
         if (word >= self.gc_alloc_bits.len) {
@@ -840,6 +892,9 @@ pub const ObjectHeap = struct {
     pub fn sweep(self: *ObjectHeap, mark_bits: []const u64) SweepStats {
         var st: SweepStats = .{};
         if (comptime !build_options.gc) return st;
+        // Release builds don't maintain the alloc bitmap incrementally —
+        // rebuild it here from the live id range minus the free lists.
+        if (comptime !gc_debug) self.gcReconstructAllocBits();
         if (comptime gc_debug) self.gcVerifyMarkClosed(mark_bits);
         const n = self.objects.count();
         var id: ObjectId = 0;
