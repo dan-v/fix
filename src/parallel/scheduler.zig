@@ -29,6 +29,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("runtime").types;
 const stable = @import("runtime").stable_segments;
+const gc = @import("runtime").gc;
+const heap_mod = @import("runtime").heap;
 
 pub const Task = union(enum) {
     /// Speculatively force a thunk to its result. The thunk lives in the
@@ -145,6 +147,22 @@ const TaskQueue = struct {
 
     fn deinit(self: *TaskQueue, allocator: std.mem.Allocator) void {
         allocator.free(self.tasks);
+    }
+
+    /// GC (`-Dgc`): mark the objects referenced by pending tasks. A queued
+    /// `force_thunk`/`force_list_range` is a live reference (a helper — or,
+    /// after this collection, demand — may still force it). Called only at
+    /// the STW safepoint, so `top..bottom` is stable.
+    fn gcMark(self: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+        const t = self.top.load(.monotonic);
+        const b = self.bottom.load(.monotonic);
+        var i = t;
+        while (i != b) : (i +%= 1) {
+            switch (self.tasks[@intCast(i & self.mask)]) {
+                .force_thunk => |id| tr.markObject(heap, id),
+                .force_list_range => |r| tr.markObject(heap, r.list_id),
+            }
+        }
     }
 
     /// Owner-only. Returns false on full.
@@ -266,6 +284,7 @@ pub const Scheduler = struct {
     /// `submitUrgent`. Drained with priority over speculative tasks so
     /// fan-out and strictness-driven submissions don't sit behind a
     /// queued speculation backlog.
+    // (GC hook defined below via gcMarkPendingTasks)
     urgent_queues: []TaskQueue,
     /// Per-worker queue of *speculative* tasks — submitted via
     /// `submit` when `makeThunk`'s heuristic suggests the body is
@@ -456,6 +475,15 @@ pub const Scheduler = struct {
             if (value <= current) return;
             if (slot.cmpxchgWeak(current, value, .monotonic, .monotonic) == null) return;
         }
+    }
+
+    /// GC (`-Dgc`): mark all objects referenced by pending tasks across
+    /// every worker's urgent + spec queues. Roots for the collector — a
+    /// queued task will still be forced. STW-only.
+    pub fn gcMarkPendingTasks(self: *const Scheduler, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+        if (comptime !gc.enabled) return;
+        for (self.urgent_queues) |*q| q.gcMark(tr, heap);
+        for (self.spec_queues) |*q| q.gcMark(tr, heap);
     }
 
     pub fn deinit(self: *Scheduler) void {

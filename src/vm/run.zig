@@ -242,8 +242,12 @@ fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
 
 fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = try force.forceValue(vm, stack.pop(vm));
-    const a = try force.forceValue(vm, stack.pop(vm));
+    // Force both operands while they stay on the stack: forcing `b` leaves
+    // its (memoised) value reachable via the on-stack slot while `a` is
+    // forced, and vice-versa — so a GC at either force can't free them.
+    const b = try force.forceValue(vm, vm.stack[vm.sp - 1]);
+    const a = try force.forceValue(vm, vm.stack[vm.sp - 2]);
+    stack.dropBin(vm);
     if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
         try stack.push(vm, try numeric.add(vm.heap, a, b));
     } else if (a.isPath()) {
@@ -329,17 +333,21 @@ fn opDivFloat(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
 
 fn opEq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try equality.valuesEqual(vm, a, b)));
+    // Operands stay on the stack across valuesEqual (which forces deeply, a
+    // GC safepoint) so they remain precise roots; drop only after.
+    const ops = stack.binTop(vm);
+    const result = try equality.valuesEqual(vm, ops.left, ops.right);
+    stack.dropBin(vm);
+    try stack.push(vm, Value.boolVal(result));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opNeq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(!try equality.valuesEqual(vm, a, b)));
+    const ops = stack.binTop(vm);
+    const result = try equality.valuesEqual(vm, ops.left, ops.right);
+    stack.dropBin(vm);
+    try stack.push(vm, Value.boolVal(!result));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -359,34 +367,36 @@ fn opNeqNull(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: us
 
 fn opLt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try equality.compareValues(vm, a, b) == .lt));
+    const ops = stack.binTop(vm);
+    const r = try equality.compareValues(vm, ops.left, ops.right);
+    stack.dropBin(vm);
+    try stack.push(vm, Value.boolVal(r == .lt));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opLte(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    const r = try equality.compareValues(vm, a, b);
+    const ops = stack.binTop(vm);
+    const r = try equality.compareValues(vm, ops.left, ops.right);
+    stack.dropBin(vm);
     try stack.push(vm, Value.boolVal(r == .lt or r == .eq));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opGt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    try stack.push(vm, Value.boolVal(try equality.compareValues(vm, a, b) == .gt));
+    const ops = stack.binTop(vm);
+    const r = try equality.compareValues(vm, ops.left, ops.right);
+    stack.dropBin(vm);
+    try stack.push(vm, Value.boolVal(r == .gt));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opGte(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const b = stack.pop(vm);
-    const a = stack.pop(vm);
-    const r = try equality.compareValues(vm, a, b);
+    const ops = stack.binTop(vm);
+    const r = try equality.compareValues(vm, ops.left, ops.right);
+    stack.dropBin(vm);
     try stack.push(vm, Value.boolVal(r == .gt or r == .eq));
     return dispatch(vm, frame, code, ip, stop_depth);
 }
@@ -475,31 +485,34 @@ fn opBuildList(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: 
 
 fn opMergeAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const right = stack.pop(vm);
-    const left = stack.pop(vm);
+    // Keep both operands on the stack across mergeAttrs (forces + allocates,
+    // a GC safepoint) so they stay precise roots; drop only after.
+    const ops = stack.binTop(vm);
     const t = prof.start(.merge_attrs);
-    const merged = try objects.mergeAttrs(vm, left, right);
+    const merged = try objects.mergeAttrs(vm, ops.left, ops.right);
     prof.end(.merge_attrs, t);
+    stack.dropBin(vm);
     try stack.push(vm, merged);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opMergeAttrsStrict(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const right = stack.pop(vm);
-    const left = stack.pop(vm);
+    const ops = stack.binTop(vm);
     const t = prof.start(.merge_attrs);
-    const merged = try objects.mergeAttrsStrict(vm, left, right);
+    const merged = try objects.mergeAttrsStrict(vm, ops.left, ops.right);
     prof.end(.merge_attrs, t);
+    stack.dropBin(vm);
     try stack.push(vm, merged);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
 fn opConcatLists(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const right = stack.pop(vm);
-    const left = stack.pop(vm);
-    try stack.push(vm, try objects.concatLists(vm, left, right));
+    const ops = stack.binTop(vm);
+    const result = try objects.concatLists(vm, ops.left, ops.right);
+    stack.dropBin(vm);
+    try stack.push(vm, result);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -828,20 +841,24 @@ fn opGetAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
 
 fn opGetAttrDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
-    const default_val = stack.pop(vm);
-    const name_val = try force.forceValue(vm, stack.pop(vm));
+    // Operands [attrs, name, default] stay on the stack across all forces
+    // (GC safepoints) so they remain precise roots; drop only after.
+    const default_val = vm.stack[vm.sp - 1];
+    const name_val = try force.forceValue(vm, vm.stack[vm.sp - 2]);
     if (!name_val.isString()) return error.TypeError;
-    const attrs_val = stack.pop(vm);
-    const attrs = try force.forceValue(vm, attrs_val);
+    const attrs = try force.forceValue(vm, vm.stack[vm.sp - 3]);
+    var result: Value = undefined;
     if (!attrs.isAttrs()) {
-        try stack.push(vm, try force.forceValue(vm, default_val));
+        result = try force.forceValue(vm, default_val);
     } else {
-        const result = vm.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
+        result = vm.heap.getAttrValue(attrs.asObjectId(), name_val.asInternId()) catch |err| switch (err) {
             error.MissingAttribute => try force.forceValue(vm, default_val),
             else => return err,
         };
-        try stack.push(vm, try force.forceValue(vm, result));
+        result = try force.forceValue(vm, result);
     }
+    vm.sp -= 3;
+    try stack.push(vm, result);
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
@@ -850,10 +867,13 @@ fn opGetAttrPathDynamicOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, s
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 2;
-    const default_val = stack.pop(vm);
-    const name_val = stack.pop(vm);
-    const attrs_val = stack.pop(vm);
+    // [attrs, name, default] stay on the stack across the (internally
+    // forcing) helper so they remain precise GC roots; drop only after.
+    const default_val = vm.stack[vm.sp - 1];
+    const name_val = vm.stack[vm.sp - 2];
+    const attrs_val = vm.stack[vm.sp - 3];
     const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], false);
+    vm.sp -= 3;
     try stack.push(vm, result);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
@@ -863,10 +883,11 @@ fn opGetAttrPathDynamicOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usiz
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 4;
-    const default_val = stack.pop(vm);
-    const name_val = stack.pop(vm);
-    const attrs_val = stack.pop(vm);
+    const default_val = vm.stack[vm.sp - 1];
+    const name_val = vm.stack[vm.sp - 2];
+    const attrs_val = vm.stack[vm.sp - 3];
     const result = try access.getAttrPathDynamicOrValue(vm, attrs_val, name_val, default_val, code[names_start..names_end], true);
+    vm.sp -= 3;
     try stack.push(vm, result);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
@@ -876,9 +897,12 @@ fn opGetAttrPathOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 2;
-    const default_val = stack.pop(vm);
-    const attrs_val = stack.pop(vm);
+    // [attrs, default] stay on the stack across the (internally forcing)
+    // helper so they remain precise GC roots; drop only after.
+    const default_val = vm.stack[vm.sp - 1];
+    const attrs_val = vm.stack[vm.sp - 2];
     const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], false);
+    vm.sp -= 2;
     try stack.push(vm, result);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
@@ -888,9 +912,10 @@ fn opGetAttrPathOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop
     const segment_count = code[ip];
     const names_start = ip + 1;
     const names_end = names_start + @as(usize, segment_count) * 4;
-    const default_val = stack.pop(vm);
-    const attrs_val = stack.pop(vm);
+    const default_val = vm.stack[vm.sp - 1];
+    const attrs_val = vm.stack[vm.sp - 2];
     const result = try access.getAttrPathOrValue(vm, attrs_val, default_val, code[names_start..names_end], true);
+    vm.sp -= 2;
     try stack.push(vm, result);
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
@@ -910,16 +935,16 @@ fn opGetAttrPathMixedOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, sto
             else => return error.InvalidBytecode,
         }
     }
-    const default_val = stack.pop(vm);
-    const dynamic_names = try vm.allocator.alloc(Value, dynamic_count);
-    defer vm.allocator.free(dynamic_names);
-    var dynamic_i: usize = dynamic_count;
-    while (dynamic_i > 0) {
-        dynamic_i -= 1;
-        dynamic_names[dynamic_i] = stack.pop(vm);
-    }
-    const attrs_val = stack.pop(vm);
+    // Stack layout (bottom→top): [attrs, dyn0, dyn1, …, dynN-1, default].
+    // Read them in place (a slice into the operand stack for the dynamic
+    // names — no heap alloc, and they stay rooted across the internally-
+    // forcing helper); drop all N+2 only after.
+    const default_val = vm.stack[vm.sp - 1];
+    const dyn_base = vm.sp - 1 - dynamic_count;
+    const dynamic_names = vm.stack[dyn_base .. vm.sp - 1];
+    const attrs_val = vm.stack[dyn_base - 1];
     const result = try access.getAttrPathMixedOrValue(vm, attrs_val, dynamic_names, default_val, code[segments_start..cur_ip], segment_count);
+    vm.sp -= (2 + dynamic_count);
     try stack.push(vm, result);
     return dispatch(vm, frame, code, cur_ip, stop_depth);
 }

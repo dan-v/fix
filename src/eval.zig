@@ -102,9 +102,13 @@ pub const Evaluator = struct {
     /// concurrently by helper-thread import compiles, hence the mutex.
     retained_arenas: std.ArrayListUnmanaged(ast_mod.AstArena),
     retained_arenas_mu: SpinMutex,
-    /// GC Phase 0 (`-Dgc`): reusable live-set marker driven by the heap's
-    /// periodic sample hook. `void` in normal builds.
+    /// GC (`-Dgc`): reusable live-set marker driven at collection safepoints.
+    /// `void` in normal builds.
     gc_tracer: if (gc.enabled) gc.Tracer else void,
+    /// GC (`-Dgc`): fresh VMs for in-flight imports/scoped-imports. These
+    /// run on transient stack-local VMs NOT in `main_worker.fibers`, so the
+    /// collector must scan them explicitly or their live values are missed.
+    gc_import_vms: if (gc.enabled) std.ArrayListUnmanaged(*VM) else void,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -150,6 +154,7 @@ pub const Evaluator = struct {
             .retained_arenas = .empty,
             .retained_arenas_mu = .{},
             .gc_tracer = if (gc.enabled) gc.Tracer.init(allocator) else {},
+            .gc_import_vms = if (gc.enabled) .empty else {},
         };
     }
 
@@ -196,6 +201,7 @@ pub const Evaluator = struct {
             gc.recordFinalTotal(self.heap.totalReservedBytes());
             gc.report();
             self.gc_tracer.deinit();
+            self.gc_import_vms.deinit(self.allocator);
         }
         drv_probe.report();
         ngram_probe.report();
@@ -481,6 +487,14 @@ pub const Evaluator = struct {
         }
         var vm = try self.initVm(0);
         defer vm.deinit();
+        // This VM isn't in `main_worker.fibers`, so the collector can't find
+        // its roots on its own — register it for the duration of the import.
+        if (comptime gc.enabled) {
+            self.gc_import_vms.append(self.allocator, &vm) catch {};
+        }
+        defer if (comptime gc.enabled) {
+            _ = self.gc_import_vms.pop();
+        };
         return vm.eval(chunk_id);
     }
 
@@ -662,6 +676,19 @@ pub const Evaluator = struct {
         if (self.main_worker) |w| {
             for (w.fibers.items) |f| gcMarkVm(tr, &self.heap, &f.vm);
         }
+        // Transient import VMs (not in the fiber list).
+        for (self.gc_import_vms.items) |ivm| gcMarkVm(tr, &self.heap, ivm);
+        // Pending scheduler tasks reference thunks/lists that will be forced.
+        self.scheduler.gcMarkPendingTasks(tr, &self.heap);
+        // Chunk constants can hold heap references (e.g. a scoped-import's
+        // ambient-scope attrset baked in via emitConstant). Chunks are never
+        // GC'd, so their constants are permanent roots.
+        const chunk_count = self.registry.count();
+        var cid: ChunkId = 0;
+        while (cid < chunk_count) : (cid += 1) {
+            const ch = self.registry.get(cid) orelse continue;
+            for (ch.constants) |c| tr.markValue(&self.heap, c);
+        }
         // Resolved import results.
         var it = self.imports.entries.iterator();
         while (it.next()) |e| {
@@ -678,6 +705,7 @@ pub const Evaluator = struct {
         if (comptime !gc.enabled) return;
         tr.markValue(heap, vm.builtins);
         tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
+        for (vm.gc_force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
         for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
         for (vm.frames[0..vm.frames_len]) |frame| {
             if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);

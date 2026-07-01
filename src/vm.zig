@@ -181,6 +181,13 @@ pub const VM = struct {
     /// in Zig locals, so collection defers. `void` in normal builds.
     native_depth: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
 
+    /// GC (`-Dgc`): the chain of thunks currently being forced on this
+    /// fiber (A forces B forces C …). Each is claimed/`.evaluating` and off
+    /// the operand stack while its body runs, so without this a collection
+    /// triggered by a nested force would sweep the outer in-flight thunks
+    /// (and their target closures). Marked as roots. `void` in normal builds.
+    gc_force_chain: if (build_options.gc) std.ArrayListUnmanaged(types.ObjectId) else void = if (build_options.gc) .empty else {},
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *ChunkRegistry,
@@ -246,6 +253,7 @@ pub const VM = struct {
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
         if (comptime tjit_record.enabled) tjit_record.cleanup(self);
+        if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);
         self.allocator.free(self.stack);
         self.allocator.free(self.frames);
     }

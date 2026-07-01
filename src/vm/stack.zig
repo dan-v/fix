@@ -82,3 +82,17 @@ pub fn pop(self: *VM) Value {
 pub fn setStack(self: *VM, idx: u32, val: Value) void {
     self.stack[idx] = val;
 }
+
+/// The top two operands (`left` = second-from-top, `right` = top) WITHOUT
+/// popping. A binary op reads them, calls a helper that may force them
+/// (a GC safepoint), and only then drops via `dropBin` — so the operands
+/// stay on the operand stack (precise GC roots) across the force. Forcing
+/// a thunk memoises its result into the thunk, which the on-stack slot
+/// keeps reachable, so no write-back is needed. See docs/gc-plan.md.
+pub inline fn binTop(self: *VM) struct { left: Value, right: Value } {
+    return .{ .left = self.stack[self.sp - 2], .right = self.stack[self.sp - 1] };
+}
+
+pub inline fn dropBin(self: *VM) void {
+    self.sp -= 2;
+}

@@ -342,6 +342,16 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
+                // Root this in-flight thunk (and thus its target closure /
+                // upvalues) for the duration of its body: a collection
+                // triggered by a nested force must not sweep it. See
+                // docs/gc-plan.md (the force-chain root).
+                if (comptime build_options.gc) {
+                    self.gc_force_chain.append(self.allocator, thunk_id) catch {};
+                }
+                defer if (comptime build_options.gc) {
+                    _ = self.gc_force_chain.pop();
+                };
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {

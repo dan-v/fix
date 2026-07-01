@@ -15,8 +15,16 @@
 //!     they have a published ObjectId.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const types = @import("types.zig");
+
+/// Deterministic use-after-free detector (ReleaseSafe `-Dgc` only): when
+/// on, freed object slots are NOT reused and every object read asserts the
+/// slot's alloc-bit is set — so a collection that frees a still-live object
+/// traps at the first stale read with a stack trace, instead of a
+/// nondeterministic segfault much later. Off in ReleaseFast (production).
+const gc_debug = build_options.gc and builtin.mode == .ReleaseSafe;
 const stable = @import("stable_segments.zig");
 const worker_id_mod = @import("worker_id.zig");
 const struct_census = @import("struct_census.zig");
@@ -299,6 +307,10 @@ pub const ObjectHeap = struct {
     /// alloc-bitmap maintenance is not yet thread-safe). When off, the
     /// allocator hot path is exactly as in a non-`-Dgc` build.
     gc_collect_enabled: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    /// First ObjectId tracked by the alloc-bitmap (set at gcEnableCollect).
+    /// Objects created before collection was enabled aren't tracked/swept,
+    /// so the detector's assert skips them.
+    gc_track_from: if (build_options.gc) ObjectId else void = if (build_options.gc) 0 else {},
     /// One bit per ObjectId: set when a slot is *filled* (a real object),
     /// cleared when swept. Lets `sweep` tell live objects from TLAB-
     /// reserved-but-unfilled slots and already-freed slots.
@@ -569,7 +581,7 @@ pub const ObjectHeap = struct {
 
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and n > 0) {
+            if (self.gc_collect_enabled and !gc_debug and n > 0) {
                 if (self.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
@@ -617,7 +629,7 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and n > 0) {
+            if (self.gc_collect_enabled and !gc_debug and n > 0) {
                 if (self.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
@@ -638,7 +650,7 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and n > 0) {
+            if (self.gc_collect_enabled and !gc_debug and n > 0) {
                 if (self.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
@@ -698,7 +710,8 @@ pub const ObjectHeap = struct {
     /// observe the in-flight slot.
     pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled) {
+            // Detector keeps freed slots unused so use-after-free is caught.
+            if (self.gc_collect_enabled and !gc_debug) {
                 if (self.gc_free_objects.pop()) |id| return id;
             }
         }
@@ -743,6 +756,25 @@ pub const ObjectHeap = struct {
         if (comptime !build_options.gc) return;
         self.gc_collect_enabled = true;
         self.gc_threshold_bytes = initial_threshold;
+        self.gc_track_from = self.objects.count();
+    }
+
+    /// Is the alloc-bit set for `id`? (Detector helper.)
+    fn gcAllocBitSet(self: *const ObjectHeap, id: ObjectId) bool {
+        const word = id >> 6;
+        if (word >= self.gc_alloc_bits.len) return false;
+        return self.gc_alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+    }
+
+    /// Detector: trap if a *tracked* slot is read after being freed.
+    inline fn gcAssertLive(self: *const ObjectHeap, id: ObjectId) void {
+        if (comptime !gc_debug) return;
+        if (self.gc_collect_enabled and id >= self.gc_track_from and !self.gcAllocBitSet(id)) {
+            // Reuse is off in the detector, so the slot still holds its real
+            // payload — print the kind so we know which root is missing.
+            std.debug.print("GC use-after-free: object {d} (kind={s}) read after sweep\n", .{ id, @tagName(self.objects.get(id).*) });
+            @panic("gc use-after-free");
+        }
     }
 
     /// Total bytes ever reserved across the four stores — the committed-RSS
@@ -781,6 +813,12 @@ pub const ObjectHeap = struct {
         _ = live_bytes;
         self.gc_collect_requested = false;
         self.gc_threshold_bytes = @max(GC_MIN_THRESHOLD, self.totalReservedBytes() + GC_HEADROOM);
+        // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
+        // that key on `token`: they hold Values weakly (not GC roots), so a
+        // swept object could still be reachable through a stale cache slot.
+        // A fresh unique token makes every existing slot miss. This is why
+        // caches needn't be traced (see docs/gc-plan.md).
+        self.token = next_heap_token.fetchAdd(1, .monotonic);
     }
 
     fn gcSetAllocBit(self: *ObjectHeap, id: ObjectId) void {
@@ -847,10 +885,12 @@ pub const ObjectHeap = struct {
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
+        self.gcAssertLive(id);
         return self.objects.getMut(id);
     }
 
     pub fn getConst(self: *const ObjectHeap, id: ObjectId) *const Object {
+        self.gcAssertLive(id);
         return self.objects.get(id);
     }
 
