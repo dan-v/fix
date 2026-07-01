@@ -280,6 +280,31 @@ fn pct(live: u64, reserved: u64) f64 {
     return 100.0 * @as(f64, @floatFromInt(live)) / @as(f64, @floatFromInt(reserved));
 }
 
+/// Peak resident set size in bytes (kernel high-water, never decreases).
+pub fn peakRssBytes() u64 {
+    const ru = std.posix.getrusage(std.posix.rusage.SELF);
+    return @as(u64, @intCast(ru.maxrss)) * 1024; // ru_maxrss is KiB on Linux
+}
+
+/// Current resident set size in bytes, read from /proc/self/statm (field 2
+/// = resident pages). Returns 0 if unavailable.
+pub fn currentRssBytes() u64 {
+    var buf: [128]u8 = undefined;
+    const linux = std.os.linux;
+    const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
+    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+    if (fd < 0) return 0;
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, &buf, buf.len);
+    const rd: isize = @bitCast(n);
+    if (rd <= 0) return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(rd)], ' ');
+    _ = it.next() orelse return 0; // total program size
+    const resident = it.next() orelse return 0;
+    const pages = std.fmt.parseInt(u64, resident, 10) catch return 0;
+    return pages * std.heap.pageSize();
+}
+
 pub fn report() void {
     if (comptime !enabled) return;
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
@@ -293,6 +318,8 @@ pub fn report() void {
     std.debug.print("final reserved: {d:.1} MB\n", .{mb(final_total_bytes)});
     std.debug.print("mark time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(mark_ns_total)) / 1e6});
     std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
+    std.debug.print("peak RSS (kernel high-water): {d:.1} MB\n", .{mb(peakRssBytes())});
+    std.debug.print("current RSS (end of eval): {d:.1} MB\n", .{mb(currentRssBytes())});
     const b = last_breakdown;
     std.debug.print("last-collect per-store (live / reserved):\n", .{});
     std.debug.print("  objects: {d} / {d} ({d:.0}% live)\n", .{ b.obj_live, b.obj_reserved, pct(b.obj_live, b.obj_reserved) });
