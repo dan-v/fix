@@ -74,6 +74,16 @@ const MemoSlot = struct {
 };
 threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
 
+/// GC (`-Dgc`): the thunk-result memo holds Values keyed by heap token.
+/// Like the attr cache, an entry can be the momentary sole reference to a
+/// shared result, so mark valid entries (token match) as roots.
+pub fn gcMarkThunkMemo(tr: *@import("runtime").gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+    if (comptime !@import("runtime").gc.enabled) return;
+    for (&thunk_memo) |*slot| {
+        if (slot.token == heap.token) tr.markValue(heap, slot.value);
+    }
+}
+
 inline fn memoSlotIndex(chunk: u32, up0: u64, up1: u64) usize {
     var h: u64 = @as(u64, chunk) *% 0x9E3779B97F4A7C15;
     h ^= up0 *% 0xC2B2AE3D27D4EB4F;

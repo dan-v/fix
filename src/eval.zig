@@ -54,6 +54,11 @@ const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
 const tjit_record = @import("jit/record.zig");
 
+/// Pure-precise push: conservative fiber-stack scan as a safety net.
+/// `false` = precise-only (crashes surface real discipline gaps via the
+/// detector); flip `true` to keep -Dgc working while converting.
+const GC_CONSERVATIVE_NET = false; // TEST: precise-only, with caches scanned
+
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
 
@@ -673,11 +678,14 @@ pub const Evaluator = struct {
         };
         self.gcMarkRoots(tr);
         tr.drain(&self.heap); // full precise closure
-        // Oracle + safety net: conservatively scan the fiber stack. Anything
-        // it marks that precise missed is a value held off the managed stack
-        // (a discipline gap) — log it with the executing op so we can fix it.
-        self.gcScanFiberStackConservative(tr);
-        tr.drain(&self.heap);
+        // Pure-precise push: the conservative fiber-stack scan is a
+        // safety net, off by default so precise-only crashes surface real
+        // managed-stack discipline gaps (dead-local false positives never
+        // crash). Flip on to keep -Dgc working while converting.
+        if (comptime GC_CONSERVATIVE_NET) {
+            self.gcScanFiberStackConservative(tr);
+            tr.drain(&self.heap);
+        }
         const st = self.heap.sweep(tr.mark_bits);
         self.heap.gcAfterCollect(tr.stats.bytes);
         gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
@@ -730,6 +738,10 @@ pub const Evaluator = struct {
         for (self.gc_import_vms.items) |ivm| gcMarkVm(tr, &self.heap, ivm);
         // Pending scheduler tasks reference thunks/lists that will be forced.
         self.scheduler.gcMarkPendingTasks(tr, &self.heap);
+        // Thread-local caches hold Values that can be the momentary sole
+        // reference to a shared object during forcing — mark them.
+        vm_force.gcMarkThunkMemo(tr, &self.heap);
+        @import("vm/access.zig").gcMarkAttrCache(tr, &self.heap);
         // Chunk constants can hold heap references (e.g. a scoped-import's
         // ambient-scope attrset baked in via emitConstant). Chunks are never
         // GC'd, so their constants are permanent roots.

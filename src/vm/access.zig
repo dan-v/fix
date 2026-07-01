@@ -88,6 +88,16 @@ const AttrCacheSlot = struct {
 
 threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
 
+/// GC (`-Dgc`): the attr cache holds attr Values keyed by heap token. Its
+/// entries can be the momentary sole reference to a shared attr value that
+/// is about to be re-accessed, so mark them as roots (valid = token match).
+pub fn gcMarkAttrCache(tr: *@import("runtime").gc.Tracer, heap: *const @import("runtime").heap.ObjectHeap) void {
+    if (comptime !@import("runtime").gc.enabled) return;
+    for (&attr_cache) |*slot| {
+        if (slot.heap_token == heap.token) tr.markValue(heap, slot.value);
+    }
+}
+
 inline fn attrCacheIndex(obj_id: types.ObjectId, name_id: InternId) usize {
     // Mix obj_id and name_id — same lookup site on the same object
     // hits the same slot, but different lookups on the same object
