@@ -677,8 +677,35 @@ pub const Evaluator = struct {
         gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
     }
 
+    /// DIAGNOSTIC: conservatively scan the current fiber's live stack region
+    /// for words that decode to valid live ObjectIds and mark them. If this
+    /// makes -Dgc complete, it proves the remaining missing roots are all
+    /// fiber-stack Zig locals. Not the shipping design — a probe.
+    fn gcScanFiberStackConservative(self: *Evaluator, tr: *gc.Tracer) void {
+        if (comptime !gc.enabled) return;
+        const fib = fiber_mod.currentFiber() orelse return;
+        const base = @intFromPtr(fib.stack.ptr);
+        const top = base + fib.stack.len;
+        var marker: usize = 0;
+        var lo = @intFromPtr(&marker);
+        if (lo < base or lo >= top) return; // not running on this fiber's stack
+        lo = (lo + 7) & ~@as(usize, 7);
+        const count = self.heap.objects.count();
+        var p = lo;
+        while (p + 8 <= top) : (p += 8) {
+            const word = @as(*const u64, @ptrFromInt(p)).*;
+            const v = Value{ .bits = word };
+            if (!(v.isThunk() or v.isList() or v.isAttrs() or v.isClosure() or
+                v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or v.isPartialApp())) continue;
+            const id = v.asObjectId();
+            if (id >= count) continue;
+            tr.markObject(&self.heap, id);
+        }
+    }
+
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
     fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
+        if (comptime gc.enabled) self.gcScanFiberStackConservative(tr); // DIAGNOSTIC probe
         if (self.builtins_value) |b| tr.markValue(&self.heap, b);
         // Every fiber's VM stack/frames/upvalues (main worker only — the
         // probe runs single-threaded; helper workers own their VMs on
