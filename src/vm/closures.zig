@@ -642,10 +642,13 @@ pub fn doCallN(self: *VM, n: u16) !void {
     // General fold: reduce one arg at a time to a value (run-to-completion),
     // then replace [callee, args] with the result. `callValue` is
     // stack-neutral, so the not-yet-consumed args stay put at `base+i`.
+    // Keep `acc` on the stack (the consumed-callee slot at base-1) so it is
+    // a precise GC root across each `callValue` (which forces).
     var acc = callee;
     var i: u16 = 0;
     while (i < n) : (i += 1) {
         acc = try callValue(self, acc, self.stack[base + i]);
+        self.stack[base - 1] = acc;
     }
     self.sp = base - 1;
     try stack.push(self, acc);
@@ -670,6 +673,7 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
     var i: u16 = 0;
     while (i < n) : (i += 1) {
         acc = try callValue(self, acc, self.stack[base + i]);
+        self.stack[base - 1] = acc;
     }
     self.sp = base - 1;
     try stack.push(self, acc);

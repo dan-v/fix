@@ -832,11 +832,17 @@ pub const ObjectHeap = struct {
                 if (a.range.len > 0) self.gc_free_attrs.push(self.allocator, a.range.segment, a.range.offset, a.range.len);
                 if (a.positions.len > 0) self.gc_free_attr_pos.push(self.allocator, a.positions.segment, a.positions.offset, a.positions.len);
             },
-            .closure => |c| if (c.upvalues.len > 0) self.gc_free_values.push(self.allocator, c.upvalues.segment, c.upvalues.offset, c.upvalues.len),
             .builtin_closure => |c| if (c.args.len > 0) self.gc_free_values.push(self.allocator, c.args.segment, c.args.offset, c.args.len),
             .partial_app => |p| if (p.args.len > 0) self.gc_free_values.push(self.allocator, p.args.segment, p.args.offset, p.args.len),
             .context_string => |c| if (c.context.len > 0) self.gc_free_attrs.push(self.allocator, c.context.segment, c.context.offset, c.context.len),
-            .merge_attrs, .boxed_int, .thunk => {},
+            // NOT reclaimed yet: an executing frame aliases its
+            // `upvalues` slice, which is owned by the .closure object (or a
+            // .thunk's spilled storage). Freeing the range while a frame
+            // runs would dangle it. Reclaiming these needs the frame to
+            // root its executing closure/thunk (a follow-up RSS opt);
+            // until then their ranges leak. `merge_attrs`/`boxed_int` own
+            // no reclaimable range.
+            .closure, .thunk, .merge_attrs, .boxed_int => {},
         }
     }
 

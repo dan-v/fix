@@ -267,7 +267,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // may be off the VM stack (passed by value), so root it explicitly
     // across the collection. See docs/gc-plan.md.
     if (comptime build_options.gc) {
-        if (demand and self.heap.gcCollectRequested()) {
+        // Collect only at native-call depth 0: a bytecode-level force where
+        // the root set is provably complete (operand stack + frames). Never
+        // inside a native builtin, whose intermediates live in Zig locals.
+        if (demand and self.native_depth == 0 and self.heap.gcCollectRequested()) {
             self.gc_extra_root = thunk_val;
             self.heap.gcRunCollect();
             self.gc_extra_root = Value.null_val;

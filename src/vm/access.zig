@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -26,6 +27,16 @@ pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
 }
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
+    // GC (`-Dgc`): mark that we're inside native builtin code. The
+    // collector only runs at native-call depth 0 (a bytecode-level force),
+    // where the root set is provably complete — the operand stack + frames.
+    // Inside a builtin, live values sit in Zig locals the collector can't
+    // see, so we never collect here; collection defers to the next
+    // depth-0 force. This is precise safepoint placement, not a scan.
+    if (comptime build_options.gc) self.native_depth += 1;
+    defer if (comptime build_options.gc) {
+        self.native_depth -= 1;
+    };
     return vm_builtins.applyBuiltin(self, builtin_id, args);
 }
 

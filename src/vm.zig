@@ -175,6 +175,12 @@ pub const VM = struct {
     /// outside a collection; `void` in normal builds.
     gc_extra_root: if (build_options.gc) Value else void = if (build_options.gc) Value.null_val else {},
 
+    /// GC (`-Dgc`): native-builtin call depth. The collector only runs at
+    /// depth 0 (a bytecode-level force), where the root set is provably the
+    /// operand stack + frames. Inside builtins (depth > 0) live values hide
+    /// in Zig locals, so collection defers. `void` in normal builds.
+    native_depth: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *ChunkRegistry,
