@@ -74,13 +74,38 @@ const MemoSlot = struct {
 };
 threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
 
-/// GC (`-Dgc`): the thunk-result memo holds Values keyed by heap token.
-/// Like the attr cache, an entry can be the momentary sole reference to a
-/// shared result, so mark valid entries (token match) as roots.
+/// GC (`-Dgc`): the thunk-result memo holds Values keyed by heap token. An
+/// entry can be the momentary sole reference to a shared result, so valid
+/// entries (token match) are roots. The memo is thread-local (per worker),
+/// so each worker publishes the address of *its* memo into a registry the
+/// stop-the-world collector walks — it can't reach other threads' TLS
+/// otherwise. Bounded by worker id (u8).
+const GC_MAX_WORKERS = 256;
+var thunk_memo_registry: [GC_MAX_WORKERS]?*[MEMO_SIZE]MemoSlot = @splat(null);
+
+/// Called by each worker (on its own thread) before it can allocate, so the
+/// collector can mark this worker's memo entries.
+pub fn gcRegisterThunkMemo(worker_id: u8) void {
+    if (comptime !@import("runtime").gc.enabled) return;
+    thunk_memo_registry[worker_id] = &thunk_memo;
+}
+
+/// Register this worker's thread-local GC caches (thunk memo + attr cache)
+/// so the collector can mark them. Called once per worker before it runs.
+pub fn gcRegisterWorkerCaches(worker_id: u8) void {
+    if (comptime !@import("runtime").gc.enabled) return;
+    gcRegisterThunkMemo(worker_id);
+    access.gcRegisterAttrCache(worker_id);
+}
+
+/// Mark every registered worker's live memo entries. STW-only (peers parked).
 pub fn gcMarkThunkMemo(tr: *@import("runtime").gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     if (comptime !@import("runtime").gc.enabled) return;
-    for (&thunk_memo) |*slot| {
-        if (slot.token == heap.token) tr.markValue(heap, slot.value);
+    for (thunk_memo_registry) |maybe| {
+        const memo = maybe orelse continue;
+        for (memo) |*slot| {
+            if (slot.token == heap.token) tr.markValue(heap, slot.value);
+        }
     }
 }
 
@@ -306,13 +331,34 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // may be off the VM stack (passed by value), so root it explicitly
     // across the collection. See docs/gc-plan.md.
     if (comptime build_options.gc) {
-        // Collect only at native-call depth 0: a bytecode-level force where
-        // the root set is provably complete (operand stack + frames). Never
-        // inside a native builtin, whose intermediates live in Zig locals.
-        if (demand and native_depth == 0 and self.heap.gcCollectRequested()) {
-            self.gc_extra_root = thunk_val;
-            self.heap.gcRunCollect();
-            self.gc_extra_root = Value.null_val;
+        // Safepoints only at native-call depth 0: a bytecode-level force
+        // where the root set is provably complete (operand stack + frames).
+        // Never inside a native builtin, whose intermediates live in Zig
+        // locals the collector can't see.
+        if (native_depth == 0) {
+            // Peer: another worker is collecting — park in the stop-the-world
+            // barrier so the heap is stable while it marks/sweeps. Our fiber
+            // (VM stack/frames) is a root it walks; root the in-flight value
+            // too, in case its only reference is this Zig local.
+            if (self.scheduler.gcStopRequested()) {
+                self.gc_extra_root = thunk_val;
+                self.scheduler.gcSafepointPark(self.workerId());
+                self.gc_extra_root = Value.null_val;
+            }
+            // Collector: the threshold was crossed. Win the race to become the
+            // sole collector (others park), stop all peers, then mark+sweep.
+            // At --workers=1 this degenerates to a direct collect (0 peers).
+            if (demand and self.heap.gcCollectRequested()) {
+                self.gc_extra_root = thunk_val;
+                if (self.scheduler.gcTryBeginCollection()) {
+                    self.scheduler.gcWaitAllParked(self.workerId());
+                    self.heap.gcRunCollect();
+                    self.scheduler.gcEndCollection(self.workerId());
+                } else {
+                    self.scheduler.gcSafepointPark(self.workerId());
+                }
+                self.gc_extra_root = Value.null_val;
+            }
         }
     }
     const t = prof.start(.force_thunk_slow);
@@ -383,10 +429,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // Root this in-flight thunk (and thus its target closure /
                 // upvalues) for the duration of its body: a collection
-                // triggered by a nested force must not sweep it. See
-                // docs/gc-plan.md (the force-chain root).
-                // TEST: force chain removed — is the in-flight thunk already
-                // reachable via its container/cache/stack root?
+                // triggered by a nested force (this worker) or by another
+                // worker's stop-the-world must not sweep it. At --workers=1
+                // container-reachability covered this, but at --workers>1 a
+                // peer's in-flight claimed thunk is not otherwise reachable
+                // when the collector runs, so the per-VM force chain is
+                // load-bearing again. See docs/gc-plan.md.
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {

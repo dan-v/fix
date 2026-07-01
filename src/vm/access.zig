@@ -89,12 +89,27 @@ const AttrCacheSlot = struct {
 threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
 
 /// GC (`-Dgc`): the attr cache holds attr Values keyed by heap token. Its
-/// entries can be the momentary sole reference to a shared attr value that
-/// is about to be re-accessed, so mark them as roots (valid = token match).
+/// entries can be the momentary sole reference to a shared attr value, so
+/// valid entries (token match) are roots. Thread-local (per worker), so each
+/// worker publishes its cache address into a registry the stop-the-world
+/// collector walks (it can't reach other threads' TLS otherwise).
+const GC_MAX_WORKERS = 256;
+var attr_cache_registry: [GC_MAX_WORKERS]?*[attr_cache_size]AttrCacheSlot = @splat(null);
+
+/// Called by each worker (on its own thread) before it can allocate.
+pub fn gcRegisterAttrCache(worker_id: u8) void {
+    if (comptime !@import("runtime").gc.enabled) return;
+    attr_cache_registry[worker_id] = &attr_cache;
+}
+
+/// Mark every registered worker's live attr-cache entries. STW-only.
 pub fn gcMarkAttrCache(tr: *@import("runtime").gc.Tracer, heap: *const @import("runtime").heap.ObjectHeap) void {
     if (comptime !@import("runtime").gc.enabled) return;
-    for (&attr_cache) |*slot| {
-        if (slot.heap_token == heap.token) tr.markValue(heap, slot.value);
+    for (attr_cache_registry) |maybe| {
+        const cache = maybe orelse continue;
+        for (cache) |*slot| {
+            if (slot.heap_token == heap.token) tr.markValue(heap, slot.value);
+        }
     }
 }
 

@@ -45,6 +45,7 @@ const vm_force = @import("../vm/force.zig");
 const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
+const gc = @import("runtime").gc;
 const eval_trace = @import("../support/trace.zig");
 const prof = @import("../probe/prof.zig");
 const timeline = @import("../probe/timeline.zig");
@@ -261,10 +262,21 @@ pub const Worker = struct {
         return self.scheduler.isShutdown() or self.shutdown_requested.load(.acquire) != 0;
     }
 
+    /// GC (`-Dgc`): if a collection is in progress on another worker, park
+    /// in the stop-the-world barrier. Called between fibers (depth 0), where
+    /// this worker holds no in-flight allocation and its fibers are the only
+    /// roots the collector needs from it.
+    inline fn gcSafepoint(self: *Worker) void {
+        if (comptime !gc.enabled) return;
+        if (self.scheduler.gcStopRequested()) self.scheduler.gcSafepointPark(self.worker_id);
+    }
+
     /// Helper main loop. Drains until shutdown.
     pub fn run(self: *Worker) void {
         worker_id_mod.current = self.worker_id;
+        if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
         while (!self.shouldStop()) {
+            self.gcSafepoint();
             if (self.drainStep() catch |err| {
                 std.log.err("worker {d} failed to allocate fiber: {s}", .{ self.worker_id, @errorName(err) });
                 continue;
@@ -289,6 +301,7 @@ pub const Worker = struct {
         arg: *anyopaque,
     ) !void {
         worker_id_mod.current = self.worker_id;
+        if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
         // Each top-level entry begins able to start background work.
         self.scheduler.setSuppressBackground(false);
         const top = try self.acquireFreeFiber();
@@ -298,6 +311,7 @@ pub const Worker = struct {
         self.runFiber(top);
 
         while (top.state != .free or self.anyFiberSuspended()) {
+            self.gcSafepoint();
             // The demanded result is ready; stop pulling new background
             // tasks and just drain the in-flight suspended fibers. Without
             // this, dead speculation in the backlog keeps running and
@@ -405,6 +419,7 @@ pub const Worker = struct {
             // available work and busy-spin on it.
             if (!self.scheduler.backgroundSuppressed() and self.scheduler.pending_tasks.load(.monotonic) > 0) return;
             if (self.shouldStop()) return;
+            if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
             std.atomic.spinLoopHint();
         }
 

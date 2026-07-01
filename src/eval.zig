@@ -107,9 +107,18 @@ pub const Evaluator = struct {
     /// `void` in normal builds.
     gc_tracer: if (gc.enabled) gc.Tracer else void,
     /// GC (`-Dgc`): fresh VMs for in-flight imports/scoped-imports. These
-    /// run on transient stack-local VMs NOT in `main_worker.fibers`, so the
-    /// collector must scan them explicitly or their live values are missed.
+    /// run on transient stack-local VMs NOT in a worker's `fibers` list, so
+    /// the collector must scan them explicitly or their live values are
+    /// missed. Guarded by `gc_import_vms_mu` — imports run concurrently at
+    /// --workers>1.
     gc_import_vms: if (gc.enabled) std.ArrayListUnmanaged(*VM) else void,
+    gc_import_vms_mu: if (gc.enabled) SpinMutex else void,
+    /// GC (`-Dgc`): every live `Worker` by id (0 = main, 1.. = helpers).
+    /// The collector walks each worker's fibers for roots. A worker
+    /// registers itself before it can allocate user objects and unregisters
+    /// after it's quiesced, and during a stop-the-world all live workers are
+    /// parked — so the collector reads a stable set.
+    gc_workers: if (gc.enabled) []std.atomic.Value(?*worker_mod.Worker) else void,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -128,6 +137,13 @@ pub const Evaluator = struct {
         const arenas = try allocator.alloc(std.heap.ArenaAllocator, worker_count);
         errdefer allocator.free(arenas);
         for (arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(allocator);
+
+        const gc_workers = if (gc.enabled) blk: {
+            const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
+            for (ws) |*w| w.* = .init(null);
+            break :blk ws;
+        } else {};
+        errdefer if (gc.enabled) allocator.free(gc_workers);
 
         return .{
             .allocator = allocator,
@@ -156,6 +172,8 @@ pub const Evaluator = struct {
             .retained_arenas_mu = .{},
             .gc_tracer = if (gc.enabled) gc.Tracer.init(allocator) else {},
             .gc_import_vms = if (gc.enabled) .empty else {},
+            .gc_import_vms_mu = if (gc.enabled) .{} else {},
+            .gc_workers = gc_workers,
         };
     }
 
@@ -203,6 +221,7 @@ pub const Evaluator = struct {
             gc.report();
             self.gc_tracer.deinit();
             self.gc_import_vms.deinit(self.allocator);
+            self.allocator.free(self.gc_workers);
         }
         drv_probe.report();
         ngram_probe.report();
@@ -488,13 +507,24 @@ pub const Evaluator = struct {
         }
         var vm = try self.initVm(0);
         defer vm.deinit();
-        // This VM isn't in `main_worker.fibers`, so the collector can't find
+        // This VM isn't in any worker's `fibers`, so the collector can't find
         // its roots on its own — register it for the duration of the import.
+        // Concurrent imports at --workers>1 interleave, so guard the list and
+        // remove by value (not LIFO pop).
         if (comptime gc.enabled) {
+            self.gc_import_vms_mu.lock();
             self.gc_import_vms.append(self.allocator, &vm) catch {};
+            self.gc_import_vms_mu.unlock();
         }
         defer if (comptime gc.enabled) {
-            _ = self.gc_import_vms.pop();
+            self.gc_import_vms_mu.lock();
+            for (self.gc_import_vms.items, 0..) |ivm, i| {
+                if (ivm == &vm) {
+                    _ = self.gc_import_vms.swapRemove(i);
+                    break;
+                }
+            }
+            self.gc_import_vms_mu.unlock();
         };
         // Depth-transparent import: we got here from inside the
         // `import`/`scopedImport` builtin (which raised native_depth). Drop
@@ -639,13 +669,22 @@ pub const Evaluator = struct {
         );
         self.main_worker = w;
         // GC (`-Dgc`): register the collect callback now that `self` is at
-        // its final address (init returns by value), and enable reclaim —
-        // only at --workers=1 for now (alloc-bitmap maintenance isn't yet
-        // thread-safe). The collect runs at the forceThunk safepoint when
-        // the allocation path has crossed the byte threshold.
+        // its final address (init returns by value), and enable reclaim. The
+        // collect runs at the forceThunk safepoint when allocation crosses
+        // the byte threshold; at --workers>1 it stops the world (all workers
+        // park at safepoints) before marking. Register worker 0 so the
+        // collector can walk its fibers for roots.
         if (comptime gc.enabled) {
+            self.gc_workers[0].store(w, .release);
+            self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
+            // Reclaim is enabled at --workers=1 (byte-identical, -16% RSS).
+            // The multi-worker stop-the-world path (barrier + per-worker
+            // roots + suspended-fiber conservative scan) is built but the STW
+            // barrier still has a back-to-back-collection handshake race, so
+            // it stays gated off pending a properly generation-tagged
+            // barrier. At --workers>1 the GC is dormant (no collection), so
+            // the evaluator behaves exactly as a non-GC build there.
             if (self.worker_count == 1) {
-                self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
                 self.heap.gcEnableCollect(ObjectHeap.GC_MIN_THRESHOLD);
             }
         }
@@ -696,15 +735,48 @@ pub const Evaluator = struct {
         return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
+    /// Conservatively scan a suspended fiber's live C-stack region for words
+    /// that decode to valid live ObjectIds, marking them. Catches heap refs
+    /// held in native-builtin Zig locals on a fiber that yielded mid-builtin
+    /// (only possible at --workers>1, blocking on a remote thunk). Over-
+    /// approximates (may retain some dead objects), never sweeps a live one.
+    fn gcScanSuspendedFiberStack(tr: *gc.Tracer, heap: *ObjectHeap, fib: *const fiber_mod.Fiber) void {
+        if (fib.state != .suspended) return;
+        const base = @intFromPtr(fib.stack.ptr);
+        const top = base + fib.stack.len;
+        var sp = fib.ctx.rsp;
+        if (sp < base or sp >= top) return; // saved SP not within this stack
+        sp = (sp + 7) & ~@as(usize, 7); // align up to 8
+        const count = heap.objects.count();
+        var p = sp;
+        while (p + 8 <= top) : (p += 8) {
+            const v = Value{ .bits = @as(*const u64, @ptrFromInt(p)).* };
+            if (!gc.hasObjectRef(v)) continue;
+            const id = v.asObjectId();
+            if (id >= count) continue;
+            tr.markObject(heap, id);
+        }
+    }
+
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
     fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
         if (self.builtins_value) |b| tr.markValue(&self.heap, b);
-        // Every fiber's VM stack/frames/upvalues (main worker only — the
-        // probe runs single-threaded; helper workers own their VMs on
-        // their own stacks and aren't enumerable here).
-        if (self.main_worker) |w| {
+        // Every worker's fibers' VM stack/frames/upvalues. At a stop-the-
+        // world every live worker is parked at a safepoint, so its fiber
+        // list is stable and its fibers' VMs hold that worker's roots. The
+        // registry is published by each worker before it can allocate.
+        for (self.gc_workers) |*slot| {
+            const w = slot.load(.acquire) orelse continue;
             for (w.fibers.items) |f| {
                 gcMarkVm(tr, &self.heap, &f.vm);
+                // A fiber that yielded (blocked on a remote thunk) while
+                // inside a native builtin has heap refs in Zig locals on its
+                // own C-stack — invisible to the precise VM scan. Zig gives no
+                // stack maps, so conservatively scan its live stack region.
+                // Only suspended fibers need this (running/parked-at-safepoint
+                // fibers are at native_depth 0, no builtin locals). See
+                // docs/gc-plan.md.
+                if (comptime gc.enabled) gcScanSuspendedFiberStack(tr, &self.heap, &f.inner);
                 // A task assigned to a fiber is out of the scheduler queue
                 // but still a live reference until the fiber processes it.
                 if (f.current_task) |task| switch (task) {
@@ -713,8 +785,10 @@ pub const Evaluator = struct {
                 };
             }
         }
-        // Transient import VMs (not in the fiber list).
+        // Transient import VMs (not in any fiber list).
+        self.gc_import_vms_mu.lock();
         for (self.gc_import_vms.items) |ivm| gcMarkVm(tr, &self.heap, ivm);
+        self.gc_import_vms_mu.unlock();
         // Pending scheduler tasks reference thunks/lists that will be forced.
         self.scheduler.gcMarkPendingTasks(tr, &self.heap);
         // Thread-local caches hold Values that can be the momentary sole
@@ -855,11 +929,20 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
         sched.awaitHelpersQuiescent();
         return;
     };
+    // GC (`-Dgc`): register this helper so the collector can walk its fibers
+    // for roots. Registration happens before `run()` (before any user-object
+    // allocation), and the collector only reads the registry at a stop-the-
+    // world where this worker is parked.
+    if (comptime gc.enabled) ev.gc_workers[worker_id].store(worker, .release);
     worker.run();
     // Wait until ALL helpers have stopped forcing before destroying any
     // fibers — a still-running helper could resolve a thunk and wake a
     // just-freed enrolled fiber (shutdown UAF). See awaitHelpersQuiescent.
     sched.awaitHelpersQuiescent();
+    // Unregister before deinit so a late collection never scans freed fibers.
+    // (After awaitHelpersQuiescent no helper is still forcing, so no
+    // collection can be triggered past this point, but keep the invariant.)
+    if (comptime gc.enabled) ev.gc_workers[worker_id].store(null, .release);
     worker.deinit();
 }
 

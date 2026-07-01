@@ -318,6 +318,11 @@ pub const ObjectHeap = struct {
     gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
     gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
     gc_free_attr_pos: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+    /// Guards free-list reuse pops from concurrent worker allocation paths
+    /// (`--workers>1`). Pushes run only during a stop-the-world (single
+    /// collector), so it's the alloc-path pops that contend. Uncontended at
+    /// `--workers=1`.
+    gc_free_mu: if (build_options.gc) stable.SpinMutex else void = if (build_options.gc) .{} else {},
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
@@ -581,7 +586,10 @@ pub const ObjectHeap = struct {
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                if (self.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                self.gc_free_mu.lock();
+                const reused = self.gc_free_values.pop(n);
+                self.gc_free_mu.unlock();
+                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         const local = self.currentLocal();
@@ -629,7 +637,10 @@ pub const ObjectHeap = struct {
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                if (self.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                self.gc_free_mu.lock();
+                const reused = self.gc_free_attrs.pop(n);
+                self.gc_free_mu.unlock();
+                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         const local = self.currentLocal();
@@ -650,7 +661,10 @@ pub const ObjectHeap = struct {
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                if (self.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                self.gc_free_mu.lock();
+                const reused = self.gc_free_attr_pos.pop(n);
+                self.gc_free_mu.unlock();
+                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         const local = self.currentLocal();
@@ -699,7 +713,10 @@ pub const ObjectHeap = struct {
         if (comptime build_options.gc) {
             // Detector keeps freed slots unused so use-after-free is caught.
             if (self.gc_collect_enabled and !gc_debug) {
-                if (self.gc_free_objects.pop()) |id| return id;
+                self.gc_free_mu.lock();
+                const reused = self.gc_free_objects.pop();
+                self.gc_free_mu.unlock();
+                if (reused) |id| return id;
             }
         }
         const local = self.currentLocal();
@@ -759,13 +776,26 @@ pub const ObjectHeap = struct {
         self.gc_collect_enabled = true;
         self.gc_threshold_bytes = initial_threshold;
         self.gc_track_from = self.objects.count();
+        // Detector build: pre-size the alloc bitmap to the whole object id
+        // space so the incremental per-fill bit-set never reallocs (which
+        // would free the array under a concurrent reader/setter at
+        // --workers>1). With a stable array, set uses atomic-or and read uses
+        // atomic-load — no lock on the hot detector paths. ~128 MB, debug only.
+        if (comptime gc_debug) {
+            const words = (@as(usize, OBJECT_MAX_SLOTS) + 63) >> 6;
+            self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch self.gc_alloc_bits;
+            @memset(self.gc_alloc_bits, 0);
+        }
     }
 
-    /// Is the alloc-bit set for `id`? (Detector helper.)
+    /// Is the alloc-bit set for `id`? (Detector helper.) Atomic load — the
+    /// bitmap is written concurrently by other workers' fills at --workers>1
+    /// (pre-sized in `gcEnableCollect`, so the array never moves).
     fn gcAllocBitSet(self: *const ObjectHeap, id: ObjectId) bool {
         const word = id >> 6;
         if (word >= self.gc_alloc_bits.len) return false;
-        return self.gc_alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) != 0;
+        const w = @atomicLoad(u64, &self.gc_alloc_bits[word], .monotonic);
+        return w & (@as(u64, 1) << @intCast(id & 63)) != 0;
     }
 
     /// Detector: trap if a *tracked* slot is read after being freed.
@@ -874,14 +904,12 @@ pub const ObjectHeap = struct {
     }
 
     fn gcSetAllocBit(self: *ObjectHeap, id: ObjectId) void {
+        // Detector-only (gc_debug), called per object fill. The bitmap is
+        // pre-sized in `gcEnableCollect` so it never reallocs here; concurrent
+        // fills from other workers at --workers>1 are handled with atomic-or.
         const word = id >> 6;
-        if (word >= self.gc_alloc_bits.len) {
-            const old_len = self.gc_alloc_bits.len;
-            const new_len = @max(word + 1, @max(old_len * 2, @as(usize, 1024)));
-            self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, new_len) catch return;
-            @memset(self.gc_alloc_bits[old_len..new_len], 0);
-        }
-        self.gc_alloc_bits[word] |= @as(u64, 1) << @intCast(id & 63);
+        if (word >= self.gc_alloc_bits.len) return;
+        _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
     }
 
     /// Sweep: free every filled object that `mark_bits` left unmarked —

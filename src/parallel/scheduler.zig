@@ -349,6 +349,19 @@ pub const Scheduler = struct {
     /// unaffected; only un-started backlog work is skipped.
     suppress_background: std.atomic.Value(bool),
 
+    /// GC stop-the-world barrier (`-Dgc`). When a worker crosses the
+    /// collection threshold at a safepoint it CASes `gc_stop_requested`
+    /// true and becomes the sole collector. Every other worker, on seeing
+    /// the flag at its own safepoint, sets its per-worker `gc_worker_parked`
+    /// flag and spins until the flag clears. The collector waits for all
+    /// peers' flags to be set, runs mark+sweep alone (no concurrent
+    /// mutation), clears the stop flag, then waits for all peers' flags to
+    /// clear before returning — a full two-phase barrier, so a slow peer can
+    /// never carry a stale parked state into the next collection (which a
+    /// shared counter + epoch could). `void`-free but inert in non-`-Dgc`.
+    gc_stop_requested: if (gc.enabled) std.atomic.Value(bool) else void,
+    gc_worker_parked: if (gc.enabled) []std.atomic.Value(bool) else void,
+
     /// `worker_count` includes the main thread (worker 0). The
     /// scheduler spawns `worker_count - 1` helper threads in `start()`;
     /// worker 0 runs on the calling thread.
@@ -389,6 +402,13 @@ pub const Scheduler = struct {
         errdefer allocator.free(wake_words);
         for (wake_words) |*w| w.* = .init(0);
 
+        const gc_worker_parked = if (gc.enabled) blk: {
+            const ws = try allocator.alloc(std.atomic.Value(bool), safe_worker_count);
+            for (ws) |*w| w.* = .init(false);
+            break :blk ws;
+        } else {};
+        errdefer if (gc.enabled) allocator.free(gc_worker_parked);
+
         return .{
             .allocator = allocator,
             .worker_count = safe_worker_count,
@@ -416,6 +436,8 @@ pub const Scheduler = struct {
             .disable_speculation = false,
             .disable_fanout = false,
             .suppress_background = .init(false),
+            .gc_stop_requested = if (gc.enabled) .init(false) else {},
+            .gc_worker_parked = gc_worker_parked,
         };
     }
 
@@ -495,6 +517,7 @@ pub const Scheduler = struct {
         self.allocator.free(self.spec_queues);
         self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
+        if (comptime gc.enabled) self.allocator.free(self.gc_worker_parked);
     }
 
     /// Push a woken fiber's ReadyNode onto the target worker's
@@ -738,6 +761,62 @@ pub const Scheduler = struct {
     /// worker whose suspended fiber just became resumable.
     pub fn wakeWorkerPublic(self: *Scheduler, worker_id: u8) void {
         self.wakeWorker(worker_id);
+    }
+
+    // --- GC stop-the-world barrier (`-Dgc`) ---
+
+    /// Fast check: has a collection been requested? Called at safepoints.
+    pub inline fn gcStopRequested(self: *const Scheduler) bool {
+        if (comptime !gc.enabled) return false;
+        return self.gc_stop_requested.load(.acquire);
+    }
+
+    /// Try to become the sole collector for this cycle. Returns true to
+    /// exactly one worker (the CAS winner); losers should `gcSafepointPark`.
+    pub fn gcTryBeginCollection(self: *Scheduler) bool {
+        if (comptime !gc.enabled) return false;
+        return self.gc_stop_requested.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null;
+    }
+
+    /// Collector (worker `collector_id`): wake every worker so parked ones
+    /// loop to a safepoint, then spin until every *peer* has set its parked
+    /// flag. On return the caller is the only running mutator — safe to mark
+    /// and sweep.
+    pub fn gcWaitAllParked(self: *Scheduler, collector_id: u8) void {
+        if (comptime !gc.enabled) return;
+        var id: u8 = 0;
+        while (id < self.worker_count) : (id += 1) self.wakeWorker(id);
+        id = 0;
+        while (id < self.worker_count) : (id += 1) {
+            if (id == collector_id) continue;
+            while (!self.gc_worker_parked[id].load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Collector: release the peers, then wait until every peer has observed
+    /// the release and cleared its parked flag. The second wait is what makes
+    /// this robust across back-to-back collections — no peer can still be
+    /// parked (or about to re-park with a stale flag) when the next
+    /// collection begins.
+    pub fn gcEndCollection(self: *Scheduler, collector_id: u8) void {
+        if (comptime !gc.enabled) return;
+        self.gc_stop_requested.store(false, .release);
+        var id: u8 = 0;
+        while (id < self.worker_count) : (id += 1) {
+            if (id == collector_id) continue;
+            while (self.gc_worker_parked[id].load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Peer (worker `worker_id`): park in the barrier until the collector
+    /// finishes this cycle. Must be called only at a safepoint (native_depth
+    /// 0, no un-rooted in-flight allocation) — the collector scans this
+    /// worker's fibers for roots.
+    pub fn gcSafepointPark(self: *Scheduler, worker_id: u8) void {
+        if (comptime !gc.enabled) return;
+        self.gc_worker_parked[worker_id].store(true, .release);
+        while (self.gc_stop_requested.load(.acquire)) std.atomic.spinLoopHint();
+        self.gc_worker_parked[worker_id].store(false, .release);
     }
 
     fn wakeWorker(self: *Scheduler, worker_id: u8) void {
