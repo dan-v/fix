@@ -54,11 +54,6 @@ const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
 const tjit_record = @import("jit/record.zig");
 
-/// Pure-precise push: conservative fiber-stack scan as a safety net.
-/// `false` = precise-only (crashes surface real discipline gaps via the
-/// detector); flip `true` to keep -Dgc working while converting.
-const GC_CONSERVATIVE_NET = false; // TEST: precise-only, with caches scanned
-
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
 
@@ -678,43 +673,9 @@ pub const Evaluator = struct {
         };
         self.gcMarkRoots(tr);
         tr.drain(&self.heap); // full precise closure
-        // Pure-precise push: the conservative fiber-stack scan is a
-        // safety net, off by default so precise-only crashes surface real
-        // managed-stack discipline gaps (dead-local false positives never
-        // crash). Flip on to keep -Dgc working while converting.
-        if (comptime GC_CONSERVATIVE_NET) {
-            self.gcScanFiberStackConservative(tr);
-            tr.drain(&self.heap);
-        }
         const st = self.heap.sweep(tr.mark_bits);
         self.heap.gcAfterCollect(tr.stats.bytes);
         gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
-    }
-
-    /// DIAGNOSTIC: conservatively scan the current fiber's live stack region
-    /// for words that decode to valid live ObjectIds and mark them. If this
-    /// makes -Dgc complete, it proves the remaining missing roots are all
-    /// fiber-stack Zig locals. Not the shipping design — a probe.
-    fn gcScanFiberStackConservative(self: *Evaluator, tr: *gc.Tracer) void {
-        if (comptime !gc.enabled) return;
-        const inner = fiber_mod.currentFiber() orelse return;
-        const base = @intFromPtr(inner.stack.ptr);
-        const top = base + inner.stack.len;
-        var marker: usize = 0;
-        var lo = @intFromPtr(&marker);
-        if (lo < base or lo >= top) return; // not running on this fiber's stack
-        lo = (lo + 7) & ~@as(usize, 7);
-        const count = self.heap.objects.count();
-        var p = lo;
-        while (p + 8 <= top) : (p += 8) {
-            const word = @as(*const u64, @ptrFromInt(p)).*;
-            const v = Value{ .bits = word };
-            if (!(v.isThunk() or v.isList() or v.isAttrs() or v.isClosure() or
-                v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or v.isPartialApp())) continue;
-            const id = v.asObjectId();
-            if (id >= count) continue;
-            tr.markObject(&self.heap, id);
-        }
     }
 
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
