@@ -712,13 +712,13 @@ pub const Evaluator = struct {
             // drain the graph. Inert at --workers=1 (no peer ever parks).
             self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
             // Reclaim is enabled at --workers=1 (byte-identical, -16% RSS).
-            // The multi-worker stop-the-world path (barrier + per-worker
-            // roots + suspended-fiber conservative scan) is built but the STW
-            // barrier still has a back-to-back-collection handshake race, so
-            // it stays gated off pending a properly generation-tagged
-            // barrier. At --workers>1 the GC is dormant (no collection), so
-            // the evaluator behaves exactly as a non-GC build there.
-            if (self.worker_count == 1) {
+            // At --workers>1 the stop-the-world collection (barrier + parallel
+            // mark, Phase 2a) is correct and byte-identical but stays DORMANT
+            // by default — the pause is only worth taking once measured small
+            // enough for production. `FIX_GC_WN` opts it in for validation and
+            // measurement; without it, --workers>1 behaves as a non-GC build.
+            const wn = if (self.env_map) |em| em.get("FIX_GC_WN") != null else false;
+            if (self.worker_count == 1 or wn) {
                 // FIX_GC_STEP_MB (validation): collect every N MB of fresh
                 // allocation so the detector exercises every builtin loop.
                 var step_bytes: u64 = 0;

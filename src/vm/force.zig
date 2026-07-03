@@ -22,6 +22,7 @@ const tjit_exec = @import("../jit/exec.zig");
 const tjit_record = @import("../jit/record.zig");
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
 const heap_mod = @import("runtime").heap;
+const gc = @import("runtime").gc;
 const thunk_trace = @import("../probe/thunk_trace.zig");
 const ChunkId = types.ChunkId;
 const deferred_compile = @import("../compiler/deferred.zig");
@@ -405,9 +406,15 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
         if (demand and self.heap.gcCollectRequested()) {
             self.gc_extra_root = thunk_val;
             if (self.scheduler.gcTryBeginCollection()) {
+                // Time the barrier (time-to-safepoint + release) separately
+                // from mark/sweep: at w>1 this busy-spin is the dominant cost.
+                const b0 = gc.nowNs();
                 self.scheduler.gcWaitAllParked(self.workerId());
+                const b1 = gc.nowNs();
                 self.heap.gcRunCollect(self.workerId());
+                const b2 = gc.nowNs();
                 self.scheduler.gcEndCollection(self.workerId());
+                gc.recordBarrier((b1 - b0) + (gc.nowNs() - b2));
             } else {
                 self.scheduler.gcSafepointPark(self.workerId());
             }

@@ -452,6 +452,18 @@ var peak_total_bytes: u64 = 0;
 var final_total_bytes: u64 = 0;
 var mark_ns_total: u64 = 0;
 var sweep_ns_total: u64 = 0;
+/// Wall time the collector spends in the STW barrier NOT marking/sweeping:
+/// waiting for every worker to reach a safepoint (time-to-safepoint) plus the
+/// post-collection release handshake. At --workers>1 this busy-spins, so it is
+/// the dominant cost of a w>1 collection — see docs/plans/gc-parallel-mark-plan.md.
+var barrier_ns_total: u64 = 0;
+
+/// Monotonic nanosecond clock for GC timing (collector + barrier).
+pub fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
 
 pub const Breakdown = struct {
     obj_live: u64,
@@ -467,6 +479,12 @@ pub fn recordTiming(mark_ns: u64, sweep_ns: u64) void {
     if (comptime !enabled) return;
     mark_ns_total += mark_ns;
     sweep_ns_total += sweep_ns;
+}
+
+/// Record barrier wall time (time-to-safepoint + release) for one collection.
+pub fn recordBarrier(ns: u64) void {
+    if (comptime !enabled) return;
+    barrier_ns_total += ns;
 }
 
 pub fn recordBreakdown(b: Breakdown) void {
@@ -529,7 +547,7 @@ pub fn report() void {
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
     // runner (the tjit work hit this). Stay silent under the test runner.
     if (builtin.is_test) return;
-    std.debug.print("\n=== GC (-Dgc, stop-the-world mark-sweep, --workers=1) ===\n", .{});
+    std.debug.print("\n=== GC (-Dgc, stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
     std.debug.print("collections: {d}\n", .{collections});
     std.debug.print("objects freed (total): {d}\n", .{objects_freed_total});
     std.debug.print("live after last collect: {d:.1} MB\n", .{mb(last_live_bytes)});
@@ -537,6 +555,7 @@ pub fn report() void {
     std.debug.print("final reserved: {d:.1} MB\n", .{mb(final_total_bytes)});
     std.debug.print("mark time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(mark_ns_total)) / 1e6});
     std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
+    std.debug.print("barrier wait (total, w>1 spin): {d:.1} ms\n", .{@as(f64, @floatFromInt(barrier_ns_total)) / 1e6});
     std.debug.print("peak RSS (kernel high-water): {d:.1} MB\n", .{mb(peakRssBytes())});
     std.debug.print("current RSS (end of eval): {d:.1} MB\n", .{mb(currentRssBytes())});
     const b = last_breakdown;
