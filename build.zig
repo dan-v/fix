@@ -151,14 +151,35 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // The `runtime` module is a separate module, so its unit tests
-    // (stable_segments, gc reclaim, …) aren't collected by the root-module
-    // test artifacts above. Run them explicitly.
+    // `runtime`, `syntax`, `parallel`, and `derivation` are each separate
+    // modules (clean-cut subsystems, see the comment above `syntax_mod`), so
+    // their unit tests aren't collected by the root-module test artifacts
+    // above — Zig only walks a module's own `@import` graph, and these are
+    // pulled into `fix` by module name, not by file inclusion. Run each
+    // explicitly, the same way `runtime_tests` already was.
     const runtime_tests = b.addTest(.{
         .root_module = runtime_mod,
         .use_llvm = true,
     });
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
+
+    const syntax_tests = b.addTest(.{
+        .root_module = syntax_mod,
+        .use_llvm = true,
+    });
+    const run_syntax_tests = b.addRunArtifact(syntax_tests);
+
+    const parallel_tests = b.addTest(.{
+        .root_module = parallel_mod,
+        .use_llvm = true,
+    });
+    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+
+    const derivation_tests = b.addTest(.{
+        .root_module = derivation_mod,
+        .use_llvm = true,
+    });
+    const run_derivation_tests = b.addRunArtifact(derivation_tests);
 
     // Module-boundary import lint (tools/lint_imports.zig). Catches relative
     // imports that reach into a clean-cut module's files instead of going
@@ -180,6 +201,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_syntax_tests.step);
+    test_step.dependOn(&run_parallel_tests.step);
+    test_step.dependOn(&run_derivation_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
