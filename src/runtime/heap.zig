@@ -228,6 +228,24 @@ pub const HeapLocal = struct {
     value: LocalChunk = .{},
     attr: LocalChunk = .{},
     attr_pos: LocalChunk = .{},
+    // GC per-worker free lists (`-Dgc`): lock-free reclaim reuse. The sweep
+    // (STW, single collector) distributes freed slots/ranges round-robin
+    // across every worker's shard; each worker's allocation hot path then pops
+    // from its OWN shard with no lock — this is what makes reclaim viable at
+    // --workers>1 (a single shared free list serialized all allocation). A
+    // worker whose shard lacks the needed size just bump-allocates.
+    gc_free_objects: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
+    gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+    gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+    gc_free_attr_pos: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+
+    fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
+        if (comptime !build_options.gc) return;
+        self.gc_free_objects.deinit(allocator);
+        self.gc_free_values.deinit(allocator);
+        self.gc_free_attrs.deinit(allocator);
+        self.gc_free_attr_pos.deinit(allocator);
+    }
 };
 
 /// GC collect hook (gated behind `-Dgc`). The heap can't reach the
@@ -317,15 +335,11 @@ pub const ObjectHeap = struct {
     /// cleared when swept. Lets `sweep` tell live objects from TLAB-
     /// reserved-but-unfilled slots and already-freed slots.
     gc_alloc_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
-    gc_free_objects: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
-    gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
-    gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
-    gc_free_attr_pos: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
-    /// Guards free-list reuse pops from concurrent worker allocation paths
-    /// (`--workers>1`). Pushes run only during a stop-the-world (single
-    /// collector), so it's the alloc-path pops that contend. Uncontended at
-    /// `--workers=1`.
-    gc_free_mu: if (build_options.gc) stable.SpinMutex else void = if (build_options.gc) .{} else {},
+    // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
+    // path reuses without a lock — a single shared free list + mutex
+    // serialized all allocation across workers and was the entire w>1 wall
+    // cost (measured: 3.8x). The sweep (STW, single collector) distributes
+    // freed memory round-robin across the per-worker shards.
 
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
@@ -349,10 +363,7 @@ pub const ObjectHeap = struct {
         self.freeErroredInfos();
         if (comptime build_options.gc) {
             self.allocator.free(self.gc_alloc_bits);
-            self.gc_free_objects.deinit(self.allocator);
-            self.gc_free_values.deinit(self.allocator);
-            self.gc_free_attrs.deinit(self.allocator);
-            self.gc_free_attr_pos.deinit(self.allocator);
+            for (self.worker_locals) |*l| l.deinit(self.allocator);
         }
         self.allocator.free(self.worker_locals);
         self.attr_positions.deinit(self.allocator);
@@ -587,15 +598,13 @@ pub const ObjectHeap = struct {
     }
 
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
+        const local = self.currentLocal();
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                self.gc_free_mu.lock();
-                const reused = self.gc_free_values.pop(n);
-                self.gc_free_mu.unlock();
-                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
+                // Lock-free: this worker's OWN free-list shard.
+                if (local.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
-        const local = self.currentLocal();
         const chunk = &local.value;
         if (chunk.fits(n)) {
             const r = chunk.take(n);
@@ -638,15 +647,12 @@ pub const ObjectHeap = struct {
     }
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
+        const local = self.currentLocal();
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                self.gc_free_mu.lock();
-                const reused = self.gc_free_attrs.pop(n);
-                self.gc_free_mu.unlock();
-                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
+                if (local.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
-        const local = self.currentLocal();
         const chunk = &local.attr;
         if (chunk.fits(n)) {
             const r = chunk.take(n);
@@ -662,15 +668,12 @@ pub const ObjectHeap = struct {
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
+        const local = self.currentLocal();
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_debug and n > 0) {
-                self.gc_free_mu.lock();
-                const reused = self.gc_free_attr_pos.pop(n);
-                self.gc_free_mu.unlock();
-                if (reused) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
+                if (local.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
-        const local = self.currentLocal();
         const chunk = &local.attr_pos;
         if (chunk.fits(n)) {
             const r = chunk.take(n);
@@ -713,16 +716,14 @@ pub const ObjectHeap = struct {
     /// `builtins.builtins` self-reference, where no other thread can
     /// observe the in-flight slot.
     pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
+        const local = self.currentLocal();
         if (comptime build_options.gc) {
             // Detector keeps freed slots unused so use-after-free is caught.
-            if (self.gc_collect_enabled and !gc_debug) {
-                self.gc_free_mu.lock();
-                const reused = self.gc_free_objects.pop();
-                self.gc_free_mu.unlock();
-                if (reused) |id| return id;
+            // Lock-free: this worker's OWN free-slot shard.
+            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
+                if (local.gc_free_objects.pop()) |id| return id;
             }
         }
-        const local = self.currentLocal();
         const chunk = &local.object;
         if (chunk.cursor < chunk.end) {
             const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
@@ -777,6 +778,15 @@ pub const ObjectHeap = struct {
     /// every builtin loop. 0 = normal policy. Set from the evaluator (which
     /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
     var gc_step_bytes: u64 = 0;
+
+    /// A/B knob (`FIX_GC_NOREUSE`): skip free-list reuse on the allocation hot
+    /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
+    /// Lets us isolate reclaim's reuse cost/benefit. Set from the evaluator.
+    var gc_disable_reuse: bool = false;
+    pub fn gcSetDisableReuse(v: bool) void {
+        if (comptime !build_options.gc) return;
+        gc_disable_reuse = v;
+    }
 
     /// Turn on reclaim (alloc-bitmap maintenance + free-list reuse +
     /// sweep) with an initial threshold. The evaluator calls this only at
@@ -897,10 +907,13 @@ pub const ObjectHeap = struct {
             const hi = ObjectStore.globalIdOf(wl.object.segment, wl.object.end);
             if (hi > lo) gcClearBitRange(self.gc_alloc_bits, lo, hi);
         }
-        // Exclude slots already on the object free list.
-        for (self.gc_free_objects.items) |id| {
-            const word = id >> 6;
-            if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+        // Exclude slots already on any worker's object free list (freed by a
+        // prior collection, not yet reused).
+        for (self.worker_locals) |*wl| {
+            for (wl.gc_free_objects.items) |id| {
+                const word = id >> 6;
+                if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~(@as(u64, 1) << @intCast(id & 63));
+            }
         }
     }
 
@@ -943,6 +956,11 @@ pub const ObjectHeap = struct {
         if (comptime !gc_debug) self.gcReconstructAllocBits();
         if (comptime gc_debug) self.gcVerifyMarkClosed(mark_bits);
         const n = self.objects.count();
+        // Round-robin distribution across per-worker free-list shards. STW, so
+        // the collector alone writes every shard (no concurrency); post-sweep
+        // each worker consumes its OWN shard lock-free.
+        const nshards = self.worker_locals.len;
+        var shard: usize = 0;
         var id: ObjectId = 0;
         while (id < n) : (id += 1) {
             const word = id >> 6;
@@ -951,10 +969,13 @@ pub const ObjectHeap = struct {
             if (self.gc_alloc_bits[word] & bit == 0) continue; // unfilled / already free
             const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
             if (marked) continue;
-            self.gcFreeObjectRanges(self.objects.get(id));
+            const local = &self.worker_locals[shard];
+            self.gcFreeObjectRanges(local, self.objects.get(id));
             self.gc_alloc_bits[word] &= ~bit;
-            self.gc_free_objects.append(self.allocator, id) catch {};
+            local.gc_free_objects.append(self.allocator, id) catch {};
             st.objects_freed += 1;
+            shard += 1;
+            if (shard >= nshards) shard = 0;
         }
         return st;
     }
@@ -1025,7 +1046,7 @@ pub const ObjectHeap = struct {
     /// upvalue/env storage is a bare slice (no segment/offset to recover),
     /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
     /// `merge_attrs`/`boxed_int` own no ranges.
-    fn gcFreeObjectRanges(self: *ObjectHeap, obj: *const Object) void {
+    fn gcFreeObjectRanges(self: *ObjectHeap, local: *HeapLocal, obj: *const Object) void {
         // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
         // slice (owner swept while a Zig local held the slice — the class the
         // reuse-off object-read assert can't see) traps on next access instead
@@ -1053,14 +1074,14 @@ pub const ObjectHeap = struct {
             }
         }
         switch (obj.*) {
-            .list => |r| if (r.len > 0) self.gc_free_values.push(self.allocator, r.segment, r.offset, r.len),
+            .list => |r| if (r.len > 0) local.gc_free_values.push(self.allocator, r.segment, r.offset, r.len),
             .attrs => |a| {
-                if (a.range.len > 0) self.gc_free_attrs.push(self.allocator, a.range.segment, a.range.offset, a.range.len);
-                if (a.positions.len > 0) self.gc_free_attr_pos.push(self.allocator, a.positions.segment, a.positions.offset, a.positions.len);
+                if (a.range.len > 0) local.gc_free_attrs.push(self.allocator, a.range.segment, a.range.offset, a.range.len);
+                if (a.positions.len > 0) local.gc_free_attr_pos.push(self.allocator, a.positions.segment, a.positions.offset, a.positions.len);
             },
-            .builtin_closure => |c| if (c.args.len > 0) self.gc_free_values.push(self.allocator, c.args.segment, c.args.offset, c.args.len),
-            .partial_app => |p| if (p.args.len > 0) self.gc_free_values.push(self.allocator, p.args.segment, p.args.offset, p.args.len),
-            .context_string => |c| if (c.context.len > 0) self.gc_free_attrs.push(self.allocator, c.context.segment, c.context.offset, c.context.len),
+            .builtin_closure => |c| if (c.args.len > 0) local.gc_free_values.push(self.allocator, c.args.segment, c.args.offset, c.args.len),
+            .partial_app => |p| if (p.args.len > 0) local.gc_free_values.push(self.allocator, p.args.segment, p.args.offset, p.args.len),
+            .context_string => |c| if (c.context.len > 0) local.gc_free_attrs.push(self.allocator, c.context.segment, c.context.offset, c.context.len),
             // NOT reclaimed yet: an executing frame aliases its
             // `upvalues` slice, which is owned by the .closure object (or a
             // .thunk's spilled storage). Freeing the range while a frame

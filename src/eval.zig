@@ -718,6 +718,10 @@ pub const Evaluator = struct {
             // enough for production. `FIX_GC_WN` opts it in for validation and
             // measurement; without it, --workers>1 behaves as a non-GC build.
             const wn = if (self.env_map) |em| em.get("FIX_GC_WN") != null else false;
+            // SPIKE (FIX_GC_NOREUSE): skip free-list reuse to isolate the
+            // shared alloc-mutex cost at --workers>1 (measurement only).
+            if (self.env_map) |em|
+                if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
             if (self.worker_count == 1 or wn) {
                 // FIX_GC_STEP_MB (validation): collect every N MB of fresh
                 // allocation so the detector exercises every builtin loop.
