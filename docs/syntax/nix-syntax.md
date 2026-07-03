@@ -70,7 +70,16 @@ and &&  or ||   impl ->
 update //   concat ++
 ```
 
-`->` (`impl`) and `//` (`update`) are **right-associative** (encoded via non-incremented recursion precedence — see [parsing](parsing.md)); the rest are left-associative. `|>` (`pipe`) has a reserved ladder rung but is not yet tokenized — the pipe operator lands later behind a flag.
+`->` (`impl`) and `//` (`update`) are **right-associative** (encoded via non-incremented recursion precedence — see [parsing](parsing.md)); the rest are left-associative.
+
+### Pipe operators (`|>` / `<|`)
+
+`|>` and `<|` occupy the `pipe` rung (looser than everything above — even `->`). They are **not** in the 14 above: a pipe is pure sugar for function application, so instead of a `binary_op` node it lowers to an ordinary `apply` tagged with its surface form (`Apply.pipe` = `.forward`/`.backward`), which reuses the whole application path in the compiler and evaluator and lets a printer spell the node back faithfully. Operands are stored in evaluation order (`func`, `arg`):
+
+- `x |> f` == `f x` — **left**-associative → `apply(func=f, arg=x, .forward)`
+- `f <| x` == `f x` — **right**-associative → `apply(func=f, arg=x, .backward)`
+
+Both always parse, but compiling one requires the `--pipe-operators` feature; otherwise the compile chokepoint rejects the file *on presence* (like Nix — an unused/deferred binding still fails), pointing the diagnostic at the operator. The gate lives in `Evaluator.parseAndCompile`; the flag is documented in [cli](../cli.md).
 
 **Unary operators** (`unary_op`, `Unary { op, expr }`): logical `!` and arithmetic negation `-`.
 

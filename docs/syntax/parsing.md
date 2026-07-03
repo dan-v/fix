@@ -40,7 +40,7 @@ The `Precedence` enum, low → high:
 ```
 none
 assignment   // = inside let/attr bindings
-pipe         // |>            (reserved — not yet tokenized)
+pipe         // |> <|         (pipe operators, behind --pipe-operators)
 impl         // ->            (right-associative)
 or_          // ||
 and_         // &&

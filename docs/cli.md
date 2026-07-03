@@ -39,6 +39,7 @@ Parsed in `src/cli/args.zig`. Defaults shown; `[=X]` means the value is optional
 | `--repl` | interactive loop; rejects a source arg |
 | `--json` / `--xml` | render the value as JSON / XML instead of Nix |
 | `--strict` | recursively force attr values + list items before writing |
+| `--pipe-operators` | enable the `\|>` / `<\|` pipe operators (sugar for application; off by default) → [syntax/nix-syntax.md](syntax/nix-syntax.md) |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
