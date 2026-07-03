@@ -484,3 +484,220 @@ fn nameSetToMask(names: *const NameSet, capture_ids: []const InternId) u64 {
     }
     return mask;
 }
+
+const parser_mod = @import("syntax").parser;
+const AstArena = ast.AstArena;
+const Parser = parser_mod.Parser;
+
+/// Parse `source` (expected to be a top-level `let ... in ...`) and hand
+/// back its bindings + body along with the owning arena/intern table. The
+/// caller analyzes `body` directly, mirroring how `compileLetIn` drives
+/// `analyzeLetEagerness` / `analyzeLetMustForce`.
+const ParsedLet = struct {
+    arena: AstArena,
+    intern: InternTable,
+    node: *const Node,
+
+    fn deinit(self: *ParsedLet) void {
+        self.intern.deinit();
+        self.arena.deinit();
+    }
+
+    fn bindings(self: *const ParsedLet) []const Node.Binding {
+        return self.node.data.let_in.bindings;
+    }
+
+    fn body(self: *const ParsedLet) *const Node {
+        return self.node.data.let_in.body;
+    }
+};
+
+fn parseLet(allocator: std.mem.Allocator, source: []const u8) !ParsedLet {
+    var arena = AstArena.init(allocator);
+    errdefer arena.deinit();
+    var parser = Parser.init(allocator, &arena, source);
+    defer parser.deinit();
+    const node = try parser.parse();
+    if (node.tag != .let_in) return error.NotALet;
+    var intern = try InternTable.init(allocator);
+    errdefer intern.deinit();
+    return .{ .arena = arena, .intern = intern, .node = node };
+}
+
+fn bindingNameIds(allocator: std.mem.Allocator, intern: *InternTable, source: []const u8, bindings: []const Node.Binding) ![]InternId {
+    const ids = try allocator.alloc(InternId, bindings.len);
+    errdefer allocator.free(ids);
+    for (bindings, ids) |binding, *id| {
+        const name = source[binding.name_offset .. binding.name_offset + binding.name_len];
+        id.* = try intern.intern(name);
+    }
+    return ids;
+}
+
+test "analyzeLetEagerness flags a binding the body forces directly" {
+    const allocator = std.testing.allocator;
+    const source = "let a = 1 + 2; b = 3; in a + 0";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const eager = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager);
+    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+
+    // Body is `a + 0`: forces `a` shallowly, never mentions `b`.
+    try std.testing.expect(eager[0]);
+    try std.testing.expect(!eager[1]);
+}
+
+test "analyzeLetEagerness does not flag names only referenced in binding right-hand-sides" {
+    const allocator = std.testing.allocator;
+    // `b`'s RHS references `a`, but the body only uses `b` — per the
+    // documented semantics, analyzeLetEagerness only looks at the BODY,
+    // so `a` must NOT be flagged even though it's forced transitively.
+    const source = "let a = 1; b = a + 1; in b";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const eager = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager);
+    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+
+    try std.testing.expect(!eager[0]); // a: not a free name in the body
+    try std.testing.expect(eager[1]); // b: forced directly by the body
+}
+
+test "analyzeLetEagerness treats attrset/list construction as non-forcing (deep only)" {
+    const allocator = std.testing.allocator;
+    // Building `{ x = a; }` doesn't force `a` to WHNF; only walking the
+    // result would. So the body's *shallow* set (what eagerness reads)
+    // must not contain `a`.
+    const source = "let a = 1; in { x = a; }";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const eager = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager);
+    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+
+    try std.testing.expect(!eager[0]);
+}
+
+test "analyzeLetEagerness unions if-branch strictness only over names common to both branches" {
+    const allocator = std.testing.allocator;
+    // `a` is forced on the then-branch (as the condition) but `b` only
+    // appears on the else-branch — the if-rule intersects per-branch
+    // strictness, so neither should show up as unconditionally forced.
+    const source = "let a = true; b = 1; in if a then a else b";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const eager = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager);
+    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+
+    // `a` is forced unconditionally as the `if` condition regardless of
+    // branch outcome.
+    try std.testing.expect(eager[0]);
+    // `b` only appears in the else branch, not the then branch.
+    try std.testing.expect(!eager[1]);
+}
+
+test "analyzeLetMustForce excludes names only forced inside an assert body" {
+    const allocator = std.testing.allocator;
+    // Under must-force semantics, the assert's body only runs if the
+    // condition holds, so forcing `a` there isn't sound to promise.
+    const source = "let a = 1; in assert true; a";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const must_force = try allocator.alloc(bool, names.len);
+    defer allocator.free(must_force);
+    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+
+    try std.testing.expect(!must_force[0]);
+}
+
+test "analyzeLetMustForce excludes names only forced inside a with scope expression" {
+    const allocator = std.testing.allocator;
+    // The `with` scope expr (`a`) is only forced lazily, on demand from
+    // the body resolving a name through it — not unconditionally.
+    const source = "let a = {}; in with a; 1";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const must_force = try allocator.alloc(bool, names.len);
+    defer allocator.free(must_force);
+    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+
+    try std.testing.expect(!must_force[0]);
+}
+
+test "analyzeLetMustForce flags a name forced on every path of an if-else" {
+    const allocator = std.testing.allocator;
+    const source = "let a = true; in if a then 1 else 2";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
+    defer allocator.free(names);
+
+    const must_force = try allocator.alloc(bool, names.len);
+    defer allocator.free(must_force);
+    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+
+    try std.testing.expect(must_force[0]);
+}
+
+test "bodyMustForceName detects a name unconditionally forced by arithmetic" {
+    const allocator = std.testing.allocator;
+    var arena = AstArena.init(allocator);
+    defer arena.deinit();
+    const source = "x + 1";
+    var parser = Parser.init(allocator, &arena, source);
+    defer parser.deinit();
+    const body = try parser.parse();
+
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    const x_id = try intern.intern("x");
+
+    const forces = try bodyMustForceName(allocator, &intern, source, body, x_id);
+    try std.testing.expect(forces);
+}
+
+test "bodyMustForceName is false when the name is shadowed by a nested lambda" {
+    const allocator = std.testing.allocator;
+    var arena = AstArena.init(allocator);
+    defer arena.deinit();
+    // The outer `x` is never referenced in the body at all — the only
+    // `x` in scope inside the lambda is its own parameter.
+    const source = "(x: x + 1) 5";
+    var parser = Parser.init(allocator, &arena, source);
+    defer parser.deinit();
+    const body = try parser.parse();
+
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    const x_id = try intern.intern("x");
+
+    const forces = try bodyMustForceName(allocator, &intern, source, body, x_id);
+    try std.testing.expect(!forces);
+}
