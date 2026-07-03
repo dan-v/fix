@@ -77,3 +77,42 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
 
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
+
+const std_testing = std.testing;
+const renderForTest = @import("../../eval/test_helpers.zig").renderForTest;
+
+test "length head and tail reject non-list arguments" {
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.length 1"));
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.head 1"));
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.tail 1"));
+}
+
+test "head and tail on an empty list raise index out of bounds" {
+    try std_testing.expectError(error.IndexOutOfBounds, renderForTest("builtins.head [ ]"));
+    try std_testing.expectError(error.IndexOutOfBounds, renderForTest("builtins.tail [ ]"));
+}
+
+test "tail on a single-element list returns the empty list" {
+    const result = try renderForTest("builtins.tail [ 1 ]");
+    defer std_testing.allocator.free(result);
+    try std_testing.expectEqualStrings("[ ]", result);
+}
+
+test "concatLists on an empty list and rejects non-list elements" {
+    const empty = try renderForTest("builtins.concatLists [ ]");
+    defer std_testing.allocator.free(empty);
+    try std_testing.expectEqualStrings("[ ]", empty);
+
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.concatLists 1"));
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.concatLists [ 1 ]"));
+}
+
+test "listToAttrs on an empty list and rejects non-attrs elements" {
+    const empty = try renderForTest("builtins.listToAttrs [ ]");
+    defer std_testing.allocator.free(empty);
+    try std_testing.expectEqualStrings("{ }", empty);
+
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.listToAttrs 1"));
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.listToAttrs [ 1 ]"));
+    try std_testing.expectError(error.TypeError, renderForTest("builtins.listToAttrs [ { name = 1; value = 2; } ]"));
+}
