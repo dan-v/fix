@@ -177,3 +177,73 @@ test "object heap stores closures" {
     try std.testing.expect(!closure.upvalues[1].asBool());
 }
 
+test "object heap supports empty lists and empty attrs" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const list_id = try heap.addList(&.{});
+    try std.testing.expectEqual(@as(usize, 0), try heap.getListLen(list_id));
+    try std.testing.expectError(error.IndexOutOfBounds, heap.getListItem(list_id, 0));
+
+    const attrs_id = try heap.addAttrs(&.{});
+    const entries = try heap.getAttrs(attrs_id);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+    try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 1));
+}
+
+test "object heap supports a single-entry attrs object" {
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+
+    const attrs_id = try heap.addAttrs(&.{
+        .{ .name = 5, .value = Value.int(99) },
+    });
+
+    const entries = try heap.getAttrs(attrs_id);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(InternId, 5), entries[0].name);
+    try std.testing.expectEqual(@as(i64, 99), (try heap.getAttrValue(attrs_id, 5)).asInt());
+    try std.testing.expectError(error.MissingAttribute, heap.getAttrValue(attrs_id, 6));
+}
+
+test "object heap sweep frees unmarked objects and lets ids be reused" {
+    const build_options = @import("build_options");
+    if (comptime !build_options.gc) return; // sweep only reclaims under -Dgc
+
+    var heap = try ObjectHeap.init(std.testing.allocator, 1);
+    defer heap.deinit();
+    heap.gcEnableCollect(64 << 20, 0);
+
+    // Two live (reachable) lists, two dead (unreferenced) lists.
+    const live_a = try heap.addList(&.{Value.int(1)});
+    const live_b = try heap.addList(&.{Value.int(2)});
+    _ = try heap.addList(&.{Value.int(3)});
+    _ = try heap.addList(&.{Value.int(4)});
+
+    var tr = @import("../gc.zig").Tracer.init(std.testing.allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(live_a));
+    tr.markValue(&heap, Value.list(live_b));
+    tr.drain(&heap);
+
+    const st = heap.sweep(tr.mark_bits);
+    try std.testing.expectEqual(@as(u64, 2), st.objects_freed);
+
+    // The marked objects still read back their original contents.
+    try std.testing.expectEqual(@as(i64, 1), (try heap.getListItem(live_a, 0)).asInt());
+    try std.testing.expectEqual(@as(i64, 2), (try heap.getListItem(live_b, 0)).asInt());
+
+    // A freed slot is handed back out to a subsequent allocation rather
+    // than growing the object store — the swept id now holds fresh data,
+    // not the stale dead list it used to.
+    const objects_before_reuse = heap.objects.count();
+    const reused_attrs = try heap.addAttrs(&.{
+        .{ .name = 1, .value = Value.int(7) },
+    });
+    try std.testing.expectEqual(objects_before_reuse, heap.objects.count());
+    const reused_entries = try heap.getAttrs(reused_attrs);
+    try std.testing.expectEqual(@as(usize, 1), reused_entries.len);
+    try std.testing.expectEqual(@as(i64, 7), (try heap.getAttrValue(reused_attrs, 1)).asInt());
+}
+

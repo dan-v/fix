@@ -369,3 +369,98 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     try std.testing.expectEqual(values_before, heap.values.count()); // value range reused
     try std.testing.expectEqual(@as(i64, 200), (try heap.getListItem(reused, 1)).asInt());
 }
+
+test "tracer collectLiveIds returns exactly the marked set" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+
+    // Reachable (from root `outer`): outer -> inner. Unreachable: loose_a, loose_b.
+    const inner = try heap.addList(&.{ Value.int(1), Value.int(2) });
+    const outer = try heap.addList(&.{Value.list(inner)});
+    const loose_a = try heap.addList(&.{Value.int(3)});
+    const loose_b = try heap.addList(&.{Value.int(4)});
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    try tr.reset(heap.objects.count());
+    tr.markValue(&heap, Value.list(outer));
+    tr.drain(&heap);
+
+    const live_ids = try tr.collectLiveIds(allocator);
+    defer allocator.free(live_ids);
+
+    try std.testing.expectEqual(@as(usize, 2), live_ids.len);
+    var saw_outer = false;
+    var saw_inner = false;
+    for (live_ids) |id| {
+        if (id == outer) saw_outer = true;
+        if (id == inner) saw_inner = true;
+    }
+    try std.testing.expect(saw_outer);
+    try std.testing.expect(saw_inner);
+    try std.testing.expect(!tr.isMarked(loose_a));
+    try std.testing.expect(!tr.isMarked(loose_b));
+}
+
+test "tracer markObject ignores objects outside the reset range" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+
+    const a = try heap.addList(&.{Value.int(1)});
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+    // Reset to a bitmap covering zero objects, then mark an id past it —
+    // markObject/testAndSet must not go out of bounds.
+    try tr.reset(0);
+    tr.markObject(&heap, a);
+    try std.testing.expect(!tr.isMarked(a));
+
+    const live_ids = try tr.collectLiveIds(allocator);
+    defer allocator.free(live_ids);
+    try std.testing.expectEqual(@as(usize, 0), live_ids.len);
+}
+
+test "gc stat recorders accumulate observable deltas" {
+    if (comptime !enabled) return; // recorders are no-ops without -Dgc
+
+    const timing_before = mark_ns_total;
+    const sweep_before = sweep_ns_total;
+    recordTiming(100, 50);
+    try std.testing.expectEqual(timing_before + 100, mark_ns_total);
+    try std.testing.expectEqual(sweep_before + 50, sweep_ns_total);
+
+    const breakdown: Breakdown = .{
+        .obj_live = 3,
+        .obj_reserved = 10,
+        .val_live = 4,
+        .val_reserved = 12,
+        .attr_live = 5,
+        .attr_reserved = 14,
+    };
+    recordBreakdown(breakdown);
+    try std.testing.expectEqual(breakdown, last_breakdown);
+
+    const collections_before = collections;
+    const freed_before = objects_freed_total;
+    const peak_before = peak_total_bytes;
+    recordCollection(7, 1234, peak_before + 999);
+    try std.testing.expectEqual(collections_before + 1, collections);
+    try std.testing.expectEqual(freed_before + 7, objects_freed_total);
+    try std.testing.expectEqual(@as(u64, 1234), last_live_bytes);
+    try std.testing.expectEqual(peak_before + 999, peak_total_bytes);
+
+    // A smaller total-after must not lower the running peak.
+    recordCollection(0, 1234, peak_before + 1);
+    try std.testing.expectEqual(peak_before + 999, peak_total_bytes);
+
+    recordFinalTotal(peak_before + 999);
+    try std.testing.expectEqual(peak_before + 999, final_total_bytes);
+
+    // recordFinalTotal also raises the peak if the final total exceeds it.
+    recordFinalTotal(peak_before + 2000);
+    try std.testing.expectEqual(peak_before + 2000, peak_total_bytes);
+    try std.testing.expectEqual(peak_before + 2000, final_total_bytes);
+}
