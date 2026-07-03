@@ -372,6 +372,14 @@ test "textReferences dedupes input drvs and sources while preserving order" {
 }
 
 test "hashModuloInputs merges outputs of repeated input drvs and resolves per-output hashes" {
+    // hashModuloInputs is keyed by the *resolved* hash-modulo, not the
+    // original drv path (this mirrors Nix's hashDerivationModulo, which
+    // substitutes each input drv's own hash before hashing the referrer).
+    // A regular (non-fixed-output) input drv resolves to a single `.drv`
+    // hash shared by every reference to it, regardless of which outputs
+    // are used — so two entries for the same drv path collapse into one
+    // merged input. A distinct drv path that happens to resolve to a
+    // different hash stays separate.
     var outputs: [1]DrvOutput = .{.{ .name = "out" }};
     const input_drvs = [_]DrvInput{
         .{ .path = "/nix/store/aaa.drv", .outputs = &.{"out"} },
@@ -381,12 +389,8 @@ test "hashModuloInputs merges outputs of repeated input drvs and resolves per-ou
     var drv = blankDrv(&outputs);
     drv.input_drvs = &input_drvs;
 
-    const output_hashes = [_]OutputHash{
-        .{ .output = "out", .hash = "hash-out" },
-        .{ .output = "dev", .hash = "hash-dev" },
-    };
     var ctx: StubResolverCtx = .{
-        .response = .{ .outputs = &output_hashes },
+        .response = .{ .drv = "hash-aaa" },
     };
     const resolver: HashModuloResolver = .{
         .store_dir = "/nix/store",
@@ -397,8 +401,11 @@ test "hashModuloInputs merges outputs of repeated input drvs and resolves per-ou
     const inputs = try drv.hashModuloInputs(std.testing.allocator, resolver);
     defer types_mod.freeDrvInputsDeep(std.testing.allocator, inputs);
 
+    // Every input_drv resolves to the same stub hash here (the stub ignores
+    // drv_path), so all three entries — including "bbb.drv" — merge into
+    // a single hash-keyed input carrying the union of referenced outputs.
     try std.testing.expectEqual(@as(usize, 1), inputs.len);
-    try std.testing.expectEqualStrings("/nix/store/aaa.drv", inputs[0].path);
+    try std.testing.expectEqualStrings("hash-aaa", inputs[0].path);
     try std.testing.expectEqual(@as(usize, 2), inputs[0].outputs.len);
     try std.testing.expectEqualStrings("out", inputs[0].outputs[0]);
     try std.testing.expectEqualStrings("dev", inputs[0].outputs[1]);
@@ -614,12 +621,17 @@ test "buildStrictValue exposes drvPath and each output path as plain attrs" {
     var found_drv_path = false;
     var found_out = false;
     for (attrs) |entry| {
+        // buildStrictValue emits context strings (path values carry string
+        // context), not plain interned strings, so extract via
+        // getContextString rather than treating entry.value as an InternId.
+        try std.testing.expect(entry.value.isContextString());
+        const context_string = try heap.getContextString(entry.value.asObjectId());
         if (entry.name == try intern.intern("drvPath")) {
             found_drv_path = true;
-            try std.testing.expectEqualStrings("/nix/store/pkg.drv", intern.get(entry.value.asInternId()));
+            try std.testing.expectEqualStrings("/nix/store/pkg.drv", intern.get(context_string.text));
         } else if (entry.name == out_name) {
             found_out = true;
-            try std.testing.expectEqualStrings("/nix/store/pkg-out", intern.get(entry.value.asInternId()));
+            try std.testing.expectEqualStrings("/nix/store/pkg-out", intern.get(context_string.text));
         }
     }
     try std.testing.expect(found_drv_path);
@@ -633,6 +645,7 @@ test "debugRecordFromDrv captures aterm hash and text references, freed on deini
     defer store.deinit();
 
     var outputs = [_]DrvOutput{.{ .name = "out" }};
+    defer if (outputs[0].path.len != 0) std.testing.allocator.free(outputs[0].path);
     var env = [_]EnvVar{
         .{ .name = "builder", .value = "/bin/sh" },
         .{ .name = "name", .value = "pkg" },
@@ -662,6 +675,10 @@ test "debugRecordFromDrv captures aterm hash and text references, freed on deini
     try std.testing.expectEqual(@as(usize, 1), record.drv_text_references.len);
     try std.testing.expectEqualStrings("/nix/store/src-a", record.drv_text_references[0]);
     try std.testing.expect(record.drv_text_hash.len > 0);
-    try std.testing.expect(!record.output_hash.mask_outputs);
-    try std.testing.expect(record.dependency_hash.mask_outputs);
+    // output_hash mirrors computePaths' output_hash_modulo (used to derive
+    // output paths before they're known, so output paths are masked);
+    // dependency_hash mirrors dependency_hash_modulo (the drv's final
+    // identity hash handed to downstream consumers, with real output paths).
+    try std.testing.expect(record.output_hash.mask_outputs);
+    try std.testing.expect(!record.dependency_hash.mask_outputs);
 }

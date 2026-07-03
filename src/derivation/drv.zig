@@ -109,17 +109,21 @@ pub const Drv = struct {
             const hash_modulo = try resolver.resolvePath(input.path) orelse return error.UnknownInputDerivation;
             switch (hash_modulo) {
                 .drv => |hash| {
-                    const outputs = try allocator.dupe([]const u8, input.outputs);
-                    errdefer allocator.free(outputs);
-                    try appendMergedInput(allocator, &inputs, hash, outputs);
+                    const outputs = try types.cloneStringListDeep(allocator, input.outputs);
+                    errdefer types.freeStringListDeep(allocator, outputs);
+                    const owned_hash = try allocator.dupe(u8, hash);
+                    errdefer allocator.free(owned_hash);
+                    try appendMergedInput(allocator, &inputs, owned_hash, outputs);
                 },
                 .outputs => |output_hashes| {
                     for (input.outputs) |output_name| {
                         const hash = outputHashByName(output_hashes, output_name) orelse return error.UnknownDerivationOutput;
+                        const owned_hash = try allocator.dupe(u8, hash);
+                        errdefer allocator.free(owned_hash);
                         const outputs = try allocator.alloc([]const u8, 1);
                         errdefer allocator.free(outputs);
-                        outputs[0] = "out";
-                        try appendMergedInput(allocator, &inputs, hash, outputs);
+                        outputs[0] = try allocator.dupe(u8, "out");
+                        try appendMergedInput(allocator, &inputs, owned_hash, outputs);
                     }
                 },
             }
@@ -151,10 +155,14 @@ fn appendMergedInput(
 
     for (inputs.items) |*existing| {
         if (!std.mem.eql(u8, existing.path, path)) continue;
+        allocator.free(path);
 
         var merged = existing.outputs;
         for (outputs) |output| {
-            if (containsString(merged, output)) continue;
+            if (containsString(merged, output)) {
+                allocator.free(output);
+                continue;
+            }
 
             const expanded = try allocator.alloc([]const u8, merged.len + 1);
             @memcpy(expanded[0..merged.len], merged);
