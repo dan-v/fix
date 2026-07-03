@@ -1,348 +1,203 @@
-# GC plan — bound peak RSS so `fix` runs on normal hardware
+# GC — status and what to do next
 
-## Why
+`-Dgc` opt-in, off by default (all GC code is `comptime`-gated, so the normal
+build is byte-for-byte unaffected). Non-moving mark-sweep with size-classed
+free lists. Goal: **bound peak RSS to ~live-set so `fix` runs on normal RAM,
+without meaningfully regressing wall time** ("fastest nix" — wall is a hard
+constraint, not a budget).
 
-`fix` currently never reclaims heap objects during an eval. The object,
-value, attr, and attr-pos stores are append-only bump allocators
-(`FlatStore` / `StableSegments` in `src/runtime/stable_segments.zig`):
-allocate forever, free everything at process exit. For the
-`nixos_toplevel` benchmark that's ~6M objects and a few hundred MB — fine
-on a 128 GB box. A full system-closure eval the way real Nix is used
-allocates *multiple GB*, the overwhelming majority of it dead the moment
-it's produced: the deforestation census (`-Dstruct-census`) measured
-**83.5% of lists and 66.8% of attrsets are single-use intermediates**
-(~2.4M structures), built by the module/overlay fixpoint and consumed
-once. Real Nix bounds this with the Boehm GC. We don't, so peak RSS
-tracks *total* allocation, not *live* set, and we OOM on machines that
-can actually run Nix.
+## Status (2026-07-02, commit 181fbfa)
 
-**Goal: bound peak RSS to ~live-set so `fix` runs on reasonable RAM —
-*without* meaningfully regressing wall time.** The project's headline is
-"fastest nix," so wall time is a hard constraint, not a budget we spend.
-This is not a throughput play (the benchmark isn't memory-bound —
-`project_not_memory_bound`, working set fits L3); the payoff is purely
-the RSS ceiling on large evals, and it has to be ~free on the clock.
-That constraint is what forces the measure-first approach below: the
-collector model is chosen to fit the wall-cost ceiling, not assumed.
+**DONE: precise collection at any native depth**, byte-identical. The collector
+fires at `native_depth > 0` — mid-builtin, during the deep module fixpoint where
+the garbage actually churns — not just at the rare depth-0 demand safepoints.
+Fully precise: **no C-stack or register scanning**.
 
-## What the architecture forces
+Validated on `nixos_toplevel` w=1:
+- ReleaseFast (slot-reuse ON, production): byte-identical at every threshold.
+- ReleaseSafe + range-poison detector: byte-identical, 0 UAF, to 728 collections.
+- normal build (no `-Dgc`): byte-identical.
 
-- **Non-moving.** Objects are addressed by a dense `ObjectId` NaN-boxed
-  directly into every `Value` (`src/runtime/value.zig`), and Values live
-  on every fiber VM stack, in frames, upvalues, attr entries, thunk
-  payloads, import results, the derivation cache, and thread-local
-  caches. A moving collector would have to rewrite every ObjectId *and*
-  every `(segment,offset,len)` Range stored inside objects, across all
-  suspended fibers — defeating the flat `base[id]` store the whole perf
-  design rests on. So: **mark, then sweep into free lists. No
-  compaction.** We accept fragmentation; size classes bound it.
+**The catch — wall.** Serial stop-the-world mark at w=1 costs **~0.2s per
+collection** (higher than depth-0's ~90ms: mid-fixpoint live sets are larger and
+it fires more often) plus a **~5.6% mutator tax** (the root-keeping on hot paths
+— `callValue`/`doCall`/`applyBuiltin`). Measured w=1:
 
-- **Concurrency model is NOT decided — it's chosen by Phase 0
-  measurement.** The hard constraint: *bound peak RSS without
-  meaningfully regressing wall time*, because the project's headline is
-  "fastest nix." For a batch tool pause *latency* is irrelevant, but
-  **total pause time IS wall time** — so a naive stop-the-world that
-  pauses for a meaningful fraction of the eval is disqualified. The three
-  candidate models and their wall costs:
+| config | wall | peak RSS |
+|---|---|---|
+| nogc | 2.756s | 1745 MB |
+| gc, 1 collection (step≈600MB) | 3.174s (+15%) | 1507 MB (−14%) |
+| gc, 3 collections (step≈256MB) | 3.472s (+26%) | 1355 MB (−22%) |
+| gc, default (18 collections) | 5.48s (2×!) | 1162 MB (−33%) |
 
-  1. **STW + parallel-mark + lazy-sweep.** Pause ∝ *live set* (not total
-     heap), marked in parallel across the idle workers, with sweep
-     amortized lazily into allocation. Collected rarely at a high
-     threshold, total pause *may* be <1% of wall — but that's a number to
-     prove in Phase 0, not assume. Simplest; no hot-path barrier.
-  2. **Concurrent mark on idle cores.** Memory: helpers are ~86% idle at
-     w=32, cores ~75% idle — a *surplus of CPU* against a *scarce serial
-     critical path*. Marking concurrently on idle helpers spends the free
-     CPU instead of wall time → ~0 wall cost, except a write barrier on
-     **thunk resolution** (`unresolved→resolved` publishes a new edge)
-     and the `merge_attrs.flattened` memo, gated on a global "gc active"
-     flag (predictable not-taken branch when idle). The risk is that even
-     a gated branch sits on the serial floor.
-  3. **Targeted reclamation (no tracing GC).** Free the *provably*
-     single-use intermediates inline where they die — 83.5% of lists /
-     66.8% of attrsets per the census. Zero pause, zero barrier, but only
-     catches what the optimizer can prove dead; this is the
-     `deforestation_ceiling` lever, needs optimizer reach.
+So today **the RSS bound costs more wall than it saves** at w=1 — worse than the
+depth-0 collector's −16%-for-free. This is Phase-0's conclusion made concrete:
+the mark must go **off the wall clock**. The precise foundation above is what
+unblocks that. **Next lever is off-clock mark, not more per-site rooting.**
 
-  Given the machine profile (idle cores cheap, serial wall scarce), (2)
-  is the natural fit and (1) is the simple baseline; Phase 0 decides.
-  Refcounting is out regardless — it dies on the cyclic thunk graphs the
-  module fixpoint builds and adds atomic contention to the shared graph.
+## How it stays correct — the rule for new ops and builtins
 
-- **Mark objects, not ranges.** Every `ValueRange`/`AttrRange`/
-  `AttrPosRange` is **single-owner**: each belongs to exactly one
-  object's field (a list's contents, an attrset's entries, a closure's
-  upvalues). Every construction site reserves a *fresh* range and
-  copies (`reserveValuesLocal`, `appendValues`, `prepareAttrsRange`, the
-  merge/concat/flatten paths); none alias another object's range. So
-  **range liveness == owning-object liveness** — we mark objects only,
-  and a range is reclaimable iff its owner is unmarked. (Load-bearing;
-  Phase 1 enforces it with an assertion, see Risks.)
+The collector marks from a fixed root set (below) and nothing else. A collection
+can fire at ANY forcing call: `force.forceValue/forceTop/forceAt/forceThunk/
+forceDeep`, `closures.callValue/doCall`, `access.getAttrValue`, and anything that
+transitively calls those. So: **after any forcing call, every heap object you
+still need must be reachable from a root.**
+
+**Bytecode ops (`vm/run.zig`).** Operands live on the VM operand stack, which is
+a precise root. Force operands *in place* — `force.forceTop(vm)` / `force.forceAt(vm, n)`
+— so they stay on the stack across the force; drop with `stack.dropBin`/pop only
+after. Never `forceValue(pop())` while another live operand sits off-stack. This
+is why almost every op is already safe; copy an existing forcing op (e.g.
+`opAddInt`, `opEq`, `opGetAttr`) when adding a new one.
+
+**Native builtins / helpers.** Your arguments are auto-rooted (`applyBuiltin`
+roots all args; `callValue`/`doCall` root callee+arg). Values reached *through* a
+rooted arg (list elements, attr values) are covered. You only need to root:
+- a container you hold as a raw `getList`/`getAttrs` slice or bare `ObjectId`
+  across a force, and
+- a **newly produced** heap value you stash in a Zig-side collection across a
+  later force (a strict-fold accumulator; lists a user fn returns mid-loop; a
+  string-**context** accumulator merged across an outer forcing loop).
+
+Use the `comptime`-gated helpers in `vm/force.zig` (zero cost without `-Dgc`):
+
+```zig
+const gc_roots = force.rootsBegin(self);
+defer force.rootsEnd(self, gc_roots);
+force.rootKeep(self, held);            // bare id: force.rootKeep(self, Value.list(id)) / Value.attrs(id)
+// loop-reassigned value: rootKeep each new value inside the loop
+```
+
+Exemplars to mirror: `collections.builtinFoldlStrict`/`builtinConcatMap`/
+`builtinGenericClosure`; `builtins/strings.coerce*ListToStringValue` (roots the
+list AND re-roots the `ctx` accumulator per item); `force.forceDeepInner`;
+`access.getAttrPathOrValue`; `builtins/derivation.buildForcedDerivationValue`.
+
+**ObjectId-keyed caches must carry the heap token.** A cache keyed by a raw
+`ObjectId` is a reuse-only correctness bug: a swept id gets handed to a different
+object, so a stale entry returns the wrong value. The reuse-OFF ReleaseSafe
+detector can't see this — only ReleaseFast corrupts. `lazy_drv_cache` learned
+this (now token-guarded); the thunk-memo/attr-IC/call-IC already key on token.
+
+## The root set (`eval.zig:gcMarkRoots` / `gcMarkVm`)
+
+At a safepoint mark:
+1. **Every VM** — worker fibers' `f.vm` (all workers), the registered eval VMs
+   (`gc_import_vms`: top-level entry, nested eval, imports — see the VM note in
+   "Next"), for each: `vm.stack[0..sp]`, `frames` + `Frame.upvalues`,
+   `vm.builtins`, `vm.native_upvalues`, plus the two precise native roots:
+   `vm.gc_force_chain` (in-flight thunks) and `vm.gc_temp_roots` (builtin roots).
+2. **Evaluator:** `builtins_value`; resolved `imports.entries` results; chunk
+   constants (chunks never GC'd); `lazy_drv_cache` — only current-token entries.
+3. **Scheduler:** queued `.force_thunk`/`.force_list_range` targets; each fiber's
+   `current_task`.
+4. **Thread-local caches are NOT traced** — thunk-memo / attr-IC / call-IC key on
+   `ObjectHeap.token`, bumped every collection so stale slots self-invalidate.
 
 ## The object graph (trace map)
 
-Authoritative field-by-field map, from `src/runtime/value.zig`,
-`src/runtime/heap.zig`, `src/runtime/thunk.zig`.
+Authoritative, from `runtime/value.zig`, `runtime/heap.zig`, `runtime/thunk.zig`.
 
-**A `Value` references the heap** iff its tag is one of: `list`,
-`attrs`, `thunk`, `closure` (primary tags 3–6), or MISC sub-tags
-`builtin_closure`, `string_context`, `boxed_int`, `partial_app`.
-Extract via `asObjectId()` (low 32 bits). `int`/`float`/`bool`/`null`/
-`builtin` carry nothing; `string`/`path` carry an **InternId** — the
-intern table is *not* GC'd, never follow it. Likewise **ChunkId** points
-into the `ChunkRegistry`, not the GC heap — never follow it.
+A `Value` references the heap iff its tag is `list`/`attrs`/`thunk`/`closure` or
+MISC sub-tag `builtin_closure`/`string_context`/`boxed_int`/`partial_app`; extract
+via `asObjectId()`. `int`/`float`/`bool`/`null`/`builtin` carry nothing;
+`string`/`path` carry an **InternId** (intern table not GC'd — never follow);
+**ChunkId** points into the registry (never follow).
 
-**Per `Object` variant, follow:**
-| variant          | follow |
-|------------------|--------|
-| `list`           | each `Value` in `values.slice(range)` |
-| `attrs`          | for each `AttrEntry` in `attrs.slice(range)`: the `.value` (the `.name` is InternId) |
-| `merge_attrs`    | `base`, `overlay` (ObjectIds); `flattened` if `!= NO_FLAT` |
-| `closure`        | each `Value` in `values.slice(upvalues)` |
-| `builtin_closure`| each `Value` in `values.slice(args)` |
-| `partial_app`    | `func` (Value); each `Value` in `values.slice(args)` |
-| `context_string` | for each `AttrEntry` in `attrs.slice(context)`: `.value` |
-| `boxed_int`      | nothing (raw i64) |
-| `thunk`          | **state-dependent**, see below |
-
-**Thunk** (`src/runtime/thunk.zig`) — the `payload` union has *no* tag;
-discriminate by `future.state` then `target_kind`:
-- `.resolved` → follow `payload.result` (a Value).
-- `.errored` → follow nothing; `payload.result` bits are a `*ErrorInfo`,
-  heap-owned via `errored_infos` (swept separately — see Risks).
-- `.blackhole` → follow nothing.
-- `.unresolved` / `.evaluating` → `payload.target`, by `target_kind`:
-  - `.closure` → `target.closure` (Value)
-  - `.pass_through` → `target.pass_through` (Value)
-  - `.attr_access` → `target.attr_access.base` (Value)
-  - `.bytecode` → `BytecodeThunk` upvalues: inline `[≤2]Value` if
-    `upvalue_count<=2`, else the spilled `values.slice`
-  - `.deferred` → `DeferredThunk` env: inline or spilled, same shape
-
-## The root set
-
-From `src/vm.zig`, `src/eval.zig`, `src/eval/worker.zig`,
-`src/parallel/{fiber,scheduler}.zig`. At a safepoint, scan:
-
-1. **Every fiber's VM** (`Worker.fibers.items` across all workers — fibers
-   are unpinned and migrate, so iterate *all* workers' lists):
-   - `vm.stack[0..vm.sp]` (operand stack, `vm.zig:139`)
-   - `vm.frames[0..vm.frames_len]`, and each `Frame.upvalues` if non-null
-     (`vm.zig:72,150`)
-   - `vm.builtins`, `vm.native_upvalues` (tjit)
-2. **Evaluator-level:** `builtins_value` (`eval.zig:72`); every
-   `ImportEntry.result` in `imports.entries` (`eval/imports.zig:76`);
-   every Value in `DerivationStore.lazy_drv_cache` (bitcast u64→Value,
-   `derivation/store.zig:38`); error-trace frames in `run.trace` and each
-   fiber's `local_trace` if they carry Values.
-3. **Scheduler pending work:** `ObjectId`s in queued tasks
-   (`.force_thunk`, `.force_list_range`) in the urgent/spec queues — a
-   pending task's target must survive (`scheduler.zig:33-45,269-279`).
-
-**Thread-local caches are NOT roots and are NOT traced.** The thunk-result
-memo (`vm/force.zig:74`), attr IC (`vm/access.zig:78`), call IC
-(`vm/closures.zig:375`) all key on `ObjectHeap.token`. **Bump the token
-at the start of every collection** → all stale slots self-invalidate on
-next access. Free, and it also covers the case where a swept slot's
-ObjectId gets reused.
-
-**Precise-safepoint invariant (load-bearing).** We collect *only* at
-the existing cooperative poll points (the `suppress_background` bail
-sites), chosen so that all live heap Values are reachable from
-`vm.stack`/`frames`/known roots — none stranded only in a Zig local on
-the raw fiber C-stack. If the audit (Phase 3) finds that invariant can't
-be guaranteed, the fallback is a *conservative* scan of each suspended
-fiber's `stack:[]u8` from `ctx.rsp` up — safe precisely because we never
-move (misidentified words only over-retain). Precise is preferred;
-conservative is the safety net.
-
-## Decision (2026-06-29): tight bound → concurrent SATB mark
-
-Target chosen: **RSS near the ~230 MB live floor at ~zero wall.** That
-requires the mark **off the wall clock** (concurrent on the idle helpers),
-paid for with a gated SATB write-barrier on the three mutation sites
-(thunk resolve `unresolved→resolved`; `merge_attrs.flattened` memo; cell
-publish), ~<1% hot path. Build order is still **STW-first** (the tracer,
-root scan, sweep + free-lists, and safepoint barrier are all reused);
-concurrent mark is the final step.
-
-### The safepoint / in-flight-allocation crux (drives the whole structure)
-A collection must not free an object that is built but **not yet rooted**
-— e.g. an object filled into its slot before its id is pushed to the VM
-stack, or a live intermediate a loop-allocating builtin (`genList`,
-`foldl'`) holds in a Zig local across a nested force. A naive
-collect-from-alloc would corrupt the result.
-
-- **STW mitigation:** collect only at a safepoint where every live Value
-  is in an enumerable root (`vm.stack`/`frames`/registered temps). Op
-  boundaries are *mostly* safe but builtins holding live temps in Zig
-  locals across nested forces are not — would need a temp-root stack.
-- **SATB dissolves it (another reason the tight-bound choice is right):**
-  with **allocate-black** (objects created during a mark cycle are born
-  marked) in-flight allocations are live by construction, and the
-  write-barrier catches edges published into already-scanned objects. So
-  the concurrent design is also the *cleaner* correctness model — build
-  toward it, don't bolt it on. The brief root-snapshot STW scans the VM
-  stacks precisely (the existing safepoint poll points); the final
-  re-scan drains the SATB buffer.
-
-## Phasing
-
-Each phase is independently landable, gated behind `-Dgc` (off by
-default; canonical path untouched, mirroring `-Djit`/`-Dtjit`/
-`-Dstruct-census`). **Byte-identical `.drv` output is the correctness
-bar at every phase.**
-
-### Phase 0 — measure, and let the numbers pick the architecture
-This phase exists *because* the wall-cost ceiling makes the collector
-model evidence-dependent. Deliver the numbers that decide between STW /
-concurrent-mark / targeted-reclamation, before committing to one.
-- `-Dgc` build flag; `src/runtime/gc.zig` skeleton; `--gc-stats`.
-- **Peak RSS** and where in the eval it occurs (high-water timeline).
-- **Live set at the high-water mark** — run a non-reclaiming mark there
-  and count reachable objects/bytes. This *is* the per-collection mark
-  cost; it tells us whether an STW pause is sub-ms or tens of ms.
-- **Reclaimable fraction** at peak (allocated − live) — the ceiling on
-  what any collector can buy.
-- **Allocation rate / threshold-crossing frequency** — how often a given
-  threshold would trigger, i.e. how many pauses.
-- **Worker slack during the high-water window** — idle-core fraction
-  while RSS is peaking, i.e. headroom for concurrent marking.
-- Ship the probe right (`feedback_tooling_quality`). **Decision gate:**
-  pick the concurrency model from these numbers and record it here before
-  Phase 1.
-
-#### Phase 0 RESULTS (2026-06-29, `nixos_toplevel`, w=1) — GC strongly justified
-`-Dgc` periodic mark-from-roots (no reclaim), every 1M object allocs:
-
-| metric | value |
+| variant | follow |
 |---|---|
-| total allocated (no-GC peak RSS) | **1208 MB** (14.0M objects, 17.0M values, 17.1M attrs, 4.7M attr-pos) |
-| **peak live set** (RSS ceiling a GC could hold) | **228 MB** (1.95M objects) |
-| **reclaimable** | **~81%** — peak-live is 19% of total → a GC caps RSS at ~5× lower |
-| live-set shape | **plateaus at ~225 MB from ~40% of the eval onward** while total climbs linearly to 1.2 GB |
-| per-collection mark cost | **~1.95M objects** (random heap walk) |
+| `list` | each `Value` in `values.slice(range)` |
+| `attrs` | each `AttrEntry.value` in `attrs.slice(range)` (`.name` is InternId) |
+| `merge_attrs` | `base`, `overlay`; `flattened` if `!= NO_FLAT` |
+| `closure` | `values.slice(upvalues)` |
+| `builtin_closure` | `values.slice(args)` |
+| `partial_app` | `func`; `values.slice(args)` |
+| `context_string` | each `AttrEntry.value` in `attrs.slice(context)` |
+| `boxed_int` | nothing |
+| `thunk` | state-dependent ↓ |
 
-Read: the eval has a **bounded, stable ~228 MB working set** but churns ~1
-GB of throwaway garbage past it — exactly the deforestation-census
-signature (single-use intermediates) at the byte level. A collector
-triggered at, say, `total > 2–3× live` (~500–700 MB) would hold RSS near
-there and collect only a handful of times. **This is the case for the
-GC.**
+Thunk: discriminate by `future.state` then `target_kind`.
+`.resolved` → `payload.result`. `.errored` (bits are a heap-owned `*ErrorInfo`,
+swept via `errored_infos`) / `.blackhole` → nothing. `.unresolved`/`.evaluating`
+→ `payload.target` by kind: `.closure`→`target.closure`; `.pass_through`→
+`target.pass_through`; `.attr_access`→`target.attr_access.base`; `.bytecode`→
+`BytecodeThunk.upvalues()` (inline ≤2, else spilled slice); `.deferred`→
+`DeferredThunk.env()` (same shape).
 
-**Architecture implication:** the live set (~2M objects) is large enough
-that a *serial* mark on the wall clock would be tens of ms × several
-collections — unacceptable against "fastest nix." So the mark must be
-**off the wall clock**: concurrent on idle cores (overlap demand) or
-parallel STW across the idle workers. Either is viable; the serial-STW
-strawman is out. **Still to measure before the final pick:** w=32 idle-
-core slack during the high-water window (room for concurrent marking) and
-real parallel-mark throughput (objects/sec/core). Those settle
-concurrent-mark vs parallel-STW; the *headroom* case is now proven.
+## Correctness tooling
 
-**Caveats (w=1 probe):** scans the main worker's fibers only; skips
-scheduler pending-task ObjectIds and trace frames (small, transient) — so
-live is a slight *under*count, i.e. reclaimable is if anything slightly
-*over*stated, but ±20% on live doesn't move the conclusion.
+- **UAF detector** (`gc_debug` = ReleaseSafe + `-Dgc`): freed object slots are not
+  reused; every object read asserts the alloc-bit → a swept-then-read traps with a
+  stack trace instead of a later nondeterministic segfault.
+- **Swept-range poison** (detector): a freed value/attr range is overwritten with a
+  thunk-to-unallocated-id, so a dangling raw `getList`/`getAttrs` slice traps on
+  next access instead of silently reading stale-but-intact data. This is what
+  catches the raw-slice class the reuse-off assert alone can't.
+- **`FIX_GC_STEP_MB`** env: collect every N MB of fresh allocation. Drives the
+  aggressive-threshold runs (small N → hundreds of collections → exhaustive
+  coverage). The completeness bar is: ReleaseFast byte-identical at several
+  thresholds AND ReleaseSafe+poison byte-identical + 0 UAF at a small step.
 
-#### Phase 0 RESULTS, part 2 — parallel-mark scaling (the STW-pause question)
-End-of-eval timed serial mark + a parallel memory-walk microbench (random/
-graph-order access, the real mark pattern):
+## What to do next (priority order)
 
-| | time | speedup |
-|---|---|---|
-| serial mark (full discovery) | **~53 ms** | — |
-| walk T=1 | ~38 ms | 1.0× |
-| walk T=4 | ~13 ms | 3.0× |
-| **walk T=8** | **~10.5 ms** | **3.7× (best)** |
-| walk T=16 | ~11 ms | 3.5× |
-| walk T=32 | ~13 ms | 3.0× (degrades) |
+1. **Off-the-clock mark — the whole ballgame.** Serial STW mark is the wall cost.
+   Two viable shapes (Phase-0 measured parallel mark tops out ~3.7× at ~8 threads,
+   memory-bandwidth-bound):
+   - **Parallel-STW across idle workers.** Needs the w>1 stop-the-world barrier
+     (built but gated off — `ensureMainWorker`; the known bug is a back-to-back-
+     collection handshake race needing a generation-tagged barrier). Split
+     roots / work-steal the mark stack across the parked workers. Pause becomes
+     live-set-proportional and ~8× shorter.
+   - **Concurrent mark on idle helpers (SATB).** Brief STW to snapshot roots +
+     bump token, then mark on idle cores while demand proceeds, guarded by a
+     gated write barrier on thunk-resolve + `merge_attrs.flattened` (+ cell
+     publish), with allocate-black. ~0 wall on the serial critical path; the risk
+     is the gated branch on the alloc/resolve hot path.
+   Either makes the RSS bound wall-viable. Parallel-STW is the smaller step (reuses
+   the STW machinery); do it first, keep concurrent as the tight-bound upgrade.
 
-**Marking is memory-latency/bandwidth-bound.** Parallel mark scales to
-**~3.7× at ~8 threads, then degrades** (DRAM bandwidth saturates; >8 adds
-cross-core/NUMA traffic — 32 threads are *slower* than 8). So "do as much
-on the workers as possible" tops out at **~8 markers, not 32**. Parallel
-mark cuts a collection from ~50 ms to a **~10–15 ms floor** (incl. real
-work-steal/CAS overhead).
+2. **Cut the ~5.6% mutator tax.** The root-keeping on `callValue`/`doCall`/
+   `applyBuiltin` is universal today (correct-by-construction). Measure which
+   choke points are actually load-bearing vs. redundant with the operand-stack /
+   arg roots, and elide the redundant ones. Also re-check the per-alloc alloc-bit
+   / threshold sampling. This tax is paid even at 0 collections, so it caps the
+   best-case tradeoff.
 
-**The RSS-vs-wall tradeoff (parallel-STW), from the plateau:**
-- collect at ~2–3× live (~500–600 MB) → ~3 collections → **~2× RSS cut for
-  ~3% wall**. Defensible first cut.
-- collect tightly (~300 MB) → ~13 collections → ~5× RSS cut but **~12%
-  wall**. Too steep for "fastest nix".
+3. **Threshold / default policy.** The additive `reserved + HEADROOM` default
+   collects ~18× (2× wall). Switch to an adaptive `reserved > k·live` target so
+   the default collects a few times (a "defensible first cut": ~−20% RSS for a
+   modest wall once the mark is off-clock). Until (1) lands, the honest default is
+   conservative (1–2 collections) or the depth-0 gate.
 
-**Architecture decision:** parallel-STW (capped at ~8 markers) is the
-**simple, no-barrier first cut** and buys a *moderate* RSS bound cheaply.
-A *tight* bound at ~zero wall needs the mark **off the clock** —
-mostly-concurrent mark on the idle helpers, paid for with a gated SATB
-write-barrier on thunk-resolve + `flattened` (~<1% hot path). Plan:
-**build parallel-STW first** (Phases 1–3 below, marker pool capped at 8);
-keep mostly-concurrent mark as the Phase-4 upgrade if the moderate bound
-isn't tight enough.
+4. **Unify the VMs (removes a whole bug class).** The root-cause bug this session
+   was that `runWithVm` runs eval on a *stack-local* VM, not the worker fiber's
+   `f.vm` — invisible to the collector until registered. The top-level entry's own
+   VM is vestigial (should use `f.vm`); imports make a fresh VM only because the
+   `import` callback doesn't carry the current VM (thread it through and run the
+   imported chunk via `runIsolatedFrame`). Collapsing to one-VM-per-fiber deletes
+   the "unregistered VM" class entirely.
 
-### Phase 1 — mark only, w=1, no sweep (prove the tracer)
-- Side mark-bitmap indexed by ObjectId (1 bit/object; the FlatStore makes
-  `bit[i] ↔ object i` trivial).
-- Precise root scan (single VM at w=1) + graph mark via the trace map.
-- `--gc-verify`: mark from roots, assert the top-level result object is
-  marked, report marked/unmarked counts. No mutation → still
-  byte-identical. **Enforce single-owner ranges here** (assert on sweep-
-  candidate ranges).
+5. **Reclaim executing closure/thunk ranges.** `gcFreeObjectRanges` deliberately
+   leaks `.closure`/`.thunk` ranges: a running frame aliases its `upvalues` slice
+   (owned by the closure/thunk), so freeing it mid-run would dangle. Root the
+   executing closure/thunk in the frame (a temp-root at frame push) and reclaim.
+   Modest extra RSS.
 
-### Phase 2 — sweep + free lists, w=1 (the real reclaim)
-- **Object store:** intrusive free list (a dead `Object` slot holds the
-  freelist next-link). `reserveObjectSlot` pulls from the free list
-  before bumping.
-- **Value/attr/attr-pos stores:** size-classed free lists keyed by range
-  length; a dead object's range returns to its class; reserve checks the
-  class first. Non-moving ⇒ fragmentation; size classes bound it.
-  `StableSegments` gains a freelist-aware reserve.
-- Handle `errored` thunks: sweep must release `*ErrorInfo` via the
-  existing `errored_infos` tracking, not double-free.
-- Trigger on occupancy threshold (and `--gc` for tests). Optional lazy
-  sweep (amortize sweep into allocation).
-- **Gate: byte-identical `.drv` on `nixos_toplevel` w=1 with an
-  aggressively low threshold** (dozens of collections mid-eval). If the
-  graph survives that, roots+tracer are right. Debug divergence with
-  `fix thunks diff` / trace-diff.
+6. **w>1 enablement.** Once (1)'s barrier is solid, turn on collection at
+   `--workers>1` (currently dormant — GC behaves as non-GC there). The per-worker
+   root marking, import-VM registry, and suspended-fiber coverage are built.
 
-### Phase 3 — go parallel, w>1 (shape set by the Phase 0 decision)
-Phases 1–2 (correct tracer + free-list sweep) are model-agnostic; this is
-where the chosen model lands. Both variants share: trigger on TLAB refill
-over threshold *after* releasing `write_mu` (no deadlock vs mark/sweep);
-audit the precise-safepoint invariant with the conservative fiber-stack
-scan as the non-moving-safe fallback; bump `ObjectHeap.token` per cycle.
-- **If STW:** safepoint barrier extending `suppress_background` — a
-  `gc_request` flag polled at the existing cooperative points (after
-  `runFiber` in `drainStep`; the genList checkpoint; thunk claim);
-  workers park via the existing futex infra; last in marks. **Parallel
-  mark** across the parked workers (split roots / work-stealing mark
-  stack) to keep the pause live-set-proportional and short.
-- **If concurrent-mark:** brief STW only to snapshot roots + bump token,
-  then mark on idle helpers while demand proceeds, guarded by the
-  thunk-resolve / `flattened` write barrier (SATB). Reclaim (lazy sweep)
-  after the concurrent mark drains.
-- **Gate: byte-identical `.drv` at w=8 and w=32, aggressive threshold,
-  ≥30 runs, 0 failures** (the bar used for the fiber-park / resume-race
-  fixes) — *and* a measured wall delta within the agreed ceiling.
+## Load-bearing invariants (don't break)
 
-### Phase 4 — tuning + decide default
-- Adaptive heap target (collect when live·k reached); lazy sweep on by
-  default; report peak-RSS reduction (the goal metric) vs throughput
-  cost at w=1/w=8/w=32. Decide a default-on threshold or keep opt-in.
-
-## Risks / load-bearing assumptions
-1. **Single-owner ranges** — if any path aliases a range into two
-   objects, sweeping one frees the other's payload. Strongly indicated
-   by the construction-site audit; enforce with a Phase-1 assertion.
-2. **Precise-safepoint invariant** — a live heap Value stranded only in a
-   Zig local at a safepoint would be collected. Audit in Phase 3;
-   conservative fiber-stack scan is the safe fallback (non-moving makes
-   it sound).
-3. **`merge_attrs.flattened`** — written lazily (a memo). In STW no
-   mutation occurs during the pause, so safe; this is another reason STW
-   beats concurrent-mark.
-4. **`errored` thunk `*ErrorInfo`** — not a Value; swept via
-   `errored_infos`, must not double-free.
-5. **Token reuse** — a swept ObjectId reused later must not match a stale
-   IC entry; the per-collection `token` bump covers it.
+- **Non-moving.** Objects are addressed by dense `ObjectId` NaN-boxed into every
+  Value and by `(segment,offset,len)` Ranges inside objects. A moving collector
+  would have to rewrite all of them across suspended fibers — defeating the flat
+  `base[id]` store. So: mark, sweep into size-classed free lists, accept
+  fragmentation.
+- **Single-owner ranges.** Every `ValueRange`/`AttrRange`/`AttrPosRange` belongs
+  to exactly one object's field (construction sites reserve fresh + copy). Range
+  liveness == owning-object liveness → we mark objects only and free a range iff
+  its owner is unmarked. If any path ever aliased a range into two objects,
+  sweeping one would free the other's payload.
+- **Token bump per collection** covers thread-local caches AND swept-then-reused
+  ObjectIds. Any new ObjectId-keyed structure must carry the token (see above).
