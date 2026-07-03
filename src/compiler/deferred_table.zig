@@ -171,3 +171,82 @@ pub const Table = struct {
         return .{ .registered = total, .compiled = compiled };
     }
 };
+
+const test_node: ast.Node = .{ .tag = .null, .data = .{ .atom = .{ .offset = 0, .len = 0 } }, .span = null };
+
+test "register stores an entry retrievable by its returned id" {
+    var table = Table.init(std.testing.allocator);
+    defer table.deinit();
+
+    const id = try table.register(.{
+        .node = &test_node,
+        .scope = &.{},
+        .source = "irrelevant",
+        .base_path = null,
+        .source_path = null,
+        .source_file_id = null,
+    });
+
+    const entry = table.get(id);
+    try std.testing.expectEqual(&test_node, entry.node);
+    try std.testing.expectEqual(@as(usize, 0), entry.scope.len);
+}
+
+test "register dupes scope capture names so the caller's buffer can be freed" {
+    var table = Table.init(std.testing.allocator);
+    defer table.deinit();
+
+    var name_buf: [3]u8 = "foo".*;
+    const caps = [_]Capture{.{ .name = &name_buf, .name_id = 7, .kind = .local, .index = 0 }};
+    const id = try table.register(.{
+        .node = &test_node,
+        .scope = &caps,
+        .source = "irrelevant",
+        .base_path = null,
+        .source_path = null,
+        .source_file_id = null,
+    });
+
+    // Mutate the caller's buffer after registering: the table must hold
+    // its own copy, not a borrowed slice into `name_buf`.
+    @memset(&name_buf, 'x');
+
+    const entry = table.get(id);
+    try std.testing.expectEqualStrings("foo", entry.scope[0].name);
+}
+
+test "stats reports registered bodies as not-yet-compiled" {
+    var table = Table.init(std.testing.allocator);
+    defer table.deinit();
+
+    _ = try table.register(.{
+        .node = &test_node,
+        .scope = &.{},
+        .source = "irrelevant",
+        .base_path = null,
+        .source_path = null,
+        .source_file_id = null,
+    });
+    _ = try table.register(.{
+        .node = &test_node,
+        .scope = &.{},
+        .source = "irrelevant",
+        .base_path = null,
+        .source_path = null,
+        .source_file_id = null,
+    });
+
+    const stats = table.stats();
+    try std.testing.expectEqual(@as(u32, 2), stats.registered);
+    try std.testing.expectEqual(@as(u32, 0), stats.compiled);
+}
+
+test "lineIndexFor caches the index for the same source pointer" {
+    var table = Table.init(std.testing.allocator);
+    defer table.deinit();
+
+    const source = "a\nb\nc";
+    const first = try table.lineIndexFor(source);
+    const second = try table.lineIndexFor(source);
+    try std.testing.expectEqual(first, second);
+}

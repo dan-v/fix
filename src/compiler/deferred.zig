@@ -87,3 +87,53 @@ pub fn compile(
     try child.compileNode(entry.node);
     return thunks.finishCompiledChild(&child, &child_builder, entry.node);
 }
+
+const fix = @import("../root.zig");
+const Evaluator = fix.Evaluator;
+
+test "an imported file large enough to defer per-attr compilation evaluates the forced attr correctly" {
+    // Lazy per-attr compilation (attrs.zig `shouldDeferSet`) only
+    // triggers for file/import compiles (source_path != null) with at
+    // least MIN_ENTRIES (64) entries whose bodies are at least
+    // MIN_BODY_BYTES (100) bytes. This builds such a set, forces exactly
+    // one entry, and checks it round-trips through the deferred
+    // force-time compile in `deferred.compile`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try contents.appendSlice(std.testing.allocator, "let shared = 3; in {\n");
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        // Each body references the enclosing `shared` binding (forcing a
+        // real scope-snapshot capture) and pads past MIN_BODY_BYTES.
+        const line = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "  attr{d} = shared + {d} /* padding padding padding padding padding padding padding */;\n",
+            .{ i, i },
+        );
+        defer std.testing.allocator.free(line);
+        try contents.appendSlice(std.testing.allocator, line);
+    }
+    try contents.appendSlice(std.testing.allocator, "}\n");
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.nix", .data = contents.items });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd, ".zig-cache", "tmp", &tmp.sub_path, "big.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).attr42", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 45), result.asInt());
+}
