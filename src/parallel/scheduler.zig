@@ -31,7 +31,7 @@ const types = @import("runtime").types;
 const stable = @import("runtime").stable_segments;
 const gc = @import("runtime").gc;
 const heap_mod = @import("runtime").heap;
-const deque = @import("deque.zig");
+const containers = @import("containers");
 
 pub const Task = union(enum) {
     /// Speculatively force a thunk to its result. The thunk lives in the
@@ -127,10 +127,10 @@ const ReadyQueue = struct {
 /// caller drops the task (speculation is best-effort; urgent
 /// submission's cap is enforced upstream by `pending_tasks`).
 ///
-/// The generic engine lives in `deque.zig` (extracted so GC mark work can
-/// reuse the same lock-free ring for `Deque(ObjectId)`); this is a thin
-/// alias plus the `Task`-specific `gcMark` helper.
-const TaskQueue = deque.Deque(Task);
+/// The generic engine lives in `containers.Deque` (extracted so GC mark
+/// work can reuse the same lock-free ring for `Deque(ObjectId)`); this is a
+/// thin alias plus the `Task`-specific `gcMark` helper.
+const TaskQueue = containers.Deque(Task);
 
 /// GC (`-Dgc`): mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,

@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
 
+    const containers_mod = b.addModule("containers", .{
+        .root_source_file = b.path("src/containers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+
     const runtime_mod = b.addModule("runtime", .{
         .root_source_file = b.path("src/runtime.zig"),
         .target = target,
@@ -66,6 +74,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     runtime_mod.addImport("build_options", build_options_mod);
+    runtime_mod.addImport("containers", containers_mod);
 
     const parallel_mod = b.addModule("parallel", .{
         .root_source_file = b.path("src/parallel.zig"),
@@ -76,6 +85,7 @@ pub fn build(b: *std.Build) void {
     });
     parallel_mod.addImport("build_options", build_options_mod);
     parallel_mod.addImport("runtime", runtime_mod);
+    parallel_mod.addImport("containers", containers_mod);
     // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
     // resolved target. Lives with the fiber code in the parallel module.
     switch (target.result.cpu.arch) {
@@ -105,6 +115,7 @@ pub fn build(b: *std.Build) void {
         .runtime = runtime_mod,
         .parallel = parallel_mod,
         .derivation = derivation_mod,
+        .containers = containers_mod,
     };
     addSharedImports(mod, shared_imports);
 
@@ -153,12 +164,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // `runtime`, `syntax`, `parallel`, and `derivation` are each separate
-    // modules (clean-cut subsystems, see the comment above `syntax_mod`), so
-    // their unit tests aren't collected by the root-module test artifacts
-    // above — Zig only walks a module's own `@import` graph, and these are
-    // pulled into `fix` by module name, not by file inclusion. Run each
-    // explicitly, the same way `runtime_tests` already was.
+    // `runtime`, `syntax`, `parallel`, `derivation`, and `containers` are each
+    // separate modules (clean-cut subsystems, see the comment above
+    // `syntax_mod`), so their unit tests aren't collected by the root-module
+    // test artifacts above — Zig only walks a module's own `@import` graph,
+    // and these are pulled into `fix` by module name, not by file inclusion.
+    // Run each explicitly, the same way `runtime_tests` already was.
+    const containers_tests = b.addTest(.{
+        .root_module = containers_mod,
+        .use_llvm = true,
+    });
+    const run_containers_tests = b.addRunArtifact(containers_tests);
+
     const runtime_tests = b.addTest(.{
         .root_module = runtime_mod,
         .use_llvm = true,
@@ -206,6 +223,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_syntax_tests.step);
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
+    test_step.dependOn(&run_containers_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
@@ -217,6 +235,7 @@ const SharedImports = struct {
     runtime: *std.Build.Module,
     parallel: *std.Build.Module,
     derivation: *std.Build.Module,
+    containers: *std.Build.Module,
 };
 
 fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
@@ -225,4 +244,5 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("runtime", imports.runtime);
     module.addImport("parallel", imports.parallel);
     module.addImport("derivation", imports.derivation);
+    module.addImport("containers", imports.containers);
 }

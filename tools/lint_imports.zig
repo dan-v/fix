@@ -1,8 +1,9 @@
 //! Module-boundary import lint.
 //!
-//! The clean-cut subsystems (`syntax`, `runtime`, `parallel`, `derivation`)
-//! are real `build.zig` modules. Code outside such a module must reach it by
-//! name — `@import("runtime")` — never by a relative path into its files.
+//! The clean-cut subsystems (`syntax`, `runtime`, `parallel`, `derivation`,
+//! `containers`) are real `build.zig` modules. Code outside such a module
+//! must reach it by name — `@import("runtime")` — never by a relative path
+//! into its files.
 //!
 //! A stray `@import("../runtime/value.zig")` from a main-module file does *not*
 //! fail to compile: it pulls that file into a second module instance, silently
@@ -17,7 +18,7 @@ const std = @import("std");
 /// Directories under `src/` that are their own build module. A file outside
 /// `src/<name>/` may not import `src/<name>/**` or the facade `src/<name>.zig`
 /// by relative path.
-const module_dirs = [_][]const u8{ "syntax", "runtime", "parallel", "derivation" };
+const module_dirs = [_][]const u8{ "syntax", "runtime", "parallel", "derivation", "containers" };
 
 const max_file_bytes = 8 * 1024 * 1024;
 
