@@ -230,13 +230,14 @@ pub const HeapLocal = struct {
     attr_pos: LocalChunk = .{},
 };
 
-/// GC Phase 0 sampling hook (gated behind `-Dgc`). The heap can't reach
-/// the evaluator's roots, so the evaluator registers a callback the
-/// allocation path fires every `gc_sample_interval` object allocations.
-/// Type-erased to keep the heap free of an `eval`/`gc` import cycle.
+/// GC collect hook (gated behind `-Dgc`). The heap can't reach the
+/// evaluator's roots, so the evaluator registers a mark+sweep callback the
+/// heap fires from `gcRunCollect` at a safepoint. Type-erased to keep the
+/// heap free of an `eval`/`gc` import cycle. `collector_id` is the worker
+/// that won the collection (its marker slot in the parallel mark).
 pub const GcHook = struct {
     ctx: *anyopaque,
-    sample: *const fn (*anyopaque) void,
+    sample: *const fn (*anyopaque, collector_id: u8) void,
 };
 
 /// Exact-fit free list of reclaimed ranges in one segmented store, keyed
@@ -838,10 +839,11 @@ pub const ObjectHeap = struct {
     }
 
     /// Run a collection now via the registered callback (the evaluator's
-    /// mark+sweep). Caller must be at a safepoint.
-    pub fn gcRunCollect(self: *ObjectHeap) void {
+    /// mark+sweep). Caller must be at a safepoint. `collector_id` is the
+    /// worker driving the collection (its slot in the parallel mark).
+    pub fn gcRunCollect(self: *ObjectHeap, collector_id: u8) void {
         if (comptime !build_options.gc) return;
-        if (self.gc_hook) |h| h.sample(h.ctx);
+        if (self.gc_hook) |h| h.sample(h.ctx, collector_id);
     }
 
     /// Called by the evaluator after a sweep: clear the request and set the

@@ -157,6 +157,15 @@ const spec_queue_capacity: u32 = 4096;
 const spec_backlog_per_helper: u32 = 128;
 const burst_wake_budget: u32 = 4;
 
+/// GC parallel-mark hook (`-Dgc`): the Evaluator installs this so a parked
+/// peer can help drain the mark graph. Type-erased to keep `parallel` free of
+/// an `eval`/`runtime.gc` import (mirrors the heap's `GcHook`).
+pub const GcMarkHook = struct {
+    ctx: *anyopaque,
+    /// Run marker `worker_id`'s drain-and-steal loop to termination.
+    help: *const fn (ctx: *anyopaque, worker_id: u8) void,
+};
+
 pub const Scheduler = struct {
     /// Cumulative scheduler activity counters. Read via `stats()`.
     /// All values are advisory — monotonic loads are fine.
@@ -278,6 +287,19 @@ pub const Scheduler = struct {
     gc_stop_requested: if (gc.enabled) std.atomic.Value(bool) else void,
     gc_worker_parked: if (gc.enabled) []std.atomic.Value(bool) else void,
 
+    /// Parallel-mark phase gate (`-Dgc`, `--workers>1`). Once every peer is
+    /// parked (`gcWaitAllParked`), the collector seeds the roots and then
+    /// opens this flag; each parked peer, seeing it, calls the mark hook to
+    /// help drain the graph (marker slot == its worker id) instead of merely
+    /// spinning. It stays open for the whole mark and is closed only AFTER
+    /// termination (when every marker has provably entered and returned), so
+    /// no peer can miss the mark and hang the work-stealing terminator.
+    gc_mark_open: if (gc.enabled) std.atomic.Value(bool) else void,
+    /// Installed by the Evaluator: runs `Tracer.drainParallel(worker_id)` to
+    /// termination. Lets the scheduler drive the marker without importing
+    /// `eval`/`gc` (same type-erasure as the heap's collect hook).
+    gc_mark_hook: if (gc.enabled) ?GcMarkHook else void,
+
     /// `worker_count` includes the main thread (worker 0). The
     /// scheduler spawns `worker_count - 1` helper threads in `start()`;
     /// worker 0 runs on the calling thread.
@@ -354,6 +376,8 @@ pub const Scheduler = struct {
             .suppress_background = .init(false),
             .gc_stop_requested = if (gc.enabled) .init(false) else {},
             .gc_worker_parked = gc_worker_parked,
+            .gc_mark_open = if (gc.enabled) .init(false) else {},
+            .gc_mark_hook = if (gc.enabled) null else {},
         };
     }
 
@@ -724,13 +748,43 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Evaluator installs the parallel-mark hook (see `GcMarkHook`) once, at
+    /// startup, so parked peers can help drain the mark.
+    pub fn gcSetMarkHook(self: *Scheduler, hook: GcMarkHook) void {
+        if (comptime !gc.enabled) return;
+        self.gc_mark_hook = hook;
+    }
+
+    /// Collector: the roots are seeded — release the parked peers to help
+    /// mark. Paired with `gcCloseMark` after the mark terminates.
+    pub fn gcOpenMark(self: *Scheduler) void {
+        if (comptime !gc.enabled) return;
+        self.gc_mark_open.store(true, .release);
+    }
+
+    /// Collector: the mark has terminated (every marker entered and returned).
+    /// Close the phase so the next collection starts from a clean gate — must
+    /// happen before `gcEndCollection` releases the peers.
+    pub fn gcCloseMark(self: *Scheduler) void {
+        if (comptime !gc.enabled) return;
+        self.gc_mark_open.store(false, .release);
+    }
+
     /// Peer (worker `worker_id`): park in the barrier until the collector
     /// finishes this cycle. Must be called only at a safepoint (native_depth
     /// 0, no un-rooted in-flight allocation) — the collector scans this
-    /// worker's fibers for roots.
+    /// worker's fibers for roots. Once the collector opens the mark, this peer
+    /// helps drain the graph (marker slot == `worker_id`) instead of spinning
+    /// idle; the mark stays open until termination so no peer can miss it (a
+    /// missed marker would hang the work-stealing terminator).
     pub fn gcSafepointPark(self: *Scheduler, worker_id: u8) void {
         if (comptime !gc.enabled) return;
         self.gc_worker_parked[worker_id].store(true, .release);
+        if (self.gc_mark_hook) |hook| {
+            while (self.gc_stop_requested.load(.acquire) and
+                !self.gc_mark_open.load(.acquire)) std.atomic.spinLoopHint();
+            if (self.gc_mark_open.load(.acquire)) hook.help(hook.ctx, worker_id);
+        }
         while (self.gc_stop_requested.load(.acquire)) std.atomic.spinLoopHint();
         self.gc_worker_parked[worker_id].store(false, .release);
     }

@@ -708,6 +708,9 @@ pub const Evaluator = struct {
         if (comptime gc.enabled) {
             self.gc_workers[0].store(w, .release);
             self.heap.setGcHook(.{ .ctx = self, .sample = gcCollectThunk });
+            // Parallel STW mark (--workers>1): parked peers call this to help
+            // drain the graph. Inert at --workers=1 (no peer ever parks).
+            self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
             // Reclaim is enabled at --workers=1 (byte-identical, -16% RSS).
             // The multi-worker stop-the-world path (barrier + per-worker
             // roots + suspended-fiber conservative scan) is built but the STW
@@ -754,28 +757,54 @@ pub const Evaluator = struct {
         }
     }
 
-    /// Type-erased trampoline for the heap's collect callback.
-    fn gcCollectThunk(ctx: *anyopaque) void {
+    /// Type-erased trampoline for the heap's collect callback. `collector_id`
+    /// is the worker that won the collection (its parallel-mark slot).
+    fn gcCollectThunk(ctx: *anyopaque, collector_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        self.gcCollect();
+        self.gcCollect(collector_id);
+    }
+
+    /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
+    /// peer helps drain marker slot `worker_id` to termination.
+    fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
+        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        self.gc_tracer.drainParallel(&self.heap, worker_id);
     }
 
     /// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
     /// live graph from roots, sweep dead objects/ranges into the free
     /// lists, set the next threshold from the surviving live set. Runs on
     /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
-    fn gcCollect(self: *Evaluator) void {
+    fn gcCollect(self: *Evaluator, collector_id: u8) void {
         if (comptime !gc.enabled) return;
         const tr = &self.gc_tracer;
-        tr.reset(self.heap.objects.count()) catch {
-            // Can't size the mark bitmap — skip this collection rather than
-            // risk an unmarked sweep. Bump the threshold so we don't spin.
-            self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-            return;
-        };
         const t0 = gcNowNs();
-        self.gcMarkRoots(tr);
-        tr.drain(&self.heap); // precise transitive closure from the roots
+        if (self.worker_count > 1) {
+            // Parallel STW mark: the peers are already parked at safepoints
+            // (gcWaitAllParked, in force.zig). Seed the roots into our own
+            // marker deque, open the mark so the peers help drain it, mark
+            // alongside them, then sum the per-marker tallies.
+            tr.resetParallel(self.heap.objects.count(), self.worker_count) catch {
+                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+                return;
+            };
+            tr.beginSeeding(collector_id);
+            self.gcMarkRoots(tr);
+            tr.endSeeding();
+            self.scheduler.gcOpenMark();
+            tr.drainParallel(&self.heap, collector_id); // returns at termination
+            self.scheduler.gcCloseMark();
+            tr.sumStats();
+        } else {
+            tr.reset(self.heap.objects.count()) catch {
+                // Can't size the mark bitmap — skip this collection rather than
+                // risk an unmarked sweep. Bump the threshold so we don't spin.
+                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+                return;
+            };
+            self.gcMarkRoots(tr);
+            tr.drain(&self.heap); // precise transitive closure from the roots
+        }
         const t1 = gcNowNs();
         const st = self.heap.sweep(tr.mark_bits);
         const t2 = gcNowNs();

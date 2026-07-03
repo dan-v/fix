@@ -406,7 +406,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             self.gc_extra_root = thunk_val;
             if (self.scheduler.gcTryBeginCollection()) {
                 self.scheduler.gcWaitAllParked(self.workerId());
-                self.heap.gcRunCollect();
+                self.heap.gcRunCollect(self.workerId());
                 self.scheduler.gcEndCollection(self.workerId());
             } else {
                 self.scheduler.gcSafepointPark(self.workerId());
