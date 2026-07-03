@@ -128,13 +128,10 @@ inline fn attrCacheIndex(obj_id: types.ObjectId, name_id: InternId) usize {
 }
 
 pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
-    // GC: each path node `current` is a freshly-forced attrs held across the
-    // next level's force; keep them rooted (the op keeps only `attrs_val` on
-    // the operand stack).
-    const gc_roots = force.rootsBegin(self);
-    defer force.rootsEnd(self, gc_roots);
+    // GC: no explicit roots — the op keeps `attrs_val` (and `default_val`) on the
+    // operand stack across this whole helper, so every `current` path node is
+    // transitively reachable from it (attr thunks resolve in place).
     var current = try force.forceValue(self, attrs_val);
-    force.rootKeep(self, current);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
@@ -145,16 +142,14 @@ pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encod
             else => return err,
         };
         current = try force.forceValue(self, current);
-        force.rootKeep(self, current);
     }
     return current;
 }
 
 pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
-    const gc_roots = force.rootsBegin(self); // root each path node across forces
-    defer force.rootsEnd(self, gc_roots);
+    // GC: no explicit roots — the op keeps [attrs, name, default] on the operand
+    // stack across this helper, so every `current` is transitively reachable.
     var current = try force.forceValue(self, attrs_val);
-    force.rootKeep(self, current);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
@@ -165,7 +160,6 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
             else => return err,
         };
         current = try force.forceValue(self, current);
-        force.rootKeep(self, current);
     }
     const name_val = try force.forceValue(self, dynamic_name);
     if (!name_val.isString()) return error.TypeError;
@@ -178,10 +172,9 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
 }
 
 pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const Value, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
-    const gc_roots = force.rootsBegin(self); // root each path node across forces
-    defer force.rootsEnd(self, gc_roots);
+    // GC: no explicit roots — the op keeps [attrs, dyn-names…, default] on the
+    // operand stack across this helper, so every `current` is transitively reachable.
     var current = try force.forceValue(self, attrs_val);
-    force.rootKeep(self, current);
     var offset: usize = 0;
     var dynamic_i: usize = 0;
     for (0..segment_count) |_| {
@@ -208,7 +201,6 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
             else => return err,
         };
         current = try force.forceValue(self, current);
-        force.rootKeep(self, current);
     }
     return current;
 }
