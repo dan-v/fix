@@ -140,13 +140,15 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 //     forcing operands *in place*; see `forceAt`/`forceTop`, never pop-then-force);
 //   - the in-flight thunk force chain (`forceThunkImpl` pushes each claimed
 //     thunk — roots its target closure / upvalues / attr-access base);
-//   - `callValue`/`doCall` root their callee+arg for the call's duration;
-//   - `applyBuiltin` roots every builtin argument for the builtin's duration;
+//   - `callValue`/`doCall`/`doTailCall` root their callee+arg for the call's
+//     duration; `doCallN` keeps args on the operand stack — so a builtin's
+//     arguments are rooted by whichever invoked it (`applyBuiltin` no longer
+//     roots them itself);
 //   - `gc_temp_roots` for anything native code holds that none of the above
 //     covers (see rule below).
 //
 // RULE for writing a native builtin (so you get it right on the first try):
-//   Your ARGUMENTS are already rooted (by applyBuiltin). Any value you pass to
+//   Your ARGUMENTS are already rooted (by the caller — doCall/callValue/doCallN). Any value you pass to
 //   `forceValue`/`callValue`/`getAttrValue` is rooted for that call. List
 //   elements / attr values reached THROUGH a rooted argument are covered too.
 //   => You only need a scope when you stash a *newly produced* heap value in a

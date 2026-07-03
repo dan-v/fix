@@ -1,5 +1,18 @@
 # GC mutator-tax removal — Phase 1 (of "tax removal + concurrent SATB")
 
+> **⚠ MEASURED OUTCOME (2026-07-03): the premise below is REFUTED.** An isolation
+> experiment (stub every `rootKeep`/`rootsBegin`/`rootsEnd` to no-ops, 0
+> collections, interleaved vs the real `-Dgc` build) measured the *rooting* cost
+> at **~0.018s median / ~0.008s best = noise (~0.6%)**. The real ~0.09s (~3.3%)
+> `-Dgc` mutator overhead is per-alloc `gcSetAllocBit`/threshold + per-force
+> safepoint bookkeeping, **not rooting**. So "remove the tax by keeping operands
+> on the stack" targets the wrong 0.6%. **Landed** the two clean, byte-identical
+> deletions as correctness/simplification wins — access path-walk roots
+> (`1351a4c`) and the `applyBuiltin` arg-loop (`d384c46`); **abandoned** the
+> `opCall`/`doCall` keep-on-stack conversion (Step B — noise-level gain, real UAF
+> risk). Real GC-wall lever = the mark cost (Phase 2), not this. The design below
+> is kept for the record.
+
 Status: DESIGN (2026-07-03). Sibling of [gc-plan.md](gc-plan.md) (the collector)
 and the forthcoming `gc-concurrent-satb-plan.md` (Phase 2). This phase is
 standalone, correctness-neutral, and independently shippable.

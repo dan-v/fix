@@ -162,12 +162,18 @@ swept via `errored_infos`) / `.blackhole` → nothing. `.unresolved`/`.evaluatin
    Either makes the RSS bound wall-viable. Parallel-STW is the smaller step (reuses
    the STW machinery); do it first, keep concurrent as the tight-bound upgrade.
 
-2. **Cut the ~5.6% mutator tax.** The root-keeping on `callValue`/`doCall`/
-   `applyBuiltin` is universal today (correct-by-construction). Measure which
-   choke points are actually load-bearing vs. redundant with the operand-stack /
-   arg roots, and elide the redundant ones. Also re-check the per-alloc alloc-bit
-   / threshold sampling. This tax is paid even at 0 collections, so it caps the
-   best-case tradeoff.
+2. **Cut the mutator tax. → MEASURED 2026-07-03: the tax is NOT the rooting.**
+   An isolation experiment (stub every `rootKeep`/`rootsBegin`/`rootsEnd` to
+   no-ops, 0 collections, interleaved vs the real `-Dgc` build) put the *rooting*
+   cost at **~0.018s median / ~0.008s best ≈ noise (~0.6%)**. The real ~0.09s
+   (~3.3%) 0-collection overhead is the **per-alloc `gcSetAllocBit`/threshold +
+   per-force safepoint bookkeeping** (and the diffuse cost of the compiled-in GC
+   branches) — not the root-keeping. Two redundant root deletions landed
+   byte-identical anyway (attr-path-walk roots, the `applyBuiltin` arg-loop) but
+   moved the wall ~0; the `opCall`/`doCall` keep-on-stack conversion was
+   abandoned (noise-level gain, real UAF risk). So if this tax is worth cutting,
+   the lever is the per-alloc/safepoint bookkeeping, **not** the rooting. Full
+   write-up: docs/plans/gc-tax-removal-{plan,audit,tasks}.md.
 
 3. **Threshold / default policy.** The additive `reserved + HEADROOM` default
    collects ~18× (2× wall). Switch to an adaptive `reserved > k·live` target so

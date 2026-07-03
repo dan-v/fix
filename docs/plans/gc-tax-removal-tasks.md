@@ -1,5 +1,13 @@
 # GC Mutator-Tax Removal — Implementation Plan
 
+> **⚠ OUTCOME (2026-07-03): Tasks 0–2 + Step A done; the rest ABANDONED by
+> measurement.** Isolating the rooting cost (stub all `rootKeep`, 0 collections)
+> showed rooting is ~0.6% (noise) of wall — the ~0.09s `-Dgc` tax is per-alloc/
+> safepoint bookkeeping, not rooting. So Task 3 (the `opCall`/`doCall`
+> keep-on-stack conversion) was NOT done — noise-level gain for real UAF risk.
+> Landed byte-identical: Task 1 (`1351a4c`), Step A / applyBuiltin loop
+> (`d384c46`). See `gc-tax-removal-plan.md` outcome note.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the redundant `-Dgc` mutator rooting tax (~5.6% w=1) by deleting `rootKeep` calls whose value is (or can be kept) on the operand stack, keeping only genuinely off-stack roots — byte-identical output throughout.

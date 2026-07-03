@@ -1,5 +1,12 @@
 # GC mutator-tax removal — audit findings (2026-07-03)
 
+> **⚠ OUTCOME:** the per-site classification below is correct, but the overall
+> effort was stopped — a later isolation experiment showed *all* rooting is only
+> ~0.6% of wall (noise); the real `-Dgc` tax is per-alloc/safepoint bookkeeping.
+> Only the two safe DELETEs were applied (access path-walks `1351a4c`,
+> `applyBuiltin` loop `d384c46`); the `doCall` keep-on-stack conversion was
+> abandoned. See `gc-tax-removal-plan.md` outcome note.
+
 Converged result of a 6-subagent read-only audit of all ~90 `rootKeep`/`rootsBegin`
 sites (see [gc-tax-removal-plan.md](gc-tax-removal-plan.md)). Each site classified
 DELETE (redundant) / KEEP (load-bearing) / NEEDS-OP-CHANGE. The ReleaseSafe `-Dgc`
