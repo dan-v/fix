@@ -1,0 +1,71 @@
+# String Context
+
+*How strings carry dependency information, and why mistracking it corrupts a `.drv`.*
+
+## Mental model
+
+In Nix, a string is not just text — it may carry a **context**: the set of store paths that must exist before the string is meaningful, each tagged with *which* dependency it induces. When you interpolate `drv.outPath` into a build script, the resulting string remembers "this text mentions `/nix/store/…-foo.drv`, and I depend on its `out` output." When that string later lands in a `derivation`'s env, the [derivation builder](./model.md) reads the context back out to populate `input_drvs` / `input_srcs`.
+
+Context is therefore **load-bearing for correctness**: a derivation's dependency edges are *derived entirely from the context of its attribute strings*. Drop or mis-merge a context entry and the `.drv` gets the wrong dependency set — a byte-different, wrong derivation.
+
+## What a context is
+
+A context is a map **store-path → descriptor**, one of:
+
+| Descriptor | Meaning |
+|---|---|
+| `{ path = true; }` | plain dependency on this store path (a source path, or an output path referenced as data) |
+| `{ allOutputs = true; }` | depend on **all** outputs of this `.drv` (the path is a `.drv`) |
+| `{ outputs = [ "out" "bin" ]; }` | depend on these specific outputs of this `.drv` |
+
+Concretely the context is stored as a sorted attrset (keys = interned store paths, values = descriptor attrsets). `builtins.getContext` exposes exactly this shape.
+
+## The `ContextString` value
+
+Strings come in three [value](../runtime/values.md) forms:
+
+- **plain string** — `Value.string(InternId)`, no context.
+- **path** — `Value.path(InternId)`; treated as carrying the implicit context `{ <path> = { path = true; }; }` when its context is queried (coercing a path into a store path is what materializes that entry).
+- **context string** — `Value.contextString(ObjectId)` → heap `ContextString{ text: InternId, context: []AttrEntry }`: interned text plus the explicit sorted context entries.
+
+`contextEntriesForValue(value)` unifies them: `[]` for a plain string, the synthesized `{path=true}` entry for a path, the stored slice for a context string, `TypeError` otherwise.
+
+## Propagation and merging through string ops
+
+Every string operation that produces a new string must **carry the union of its inputs' contexts** — otherwise a dependency is silently dropped. See [string ops](../vm/access.md) for the operations themselves; the context rules:
+
+- **Concatenation** (`++` on strings, `builtins.concatStringsSep`, interpolation): the result's context is the union of all operands' contexts. If no operand had context the result is a plain string; otherwise a context string.
+- **`substring` / `replaceStrings` / other transforms**: propagate the source string's context wholesale (context tracks *the whole string's* dependencies, not per-character — a substring keeps them all).
+- **path ++ string**: result carries the path's `{path=true}` entry plus the string's context; concatenating a store-path-context string onto a *path* is rejected (`InvalidPathConcatenation`).
+
+**Merge algorithm.** When two contexts are unioned, entries are combined by store path via a **sorted attr merge** (both context attrsets are kept sorted by interned key, so it is a linear two-pointer merge). For a path present in both:
+
+- Descriptors are merged key-by-key (also a sorted merge). Most keys take the right value.
+- The **`outputs` list is special-cased**: the two lists are **unioned, appending only names not already present** (order-preserving dedup), so `outputs=["out"]` merged with `outputs=["bin"]` → `["out","bin"]`.
+- `path` / `allOutputs` booleans just merge as ordinary keys.
+
+Building a context string always goes through `addContextString(text, entries)` with the merged, sorted entries; an empty merge result collapses back to a plain `Value.string`.
+
+## The context builtins
+
+| Builtin | Effect |
+|---|---|
+| `getContext s` | return the context as an attrset (the map above) |
+| `hasContext s` | true iff the string's context is non-empty |
+| `appendContext s ctx` | attach/merge an explicit context attrset onto `s`'s text (each entry merged via the same union rules) |
+| `unsafeDiscardStringContext s` | return the bare text as a **plain string**, dropping all context |
+| `unsafeDiscardOutputDependency s` | keep entries but rewrite each descriptor to `{ path = true; }` (demote drv-output deps to plain path deps) |
+| `addDrvOutputDependencies s` | rewrite every `.drv`-path entry's descriptor to `{ allOutputs = true; }`; if `s` has no context but its text ends in `.drv`, add a `{ <text> = { allOutputs = true; }; }` entry. This is what `drv.drvPath` uses so that depending on a `.drv` string pulls in all its outputs. |
+
+`appendContext` and `addDrvOutputDependencies` reject non-string-like arguments with `TypeError`; `appendContext` also rejects a non-attrs context. These are the [builtins](../vm/builtins.md) surface for context.
+
+## Why it matters: context → `.drv` deps
+
+When [`derivation`](./model.md) normalizes its argument, each attribute value is string-coerced and its context is walked (`normalizeDerivationString`):
+
+- A context entry whose path **ends in `.drv`** becomes an **`input_drvs`** edge — the requested output names come straight from the descriptor (`allOutputs` → the input drv's recorded output names; `outputs=[…]` → those names; bare → `["out"]`). Duplicate input paths are **merged by union of output names**, matching the [hashing](./hashing.md) `hashModuloInputs` invariant.
+- A context entry whose path is **not** a `.drv` becomes an **`input_srcs`** edge, and — for source paths — the referenced path text is rewritten to its computed store path (NAR-hashed via [source-path hashing](./hashing.md)).
+
+The store-path strings a derivation *hands out* are themselves context strings that seed this: `drvPath` carries `{ <drv> = { allOutputs = true; }; }`, and each `outPath` carries `{ <drv> = { outputs = [ <thatOutput> ]; }; }`. So the moment one derivation's `outPath` flows into another's env, the consumer records the exact input-drv edge and output name. This closed loop — context in the produced strings, context read back at consumption — is what makes cross-derivation dependency tracking byte-correct.
+
+Code: `src/derivation/`, `src/vm/builtins/string_context.zig`

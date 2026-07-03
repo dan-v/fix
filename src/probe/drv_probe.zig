@@ -3,7 +3,7 @@
 //!
 //! Answers the "is the serial chain's drv frontier already resolved when
 //! main reaches it, or does main force it inline?" question that gates
-//! deep consumer strict-demand fanout (P1, docs/parallel-redesign-plan.md).
+//! deep consumer strict-demand fanout (P1, docs/plans/parallel-redesign-plan.md).
 //!
 //! Two independent measurements:
 //!

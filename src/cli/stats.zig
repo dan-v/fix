@@ -2,8 +2,8 @@
 //!
 //! Scheduler/registry/deferred counters, plus the comptime-gated `-Djit`,
 //! `-Dprof-main`, and `-Dprof-path` reports. Kept out of `main` so the entry
-//! point stays composition; the build-flag-gated subsystem internals are
-//! imported here at the top of the file rather than inline at each use.
+//! point stays a thin composition; the build-flag-gated subsystem internals
+//! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
 const Evaluator = @import("../eval.zig").Evaluator;
@@ -39,7 +39,7 @@ pub fn report(ev: *Evaluator) void {
             if (s.busy_ns + s.idle_ns == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(s.busy_ns)) / @as(f64, @floatFromInt(s.busy_ns + s.idle_ns)),
         },
     );
-    // Speculation precision (instrument I1, docs/parallel-redesign-plan.md):
+    // Speculation precision (instrument I1, docs/plans/parallel-redesign-plan.md):
     // of all thunks that reached `.resolved`, how many were ever demanded by
     // a real caller vs. pre-forced (speculation / fan-out) and never observed.
     // The undemanded share is the speculative-waste fraction by COUNT.

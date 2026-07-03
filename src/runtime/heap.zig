@@ -5,11 +5,13 @@
 //! centralizes object layout behind heap accessors.
 //!
 //! Thread safety:
-//!   - The four backing stores (objects, values, attrs, attr_positions) are
+//!   - The four backing stores are non-relocating: `objects` is a flat
+//!     mmap `FlatStore`, `values`/`attrs`/`attr_positions` are
 //!     `StableSegments`. Readers are lock-free; writers serialize per-store
 //!     on the store's internal `SpinMutex`.
-//!   - Mutation of object payloads is restricted to two cases:
-//!       * Atomic ops on `*Thunk` state (via `getThunk` -> CAS / release-store).
+//!   - In-place mutation of an object payload is restricted to atomics:
+//!       * `*Thunk` state (via `getThunk` -> CAS / release-store).
+//!       * `merge_attrs.flattened` (cmpxchg memoizing the flattened attrs id).
 //!   - The union tag of an object slot is fixed at creation and never changes,
 //!     so concurrent readers can pattern-match without synchronization once
 //!     they have a published ObjectId.
@@ -387,7 +389,7 @@ pub const ObjectHeap = struct {
         /// `Future.demanded`: `resolved_demanded` were observed by a real
         /// (demand) caller; `resolved_undemanded` were pre-forced by
         /// speculation / fan-out and never observed — the speculative-waste
-        /// fraction. See docs/parallel-redesign-plan.md (instrument I1).
+        /// fraction. See docs/plans/parallel-redesign-plan.md (instrument I1).
         resolved_demanded: u32,
         resolved_undemanded: u32,
         /// Magnitude histogram for inline `.int` values found in the
@@ -863,7 +865,7 @@ pub const ObjectHeap = struct {
         // that key on `token`: they hold Values weakly (not GC roots), so a
         // swept object could still be reachable through a stale cache slot.
         // A fresh unique token makes every existing slot miss. This is why
-        // caches needn't be traced (see docs/gc-plan.md).
+        // caches needn't be traced (see docs/plans/gc-plan.md).
         self.token = next_heap_token.fetchAdd(1, .monotonic);
     }
 
@@ -1017,7 +1019,7 @@ pub const ObjectHeap = struct {
 
     /// Return a dead object's owned store ranges to the free lists. Ranges
     /// are single-owner (every construction site reserves fresh + copies),
-    /// so this is the only owner — see docs/gc-plan.md. Thunk *spilled*
+    /// so this is the only owner — see docs/plans/gc-plan.md. Thunk *spilled*
     /// upvalue/env storage is a bare slice (no segment/offset to recover),
     /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
     /// `merge_attrs`/`boxed_int` own no ranges.

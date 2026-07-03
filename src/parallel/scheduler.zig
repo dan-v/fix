@@ -257,7 +257,7 @@ pub const Scheduler = struct {
         /// representative workload.
         max_fiber_stack_used_bytes: u64,
         /// Deepest VM value-stack sp seen across all workers, in Values.
-        /// Multiply by `@sizeOf(Value)` (= 16) for a byte count.
+        /// Multiply by `@sizeOf(Value)` (= 8) for a byte count.
         max_vm_sp: u64,
         /// Summed across all workers (main + helpers): time spent parked
         /// on the wake futex, in nanoseconds. Together with `busy_ns` and
@@ -343,7 +343,7 @@ pub const Scheduler = struct {
     /// the worst case where speculation guessed a large, never-demanded
     /// body: without it, helpers keep pulling the dead backlog and extend
     /// wall time past when the answer was computed (a self-inflicted
-    /// pathology — see docs/parallel-redesign-plan.md). In-flight fibers
+    /// pathology — see docs/plans/parallel-redesign-plan.md). In-flight fibers
     /// still drain to completion (a suspended fiber only waits on an
     /// already-claimed thunk, never on a queued task), so correctness is
     /// unaffected; only un-started backlog work is skipped.
@@ -889,7 +889,7 @@ test "submitUrgent bypasses the speculation backlog cap" {
     try std.testing.expect(!sched.submit(.{ .force_thunk = 999 }, 0));
 
     // `submitUrgent` should still go through — it lives on a separate
-    // queue with its own 1024-element capacity.
+    // queue with its own capacity (`urgent_queue_capacity`).
     try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 100 }, 0));
     try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 101 }, 0));
 

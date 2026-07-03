@@ -4,7 +4,7 @@
 //! and lambda bodies) rather than loop headers. A per-chunk saturating
 //! counter is bumped on entry (`stack.pushFrame`); when it crosses
 //! `hot_threshold` the chunk becomes a trace anchor and the next entry is
-//! recorded. See `docs/tracing-jit.md`.
+//! recorded. See `docs/plans/tracing-jit.md`.
 //!
 //! Thread-safe by construction: the entry array is allocated once at a fixed
 //! capacity (no resize, so a reader never races a realloc), and per-chunk
@@ -77,7 +77,8 @@ pub const HotTable = struct {
         e.count += 1; // plain; racy-benign at w>1
         const n = e.count;
         if (n != self.hot_threshold) return false;
-        // Exactly one fetchAdd produced n == threshold; that worker arms.
+        // The racy counter may let several workers observe n == threshold at
+        // w>1; the cold→armed CAS is what guarantees exactly one of them arms.
         return e.state.cmpxchgStrong(
             @intFromEnum(State.cold),
             @intFromEnum(State.armed),

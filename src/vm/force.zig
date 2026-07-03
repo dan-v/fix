@@ -275,7 +275,7 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 const fan_out_min_items: usize = 4;
 
 /// Items-per-batch when submitting `force_list_range` tasks. With
-/// average per-thunk force ≈ 15 µs, an 8-item batch lands at ~120 µs
+/// average per-thunk force ≈ 15 µs, a 16-item batch lands at ~240 µs
 /// of helper work — comfortably above the per-task scheduling overhead
 /// without serialising the list too coarsely. The scheduler queue is
 /// sized in tasks, not items, so batching also lets a fixed-cap queue
@@ -376,7 +376,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
-    // across the collection. See docs/gc-plan.md.
+    // across the collection. See docs/plans/gc-plan.md.
     if (comptime build_options.gc) {
         // Peer stop-the-world response (w>1): only park at native depth 0,
         // where this fiber holds no builtin Zig locals a peer collector would
@@ -432,7 +432,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // never-needed) body to completion, abandon it at this safe
                 // checkpoint and reset the thunk so a later real demand
                 // recomputes it. Bounds the cost of a single wrong
-                // speculative guess (see docs/parallel-redesign-plan.md).
+                // speculative guess (see docs/plans/parallel-redesign-plan.md).
                 // Speculative path only — demand never bails — and the
                 // atomic load is off the resolved fast path.
                 if (self.in_speculation and self.scheduler.backgroundSuppressed()) {
@@ -480,7 +480,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // its body runs, and `thunk_val` is dead here (only `thunk_id`
                 // + the raw pointer remain), so the conservative scan can't
                 // see it — the per-VM force chain is load-bearing. The tracer
-                // follows an `.evaluating` thunk's target. See docs/gc-plan.md.
+                // follows an `.evaluating` thunk's target. See docs/plans/gc-plan.md.
                 if (comptime build_options.gc) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
                 defer if (comptime build_options.gc) {
                     _ = self.gc_force_chain.pop();

@@ -4,7 +4,7 @@
 //! inlined through `force` and `call` boundaries. The recorder appends
 //! `Instr`s; the optimizer rewrites them (guard/force CSE, allocation
 //! sinking, DCE); the backend lowers them to native code with side-exit
-//! stubs. See `docs/tracing-jit.md` for the full design and the laziness /
+//! stubs. See `docs/plans/tracing-jit.md` for the full design and the laziness /
 //! parallelism rationale.
 //!
 //! This file is types + construction only — no recording, optimization, or

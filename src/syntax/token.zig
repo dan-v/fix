@@ -18,7 +18,7 @@ pub const TokenType = enum(u8) {
     semicolon,
     slash,
     star,
-    question_mark, // for path-like syntax
+    question_mark, // ? (has-attr and default params)
     dollar_curly, // ${
 
     // ---- compound ----

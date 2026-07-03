@@ -1,6 +1,6 @@
 //! Garbage collector (gated behind `-Dgc`, off by default; zero cost in
 //! normal builds). Non-moving, stop-the-world mark-sweep — see
-//! docs/gc-plan.md for the architecture (and why moving / refcounting are
+//! docs/plans/gc-plan.md for the architecture (and why moving / refcounting are
 //! ruled out, and why the end goal is concurrent SATB).
 //!
 //! `fix`'s stores are append-only bump allocators, so without reclamation
@@ -12,7 +12,7 @@
 //! is crossed. Single-threaded (`--workers=1`) for now.
 //!
 //! The `Tracer` is precise — it follows exactly the heap edges (the trace
-//! map in docs/gc-plan.md) — and is the reusable marker for the later
+//! map in docs/plans/gc-plan.md) — and is the reusable marker for the later
 //! parallel/concurrent phases.
 
 const std = @import("std");
@@ -131,7 +131,7 @@ pub const Tracer = struct {
     }
 
     /// Process the work stack until empty: account each object's slot,
-    /// follow its outgoing edges (the trace map from docs/gc-plan.md).
+    /// follow its outgoing edges (the trace map from docs/plans/gc-plan.md).
     /// Call once after all roots are marked.
     pub fn drain(self: *Tracer, heap: *const ObjectHeap) void {
         while (self.stack.pop()) |id| {

@@ -1,6 +1,6 @@
 //! Linear (whole-body) JIT compiler for the fix bytecode VM.
 //!
-//! Unlike the peephole stub matcher in `jit.zig` (which recognizes a
+//! Unlike the peephole stub matcher in `native.zig` (which recognizes a
 //! fixed catalog of tiny exact bytecode shapes), this compiles an
 //! *arbitrary* straight-line chunk body op-by-op into native code,
 //! falling back to the interpreter (returns null) on any op it doesn't
@@ -13,7 +13,7 @@
 //! Callee-saved regs hold the live context across helper calls:
 //!   rbx = vm, r14 = upvalues.ptr, r15 = arg (lambda only).
 //! Complex ops (force, call, attr) tail into the existing C-ABI helpers
-//! in `jit.zig`, which return `JitResult{value, error_code}` in rax:rdx.
+//! in `native.zig`, which return `JitResult{value, error_code}` in rax:rdx.
 //! After each helper call we `test rdx,rdx; jnz epilogue` to propagate
 //! errors. `ret` loads the top operand into rax, zeroes rdx, and jumps to
 //! the shared epilogue (restore rsp + callee-saved regs + `ret`).

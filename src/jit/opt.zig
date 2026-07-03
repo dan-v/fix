@@ -4,7 +4,7 @@
 //! redundancy the passes here remove — repeated chunk guards, constants
 //! exposed across inlined boundaries, and computations made dead by inlining.
 //! Tightening matters: it's what makes inlining *pay*, and it's the substrate
-//! allocation sinking plugs into. See `docs/tracing-jit.md`.
+//! allocation sinking plugs into. See `docs/plans/tracing-jit.md`.
 //!
 //! Deletions are done by overwriting an instruction with `.nop` rather than
 //! removing it, so SSA `Ref`s (array indices) never renumber — every existing
@@ -37,7 +37,7 @@ pub fn optimize(trace: *Trace, allocator: std.mem.Allocator) !void {
 /// value (the body result) still flows on unchanged. This is the one
 /// optimization that removes the heavyweight per-thunk *work* (alloc + atomic
 /// claim + memo publish), not just dispatch — the reason the tracing JIT can
-/// beat the dispatch bound. See docs/tracing-jit.md.
+/// beat the dispatch bound. See docs/plans/tracing-jit.md.
 /// Count of thunks eliminated by sinking (diagnostic, printed via
 /// --print-sched-stats from record.zig).
 pub var sink_count: u64 = 0;

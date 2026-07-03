@@ -19,7 +19,7 @@ const Scanner = @import("scanner.zig").Scanner;
 pub const Precedence = enum(u8) {
     none,
     assignment, // = (in let)
-    pipe, // |>
+    pipe, // |> (reserved; not yet tokenized — pipe operator lands behind a flag later)
     impl, // ->
     or_, // ||
     and_, // &&
@@ -115,7 +115,6 @@ pub const Parser = struct {
     pub fn expect(self: *Parser, tt: TokenType, msg: []const u8) !void {
         if (!self.match(tt)) {
             self.reportError(msg);
-            // Recovery: skip until we find the expected token or safe token.
             return error.ParseError;
         }
     }
@@ -231,8 +230,6 @@ pub const Parser = struct {
         while (true) {
             // Check for function application (juxtaposition)
             if (allow_apply and canStartExpr(self.current.type) and @intFromEnum(min_prec) <= @intFromEnum(Precedence.apply)) {
-                const prev = self.previous;
-                _ = prev;
                 // Don't advance — parse the argument
                 const arg = try self.parsePrecedence(@enumFromInt(@intFromEnum(Precedence.apply) + 1));
                 left = try self.makeApply(left, arg);

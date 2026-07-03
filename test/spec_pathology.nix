@@ -1,4 +1,4 @@
-# Speculation pathology probe (see docs/parallel-redesign-plan.md).
+# Speculation pathology probe (see docs/plans/parallel-redesign-plan.md).
 #
 # A lazy outer list whose elements are individually expensive AND whose
 # producing lambda is "substantial" (>= SPECULATION_MIN_CODE_BYTES of

@@ -16,9 +16,9 @@ pub fn build(b: *std.Build) void {
     const struct_census = b.option(bool, "struct-census", "Measure deforestation headroom: per-list/attrset consume-count histogram (single-use vs shared). Run at --workers=1.") orelse false;
     const drv_probe = b.option(bool, "drv-probe", "Measure derivation-build demand: per-attr resolved-ahead vs forced-inline, fanout ok/rej, and serial input-DAG depth/fan-in. Depth meaningful only at --workers=1.") orelse false;
     const opcode_ngram = b.option(bool, "opcode-ngram", "Profile hottest adjacent (fall-through) opcode pairs for superinstruction fusion. Run at --workers=1.") orelse false;
-    const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
+    const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/plans/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
     const timeline = b.option(bool, "timeline", "Record a wall-clock event timeline (parse/compile/import phases, fiber-run quanta, idle parks) per worker; write Perfetto JSON via --timeline[=path].") orelse false;
-    const gc = b.option(bool, "gc", "GC Phase 0: sample the live set periodically during eval (mark from roots, no reclaim) and report peak-live vs total-allocated — the reclaimable-RSS headroom. Run at --workers=1. See docs/gc-plan.md.") orelse false;
+    const gc = b.option(bool, "gc", "GC Phase 0: sample the live set periodically during eval (mark from roots, no reclaim) and report peak-live vs total-allocated — the reclaimable-RSS headroom. Run at --workers=1. See docs/plans/gc-plan.md.") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
     const debug_checks = debug_checks_opt orelse (optimize == .Debug);
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     // Clean-cut subsystem modules: genuinely-acyclic subsystems are real
     // modules so consumers import them by name (`@import("syntax")`) and the
     // compiler enforces that nothing reaches into their internals. The coupled
-    // evaluator engine stays in the main module (see docs/cleanup-plan.md).
+    // evaluator engine stays in the main module (see docs/plans/cleanup-plan.md).
     const syntax_mod = b.addModule("syntax", .{
         .root_source_file = b.path("src/syntax.zig"),
         .target = target,

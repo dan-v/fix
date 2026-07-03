@@ -1015,10 +1015,11 @@ fn matchGenListApply(ch: *const Chunk) bool {
 }
 
 /// `push_null|push_true|push_false; ret; halt` → bake the literal
-/// `Value` bits in and return. Slips through the trivial-body
-/// classifier (which only recognizes constant_ret / get_upvalue_ret /
-/// closure / push_builtins) so these tiny 3-byte chunks were
-/// previously executed by the interpreter end-to-end.
+/// `Value` bits in and return. The compiler doesn't fuse these into a
+/// `_ret` super-op (only constant/get_upvalue/get_local are fused), so
+/// the literal-return chunk survives as bytecode here — handled when it
+/// actually *runs* under `-Djit` (the trivial-body classifier's `.literal`
+/// arm short-circuits most of them earlier, at `thunk_captures` time).
 fn compilePushLitRet(buf: *CodeBuffer, ch: *const Chunk) ?CompiledFn {
     if (ch.code.len != 3) return null;
     const op: OpCode = @enumFromInt(ch.code[0]);

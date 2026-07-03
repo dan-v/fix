@@ -6,7 +6,7 @@
 //! an inline frame whose first local *is the caller's argument Ref* — so a
 //! callee's parameter reads become direct uses of the caller's value, with no
 //! frame at trace-execution time. That's what later lets allocation sinking
-//! delete intermediate thunks/attrsets. See `docs/tracing-jit.md`.
+//! delete intermediate thunks/attrsets. See `docs/plans/tracing-jit.md`.
 //!
 //! Locals and upvalues are pure dataflow (resolved to existing Refs, no IR);
 //! only genuine effects (force/get_attr/call guards, arithmetic) emit IR. The

@@ -390,7 +390,7 @@ test "a lambda body returning a captured upvalue evaluates correctly" {
 }
 
 test "chained attribute access through an upvalue evaluates correctly" {
-    // Exercises the get_upvalue/get_local_attr fusion in emitGetAttr.
+    // Exercises the get_upvalue/get_upvalue_attr fusion in emitGetAttr.
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 

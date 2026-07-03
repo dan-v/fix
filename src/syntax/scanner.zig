@@ -1,5 +1,5 @@
 //! Lexer / scanner. Produces a token stream from source text.
-//! Lock-free single-pass design. No allocation during scanning.
+//! Single-pass, no allocation during scanning.
 //! Returns byte offsets rather than string slices — the source lives longer.
 
 const std = @import("std");
@@ -181,7 +181,7 @@ pub const Scanner = struct {
             self.pos += 1;
         }
         if (self.pos < self.source.len and self.source[self.pos] == '.') {
-            self.pos += 1; // consume '.'
+            self.pos += 1;
             while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
                 self.pos += 1;
             }

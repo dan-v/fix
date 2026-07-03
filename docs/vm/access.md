@@ -1,0 +1,80 @@
+# VM Access & Value Operations
+
+*Reading structured data fast, and the value operators: merge, concat, deep equality, string composition.*
+
+Attribute selection is one of the most frequent operations in NixOS module evaluation (`config.foo`, `lib.bar`, attrset-pattern lookups everywhere). This doc covers how the VM reads attrsets and lists cheaply, and how the structural operators (`//`, `++`, `==`, string `+`) execute. The data *layouts* live in [runtime/heap.md](../runtime/heap.md); this is about the operations over them.
+
+## Attribute access
+
+Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by name id**, so a lookup is a **binary search** (`heap.getAttrValue`). Names are interned ([runtime/interning.md](../runtime/interning.md)), so comparison is an integer compare. Access opcodes:
+
+| op | stack / operand | behavior |
+|---|---|---|
+| `get_attr` (`_long`) | `[attrs]`, name id operand | force attrs, binary-search name, force + push the value. |
+| `get_attr_dynamic` | `[attrs, name]` | name is a runtime string; force it to an `InternId`, then as `get_attr`. |
+| `get_attr_dynamic_or` | `[attrs, name, default]` | dynamic select with a lazy default if missing / non-attrs. |
+| `get_attr_path_or` (`_long`) | `[attrs, default]`, N static ids | walk N segments; any missing segment ⇒ force+return the default. |
+| `get_attr_path_dynamic_or` | `[attrs, name, default]` | static prefix + one trailing runtime-string segment. |
+| `get_attr_path_mixed_or` | `[attrs, dyn…, default]` | mixed static/runtime path; a per-segment tag byte says static (inline id) or dynamic (next stack value). |
+| `has_attr_path` / `has_attr_dynamic` / `has_attr_path_mixed` | `[attrs, …]` | existence test **without forcing** the final value. |
+| `validate_attrs` (`_long`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
+| `lookup_with` (`_long`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
+
+All path walks keep each intermediate node rooted across the next level's force (path nodes are reached via `getAttrValue`, not held on the operand stack), which matters under [-Dgc](../gc.md).
+
+### Attr inline cache
+
+`cachedAttrLookup` fronts every lookup with a thread-local IC: `(heap_token, obj_id, name_id) → raw Value` (pre-force). A hit returns the raw attr value and skips the binary search; the caller forces it if it needs WHNF. The index mixes `obj_id` and `name_id` so `x.a` and `x.b` on the same object land in different slots. `heap_token`-guarded — the cache is per-worker and object ids are not stable across evaluators, so a token mismatch invalidates the slot. STW GC walks each registered worker's live (token-matching) slots as roots.
+
+## Fused super-ops
+
+The compiler collapses pervasive read chains into single opcodes, saving a dispatch and the intermediate push/pop (fusion is chosen at emit time; see [compiler/pipeline.md](../compiler/pipeline.md)):
+
+- **`get_upvalue_attr`** (upvalue idx + name): force upvalue, select attr, push. The `lib.foo` / `config.bar` chain — `get_upvalue` alone is a large fraction of all ops, much of it feeding a `get_attr`.
+- **`get_local_attr`** / **`get_local_attr_long`**: same for a local slot (narrow / wide).
+- **Value-returning `_ret` fusions** — `constant_ret`, `get_local_ret` (`_long`), `get_upvalue_ret`: load-and-return in one op, collapsing the two dispatches that dominate per-thunk overhead. These also drive the trivial-body thunk short-circuit (see [runtime/thunks.md](../runtime/thunks.md)).
+
+**Well-known stub chunks** are the same idea at the builtin level: `genlist_apply` (`[func, index]` → `func index`) and `mapattrs_apply` (`[func, name, value]` → `(func name) value`) are shared 1-/2-arg-application bodies reused by `genList`/`map`/`mapAttrs` instead of allocating a per-element closure object. They pass their captured arg **unforced** so the user function decides laziness — forcing eagerly here would blackhole when the lambda captures the surrounding recursive attrset (the typical module pattern).
+
+## The `//` update operator
+
+`merge_attrs` and `merge_attrs_strict` (`[left, right] → [merged]`) execute a **reserve-then-flush sorted merge**. Both operands stay on the operand stack across the merge (it forces and allocates — a GC safepoint) and are dropped only after:
+
+1. Force both attrsets.
+2. Allocate the merged output sized to hold the union.
+3. Walk both sorted entry arrays in lockstep (O(n+m)), writing entries in place: left-only and right-only entries copy through; on a name collision the **right (RHS) key wins** (`//` semantics).
+
+`merge_attrs` (attrset-literal / runtime `//`) overrides on duplicate. `merge_attrs_strict` is for merging parts of a *single* attrset literal and **errors on a duplicate leaf**. The heap-side merge structure — layered `base // overlay` nodes, k-way flatten, and the depth cap that keeps the NixOS fixpoint's thousands of `//`s from degenerating — is a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
+
+## List concatenation
+
+`concat_lists` (`[left, right] → [result]`, from `++`) forces both operands (kept on the stack as roots) and produces the concatenated list. Elements are carried across unforced — `++` does not force list contents.
+
+## Deep equality
+
+`==`/`!=` (`eq`, `neq`, plus the monomorphic `eq_null`/`neq_null` specializations the compiler emits when one side is literal `null`) run a recursive, **cycle-tracking** structural comparison (`valuesEqual`):
+
+- **Numeric coercion**: two ints compare as ints; any int/float mix compares as floats (`int ↔ float`).
+- **String-like coercion**: `string`, `path`, and `string_context` are mutually comparable **by their text** (interned id), ignoring context.
+- **Containers**: lists compare elementwise; attrsets compare by matching sorted `(name, value)` pairs. A **`seen` pair list** breaks cycles — a pair already being compared is treated as equal, so recursive structures terminate.
+- **Reference shortcut**: identical `ObjectId`s (same list/attrset object) are equal without recursing.
+- **Derivation shortcut**: two attrsets that both have `type == "derivation"` are equal iff their `.outPath` strings are equal — Nix's derivation identity, avoiding a full deep walk of the derivation attrs. (See [derivation/model.md](../derivation/model.md).)
+- Closures/builtins/PAPs compare by identity (`ObjectId` / builtin id).
+
+`compareValues` (`<`, `<=`, `>`, `>=`) is the ordered sibling: numeric with int/float coercion, and lexicographic `std.mem.order` over string-like text; other kinds are a `TypeError`.
+
+## String operations
+
+String concatenation (`+` on strings, and interpolation) **interns** the pieces, composes their text ids, and **merges string context** — the set of store-path/derivation-output dependencies a string carries. Context merge deduplicates by entry name and unions derivation `outputs` lists; the full context model (why a string carries dependencies, how `.drv` inputs are derived from it) is in [derivation/context.md](../derivation/context.md).
+
+Operand **coercion to a string** (`coerceLanguageStringValue`): `string`/`string_context` pass through; a `path` becomes a store-path context string; an **attrset** coerces via `__toString` (called on the attrset) if present, else via `.outPath` — otherwise a `TypeError`. Path concatenation (`path + …`) normalizes an absolute result and rejects mixing in a string that already carries store-path context (`InvalidPathConcatenation`). All coercion helpers root their operands across the forces (`__toString`/`.outPath` invoke user code — GC safepoints).
+
+## Invariants
+
+- **Operands stay on the operand stack across the operation** (merge / concat / attr select force + allocate — GC safepoints); dropped or replaced in place only after. Never `forceValue(pop())`.
+- **Attrs are sorted by interned name**; lookup is binary search over integer ids.
+- **Existence tests don't force** the final value; selection does.
+- **Attr IC is per-thread and `heap_token`-guarded**; entries are GC roots while the token matches.
+- **Equality/order coerce** across int↔float and string/path/context, and short-circuit derivations by `.outPath`.
+
+Code: `src/vm/`, `src/bytecode/`

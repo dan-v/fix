@@ -461,9 +461,11 @@ pub fn builtinGenList(self: anytype, fn_arg: Value, count_arg: Value) !Value {
     return Value.list(try self.heap.addList(out));
 }
 
-/// Mirror of `force.isSpeculatableBuiltinClosure`'s `.mapValue` branch.
-/// Keep behaviour: speculate iff the user function is a `.closure` whose
-/// body chunk is marked `speculatable`.
+/// The closure half of `force.isSpeculatableBuiltinClosure`'s map-style
+/// branch: speculate iff the user function is a `.closure` whose body
+/// chunk is substantial. (That branch also speculates on expensive
+/// builtins via `isSpeculatableMapFunc`; this fast path only handles the
+/// closure case.)
 fn isSpeculatableUserFunc(self: anytype, func: Value) bool {
     if (!func.isClosure()) return false;
     const closure = self.heap.getClosure(func.asObjectId()) catch return false;

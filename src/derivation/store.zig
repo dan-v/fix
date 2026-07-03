@@ -32,12 +32,10 @@ pub const DerivationStore = struct {
     /// outputName, named outputs, ...) — the cache deduplicates so
     /// the first access pays and the rest just look the result up.
     ///
-    /// `u64` storage instead of `Value` to keep this header from
-    /// having to know about the runtime Value type. The caller
-    /// converts via `@bitCast` at each end.
-    /// Keyed by attrs ObjectId; the `token` guards against GC id-reuse (a
-    /// swept attrs' id can be handed to a different attrs, so a stale entry
-    /// must miss). `bits` is the cached `Value.bits`.
+    /// `u64` storage instead of `Value` to keep this header from having to
+    /// know about the runtime Value type; the caller round-trips through the
+    /// `Value.bits` field. Keyed by attrs ObjectId; the `token` guards against
+    /// GC id-reuse (see `lookupLazyDerivation`).
     lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
     lazy_drv_mu: stable.SpinMutex = .{},
 

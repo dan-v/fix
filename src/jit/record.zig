@@ -1,5 +1,5 @@
 //! Record mode for the tracing JIT (`-Dtjit`): drives the `Recorder` from
-//! the interpreter dispatch loop. See `docs/tracing-jit.md`.
+//! the interpreter dispatch loop. See `docs/plans/tracing-jit.md`.
 //!
 //! When a chunk arms (`hot.onEntry` returns true in `stack.pushFrame`), the
 //! interpreter `start`s a recording anchored at that frame. Thereafter the
@@ -8,12 +8,14 @@
 //! reads VM state and builds IR; it never alters execution, so a bug here
 //! cannot change `.drv` output (worst case: an aborted/garbage trace).
 //!
-//! Phase 1 (this module): single-frame, no inlining. Any nesting — a `call`,
-//! or an *implicit* force that ran a thunk body — moves `frames_len` off the
-//! anchor depth, and we abort cleanly. So traces succeed only for leaf-ish
-//! chunks whose body forces nothing that nests. That validates the
-//! record→IR pipeline on the real workload and prints trace shapes. Inlining
-//! through force/call (the valuable part) layers on next.
+//! The driver keeps the recorder's inline-frame depth in lock-step with the
+//! VM's (`root_depth + inlineDepth()`). It inlines through `call`/`call_n` and
+//! through forces of trace-built thunks (`onForceInline`), so a callee/thunk
+//! body becomes part of the trace. An *unmodeled* nesting — an implicit force
+//! that ran some other thunk's body — pushes `frames_len` above our model; we
+//! *suppress* observation until it unwinds and record the site as a plain
+//! re-force. An op we can't record truncates (side-exit, keeping the handled
+//! prefix) rather than discarding the whole trace.
 
 const std = @import("std");
 const build_options = @import("build_options");

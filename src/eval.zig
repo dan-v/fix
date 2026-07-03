@@ -736,7 +736,7 @@ pub const Evaluator = struct {
     /// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
     /// live graph from roots, sweep dead objects/ranges into the free
     /// lists, set the next threshold from the surviving live set. Runs on
-    /// the lone mutator at --workers=1; see docs/gc-plan.md for the roots.
+    /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
     fn gcCollect(self: *Evaluator) void {
         if (comptime !gc.enabled) return;
         const tr = &self.gc_tracer;
@@ -771,7 +771,7 @@ pub const Evaluator = struct {
         return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
-    /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
+    /// Mark all GC roots into `tr` (without draining). See docs/plans/gc-plan.md.
     fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
         if (self.builtins_value) |b| tr.markValue(&self.heap, b);
         // Every worker's fibers' VM stack/frames/upvalues. At a stop-the-
@@ -922,11 +922,11 @@ pub const Evaluator = struct {
     }
 };
 
-/// Helper worker loop. Owns a fiber pool of `worker_mod.slots_per_worker`
-/// slots; each slot has its own VM and can be parked mid-evaluation when
-/// it hits a `.busy` thunk. The Worker drives the slot scheduler — see
+/// Helper worker loop. Owns an on-demand fiber pool (no fixed size);
+/// each fiber has its own VM and can be parked mid-evaluation when it
+/// hits a `.busy` thunk. The Worker drives the fiber drain loop — see
 /// `worker.zig`. Errors during speculation are swallowed inside the
-/// slot's entry; the thunk's own `reset()` on failure surfaces the
+/// fiber's entry; the thunk's own `reset()` on failure surfaces the
 /// error to a future genuine caller.
 fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     const worker = worker_mod.Worker.init(
