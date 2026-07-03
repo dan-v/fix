@@ -311,3 +311,29 @@ pub const OpCode = enum(u8) {
 };
 
 pub const count = @typeInfo(OpCode).@"enum".fields.len;
+
+const std = @import("std");
+
+test "opcode byte values round-trip through enumFromInt" {
+    inline for (@typeInfo(OpCode).@"enum".fields) |field| {
+        const op: OpCode = @enumFromInt(field.value);
+        try std.testing.expectEqual(@as(u8, field.value), @intFromEnum(op));
+    }
+}
+
+test "opcode count matches the number of declared variants" {
+    try std.testing.expectEqual(@typeInfo(OpCode).@"enum".fields.len, count);
+    // Sanity bound: the opcode set is small and fits comfortably in a u8,
+    // which the bytecode encoding relies on.
+    try std.testing.expect(count > 0);
+    try std.testing.expect(count <= 256);
+}
+
+test "opcode tag names are unique" {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(std.testing.allocator);
+    inline for (@typeInfo(OpCode).@"enum".fields) |field| {
+        const result = try seen.getOrPut(std.testing.allocator, field.name);
+        try std.testing.expect(!result.found_existing);
+    }
+}

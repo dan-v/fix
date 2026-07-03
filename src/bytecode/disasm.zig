@@ -505,3 +505,114 @@ fn readU16(code: []const u8, ip: usize) u16 {
 fn readU32(code: []const u8, ip: usize) u32 {
     return encoding.readU32(code, ip);
 }
+
+const ChunkBuilder = @import("chunk.zig").ChunkBuilder;
+
+test "disassembling a chunk prints arithmetic opcode names and jump targets" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    // get_local 0; get_local 1; add_int; jump +0; ret; halt
+    try builder.writeOp(allocator, .get_local);
+    try builder.writeByte(allocator, 0);
+    try builder.writeOp(allocator, .get_local);
+    try builder.writeByte(allocator, 1);
+    try builder.writeOp(allocator, .add_int);
+    try builder.writeOp(allocator, .jump);
+    try builder.writeU32(allocator, 0);
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 2);
+    defer chunk.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(&out.writer, 7, &chunk, .{}, .{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "chunk #7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "get_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "add_int") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "local[0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "local[1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "jump") != null);
+    // jump operand is a relative +0 offset; disasm annotates the
+    // resolved absolute target after the operand.
+    try std.testing.expect(std.mem.indexOf(u8, text, "+0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "halt") != null);
+}
+
+test "disassembling prints the constant pool with resolved values" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.emitConstant(allocator, Value.int(42));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(&out.writer, null, &chunk, .{}, .{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "constants (1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "constant") != null);
+}
+
+test "disassembling resolves an interned attribute name via Symbols" {
+    const allocator = std.testing.allocator;
+    var intern = try InternTable.init(allocator);
+    defer intern.deinit();
+    const name_id = try intern.intern("myAttr");
+
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .get_attr);
+    try builder.writeU16(allocator, @intCast(name_id));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(&out.writer, null, &chunk, .{ .intern = &intern }, .{});
+    const text = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "get_attr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"myAttr\"") != null);
+}
+
+test "disassembling omits the constant pool section when show_constants is false" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.emitConstant(allocator, Value.int(1));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try writeChunk(&out.writer, null, &chunk, .{}, .{ .show_constants = false });
+    const text = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "constants (") == null);
+}
