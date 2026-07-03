@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const containers = @import("containers");
 const heap_mod = @import("heap.zig");
 const value_mod = @import("value.zig");
 const thunk_mod = @import("thunk.zig");
@@ -43,6 +44,73 @@ pub const LiveStats = struct {
     attrs: u64 = 0,
     attr_pos: u64 = 0,
     bytes: u64 = 0,
+
+    /// Accumulate another tally (summing per-marker stats after a parallel mark).
+    pub fn add(self: *LiveStats, other: LiveStats) void {
+        self.objects += other.objects;
+        self.values += other.values;
+        self.attrs += other.attrs;
+        self.attr_pos += other.attr_pos;
+        self.bytes += other.bytes;
+    }
+};
+
+/// Set the mark bit for `id` **atomically** (parallel mark: many markers may
+/// race the same object). Returns true iff this call is the one that newly
+/// set the bit — the caller then enqueues `id` for scanning, so exactly one
+/// marker ever scans a given object. An atomic OR + old-bit test; `.acq_rel`
+/// so a marker that loses the race still synchronizes-with the winner's write
+/// (the winner will scan the object and mark its children).
+fn atomicTestAndSet(mark_bits: []u64, id: ObjectId) bool {
+    const word = id >> 6;
+    if (word >= mark_bits.len) return false; // allocated after reset
+    const mask = @as(u64, 1) << @intCast(id & 63);
+    const prev = @atomicRmw(u64, &mark_bits[word], .Or, mask, .acq_rel);
+    return prev & mask == 0;
+}
+
+/// One parallel marker: a private never-drop worklist (`GrowableDeque` — a
+/// dropped element is a swept live object) plus a private `LiveStats` tally
+/// (summed after termination; a shared atomic per object would cache-line
+/// bounce and erase the parallel win). All markers share the one atomic
+/// mark-bitmap (`mark_bits`, aliased from the owning `Tracer`).
+///
+/// `Marker` doubles as a `scanObject` **sink**: it exposes the same
+/// `markValue`/`markObject`/`count*` methods the serial `SerialSink` does, so
+/// the single generic edge-walk (`scanObject`) is the ONE place the heap trace
+/// map lives — serial and parallel marking can never drift.
+pub const Marker = struct {
+    deque: containers.GrowableDeque(ObjectId),
+    stats: LiveStats = .{},
+    /// Shared with every other marker and the Tracer; set in `resetParallel`.
+    mark_bits: []u64 = &.{},
+    allocator: std.mem.Allocator,
+
+    inline fn markValue(self: *Marker, heap: *const ObjectHeap, v: Value) void {
+        if (hasObjectRef(v)) self.markObject(heap, v.asObjectId());
+    }
+    inline fn markObject(self: *Marker, heap: *const ObjectHeap, id: ObjectId) void {
+        _ = heap;
+        // OOM: undercount rather than crash, matching the serial path. In
+        // practice the worklist peaks near the live-set size and never OOMs.
+        if (atomicTestAndSet(self.mark_bits, id)) self.deque.push(self.allocator, id) catch {};
+    }
+    inline fn countObject(self: *Marker) void {
+        self.stats.objects += 1;
+        self.stats.bytes += @sizeOf(heap_mod.Object);
+    }
+    inline fn countValues(self: *Marker, n: u64) void {
+        self.stats.values += n;
+        self.stats.bytes += n * @sizeOf(Value);
+    }
+    inline fn countAttrs(self: *Marker, n: u64) void {
+        self.stats.attrs += n;
+        self.stats.bytes += n * @sizeOf(heap_mod.AttrEntry);
+    }
+    inline fn countAttrPos(self: *Marker, n: u64) void {
+        self.stats.attr_pos += n;
+        self.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
+    }
 };
 
 /// Precise marker over the heap object graph. Holds a mark-bitmap indexed
@@ -52,11 +120,32 @@ pub const LiveStats = struct {
 /// count and clears it.
 pub const Tracer = struct {
     allocator: std.mem.Allocator,
-    /// One bit per ObjectId; bit set == marked.
+    /// One bit per ObjectId; bit set == marked. Shared (aliased) by every
+    /// `Marker` in the parallel path; set with `atomicTestAndSet` there.
     mark_bits: []u64 = &.{},
-    /// Worklist of marked-but-not-yet-scanned objects.
+    /// Serial (`--workers=1`) worklist of marked-but-not-yet-scanned objects.
     stack: std.ArrayListUnmanaged(ObjectId) = .empty,
     stats: LiveStats = .{},
+
+    // --- parallel mark (`--workers>1`; see resetParallel/drainParallel) ---
+    /// One `Marker` per worker (slot == worker_id). Allocated lazily on the
+    /// first parallel collection and reused across collections (deques keep
+    /// their grown capacity; `resetParallel` just clears them).
+    markers: []Marker = &.{},
+    /// Number of markers participating in the current collection (== worker
+    /// count). Termination target for `active_idle`.
+    marker_count: u32 = 0,
+    /// Work-stealing termination counter (HotSpot ParallelTaskTerminator
+    /// shape): count of markers currently offering termination. Mark is done
+    /// iff this reaches `marker_count` — which can only happen when every
+    /// deque is empty and no scan is in flight (a producing marker is active,
+    /// hence not offering). Bumped per idle-transition, NOT per object.
+    active_idle: std.atomic.Value(u32) = .init(0),
+    /// When non-null, `markObject`/`markValue` seed into this marker's deque
+    /// (atomic bitmap) instead of the serial `stack`. Set only by the lone
+    /// collector during the single-threaded root-scan (`beginSeeding`), so a
+    /// plain field — no concurrency — is safe.
+    parallel_seed: ?*Marker = null,
 
     pub fn init(allocator: std.mem.Allocator) Tracer {
         return .{ .allocator = allocator };
@@ -65,6 +154,8 @@ pub const Tracer = struct {
     pub fn deinit(self: *Tracer) void {
         self.allocator.free(self.mark_bits);
         self.stack.deinit(self.allocator);
+        for (self.markers) |*m| m.deque.deinit(self.allocator);
+        self.allocator.free(self.markers);
     }
 
     /// Prepare for a fresh mark over `[0, object_count)`: grow + clear the
@@ -104,63 +195,117 @@ pub const Tracer = struct {
         self.markObject(heap, v.asObjectId());
     }
 
-    /// Mark `id` for later scanning. Append-only — the caller runs `drain`
+    /// Mark `id` for later scanning. The caller runs `drain`/`drainParallel`
     /// once after all roots are marked, so the graph is walked iteratively
-    /// (the work stack), never by native recursion.
+    /// (the worklist), never by native recursion. During a parallel
+    /// collection's single-threaded root-scan, `parallel_seed` is set and the
+    /// root is seeded into that marker's deque instead of the serial stack.
     pub fn markObject(self: *Tracer, heap: *const ObjectHeap, id: ObjectId) void {
-        _ = heap;
+        if (self.parallel_seed) |m| {
+            m.markObject(heap, id);
+            return;
+        }
         if (!self.testAndSet(id)) return;
         self.stack.append(self.allocator, id) catch return; // OOM: undercount, don't crash
     }
 
-    fn addValues(self: *Tracer, heap: *const ObjectHeap, range: heap_mod.ValueRange) void {
-        self.stats.values += range.len;
-        self.stats.bytes += @as(u64, range.len) * @sizeOf(Value);
-        for (heap.values.slice(range)) |v| self.markValue(heap, v);
-    }
-
-    fn addAttrs(self: *Tracer, heap: *const ObjectHeap, range: heap_mod.AttrRange) void {
-        self.stats.attrs += range.len;
-        self.stats.bytes += @as(u64, range.len) * @sizeOf(heap_mod.AttrEntry);
-        for (heap.attrs.slice(range)) |entry| self.markValue(heap, entry.value);
-    }
-
-    fn addAttrPos(self: *Tracer, range: heap_mod.AttrPosRange) void {
-        self.stats.attr_pos += range.len;
-        self.stats.bytes += @as(u64, range.len) * @sizeOf(heap_mod.AttrPosEntry);
-    }
-
-    /// Process the work stack until empty: account each object's slot,
-    /// follow its outgoing edges (the trace map from docs/plans/gc-plan.md).
-    /// Call once after all roots are marked.
+    /// Serial drain (`--workers=1`): process the work stack until empty via the
+    /// shared generic edge-walk. `SerialSink` pushes children to `self.stack`
+    /// and accumulates into `self.stats`. The trace map itself lives ONCE, in
+    /// `scanObject` — serial and parallel marking can never disagree.
     pub fn drain(self: *Tracer, heap: *const ObjectHeap) void {
-        while (self.stack.pop()) |id| {
-            self.stats.objects += 1;
-            self.stats.bytes += @sizeOf(heap_mod.Object);
-            const obj = heap.objects.get(id);
-            switch (obj.*) {
-                .list => |r| self.addValues(heap, r),
-                .attrs => |a| {
-                    self.addAttrs(heap, a.range);
-                    self.addAttrPos(a.positions);
-                },
-                .merge_attrs => |m| {
-                    self.markObject(heap, m.base);
-                    self.markObject(heap, m.overlay);
-                    const flat = m.flattened.load(.monotonic);
-                    if (flat != NO_FLAT) self.markObject(heap, flat);
-                },
-                .closure => |c| self.addValues(heap, c.upvalues),
-                .builtin_closure => |c| self.addValues(heap, c.args),
-                .partial_app => |p| {
-                    self.markValue(heap, p.func);
-                    self.addValues(heap, p.args);
-                },
-                .context_string => |c| self.addAttrs(heap, c.context),
-                .boxed_int => {},
-                .thunk => self.markThunk(heap, &obj.thunk),
+        var sink = SerialSink{ .tr = self };
+        while (self.stack.pop()) |id| scanObject(SerialSink, &sink, heap, id);
+    }
+
+    // --- parallel mark ---
+
+    /// Prepare for a parallel mark over `[0, object_count)` with `marker_count`
+    /// markers (== worker count). Grows + clears the shared bitmap, (re)sizes
+    /// the marker roster reusing deques across collections, clears each deque
+    /// and per-marker stats, and resets the termination counter. Call at a
+    /// stop-the-world safepoint, before seeding roots.
+    pub fn resetParallel(self: *Tracer, object_count: u32, marker_count: u32) !void {
+        const words = (@as(usize, object_count) + 63) >> 6;
+        if (words > self.mark_bits.len)
+            self.mark_bits = try self.allocator.realloc(self.mark_bits, words);
+        @memset(self.mark_bits[0..words], 0);
+        self.stats = .{};
+        // Grow the roster once (worker count is fixed within a run); reuse
+        // the deques (with their grown capacity) on later collections.
+        if (self.markers.len < marker_count) {
+            const old = self.markers.len;
+            self.markers = try self.allocator.realloc(self.markers, marker_count);
+            for (self.markers[old..]) |*m| m.* = .{
+                .deque = try containers.GrowableDeque(ObjectId).init(self.allocator, 1024),
+                .allocator = self.allocator,
+            };
+        }
+        for (self.markers[0..marker_count]) |*m| {
+            m.deque.clear();
+            m.stats = .{};
+            m.mark_bits = self.mark_bits;
+        }
+        self.marker_count = marker_count;
+        self.active_idle = .init(0);
+        self.parallel_seed = null;
+    }
+
+    /// Seed subsequent `markObject`/`markValue` root marks into marker `id`'s
+    /// deque (collector-only, single-threaded). Paired with `endSeeding`.
+    pub fn beginSeeding(self: *Tracer, id: usize) void {
+        self.parallel_seed = &self.markers[id];
+    }
+    pub fn endSeeding(self: *Tracer) void {
+        self.parallel_seed = null;
+    }
+
+    /// Parallel marker `id`: drain own deque (LIFO), steal from peers when
+    /// empty, and cooperatively detect termination. Returns only when the
+    /// whole mark is complete (`active_idle == marker_count`). Safe to run on
+    /// every worker concurrently. See the `active_idle` field for the
+    /// termination-correctness argument.
+    pub fn drainParallel(self: *Tracer, heap: *const ObjectHeap, id: usize) void {
+        const me = &self.markers[id];
+        while (true) {
+            // Phase A: drain everything in our own deque first (LIFO).
+            while (me.deque.pop()) |oid| scanObject(Marker, me, heap, oid);
+            // Phase B: our deque is empty. Try to steal one item and scan it;
+            // if that fails, offer termination.
+            if (self.stealOneAndScan(heap, id)) continue;
+            _ = self.active_idle.fetchAdd(1, .acq_rel); // announce idle
+            while (true) {
+                if (self.active_idle.load(.acquire) == self.marker_count) return; // all done
+                if (self.stealOneAndScan(heap, id)) {
+                    _ = self.active_idle.fetchSub(1, .acq_rel); // retract: found work
+                    break; // re-enter Phase A to drain any children we pushed
+                }
+                std.atomic.spinLoopHint();
             }
         }
+    }
+
+    /// Steal one object from some peer's deque and scan it into marker `id`'s
+    /// own deque. Returns true iff an item was stolen (and scanned). Visits
+    /// peers in a rotated order to spread steal contention.
+    fn stealOneAndScan(self: *Tracer, heap: *const ObjectHeap, id: usize) bool {
+        const n = self.marker_count;
+        var k: usize = 1;
+        while (k < n) : (k += 1) {
+            const j = (id + k) % n;
+            if (self.markers[j].deque.steal()) |oid| {
+                scanObject(Marker, &self.markers[id], heap, oid);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Sum the per-marker stats into `self.stats` after a parallel mark
+    /// terminates. Call once, single-threaded, before recording/sweeping.
+    pub fn sumStats(self: *Tracer) void {
+        self.stats = .{};
+        for (self.markers[0..self.marker_count]) |*m| self.stats.add(m.stats);
     }
 
     /// Collect every currently-marked ObjectId (the live set) into a fresh
@@ -181,41 +326,115 @@ pub const Tracer = struct {
         return list.toOwnedSlice(allocator);
     }
 
-    fn markThunk(self: *Tracer, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
-        switch (@as(FutureState, @enumFromInt(t.future.state.load(.monotonic)))) {
-            .resolved => self.markValue(heap, t.payload.result),
-            // `.errored` reuses the result bits as a `*ErrorInfo` (heap-
-            // owned out-of-band, swept separately); `.blackhole` is
-            // terminal. Neither holds a Value to follow.
-            .errored, .blackhole => {},
-            .unresolved, .evaluating => switch (t.future.target_kind) {
-                .closure => self.markValue(heap, t.payload.target.closure),
-                .pass_through => self.markValue(heap, t.payload.target.pass_through),
-                .attr_access => self.markValue(heap, t.payload.target.attr_access.base),
-                .bytecode => {
-                    const bt = &t.payload.target.bytecode;
-                    const ups = bt.upvalues();
-                    // Spilled upvalues live in the value store and belong
-                    // to this thunk; inline ones are inside the slot.
-                    if (bt.upvalue_count > thunk_mod.BytecodeThunk.INLINE_CAP) {
-                        self.stats.values += ups.len;
-                        self.stats.bytes += @as(u64, ups.len) * @sizeOf(Value);
-                    }
-                    for (ups) |v| self.markValue(heap, v);
-                },
-                .deferred => {
-                    const dt = &t.payload.target.deferred;
-                    const env = dt.env();
-                    if (dt.env_count > thunk_mod.DeferredThunk.INLINE_CAP) {
-                        self.stats.values += env.len;
-                        self.stats.bytes += @as(u64, env.len) * @sizeOf(Value);
-                    }
-                    for (env) |v| self.markValue(heap, v);
-                },
-            },
-        }
+};
+
+/// Serial-mark sink (`--workers=1`): the `scanObject` counterpart of `Marker`.
+/// Pushes children to the Tracer's `stack` (plain, non-atomic `testAndSet`)
+/// and accumulates into the Tracer's `stats`. Same method surface as `Marker`
+/// so the one generic edge-walk drives both.
+const SerialSink = struct {
+    tr: *Tracer,
+
+    inline fn markValue(self: *SerialSink, heap: *const ObjectHeap, v: Value) void {
+        self.tr.markValue(heap, v);
+    }
+    inline fn markObject(self: *SerialSink, heap: *const ObjectHeap, id: ObjectId) void {
+        self.tr.markObject(heap, id);
+    }
+    inline fn countObject(self: *SerialSink) void {
+        self.tr.stats.objects += 1;
+        self.tr.stats.bytes += @sizeOf(heap_mod.Object);
+    }
+    inline fn countValues(self: *SerialSink, n: u64) void {
+        self.tr.stats.values += n;
+        self.tr.stats.bytes += n * @sizeOf(Value);
+    }
+    inline fn countAttrs(self: *SerialSink, n: u64) void {
+        self.tr.stats.attrs += n;
+        self.tr.stats.bytes += n * @sizeOf(heap_mod.AttrEntry);
+    }
+    inline fn countAttrPos(self: *SerialSink, n: u64) void {
+        self.tr.stats.attr_pos += n;
+        self.tr.stats.bytes += n * @sizeOf(heap_mod.AttrPosEntry);
     }
 };
+
+// --- the trace map (edge-walk), written exactly once ---
+//
+// `scanObject` and its helpers are generic over the `Sink` (`SerialSink` or
+// `Marker`), so the mapping from each heap object to its outgoing edges — the
+// GC correctness invariant — has a single source of truth. A missed edge here
+// is a swept live object (use-after-free) at BOTH --workers=1 and --workers>1,
+// so both mark paths always agree by construction. See docs/plans/gc-plan.md.
+
+/// Account object `id`'s slot and follow its outgoing edges via `sink`.
+fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: ObjectId) void {
+    sink.countObject();
+    const obj = heap.objects.get(id);
+    switch (obj.*) {
+        .list => |r| scanValues(Sink, sink, heap, r),
+        .attrs => |a| {
+            scanAttrs(Sink, sink, heap, a.range);
+            sink.countAttrPos(a.positions.len);
+        },
+        .merge_attrs => |m| {
+            sink.markObject(heap, m.base);
+            sink.markObject(heap, m.overlay);
+            const flat = m.flattened.load(.monotonic);
+            if (flat != NO_FLAT) sink.markObject(heap, flat);
+        },
+        .closure => |c| scanValues(Sink, sink, heap, c.upvalues),
+        .builtin_closure => |c| scanValues(Sink, sink, heap, c.args),
+        .partial_app => |p| {
+            sink.markValue(heap, p.func);
+            scanValues(Sink, sink, heap, p.args);
+        },
+        .context_string => |c| scanAttrs(Sink, sink, heap, c.context),
+        .boxed_int => {},
+        .thunk => scanThunk(Sink, sink, heap, &obj.thunk),
+    }
+}
+
+fn scanValues(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.ValueRange) void {
+    sink.countValues(range.len);
+    for (heap.values.slice(range)) |v| sink.markValue(heap, v);
+}
+
+fn scanAttrs(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, range: heap_mod.AttrRange) void {
+    sink.countAttrs(range.len);
+    for (heap.attrs.slice(range)) |entry| sink.markValue(heap, entry.value);
+}
+
+fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *const thunk_mod.Thunk) void {
+    switch (@as(FutureState, @enumFromInt(t.future.state.load(.monotonic)))) {
+        .resolved => sink.markValue(heap, t.payload.result),
+        // `.errored` reuses the result bits as a `*ErrorInfo` (heap-owned
+        // out-of-band, swept separately); `.blackhole` is terminal. Neither
+        // holds a Value to follow.
+        .errored, .blackhole => {},
+        .unresolved, .evaluating => switch (t.future.target_kind) {
+            .closure => sink.markValue(heap, t.payload.target.closure),
+            .pass_through => sink.markValue(heap, t.payload.target.pass_through),
+            .attr_access => sink.markValue(heap, t.payload.target.attr_access.base),
+            .bytecode => {
+                const bt = &t.payload.target.bytecode;
+                const ups = bt.upvalues();
+                // Spilled upvalues live in the value store and belong to this
+                // thunk; inline ones are inside the slot.
+                if (bt.upvalue_count > thunk_mod.BytecodeThunk.INLINE_CAP)
+                    sink.countValues(ups.len);
+                for (ups) |v| sink.markValue(heap, v);
+            },
+            .deferred => {
+                const dt = &t.payload.target.deferred;
+                const env = dt.env();
+                if (dt.env_count > thunk_mod.DeferredThunk.INLINE_CAP)
+                    sink.countValues(env.len);
+                for (env) |v| sink.markValue(heap, v);
+            },
+        },
+    }
+}
 
 /// Does this Value carry a heap ObjectId a marker must follow?
 pub inline fn hasObjectRef(v: Value) bool {
@@ -421,6 +640,62 @@ test "tracer markObject ignores objects outside the reset range" {
     const live_ids = try tr.collectLiveIds(allocator);
     defer allocator.free(live_ids);
     try std.testing.expectEqual(@as(usize, 0), live_ids.len);
+}
+
+test "tracer: parallel mark reaches exactly the live set (K markers, stealing)" {
+    const allocator = std.testing.allocator;
+    var heap = try ObjectHeap.init(allocator, 1);
+    defer heap.deinit();
+
+    // Wide + deep graph so stealing is actually exercised: a root list of C
+    // chain-heads, each chain a depth-D spine of 1-element lists. All objects
+    // are distinct (append-only store), so the live set is exactly C*D + 1.
+    const C = 512;
+    const D = 8;
+    var heads: [C]Value = undefined;
+    for (&heads) |*h| {
+        var node = try heap.addList(&.{Value.int(0)}); // innermost (1 object)
+        var d: usize = 1;
+        while (d < D) : (d += 1) node = try heap.addList(&.{Value.list(node)});
+        h.* = Value.list(node);
+    }
+    const root = try heap.addList(&heads);
+    const live_expected: u64 = @as(u64, C) * D + 1;
+
+    // Garbage the mark must NOT reach.
+    const g1 = try heap.addList(&.{Value.int(1)});
+    const g2 = try heap.addList(&.{ Value.int(2), Value.int(3) });
+
+    const Worker = struct {
+        fn drain(tr: *Tracer, h: *const ObjectHeap, id: usize) void {
+            tr.drainParallel(h, id);
+        }
+    };
+
+    var tr = Tracer.init(allocator);
+    defer tr.deinit();
+
+    const K = 4;
+    // Repeat: a parallel-mark data race is rare, so hammer it.
+    var iter: usize = 0;
+    while (iter < 50) : (iter += 1) {
+        try tr.resetParallel(heap.objects.count(), K);
+        // Seed the single root into marker 0; stealing spreads the rest.
+        tr.beginSeeding(0);
+        tr.markValue(&heap, Value.list(root));
+        tr.endSeeding();
+
+        var threads: [K]std.Thread = undefined;
+        for (&threads, 0..) |*th, id|
+            th.* = try std.Thread.spawn(.{}, Worker.drain, .{ &tr, &heap, id });
+        for (&threads) |th| th.join();
+
+        tr.sumStats();
+        try std.testing.expectEqual(live_expected, tr.stats.objects);
+        try std.testing.expect(tr.isMarked(root));
+        try std.testing.expect(!tr.isMarked(g1));
+        try std.testing.expect(!tr.isMarked(g2));
+    }
 }
 
 test "gc stat recorders accumulate observable deltas" {

@@ -263,6 +263,14 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             return item;
         }
 
+        /// Reset to empty, retaining the (possibly grown) backing buffer.
+        /// NOT thread-safe — call only when no stealer can be running (e.g. a
+        /// GC marker roster reused across stop-the-world collections).
+        pub fn clear(self: *Self) void {
+            self.bottom.store(0, .monotonic);
+            self.top.store(0, .monotonic);
+        }
+
         pub fn approxLen(self: *const Self) u64 {
             const b = self.bottom.load(.monotonic);
             const t = self.top.load(.monotonic);
