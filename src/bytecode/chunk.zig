@@ -737,3 +737,194 @@ pub const ChunkRegistry = struct {
         return result;
     }
 };
+
+test "chunk builder emits opcodes and operands into the code stream" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .get_local);
+    try builder.writeByte(allocator, 3);
+    try builder.writeOp(allocator, .jump);
+    try builder.writeU32(allocator, 10);
+
+    var chunk = try builder.finish(allocator, 1);
+    defer chunk.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 7), chunk.code.len);
+    try std.testing.expectEqual(@intFromEnum(OpCode.get_local), chunk.code[0]);
+    try std.testing.expectEqual(@as(u8, 3), chunk.code[1]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.jump), chunk.code[2]);
+    try std.testing.expectEqual(@as(u32, 10), readU32Inline(chunk.code, 3));
+}
+
+test "chunk builder patches a forward jump offset after emission" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .jump_if_false);
+    const patch_at = builder.code.items.len;
+    try builder.writeU32(allocator, 0); // placeholder, patched below
+    try builder.writeOp(allocator, .push_null);
+    try builder.writeOp(allocator, .ret);
+
+    // Patch the placeholder now that we know how far to jump.
+    const target = builder.code.items.len;
+    const offset: u32 = @intCast(target - (patch_at + 4));
+    std.mem.writeInt(u32, builder.code.items[patch_at..][0..4], offset, .little);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    const decoded = readU32Inline(chunk.code, patch_at);
+    try std.testing.expectEqual(offset, decoded);
+    // The patched jump should land exactly at the end of the code.
+    try std.testing.expectEqual(chunk.code.len, patch_at + 4 + decoded);
+}
+
+test "addConstant appends without deduping identical values" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    const first = try builder.addConstant(allocator, Value.int(7));
+    const second = try builder.addConstant(allocator, Value.int(7));
+
+    try std.testing.expectEqual(@as(ConstIdx, 0), first);
+    try std.testing.expectEqual(@as(ConstIdx, 1), second);
+    try std.testing.expectEqual(@as(usize, 2), builder.constants.items.len);
+}
+
+test "emitConstant writes a constant op referencing the new pool index" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.emitConstant(allocator, Value.int(99));
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), chunk.constants.len);
+    try std.testing.expectEqual(@as(i64, 99), chunk.constants[0].asInt());
+    try std.testing.expectEqual(@intFromEnum(OpCode.constant), chunk.code[0]);
+    try std.testing.expectEqual(@as(u16, 0), readU16Inline(chunk.code, 1));
+}
+
+test "classifyTrivialBody recognizes a get_upvalue_ret-only thunk body" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .get_upvalue_ret);
+    try builder.writeU16(allocator, 4);
+    try builder.writeOp(allocator, .halt);
+
+    // Thunk bodies have local_count == 0.
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    switch (chunk.scheduling.trivial) {
+        .identity_upvalue => |idx| try std.testing.expectEqual(@as(u16, 4), idx),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "classifyTrivialBody recognizes a constant_ret-only thunk body" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.emitConstant(allocator, Value.int(5));
+    // emitConstant writes a plain `constant` op; fuse it into
+    // `constant_ret` by hand the way the compiler's emit.zig would,
+    // then append halt so the shape matches the classifier's expectation.
+    builder.code.items[0] = @intFromEnum(OpCode.constant_ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    switch (chunk.scheduling.trivial) {
+        .constant => |idx| try std.testing.expectEqual(@as(ConstIdx, 0), idx),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "classifyTrivialBody classifies a multi-instruction body as non-trivial" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .get_upvalue);
+    try builder.writeU16(allocator, 0);
+    try builder.writeOp(allocator, .get_upvalue);
+    try builder.writeU16(allocator, 1);
+    try builder.writeOp(allocator, .add_int);
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+
+    var chunk = try builder.finish(allocator, 0);
+    defer chunk.deinit(allocator);
+
+    try std.testing.expectEqual(TrivialBody.none, chunk.scheduling.trivial);
+}
+
+test "classifyTrivialBody never fires for chunks with locals (lambda bodies)" {
+    const allocator = std.testing.allocator;
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+
+    try builder.writeOp(allocator, .get_upvalue_ret);
+    try builder.writeU16(allocator, 0);
+    try builder.writeOp(allocator, .halt);
+
+    // local_count == 1 means this is a lambda body, not a thunk body,
+    // so the short-circuit must not apply even though the bytes match
+    // the get_upvalue_ret shape exactly.
+    var chunk = try builder.finish(allocator, 1);
+    defer chunk.deinit(allocator);
+
+    try std.testing.expectEqual(TrivialBody.none, chunk.scheduling.trivial);
+}
+
+test "chunk registry registers well-known chunks retrievable by id" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    const genlist_chunk = registry.get(registry.well_known.genlist_apply);
+    try std.testing.expect(genlist_chunk != null);
+    const mapattrs_chunk = registry.get(registry.well_known.mapattrs_apply);
+    try std.testing.expect(mapattrs_chunk != null);
+
+    // Two distinct well-known chunks must have distinct ids.
+    try std.testing.expect(registry.well_known.genlist_apply != registry.well_known.mapattrs_apply);
+}
+
+test "chunk registry register/get round-trips a custom chunk" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.emitConstant(allocator, Value.int(123));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+    const built = try builder.finish(allocator, 0);
+
+    const id = try registry.register(built);
+    const fetched = registry.get(id) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(usize, 1), fetched.constants.len);
+    try std.testing.expectEqual(@as(i64, 123), fetched.constants[0].asInt());
+}
+
+test "chunk registry get returns null for an out-of-range id" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get(std.math.maxInt(ChunkId)) == null);
+}
