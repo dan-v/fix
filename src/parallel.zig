@@ -7,11 +7,14 @@
 
 pub const scheduler = @import("parallel/scheduler.zig");
 pub const fiber = @import("parallel/fiber.zig");
+pub const deque = @import("parallel/deque.zig");
 
 pub const Scheduler = scheduler.Scheduler;
 pub const Fiber = fiber.Fiber;
+pub const Deque = deque.Deque;
 
 test {
     _ = scheduler;
     _ = fiber;
+    _ = deque;
 }
