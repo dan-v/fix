@@ -896,7 +896,13 @@ test "submitUrgent bypasses the speculation backlog cap" {
     var drained: u32 = 0;
     for (sched.urgent_queues) |*q| while (q.steal()) |_| { drained += 1; };
     for (sched.spec_queues) |*q| while (q.steal()) |_| { drained += 1; };
-    try std.testing.expectEqual(@as(u32, 66), drained);
+    // spec_backlog_per_helper (128) speculative tasks + 2 urgent tasks
+    // that bypassed the cap. This was 66 (64 + 2) back when the cap was
+    // helper_count * 64; when the cap was raised to 128 (commit
+    // 7ad94c5, "Raise scheduler burst headroom") the fill loop bound was
+    // updated to the new `spec_backlog_per_helper` constant but this
+    // expected total was left stale at the old value.
+    try std.testing.expectEqual(spec_backlog_per_helper + 2, drained);
 }
 
 test "stealForWorker: each worker excludes its own queue" {
