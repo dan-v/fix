@@ -389,6 +389,57 @@ test "evaluate flake ref builtins" {
     try std.testing.expectEqualStrings("\"github:NixOS/nixpkgs/nixos-unstable\"", stringified);
 }
 
+test "parseFlakeRef handles github refs without a branch and bare absolute paths" {
+    const github_no_ref = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"github:NixOS/nixpkgs\")");
+    defer std.testing.allocator.free(github_no_ref);
+    try std.testing.expectEqualStrings("\"{\\\"owner\\\":\\\"NixOS\\\",\\\"repo\\\":\\\"nixpkgs\\\",\\\"type\\\":\\\"github\\\"}\"", github_no_ref);
+
+    const path_no_query = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"path:/tmp/source\")");
+    defer std.testing.allocator.free(path_no_query);
+    try std.testing.expectEqualStrings("\"{\\\"path\\\":\\\"/tmp/source\\\",\\\"type\\\":\\\"path\\\"}\"", path_no_query);
+
+    const bare_absolute_path = try renderForTest("builtins.toJSON (builtins.parseFlakeRef \"/tmp/source\")");
+    defer std.testing.allocator.free(bare_absolute_path);
+    try std.testing.expectEqualStrings("\"{\\\"path\\\":\\\"/tmp/source\\\",\\\"type\\\":\\\"path\\\"}\"", bare_absolute_path);
+}
+
+test "parseFlakeRef rejects malformed refs" {
+    try std.testing.expectError(error.InvalidFlakeRef, renderForTest("builtins.parseFlakeRef \"github:NixOS\""));
+    try std.testing.expectError(error.InvalidFlakeRef, renderForTest("builtins.parseFlakeRef \"relative/path\""));
+    try std.testing.expectError(error.InvalidFlakeRef, renderForTest("builtins.parseFlakeRef \"\""));
+}
+
+test "flakeRefToString round-trips path refs and rejects unsupported types" {
+    const path_only = try renderForTest("builtins.flakeRefToString { type = \"path\"; path = \"/tmp/source\"; }");
+    defer std.testing.allocator.free(path_only);
+    try std.testing.expectEqualStrings("\"path:/tmp/source\"", path_only);
+
+    const path_with_query = try renderForTest(
+        "builtins.flakeRefToString { type = \"path\"; path = \"/tmp/source\"; rev = \"abc\"; narHash = \"sha256-test\"; }",
+    );
+    defer std.testing.allocator.free(path_with_query);
+    try std.testing.expectEqualStrings("\"path:/tmp/source?rev=abc&narHash=sha256-test\"", path_with_query);
+
+    try std.testing.expectError(
+        error.InvalidFlakeRef,
+        renderForTest("builtins.flakeRefToString { type = \"git\"; url = \"https://example.com/repo\"; }"),
+    );
+    try std.testing.expectError(
+        error.MissingAttribute,
+        renderForTest("builtins.flakeRefToString { type = \"github\"; owner = \"NixOS\"; }"),
+    );
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.flakeRefToString \"github:NixOS/nixpkgs\""));
+}
+
+test "fetchTree rejects unrecognized or non-attrset input without touching the network" {
+    try std.testing.expectError(
+        error.InvalidFlakeRef,
+        renderForTest("builtins.fetchTree { type = \"bogus\"; }"),
+    );
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.fetchTree 1"));
+    try std.testing.expectError(error.MissingAttribute, renderForTest("builtins.fetchTree { }"));
+}
+
 test "evaluate getFlake builtin for local path ref" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
