@@ -221,6 +221,10 @@ fn nixBase32Decode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         const value = nixBase32Value(char) orelse return error.InvalidHash;
         const bit = (text.len - n - 1) * 5;
         const byte_index = bit / 8;
+        // A malformed-length input can place the leading character's bits
+        // past the end of the truncated `byte_len` buffer; that's an invalid
+        // encoding, not a crash.
+        if (byte_index >= bytes.len) return error.InvalidHash;
         const bit_index: u3 = @intCast(bit % 8);
         bytes[byte_index] |= value << bit_index;
         if (byte_index + 1 < bytes.len and bit_index > 3) {
