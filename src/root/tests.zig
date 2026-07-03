@@ -9,4 +9,6 @@ test {
     _ = @import("../jit/hot.zig");
     _ = @import("../jit/recorder.zig");
     _ = @import("../jit/opt.zig");
+    _ = @import("../jit/codegen.zig");
+    _ = @import("../jit/linear.zig");
 }

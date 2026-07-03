@@ -171,3 +171,39 @@ test "hot table ignores out-of-capacity ids" {
     try std.testing.expect(!t.onEntry(100));
     try std.testing.expectEqual(State.cold, t.stateOf(100));
 }
+
+test "hot table does not arm one entry below threshold" {
+    const allocator = std.testing.allocator;
+    var t = try HotTable.init(allocator, 4, 4, 3);
+    defer t.deinit(allocator);
+
+    // Three entries: one short of the threshold of 4.
+    for (0..3) |_| try std.testing.expect(!t.onEntry(1));
+    try std.testing.expectEqual(State.cold, t.stateOf(1));
+
+    // The fourth entry crosses the threshold and arms exactly once.
+    try std.testing.expect(t.onEntry(1));
+    try std.testing.expectEqual(State.armed, t.stateOf(1));
+}
+
+test "hot table native and interpreted trace publication round-trip independently" {
+    const allocator = std.testing.allocator;
+    var t = try HotTable.init(allocator, 4, 1, 3);
+    defer t.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), t.traceOf(2));
+    try std.testing.expectEqual(@as(usize, 0), t.nativeOf(2));
+
+    t.publishTrace(2, 0xdead0);
+    try std.testing.expectEqual(@as(usize, 0xdead0), t.traceOf(2));
+    try std.testing.expectEqual(State.traced, t.stateOf(2));
+    try std.testing.expectEqual(@as(usize, 0), t.nativeOf(2)); // unaffected
+
+    t.publishNative(2, 0xbeef0);
+    try std.testing.expectEqual(@as(usize, 0xbeef0), t.nativeOf(2));
+    try std.testing.expectEqual(@as(usize, 0xdead0), t.traceOf(2)); // unaffected
+
+    // Out-of-capacity ids are no-ops, not crashes.
+    t.publishNative(100, 1);
+    try std.testing.expectEqual(@as(usize, 0), t.nativeOf(100));
+}

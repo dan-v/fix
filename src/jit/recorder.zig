@@ -554,3 +554,165 @@ test "recorder: get_local on uninitialized slot aborts" {
     try rec.startRoot(1, 2, true); // local0 = arg, local1 = null
     try std.testing.expectError(error.TraceAborted, rec.getLocal(1));
 }
+
+test "recorder: saturated call_n defers its frame until activated" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, true);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+
+    try rec.startRoot(1, 1, true); // local0 = arg (trace_arg)
+    try rec.getUpvalue(0); // func
+    try rec.getUpvalue(1); // a0
+    try rec.getUpvalue(2); // a1
+    // enterCallN pops args+func and guards, but does NOT push a frame yet.
+    try rec.enterCallN(50, 2, 2, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), rec.inlineDepth()); // still at root
+    try std.testing.expect(rec.pending_call != null);
+
+    // The driver activates once the real callee frame appears.
+    try rec.activatePendingCall();
+    try std.testing.expectEqual(@as(usize, 2), rec.inlineDepth());
+    try std.testing.expect(rec.pending_call == null);
+
+    // Callee body: return its second param (local 1).
+    try rec.getLocal(1);
+    try rec.ret();
+    try std.testing.expectEqual(@as(usize, 1), rec.inlineDepth());
+    try rec.ret();
+    try std.testing.expect(rec.done and !rec.aborted);
+
+    // local 1 resolved directly to the a1 upvalue-load Ref (load_upvalue 2),
+    // not a fresh load — same inlining property as a single-arg call.
+    const ops = trace.instrs.items;
+    try std.testing.expectEqual(Op.ret, ops[ops.len - 1].op);
+    // find the load_upvalue for slot 2 (a1) and confirm it's what the final ret returns.
+    var a1_ref: ?Ref = null;
+    for (ops, 0..) |o, idx| {
+        if (o.op == .load_upvalue and o.aux == 2) a1_ref = @intCast(idx);
+    }
+    try std.testing.expect(a1_ref != null);
+    try std.testing.expectEqual(a1_ref.?, ops[ops.len - 1].a);
+}
+
+test "recorder: call_n strict params are eagerly forced on activation" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, true);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+
+    try rec.startRoot(1, 1, true);
+    try rec.getUpvalue(0); // func
+    try rec.getUpvalue(1); // a0 (strict param 0)
+    try rec.enterCallN(9, 1, 1, 0b1, 0); // strict_params bit 0 set
+    try rec.activatePendingCall();
+
+    // A `force` was emitted for local 0 (the strict arg) during activation.
+    var saw_force = false;
+    for (trace.instrs.items) |o| {
+        if (o.op == .force) saw_force = true;
+    }
+    try std.testing.expect(saw_force);
+}
+
+test "recorder: tail call reuses the current frame (no depth change)" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, true);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+
+    try rec.startRoot(1, 1, true);
+    try rec.getUpvalue(0); // func
+    try rec.getUpvalue(1); // arg
+    try rec.replaceTail(77, 1);
+    try std.testing.expectEqual(@as(usize, 1), rec.inlineDepth()); // no new frame
+    try rec.getLocal(0); // the tail callee's param (now local 0 of the reused frame)
+    try rec.ret();
+    try std.testing.expect(rec.done and !rec.aborted);
+
+    // ret returns the arg Ref directly (load_upvalue 1) — tail call didn't
+    // add a frame, so the local resolved straight to the caller's arg value.
+    const ops = trace.instrs.items;
+    try std.testing.expectEqual(Op.ret, ops[ops.len - 1].op);
+    try std.testing.expectEqual(Op.guard, ops[3].op); // chunk_id guard on func
+}
+
+test "recorder: emitSideExit snapshots a truncated inline call stack" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(3, true);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+
+    try rec.startRoot(3, 1, true);
+    try rec.getUpvalue(0); // func
+    try rec.getUpvalue(1); // arg
+    try rec.enterCall(11, 1, 5); // caller resumes at ip=5 after this callee
+    rec.setIp(2); // callee hits an unhandled op at ip=2
+    try rec.emitSideExit();
+    try std.testing.expect(rec.done and !rec.aborted);
+
+    // One snapshot with two frames (anchor + inlined callee).
+    try std.testing.expectEqual(@as(usize, 1), trace.snapshots.items.len);
+    const frames = trace.snapshots.items[0].frames;
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqual(@as(u32, 3), frames[0].chunk); // anchor chunk
+    try std.testing.expectEqual(@as(u32, 5), frames[0].resume_ip); // caller's call_return_ip
+    try std.testing.expectEqual(@as(u32, 11), frames[1].chunk); // inlined callee
+    try std.testing.expectEqual(@as(u32, 2), frames[1].resume_ip); // deepest resumes at current ip
+    try std.testing.expectEqual(Op.side_exit, trace.instrs.items[trace.instrs.items.len - 1].op);
+}
+
+test "recorder: emitSideExit aborts with a live force-inlined frame" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, false);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+
+    try rec.startRoot(1, 0, false);
+    const cap = try rec.upvalueRef(0);
+    try rec.allocThunk(5, &.{cap});
+    try rec.forceTop();
+    try std.testing.expect(rec.pendingForceIsTraceThunk());
+    try rec.beginForceInline(1); // now inside a force-inlined thunk body
+    rec.setIp(1);
+    // A mid-claim thunk body can't be reconstructed at a side-exit.
+    try std.testing.expectError(error.TraceAborted, rec.emitSideExit());
+}
+
+test "recorder: enterCall past MAX_INLINE_DEPTH aborts" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, true);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+    try rec.startRoot(1, 1, true);
+
+    // Manually drive inlineDepth to MAX_INLINE_DEPTH by repeated enterCall,
+    // each callee taking 1 local and immediately becoming the new "current"
+    // frame (we never ret, so depth only grows).
+    var i: usize = 0;
+    while (i < MAX_INLINE_DEPTH - 1) : (i += 1) {
+        try rec.getUpvalue(0);
+        try rec.getUpvalue(0);
+        try rec.enterCall(@intCast(100 + i), 1, 0);
+    }
+    try std.testing.expectEqual(MAX_INLINE_DEPTH, rec.inlineDepth());
+    try rec.getUpvalue(0);
+    try rec.getUpvalue(0);
+    try std.testing.expectError(error.TraceAborted, rec.enterCall(999, 1, 0));
+}
+
+test "recorder: pop on empty operand stack aborts" {
+    const allocator = std.testing.allocator;
+    var trace = Trace.init(1, false);
+    defer trace.deinit(allocator);
+    var rec = Recorder.init(allocator, &trace);
+    defer rec.deinit();
+    try rec.startRoot(1, 0, false);
+    try std.testing.expectError(error.TraceAborted, rec.dropTop());
+}
