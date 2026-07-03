@@ -47,6 +47,13 @@ pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !
 
     const sep = self.intern.get(try stringTextInternId(self, sep_value));
 
+    // GC: `item_values` holds freshly-coerced string/context-string values that
+    // are NOT on the VM stack; the loop below forces (via appendContextEntry ->
+    // mergeContextValues). Root each coerced value across those forces.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    for (item_values) |item_value| vm_force.rootKeep(self, item_value);
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -81,6 +88,9 @@ pub fn coerceStringContextValue(self: anytype, arg: Value) !Value {
 }
 
 pub fn coerceAttrsStringContextValue(self: anytype, attrs: Value) !Value {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
         const result = try vm_closures.callValue(self, try vm_force.forceValue(self, to_string), attrs);
@@ -287,6 +297,11 @@ pub fn coerceListToStringId(self: anytype, list_id: ObjectId) !InternId {
 }
 
 pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
+    // GC: `list_id` is a bare id and we force-walk the list (recursively for
+    // nested lists/attrs); root the container across the walk.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.list(list_id));
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -295,6 +310,10 @@ pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
     var first = true;
     var trailing_empty_list = false;
     for (try self.heap.getList(list_id)) |item| {
+        // GC: re-root the accumulated context values across each item's forces.
+        const iter_roots = vm_force.rootsBegin(self);
+        defer vm_force.rootsEnd(self, iter_roots);
+        for (ctx.items) |e| vm_force.rootKeep(self, e.value);
         const forced = try vm_force.forceValue(self, item);
         if (try isEmptyListStringItem(self, forced)) {
             if (!first) trailing_empty_list = true;
@@ -322,6 +341,9 @@ pub fn isEmptyListStringItem(self: anytype, value: Value) !bool {
 }
 
 pub fn coerceAttrsToStringValue(self: anytype, attrs: Value) !Value {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
         const result = try vm_closures.callValue(self, try vm_force.forceValue(self, to_string), attrs);
@@ -363,6 +385,10 @@ pub fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
 }
 
 pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Value {
+    // GC: root the (bare-id) list across the recursive force-walk.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.list(list_id));
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -371,6 +397,11 @@ pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Valu
     var first = true;
     var trailing_empty_list = false;
     for (try self.heap.getList(list_id)) |item| {
+        // GC: the `ctx` accumulator holds merged context values (new attrs) in
+        // Zig memory across each later item's forces; re-root them per item.
+        const iter_roots = vm_force.rootsBegin(self);
+        defer vm_force.rootsEnd(self, iter_roots);
+        for (ctx.items) |e| vm_force.rootKeep(self, e.value);
         const forced = try vm_force.forceValue(self, item);
         if (try isEmptyListStringItem(self, forced)) {
             if (!first) trailing_empty_list = true;
@@ -394,6 +425,9 @@ pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Valu
 }
 
 pub fn coerceDerivationAttrsToStringValue(self: anytype, attrs: Value) !Value {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, attrs); // held across getAttrValue + callValue + coerce
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
         const result = try vm_closures.callValue(self, try vm_force.forceValue(self, to_string), attrs);

@@ -58,6 +58,9 @@ pub fn isPlainString(value: Value) bool {
 }
 
 pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, attrs); // held across getAttrValue + callValue + recurse
     const to_string_id = try self.intern.intern("__toString");
     if (self.heap.getAttrValue(attrs.asObjectId(), to_string_id)) |to_string| {
         return stringLikeValue(self, try closures.callValue(self, try force.forceValue(self, to_string), attrs));
@@ -95,8 +98,12 @@ pub fn concatPathLike(self: *VM, left: Value, right: Value) !Value {
 }
 
 pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
     const left_like = try coerceLanguageStringValue(self, left);
+    force.rootKeep(self, left_like); // held across the `right` coercion + appendStringContext forces
     const right_like = try coerceLanguageStringValue(self, right);
+    force.rootKeep(self, right_like); // held across appendStringContext forces
     const text_id = try concatInternedString(self, try stringTextInternId(self, left_like), try stringTextInternId(self, right_like));
 
     var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -108,7 +115,10 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
 }
 
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
     const forced = try force.forceValue(self, value);
+    force.rootKeep(self, forced); // held across getAttrValue + callValue + recurse
     return switch (forced.kind()) {
         .string, .string_context => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
@@ -159,6 +169,9 @@ pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.
             try appendContextEntry(self, context, value.asInternId(), try pathContextValue(self));
         },
         .string_context => {
+            const gc_roots = force.rootsBegin(self);
+            defer force.rootsEnd(self, gc_roots);
+            force.rootKeep(self, value); // owns string.context slice, held across appendContextEntry forces
             const string = try self.heap.getContextString(value.asObjectId());
             for (string.context) |entry| try appendContextEntry(self, context, entry.name, entry.value);
         },
@@ -186,7 +199,10 @@ pub fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.A
 }
 
 pub fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
     const left_forced = try force.forceValue(self, left);
+    force.rootKeep(self, left_forced); // held across the `right` force + mergeContextAttrs
     const right_forced = try force.forceValue(self, right);
     if (left_forced.isAttrs() and right_forced.isAttrs()) {
         return Value.attrs(try mergeContextAttrs(self, left_forced.asObjectId(), right_forced.asObjectId()));
@@ -195,6 +211,10 @@ pub fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
 }
 
 pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, Value.attrs(left_id)); // owns `left` slice, held across mergeContextAttrValue forces
+    force.rootKeep(self, Value.attrs(right_id)); // owns `right` slice
     const left = try self.heap.getAttrs(left_id);
     const right = try self.heap.getAttrs(right_id);
 
@@ -235,8 +255,12 @@ pub fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Valu
 }
 
 pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
     const left_list = try force.forceValue(self, left);
+    force.rootKeep(self, left_list); // owns getList slice, held across appendUniqueContextOutput forces
     const right_list = try force.forceValue(self, right);
+    force.rootKeep(self, right_list); // owns getList slice, held across appendUniqueContextOutput forces
     if (!left_list.isList() or !right_list.isList()) return error.TypeError;
 
     var outputs: std.ArrayListUnmanaged(Value) = .empty;

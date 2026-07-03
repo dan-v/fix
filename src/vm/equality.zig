@@ -86,6 +86,13 @@ pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
     if (a.asObjectId() == b.asObjectId()) return true;
     if (try equalityPairSeen(self, a, b, seen)) return true;
 
+    // a/b may be nested containers reached via getList (not on the operand
+    // stack); root them so their backing slices survive the element forces.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, a);
+    force.rootKeep(self, b);
+
     const a_items = try self.heap.getList(a.asObjectId());
     const b_items = try self.heap.getList(b.asObjectId());
     if (a_items.len != b_items.len) return false;
@@ -99,6 +106,14 @@ pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
 pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(EqualityPair)) anyerror!bool {
     if (a.asObjectId() == b.asObjectId()) return true;
     if (try equalityPairSeen(self, a, b, seen)) return true;
+
+    // a/b may be nested containers reached via getAttrs (not on the operand
+    // stack); root them so a_entries/b_entries survive the value forces in
+    // derivationAttrsEqual + the element loop.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, a);
+    force.rootKeep(self, b);
 
     const a_entries = try self.heap.getAttrs(a.asObjectId());
     const b_entries = try self.heap.getAttrs(b.asObjectId());

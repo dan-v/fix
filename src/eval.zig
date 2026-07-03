@@ -627,6 +627,8 @@ pub const Evaluator = struct {
         if (fiber_mod.currentFiber() != null) {
             var vm = try self.initVm(0);
             defer vm.deinit();
+            if (comptime gc.enabled) self.gcRegisterVm(&vm);
+            defer if (comptime gc.enabled) self.gcUnregisterVm(&vm);
             return @call(.auto, body, .{&vm} ++ args);
         }
         const Args = @TypeOf(args);
@@ -644,6 +646,8 @@ pub const Evaluator = struct {
                     return;
                 };
                 defer vm.deinit();
+                if (comptime gc.enabled) ctx.ev.gcRegisterVm(&vm);
+                defer if (comptime gc.enabled) ctx.ev.gcUnregisterVm(&vm);
                 const result = @call(.auto, body, .{&vm} ++ ctx.body_args) catch |e| {
                     ctx.err = e;
                     return;
@@ -685,10 +689,42 @@ pub const Evaluator = struct {
             // barrier. At --workers>1 the GC is dormant (no collection), so
             // the evaluator behaves exactly as a non-GC build there.
             if (self.worker_count == 1) {
-                self.heap.gcEnableCollect(ObjectHeap.GC_MIN_THRESHOLD);
+                // FIX_GC_STEP_MB (validation): collect every N MB of fresh
+                // allocation so the detector exercises every builtin loop.
+                var step_bytes: u64 = 0;
+                if (self.env_map) |em| {
+                    if (em.get("FIX_GC_STEP_MB")) |s| {
+                        if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
+                    }
+                }
+                self.heap.gcEnableCollect(ObjectHeap.GC_MIN_THRESHOLD, step_bytes);
             }
         }
         return w;
+    }
+
+    /// GC (`-Dgc`): register a stack-local VM (the top-level entry's VM, a
+    /// nested-eval VM, or an import VM) so the collector scans its roots.
+    /// These VMs are NOT in any worker's `fibers` list, so without this their
+    /// operand stack / frames / force-chain / temp-roots are invisible and
+    /// their live objects get swept. Concurrent imports at --workers>1
+    /// interleave, hence the mutex + remove-by-value.
+    pub fn gcRegisterVm(self: *Evaluator, vm: *VM) void {
+        if (comptime !gc.enabled) return;
+        self.gc_import_vms_mu.lock();
+        defer self.gc_import_vms_mu.unlock();
+        self.gc_import_vms.append(self.allocator, vm) catch {};
+    }
+    pub fn gcUnregisterVm(self: *Evaluator, vm: *VM) void {
+        if (comptime !gc.enabled) return;
+        self.gc_import_vms_mu.lock();
+        defer self.gc_import_vms_mu.unlock();
+        for (self.gc_import_vms.items, 0..) |ivm, i| {
+            if (ivm == vm) {
+                _ = self.gc_import_vms.swapRemove(i);
+                break;
+            }
+        }
     }
 
     /// Type-erased trampoline for the heap's collect callback.
@@ -712,7 +748,7 @@ pub const Evaluator = struct {
         };
         const t0 = gcNowNs();
         self.gcMarkRoots(tr);
-        tr.drain(&self.heap); // full precise closure
+        tr.drain(&self.heap); // precise transitive closure from the roots
         const t1 = gcNowNs();
         const st = self.heap.sweep(tr.mark_bits);
         const t2 = gcNowNs();
@@ -735,29 +771,6 @@ pub const Evaluator = struct {
         return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
-    /// Conservatively scan a suspended fiber's live C-stack region for words
-    /// that decode to valid live ObjectIds, marking them. Catches heap refs
-    /// held in native-builtin Zig locals on a fiber that yielded mid-builtin
-    /// (only possible at --workers>1, blocking on a remote thunk). Over-
-    /// approximates (may retain some dead objects), never sweeps a live one.
-    fn gcScanSuspendedFiberStack(tr: *gc.Tracer, heap: *ObjectHeap, fib: *const fiber_mod.Fiber) void {
-        if (fib.state != .suspended) return;
-        const base = @intFromPtr(fib.stack.ptr);
-        const top = base + fib.stack.len;
-        var sp = fib.ctx.rsp;
-        if (sp < base or sp >= top) return; // saved SP not within this stack
-        sp = (sp + 7) & ~@as(usize, 7); // align up to 8
-        const count = heap.objects.count();
-        var p = sp;
-        while (p + 8 <= top) : (p += 8) {
-            const v = Value{ .bits = @as(*const u64, @ptrFromInt(p)).* };
-            if (!gc.hasObjectRef(v)) continue;
-            const id = v.asObjectId();
-            if (id >= count) continue;
-            tr.markObject(heap, id);
-        }
-    }
-
     /// Mark all GC roots into `tr` (without draining). See docs/gc-plan.md.
     fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
         if (self.builtins_value) |b| tr.markValue(&self.heap, b);
@@ -768,15 +781,9 @@ pub const Evaluator = struct {
         for (self.gc_workers) |*slot| {
             const w = slot.load(.acquire) orelse continue;
             for (w.fibers.items) |f| {
+                // Precise, for every fiber: operand stack + frames + upvalues +
+                // in-flight force chain + builtin temp-roots (see force.zig).
                 gcMarkVm(tr, &self.heap, &f.vm);
-                // A fiber that yielded (blocked on a remote thunk) while
-                // inside a native builtin has heap refs in Zig locals on its
-                // own C-stack — invisible to the precise VM scan. Zig gives no
-                // stack maps, so conservatively scan its live stack region.
-                // Only suspended fibers need this (running/parked-at-safepoint
-                // fibers are at native_depth 0, no builtin locals). See
-                // docs/gc-plan.md.
-                if (comptime gc.enabled) gcScanSuspendedFiberStack(tr, &self.heap, &f.inner);
                 // A task assigned to a fiber is out of the scheduler queue
                 // but still a live reference until the fiber processes it.
                 if (f.current_task) |task| switch (task) {
@@ -811,9 +818,12 @@ pub const Evaluator = struct {
             if (entry.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved))
                 tr.markValue(&self.heap, entry.result);
         }
-        // Lazy-derivation cache (Value bits keyed by attrs id).
+        // Lazy-derivation cache (Value bits keyed by attrs id). Only current-
+        // token entries are live roots; stale ones (pre-GC id, now reused) are
+        // dead and will miss on lookup, so don't retain them.
         var dit = self.derivations.lazy_drv_cache.iterator();
-        while (dit.next()) |e| tr.markValue(&self.heap, .{ .bits = e.value_ptr.* });
+        while (dit.next()) |e| if (e.value_ptr.token == self.heap.token)
+            tr.markValue(&self.heap, .{ .bits = e.value_ptr.bits });
     }
 
     fn gcMarkVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *const VM) void {
@@ -821,6 +831,7 @@ pub const Evaluator = struct {
         tr.markValue(heap, vm.builtins);
         tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
         for (vm.gc_force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
+        for (vm.gc_temp_roots.items) |v| tr.markValue(heap, v); // native builtin roots
         for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
         for (vm.frames[0..vm.frames_len]) |frame| {
             if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);

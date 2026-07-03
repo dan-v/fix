@@ -95,6 +95,13 @@ pub fn singleContextEntry(self: anytype, name: InternId, value: Value) ![]const 
 pub fn appendContextEntry(self: anytype, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {
     for (context.items) |*entry| {
         if (entry.name == name) {
+            // GC: mergeContextValues forces; the already-accumulated entries in
+            // `context` (caller-owned, not on the VM stack) plus the incoming
+            // `value` must survive the walk.
+            const gc_roots = vm_force.rootsBegin(self);
+            defer vm_force.rootsEnd(self, gc_roots);
+            for (context.items) |held| vm_force.rootKeep(self, held.value);
+            vm_force.rootKeep(self, value);
             entry.value = try mergeContextValues(self, entry.value, value);
             return;
         }
@@ -103,6 +110,12 @@ pub fn appendContextEntry(self: anytype, context: *std.ArrayListUnmanaged(heap_m
 }
 
 pub fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
+    // GC: `left` is held across the force of `right`, and both forced ids are
+    // held across mergeContextAttrs (which forces). Root both across the walk.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, left);
+    vm_force.rootKeep(self, right);
     const left_forced = try vm_force.forceValue(self, left);
     const right_forced = try vm_force.forceValue(self, right);
     if (left_forced.isAttrs() and right_forced.isAttrs()) {
@@ -112,6 +125,12 @@ pub fn mergeContextValues(self: anytype, left: Value, right: Value) !Value {
 }
 
 pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+    // GC: `left`/`right` are raw attr slices held across mergeContextAttrValue
+    // -> mergeContextOutputs forces; keep their owner objects live.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.attrs(left_id));
+    vm_force.rootKeep(self, Value.attrs(right_id));
     const left = try self.heap.getAttrs(left_id);
     const right = try self.heap.getAttrs(right_id);
 
@@ -152,6 +171,12 @@ pub fn mergeContextAttrValue(self: anytype, name: InternId, left: Value, right: 
 }
 
 pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
+    // GC: `left`/`right` (and their forced list slices) are held across the
+    // per-item forces in appendUniqueContextOutput; keep the lists live.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, left);
+    vm_force.rootKeep(self, right);
     const left_list = try vm_force.forceValue(self, left);
     const right_list = try vm_force.forceValue(self, right);
     if (!left_list.isList() or !right_list.isList()) return error.TypeError;

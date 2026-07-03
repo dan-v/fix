@@ -35,8 +35,13 @@ pub const DerivationStore = struct {
     /// `u64` storage instead of `Value` to keep this header from
     /// having to know about the runtime Value type. The caller
     /// converts via `@bitCast` at each end.
-    lazy_drv_cache: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    /// Keyed by attrs ObjectId; the `token` guards against GC id-reuse (a
+    /// swept attrs' id can be handed to a different attrs, so a stale entry
+    /// must miss). `bits` is the cached `Value.bits`.
+    lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
     lazy_drv_mu: stable.SpinMutex = .{},
+
+    const LazyDrvEntry = struct { token: u64, bits: u64 };
 
     const Record = struct {
         hash_modulo: HashModulo,
@@ -67,18 +72,24 @@ pub const DerivationStore = struct {
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.
     /// Returns the cached `Value.bits` if present, `null` otherwise.
-    pub fn lookupLazyDerivation(self: *DerivationStore, attrs_id: u32) ?u64 {
+    pub fn lookupLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64) ?u64 {
         self.lazy_drv_mu.lock();
         defer self.lazy_drv_mu.unlock();
-        return self.lazy_drv_cache.get(attrs_id);
+        const entry = self.lazy_drv_cache.get(attrs_id) orelse return null;
+        // The key is a raw ObjectId; after a GC the attrs may be swept and its
+        // id reused for a different attrs. `token` bumps every collection, so a
+        // stale entry must miss — else we'd return another derivation's value
+        // for a reused id (a reuse-only bug the -Dgc detector can't see).
+        if (entry.token != token) return null;
+        return entry.bits;
     }
 
     /// Cache the result of `buildForcedDerivationValue(.lazy)` for
     /// future per-attr lookups against the same input attrs.
-    pub fn cacheLazyDerivation(self: *DerivationStore, attrs_id: u32, value_bits: u64) !void {
+    pub fn cacheLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64, value_bits: u64) !void {
         self.lazy_drv_mu.lock();
         defer self.lazy_drv_mu.unlock();
-        try self.lazy_drv_cache.put(self.allocator, attrs_id, value_bits);
+        try self.lazy_drv_cache.put(self.allocator, attrs_id, .{ .token = token, .bits = value_bits });
     }
 
     pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {

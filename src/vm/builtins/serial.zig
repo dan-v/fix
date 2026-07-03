@@ -76,6 +76,14 @@ fn writeJsonValueInner(
     path_mode: JsonPathMode,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) anyerror!void {
+    // GC: the `context` accumulator holds freshly-produced context values (heap
+    // objects not on the VM stack) that must survive the force below and the
+    // recursive subtree. Re-root the accumulated entries at this force point; a
+    // deeper frame re-roots before its own force, so LIFO truncation is safe.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    if (context) |entries| for (entries.items) |held| vm_force.rootKeep(self, held.value);
+
     const forced = try vm_force.forceValue(self, value);
     switch (forced.kind()) {
         .null => try writer.writeAll("null"),
@@ -162,6 +170,12 @@ fn writeJsonList(
     if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
+    // GC: `id` is a bare list id whose element slice is force-walked below; keep
+    // the list live across the child forces.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.list(id));
+
     try writer.writeByte('[');
     for (try self.heap.getList(id), 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
@@ -180,6 +194,13 @@ fn writeJsonAttrs(
 ) !void {
     if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
+
+    // GC: `sorted` is a private copy of the attr entries whose values reference
+    // heap objects reachable only via the attrs object; keep it live across the
+    // per-entry forces below.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.attrs(id));
 
     const sorted = try sortedAttrEntries(self, Value.attrs(id));
     defer self.allocator.free(sorted);
@@ -308,6 +329,13 @@ fn writeXmlList(
     depth: usize,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
+    // GC: keep the bare list id live across the child force-walk below, plus the
+    // accumulated `context` values (heap objects not on the VM stack).
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.list(id));
+    if (context) |entries| for (entries.items) |held| vm_force.rootKeep(self, held.value);
+
     try writer.writeAll("<list>\n");
     for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1, context);
     try writeXmlIndent(writer, depth);
@@ -321,6 +349,14 @@ fn writeXmlAttrs(
     depth: usize,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
+    // GC: `sorted` holds attr-entry values reachable only via the attrs object;
+    // keep it live across the per-entry force-walk below, plus the accumulated
+    // `context` values (heap objects not on the VM stack).
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.attrs(id));
+    if (context) |entries| for (entries.items) |held| vm_force.rootKeep(self, held.value);
+
     const sorted = try sortedAttrEntries(self, Value.attrs(id));
     defer self.allocator.free(sorted);
 

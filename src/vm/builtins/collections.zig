@@ -367,9 +367,16 @@ pub fn builtinConcatMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
     vm_force.fanOutListShallow(self, list_id, items);
+    // GC: `out` accumulates elements of NEW lists produced by `func` — not
+    // reachable through any argument — and holds them across later iterations'
+    // forces. Root each produced list. (`func`/`list` and its elements are
+    // covered by the arg roots.)
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
     for (items) |item| {
         const mapped = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!mapped.isList()) return error.TypeError;
+        vm_force.rootKeep(self, mapped);
         try out.appendSlice(self.allocator, try self.heap.getList(mapped.asObjectId()));
     }
     return Value.list(try self.heap.addList(out.items));
@@ -569,6 +576,13 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
     var keys: GcKeySet = .{};
     defer keys.deinit(self.allocator);
 
+    // GC: `result` (a Zig-side list) holds items from `start_set` (reachable
+    // through the arg) and from NEW lists `operator` produces, read back across
+    // later forces. Root each produced list so its items — and thus `result`'s
+    // contents and the `keys` set — stay alive.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+
     const key_name = try self.intern.intern("key");
     for (try self.heap.getList(start_set.asObjectId())) |item| {
         try genericClosureAppend(self, key_name, item, &result, &keys);
@@ -578,6 +592,7 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
     while (index < result.items.len) : (index += 1) {
         const produced = try vm_force.forceValue(self, try vm_closures.callValue(self, operator, result.items[index]));
         if (!produced.isList()) return error.TypeError;
+        vm_force.rootKeep(self, produced);
         for (try self.heap.getList(produced.asObjectId())) |item| {
             try genericClosureAppend(self, key_name, item, &result, &keys);
         }
@@ -639,9 +654,17 @@ pub fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
     vm_force.fanOutListShallow(self, list_id, items);
+    // GC: `acc` becomes a NEW value produced by `op` (not reachable through any
+    // argument) and is held across the next iteration's call/force. Root the
+    // running accumulator so it survives collection between iterations. (`op`
+    // and `list`/its elements are covered by the arg roots; the seed `nul_arg`
+    // is an arg until the first iteration overwrites `acc`.)
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
     for (items) |item| {
         const partial = try vm_closures.callValue(self, op, acc);
         acc = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, item));
+        vm_force.rootKeep(self, acc);
     }
 
     return acc;

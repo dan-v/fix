@@ -429,6 +429,13 @@ inline fn forceStrictArgs(self: *VM, ch: *const Chunk, args_base: u32, n: u16) !
 pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_call);
     defer prof.end(.do_call, t);
+    // GC (`-Dgc`): root callee+arg for the call — they were popped off the
+    // operand stack into Zig locals, so a force inside the call must not sweep
+    // them. See callValue / force.RootScope. Compiles away w/o -Dgc.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, callee);
+    force.rootKeep(self, arg);
     if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);
@@ -499,7 +506,15 @@ fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
 pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
     const t = prof.start(.do_tail_call);
     defer prof.end(.do_tail_call, t);
+    // GC (`-Dgc`): `arg` and the walked `current` are held in Zig locals across
+    // forcing calls (applyToPartial/applyBuiltin*/callAttrFunctor) — none are on
+    // the operand stack here — so root them. `current` is re-rooted after each
+    // functor hop. Compiles away w/o -Dgc.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, arg);
     var current = callee;
+    force.rootKeep(self, current);
     while (true) {
         switch (current.kind()) {
             .closure => {
@@ -546,7 +561,10 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                 try stack.push(self, try access.applyBuiltinClosure(self, current, arg));
                 return;
             },
-            .attrs => current = try access.callAttrFunctor(self, current),
+            .attrs => {
+                current = try access.callAttrFunctor(self, current);
+                force.rootKeep(self, current);
+            },
             else => return trace.notCallableError(self, current),
         }
     }
@@ -632,6 +650,15 @@ pub fn doCallN(self: *VM, n: u16) !void {
         if (ch.arity == n) {
             // Saturated: drop the callee from below the args (shift the
             // args down one slot), then push one frame over the n args.
+            // GC (`-Dgc`): the shift overwrites the callee's stack slot at
+            // `base-1`, so once `sp` drops it is no longer a stack root — yet
+            // `closure.upvalues` (a raw slice owned by that closure object) is
+            // read by `pushFrame` AFTER `forceStrictArgs` forces. Root the
+            // callee across the force so the closure (and its upvalue range)
+            // survives. Compiles away w/o -Dgc.
+            const gc_roots = force.rootsBegin(self);
+            defer force.rootsEnd(self, gc_roots);
+            force.rootKeep(self, callee);
             var j: u32 = 0;
             while (j < n) : (j += 1) self.stack[base - 1 + j] = self.stack[base + j];
             self.sp -= 1;
@@ -682,6 +709,15 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
 pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
     const t = prof.start(.call_value);
     defer prof.end(.call_value, t);
+    // GC (`-Dgc`): root callee+arg for the call's duration — they arrive in Zig
+    // locals, so a force inside the call would otherwise sweep them. This is
+    // what lets a builtin pass a freshly-produced value (e.g. a partial
+    // application, or a user-fn result) into callValue without rooting it
+    // itself. Precise; compiles away w/o -Dgc.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, callee);
+    force.rootKeep(self, arg);
     if (callee.isClosure()) {
         const closure_id = callee.asObjectId();
         const closure = try getClosureById(self, closure_id);

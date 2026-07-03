@@ -130,6 +130,47 @@ inline fn memoKeyForBytecode(b: *const thunk_mod.BytecodeThunk) ?MemoKey {
 
 // ---- thunk management ----
 
+// ---- GC roots for native code (`-Dgc`) ----
+//
+// The collector is fully PRECISE: it never scans raw C-stacks or registers.
+// Every live heap `Value` must therefore be reachable from an enumerable root
+// at a collection safepoint (a `forceValue`/`forceThunk`). The roots are:
+//   - the VM operand stack + frames + upvalues (bytecode ops — kept precise by
+//     forcing operands *in place*; see `forceAt`/`forceTop`, never pop-then-force);
+//   - the in-flight thunk force chain (`forceThunkImpl` pushes each claimed
+//     thunk — roots its target closure / upvalues / attr-access base);
+//   - `callValue`/`doCall` root their callee+arg for the call's duration;
+//   - `applyBuiltin` roots every builtin argument for the builtin's duration;
+//   - `gc_temp_roots` for anything native code holds that none of the above
+//     covers (see rule below).
+//
+// RULE for writing a native builtin (so you get it right on the first try):
+//   Your ARGUMENTS are already rooted (by applyBuiltin). Any value you pass to
+//   `forceValue`/`callValue`/`getAttrValue` is rooted for that call. List
+//   elements / attr values reached THROUGH a rooted argument are covered too.
+//   => You only need a scope when you stash a *newly produced* heap value in a
+//      Zig-side collection (an ArrayList, a running result) and keep it across a
+//      LATER force — e.g. lists a user function returns mid-loop. Then:
+//
+//        const scope = force.rootsBegin(self);
+//        defer force.rootsEnd(self, scope);
+//        ...
+//        force.rootKeep(self, produced); // keep `produced` alive across later forces
+//
+// All of this compiles to nothing without `-Dgc` (`self: anytype` so builtins
+// taking a test mock still compile). It never costs the normal build a thing.
+pub const RootScope = usize;
+
+pub inline fn rootsBegin(self: anytype) RootScope {
+    return if (comptime build_options.gc) self.gc_temp_roots.items.len else 0;
+}
+pub inline fn rootsEnd(self: anytype, scope: RootScope) void {
+    if (comptime build_options.gc) self.gc_temp_roots.items.len = scope;
+}
+pub inline fn rootKeep(self: anytype, v: Value) void {
+    if (comptime build_options.gc) self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
+}
+
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
     return forceThunkImpl(self, thunk_val, true);
 }
@@ -193,19 +234,25 @@ pub const SeenDeepObject = struct {
 pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
     const forced = try forceValue(self, value);
     switch (forced.kind()) {
-        .list => {
+        .list, .attrs => {
+            // GC: root the container across the recursive element forces — we
+            // hold it only as a Zig local (`forced`) + a raw store slice, which
+            // no precise root covers, and the deep recursion forces mid-walk.
+            const gc_roots = rootsBegin(self);
+            defer rootsEnd(self, gc_roots);
+            rootKeep(self, forced);
             const id = forced.asObjectId();
-            if (!try enterDeep(self, .list, id, seen)) return;
-            const items = try self.heap.getList(id);
-            fanOutListShallow(self, id, items);
-            for (items) |item| try forceDeepInner(self, item, seen);
-        },
-        .attrs => {
-            const id = forced.asObjectId();
-            if (!try enterDeep(self, .attrs, id, seen)) return;
-            const entries = try self.heap.getAttrs(id);
-            fanOutAttrsShallow(self, entries);
-            for (entries) |entry| try forceDeepInner(self, entry.value, seen);
+            if (forced.kind() == .list) {
+                if (!try enterDeep(self, .list, id, seen)) return;
+                const items = try self.heap.getList(id);
+                fanOutListShallow(self, id, items);
+                for (items) |item| try forceDeepInner(self, item, seen);
+            } else {
+                if (!try enterDeep(self, .attrs, id, seen)) return;
+                const entries = try self.heap.getAttrs(id);
+                fanOutAttrsShallow(self, entries);
+                for (entries) |entry| try forceDeepInner(self, entry.value, seen);
+            }
         },
         else => {},
     }
@@ -331,34 +378,33 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // may be off the VM stack (passed by value), so root it explicitly
     // across the collection. See docs/gc-plan.md.
     if (comptime build_options.gc) {
-        // Safepoints only at native-call depth 0: a bytecode-level force
-        // where the root set is provably complete (operand stack + frames).
-        // Never inside a native builtin, whose intermediates live in Zig
-        // locals the collector can't see.
-        if (native_depth == 0) {
-            // Peer: another worker is collecting — park in the stop-the-world
-            // barrier so the heap is stable while it marks/sweeps. Our fiber
-            // (VM stack/frames) is a root it walks; root the in-flight value
-            // too, in case its only reference is this Zig local.
-            if (self.scheduler.gcStopRequested()) {
-                self.gc_extra_root = thunk_val;
+        // Peer stop-the-world response (w>1): only park at native depth 0,
+        // where this fiber holds no builtin Zig locals a peer collector would
+        // need but can't precisely see. (The w>1 collector is dormant today;
+        // see Evaluator.ensureMainWorker.)
+        if (native_depth == 0 and self.scheduler.gcStopRequested()) {
+            self.gc_extra_root = thunk_val;
+            self.scheduler.gcSafepointPark(self.workerId());
+            self.gc_extra_root = Value.null_val;
+        }
+        // Collector: the threshold was crossed. Win the race to become the
+        // sole collector (others park), stop all peers, then mark+sweep. At
+        // --workers=1 this degenerates to a direct collect (0 peers).
+        //
+        // Fires at ANY native depth (the RSS lever). Correctness rests on the
+        // precise root discipline: eval-VM registration, arg/call rooting, the
+        // in-flight force chain, and container temp-roots in force-walking
+        // native fns. Audit in progress (see force.zig root helpers).
+        if (demand and self.heap.gcCollectRequested()) {
+            self.gc_extra_root = thunk_val;
+            if (self.scheduler.gcTryBeginCollection()) {
+                self.scheduler.gcWaitAllParked(self.workerId());
+                self.heap.gcRunCollect();
+                self.scheduler.gcEndCollection(self.workerId());
+            } else {
                 self.scheduler.gcSafepointPark(self.workerId());
-                self.gc_extra_root = Value.null_val;
             }
-            // Collector: the threshold was crossed. Win the race to become the
-            // sole collector (others park), stop all peers, then mark+sweep.
-            // At --workers=1 this degenerates to a direct collect (0 peers).
-            if (demand and self.heap.gcCollectRequested()) {
-                self.gc_extra_root = thunk_val;
-                if (self.scheduler.gcTryBeginCollection()) {
-                    self.scheduler.gcWaitAllParked(self.workerId());
-                    self.heap.gcRunCollect();
-                    self.scheduler.gcEndCollection(self.workerId());
-                } else {
-                    self.scheduler.gcSafepointPark(self.workerId());
-                }
-                self.gc_extra_root = Value.null_val;
-            }
+            self.gc_extra_root = Value.null_val;
         }
     }
     const t = prof.start(.force_thunk_slow);
@@ -428,13 +474,17 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 }
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // Root this in-flight thunk (and thus its target closure /
-                // upvalues) for the duration of its body: a collection
-                // triggered by a nested force (this worker) or by another
-                // worker's stop-the-world must not sweep it. At --workers=1
-                // container-reachability covered this, but at --workers>1 a
-                // peer's in-flight claimed thunk is not otherwise reachable
-                // when the collector runs, so the per-VM force chain is
-                // load-bearing again. See docs/gc-plan.md.
+                // upvalues / attr-access base) for the duration of its body:
+                // a collection triggered by a nested force must not sweep it.
+                // The thunk is `.evaluating` and off the operand stack while
+                // its body runs, and `thunk_val` is dead here (only `thunk_id`
+                // + the raw pointer remain), so the conservative scan can't
+                // see it — the per-VM force chain is load-bearing. The tracer
+                // follows an `.evaluating` thunk's target. See docs/gc-plan.md.
+                if (comptime build_options.gc) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+                defer if (comptime build_options.gc) {
+                    _ = self.gc_force_chain.pop();
+                };
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {

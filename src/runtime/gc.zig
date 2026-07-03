@@ -334,7 +334,7 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap.gcEnableCollect(64 << 20);
+    heap.gcEnableCollect(64 << 20, 0);
 
     // Live tree: outer list -> inner list. Garbage: two unreferenced lists.
     const inner = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });

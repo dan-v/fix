@@ -768,13 +768,24 @@ pub const ObjectHeap = struct {
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
     pub const GC_HEADROOM: u64 = 32 << 20;
 
+    /// Validation knob (`FIX_GC_STEP_MB`, `-Dgc` only): when > 0, collect
+    /// every this-many MB of fresh allocation instead of the normal additive-
+    /// headroom policy. Drives many collections so the detector exercises
+    /// every builtin loop. 0 = normal policy. Set from the evaluator (which
+    /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
+    var gc_step_bytes: u64 = 0;
+
     /// Turn on reclaim (alloc-bitmap maintenance + free-list reuse +
     /// sweep) with an initial threshold. The evaluator calls this only at
     /// `--workers=1` (alloc-bitmap maintenance isn't yet thread-safe).
-    pub fn gcEnableCollect(self: *ObjectHeap, initial_threshold: u64) void {
+    pub fn gcEnableCollect(self: *ObjectHeap, initial_threshold: u64, step_bytes: u64) void {
         if (comptime !build_options.gc) return;
         self.gc_collect_enabled = true;
-        self.gc_threshold_bytes = initial_threshold;
+        gc_step_bytes = step_bytes;
+        self.gc_threshold_bytes = if (gc_step_bytes > 0)
+            self.totalReservedBytes() + gc_step_bytes
+        else
+            initial_threshold;
         self.gc_track_from = self.objects.count();
         // Detector build: pre-size the alloc bitmap to the whole object id
         // space so the incremental per-fill bit-set never reallocs (which
@@ -844,7 +855,10 @@ pub const ObjectHeap = struct {
         if (comptime !build_options.gc) return;
         _ = live_bytes;
         self.gc_collect_requested = false;
-        self.gc_threshold_bytes = @max(GC_MIN_THRESHOLD, self.totalReservedBytes() + GC_HEADROOM);
+        self.gc_threshold_bytes = if (gc_step_bytes > 0)
+            self.totalReservedBytes() + gc_step_bytes
+        else
+            @max(GC_MIN_THRESHOLD, self.totalReservedBytes() + GC_HEADROOM);
         // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
         // that key on `token`: they hold Values weakly (not GC roots), so a
         // swept object could still be reachable through a stale cache slot.
@@ -1008,6 +1022,32 @@ pub const ObjectHeap = struct {
     /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
     /// `merge_attrs`/`boxed_int` own no ranges.
     fn gcFreeObjectRanges(self: *ObjectHeap, obj: *const Object) void {
+        // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
+        // slice (owner swept while a Zig local held the slice — the class the
+        // reuse-off object-read assert can't see) traps on next access instead
+        // of silently reading stale-but-valid data. Poison is a thunk to an
+        // unallocated id, so forcing/reading a poisoned element hits gcAssertLive.
+        if (comptime gc_debug) {
+            const poison = Value.thunk(OBJECT_MAX_SLOTS - 1);
+            switch (obj.*) {
+                .list => |r| for (self.values.sliceMut(r)) |*v| {
+                    v.* = poison;
+                },
+                .attrs => |a| for (self.attrs.sliceMut(a.range)) |*e| {
+                    e.value = poison;
+                },
+                .builtin_closure => |c| for (self.values.sliceMut(c.args)) |*v| {
+                    v.* = poison;
+                },
+                .partial_app => |p| for (self.values.sliceMut(p.args)) |*v| {
+                    v.* = poison;
+                },
+                .context_string => |c| for (self.attrs.sliceMut(c.context)) |*e| {
+                    e.value = poison;
+                },
+                else => {},
+            }
+        }
         switch (obj.*) {
             .list => |r| if (r.len > 0) self.gc_free_values.push(self.allocator, r.segment, r.offset, r.len),
             .attrs => |a| {

@@ -34,6 +34,16 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
     if (args.len < arity) return shared.makeBuiltinClosure(self, builtin_id, args);
     if (args.len > arity) return error.TooManyArguments;
 
+    // GC (`-Dgc`): root every argument for the builtin's duration. The
+    // collector is precise and a builtin's args live in Zig locals / a C-stack
+    // slice (never on the VM operand stack), so a force mid-body could
+    // otherwise sweep them (and everything reachable through them). Rooting
+    // here covers ALL builtins uniformly; individual builtins only deal with
+    // newly-produced intermediates (see force.RootScope). Compiles away w/o -Dgc.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    for (args) |a| vm_force.rootKeep(self, a);
+
     return switch (id) {
         .toString => strings.builtinToString(self, args[0]),
         .isAttrs => predicates.builtinTypePredicate(self, args[0], .attrs),

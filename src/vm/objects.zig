@@ -59,6 +59,14 @@ pub fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {
 }
 
 pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: types.ObjectId) anyerror!types.ObjectId {
+    // Recursive calls receive nested attr ids that are NOT on the operand
+    // stack; root the input objects so their `left`/`right` slices survive
+    // the forces inside mergeAttrLiteralValue.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, Value.attrs(left_id));
+    force.rootKeep(self, Value.attrs(right_id));
+
     const left = try self.heap.getAttrs(left_id);
     const right = try self.heap.getAttrs(right_id);
 

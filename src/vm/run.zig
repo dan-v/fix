@@ -247,13 +247,22 @@ fn opAddInt(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usi
     // GC-safe primitive — never `forceValue(pop())`. See vm/force.zig.
     const b = try force.forceTop(vm);
     const a = try force.forceAt(vm, 1);
-    stack.dropBin(vm);
     if (numeric.isNumeric(a) and numeric.isNumeric(b)) {
+        stack.dropBin(vm);
         try stack.push(vm, try numeric.add(vm.heap, a, b));
-    } else if (a.isPath()) {
-        try stack.push(vm, try strings.concatPathLike(vm, a, b));
     } else {
-        try stack.push(vm, try strings.concatStringLike(vm, a, b));
+        // GC: the string/path concat helpers force BOTH operands again
+        // (coerceLanguageStringValue → forceValue + possible callValue/
+        // getAttrValue on a `__toString`/`outPath` attrset — GC safepoints)
+        // while the other operand is held only in a Zig local. Keep both on
+        // the operand stack across the concat so they stay precise roots;
+        // drop only after. Compiles away without -Dgc.
+        const result = if (a.isPath())
+            try strings.concatPathLike(vm, a, b)
+        else
+            try strings.concatStringLike(vm, a, b);
+        stack.dropBin(vm);
+        try stack.push(vm, result);
     }
     return dispatch(vm, frame, code, ip, stop_depth);
 }

@@ -387,6 +387,12 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     }
     if (!attrs.isAttrs()) return error.TypeError;
 
+    // GC: `attrs` is held (via `attrs_id`) across the force-walking spec
+    // helpers below. On the recursive path (`builtinParseFlakeRef` result) it
+    // is a freshly built attrset that isn't the auto-rooted builtin argument.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, attrs);
     const attrs_id = attrs.asObjectId();
     const type_value = try requiredStringAttr(self, attrs_id, "type");
     defer self.allocator.free(type_value);
@@ -456,6 +462,14 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     const ref_value = Value.string(try self.intern.intern(ref));
     const source_info = try builtinFetchTree(self, try builtinParseFlakeRef(self, ref_value));
+    // GC: `source_info` is a freshly built attrset (not the auto-rooted arg)
+    // held across the import/force/call sequence below, up to the final
+    // `flakeResultValue`. The later intermediates (`outputs_func`, `inputs`,
+    // `outputs`) are each only live across a call/force where they are the
+    // direct callee/arg (rooted by that call) or across non-forcing calls.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, source_info);
     const out_path = try requiredStringAttr(self, source_info.asObjectId(), "outPath");
     defer self.allocator.free(out_path);
 

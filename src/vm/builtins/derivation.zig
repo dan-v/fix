@@ -71,12 +71,13 @@ pub fn builtinDerivationLazyAttr(self: anytype, attrs_arg: Value, name_arg: Valu
     // `derivationLazyAttr`'s wall time on workloads like the
     // NixOS toplevel where one derivation is touched for several
     // of its lazy attrs.
-    const cached_bits = self.derivations.lookupLazyDerivation(attrs_id);
+    const cached_bits = self.derivations.lookupLazyDerivation(attrs_id, self.heap.token);
     const value: Value = if (cached_bits) |bits| .{ .bits = bits } else blk: {
         const built = try buildForcedDerivationValue(self, attrs_id, .lazy);
         // Best-effort cache; if the put fails (OOM) we still
-        // proceed — correctness doesn't depend on caching.
-        self.derivations.cacheLazyDerivation(attrs_id, built.bits) catch {};
+        // proceed — correctness doesn't depend on caching. Token-guarded so a
+        // GC that reuses `attrs_id` for a different attrs can't hit a stale entry.
+        self.derivations.cacheLazyDerivation(attrs_id, self.heap.token, built.bits) catch {};
         break :blk built;
     };
     return self.heap.getAttrValue(value.asObjectId(), name_id);
@@ -173,6 +174,10 @@ fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     drv_probe.buildEnter();
     defer drv_probe.buildExit();
+    // GC: `attrs_id` is a bare id held across the whole (force-heavy) build.
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, Value.attrs(attrs_id));
     const name_id = try self.intern.intern("name");
     const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(attrs_id, name_id));
     if (!isPlainString(name_value)) return error.TypeError;
@@ -465,7 +470,11 @@ fn derivationAttrString(
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const u8 {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, value);
     const string_value = try coerceDerivationStringValue(self, value);
+    vm_force.rootKeep(self, string_value);
     return normalizeDerivationString(self, string_value, inputs, owned_strings);
 }
 
@@ -644,6 +653,9 @@ fn normalizeDerivationString(
     inputs: *DerivationInputs,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const u8 {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, value); // held across contextOutputs forces (below)
     const text = self.intern.get(try stringTextInternId(self, value));
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
@@ -690,8 +702,11 @@ fn contextOutputs(
     value: Value,
     owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const []const u8 {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
     const attrs = try vm_force.forceValue(self, value);
     if (!attrs.isAttrs()) return error.TypeError;
+    vm_force.rootKeep(self, attrs); // held across the outputs forces
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("allOutputs"))) |all_outputs_value| {
         const all_outputs = try vm_force.forceValue(self, all_outputs_value);
         if (!all_outputs.isBool()) return error.TypeError;
@@ -782,6 +797,12 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
 
     const outputs_list = try vm_force.forceValue(self, outputs_value);
     if (!outputs_list.isList()) return error.TypeError;
+    // GC: `items` is a raw store slice held across the per-item forces below;
+    // its owning list isn't otherwise rooted (this runs under the lazy path
+    // where `attrs_id` isn't rooted by the caller).
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, outputs_list);
     const items = try self.heap.getList(outputs_list.asObjectId());
     if (items.len == 0) return error.InvalidDerivationOutput;
 

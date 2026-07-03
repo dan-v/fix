@@ -18,6 +18,12 @@ const readU32 = vm_mod.readU32;
 const readInternId = vm_mod.readInternId;
 
 pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
+    // GC (`-Dgc`): `callee` (the functor attrset) is held in a Zig local across
+    // `forceValue(functor)` — and callers reach here off the operand stack
+    // (e.g. doTailCall's `current`) — so root it. Compiles away w/o -Dgc.
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
+    force.rootKeep(self, callee);
     const functor_id = try self.intern.intern("__functor");
     const functor = self.heap.getAttrValue(callee.asObjectId(), functor_id) catch |err| switch (err) {
         error.MissingAttribute => return error.NotCallable,
@@ -122,7 +128,13 @@ inline fn attrCacheIndex(obj_id: types.ObjectId, name_id: InternId) usize {
 }
 
 pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
+    // GC: each path node `current` is a freshly-forced attrs held across the
+    // next level's force; keep them rooted (the op keeps only `attrs_val` on
+    // the operand stack).
+    const gc_roots = force.rootsBegin(self);
+    defer force.rootsEnd(self, gc_roots);
     var current = try force.forceValue(self, attrs_val);
+    force.rootKeep(self, current);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
@@ -133,12 +145,16 @@ pub fn getAttrPathOrValue(self: *VM, attrs_val: Value, default_val: Value, encod
             else => return err,
         };
         current = try force.forceValue(self, current);
+        force.rootKeep(self, current);
     }
     return current;
 }
 
 pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Value, default_val: Value, encoded_names: []const u8, wide: bool) !Value {
+    const gc_roots = force.rootsBegin(self); // root each path node across forces
+    defer force.rootsEnd(self, gc_roots);
     var current = try force.forceValue(self, attrs_val);
+    force.rootKeep(self, current);
     var offset: usize = 0;
     const stride: usize = if (wide) 4 else 2;
     while (offset < encoded_names.len) : (offset += stride) {
@@ -149,6 +165,7 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
             else => return err,
         };
         current = try force.forceValue(self, current);
+        force.rootKeep(self, current);
     }
     const name_val = try force.forceValue(self, dynamic_name);
     if (!name_val.isString()) return error.TypeError;
@@ -161,7 +178,10 @@ pub fn getAttrPathDynamicOrValue(self: *VM, attrs_val: Value, dynamic_name: Valu
 }
 
 pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []const Value, default_val: Value, encoded_segments: []const u8, segment_count: usize) !Value {
+    const gc_roots = force.rootsBegin(self); // root each path node across forces
+    defer force.rootsEnd(self, gc_roots);
     var current = try force.forceValue(self, attrs_val);
+    force.rootKeep(self, current);
     var offset: usize = 0;
     var dynamic_i: usize = 0;
     for (0..segment_count) |_| {
@@ -188,6 +208,7 @@ pub fn getAttrPathMixedOrValue(self: *VM, attrs_val: Value, dynamic_names: []con
             else => return err,
         };
         current = try force.forceValue(self, current);
+        force.rootKeep(self, current);
     }
     return current;
 }

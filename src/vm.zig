@@ -182,6 +182,16 @@ pub const VM = struct {
     /// (and their target closures). Marked as roots. `void` in normal builds.
     gc_force_chain: if (build_options.gc) std.ArrayListUnmanaged(types.ObjectId) else void = if (build_options.gc) .empty else {},
 
+    /// GC (`-Dgc`): heap containers a native builtin holds as a raw store
+    /// slice across a force (e.g. `heap.getList(id)` after the list `Value`
+    /// goes dead). The conservative running-fiber scan sees `Value`-shaped
+    /// locals but cannot recover an object from a raw interior pointer, so an
+    /// iterating builtin pushes the container here for its loop's duration —
+    /// keeping it, and thus its not-yet-visited elements, alive across a
+    /// collection triggered mid-loop. Marked as roots; scoped via
+    /// `force.gcRootsMark`/`gcRootsRestore`. `void` in normal builds.
+    gc_temp_roots: if (build_options.gc) std.ArrayListUnmanaged(Value) else void = if (build_options.gc) .empty else {},
+
     pub fn init(
         allocator: std.mem.Allocator,
         registry: *ChunkRegistry,
@@ -248,6 +258,7 @@ pub const VM = struct {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
         if (comptime tjit_record.enabled) tjit_record.cleanup(self);
         if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);
+        if (comptime build_options.gc) self.gc_temp_roots.deinit(self.allocator);
         self.allocator.free(self.stack);
         self.allocator.free(self.frames);
     }
