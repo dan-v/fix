@@ -151,3 +151,94 @@ pub fn compile(buf: *CodeBuffer, trace: *const ir.Trace) ?*const anyopaque {
     if (e.overflow) return null;
     return @ptrCast(@alignCast(buf.append(e.buf[0..e.len]) orelse return null));
 }
+
+test "codegen: empty trace is rejected" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(std.testing.allocator);
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compile(&buf, &trace));
+}
+
+test "codegen: an unmodeled op (eq) is rejected" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(allocator);
+    const a = try trace.emit(allocator, .{ .op = .trace_arg });
+    const eq = try trace.emit(allocator, .{ .op = .eq, .a = a, .b = a });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = eq });
+
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compile(&buf, &trace));
+}
+
+test "codegen: a guard with an unsupported kind is rejected" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(allocator);
+    const a = try trace.emit(allocator, .{ .op = .trace_arg });
+    // thunk_resolved isn't one of the codegen-supported guard kinds.
+    _ = try trace.emit(allocator, .{ .op = .guard, .a = a, .aux = @intFromEnum(GuardKind.thunk_resolved) });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = a });
+
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compile(&buf, &trace));
+}
+
+test "codegen: const_val + ret compiles and executes to the constant" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(allocator);
+    const cidx = try trace.addConst(allocator, Value.int(11));
+    const c = try trace.emit(allocator, .{ .op = .const_val, .aux = cidx });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = c });
+
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    const raw = compile(&buf, &trace) orelse return error.CodegenFailed;
+    const fn_ptr: jit.LambdaCompiledFn = @ptrCast(@alignCast(raw));
+    // const_val + ret never touch vm/upvalues — safe to call with dummy args.
+    const result = fn_ptr(undefined, undefined, Value.null_val);
+    try std.testing.expectEqual(@as(u64, 0), result.error_code);
+    try std.testing.expectEqual(@as(i64, 11), result.value.asInt());
+}
+
+test "codegen: trace_arg + ret echoes the passed-in argument" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(allocator);
+    const a = try trace.emit(allocator, .{ .op = .trace_arg });
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = a });
+
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    const raw = compile(&buf, &trace) orelse return error.CodegenFailed;
+    const fn_ptr: jit.LambdaCompiledFn = @ptrCast(@alignCast(raw));
+    const result = fn_ptr(undefined, undefined, Value.int(5));
+    try std.testing.expectEqual(@as(u64, 0), result.error_code);
+    try std.testing.expectEqual(@as(i64, 5), result.value.asInt());
+}
+
+test "codegen: a trace longer than MAX_INSTRS is rejected" {
+    if (!jit.code_enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var trace = ir.Trace.init(1, true);
+    defer trace.deinit(allocator);
+    var last: ir.Ref = try trace.emit(allocator, .{ .op = .trace_arg });
+    var i: usize = 0;
+    while (i < MAX_INSTRS + 1) : (i += 1) {
+        last = try trace.emit(allocator, .{ .op = .force, .a = last });
+    }
+    _ = try trace.emit(allocator, .{ .op = .ret, .a = last });
+
+    var buf = try CodeBuffer.init(1 << 20);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compile(&buf, &trace));
+}

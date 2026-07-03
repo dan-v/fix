@@ -1224,3 +1224,74 @@ test "JIT stub: get_upvalue_ret loads from upvalues and forces" {
     try std.testing.expectEqual(@as(u64, 0), result.error_code);
     try std.testing.expectEqual(true, result.value.asBool());
 }
+
+test "JIT stub: push_null/push_true/push_false round-trip a baked-in literal" {
+    if (!enabled) return error.SkipZigTest;
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+
+    inline for (.{
+        .{ OpCode.push_null, Value.null_val },
+        .{ OpCode.push_true, Value.boolVal(true) },
+        .{ OpCode.push_false, Value.boolVal(false) },
+    }) |case| {
+        var code = [_]u8{ @intFromEnum(case[0]), @intFromEnum(OpCode.ret), @intFromEnum(OpCode.halt) };
+        var constants = [_]Value{};
+        const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+        const fn_ptr = compile(&buf, &ch) orelse return error.JitCompileFailed;
+        const result = fn_ptr(undefined, undefined, 0);
+        try std.testing.expectEqual(@as(u64, 0), result.error_code);
+        try std.testing.expectEqual(case[1].kind(), result.value.kind());
+    }
+}
+
+test "JIT stub: get_upvalue_attr_ret loads an upvalue and looks up an attr" {
+    if (!enabled) return error.SkipZigTest;
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+
+    // get_upvalue_attr slot=1 name=7; ret; halt (7 bytes).
+    var code = [_]u8{
+        @intFromEnum(OpCode.get_upvalue_attr), 1, 0, 7, 0,
+        @intFromEnum(OpCode.ret),
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    const fn_ptr = compile(&buf, &ch) orelse return error.JitCompileFailed;
+    try std.testing.expectEqual(@as(u32, 1), compile_counts.get_upvalue_attr_ret);
+    _ = fn_ptr; // Exercising the call requires a live VM (jitGetAttr dereferences
+    // it); the shape match + emitted-function existence is what's tested here.
+}
+
+test "JIT compile: unsupported shape returns null and bumps the unsupported counter" {
+    if (!enabled) return error.SkipZigTest;
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+
+    const before = compile_counts.unsupported;
+    // add_int; ret; halt — not one of the recognized trivial shapes.
+    var code = [_]u8{
+        @intFromEnum(OpCode.add_int),
+        @intFromEnum(OpCode.ret),
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    try std.testing.expectEqual(@as(?CompiledFn, null), compile(&buf, &ch));
+    try std.testing.expectEqual(before + 1, compile_counts.unsupported);
+}
+
+test "JIT compileLambda: local_count != 1 is rejected" {
+    if (!enabled) return error.SkipZigTest;
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+
+    var code = [_]u8{
+        @intFromEnum(OpCode.get_local_ret), 0, 0,
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 2 };
+    try std.testing.expectEqual(@as(?LambdaCompiledFn, null), compileLambda(&buf, &ch));
+}

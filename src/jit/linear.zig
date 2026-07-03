@@ -386,3 +386,88 @@ fn forceArg(e: *Emitter) void {
     e.callHelper(@intFromPtr(&jit.jitForceValue));
     e.errCheckToEpilogue();
 }
+
+test "compileLinear: thunk body (local_count != 0) is rejected" {
+    if (!jit.enabled) return error.SkipZigTest;
+    var code = [_]u8{
+        @intFromEnum(OpCode.constant_ret), 0, 0,
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{Value.int(1)};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 1 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compileLinear(&buf, &ch, false));
+}
+
+test "compileLinear: empty code body is rejected" {
+    if (!jit.enabled) return error.SkipZigTest;
+    var code = [_]u8{};
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compileLinear(&buf, &ch, false));
+}
+
+test "compileLinear: an unsupported opcode is rejected" {
+    if (!jit.enabled) return error.SkipZigTest;
+    // add_int isn't in operandLen's supported set.
+    var code = [_]u8{
+        @intFromEnum(OpCode.add_int),
+        @intFromEnum(OpCode.ret),
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compileLinear(&buf, &ch, false));
+}
+
+test "compileLinear: a body with no terminating ret is rejected" {
+    if (!jit.enabled) return error.SkipZigTest;
+    var code = [_]u8{
+        @intFromEnum(OpCode.push_null),
+        @intFromEnum(OpCode.pop),
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compileLinear(&buf, &ch, false));
+}
+
+test "compileLinear: get_local on a non-lambda thunk body is rejected" {
+    if (!jit.enabled) return error.SkipZigTest;
+    // get_local reading a local is only valid in a lambda body (slot 0 = arg);
+    // a thunk body (is_lambda=false) has no locals at all.
+    var code = [_]u8{
+        @intFromEnum(OpCode.get_local_ret), 0,
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    try std.testing.expectEqual(@as(?*const anyopaque, null), compileLinear(&buf, &ch, false));
+}
+
+test "compileLinear: constant_ret thunk body compiles and executes" {
+    if (!jit.enabled) return error.SkipZigTest;
+    var code = [_]u8{
+        @intFromEnum(OpCode.constant_ret), 0, 0,
+        @intFromEnum(OpCode.halt),
+    };
+    var constants = [_]Value{Value.int(21)};
+    const ch: Chunk = .{ .code = &code, .constants = &constants, .local_count = 0 };
+    var buf = try CodeBuffer.init(4096);
+    defer buf.deinit();
+    const raw = compileLinear(&buf, &ch, false) orelse return error.CompileFailed;
+    const fn_ptr: jit.CompiledFn = @ptrCast(@alignCast(raw));
+    // constant_ret never touches vm/upvalues — safe with dummy args.
+    const result = fn_ptr(undefined, undefined, 0);
+    try std.testing.expectEqual(@as(u64, 0), result.error_code);
+    try std.testing.expectEqual(@as(i64, 21), result.value.asInt());
+}
