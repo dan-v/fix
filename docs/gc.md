@@ -1,6 +1,6 @@
 # GC
 
-*An experimental non-moving precise mark-sweep collector (`-Dgc`), off by default, zero-cost when off. STATUS: w=1 works and is byte-identical (~-16% RSS, ~81% of heap reclaimable) but serial-mark is a net-negative wall tax; w>1 STW infra is built but GATED OFF on a barrier handshake race. Experimental; interpreter canonical.*
+*An experimental non-moving precise mark-sweep collector (`-Dgc`), off by default, zero-cost when off. STATUS: w=1 works and is byte-identical (~-16% RSS, ~81% of heap reclaimable) but serial-mark is a net-negative wall tax; w>1 collection is CORRECT as of 2026-07-03 (the blocker was a speculative missing-root bug — NOT the barrier) but stays dormant-by-default pending a parallel/off-clock mark (serial STW is ~8–11× wall at w=32). Experimental; interpreter canonical.*
 
 **Zero-cost when off.** `-Dgc` is a comptime `build_options.gc` flag; every root-enumeration, safepoint, and bitmap path is guarded and compiles to nothing when disabled. Enabling it never changes output — the [interpreter](vm/dispatch.md) is canonical and evaluation is byte-identical with the collector on or off.
 
@@ -56,7 +56,7 @@ Every `ValueRange` / `AttrRange` (the backing store for lists and attrsets) has 
 | Mode | State |
 |------|-------|
 | w=1 | **Fully working, byte-identical.** ~0.2s per collection at deep fixpoint; ~5.6% mutator rooting tax. Measured ~81% of the heap reclaimable, ~-16% peak RSS (1208MB allocated vs 228MB live at w=1). |
-| w>1 | Full STW infra **built but dormant** — gated off on a barrier *back-to-back-collection handshake* race. NOT a roots bug (a full conservative stack scan did **not** fix it); needs a **generation-tagged barrier**. |
+| w>1 | **Correct but dormant-by-default.** The barrier was NOT the problem (mark-only — full STW barrier + mark, no reclaim — is byte-identical at w=32); the blocker was a **missing GC root**: the speculative `force_list_range` task held a raw `getList` slice across a force without rooting the list, so reclaim swept+reused it → dangling slice → corruption. Fixed 2026-07-03 (root the list, `worker.zig`); w=32 verified 60/60 byte-identical with collection forced on. Stays dormant-by-default because serial-STW mark is **~8–11× wall at w=32** (measured: 29 collections, 6.7s serial mark + ~6.7s all-cores-spinning STW convergence). Enable once the mark is parallel/off-clock. |
 
 **Net verdict on time:** serial mark is a wall tax. The RSS bound is real and valuable, but the ~0.2s/collection serial mark + ~5.6% tax makes it net-negative on *time* — mark must move **off the wall clock** (concurrent-on-idle or parallel STW) to pay. The live set plateaus while total allocation grows linearly, so the RSS win is genuine; the cost is the mark, not the sweep. Page-return via `madvise` recovers only ~32MB (scattered non-moving death) → dead; migrating range stores to mmap won't help RSS either.
 

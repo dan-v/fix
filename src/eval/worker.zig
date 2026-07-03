@@ -575,6 +575,16 @@ fn slotEntry(arg: *anyopaque) void {
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
         },
         .force_list_range => |range| {
+            // `items` is a RAW slice into the list's value range, held across
+            // `forceValueSpeculative` — which can drive a GC collection. We
+            // nulled `current_task` above, so nothing else roots this list; at
+            // --workers>1 a collection would sweep it, free+reuse its range,
+            // and the slice would dangle (garbage item -> bogus thunk ->
+            // corrupt waiter list -> SIGSEGV). Keep the list rooted for the
+            // duration. Zero cost without -Dgc.
+            const gc_roots = vm_force.rootsBegin(&f.vm);
+            defer vm_force.rootsEnd(&f.vm, gc_roots);
+            vm_force.rootKeep(&f.vm, Value.list(range.list_id));
             const items = f.vm.heap.getList(range.list_id) catch return;
             const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
             for (items[range.offset..end]) |item| {

@@ -143,11 +143,17 @@ swept via `errored_infos`) / `.blackhole` → nothing. `.unresolved`/`.evaluatin
 1. **Off-the-clock mark — the whole ballgame.** Serial STW mark is the wall cost.
    Two viable shapes (Phase-0 measured parallel mark tops out ~3.7× at ~8 threads,
    memory-bandwidth-bound):
-   - **Parallel-STW across idle workers.** Needs the w>1 stop-the-world barrier
-     (built but gated off — `ensureMainWorker`; the known bug is a back-to-back-
-     collection handshake race needing a generation-tagged barrier). Split
-     roots / work-steal the mark stack across the parked workers. Pause becomes
-     live-set-proportional and ~8× shorter.
+   - **Parallel-STW across idle workers.** The w>1 stop-the-world barrier is
+     CORRECT (2026-07-03: the earlier w>1 crash was NOT the barrier — mark-only
+     is byte-identical at w=32 — but a missing GC root in the speculative
+     `force_list_range` path; fixed in `worker.zig`). Collection is enabled only
+     at `worker_count==1` because serial-STW mark is ~8–11× wall at w=32 (29
+     collections: 6.7s serial mark + ~6.7s all-cores-spinning STW convergence —
+     the barrier busy-spins rather than futex-parks). Split roots / work-steal
+     the mark stack across the parked workers instead of spinning: pause becomes
+     live-set-proportional and ~8× shorter (Phase-0: parallel mark ~3.7× at ~8
+     threads, bandwidth-bound), and the idle cores do useful work instead of
+     burning CPU at the barrier.
    - **Concurrent mark on idle helpers (SATB).** Brief STW to snapshot roots +
      bump token, then mark on idle cores while demand proceeds, guarded by a
      gated write barrier on thunk-resolve + `merge_attrs.flattened` (+ cell
@@ -183,9 +189,11 @@ swept via `errored_infos`) / `.blackhole` → nothing. `.unresolved`/`.evaluatin
    executing closure/thunk in the frame (a temp-root at frame push) and reclaim.
    Modest extra RSS.
 
-6. **w>1 enablement.** Once (1)'s barrier is solid, turn on collection at
-   `--workers>1` (currently dormant — GC behaves as non-GC there). The per-worker
-   root marking, import-VM registry, and suspended-fiber coverage are built.
+6. **w>1 enablement.** The barrier + roots are correct (w=32 byte-identical,
+   2026-07-03); collection at `--workers>1` is dormant only because serial-STW
+   mark is ~8–11× wall there. Turn it on once (1) makes the mark parallel/
+   off-clock. The per-worker root marking, import-VM registry, and suspended-
+   fiber coverage are built and verified.
 
 ## Load-bearing invariants (don't break)
 
