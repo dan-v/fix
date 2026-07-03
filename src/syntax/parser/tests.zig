@@ -362,3 +362,221 @@ test "parser recovers across attrset entries" {
     try std.testing.expectEqualStrings("Expected attribute name.", parser.diagnostics.items[0].message);
     try std.testing.expectEqualStrings("Expected inherited variable name.", parser.diagnostics.items[1].message);
 }
+
+// ---- prefix.zig / infix.zig targeted coverage ----
+//
+// Note on string interpolation: the scanner (see scanner.zig "recognizes nested
+// strings in interpolation") flattens an entire interpolated string, including
+// nested `${...}` and nested string literals, into a single `.string` token
+// before the parser ever sees it. `prefix.stringLit` has exactly one code path
+// (capture the token span as an atom) regardless of whether the source text
+// contains interpolation. There is no separate prefix handler or branch for
+// the interpolated case, so a parser-level "interpolation as prefix position"
+// test would just re-exercise `stringLit` identically to a plain string test
+// already implied above — skipped as redundant per the task guardrail.
+
+test "parser disambiguates unary minus from binary minus" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "-1 - -2");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.sub, node.data.binary.op);
+
+    try std.testing.expectEqual(NodeTag.unary_op, node.data.binary.left.tag);
+    try std.testing.expectEqual(ast.UnaryOp.negate, node.data.binary.left.data.unary.op);
+    try std.testing.expectEqual(NodeTag.integer, node.data.binary.left.data.unary.expr.tag);
+
+    try std.testing.expectEqual(NodeTag.unary_op, node.data.binary.right.tag);
+    try std.testing.expectEqual(ast.UnaryOp.negate, node.data.binary.right.data.unary.op);
+    try std.testing.expectEqual(NodeTag.integer, node.data.binary.right.data.unary.expr.tag);
+}
+
+test "parser gives unary minus higher precedence than multiplication" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "-2 * 3");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.mul, node.data.binary.op);
+    try std.testing.expectEqual(NodeTag.unary_op, node.data.binary.left.tag);
+    try std.testing.expectEqual(ast.UnaryOp.negate, node.data.binary.left.data.unary.op);
+    try std.testing.expectEqual(NodeTag.integer, node.data.binary.right.tag);
+}
+
+test "parser gives boolean not higher precedence than and/or" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "!true && false || !false");
+    const node = try parser.parse();
+
+    // (!true && false) || (!false)
+    try std.testing.expectEqual(NodeTag.binary_op, node.tag);
+    try std.testing.expectEqual(ast.BinaryOp.or_, node.data.binary.op);
+
+    const lhs = node.data.binary.left;
+    try std.testing.expectEqual(NodeTag.binary_op, lhs.tag);
+    try std.testing.expectEqual(ast.BinaryOp.and_, lhs.data.binary.op);
+    try std.testing.expectEqual(NodeTag.unary_op, lhs.data.binary.left.tag);
+    try std.testing.expectEqual(ast.UnaryOp.not, lhs.data.binary.left.data.unary.op);
+
+    const rhs = node.data.binary.right;
+    try std.testing.expectEqual(NodeTag.unary_op, rhs.tag);
+    try std.testing.expectEqual(ast.UnaryOp.not, rhs.data.unary.op);
+}
+
+test "parser combines boolean not with trailing has-attr operator" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "!x ? y");
+    const node = try parser.parse();
+
+    // `!` binds the has-attr test itself: not (x ? y)
+    try std.testing.expectEqual(NodeTag.unary_op, node.tag);
+    try std.testing.expectEqual(ast.UnaryOp.not, node.data.unary.op);
+    try std.testing.expectEqual(NodeTag.has_attr, node.data.unary.expr.tag);
+    try std.testing.expectEqual(@as(usize, 1), node.data.unary.expr.data.has_attr.segments.len);
+}
+
+test "parser parses with as a prefix keyword" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "with { x = 1; }; x");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.with_expr, node.tag);
+    try std.testing.expectEqual(NodeTag.attr_set, node.data.with_expr.attr_set.tag);
+    try std.testing.expectEqual(NodeTag.identifier, node.data.with_expr.body.tag);
+}
+
+test "parser parses assert as a prefix keyword" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "assert true; 1");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.assert, node.tag);
+    try std.testing.expectEqual(NodeTag.bool_true, node.data.assert.cond.tag);
+    try std.testing.expectEqual(NodeTag.integer, node.data.assert.body.tag);
+}
+
+test "parser parses rec as a prefix keyword producing a recursive attrset" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "rec { a = 1; b = a; }");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    try std.testing.expect(node.data.attr_set.recursive);
+    try std.testing.expectEqual(@as(usize, 2), node.data.attr_set.entries.len);
+}
+
+test "parser parses let as a prefix keyword with multiple bindings" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "let a = 1; b = 2; in a + b");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.let_in, node.tag);
+    try std.testing.expectEqual(@as(usize, 2), node.data.let_in.bindings.len);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.let_in.body.tag);
+}
+
+test "parser parses deeply nested parenthesization" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "((((((((((1))))))))))");
+    const node = try parser.parse();
+
+    var current = node;
+    var depth: usize = 0;
+    while (current.tag == .parens) : (depth += 1) {
+        current = current.data.parens;
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), depth);
+    try std.testing.expectEqual(NodeTag.integer, current.tag);
+}
+
+test "parser attaches or-default to attribute path produced by function application" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "f a.b or c");
+    const node = try parser.parse();
+
+    // `f (a.b or c)` — the `or` default rewraps the apply's argument.
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(NodeTag.identifier, node.data.apply.func.tag);
+    try std.testing.expectEqual(NodeTag.attr_or, node.data.apply.arg.tag);
+    try std.testing.expectEqual(NodeTag.attr_path, node.data.apply.arg.data.attr_or.attr_path.tag);
+    try std.testing.expectEqual(NodeTag.identifier, node.data.apply.arg.data.attr_or.default.tag);
+}
+
+test "parser rejects or-default on a non-attribute-path expression" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "1 or 2");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings("'or' default requires an attribute path.", parser.diagnostics.items[0].message);
+}
+
+test "parser reports missing binding name in attrset lambda pattern" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ x }@: x");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "Expected function argument binding name.",
+        parser.diagnostics.items[0].message,
+    );
+}
+
+test "parser reports missing inherit source variable name" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "{ inherit (src); }");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "Expected inherited variable name.",
+        parser.diagnostics.items[0].message,
+    );
+}
+
+test "parser reports missing variable name in let inherit" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "let inherit; in 1");
+    defer parser.deinit();
+
+    try std.testing.expectError(error.ParseError, parser.parse());
+    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "Expected inherited variable name.",
+        parser.diagnostics.items[0].message,
+    );
+}
