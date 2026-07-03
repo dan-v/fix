@@ -245,6 +245,35 @@ test "evaluate JSON builtins" {
     try std.testing.expectEqualStrings("\"dev,out\"", json_preserves_string_context);
 }
 
+test "toJSON rejects function values" {
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.toJSON (x: x)"));
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.toJSON { f = x: x; }"));
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.toJSON [ (x: x) ]"));
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.toJSON builtins.head"));
+}
+
+test "toJSON rejects self-referencing structures" {
+    try std.testing.expectError(
+        error.RecursiveThunk,
+        renderForTest("builtins.toJSON (let x = { a = x; }; in x)"),
+    );
+    try std.testing.expectError(
+        error.RecursiveThunk,
+        renderForTest("builtins.toJSON (let x = [ x ]; in x)"),
+    );
+    // Distinct branches referencing the same shared substructure are fine
+    // (not a cycle) — only an object appearing in its own ancestry errors.
+    const shared_not_cyclic = try renderForTest(
+        \\let shared = { v = 1; }; in builtins.toJSON { a = shared; b = shared; }
+    );
+    defer std.testing.allocator.free(shared_not_cyclic);
+    try std.testing.expectEqualStrings("\"{\\\"a\\\":{\\\"v\\\":1},\\\"b\\\":{\\\"v\\\":1}}\"", shared_not_cyclic);
+}
+
+test "fromJSON rejects malformed input" {
+    try std.testing.expectError(error.SyntaxError, renderForTest("builtins.fromJSON \"{ not json\""));
+}
+
 test "evaluate XML builtin" {
     const xml = try renderForTest("builtins.toXML { b = [ true \"x\" null ]; a = 1; }");
     defer std.testing.allocator.free(xml);

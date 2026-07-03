@@ -415,3 +415,108 @@ test "evaluate minimal derivation builtins" {
     defer std.testing.allocator.free(preserved_args);
     try std.testing.expectEqualStrings("1", preserved_args);
 }
+
+test "derivation builtin rejects missing required attrs" {
+    try std.testing.expectError(
+        error.MissingAttribute,
+        renderForTest("(builtins.derivation { system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.MissingAttribute,
+        renderForTest("(builtins.derivation { name = \"pkg\"; builder = \"/bin/sh\"; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.MissingAttribute,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; }).outPath"),
+    );
+}
+
+test "derivation builtin rejects wrong-typed required attrs" {
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = 1; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = { }; builder = \"/bin/sh\"; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = { }; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("builtins.derivation \"not-an-attrset\""),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; args = \"not-a-list\"; }).outPath"),
+    );
+}
+
+test "derivation builtin rejects invalid outputs list" {
+    try std.testing.expectError(
+        error.InvalidDerivationOutput,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ ]; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.InvalidDerivationOutput,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ \"\" ]; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = [ 1 ]; }).outPath"),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest("(builtins.derivation { name = \"pkg\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; outputs = \"out\"; }).outPath"),
+    );
+}
+
+test "derivation builtin rejects invalid hash mode and multi-output fixed hash" {
+    try std.testing.expectError(
+        error.InvalidHashMode,
+        renderForTest(
+            \\(builtins.derivation {
+            \\  name = "src";
+            \\  system = "x86_64-linux";
+            \\  builder = "/bin/sh";
+            \\  outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            \\  outputHashAlgo = "sha256";
+            \\  outputHashMode = "bogus";
+            \\}).outPath
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidDerivationOutput,
+        renderForTest(
+            \\(builtins.derivation {
+            \\  name = "src";
+            \\  system = "x86_64-linux";
+            \\  builder = "/bin/sh";
+            \\  outputs = [ "out" "dev" ];
+            \\  outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            \\  outputHashAlgo = "sha256";
+            \\  outputHashMode = "flat";
+            \\}).outPath
+        ),
+    );
+    try std.testing.expectError(
+        error.TypeError,
+        renderForTest(
+            \\(builtins.derivation {
+            \\  name = "src";
+            \\  system = "x86_64-linux";
+            \\  builder = "/bin/sh";
+            \\  outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            \\  outputHashAlgo = "sha256";
+            \\  outputHashMode = [ "flat" ];
+            \\}).outPath
+        ),
+    );
+}
+
+test "derivationStrict rejects non-attrset argument" {
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.derivationStrict 1"));
+    try std.testing.expectError(error.TypeError, renderForTest("builtins.derivationStrict [ ]"));
+}
