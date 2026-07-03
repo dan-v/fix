@@ -50,6 +50,7 @@ const thunk_mod = @import("runtime").thunk;
 const trace_probe = @import("probe/trace_probe.zig");
 const drv_probe = @import("probe/drv_probe.zig");
 const ngram_probe = @import("probe/ngram_probe.zig");
+const depth0_probe = @import("probe/depth0_probe.zig");
 const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
 const tjit_record = @import("jit/record.zig");
@@ -230,6 +231,7 @@ pub const Evaluator = struct {
         }
         drv_probe.report();
         ngram_probe.report();
+        depth0_probe.report();
         if (comptime tjit_hot.enabled) self.reportHotAnchors();
         if (comptime tjit_exec.enabled) tjit_exec.report();
         if (comptime tjit_record.enabled) tjit_record.report();
@@ -557,8 +559,8 @@ pub const Evaluator = struct {
         // top-level import still collects (depth 0), while an import nested
         // inside another builtin stays gated (that builtin's depth). This is
         // what keeps builtins correct-by-default. See vm/force.zig.
-        if (comptime gc.enabled) vm_force.native_depth -= 1;
-        defer if (comptime gc.enabled) {
+        if (comptime gc.enabled or depth0_probe.enabled) vm_force.native_depth -= 1;
+        defer if (comptime gc.enabled or depth0_probe.enabled) {
             vm_force.native_depth += 1;
         };
         return vm.eval(chunk_id);

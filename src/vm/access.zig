@@ -39,8 +39,8 @@ pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     // — builtins need no GC-rooting of their own (correct-by-default). The
     // one exception, `import`/`scopedImport`, drops back to the caller's
     // depth for the imported eval (see `Evaluator.evaluateSource`).
-    if (comptime build_options.gc) force.native_depth += 1;
-    defer if (comptime build_options.gc) {
+    if (comptime build_options.gc or build_options.depth0_probe) force.native_depth += 1;
+    defer if (comptime build_options.gc or build_options.depth0_probe) {
         force.native_depth -= 1;
     };
     return vm_builtins.applyBuiltin(self, builtin_id, args);

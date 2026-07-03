@@ -17,6 +17,7 @@ const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("../probe/prof.zig");
 const prof_path = @import("../probe/prof_path.zig");
 const trace_probe = @import("../probe/trace_probe.zig");
+const depth0_probe = @import("../probe/depth0_probe.zig");
 const tjit_exec = @import("../jit/exec.zig");
 const tjit_record = @import("../jit/record.zig");
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
@@ -373,6 +374,10 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 pub threadlocal var native_depth: u32 = 0;
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
+    // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
+    // safepoint by native_depth + allocation cursor. Independent of -Dgc.
+    if (comptime build_options.depth0_probe)
+        depth0_probe.onForceThunk(native_depth, self.heap.totalReservedBytes());
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
