@@ -235,3 +235,34 @@ fn nixBase32Value(char: u8) ?u8 {
     const alphabet = "0123456789abcdfghijklmnpqrsvwxyz";
     return @intCast(std.mem.indexOfScalar(u8, alphabet, char) orelse return null);
 }
+
+test "nixBase32 round-trips through nixBase32Decode" {
+    const original = [_]u8{
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        0x00, 0xff, 0x7f, 0x80,
+    };
+    const encoded = nixBase32(original);
+    try std.testing.expectEqual(@as(usize, 32), encoded.len);
+    for (encoded) |char| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, "0123456789abcdfghijklmnpqrsvwxyz", char) != null);
+    }
+
+    const decoded = try nixBase32Decode(std.testing.allocator, &encoded);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &original, decoded);
+}
+
+test "nixBase32 all-zero input encodes to all-zero alphabet symbol" {
+    const zero = [_]u8{0} ** 20;
+    const encoded = nixBase32(zero);
+    for (encoded) |char| try std.testing.expectEqual(@as(u8, '0'), char);
+
+    const decoded = try nixBase32Decode(std.testing.allocator, &encoded);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, &zero, decoded);
+}
+
+test "nixBase32Decode rejects characters outside the alphabet" {
+    try std.testing.expectError(error.InvalidHash, nixBase32Decode(std.testing.allocator, "0000000000000000000000000000e1"));
+}
