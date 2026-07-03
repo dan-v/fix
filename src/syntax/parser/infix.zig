@@ -36,6 +36,33 @@ pub fn binary(self: *Parser, left: *Node) !*Node {
     return self.makeBinary(op, left, right);
 }
 
+/// `x |> f` == `f x`. Left-associative: the right operand binds tighter
+/// than the pipe level, so `a |> b |> c` folds as `(a |> b) |> c`. The
+/// desugared apply stores operands in evaluation order (func, arg) tagged
+/// `.forward` so it can be printed back as `arg |> func`.
+pub fn pipeForward(self: *Parser, left: *Node) !*Node {
+    self.notePipe();
+    const right = try self.parsePrecedence(@enumFromInt(@intFromEnum(Precedence.pipe) + 1));
+    return self.arena.createNode(.apply, .{ .apply = .{
+        .func = right,
+        .arg = left,
+        .pipe = .forward,
+    } });
+}
+
+/// `f <| x` == `f x`. Right-associative: the right operand parses at the
+/// same level, so `a <| b <| c` folds as `a <| (b <| c)`. Tagged
+/// `.backward` so it prints back as `func <| arg`.
+pub fn pipeBackward(self: *Parser, left: *Node) !*Node {
+    self.notePipe();
+    const right = try self.parsePrecedence(Precedence.pipe);
+    return self.arena.createNode(.apply, .{ .apply = .{
+        .func = left,
+        .arg = right,
+        .pipe = .backward,
+    } });
+}
+
 pub fn dotAccess(self: *Parser, left: *Node) !*Node {
     // `expr.attr` or `expr."string"` or `expr.${...}`
     const arena_allocator = self.arena.allocator();

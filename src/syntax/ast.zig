@@ -62,6 +62,21 @@ pub const UnaryOp = enum(u8) {
     negate,
 };
 
+/// Surface provenance of an `apply` node. A pipe operator is pure sugar
+/// for function application, so `|>`/`<|` lower to ordinary `apply` nodes
+/// (reusing all of compile/strictness/eval) and record which surface form
+/// produced them, purely so the tree can be printed back faithfully. The
+/// operands are always stored in evaluation order (func, arg) — the tag
+/// says how to re-spell them:
+///   .none     → `func arg`
+///   .forward  → `arg |> func`   (from `x |> f`, arg=x func=f)
+///   .backward → `func <| arg`   (from `f <| x`, func=f arg=x)
+pub const PipeSugar = enum(u8) {
+    none,
+    forward,
+    backward,
+};
+
 /// All AST nodes use this struct. The `data` union holds type-specific fields.
 /// Pointers inside `data` point to other Node structs within the same arena.
 pub const Node = struct {
@@ -112,6 +127,9 @@ pub const Node = struct {
     pub const Apply = struct {
         func: *Node,
         arg: *Node,
+        /// Surface form this application was written as; `.none` for a
+        /// plain `func arg`. See `PipeSugar`.
+        pipe: PipeSugar = .none,
     };
 
     pub const Lambda = struct {
@@ -370,6 +388,7 @@ pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
         .apply => arena.createNode(.apply, .{ .apply = .{
             .func = try cloneNode(arena, node.data.apply.func),
             .arg = try cloneNode(arena, node.data.apply.arg),
+            .pipe = node.data.apply.pipe,
         } }),
         .lambda => arena.createNode(.lambda, .{ .lambda = .{
             .param_offset = node.data.lambda.param_offset,

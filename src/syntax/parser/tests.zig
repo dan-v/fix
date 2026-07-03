@@ -47,6 +47,136 @@ test "parser gives implication lower precedence than boolean or" {
     try std.testing.expectEqual(NodeTag.bool_false, node.data.binary.right.tag);
 }
 
+test "parser desugars |> to a forward-tagged application" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "x |> f");
+    const node = try parser.parse();
+
+    // `x |> f` == `f x`: func is the right operand, arg the left.
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, node.data.apply.pipe);
+    try std.testing.expectEqual(NodeTag.identifier, node.data.apply.func.tag);
+    try std.testing.expectEqualStrings("f", parser.source[node.data.apply.func.data.atom.offset..][0..node.data.apply.func.data.atom.len]);
+    try std.testing.expectEqualStrings("x", parser.source[node.data.apply.arg.data.atom.offset..][0..node.data.apply.arg.data.atom.len]);
+    try std.testing.expect(parser.used_pipe_operators);
+    try std.testing.expect(parser.first_pipe_token != null);
+}
+
+test "parser desugars <| to a backward-tagged application" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "f <| x");
+    const node = try parser.parse();
+
+    // `f <| x` == `f x`: func is the left operand, arg the right.
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.backward, node.data.apply.pipe);
+    try std.testing.expectEqualStrings("f", parser.source[node.data.apply.func.data.atom.offset..][0..node.data.apply.func.data.atom.len]);
+    try std.testing.expectEqualStrings("x", parser.source[node.data.apply.arg.data.atom.offset..][0..node.data.apply.arg.data.atom.len]);
+    try std.testing.expect(parser.used_pipe_operators);
+}
+
+test "parser treats |> as left associative" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // a |> b |> c  ==  c (b a)  ==  apply(func=c, arg=apply(func=b, arg=a))
+    var parser = Parser.init(std.testing.allocator, &arena, "a |> b |> c");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, node.data.apply.pipe);
+    try std.testing.expectEqualStrings("c", parser.source[node.data.apply.func.data.atom.offset..][0..node.data.apply.func.data.atom.len]);
+    // The outer application's argument is the inner `a |> b`.
+    const inner = node.data.apply.arg;
+    try std.testing.expectEqual(NodeTag.apply, inner.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, inner.data.apply.pipe);
+    try std.testing.expectEqualStrings("b", parser.source[inner.data.apply.func.data.atom.offset..][0..inner.data.apply.func.data.atom.len]);
+    try std.testing.expectEqualStrings("a", parser.source[inner.data.apply.arg.data.atom.offset..][0..inner.data.apply.arg.data.atom.len]);
+}
+
+test "parser treats <| as right associative" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // a <| b <| c  ==  a (b c)  ==  apply(func=a, arg=apply(func=b, arg=c))
+    var parser = Parser.init(std.testing.allocator, &arena, "a <| b <| c");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.backward, node.data.apply.pipe);
+    try std.testing.expectEqualStrings("a", parser.source[node.data.apply.func.data.atom.offset..][0..node.data.apply.func.data.atom.len]);
+    const inner = node.data.apply.arg;
+    try std.testing.expectEqual(NodeTag.apply, inner.tag);
+    try std.testing.expectEqual(ast.PipeSugar.backward, inner.data.apply.pipe);
+    try std.testing.expectEqualStrings("b", parser.source[inner.data.apply.func.data.atom.offset..][0..inner.data.apply.func.data.atom.len]);
+    try std.testing.expectEqualStrings("c", parser.source[inner.data.apply.arg.data.atom.offset..][0..inner.data.apply.arg.data.atom.len]);
+}
+
+test "parser gives |> lower precedence than ->" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // a -> b |> c  ==  (a -> b) |> c : the arg is the whole implication.
+    var parser = Parser.init(std.testing.allocator, &arena, "a -> b |> c");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, node.data.apply.pipe);
+    try std.testing.expectEqual(NodeTag.binary_op, node.data.apply.arg.tag);
+    try std.testing.expectEqual(ast.BinaryOp.impl, node.data.apply.arg.data.binary.op);
+}
+
+test "parser gives function application higher precedence than |>" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // f x |> g  ==  g (f x) : the arg is the plain application `f x`.
+    var parser = Parser.init(std.testing.allocator, &arena, "f x |> g");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.apply, node.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, node.data.apply.pipe);
+    const arg = node.data.apply.arg;
+    try std.testing.expectEqual(NodeTag.apply, arg.tag);
+    try std.testing.expectEqual(ast.PipeSugar.none, arg.data.apply.pipe);
+}
+
+test "parser keeps a parenthesized pipe as a single list item" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "[ (1 |> f) ]");
+    const node = try parser.parse();
+
+    try std.testing.expectEqual(NodeTag.list, node.tag);
+    try std.testing.expectEqual(@as(usize, 1), node.data.list.items.len);
+}
+
+test "parser rejects a bare pipe operator inside a list" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "[ 1 |> f ]");
+    defer parser.deinit(); // error path records a diagnostic; free it
+    try std.testing.expectError(error.ParseError, parser.parse());
+}
+
+test "cloneNode preserves pipe provenance" {
+    var arena = ast.AstArena.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(std.testing.allocator, &arena, "x |> f");
+    const node = try parser.parse();
+    const copy = try ast.cloneNode(&arena, node);
+
+    try std.testing.expectEqual(NodeTag.apply, copy.tag);
+    try std.testing.expectEqual(ast.PipeSugar.forward, copy.data.apply.pipe);
+}
+
 test "parser recognizes identifier lambda" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();

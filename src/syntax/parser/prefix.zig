@@ -38,6 +38,8 @@ fn isDisallowedListItemContinuation(tt: TokenType) bool {
         .greater_equal,
         .amp_amp,
         .pipe_pipe,
+        .pipe_forward,
+        .pipe_backward,
         .double_slash,
         .double_plus,
         .arrow,

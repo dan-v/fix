@@ -60,6 +60,13 @@ pub const Parser = struct {
     previous: Token,
     had_error: bool,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
+    /// Whether any `|>`/`<|` pipe operator was parsed. The operators always
+    /// parse (into ordinary tagged `apply` nodes); enforcement that the
+    /// `pipe-operators` feature is enabled happens at the compile chokepoint
+    /// (`Evaluator.parseAndCompile`), which reads this flag.
+    used_pipe_operators: bool,
+    /// The first pipe operator token seen, for a precise "disabled" diagnostic.
+    first_pipe_token: ?Token,
 
     pub fn init(allocator: std.mem.Allocator, arena: *ast.AstArena, source: []const u8) Parser {
         return .{
@@ -71,6 +78,8 @@ pub const Parser = struct {
             .previous = undefined,
             .had_error = false,
             .diagnostics = .empty,
+            .used_pipe_operators = false,
+            .first_pipe_token = null,
         };
     }
 
@@ -136,6 +145,17 @@ pub const Parser = struct {
         return self.source[tok.offset .. tok.offset + tok.len];
     }
 
+    /// Record that a pipe operator was parsed, capturing the first one's
+    /// token (the current `previous`, i.e. the operator just consumed) for
+    /// the compile-time "pipe operators are disabled" diagnostic. Parsing
+    /// itself never depends on the feature flag.
+    pub fn notePipe(self: *Parser) void {
+        if (!self.used_pipe_operators) {
+            self.used_pipe_operators = true;
+            self.first_pipe_token = self.previous;
+        }
+    }
+
     // ---- precedence ----
 
     pub fn rule(tt: TokenType) Rule {
@@ -170,6 +190,8 @@ pub const Parser = struct {
             .greater_equal => return .{ .prefix = null, .infix = infix.binary, .prec = .cmp },
             .amp_amp => return .{ .prefix = null, .infix = infix.binary, .prec = .and_ },
             .pipe_pipe => return .{ .prefix = null, .infix = infix.binary, .prec = .or_ },
+            .pipe_forward => return .{ .prefix = null, .infix = infix.pipeForward, .prec = .pipe },
+            .pipe_backward => return .{ .prefix = null, .infix = infix.pipeBackward, .prec = .pipe },
             .kw_or => return .{ .prefix = null, .infix = infix.attrOr, .prec = .primary },
             .double_slash => return .{ .prefix = null, .infix = infix.binary, .prec = .update },
             .double_plus => return .{ .prefix = null, .infix = infix.binary, .prec = .concat },
