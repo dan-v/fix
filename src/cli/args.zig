@@ -13,6 +13,7 @@ pub const usage =
     \\  --json                 write the evaluated value as JSON
     \\  --xml                  write the evaluated value as XML
     \\  --strict               recursively force attr values and list items before writing
+    \\  --pipe-operators       enable the |> and <| pipe operators (experimental)
     \\  --debug-derivations[=MODE]
     \\                         write derivation debug records to stderr: summary, full
     \\  --debug-derivation-filter TEXT
@@ -49,6 +50,7 @@ pub const SourceArg = union(enum) {
 pub const Options = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
+    pipe_operators: bool = false,
     color: cli.When = .auto,
     progress: cli.When = .auto,
     show_trace: bool = false,
@@ -96,6 +98,8 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.output = .xml;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             options.strict = true;
+        } else if (std.mem.eql(u8, arg, "--pipe-operators")) {
+            options.pipe_operators = true;
         } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
             options.derivation_debug.mode = .summary;
         } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {

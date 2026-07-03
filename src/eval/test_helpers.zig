@@ -29,6 +29,20 @@ pub fn renderStrictForTest(source: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+pub fn renderWithPipeOperators(source: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.pipe_operators_enabled = true;
+
+    const result = try ev.evaluate(source);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
 pub fn renderForTestFromCurrentPath(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

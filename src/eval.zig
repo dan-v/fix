@@ -77,6 +77,11 @@ pub const Evaluator = struct {
     /// Propagated to every VM via `initVm`; gates `make_lazy_shell`.
     /// Default false — the CLI sets it true only for `--xml`.
     lazy_shells_visible: bool = false,
+    /// Whether the `|>`/`<|` pipe operators are permitted. They always
+    /// parse; when this is false, `parseAndCompile` rejects any source that
+    /// used one (matching Nix, which gates the feature on presence). The CLI
+    /// sets it true for `--pipe-operators`. Default false.
+    pipe_operators_enabled: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -367,6 +372,26 @@ pub const Evaluator = struct {
                 return error.ParseError;
             };
         };
+
+        // Compile-time feature gate. Pipe operators always parse (into tagged
+        // apply nodes); enabling them is required to compile. Like Nix, we
+        // reject on *presence* — the parser records whether any `|>`/`<|`
+        // was seen, so a pipe anywhere in the file (even an unused/deferred
+        // attr body) fails here, before any compilation runs.
+        if (parser.used_pipe_operators and !self.pipe_operators_enabled) {
+            const tok = parser.first_pipe_token.?;
+            try self.copyDiagnostics(&.{.{
+                .severity = .err,
+                .kind = .compile,
+                .line = tok.line,
+                .column = diagnostic.columnForOffset(source, tok.offset),
+                .offset = tok.offset,
+                .len = tok.len,
+                .token_type = tok.type,
+                .message = "pipe operators are disabled; pass --pipe-operators to enable them",
+            }}, source, source_path);
+            return error.PipeOperatorsDisabled;
+        }
 
         // Per-compilation-unit scratch arena: all of the compiler's
         // transient structures (builder buffers, locals/captures, strictness
