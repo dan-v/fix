@@ -971,3 +971,132 @@ test "scheduler helpers run their loop and shut down cleanly" {
 
     // shutdown via deinit join
 }
+
+test "ReadyNode.queued CAS guard makes a second enqueue a no-op" {
+    // Regression coverage for the double-resume race: multiple racing
+    // wakers (or a waker racing a runner-tail path) may call
+    // `enqueueReady` for the same node. Only the first should land the
+    // node on the queue; the rest must be dropped so the same fiber is
+    // never resumable from two places at once.
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    var node: ReadyNode = .{};
+    sched.enqueueReady(1, &node);
+    try std.testing.expectEqual(@as(u8, 1), node.queued.load(.monotonic));
+
+    // A second enqueue for the still-queued node must not push it again
+    // (which would corrupt the singly-linked `next` pointer and/or hand
+    // the same node to two poppers).
+    sched.enqueueReady(1, &node);
+
+    const first = sched.popReady(1);
+    try std.testing.expectEqual(@as(?*ReadyNode, &node), first);
+    // Queue is empty — proof there was only ever one entry.
+    try std.testing.expectEqual(@as(?*ReadyNode, null), sched.popReady(1));
+}
+
+test "popReady resets queued so the node can be re-enqueued later" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    var node: ReadyNode = .{};
+    sched.enqueueReady(1, &node);
+    _ = sched.popReady(1);
+    try std.testing.expectEqual(@as(u8, 0), node.queued.load(.monotonic));
+
+    // Now that it's off-queue, a fresh enqueue must succeed again.
+    sched.enqueueReady(1, &node);
+    try std.testing.expectEqual(@as(u8, 1), node.queued.load(.monotonic));
+    try std.testing.expectEqual(@as(?*ReadyNode, &node), sched.popReady(1));
+}
+
+test "ready queue is FIFO" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    var a: ReadyNode = .{};
+    var b: ReadyNode = .{};
+    var c: ReadyNode = .{};
+    sched.enqueueReady(1, &a);
+    sched.enqueueReady(1, &b);
+    sched.enqueueReady(1, &c);
+
+    try std.testing.expectEqual(@as(?*ReadyNode, &a), sched.popReady(1));
+    try std.testing.expectEqual(@as(?*ReadyNode, &b), sched.popReady(1));
+    try std.testing.expectEqual(@as(?*ReadyNode, &c), sched.popReady(1));
+    try std.testing.expectEqual(@as(?*ReadyNode, null), sched.popReady(1));
+}
+
+test "stealReady finds a ready fiber on another worker's queue" {
+    var sched = try Scheduler.init(std.testing.allocator, 3);
+    defer sched.deinit();
+
+    var node: ReadyNode = .{};
+    sched.enqueueReady(2, &node);
+
+    // Worker 1 has no ready work of its own but can steal worker 2's.
+    try std.testing.expectEqual(@as(?*ReadyNode, null), sched.popReady(1));
+    const stolen = sched.stealReady(1);
+    try std.testing.expectEqual(@as(?*ReadyNode, &node), stolen);
+
+    // Gone now — nothing left to steal.
+    try std.testing.expectEqual(@as(?*ReadyNode, null), sched.stealReady(1));
+}
+
+test "stealReady never returns the caller's own queue" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    var node: ReadyNode = .{};
+    sched.enqueueReady(0, &node);
+
+    // Only worker 0 has ready work, and worker 0 is asking — must not
+    // steal from itself.
+    try std.testing.expectEqual(@as(?*ReadyNode, null), sched.stealReady(0));
+
+    // A worker that isn't 0 can still steal it.
+    try std.testing.expectEqual(@as(?*ReadyNode, &node), sched.stealReady(1));
+}
+
+test "pop drains urgent tasks before speculative ones" {
+    // Documented priority: "Pop a task from `worker_id`'s own queues —
+    // urgent first, then speculative." Fan-out (demand-driven) work must
+    // not sit behind a queued speculation backlog.
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    try std.testing.expect(sched.submit(.{ .force_thunk = 1 }, 1));
+    try std.testing.expect(sched.submitUrgent(.{ .force_thunk = 2 }, 1));
+
+    const first = sched.pop(1).?;
+    try std.testing.expectEqual(@as(types.ObjectId, 2), first.force_thunk);
+    const second = sched.pop(1).?;
+    try std.testing.expectEqual(@as(types.ObjectId, 1), second.force_thunk);
+    try std.testing.expectEqual(@as(?Task, null), sched.pop(1));
+}
+
+test "parkWorker returns immediately when already woken" {
+    // Single-threaded regression for the lost-wakeup guard: if a wake
+    // arrives (word set to 1) before the worker parks, `parkWorker` must
+    // observe it and return without blocking on the futex syscall.
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    sched.wakeWorkerPublic(1);
+    try std.testing.expectEqual(@as(u32, 1), sched.wake_words[1].load(.monotonic));
+
+    // Must return promptly (no real wait to service) and drain the word.
+    sched.parkWorker(1);
+    try std.testing.expectEqual(@as(u32, 0), sched.wake_words[1].load(.monotonic));
+}
+
+test "parkWorker returns immediately once shutdown is flagged" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    sched.shutdown_flag.store(true, .release);
+    // No wake pending and shutdown is set — parkWorker must not block
+    // waiting for a wake that will never come.
+    sched.parkWorker(1);
+}

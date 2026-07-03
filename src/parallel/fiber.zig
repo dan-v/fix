@@ -470,3 +470,65 @@ test "nested fiber call" {
     try testing.expectEqual(State.finished, inner.state);
     try testing.expectEqual(State.finished, outer.state);
 }
+
+test "reset recycles a finished fiber's stack for a fresh entry" {
+    // Worker.zig relies on `reset` to reuse a `.finished` fiber's stack
+    // buffer for a new task rather than allocating a new one. Verify the
+    // recycled fiber runs the new entry/arg from a clean `.ready` state
+    // and reaches `.finished` again on its own stack.
+    const CtxA = struct {
+        ran: bool = false,
+        fn entry(arg: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(arg));
+            ctx.ran = true;
+            Fiber.yield();
+        }
+    };
+    const CtxB = struct {
+        ran: bool = false,
+        fn entry(arg: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(arg));
+            ctx.ran = true;
+        }
+    };
+
+    var ctx_a: CtxA = .{};
+    var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, CtxA.entry, &ctx_a);
+    defer fiber.deinit(testing.allocator);
+
+    // Drive it to completion (one yield, then falls off the end).
+    fiber.resume_();
+    try testing.expect(ctx_a.ran);
+    try testing.expectEqual(State.suspended, fiber.state);
+    fiber.resume_();
+    try testing.expectEqual(State.finished, fiber.state);
+
+    var ctx_b: CtxB = .{};
+    fiber.reset(CtxB.entry, &ctx_b);
+    try testing.expectEqual(State.ready, fiber.state);
+
+    fiber.resume_();
+    try testing.expect(ctx_b.ran);
+    try testing.expectEqual(State.finished, fiber.state);
+}
+
+test "reset is valid from the .ready state (never-resumed fiber)" {
+    const Ctx = struct {
+        calls: u32 = 0,
+        fn entry(arg: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(arg));
+            ctx.calls += 1;
+        }
+    };
+    var ctx: Ctx = .{};
+    var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx);
+    defer fiber.deinit(testing.allocator);
+
+    try testing.expectEqual(State.ready, fiber.state);
+    fiber.reset(Ctx.entry, &ctx);
+    try testing.expectEqual(State.ready, fiber.state);
+
+    fiber.resume_();
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try testing.expectEqual(State.finished, fiber.state);
+}
