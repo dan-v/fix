@@ -78,6 +78,7 @@ pub const Scanner = struct {
             },
             '<' => {
                 if (self.match('=')) return self.makeToken(.less_equal, start, 2);
+                if (self.match('|')) return self.makeToken(.pipe_backward, start, 2);
                 if (isSearchPathStart(self.peek())) return self.lexSearchPath(start);
                 return self.makeToken(.less, start, 1);
             },
@@ -96,6 +97,7 @@ pub const Scanner = struct {
             },
             '|' => {
                 if (self.match('|')) return self.makeToken(.pipe_pipe, start, 2);
+                if (self.match('>')) return self.makeToken(.pipe_forward, start, 2);
                 return self.makeToken(.error_token, start, 1);
             },
             else => return self.makeToken(.error_token, start, 1),
@@ -307,6 +309,34 @@ test "scanner recognizes boolean operator tokens" {
     try std.testing.expectEqual(TokenType.left_bracket, scanner.next().type);
     try std.testing.expectEqual(TokenType.right_bracket, scanner.next().type);
     try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner recognizes pipe operator tokens" {
+    var scanner = Scanner.init("a |> b <| c");
+
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.pipe_forward, scanner.next().type);
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.pipe_backward, scanner.next().type);
+    try std.testing.expectEqual(TokenType.identifier, scanner.next().type);
+    try std.testing.expectEqual(TokenType.eof, scanner.next().type);
+}
+
+test "scanner keeps single '<' and '|' behaviour intact" {
+    // Regression guard: `<` still comparison, `<nixpkgs>` still a search path,
+    // `||` still logical-or — none of these should be swallowed by `<|`/`|>`.
+    var lt = Scanner.init("a < b");
+    try std.testing.expectEqual(TokenType.identifier, lt.next().type);
+    try std.testing.expectEqual(TokenType.less, lt.next().type);
+    try std.testing.expectEqual(TokenType.identifier, lt.next().type);
+
+    var sp = Scanner.init("<nixpkgs>");
+    try std.testing.expectEqual(TokenType.search_path, sp.next().type);
+
+    var orop = Scanner.init("a || b");
+    try std.testing.expectEqual(TokenType.identifier, orop.next().type);
+    try std.testing.expectEqual(TokenType.pipe_pipe, orop.next().type);
+    try std.testing.expectEqual(TokenType.identifier, orop.next().type);
 }
 
 test "scanner recognizes lambda colon" {
