@@ -554,6 +554,10 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
+        // FIX_SPEC_BACKLOG: sweep the speculation backlog cap (peak-RSS↔wall knob).
+        if (self.env_map) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
+            if (std.fmt.parseInt(u32, s, 10)) |n| @import("parallel").scheduler.setSpecBacklog(n) else |_| {}
+        };
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();

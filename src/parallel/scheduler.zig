@@ -154,7 +154,13 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
 // back onto the critical path at 32 workers.
 const urgent_queue_capacity: u32 = 4096;
 const spec_queue_capacity: u32 = 4096;
-const spec_backlog_per_helper: u32 = 128;
+/// Per-helper speculation backlog cap. `var` (not `const`) so `FIX_SPEC_BACKLOG`
+/// can sweep it — it's the primary control on how much speculative garbage runs
+/// ahead of demand, i.e. the peak-RSS↔wall knob.
+var spec_backlog_per_helper: u32 = 128;
+pub fn setSpecBacklog(n: u32) void {
+    spec_backlog_per_helper = n;
+}
 const burst_wake_budget: u32 = 4;
 
 /// GC parallel-mark hook (`-Dgc`): the Evaluator installs this so a parked
