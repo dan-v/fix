@@ -218,7 +218,56 @@ pub const Evaluator = struct {
         std.debug.print("=== tjit hot anchors: {d} armed, {d} traced (threshold={d}, chunks={d}) ===\n", .{ armed, traced, h.hot_threshold, count });
     }
 
+    /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
+    /// where the memory actually goes (the tracked object stores are only part
+    /// of it — interned strings, bytecode, and AST arenas are large and the GC
+    /// never sees them). Printed at deinit, before any teardown frees state.
+    fn memReport(self: *Evaluator) void {
+        const on = if (self.env_map) |em| em.get("FIX_MEM_REPORT") != null else false;
+        if (!on) return;
+        const heap_mod = @import("runtime").heap;
+        const mb = struct {
+            fn f(bytes: u64) f64 {
+                return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+            }
+        }.f;
+        const p = std.debug.print;
+
+        const obj_b = @as(u64, self.heap.objects.count()) * @sizeOf(heap_mod.Object);
+        const val_b = @as(u64, self.heap.values.count()) * @sizeOf(Value);
+        const attr_b = @as(u64, self.heap.attrs.count()) * @sizeOf(heap_mod.AttrEntry);
+        const apos_b = @as(u64, self.heap.attr_positions.count()) * @sizeOf(heap_mod.AttrPosEntry);
+        const stores_b = obj_b + val_b + attr_b + apos_b;
+
+        const is = self.intern.stats();
+        const intern_b = @as(u64, is.entries) * 12 + is.data_bytes; // Entry = 3×u32
+
+        const cs = self.registry.stats();
+        const code_b = cs.code_bytes + cs.const_count * @sizeOf(Value) +
+            cs.source_map_entries * @sizeOf(bytecode.chunk.Chunk.SourceMapEntry);
+
+        var arena_b: u64 = 0;
+        for (self.retained_arenas.items) |*a| arena_b += a.inner.queryCapacity();
+
+        const accounted = stores_b + intern_b + code_b + arena_b;
+        const rss = gc.peakRssBytes();
+
+        p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
+        p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), self.heap.objects.count() });
+        p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), self.heap.values.count() });
+        p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), self.heap.attrs.count() });
+        p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
+        p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
+        p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
+        p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
+        p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), self.retained_arenas.items.len });
+        p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
+        p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
+        if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
+    }
+
     pub fn deinit(self: *Evaluator) void {
+        self.memReport();
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         trace_probe.report();
         struct_census.report();
