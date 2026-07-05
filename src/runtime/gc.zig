@@ -146,6 +146,11 @@ pub const Tracer = struct {
     /// collector during the single-threaded root-scan (`beginSeeding`), so a
     /// plain field — no concurrency — is safe.
     parallel_seed: ?*Marker = null,
+    /// Minor-collection mode (copying nursery): when armed, `markObject` stops
+    /// at OLD objects — the mark reaches only the young generation. Old objects
+    /// are assumed live; the young objects they reference arrive via the
+    /// remembered set (`markRemsetSource`), not by tracing through old.
+    minor_gate: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Tracer {
         return .{ .allocator = allocator };
@@ -201,6 +206,10 @@ pub const Tracer = struct {
     /// collection's single-threaded root-scan, `parallel_seed` is set and the
     /// root is seeded into that marker's deque instead of the serial stack.
     pub fn markObject(self: *Tracer, heap: *const ObjectHeap, id: ObjectId) void {
+        // Minor collection: the trace stops at old objects (they're live; their
+        // young referents come via the remembered set). Young-only keeps the
+        // pause proportional to the young survivors, not the whole heap.
+        if (self.minor_gate and !heap.gcIsYoung(id)) return;
         if (self.parallel_seed) |m| {
             m.markObject(heap, id);
             return;
@@ -216,6 +225,31 @@ pub const Tracer = struct {
     pub fn drain(self: *Tracer, heap: *const ObjectHeap) void {
         var sink = SerialSink{ .tr = self };
         while (self.stack.pop()) |id| scanObject(SerialSink, &sink, heap, id);
+    }
+
+    // --- minor collection (copying nursery, young-gated) ---
+
+    /// Prepare a young-gated mark over `[0, object_count)`.
+    pub fn resetMinor(self: *Tracer, object_count: u32) !void {
+        try self.reset(object_count);
+        self.minor_gate = true;
+    }
+
+    /// Seed the young referents of a remembered old `source` (an old→young
+    /// edge). Scans the source's outgoing edges via the shared trace map;
+    /// young children are marked+queued (the gate drops old ones), and the old
+    /// source itself is never added to the live set. Call for each remembered
+    /// source before `drainMinor`.
+    pub fn markRemsetSource(self: *Tracer, heap: *const ObjectHeap, source: ObjectId) void {
+        var sink = SerialSink{ .tr = self };
+        scanObject(SerialSink, &sink, heap, source);
+    }
+
+    /// Drain the young-gated mark to its transitive closure, then disarm the
+    /// gate.
+    pub fn drainMinor(self: *Tracer, heap: *const ObjectHeap) void {
+        self.drain(heap);
+        self.minor_gate = false;
     }
 
     // --- parallel mark ---

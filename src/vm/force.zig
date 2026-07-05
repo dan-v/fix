@@ -584,6 +584,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         s.count == k.count and s.up0 == k.up0 and s.up1 == k.up1)
                     {
                         thunk.resolve(s.value);
+                        self.heap.gcRecordEdge(thunk_id, s.value); // old→young barrier
                         recordResolve(self, thunk_id, s.value);
                         if (demand) thunk.markDemanded();
                         return s.value;
@@ -626,6 +627,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     return err;
                 };
                 thunk.resolve(result);
+                self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
                 if (memo_key) |k| thunk_memo[k.idx] = .{
                     .token = self.heap.token,
                     .chunk = k.chunk,

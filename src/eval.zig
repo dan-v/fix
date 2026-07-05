@@ -834,47 +834,44 @@ pub const Evaluator = struct {
     /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
     fn gcCollect(self: *Evaluator, collector_id: u8) void {
         if (comptime !gc.enabled) return;
+        _ = collector_id;
+        // Copying minor collection (STW). At --workers>1 the peers are already
+        // parked at safepoints (gcWaitAllParked in force.zig), so the minor runs
+        // single-threaded on the collector regardless of worker count. The young
+        // set is small (most objects die young), so a serial mark is cheap — no
+        // parallel mark needed for a minor.
         const tr = &self.gc_tracer;
         const t0 = gcNowNs();
-        if (self.worker_count > 1) {
-            // Parallel STW mark: the peers are already parked at safepoints
-            // (gcWaitAllParked, in force.zig). Seed the roots into our own
-            // marker deque, open the mark so the peers help drain it, mark
-            // alongside them, then sum the per-marker tallies.
-            tr.resetParallel(self.heap.objects.count(), self.worker_count) catch {
-                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-                return;
-            };
-            tr.beginSeeding(collector_id);
-            self.gcMarkRoots(tr);
-            tr.endSeeding();
-            self.scheduler.gcOpenMark();
-            tr.drainParallel(&self.heap, collector_id); // returns at termination
-            self.scheduler.gcCloseMark();
-            tr.sumStats();
-        } else {
-            tr.reset(self.heap.objects.count()) catch {
-                // Can't size the mark bitmap — skip this collection rather than
-                // risk an unmarked sweep. Bump the threshold so we don't spin.
-                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-                return;
-            };
-            self.gcMarkRoots(tr);
-            tr.drain(&self.heap); // precise transitive closure from the roots
-        }
+        tr.resetMinor(self.heap.objects.count()) catch {
+            self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+            return;
+        };
+        // Young-gated mark from every root; the trace stops at old objects.
+        self.gcMarkRoots(tr);
+        // Seed young objects kept alive only through an old parent (the
+        // remembered set of old→young edges recorded by the write barrier).
+        const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
+        const Seed = struct {
+            fn cb(ctx: SeedCtx, source: types.ObjectId) void {
+                ctx.tr.markRemsetSource(ctx.heap, source);
+            }
+        };
+        self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
+        tr.drainMinor(&self.heap);
         const t1 = gcNowNs();
-        const st = self.heap.sweep(tr.mark_bits);
+        const st = self.heap.gcMinorCollect(tr.mark_bits);
         const t2 = gcNowNs();
+        self.heap.gcRemsetClear();
         self.heap.gcAfterCollect(tr.stats.bytes);
-        gc.recordCollection(st.objects_freed, tr.stats.bytes, self.heap.totalReservedBytes());
+        gc.recordCollection(st.freed, tr.stats.bytes, self.heap.totalReservedBytes());
         gc.recordTiming(t1 - t0, t2 - t1);
         gc.recordBreakdown(.{
             .obj_live = tr.stats.objects,
             .obj_reserved = self.heap.objects.count(),
             .val_live = tr.stats.values,
-            .val_reserved = self.heap.values.count(),
+            .val_reserved = self.heap.values.reservedSlots(),
             .attr_live = tr.stats.attrs,
-            .attr_reserved = self.heap.attrs.count(),
+            .attr_reserved = self.heap.attrs.reservedSlots(),
         });
     }
 

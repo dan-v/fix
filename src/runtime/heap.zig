@@ -248,6 +248,12 @@ pub const HeapLocal = struct {
     gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
     gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
     gc_free_attr_pos: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
+    /// Copying-nursery remembered set: `source` object ids (already old) that
+    /// were written a pointer to a young object since the last minor. Per-worker
+    /// and single-owner, so the write barrier (`gcRecordEdge`) appends without a
+    /// lock. Drained (STW) at the next minor to seed the young referents that
+    /// only an old object keeps alive; cleared after.
+    gc_remset: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         if (comptime !build_options.gc) return;
@@ -255,6 +261,7 @@ pub const HeapLocal = struct {
         self.gc_free_values.deinit(allocator);
         self.gc_free_attrs.deinit(allocator);
         self.gc_free_attr_pos.deinit(allocator);
+        self.gc_remset.deinit(allocator);
     }
 };
 
@@ -345,6 +352,12 @@ pub const ObjectHeap = struct {
     /// cleared when swept. Lets `sweep` tell live objects from TLAB-
     /// reserved-but-unfilled slots and already-freed slots.
     gc_alloc_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
+    /// Copying-nursery generation bitmap: one bit per ObjectId, set ⇒ **old**
+    /// (tenured). Clear (or beyond the array) ⇒ **young**. Written ONLY at a
+    /// stop-the-world minor (promote sets it; a future major clears it on
+    /// free), so there is NO allocation-path barrier — a freshly bumped slot is
+    /// young by default. Grown (zeroed) at each minor to cover the object count.
+    gc_old_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
     // path reuses without a lock — a single shared free list + mutex
     // serialized all allocation across workers and was the entire w>1 wall
@@ -385,6 +398,7 @@ pub const ObjectHeap = struct {
         self.freeErroredInfos();
         if (comptime build_options.gc) {
             self.allocator.free(self.gc_alloc_bits);
+            self.allocator.free(self.gc_old_bits);
             for (self.worker_locals) |*l| l.deinit(self.allocator);
         }
         self.allocator.free(self.worker_locals);
@@ -707,11 +721,13 @@ pub const ObjectHeap = struct {
     }
 
     /// Nursery-exhausted hook: request a minor collection to run at the next
-    /// safepoint (which evacuates survivors and resets the nursery). No-op in
-    /// Phase 1 (the reservation has already spilled to the tenured region).
+    /// forceThunk safepoint (which evacuates survivors and resets the nursery).
+    /// The reservation that triggered this has already spilled to the tenured
+    /// region so the allocation succeeds now; the spill window (until the
+    /// safepoint) is small because forces are frequent.
     inline fn gcNurseryFull(self: *ObjectHeap) void {
         if (comptime !build_options.gc) return;
-        _ = self;
+        self.gc_collect_requested = true;
     }
 
     /// Register the collect callback (no-op in non-`-Dgc` builds). Fired at
@@ -977,6 +993,166 @@ pub const ObjectHeap = struct {
         const word = id >> 6;
         if (word >= self.gc_alloc_bits.len) return;
         _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
+    }
+
+    // ===================================================================
+    // Copying nursery — minor collection (`-Dgc`)
+    // ===================================================================
+
+    /// Is object `id` young? Old ⇒ its bit is set (promoted in a prior minor);
+    /// young ⇒ clear or beyond the (STW-grown) bitmap. No allocation barrier.
+    pub inline fn gcIsYoung(self: *const ObjectHeap, id: ObjectId) bool {
+        if (comptime !build_options.gc) return false;
+        // Pre-collection (bootstrap) objects are permanent — always old. Never
+        // evacuated/reclaimed, and the write barrier MUST treat them as old so
+        // an old→young edge they gain (e.g. a bootstrap thunk resolving to a
+        // young value) is remembered.
+        if (id < self.gc_track_from) return false;
+        const word = id >> 6;
+        if (word >= self.gc_old_bits.len) return true;
+        return self.gc_old_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0;
+    }
+
+    inline fn gcSetOld(self: *ObjectHeap, id: ObjectId) void {
+        const word = id >> 6;
+        if (word >= self.gc_old_bits.len) return;
+        self.gc_old_bits[word] |= @as(u64, 1) << @intCast(id & 63);
+    }
+
+    /// Grow the generation bitmap to cover `[0, count)` (new words zeroed ⇒
+    /// young). STW only, so plain (non-atomic).
+    fn gcGrowOldBits(self: *ObjectHeap, count: u32) void {
+        const words = (@as(usize, count) + 63) >> 6;
+        if (self.gc_old_bits.len < words) {
+            const old_len = self.gc_old_bits.len;
+            self.gc_old_bits = self.allocator.realloc(self.gc_old_bits, words) catch return;
+            @memset(self.gc_old_bits[old_len..words], 0);
+        }
+    }
+
+    /// If a Value carries a heap ObjectId, return it (inlined here to avoid a
+    /// gc-module import cycle — mirrors `gc.hasObjectRef`).
+    inline fn gcHeapId(v: Value) ?ObjectId {
+        if (v.isList() or v.isAttrs() or v.isThunk() or v.isClosure() or
+            v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or
+            v.isPartialApp()) return v.asObjectId();
+        return null;
+    }
+
+    /// Write barrier: `source` (an old object) now references `referent`. Record
+    /// the source for the next minor iff this is a genuine old→young edge; every
+    /// other case bails cheaply. Fired at the write-once mutation sites (thunk
+    /// resolve, merge flatten, cell bind).
+    pub fn gcRecordEdge(self: *ObjectHeap, source: ObjectId, referent: Value) void {
+        if (comptime !build_options.gc) return;
+        if (!self.gc_collect_enabled) return;
+        const ref_id = gcHeapId(referent) orelse return;
+        if (!self.gcIsYoung(ref_id)) return; // referent already old
+        if (self.gcIsYoung(source)) return; // source young → not old→young
+        self.currentLocal().gc_remset.append(self.allocator, source) catch {};
+    }
+
+    /// Visit every remembered old source (STW). `cb(ctx, source_id)`.
+    pub fn gcForEachRemsetSource(self: *ObjectHeap, ctx: anytype, comptime cb: fn (@TypeOf(ctx), ObjectId) void) void {
+        if (comptime !build_options.gc) return;
+        for (self.worker_locals) |*wl| for (wl.gc_remset.items) |sid| cb(ctx, sid);
+    }
+
+    pub fn gcRemsetClear(self: *ObjectHeap) void {
+        for (self.worker_locals) |*wl| wl.gc_remset.clearRetainingCapacity();
+    }
+
+    // --- evacuation: copy a survivor's young ranges into the tenured region ---
+    //
+    // The ObjectIds *inside* a range are untouched (slots never move), so
+    // evacuation is a raw memcpy + one back-pointer rewrite. Ranges already
+    // tenured (segment ≥ nursery_segs — oversized spills, or thunk spilled
+    // upvalues which are born tenured) are left in place.
+
+    fn gcEvacValues(self: *ObjectHeap, r: *ValueRange) void {
+        if (r.len == 0 or !self.values.isYoung(r.*)) return;
+        const dst = self.values.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (values)");
+        @memcpy(self.values.sliceMut(dst), self.values.slice(r.*));
+        r.* = dst;
+    }
+    fn gcEvacAttrs(self: *ObjectHeap, r: *AttrRange) void {
+        if (r.len == 0 or !self.attrs.isYoung(r.*)) return;
+        const dst = self.attrs.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (attrs)");
+        @memcpy(self.attrs.sliceMut(dst), self.attrs.slice(r.*));
+        r.* = dst;
+    }
+    fn gcEvacAttrPos(self: *ObjectHeap, r: *AttrPosRange) void {
+        if (r.len == 0 or !self.attr_positions.isYoung(r.*)) return;
+        const dst = self.attr_positions.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (attr_pos)");
+        @memcpy(self.attr_positions.sliceMut(dst), self.attr_positions.slice(r.*));
+        r.* = dst;
+    }
+
+    fn gcEvacuateObject(self: *ObjectHeap, id: ObjectId) void {
+        const obj = self.objects.getMut(id);
+        switch (obj.*) {
+            .list => |*r| self.gcEvacValues(r),
+            .attrs => |*a| {
+                self.gcEvacAttrs(&a.range);
+                self.gcEvacAttrPos(&a.positions);
+            },
+            .closure => |*c| self.gcEvacValues(&c.upvalues),
+            .builtin_closure => |*c| self.gcEvacValues(&c.args),
+            .partial_app => |*p| self.gcEvacValues(&p.args),
+            .context_string => |*c| self.gcEvacAttrs(&c.context),
+            .thunk, .merge_attrs, .boxed_int => {},
+        }
+    }
+
+    pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
+
+    /// One stop-the-world minor collection. The evaluator has already marked
+    /// the reachable young set into `mark_bits` (young-gated: roots + the
+    /// old→young remembered set, stopping at old). Here: evacuate every marked
+    /// young object's ranges to tenured + promote it, reclaim dead young slot
+    /// ids, then reset the nursery (bulk-reclaiming all dead young storage).
+    /// Runs at a safepoint; single-threaded at `--workers=1`.
+    pub fn gcMinorCollect(self: *ObjectHeap, mark_bits: []const u64) MinorStats {
+        var st: MinorStats = .{};
+        if (comptime !build_options.gc) return st;
+        if (comptime !gc_debug) self.gcReconstructAllocBits();
+        self.gcGrowOldBits(self.objects.count());
+        const n = self.objects.count();
+        var id: ObjectId = self.gc_track_from;
+        while (id < n) : (id += 1) {
+            const word = id >> 6;
+            if (word >= self.gc_alloc_bits.len) break;
+            const bit = @as(u64, 1) << @intCast(id & 63);
+            if (self.gc_alloc_bits[word] & bit == 0) continue; // unfilled / free
+            if (!self.gcIsYoung(id)) continue; // already tenured
+            const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
+            if (marked) {
+                self.gcEvacuateObject(id);
+                self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
+                st.promoted += 1;
+            } else {
+                // Dead young: reclaim the slot id. Its young ranges are in the
+                // nursery, reclaimed wholesale by the reset below.
+                self.currentLocal().gc_free_objects.append(self.allocator, id) catch {};
+                if (comptime gc_debug) self.gc_alloc_bits[word] &= ~bit;
+                st.freed += 1;
+            }
+        }
+        self.gcResetNursery();
+        return st;
+    }
+
+    /// Rewind the nursery bump cursors (reclaiming all young slots at once) and
+    /// flush every worker's young TLAB (which points into the just-reset space).
+    fn gcResetNursery(self: *ObjectHeap) void {
+        self.values.resetYoung();
+        self.attrs.resetYoung();
+        self.attr_positions.resetYoung();
+        for (self.worker_locals) |*l| {
+            l.value = .{};
+            l.attr = .{};
+            l.attr_pos = .{};
+        }
     }
 
     /// Sweep: free every filled object that `mark_bits` left unmarked —
@@ -1249,6 +1425,9 @@ pub const ObjectHeap = struct {
         const flat = try self.kwayMergeLeaves(leaves.items);
 
         const prev = self.get(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
+        // old→young barrier: the (possibly old) merge node now points at its
+        // flattened attrs object. Only the CAS winner installed the edge.
+        if (prev == null) self.gcRecordEdge(id, Value.attrs(flat));
         return prev orelse flat;
     }
 
@@ -1570,7 +1749,12 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addClosure(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
-        const range = try self.appendValues(upvalues);
+        // Upvalues are cached in the executing frame's `upvalues` slice (see
+        // vm/stack.zig Frame), which would dangle if the range were evacuated
+        // mid-execution. Born tenured so the frame slice never moves. (A future
+        // optimization can re-derive frame.upvalues at GC time and let these be
+        // young — see docs/plans/gc-copying-nursery-plan.md.)
+        const range = try self.appendValuesTenured(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .closure = .{
             .chunk_id = chunk_id,
@@ -1620,7 +1804,10 @@ pub const ObjectHeap = struct {
         if (upvalues.len <= BytecodeThunk.INLINE_CAP) {
             return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
         }
-        const range = try self.appendValues(upvalues);
+        // Spilled upvalues are a bare slice held by the thunk AND cached in the
+        // executing frame's `upvalues` — both would dangle if the range were
+        // evacuated. Born tenured (never moves), so neither ever moves.
+        const range = try self.appendValuesTenured(upvalues);
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, self.values.slice(range)) });
     }
@@ -1631,7 +1818,7 @@ pub const ObjectHeap = struct {
         if (env.len <= DeferredThunk.INLINE_CAP) {
             return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
         }
-        const range = try self.appendValues(env);
+        const range = try self.appendValuesTenured(env); // stable: see addBytecodeThunk
         errdefer self.values.rollback(range);
         return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, self.values.slice(range)) });
     }
@@ -1658,6 +1845,18 @@ pub const ObjectHeap = struct {
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
         errdefer self.values.rollback(pending.range);
+        // Spilled (>INLINE_CAP) upvalues become the thunk's stable backing slice
+        // and are cached in executing frames; if the pending range is young it
+        // must be copied to the tenured region so it never moves. Inline (<=2)
+        // upvalues are copied into the thunk, so the young pending range is
+        // harmless (reclaimed by the next nursery reset).
+        if (comptime build_options.gc) {
+            if (pending.range.len > BytecodeThunk.INLINE_CAP and self.values.isYoung(pending.range)) {
+                const t = try self.values.reserve(self.allocator, pending.range.len);
+                @memcpy(self.values.sliceMut(t), self.values.slice(pending.range));
+                return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(t)) });
+            }
+        }
         return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(pending.range)) });
     }
 
@@ -1667,6 +1866,16 @@ pub const ObjectHeap = struct {
 
     fn appendValues(self: *ObjectHeap, items: []const Value) !ValueRange {
         const range = try self.reserveValuesLocal(@intCast(items.len));
+        @memcpy(self.values.sliceMut(range), items);
+        return range;
+    }
+
+    /// Like `appendValues` but always tenured (bypasses the nursery). For
+    /// storage that must never be evacuated because a bare slice into it is
+    /// held outside the object graph — spilled thunk upvalues (see
+    /// `addBytecodeThunk`).
+    fn appendValuesTenured(self: *ObjectHeap, items: []const Value) !ValueRange {
+        const range = try self.values.reserve(self.allocator, @intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
         return range;
     }

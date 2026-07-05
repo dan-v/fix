@@ -264,6 +264,28 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return ptr[0..segmentCapacity(i)];
         }
 
+        /// Is `range` a young (nursery) reservation? True iff it lives in a
+        /// nursery segment. Used by the copying collector to decide what to
+        /// evacuate.
+        pub fn isYoung(self: *const Self, range: Range) bool {
+            return self.nursery_segs != 0 and range.segment < self.nursery_segs;
+        }
+
+        /// Does raw pointer `ptr` fall inside a nursery segment? For the one
+        /// place a bare slice into the store is held (spilled thunk upvalues),
+        /// where the owning `(segment, offset)` isn't recorded. O(nursery_segs).
+        pub fn isYoungPtr(self: *const Self, ptr: [*]const T) bool {
+            if (self.nursery_segs == 0) return false;
+            const p = @intFromPtr(ptr);
+            var i: u32 = 0;
+            while (i < self.nursery_segs) : (i += 1) {
+                const seg = self.segments[i].load(.monotonic) orelse continue;
+                const base = @intFromPtr(seg);
+                if (p >= base and p < base + @as(usize, segmentCapacity(i)) * @sizeOf(T)) return true;
+            }
+            return false;
+        }
+
         /// Append a single value. Returns its global u32 id.
         pub fn append(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
             const range = try self.reserve(allocator, 1);

@@ -215,6 +215,7 @@ fn opSetCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     // pass_through path lazily. Any helper that parked while we held
     // the claim wakes here.
     thunk.publishCellBinding(val);
+    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
     return dispatch(vm, frame, code, ip + 1, stop_depth);
 }
 
@@ -226,6 +227,7 @@ fn opSetCellLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_
     if (!cell_val.isThunk()) return error.TypeError;
     const thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
     thunk.publishCellBinding(val);
+    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
@@ -685,6 +687,7 @@ fn opThunkCapturesStoreCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: u
     const cell_val = vm.stack[frame.frame_base + slot];
     if (!cell_val.isThunk()) return error.TypeError;
     vm.heap.getThunkAssumeValid(cell_val.asObjectId()).publishCellBinding(val);
+    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
     return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
 }
 
@@ -718,6 +721,7 @@ fn opThunkCapturesEagerStoreCellLocal(vm: *VM, frame: *Frame, code: []const u8, 
     const cell_val = vm.stack[frame.frame_base + slot];
     if (!cell_val.isThunk()) return error.TypeError;
     vm.heap.getThunkAssumeValid(cell_val.asObjectId()).publishCellBinding(val);
+    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
     return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
 }
 
