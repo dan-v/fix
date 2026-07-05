@@ -477,7 +477,7 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     defer self.allocator.free(flake_path);
 
     const host = self.import_host orelse return error.ImportUnavailable;
-    const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path));
+    const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path, self.native_depth));
     if (!flake_value.isAttrs()) return error.TypeError;
 
     const outputs_id = try self.intern.intern("outputs");

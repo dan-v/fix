@@ -118,15 +118,15 @@ pub fn checkScopedCycle(path: []const u8) !void {
 /// evaluator is passed by anytype to avoid an @import cycle; it must
 /// expose `allocator`, `imports`, `files`, `progress*`, `evaluateSource`,
 /// and `resolveHostPath`.
-pub fn importPath(ev: anytype, path: []const u8) !Value {
+pub fn importPath(ev: anytype, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);
-    return importResolvedPath(ev, resolved.text);
+    return importResolvedPath(ev, resolved.text, parent_depth);
 }
 
-pub fn importResolvedPath(ev: anytype, path: []const u8) anyerror!Value {
+pub fn importResolvedPath(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
     const entry = try ev.imports.lookupOrCreate(ev.allocator, path);
-    return forceEntry(ev, path, entry);
+    return forceEntry(ev, path, entry, parent_depth);
 }
 
 /// Drive the claim protocol on `entry`. The first fiber to claim
@@ -135,7 +135,7 @@ pub fn importResolvedPath(ev: anytype, path: []const u8) anyerror!Value {
 /// terminal state. Cycle detection comes for free from `Future`:
 /// same-claimer recursion returns `.blackhole`, which we translate
 /// to `error.ImportCycle`.
-pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!Value {
+pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry, parent_depth: u32) anyerror!Value {
     const me = currentClaimer();
     while (true) {
         switch (entry.future.tryClaim(me)) {
@@ -154,7 +154,7 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry) anyerror!V
                 continue;
             },
             .claimed => {
-                const value = compileImportPath(ev, path) catch |err| {
+                const value = compileImportPath(ev, path, parent_depth) catch |err| {
                     publishCompileFailure(ev, entry, err);
                     return err;
                 };
@@ -190,7 +190,7 @@ fn currentClaimer() thunk_mod.ClaimerId {
 
 /// Caller has already claimed the `ImportEntry`. Reads the source
 /// (or returns the synthetic corepkgs string), then evaluates.
-pub fn compileImportPath(ev: anytype, path: []const u8) anyerror!Value {
+pub fn compileImportPath(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
     const stable_path = try ev.allocator.dupe(u8, path);
     defer ev.allocator.free(stable_path);
 
@@ -202,20 +202,20 @@ pub fn compileImportPath(ev: anytype, path: []const u8) anyerror!Value {
         core_source
     else
         ev.files.readFile(stable_path) catch |err| switch (err) {
-            error.IsDir => return importDirectory(ev, stable_path),
+            error.IsDir => return importDirectory(ev, stable_path, parent_depth),
             else => return err,
         };
     const source_base = std.fs.path.dirname(stable_path) orelse "/";
-    return ev.evaluateSource(source, source_base, stable_path, null);
+    return ev.evaluateSource(source, source_base, stable_path, null, parent_depth);
 }
 
-pub fn scopedImportPath(ev: anytype, scope: Value, path: []const u8) !Value {
+pub fn scopedImportPath(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);
-    return scopedImportResolvedPath(ev, scope, resolved.text);
+    return scopedImportResolvedPath(ev, scope, resolved.text, parent_depth);
 }
 
-pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8) anyerror!Value {
+pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
     const stable_path = try ev.allocator.dupe(u8, path);
     defer ev.allocator.free(stable_path);
 
@@ -232,23 +232,23 @@ pub fn scopedImportResolvedPath(ev: anytype, scope: Value, path: []const u8) any
         core_source
     else
         ev.files.readFile(stable_path) catch |err| switch (err) {
-            error.IsDir => return scopedImportDirectory(ev, scope, stable_path),
+            error.IsDir => return scopedImportDirectory(ev, scope, stable_path, parent_depth),
             else => return err,
         };
     const source_base = std.fs.path.dirname(stable_path) orelse "/";
-    return ev.evaluateSource(source, source_base, stable_path, scope);
+    return ev.evaluateSource(source, source_base, stable_path, scope, parent_depth);
 }
 
-pub fn importDirectory(ev: anytype, path: []const u8) anyerror!Value {
+pub fn importDirectory(ev: anytype, path: []const u8, parent_depth: u32) anyerror!Value {
     const default_path = try std.fs.path.resolve(ev.allocator, &.{ path, "default.nix" });
     defer ev.allocator.free(default_path);
-    return importResolvedPath(ev, default_path);
+    return importResolvedPath(ev, default_path, parent_depth);
 }
 
-pub fn scopedImportDirectory(ev: anytype, scope: Value, path: []const u8) anyerror!Value {
+pub fn scopedImportDirectory(ev: anytype, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
     const default_path = try std.fs.path.resolve(ev.allocator, &.{ path, "default.nix" });
     defer ev.allocator.free(default_path);
-    return scopedImportResolvedPath(ev, scope, default_path);
+    return scopedImportResolvedPath(ev, scope, default_path, parent_depth);
 }
 
 /// Synthetic source for `<nix/fetchurl.nix>`, hard-coded so the

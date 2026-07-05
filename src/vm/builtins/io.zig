@@ -26,14 +26,16 @@ pub fn builtinReadFileType(self: anytype, arg: Value) !Value {
 
 pub fn builtinImport(self: anytype, arg: Value) !Value {
     const host = self.import_host orelse return error.ImportUnavailable;
-    return host.import_value(host.context, try pathArg(self, arg));
+    const path = try pathArg(self, arg);
+    return host.import_value(host.context, path, self.native_depth);
 }
 
 pub fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Value {
     const scope = try vm_force.forceValue(self, scope_arg);
     if (!scope.isAttrs()) return vm_trace.typeErrorExpected(self, "attrs", scope);
     const host = self.import_host orelse return error.ImportUnavailable;
-    return host.scoped_import(host.context, scope, try pathArg(self, path_arg));
+    const path = try pathArg(self, path_arg);
+    return host.scoped_import(host.context, scope, path, self.native_depth);
 }
 
 pub fn builtinReadDir(self: anytype, arg: Value) !Value {

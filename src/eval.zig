@@ -561,7 +561,7 @@ pub const Evaluator = struct {
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
-        return self.evaluateSource(source, self.base_path, null, null);
+        return self.evaluateSource(source, self.base_path, null, null, 0);
     }
 
     pub fn evaluateSource(
@@ -570,6 +570,11 @@ pub const Evaluator = struct {
         base_path: ?[]const u8,
         source_path: ?[]const u8,
         scope: ?Value,
+        /// The calling VM's `native_depth` (the `import` builtin already +1'd
+        /// it). The nested import VM inherits `parent_depth - 1` so imports are
+        /// GC-safepoint-transparent (a top-level import collects at depth 0; a
+        /// nested one stays gated at the caller's depth). 0 for the top level.
+        parent_depth: u32,
     ) !Value {
         const chunk_id = try self.parseAndCompile(source, base_path, source_path, scope);
         const subject = source_path orelse "expression";
@@ -587,6 +592,12 @@ pub const Evaluator = struct {
         }
         var vm = try self.initVm(0);
         defer vm.deinit();
+        // Depth-transparent import: the fresh nested VM inherits the caller's
+        // depth minus 1 (dropping the `import` builtin's own +1), so a
+        // top-level import evaluates at depth 0 (collects) while a nested one
+        // stays gated at the enclosing builtin's depth. native_depth lives on
+        // the VM (fiber-local), so no threadlocal dance is needed.
+        if (comptime gc.enabled or depth0_probe.enabled) vm.native_depth = parent_depth -| 1;
         // This VM isn't in any worker's `fibers`, so the collector can't find
         // its roots on its own — register it for the duration of the import.
         // Concurrent imports at --workers>1 interleave, so guard the list and
@@ -605,16 +616,6 @@ pub const Evaluator = struct {
                 }
             }
             self.gc_import_vms_mu.unlock();
-        };
-        // Depth-transparent import: we got here from inside the
-        // `import`/`scopedImport` builtin (which raised native_depth). Drop
-        // back to the caller's depth for the imported eval so that a
-        // top-level import still collects (depth 0), while an import nested
-        // inside another builtin stays gated (that builtin's depth). This is
-        // what keeps builtins correct-by-default. See vm/force.zig.
-        if (comptime gc.enabled or depth0_probe.enabled) vm_force.native_depth -= 1;
-        defer if (comptime gc.enabled or depth0_probe.enabled) {
-            vm_force.native_depth += 1;
         };
         return vm.eval(chunk_id);
     }
@@ -947,14 +948,14 @@ pub const Evaluator = struct {
         for (vm.native_upvalues) |v| tr.markValue(heap, v);
     }
 
-    fn importValue(context: *anyopaque, path: []const u8) anyerror!Value {
+    fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.importPath(self, path);
+        return imports_mod.importPath(self, path, parent_depth);
     }
 
-    fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8) anyerror!Value {
+    fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
-        return imports_mod.scopedImportPath(self, scope, path);
+        return imports_mod.scopedImportPath(self, scope, path, parent_depth);
     }
 
     fn findFile(context: *anyopaque, name: []const u8) anyerror!Value {

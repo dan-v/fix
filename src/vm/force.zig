@@ -379,15 +379,14 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
     return forceAt(self, 0);
 }
 
-/// GC (`-Dgc`): per-THREAD native-builtin call depth. Collections only run
-/// at depth 0 — a point where NO builtin frame is active anywhere on the
-/// thread, so a builtin may hold heap refs in Zig locals freely (they can
-/// never be observed by a collection). This is what makes writing a builtin
-/// correct-by-default. Per-thread (not per-VM) because imports evaluate on
-/// fresh VMs but the same OS thread; `import`/`scopedImport` are
-/// depth-transparent (see `Evaluator.evaluateSource`) so a top-level import
-/// still collects while an import nested inside another builtin does not.
-pub threadlocal var native_depth: u32 = 0;
+// GC native-builtin call depth now lives on the VM (`VM.native_depth`), NOT a
+// threadlocal: a fiber can yield mid-builtin and resume on a DIFFERENT OS
+// thread, which would drift a per-thread counter (a builtin's `+1` and its
+// `defer -1` landing on different threads). The VM travels with the fiber, so
+// `self.native_depth` is fiber-local by construction. Imports evaluate on a
+// fresh nested VM that inherits the caller's depth (depth-transparency — see
+// `Evaluator.evaluateSource`), so a top-level import still collects (depth 0)
+// while an import nested inside a builtin stays gated at that builtin's depth.
 
 /// Rich source label for a thunk, as a `timeline.Subject` — an interned source
 /// location (file id + line, resolved to "modules.nix:545" at dump) or a
@@ -510,7 +509,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
     // safepoint by native_depth + allocation cursor. Independent of -Dgc.
     if (comptime build_options.depth0_probe)
-        depth0_probe.onForceThunk(native_depth, self.heap.totalReservedBytes());
+        depth0_probe.onForceThunk(self.native_depth, self.heap.totalReservedBytes());
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
@@ -520,7 +519,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
         // where this fiber holds no builtin Zig locals a peer collector would
         // need but can't precisely see. (The w>1 collector is dormant today;
         // see Evaluator.ensureMainWorker.)
-        if (native_depth == 0 and self.scheduler.gcStopRequested()) {
+        if (self.native_depth == 0 and self.scheduler.gcStopRequested()) {
             self.gc_extra_root = thunk_val;
             self.scheduler.gcSafepointPark(self.workerId());
             self.gc_extra_root = Value.null_val;

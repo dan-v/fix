@@ -74,8 +74,11 @@ pub const Frame = struct {
 
 pub const ImportHost = struct {
     context: *anyopaque,
-    import_value: *const fn (*anyopaque, []const u8) anyerror!Value,
-    scoped_import: *const fn (*anyopaque, Value, []const u8) anyerror!Value,
+    // `parent_depth` = the calling VM's `native_depth` (the import builtin has
+    // already +1'd it): the nested import VM inherits `parent_depth - 1` so
+    // imports stay depth-transparent for GC safepoints.
+    import_value: *const fn (*anyopaque, []const u8, u32) anyerror!Value,
+    scoped_import: *const fn (*anyopaque, Value, []const u8, u32) anyerror!Value,
     find_file: *const fn (*anyopaque, []const u8) anyerror!Value,
     get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
 };
@@ -133,6 +136,13 @@ pub const VM = struct {
     /// `ClaimerId` for thunk forces. Worker patches this when binding
     /// the VM to a fiber.
     claimer_id: thunk_mod.ClaimerId,
+    /// GC native-builtin call depth (`-Dgc`/`-Ddepth0-probe`): incremented
+    /// around each native builtin, so `native_depth == 0` marks a clean
+    /// safepoint where no builtin holds un-rooted Zig locals. On the VM (not a
+    /// threadlocal) so it's fiber-local — a yielded fiber resuming on another
+    /// thread keeps its own count. A nested import's fresh VM inherits the
+    /// caller's depth (see `Evaluator.evaluateSource`).
+    native_depth: u32 = 0,
 
     /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
     /// logical length.
