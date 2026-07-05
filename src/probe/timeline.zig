@@ -424,6 +424,24 @@ pub fn setFlowSample(n: u32) void {
     flow_sample = n;
 }
 
+/// Monotonic, globally-unique flow id (never 0). A steal takes one and uses it
+/// for BOTH the flowOut and the matching flowIn → no FLOW_DUPLICATE_ID (unlike
+/// a payload-derived id, which repeats when the same thunk is stolen twice).
+var next_flow: std.atomic.Value(u64) = .init(1);
+pub fn nextFlowId() u64 {
+    return next_flow.fetchAdd(1, .monotonic);
+}
+
+/// True if worker `tid` currently has an open span. A flow endpoint binds to
+/// the enclosing slice, so a flowOut is only valid while the victim is inside a
+/// quantum — checking this avoids FLOW_INVALID_ID from arrows anchored to a
+/// parked/idle track. Cross-thread read of a per-worker u8 (atomic on x86;
+/// best-effort — a tiny race just drops/keeps one arrow).
+pub inline fn workerHasOpenSpan(tid: u16) bool {
+    if (!active or tid >= stacks.len) return false;
+    return stacks[tid].len > 0;
+}
+
 fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16) void {
     if (!active) return;
     if (id == 0) return; // 0 = "no flow" sentinel

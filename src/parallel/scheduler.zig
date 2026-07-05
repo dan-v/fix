@@ -662,17 +662,6 @@ pub const Scheduler = struct {
         return self.stealExcluding(self.spec_queues, worker_id, victim);
     }
 
-    /// Stable flow-arrow id for a task (see `timeline.flowOut`/`flowIn`): the
-    /// producer (steal) and consumer (the quantum that runs it) derive the same
-    /// id. Disjoint high tag bits per variant; never 0 (the "no flow" sentinel).
-    pub fn flowId(task: Task) u64 {
-        return switch (task) {
-            .force_thunk => |id| (@as(u64, 1) << 62) | id,
-            .force_list_range => |r| (@as(u64, 2) << 62) |
-                (@as(u64, r.list_id) << 24) | (@as(u64, r.offset) & 0xFFFFFF),
-        };
-    }
-
     fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;

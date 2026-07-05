@@ -355,12 +355,14 @@ pub const Worker = struct {
             const f = try self.acquireFreeFiber();
             f.current_task = task;
             // Timeline: a stolen task's run draws a victim→stealer arrow. Emit
-            // the producer end (on the victim's track) now and carry the id to
-            // the quantum, which emits the matching consumer end. Inert off.
+            // the producer end on the victim's track (only while the victim is
+            // in a quantum, so the arrow binds — else FLOW_INVALID_ID) with a
+            // unique id (no FLOW_DUPLICATE_ID), and carry it to the quantum for
+            // the matching consumer end. flow_in_id stays 0 (no arrow) otherwise.
             f.flow_in_id = 0;
             if (victim) |vtid| {
-                if (timeline.on()) {
-                    const fid = Scheduler.flowId(task);
+                if (timeline.on() and timeline.workerHasOpenSpan(vtid)) {
+                    const fid = timeline.nextFlowId();
                     f.flow_in_id = fid;
                     timeline.flowOut(.steal, fid, vtid);
                 }
