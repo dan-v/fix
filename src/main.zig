@@ -136,6 +136,10 @@ pub fn main(init: std.process.Init) !void {
     if (timeline_path != null) {
         timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
         timeline.setFlowSample(options.timeline_flows);
+        timeline.setSource(switch (source_arg) {
+            .file => |p| p,
+            .expr => "(expression)",
+        });
     }
 
     const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);

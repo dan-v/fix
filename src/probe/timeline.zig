@@ -197,6 +197,13 @@ var active: bool = false;
 /// dump time. Set in `init`; read only on the main thread during `dump`.
 var intern_table: ?*const InternTable = null;
 
+/// A human label for what was evaluated (a file path or "(expression)"),
+/// written into the trace `metadata` block. Set before dump.
+var meta_source: []const u8 = "";
+pub fn setSource(s: []const u8) void {
+    meta_source = s;
+}
+
 fn nowNs() u64 {
     if (builtin.os.tag != .linux) return 0;
     var ts: std.os.linux.timespec = undefined;
@@ -204,6 +211,14 @@ fn nowNs() u64 {
     const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
     const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
     return sec * std.time.ns_per_s + nsec;
+}
+
+/// Wall-clock seconds since the epoch (for the trace `metadata` timestamp).
+fn unixTimeSec() i64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return ts.sec;
 }
 
 /// Allocate the event/name buffers and per-worker stacks. Call once,
@@ -588,7 +603,11 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
     var fw = file.writerStreaming(io, &buf);
     const w = &fw.interface;
 
-    try w.writeAll("[\n");
+    // Object form (not a bare array) so we can attach a `metadata` block that
+    // Perfetto surfaces in Info & Stats. NB: this is trace-level annotation —
+    // Perfetto's internal permalink `trace_uuid` is content-derived for JSON
+    // and only settable via the protobuf format.
+    try w.writeAll("{\"traceEvents\":[\n");
 
     // Thread-name metadata so each track is labelled in the viewer.
     var t: usize = 0;
@@ -676,7 +695,27 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
         try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
     }
 
-    try w.writeAll("]\n");
+    // Close the events array and emit the trace-level metadata block.
+    try w.writeAll("],\n\"displayTimeUnit\":\"ns\",\n\"metadata\":{\n");
+    // Derive a unique-per-run id from the clocks (no crypto entropy needed —
+    // this just identifies the run, it isn't a secret).
+    var uuid: [16]u8 = undefined;
+    const a: u64 = nowNs() *% 0x9E3779B97F4A7C15;
+    const b: u64 = (@as(u64, @bitCast(unixTimeSec())) ^ (a >> 17)) *% 0xC2B2AE3D27D4EB4F;
+    std.mem.writeInt(u64, uuid[0..8], a, .little);
+    std.mem.writeInt(u64, uuid[8..16], b, .little);
+    uuid[6] = (uuid[6] & 0x0f) | 0x40; // version 4
+    uuid[8] = (uuid[8] & 0x3f) | 0x80; // variant
+    try w.print(
+        "  \"trace-uuid\":\"{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\",\n",
+        .{ uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15] },
+    );
+    try w.writeAll("  \"tool\":\"fix\",\n");
+    try w.print("  \"workers\":{d},\n", .{n_workers});
+    try w.print("  \"unix-time\":{d},\n", .{unixTimeSec()});
+    try w.writeAll("  \"source\":");
+    try writeJsonString(w, meta_source);
+    try w.writeAll("\n}\n}\n");
     try w.flush();
 
     const dropped_e = dropped_events.load(.monotonic);
