@@ -832,7 +832,11 @@ pub const Evaluator = struct {
     /// peer helps drain marker slot `worker_id` to termination.
     fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        // Drain the mark to global termination, then help evacuate: the young-
+        // object lists are a shared work queue, so this parked peer claims and
+        // copies survivors into its own tenured TLAB alongside the collector.
         self.gc_tracer.drainParallel(&self.heap, worker_id);
+        self.heap.gcEvacClaimLoop(self.gc_tracer.mark_bits);
     }
 
     /// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
@@ -857,6 +861,7 @@ pub const Evaluator = struct {
                 self.heap.gcAfterCollect(self.heap.totalReservedBytes());
                 return;
             };
+            self.heap.gcBeginEvac(self.worker_count); // arm the evac work queue (phase closed)
             // Seed roots + remset into the collector's own marker deque, open
             // the mark so parked peers help drain it, then drain alongside them.
             tr.beginSeeding(collector_id);
@@ -865,6 +870,12 @@ pub const Evaluator = struct {
             tr.endSeeding();
             self.scheduler.gcOpenMark();
             tr.drainParallel(&self.heap, collector_id); // returns at termination
+            // Mark closed. Verify closure while peers spin (no range moves yet),
+            // then open the evac phase and evacuate alongside them.
+            self.heap.gcVerifyMinorClosure(tr.mark_bits);
+            self.heap.gcOpenEvac();
+            self.heap.gcEvacClaimLoop(tr.mark_bits);
+            self.heap.gcWaitEvacDone();
             self.scheduler.gcCloseMark();
             tr.sumStats();
         } else {
@@ -877,7 +888,12 @@ pub const Evaluator = struct {
             tr.drainMinor(&self.heap);
         }
         const t1 = gcNowNs();
-        const st = self.heap.gcMinorCollect(tr.mark_bits);
+        // w>1 already evacuated in parallel (claim loop); just finish (verify +
+        // reset nursery). w=1 runs the whole serial minor here.
+        const st = if (self.worker_count > 1)
+            self.heap.gcFinishEvac()
+        else
+            self.heap.gcMinorCollect(tr.mark_bits);
         const t2 = gcNowNs();
         self.heap.gcRemsetClear();
         self.heap.gcAfterCollect(tr.stats.bytes);

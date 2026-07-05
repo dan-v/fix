@@ -120,6 +120,33 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             len: u32,
         };
 
+        /// Per-worker tenured bump cursor (a thread-local allocation buffer).
+        /// Refilled a chunk at a time under `write_mu`; individual reservations
+        /// bump the local cursor lock-free. Lets the parallel copying collector
+        /// evacuate survivors concurrently without every worker serializing on
+        /// the store's global `reserve`. Only the final partial chunk per worker
+        /// leaks (its unused tail), so the waste is bounded and tiny.
+        pub const Tlab = struct { seg: u32 = 0, off: u32 = 0, used: u32 = 0, cap: u32 = 0 };
+        pub const TLAB_CHUNK: u32 = 8192;
+
+        /// Reserve `len` slots via `tlab` (tenured). Bumps the local cursor when
+        /// the current chunk has room; otherwise refills one chunk under
+        /// `write_mu` (or, for an oversized `len`, reserves it directly and
+        /// leaves the chunk intact). Not thread-safe on a single `tlab` — each
+        /// worker owns its own.
+        pub fn reserveLocal(self: *Self, allocator: std.mem.Allocator, tlab: *Tlab, len: u32) !Range {
+            if (len == 0) return .{ .segment = 0, .offset = 0, .len = 0 };
+            if (tlab.used + len <= tlab.cap) {
+                const r: Range = .{ .segment = tlab.seg, .offset = tlab.off + tlab.used, .len = len };
+                tlab.used += len;
+                return r;
+            }
+            if (len >= TLAB_CHUNK) return self.reserve(allocator, len); // oversized: direct, keep tlab
+            const chunk = try self.reserve(allocator, TLAB_CHUNK);
+            tlab.* = .{ .seg = chunk.segment, .off = chunk.offset, .used = len, .cap = chunk.len };
+            return .{ .segment = chunk.segment, .offset = chunk.offset, .len = len };
+        }
+
         /// Cursor packs (segment_index, used_in_segment) into one u64 so we can
         /// load it atomically. The writer mutex is the only mutator, so this
         /// could be plain u64; the atomic wrapper exists so opportunistic

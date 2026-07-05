@@ -259,6 +259,13 @@ pub const HeapLocal = struct {
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
+    /// Per-worker tenured allocation buffers used ONLY during evacuation, so the
+    /// parallel copying collector's workers each bump their own tenured cursor
+    /// instead of serializing on the store's `write_mu`. Persist across minors
+    /// (tenured space is permanent); never reset.
+    evac_v: if (build_options.gc) ValueStore.Tlab else void = if (build_options.gc) .{} else {},
+    evac_a: if (build_options.gc) AttrStore.Tlab else void = if (build_options.gc) .{} else {},
+    evac_p: if (build_options.gc) AttrPosStore.Tlab else void = if (build_options.gc) .{} else {},
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         if (comptime !build_options.gc) return;
@@ -364,6 +371,18 @@ pub const ObjectHeap = struct {
     /// free), so there is NO allocation-path barrier — a freshly bumped slot is
     /// young by default. Grown (zeroed) at each minor to cover the object count.
     gc_old_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
+    /// Parallel-evacuation coordination (`--workers>1`). The young-object lists
+    /// (`worker_locals[*].gc_young_slots`) form a work queue: each helping
+    /// worker atomically claims a list index via `gc_evac_next`, evacuates it
+    /// into ITS OWN tenured TLAB, and bumps `gc_evac_done`. The collector opens
+    /// the phase via `gc_evac_open` (after it has verified mark closure) and
+    /// waits until `gc_evac_done == gc_evac_count` before resetting the nursery.
+    gc_evac_open: if (build_options.gc) std.atomic.Value(bool) else void = if (build_options.gc) .init(false) else {},
+    gc_evac_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    gc_evac_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    gc_evac_count: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
+    gc_evac_promoted: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
+    gc_evac_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
     // path reuses without a lock — a single shared free list + mutex
     // serialized all allocation across workers and was the entire w>1 wall
@@ -1059,7 +1078,10 @@ pub const ObjectHeap = struct {
     inline fn gcSetOld(self: *ObjectHeap, id: ObjectId) void {
         const word = id >> 6;
         if (word >= self.gc_old_bits.len) return;
-        self.gc_old_bits[word] |= @as(u64, 1) << @intCast(id & 63);
+        // Atomic OR: parallel evacuation promotes concurrently from multiple
+        // workers, whose ids may share a bitmap word. (Serially uncontended, so
+        // ~free at --workers=1.)
+        _ = @atomicRmw(u64, &self.gc_old_bits[word], .Or, @as(u64, 1) << @intCast(id & 63), .monotonic);
     }
 
     /// Grow the generation bitmap to cover `[0, count)` (new words zeroed ⇒
@@ -1112,37 +1134,37 @@ pub const ObjectHeap = struct {
     // tenured (segment ≥ nursery_segs — oversized spills, or thunk spilled
     // upvalues which are born tenured) are left in place.
 
-    fn gcEvacValues(self: *ObjectHeap, r: *ValueRange) void {
+    fn gcEvacValues(self: *ObjectHeap, local: *HeapLocal, r: *ValueRange) void {
         if (r.len == 0 or !self.values.isYoung(r.*)) return;
-        const dst = self.values.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (values)");
+        const dst = self.values.reserveLocal(self.allocator, &local.evac_v, r.len) catch @panic("gc: nursery evacuation OOM (values)");
         @memcpy(self.values.sliceMut(dst), self.values.slice(r.*));
         r.* = dst;
     }
-    fn gcEvacAttrs(self: *ObjectHeap, r: *AttrRange) void {
+    fn gcEvacAttrs(self: *ObjectHeap, local: *HeapLocal, r: *AttrRange) void {
         if (r.len == 0 or !self.attrs.isYoung(r.*)) return;
-        const dst = self.attrs.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (attrs)");
+        const dst = self.attrs.reserveLocal(self.allocator, &local.evac_a, r.len) catch @panic("gc: nursery evacuation OOM (attrs)");
         @memcpy(self.attrs.sliceMut(dst), self.attrs.slice(r.*));
         r.* = dst;
     }
-    fn gcEvacAttrPos(self: *ObjectHeap, r: *AttrPosRange) void {
+    fn gcEvacAttrPos(self: *ObjectHeap, local: *HeapLocal, r: *AttrPosRange) void {
         if (r.len == 0 or !self.attr_positions.isYoung(r.*)) return;
-        const dst = self.attr_positions.reserve(self.allocator, r.len) catch @panic("gc: nursery evacuation OOM (attr_pos)");
+        const dst = self.attr_positions.reserveLocal(self.allocator, &local.evac_p, r.len) catch @panic("gc: nursery evacuation OOM (attr_pos)");
         @memcpy(self.attr_positions.sliceMut(dst), self.attr_positions.slice(r.*));
         r.* = dst;
     }
 
-    fn gcEvacuateObject(self: *ObjectHeap, id: ObjectId) void {
+    fn gcEvacuateObject(self: *ObjectHeap, local: *HeapLocal, id: ObjectId) void {
         const obj = self.objects.getMut(id);
         switch (obj.*) {
-            .list => |*r| self.gcEvacValues(r),
+            .list => |*r| self.gcEvacValues(local, r),
             .attrs => |*a| {
-                self.gcEvacAttrs(&a.range);
-                self.gcEvacAttrPos(&a.positions);
+                self.gcEvacAttrs(local, &a.range);
+                self.gcEvacAttrPos(local, &a.positions);
             },
-            .closure => |*c| self.gcEvacValues(&c.upvalues),
-            .builtin_closure => |*c| self.gcEvacValues(&c.args),
-            .partial_app => |*p| self.gcEvacValues(&p.args),
-            .context_string => |*c| self.gcEvacAttrs(&c.context),
+            .closure => |*c| self.gcEvacValues(local, &c.upvalues),
+            .builtin_closure => |*c| self.gcEvacValues(local, &c.args),
+            .partial_app => |*p| self.gcEvacValues(local, &p.args),
+            .context_string => |*c| self.gcEvacAttrs(local, &c.context),
             .thunk, .merge_attrs, .boxed_int => {},
         }
     }
@@ -1160,7 +1182,8 @@ pub const ObjectHeap = struct {
     /// young child of any parent means the tracer/remembered-set missed an edge
     /// and is about to sweep a live object. Panics with parent→child so a missed
     /// barrier/root is caught at its source, before any downstream misread.
-    fn gcVerifyMinorClosure(self: *ObjectHeap, mark_bits: []const u64) void {
+    pub fn gcVerifyMinorClosure(self: *ObjectHeap, mark_bits: []const u64) void {
+        if (comptime !gc_debug) return;
         const marked = struct {
             fn f(mb: []const u64, id: ObjectId) bool {
                 const w = id >> 6;
@@ -1244,35 +1267,109 @@ pub const ObjectHeap = struct {
         var st: MinorStats = .{};
         if (comptime !build_options.gc) return st;
         self.gcGrowOldBits(self.objects.count());
-        if (comptime gc_debug) self.gcVerifyMinorClosure(mark_bits);
-        // Iterate exactly this cycle's young objects (per-worker lists). Marked
-        // ⇒ live survivor: evacuate its young ranges + promote. Unmarked ⇒ dead:
-        // reclaim its slot id (its young ranges vanish with the nursery reset).
+        self.gcVerifyMinorClosure(mark_bits);
+        // Iterate exactly this cycle's young objects (per-worker lists), all into
+        // the calling worker's tenured TLAB / free shard.
+        const dst = self.currentLocal();
         for (self.worker_locals) |*local| {
-            for (local.gc_young_slots.items) |id| {
-                const word = id >> 6;
-                const bit = @as(u64, 1) << @intCast(id & 63);
-                const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
-                if (marked) {
-                    self.gcEvacuateObject(id);
-                    self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
-                    st.promoted += 1;
-                } else {
-                    // Detector leaks dead ids (no reuse) + clears the alloc bit so
-                    // a dangling read traps; release recycles the id.
-                    if (comptime gc_debug) {
-                        if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~bit;
-                    } else {
-                        local.gc_free_objects.append(self.allocator, id) catch {};
-                    }
-                    st.freed += 1;
-                }
-            }
+            self.gcEvacListInto(local.gc_young_slots.items, dst, mark_bits, &st);
             local.gc_young_slots.clearRetainingCapacity();
         }
         if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
         self.gcResetNursery();
         return st;
+    }
+
+    /// Evacuate one young-object list into `dst` (the *processing* worker's
+    /// tenured TLAB + free shard — NOT necessarily the list's owner). Marked ⇒
+    /// live survivor: evacuate its young ranges + promote. Unmarked ⇒ dead:
+    /// reclaim its slot id (its young ranges vanish with the nursery reset).
+    /// Safe to run concurrently on DISJOINT lists: each object id lives in
+    /// exactly one list, ranges are single-owner, `gcSetOld` is atomic, and each
+    /// worker writes only its own `dst`.
+    fn gcEvacListInto(self: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLocal, mark_bits: []const u64, st: *MinorStats) void {
+        for (src_ids) |id| {
+            const word = id >> 6;
+            const bit = @as(u64, 1) << @intCast(id & 63);
+            const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
+            if (marked) {
+                self.gcEvacuateObject(dst, id);
+                self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
+                st.promoted += 1;
+            } else {
+                // Detector leaks dead ids (no reuse) + clears the alloc bit so a
+                // dangling read traps (atomic — parallel evac shares the word);
+                // release recycles the id into the processing worker's shard.
+                if (comptime gc_debug) {
+                    if (word < self.gc_alloc_bits.len) _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .And, ~bit, .monotonic);
+                } else {
+                    dst.gc_free_objects.append(self.allocator, id) catch {};
+                }
+                st.freed += 1;
+            }
+        }
+    }
+
+    // --- parallel evacuation phase (`--workers>1`) ---------------------------
+    //
+    // The collector calls `gcBeginEvac` before opening the mark, then (after the
+    // mark terminates and it has verified closure) `gcOpenEvac`. Every worker —
+    // collector and parked peers alike — runs `gcEvacClaimLoop`, atomically
+    // claiming young-object lists and evacuating them into its own TLAB. The
+    // collector then `gcWaitEvacDone` + `gcFinishEvac` (reset the nursery).
+
+    /// Collector: arm the evac work queue. Called before `gcOpenMark` (grows the
+    /// generation bitmap while the object count is quiescent; the phase stays
+    /// closed until `gcOpenEvac`).
+    pub fn gcBeginEvac(self: *ObjectHeap, worker_count: u8) void {
+        if (comptime !build_options.gc) return;
+        self.gcGrowOldBits(self.objects.count());
+        self.gc_evac_count = worker_count;
+        self.gc_evac_next.store(0, .monotonic);
+        self.gc_evac_done.store(0, .monotonic);
+        self.gc_evac_promoted.store(0, .monotonic);
+        self.gc_evac_freed.store(0, .monotonic);
+        self.gc_evac_open.store(false, .release);
+    }
+
+    /// Collector: release helpers into the evac phase. Called only after mark
+    /// closure is verified, so no worker moves a range the collector is still
+    /// reading.
+    pub fn gcOpenEvac(self: *ObjectHeap) void {
+        if (comptime !build_options.gc) return;
+        self.gc_evac_open.store(true, .release);
+    }
+
+    /// Any worker (collector or parked peer): claim + evacuate young-object
+    /// lists until the queue drains. Spins until the collector opens the phase.
+    pub fn gcEvacClaimLoop(self: *ObjectHeap, mark_bits: []const u64) void {
+        if (comptime !build_options.gc) return;
+        while (!self.gc_evac_open.load(.acquire)) std.atomic.spinLoopHint();
+        const dst = self.currentLocal();
+        var local_st: MinorStats = .{};
+        while (true) {
+            const i = self.gc_evac_next.fetchAdd(1, .monotonic);
+            if (i >= self.gc_evac_count) break;
+            self.gcEvacListInto(self.worker_locals[i].gc_young_slots.items, dst, mark_bits, &local_st);
+            self.worker_locals[i].gc_young_slots.clearRetainingCapacity();
+            _ = self.gc_evac_done.fetchAdd(1, .release);
+        }
+        _ = self.gc_evac_promoted.fetchAdd(local_st.promoted, .monotonic);
+        _ = self.gc_evac_freed.fetchAdd(local_st.freed, .monotonic);
+    }
+
+    /// Collector: block until every young-object list has been evacuated.
+    pub fn gcWaitEvacDone(self: *ObjectHeap) void {
+        if (comptime !build_options.gc) return;
+        while (self.gc_evac_done.load(.acquire) < self.gc_evac_count) std.atomic.spinLoopHint();
+    }
+
+    /// Collector: post-evac finish (all lists drained). Verify + reset nursery.
+    pub fn gcFinishEvac(self: *ObjectHeap) MinorStats {
+        if (comptime !build_options.gc) return .{};
+        if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
+        self.gcResetNursery();
+        return .{ .promoted = self.gc_evac_promoted.load(.monotonic), .freed = self.gc_evac_freed.load(.monotonic) };
     }
 
     /// Detector: after evacuation every reachable object's owned ranges must be
