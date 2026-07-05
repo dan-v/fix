@@ -112,7 +112,7 @@ pub const Fiber = struct {
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
-    /// Timeline (`FIX_TIMELINE`): flow-arrow id for a STOLEN task's quantum,
+    /// Timeline (`--timeline`): flow-arrow id for a STOLEN task's quantum,
     /// so the run emits a `flowIn` matching the steal's `flowOut` (→ a
     /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
     /// `flowIn` treats 0 as "no flow", so this is inert when tracing is off.

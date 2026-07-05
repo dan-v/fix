@@ -27,22 +27,22 @@
 //! `end` asserts the popped label matches, so if a span ever straddles a
 //! yield the imbalance trips the assertion at its source.
 //!
-//! Runtime-gated (`FIX_TIMELINE` env or `--timeline[=path]`): always compiled
-//! in, `init()` flips `active` on. When off, each entry point is one
-//! predictable branch on `active`; the hot instrumentation sits at
-//! fiber-quantum / park granularity (not per-op), so it is effectively free.
+//! Runtime-gated (`--timeline[=path]`): always compiled in, `init()` flips
+//! `active` on. When off, each entry point is one predictable branch on
+//! `active`; the hot instrumentation sits at fiber-quantum / park granularity
+//! (not per-op), so it is effectively free.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const worker_id_mod = @import("runtime").worker_id;
 
-/// Always compiled in — timeline is now RUNTIME-gated (`FIX_TIMELINE` env or
-/// `--timeline[=path]`): `init()` flips `active` on. When off, every entry
-/// point is one predictable-not-taken branch on `active`; the hot
-/// instrumentation is at fiber-quantum / park granularity (not per-op), so it
-/// is effectively free. Kept as a `pub const true` so existing
-/// `if (comptime timeline.enabled)` sites fold to the taken branch — the real
-/// switch is the runtime `active` flag, read via `on()`.
+/// Always compiled in — timeline is now RUNTIME-gated (`--timeline[=path]`):
+/// `init()` flips `active` on. When off, every entry point is one
+/// predictable-not-taken branch on `active`; the hot instrumentation is at
+/// fiber-quantum / park granularity (not per-op), so it is effectively free.
+/// Kept as a `pub const true` so existing `if (comptime timeline.enabled)`
+/// sites fold to the taken branch — the real switch is the runtime `active`
+/// flag, read via `on()`.
 pub const enabled = true;
 
 /// Runtime switch: true between `init()` and `dump()`. THE gate — a plain

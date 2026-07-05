@@ -129,13 +129,10 @@ pub fn main(init: std.process.Init) !void {
         tjit_hot.report_enabled = options.print_sched_stats;
     }
 
-    // Timeline is always compiled in and RUNTIME-gated: enable via
-    // `--timeline[=path]` OR the `FIX_TIMELINE[=path]` env var. `init()` flips
-    // the runtime gate on; with neither set the probe stays dormant (~free).
-    const timeline_path: ?[]const u8 = options.timeline_path orelse blk: {
-        const v = init.environ_map.get("FIX_TIMELINE") orelse break :blk null;
-        break :blk if (v.len == 0) "fix-timeline.json" else v;
-    };
+    // Timeline is always compiled in and RUNTIME-gated: `--timeline[=path]`
+    // calls `init()` which flips the runtime gate on; without it the probe
+    // stays dormant (one predictable branch at quantum granularity, ~free).
+    const timeline_path = options.timeline_path;
     if (timeline_path != null) timeline.init(allocator, worker_count, 1 << 21);
 
     const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);

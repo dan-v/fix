@@ -12,9 +12,15 @@ Emitter is a lock-free atomic-append event buffer + name arena + per-worker span
 stacks (src/probe/timeline.zig). Nesting constraint (spans mustn't straddle a fiber
 yield) is solved for new fine-grained work by using **async events** (don't nest).
 
+## Status (branch feat/timeline-perfetto, off main)
+A/B/C/D-core DONE + verified (byte-identical off-path, valid Perfetto JSON via
+FIX_TIMELINE on a normal build). Remaining: stall markers, critical-path track,
+async fibers, flamegraph naming, GC coarse spans (-Dgc). Commits 697ed5e (A),
+b921deb (B), 2b72a58 (C), e2ff910 (D-core).
+
 ## Stages
 
-- **A — Foundation (runtime gating + richer emitter).** DONE-criteria: `FIX_TIMELINE`
+- **A — Foundation (runtime gating + richer emitter). DONE.** DONE-criteria: `FIX_TIMELINE`
   env (and `--timeline`) activate on a NORMAL build (timeline always compiled in,
   `active` is the runtime gate, `on()` accessor; ~free when off — predictable branch
   at quantum granularity). Adopt the richer emitter (counter tracks, rich args,
