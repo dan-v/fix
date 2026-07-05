@@ -415,21 +415,13 @@ pub const Worker = struct {
     /// map, or a list-range (no single chunk). Only called when tracing is on.
     fn timelineTaskLoc(f: *Fiber, buf: []u8) []const u8 {
         const task = f.current_task orelse return "";
-        const span = switch (task) {
-            .force_thunk => |id| blk: {
-                const th = f.vm.heap.getThunkAssumeValid(id);
-                // Target arm is live only while unresolved(0)/evaluating(1);
-                // past that it's been overwritten by the result → don't read it.
-                if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) break :blk null;
-                if (th.targetKind() != .bytecode) break :blk null;
-                const ch = f.vm.registry.get(th.payload.target.bytecode.chunk_id) orelse break :blk null;
-                break :blk vm_errors.chunkEntrySpan(ch);
-            },
-            .force_list_range => null,
-        } orelse return "";
-        const file_id = span.file orelse return "";
-        const base = std.fs.path.basename(f.vm.intern.get(file_id));
-        return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
+        return switch (task) {
+            // Shared rich label (source loc / mapAttrs / builtins.* / applied
+            // fn / …); "" when unresolvable or already resolved → the quantum
+            // keeps its generic "force-thunk" name.
+            .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
+            .force_list_range => "",
+        };
     }
 
     /// Best-effort "basename:line" for the frame a resumed fiber re-enters.

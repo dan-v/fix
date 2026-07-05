@@ -383,15 +383,27 @@ pub threadlocal var native_depth: u32 = 0;
 /// giant.nix" for a builtin (the path arg is the useful bit). A busy thunk is
 /// mid-evaluation, so its bare target arm is live — safe to read here (call it
 /// BEFORE the yield). Best-effort → "".
-fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
-    // The outer thunk is busy (evaluating) → its target arm is live.
+/// Rich source label for a thunk — "modules.nix:545" / "mapAttrs" /
+/// "builtins.import foo.nix" / ".attr" / an applied fn's location. Shared by
+/// the crit-wait track (force.zig) and the run quanta (worker.zig).
+///
+/// Returns "" when unresolvable OR when the thunk has already RESOLVED: a
+/// resolved thunk's bare target union is clobbered, so it must not be read
+/// (state-guarded). Best-effort and bounds-safe against a concurrent resolve.
+pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    const label = critTargetLabel(self, th, buf, true);
+    if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) return "";
+    return critTargetLabel(self, th, buf, true);
+}
+
+fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
+    const label = thunkLabel(self, thunk_id, buf);
     if (label.len > 0) return label;
-    // No resolvable location. Usually the RACE: the busy thunk resolved between
-    // our `.busy` observation and this read (a short wait), clobbering its
-    // target union — only the stale kind survives. Long (meaningful) waits stay
-    // busy throughout and label above. Fall back to the kind.
+    // The crit track never shows a bare "wait". thunkLabel returns "" either
+    // because the thunk RESOLVED mid-read (the race — a short wait, target
+    // clobbered) or because it's genuinely source-less; distinguish the two.
+    const th = self.heap.getThunkAssumeValid(thunk_id);
+    if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) return "resolved";
     return @tagName(th.targetKind());
 }
 
