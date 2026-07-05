@@ -254,6 +254,11 @@ pub const HeapLocal = struct {
     /// lock. Drained (STW) at the next minor to seed the young referents that
     /// only an old object keeps alive; cleared after.
     gc_remset: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
+    /// This worker's young objects since the last minor (every id from
+    /// `reserveObjectSlot`, including reused slots). The STW minor iterates
+    /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
+    /// safe, unlike an id-range frontier.
+    gc_young_slots: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         if (comptime !build_options.gc) return;
@@ -262,6 +267,7 @@ pub const HeapLocal = struct {
         self.gc_free_attrs.deinit(allocator);
         self.gc_free_attr_pos.deinit(allocator);
         self.gc_remset.deinit(allocator);
+        self.gc_young_slots.deinit(allocator);
     }
 };
 
@@ -790,37 +796,34 @@ pub const ObjectHeap = struct {
     /// observe the in-flight slot.
     pub fn reserveObjectSlot(self: *ObjectHeap) !ObjectId {
         const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            // Detector keeps freed slots unused so use-after-free is caught.
-            // Lock-free: this worker's OWN free-slot shard.
-            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
-                if (local.gc_free_objects.pop()) |id| return id;
+        const id = blk: {
+            if (comptime build_options.gc) {
+                // Reuse a slot freed by a prior minor. Detector leaves freed
+                // slots unused so use-after-free is caught.
+                if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
+                    if (local.gc_free_objects.pop()) |rid| break :blk rid;
+                }
             }
-        }
-        const chunk = &local.object;
-        if (chunk.cursor < chunk.end) {
-            const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
+            const chunk = &local.object;
+            if (chunk.cursor < chunk.end) {
+                const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
+                chunk.cursor += 1;
+                break :blk cid;
+            }
+            const refilled = try self.objects.reserve(self.allocator, OBJECT_CHUNK_SIZE);
+            chunk.segment = refilled.segment;
+            chunk.cursor = refilled.offset;
+            chunk.end = refilled.offset + refilled.len;
+            const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
             chunk.cursor += 1;
-            return id;
-        }
-        const refilled = try self.objects.reserve(self.allocator, OBJECT_CHUNK_SIZE);
-        chunk.segment = refilled.segment;
-        chunk.cursor = refilled.offset;
-        chunk.end = refilled.offset + refilled.len;
-        // GC threshold check lives here on the chunk-refill slow path (once
-        // per OBJECT_CHUNK_SIZE allocs), never on the per-alloc fast path.
-        // While the heap is growing (free lists empty) every chunk refills,
-        // so the byte threshold is sampled finely; once collecting starts
-        // and slots are reused, refills — and this check — go quiet.
+            break :blk cid;
+        };
+        // Record the id in this worker's young-slot list: the minor iterates
+        // exactly these (O(young)), and it's robust to slot reuse and the
+        // reserved-vs-filled TLAB tail (both of which broke an id-range frontier).
         if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !self.gc_collect_requested and
-                self.totalReservedBytes() > self.gc_threshold_bytes)
-            {
-                self.gc_collect_requested = true;
-            }
+            if (self.gc_collect_enabled) local.gc_young_slots.append(self.allocator, id) catch {};
         }
-        const id = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
-        chunk.cursor += 1;
         return id;
     }
 
@@ -1226,39 +1229,46 @@ pub const ObjectHeap = struct {
         if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
     }
 
+    /// One minor collection — **O(young)**, not O(total objects). The young
+    /// generation is the contiguous slot range `[gc_young_slot_start, count)`.
+    /// Slot ids are NOT recycled between minors (dead young slots leak until a
+    /// rare major), so the range is gap-free and holds exactly this cycle's new
+    /// objects. `gcResetNursery` flushes the OBJECT TLABs too, so after a minor
+    /// `count()` is the true next-allocatable id — the frontier — and the next
+    /// generation's objects are all born at or above it (the reserved-vs-filled
+    /// TLAB-tail hazard is why an earlier frontier=count attempt leaked
+    /// below-frontier survivors). Only MARKED (survivor) slots do work; unmarked
+    /// slots are dead young or unfilled tails and need nothing. No
+    /// `gcReconstructAllocBits`, no O(count) walk.
     pub fn gcMinorCollect(self: *ObjectHeap, mark_bits: []const u64) MinorStats {
         var st: MinorStats = .{};
         if (comptime !build_options.gc) return st;
-        if (comptime !gc_debug) self.gcReconstructAllocBits();
         self.gcGrowOldBits(self.objects.count());
         if (comptime gc_debug) self.gcVerifyMinorClosure(mark_bits);
-        const n = self.objects.count();
-        var id: ObjectId = self.gc_track_from;
-        while (id < n) : (id += 1) {
-            const word = id >> 6;
-            if (word >= self.gc_alloc_bits.len) break;
-            const bit = @as(u64, 1) << @intCast(id & 63);
-            if (self.gc_alloc_bits[word] & bit == 0) continue; // unfilled / free
-            if (!self.gcIsYoung(id)) continue; // already tenured
-            const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
-            if (marked) {
-                self.gcEvacuateObject(id);
-                self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
-                st.promoted += 1;
-            } else {
-                // Dead young: reclaim the slot id. Its young ranges are in the
-                // nursery, reclaimed wholesale by the reset below. In the
-                // detector we DON'T recycle the id (just clear its alloc bit),
-                // so any dangling reference — a missed root or an unrecorded
-                // old→young edge — traps at `gcAssertLive` with the object kind
-                // instead of silently reading a reused slot.
-                if (comptime gc_debug) {
-                    self.gc_alloc_bits[word] &= ~bit;
+        // Iterate exactly this cycle's young objects (per-worker lists). Marked
+        // ⇒ live survivor: evacuate its young ranges + promote. Unmarked ⇒ dead:
+        // reclaim its slot id (its young ranges vanish with the nursery reset).
+        for (self.worker_locals) |*local| {
+            for (local.gc_young_slots.items) |id| {
+                const word = id >> 6;
+                const bit = @as(u64, 1) << @intCast(id & 63);
+                const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
+                if (marked) {
+                    self.gcEvacuateObject(id);
+                    self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
+                    st.promoted += 1;
                 } else {
-                    self.currentLocal().gc_free_objects.append(self.allocator, id) catch {};
+                    // Detector leaks dead ids (no reuse) + clears the alloc bit so
+                    // a dangling read traps; release recycles the id.
+                    if (comptime gc_debug) {
+                        if (word < self.gc_alloc_bits.len) self.gc_alloc_bits[word] &= ~bit;
+                    } else {
+                        local.gc_free_objects.append(self.allocator, id) catch {};
+                    }
+                    st.freed += 1;
                 }
-                st.freed += 1;
             }
+            local.gc_young_slots.clearRetainingCapacity();
         }
         if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
         self.gcResetNursery();
