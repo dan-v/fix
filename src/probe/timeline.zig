@@ -73,6 +73,13 @@ pub const Label = enum(u8) {
     /// A builtin on the critical path (subject = builtin name). Instant marker
     /// — many builtins force args and thus straddle a yield.
     builtin,
+    /// The demand fiber blocked on a busy thunk (subject = the thunk's source
+    /// location). Emitted on the dedicated CRIT_TID track = the serial floor's
+    /// "waiting for someone else to compute X" spans.
+    crit_wait,
+    /// A worker parked while stealable work was pending (subject = pending
+    /// count) — a scheduling stall, distinct from a genuine no-work park.
+    stall,
 
     fn text(self: Label) []const u8 {
         return switch (self) {
@@ -86,9 +93,15 @@ pub const Label = enum(u8) {
             .gc => "gc",
             .gc_wait => "gc-wait",
             .builtin => "builtin",
+            .crit_wait => "wait",
+            .stall => "stall",
         };
     }
 };
+
+/// Dedicated track id for the demand fiber's blocking-wait spans (the critical
+/// path). Above any real worker id (u8), so it never collides.
+pub const CRIT_TID: u16 = 500;
 
 const MAX_DEPTH = 64;
 
@@ -373,6 +386,31 @@ fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16) void {
     });
 }
 
+/// Start timing a demand-fiber blocking wait for the critical-path track:
+/// returns a start timestamp (0 = tracing off / don't record). Cheap.
+pub inline fn critWaitBegin() u64 {
+    return if (active) nowNs() else 0;
+}
+
+/// Close a demand-fiber wait started by `critWaitBegin`: emit a span on the
+/// dedicated CRIT_TID track from `start_ns` to now, labelled with `subject`
+/// (the busy thunk's source location). No-op if tracing off or start==0.
+pub fn critWaitEnd(subject: []const u8, begin_ns: u64) void {
+    if (!active or begin_ns == 0) return;
+    const now = nowNs();
+    const nm = storeName(subject);
+    appendEvent(.{
+        .ts_ns = begin_ns,
+        .dur_ns = if (now > begin_ns) now - begin_ns else 0,
+        .tid = CRIT_TID,
+        .kind = .span,
+        .label = .crit_wait,
+        .subj_off = nm.off,
+        .subj_len = nm.len,
+        .arg = 0,
+    });
+}
+
 /// Throttle helper for periodic sampling: returns true at most once per
 /// `min_gap_ns` (per calling worker is fine — counters merge by name/ts).
 var last_sample_ns: std.atomic.Value(u64) = .init(0);
@@ -471,6 +509,11 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
         }
         try w.writeAll("\"}},\n");
     }
+    // The dedicated critical-path track (demand-fiber blocking waits).
+    try w.print(
+        "{{\"ph\":\"M\",\"pid\":1,\"tid\":{d},\"name\":\"thread_name\",\"args\":{{\"name\":\"critical path (demand waits)\"}}}},\n",
+        .{CRIT_TID},
+    );
 
     var i: usize = 0;
     while (i < count) : (i += 1) {

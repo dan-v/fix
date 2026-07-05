@@ -15,6 +15,8 @@ const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("../probe/prof.zig");
+const timeline = @import("../probe/timeline.zig");
+const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe/prof_path.zig");
 const trace_probe = @import("../probe/trace_probe.zig");
 const depth0_probe = @import("../probe/depth0_probe.zig");
@@ -376,6 +378,19 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 /// still collects while an import nested inside another builtin does not.
 pub threadlocal var native_depth: u32 = 0;
 
+/// Timeline: "basename:line" source location of a busy thunk the demand fiber
+/// is blocking on. A busy thunk is mid-evaluation, so its bare target arm is
+/// live — safe to read here (call it BEFORE the yield). Best-effort → "".
+fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
+    const th = self.heap.getThunkAssumeValid(thunk_id);
+    if (th.targetKind() != .bytecode) return "";
+    const ch = self.registry.get(th.payload.target.bytecode.chunk_id) orelse return "";
+    const span = vm_errors.sourceSpanForChunk(ch, 0) orelse return "";
+    const file_id = span.file orelse return "";
+    const base = std.fs.path.basename(self.intern.get(file_id));
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
     // safepoint by native_depth + allocation cursor. Independent of -Dgc.
@@ -535,10 +550,21 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 const worker_fiber: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
                 if (thunk.enrollWaiter(&worker_fiber.waiter)) {
                     worker_fiber.state = .suspended;
+                    // Timeline: if the DEMAND fiber blocks here, this wait is on
+                    // the critical path — time it and record a labelled span on
+                    // the crit track (the "main stalls on a giant file" signal).
+                    // Resolve the label NOW (the busy thunk is still evaluating,
+                    // so its target arm is live); after the yield it may be
+                    // resolved and the union clobbered. `lbuf` lives on the
+                    // fiber stack, preserved across the yield.
+                    const crit_start = if (worker_fiber.is_demand) timeline.critWaitBegin() else 0;
+                    var lbuf: [128]u8 = undefined;
+                    const crit_label = if (crit_start != 0) critWaitLabel(self, thunk_id, &lbuf) else "";
                     const ty = prof.start(.wait_busy_thunk);
                     fiber_mod.Fiber.yield();
                     prof.end(.wait_busy_thunk, ty);
                     worker_fiber.state = .running;
+                    if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
                 }
                 continue;
             },
