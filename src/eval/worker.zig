@@ -397,15 +397,15 @@ pub const Worker = struct {
             // the thunk/list id as click-through args.
             const loc = timelineTaskLoc(f, &locbuf);
             switch (task) {
-                .force_thunk => |id| timeline.beginArgs(.run, if (loc.len > 0) loc else "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
+                .force_thunk => |id| timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("force-thunk") else loc, f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
                 .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
             }
             // Consumer end of the work-stealing arrow — inside this quantum so
             // the arrow lands on it. No-op unless this task was stolen (id != 0).
             timeline.flowIn(.steal, f.flow_in_id, worker_id_mod.current);
         } else {
-            const loc = timelineResumeLoc(f, &locbuf);
-            timeline.begin(.run, if (loc.len > 0) loc else "resume", f.fiber_id);
+            const loc = timelineResumeLoc(f);
+            timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("resume") else loc, f.fiber_id, "");
         }
     }
 
@@ -413,24 +413,23 @@ pub const Worker = struct {
     /// when unresolvable — a non-bytecode thunk, a thunk already resolved (its
     /// bare target union is dead, guarded by the state check), a missing source
     /// map, or a list-range (no single chunk). Only called when tracing is on.
-    fn timelineTaskLoc(f: *Fiber, buf: []u8) []const u8 {
-        const task = f.current_task orelse return "";
+    fn timelineTaskLoc(f: *Fiber, buf: []u8) timeline.Subject {
+        const task = f.current_task orelse return .{};
         return switch (task) {
             // Shared rich label (source loc / mapAttrs / builtins.* / applied
-            // fn / …); "" when unresolvable or already resolved → the quantum
+            // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range => "",
+            .force_list_range => .{},
         };
     }
 
     /// Best-effort "basename:line" for the frame a resumed fiber re-enters.
-    fn timelineResumeLoc(f: *Fiber, buf: []u8) []const u8 {
-        if (f.vm.frames_len == 0) return "";
-        const span = vm_errors.sourceSpanForFrame(f.vm.frames[f.vm.frames_len - 1]) orelse return "";
-        const file_id = span.file orelse return "";
-        const base = std.fs.path.basename(f.vm.intern.get(file_id));
-        return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
+    fn timelineResumeLoc(f: *Fiber) timeline.Subject {
+        if (f.vm.frames_len == 0) return .{};
+        const span = vm_errors.sourceSpanForFrame(f.vm.frames[f.vm.frames_len - 1]) orelse return .{};
+        const file_id = span.file orelse return .{};
+        return timeline.Subject.src(file_id, span.line);
     }
 
     /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks

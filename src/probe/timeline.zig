@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const worker_id_mod = @import("runtime").worker_id;
+const InternTable = @import("runtime").intern.InternTable;
 
 /// Always compiled in — timeline is now RUNTIME-gated (`--timeline[=path]`):
 /// `init()` flips `active` on. When off, every entry point is one
@@ -110,6 +111,8 @@ const StackEntry = struct {
     label: Label,
     subj_off: u32,
     subj_len: u32,
+    src_file: u32 = 0,
+    src_line: u32 = 0,
     arg: u64,
     args_off: u32,
     args_len: u32,
@@ -121,6 +124,27 @@ const StackEntry = struct {
 /// Used for work-stealing (victim push → stealer run) and thunk-resolve wakes.
 const Kind = enum(u8) { span, instant, counter, flow_out, flow_in };
 
+/// A span/marker subject: EITHER an interned source location (`file` = the
+/// evaluator's file InternId, resolved to a basename only at dump time — so a
+/// hot repeating "modules.nix:545" costs two u32s, not a stored+duplicated
+/// string) OR a literal `text` (mapAttrs / builtins.* / .attr / kind). `file`
+/// == 0 selects `text`. Empty = neither.
+pub const Subject = struct {
+    file: u32 = 0,
+    line: u32 = 0,
+    text: []const u8 = "",
+
+    pub fn src(file_id: u32, line: u32) Subject {
+        return .{ .file = file_id, .line = line };
+    }
+    pub fn lit(text: []const u8) Subject {
+        return .{ .text = text };
+    }
+    pub fn isEmpty(self: Subject) bool {
+        return self.file == 0 and self.text.len == 0;
+    }
+};
+
 const Event = struct {
     ts_ns: u64,
     dur_ns: u64,
@@ -129,6 +153,10 @@ const Event = struct {
     label: Label,
     subj_off: u32,
     subj_len: u32,
+    /// Interned source location (see `Subject`); `src_file` != 0 overrides the
+    /// `subj_*` string with a dump-time-resolved "basename:line".
+    src_file: u32 = 0,
+    src_line: u32 = 0,
     arg: u64,
     /// A pre-formatted JSON object *body* (no braces), stored in the name
     /// arena — e.g. `"chunk":123,"depth":7`. Rendered as the event's `args`.
@@ -165,6 +193,10 @@ var stacks: []WorkerStack = &.{};
 
 var active: bool = false;
 
+/// Evaluator intern table, for resolving `Subject.file` ids → file paths at
+/// dump time. Set in `init`; read only on the main thread during `dump`.
+var intern_table: ?*const InternTable = null;
+
 fn nowNs() u64 {
     if (builtin.os.tag != .linux) return 0;
     var ts: std.os.linux.timespec = undefined;
@@ -178,9 +210,10 @@ fn nowNs() u64 {
 /// before evaluation, on the main thread. `event_cap` bounds how many
 /// spans+markers are retained; overflow is counted and reported (never
 /// silently truncated).
-pub fn init(allocator: std.mem.Allocator, n_workers: usize, event_cap: usize) void {
+pub fn init(allocator: std.mem.Allocator, n_workers: usize, event_cap: usize, intern: *const InternTable) void {
     if (!enabled) return;
     gpa = allocator;
+    intern_table = intern;
     events = allocator.alloc(Event, event_cap) catch &.{};
     events_cap = events.len;
     names = allocator.alloc(u8, 8 << 20) catch &.{};
@@ -221,29 +254,40 @@ fn appendEvent(e: Event) void {
 /// `arg` is a free numeric annotation (used for the fiber id on quanta).
 pub inline fn begin(label: Label, subject: []const u8, arg: u64) void {
     if (!enabled) return;
-    beginImpl(label, subject, arg, "");
+    beginImpl(label, Subject.lit(subject), arg, "");
 }
 
 /// Like `begin`, plus a pre-formatted JSON object body (no braces) shown in
 /// Perfetto's detail panel — e.g. `"chunk":123,"builtin":"map"`.
 pub inline fn beginArgs(label: Label, subject: []const u8, arg: u64, args: []const u8) void {
     if (!enabled) return;
-    beginImpl(label, subject, arg, args);
+    beginImpl(label, Subject.lit(subject), arg, args);
 }
 
-fn beginImpl(label: Label, subject: []const u8, arg: u64, args: []const u8) void {
+/// Like `beginArgs`, but the subject is a `Subject` — an interned source
+/// location (resolved at dump) or a literal string.
+pub inline fn beginSubj(label: Label, subj: Subject, arg: u64, args: []const u8) void {
+    if (!enabled) return;
+    beginImpl(label, subj, arg, args);
+}
+
+fn beginImpl(label: Label, subj: Subject, arg: u64, args: []const u8) void {
     if (!active) return;
     const wid = worker_id_mod.current;
     if (wid >= stacks.len) return;
     const st = &stacks[wid];
     if (st.len >= MAX_DEPTH) return;
-    const nm = storeName(subject);
+    // A source-ref subject stores only file+line (no arena); a literal is
+    // copied. `storeName("")` returns {0,0}, so pass "" for the source-ref case.
+    const nm = storeName(if (subj.file != 0) "" else subj.text);
     const ar = storeName(args);
     st.items[st.len] = .{
         .ts_ns = nowNs(),
         .label = label,
         .subj_off = nm.off,
         .subj_len = nm.len,
+        .src_file = subj.file,
+        .src_line = subj.line,
         .arg = arg,
         .args_off = ar.off,
         .args_len = ar.len,
@@ -277,6 +321,8 @@ fn endImpl(label: Label) void {
         .label = e.label,
         .subj_off = e.subj_off,
         .subj_len = e.subj_len,
+        .src_file = e.src_file,
+        .src_line = e.src_line,
         .arg = e.arg,
         .args_off = e.args_off,
         .args_len = e.args_len,
@@ -393,12 +439,13 @@ pub inline fn critWaitBegin() u64 {
 }
 
 /// Close a demand-fiber wait started by `critWaitBegin`: emit a span on the
-/// dedicated CRIT_TID track from `start_ns` to now, labelled with `subject`
-/// (the busy thunk's source location). No-op if tracing off or start==0.
-pub fn critWaitEnd(subject: []const u8, begin_ns: u64) void {
+/// dedicated CRIT_TID track from `begin_ns` to now, labelled with `subj` (the
+/// busy thunk's source location — interned or literal). No-op if tracing off
+/// or begin==0.
+pub fn critWaitEnd(subj: Subject, begin_ns: u64) void {
     if (!active or begin_ns == 0) return;
     const now = nowNs();
-    const nm = storeName(subject);
+    const nm = storeName(if (subj.file != 0) "" else subj.text);
     appendEvent(.{
         .ts_ns = begin_ns,
         .dur_ns = if (now > begin_ns) now - begin_ns else 0,
@@ -407,6 +454,8 @@ pub fn critWaitEnd(subject: []const u8, begin_ns: u64) void {
         .label = .crit_wait,
         .subj_off = nm.off,
         .subj_len = nm.len,
+        .src_file = subj.file,
+        .src_line = subj.line,
         .arg = 0,
     });
 }
@@ -422,7 +471,13 @@ pub fn shouldSample(min_gap_ns: u64) bool {
     return last_sample_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) == null;
 }
 
-fn subjectOf(e: Event) []const u8 {
+fn subjectOf(e: Event, buf: []u8) []const u8 {
+    // Interned source ref: resolve the file id → basename via the evaluator's
+    // intern table (never stored/duplicated in our name arena) and format now.
+    if (e.src_file != 0) {
+        const path = if (intern_table) |it| it.get(e.src_file) else "";
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ std.fs.path.basename(path), e.src_line }) catch "";
+    }
     if (e.subj_len == 0) return "";
     const off: usize = e.subj_off;
     return names[off..][0..e.subj_len];
@@ -519,7 +574,8 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
     while (i < count) : (i += 1) {
         const e = events[i];
         const rel_ns = if (e.ts_ns > start_ns) e.ts_ns - start_ns else 0;
-        const subj = subjectOf(e);
+        var subjbuf: [512]u8 = undefined;
+        const subj = subjectOf(e, &subjbuf);
         const body = argsBodyOf(e);
         // Counter: a time-series track named `ctr`, values = the args body.
         if (e.kind == .counter) {
