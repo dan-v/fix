@@ -364,6 +364,29 @@ pub const ObjectHeap = struct {
     // cost (measured: 3.8x). The sweep (STW, single collector) distributes
     // freed memory round-robin across the per-worker shards.
 
+    /// Nursery size (segments) for a range store. Scales with worker count:
+    /// each STW minor stalls ALL workers, so at higher parallelism we amortize
+    /// over a bigger nursery (fewer collections). `+1 segment` ≈ doubles the
+    /// capacity; capped so it doesn't overshoot to zero collections (no
+    /// reclaim). `FIX_GC_NURSERY_SEGS` overrides the per-store base for tuning.
+    /// Optional compile-time-set override for the nursery base (set once from
+    /// the evaluator, which can read env). 0 = use the passed base.
+    var gc_nursery_base_override: u32 = 0;
+    pub fn gcSetNurseryBase(n: u32) void {
+        if (comptime !build_options.gc) return;
+        if (n > 0 and n < 26) gc_nursery_base_override = n;
+    }
+
+    fn gcNurserySegs(base: u32, worker_count: u8) u32 {
+        _ = worker_count;
+        // Worker-count scaling was measured net-negative with the current
+        // SERIAL O(total-objects) minor: a bigger nursery cuts collections but
+        // raises RSS and each collection still does O(count) reconstruct+walk,
+        // so wall barely moves. Making w>1 fast needs parallel + O(young)
+        // minors first (then revisit scaling). For now: fixed base.
+        return if (gc_nursery_base_override != 0) gc_nursery_base_override else base;
+    }
+
     pub fn init(allocator: std.mem.Allocator, worker_count: u8) !ObjectHeap {
         var objects = try ObjectStore.init();
         errdefer objects.deinit(allocator);
@@ -377,9 +400,9 @@ pub const ObjectHeap = struct {
         // bootstrap (builtins) tenures directly and post-collect allocations
         // bump the nursery. Zero-cost in non-`-Dgc` builds.
         if (comptime build_options.gc) {
-            values.enableNursery(NURSERY_SEGS_VALUES);
-            attrs.enableNursery(NURSERY_SEGS_ATTRS);
-            attr_positions.enableNursery(NURSERY_SEGS_ATTR_POS);
+            values.enableNursery(gcNurserySegs(NURSERY_SEGS_VALUES, worker_count));
+            attrs.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTRS, worker_count));
+            attr_positions.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTR_POS, worker_count));
         }
         return .{
             .allocator = allocator,

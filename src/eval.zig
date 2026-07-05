@@ -764,18 +764,16 @@ pub const Evaluator = struct {
             // Parallel STW mark (--workers>1): parked peers call this to help
             // drain the graph. Inert at --workers=1 (no peer ever parks).
             self.scheduler.gcSetMarkHook(.{ .ctx = self, .help = gcHelpMarkThunk });
-            // Reclaim is enabled at --workers=1 (byte-identical, -16% RSS).
-            // At --workers>1 the stop-the-world collection (barrier + parallel
-            // mark, Phase 2a) is correct and byte-identical but stays DORMANT
-            // by default — the pause is only worth taking once measured small
-            // enough for production. `FIX_GC_WN` opts it in for validation and
-            // measurement; without it, --workers>1 behaves as a non-GC build.
-            const wn = if (self.env_map) |em| em.get("FIX_GC_WN") != null else false;
-            // SPIKE (FIX_GC_NOREUSE): skip free-list reuse to isolate the
-            // shared alloc-mutex cost at --workers>1 (measurement only).
+            // The copying nursery collector runs at ALL worker counts by
+            // default: minor pauses are short (~ms) and it bounds RSS. It pairs
+            // with speculation being opt-in (default off) — speculation is the
+            // dominant source of young garbage, so with it off the nursery sees
+            // mostly real work and collects a handful of times. `FIX_GC_OFF`
+            // opts out (measurement / bump-only A-B).
+            const gc_off = if (self.env_map) |em| em.get("FIX_GC_OFF") != null else false;
             if (self.env_map) |em|
                 if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
-            if (self.worker_count == 1 or wn) {
+            if (!gc_off) {
                 // FIX_GC_STEP_MB (validation): collect every N MB of fresh
                 // allocation so the detector exercises every builtin loop.
                 var step_bytes: u64 = 0;

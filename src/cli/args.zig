@@ -63,7 +63,11 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
-    disable_spec_thunks: bool = false,
+    /// Speculation (eager background thunk forcing) is OPT-IN: it is the
+    /// dominant source of young garbage and RSS, so it defaults OFF and the
+    /// GC nursery mostly sees real work. `--speculate` turns it on for maximum
+    /// parallelism at the cost of higher RSS / GC pressure.
+    disable_spec_thunks: bool = true,
     disable_fanout: bool = false,
     print_sched_stats: bool = false,
     timeline_path: ?[]const u8 = null,
@@ -158,8 +162,10 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
         } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
             options.thunks_log_path = arg["--thunks-log=".len..];
+        } else if (std.mem.eql(u8, arg, "--speculate")) {
+            options.disable_spec_thunks = false;
         } else if (std.mem.eql(u8, arg, "--no-spec-thunks")) {
-            options.disable_spec_thunks = true;
+            options.disable_spec_thunks = true; // now the default; kept for A/B
         } else if (std.mem.eql(u8, arg, "--no-fanout")) {
             options.disable_fanout = true;
         } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
