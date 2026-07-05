@@ -211,9 +211,9 @@ const ATTR_POS_CHUNK_SIZE: u32 = 256;
 // attrs 512, attr_pos 512} and N below the nursery is ~16 MB for values and
 // ~16 MB for attrs — a minor fires when whichever store's nursery fills. A
 // young range is one whose `segment < nursery_segs` (no tag bit needed).
-const NURSERY_SEGS_VALUES: u32 = 11;
-const NURSERY_SEGS_ATTRS: u32 = 11;
-const NURSERY_SEGS_ATTR_POS: u32 = 11;
+const NURSERY_SEGS_VALUES: u32 = 13;
+const NURSERY_SEGS_ATTRS: u32 = 13;
+const NURSERY_SEGS_ATTR_POS: u32 = 13;
 
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
