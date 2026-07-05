@@ -228,6 +228,24 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return range;
         }
 
+        /// Overwrite the used young region with `poison` (detector builds only,
+        /// called just before `resetYoung`). Any slice that dangled into the
+        /// nursery across a collection then reads the poison and traps, instead
+        /// of silently reading stale-but-valid data. Survivors have already been
+        /// evacuated out by the time this runs.
+        pub fn poisonYoung(self: *Self, poison: T) void {
+            if (self.nursery_segs == 0) return;
+            const cur = self.young_cursor.load(.monotonic);
+            const top_seg = segmentOf(cur);
+            const top_used = usedOf(cur);
+            var i: u32 = 0;
+            while (i <= top_seg and i < self.nursery_segs) : (i += 1) {
+                const ptr = self.segments[i].load(.monotonic) orelse continue;
+                const fill_len = if (i < top_seg) segmentCapacity(i) else top_used;
+                @memset(ptr[0..fill_len], poison);
+            }
+        }
+
         /// Rewind the nursery bump cursor, reclaiming every young slot at once.
         /// Segment backing arrays stay allocated (reused next cycle); an
         /// optional `MADV_DONTNEED` to return their pages is layered on top by

@@ -689,6 +689,14 @@ pub const ObjectHeap = struct {
     /// by attr-set merge primitives to skip a per-merge ArrayList +
     /// extra copy.
     pub fn reserveAttrsForMerge(self: *ObjectHeap, n: u32) !AttrRange {
+        // Tenured: the caller holds this reservation's raw `dst` slice across
+        // value-merge forces (see vm/objects.zig mergeAttrLiteralObjects). A
+        // young reservation would be reclaimed out from under `dst` by a minor's
+        // nursery reset. Tenured slots are never reset/evacuated, so `dst` stays
+        // valid. (The published object's slot is still young/reclaimable.)
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled) return self.attrs.reserve(self.allocator, n);
+        }
         return self.reserveAttrsLocal(n);
     }
 
@@ -1145,6 +1153,15 @@ pub const ObjectHeap = struct {
     /// Rewind the nursery bump cursors (reclaiming all young slots at once) and
     /// flush every worker's young TLAB (which points into the just-reset space).
     fn gcResetNursery(self: *ObjectHeap) void {
+        // Detector: poison the dead young region so any slice that dangled
+        // across this collection (held a raw value/attr store slice over a
+        // force) traps on its next read instead of reading stale data. Poison
+        // is a thunk to an unallocated id → forcing/reading it hits gcAssertLive.
+        if (comptime gc_debug) {
+            const poison = Value.thunk(OBJECT_MAX_SLOTS - 1);
+            self.values.poisonYoung(poison);
+            self.attrs.poisonYoung(.{ .name = 0, .value = poison });
+        }
         self.values.resetYoung();
         self.attrs.resetYoung();
         self.attr_positions.resetYoung();
@@ -1620,7 +1637,7 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addContextString(self: *ObjectHeap, text: InternId, context: []const AttrEntry) !ObjectId {
-        const range = try self.appendAttrEntries(context);
+        const range = try self.appendAttrEntriesTenured(context);
         errdefer self.attrs.rollback(range);
         self.sortAttrs(range);
         try self.rejectDuplicateAttrs(range);
@@ -1882,6 +1899,17 @@ pub const ObjectHeap = struct {
 
     fn appendAttrEntries(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
         const range = try self.reserveAttrsLocal(@intCast(entries.len));
+        @memcpy(self.attrs.sliceMut(range), entries);
+        return range;
+    }
+
+    /// Tenured attr append — for a context-string's `context`, whose raw slice
+    /// (`contextEntriesForValue`) is held across forces in string builtins and
+    /// would dangle if evacuated. See `addContextString`.
+    fn appendAttrEntriesTenured(self: *ObjectHeap, entries: []const AttrEntry) !AttrRange {
+        if (comptime !build_options.gc) return self.appendAttrEntries(entries);
+        if (!self.gc_collect_enabled) return self.appendAttrEntries(entries);
+        const range = try self.attrs.reserve(self.allocator, @intCast(entries.len));
         @memcpy(self.attrs.sliceMut(range), entries);
         return range;
     }
