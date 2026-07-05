@@ -46,10 +46,17 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
 }
 
 pub fn sourceSpanForFrame(frame: Frame) ?chunk.Chunk.SourceSpan {
-    if (frame.chunk_ptr.source_map.len == 0) return null;
-    const pc = if (frame.ip == 0) 0 else frame.ip - 1;
+    return sourceSpanForChunk(frame.chunk_ptr, frame.ip);
+}
+
+/// The tightest source span covering `ip` in `chunk_ptr` (or null if the chunk
+/// carries no source map). `ip == 0` resolves the chunk's entry point — used by
+/// the timeline to label a thunk quantum with the expression it forces.
+pub fn sourceSpanForChunk(chunk_ptr: *const chunk.Chunk, ip: usize) ?chunk.Chunk.SourceSpan {
+    if (chunk_ptr.source_map.len == 0) return null;
+    const pc = if (ip == 0) 0 else ip - 1;
     var best: ?chunk.Chunk.SourceMapEntry = null;
-    for (frame.chunk_ptr.source_map) |entry| {
+    for (chunk_ptr.source_map) |entry| {
         if (pc < entry.start or pc >= entry.end) continue;
         if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
             best = entry;

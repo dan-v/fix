@@ -42,6 +42,7 @@ const Task = scheduler_mod.Task;
 const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("../vm/force.zig");
+const vm_errors = @import("../vm/errors.zig");
 const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
@@ -384,17 +385,55 @@ pub const Worker = struct {
     /// "run"). Rich `args` carry the thunk/list id for click-through.
     fn timelineQuantumBegin(f: *Fiber) void {
         var buf: [80]u8 = undefined;
+        var locbuf: [128]u8 = undefined;
         if (f.current_task) |task| {
+            // Label the quantum with the Nix source location it forces (so the
+            // track reads "run: modules.nix:412", not just "force-thunk"), then
+            // the thunk/list id as click-through args.
+            const loc = timelineTaskLoc(f, &locbuf);
             switch (task) {
-                .force_thunk => |id| timeline.beginArgs(.run, "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
+                .force_thunk => |id| timeline.beginArgs(.run, if (loc.len > 0) loc else "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
                 .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
             }
             // Consumer end of the work-stealing arrow — inside this quantum so
             // the arrow lands on it. No-op unless this task was stolen (id != 0).
             timeline.flowIn(.steal, f.flow_in_id, worker_id_mod.current);
         } else {
-            timeline.begin(.run, "resume", f.fiber_id);
+            const loc = timelineResumeLoc(f, &locbuf);
+            timeline.begin(.run, if (loc.len > 0) loc else "resume", f.fiber_id);
         }
+    }
+
+    /// Best-effort "basename:line" for the task this quantum forces. Returns ""
+    /// when unresolvable — a non-bytecode thunk, a thunk already resolved (its
+    /// bare target union is dead, guarded by the state check), a missing source
+    /// map, or a list-range (no single chunk). Only called when tracing is on.
+    fn timelineTaskLoc(f: *Fiber, buf: []u8) []const u8 {
+        const task = f.current_task orelse return "";
+        const span = switch (task) {
+            .force_thunk => |id| blk: {
+                const th = f.vm.heap.getThunkAssumeValid(id);
+                // Target arm is live only while unresolved(0)/evaluating(1);
+                // past that it's been overwritten by the result → don't read it.
+                if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) break :blk null;
+                if (th.targetKind() != .bytecode) break :blk null;
+                const ch = f.vm.registry.get(th.payload.target.bytecode.chunk_id) orelse break :blk null;
+                break :blk vm_errors.sourceSpanForChunk(ch, 0);
+            },
+            .force_list_range => null,
+        } orelse return "";
+        const file_id = span.file orelse return "";
+        const base = std.fs.path.basename(f.vm.intern.get(file_id));
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
+    }
+
+    /// Best-effort "basename:line" for the frame a resumed fiber re-enters.
+    fn timelineResumeLoc(f: *Fiber, buf: []u8) []const u8 {
+        if (f.vm.frames_len == 0) return "";
+        const span = vm_errors.sourceSpanForFrame(f.vm.frames[f.vm.frames_len - 1]) orelse return "";
+        const file_id = span.file orelse return "";
+        const base = std.fs.path.basename(f.vm.intern.get(file_id));
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
     }
 
     /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks
