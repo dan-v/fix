@@ -177,9 +177,12 @@ fn writeJsonList(
     vm_force.rootKeep(self, Value.list(id));
 
     try writer.writeByte('[');
-    for (try self.heap.getList(id), 0..) |item, i| {
+    // gc: re-fetch — range may move across writeJsonValueInner's force
+    const n = try self.heap.getListLen(id);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
         if (i > 0) try writer.writeByte(',');
-        try writeJsonValueInner(self, writer, item, seen, path_mode, context);
+        try writeJsonValueInner(self, writer, try self.heap.getListItem(id, i), seen, path_mode, context);
     }
     try writer.writeByte(']');
 }
@@ -337,7 +340,10 @@ fn writeXmlList(
     if (context) |entries| for (entries.items) |held| vm_force.rootKeep(self, held.value);
 
     try writer.writeAll("<list>\n");
-    for (try self.heap.getList(id)) |item| try writeXmlValue(self, writer, item, depth + 1, context);
+    // gc: re-fetch — range may move across writeXmlValue's force
+    const n = try self.heap.getListLen(id);
+    var i: usize = 0;
+    while (i < n) : (i += 1) try writeXmlValue(self, writer, try self.heap.getListItem(id, i), depth + 1, context);
     try writeXmlIndent(writer, depth);
     try writer.writeAll("</list>\n");
 }

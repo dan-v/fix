@@ -41,7 +41,11 @@ pub fn builtinConcatLists(self: anytype, arg: Value) !Value {
     const list_id = value.asObjectId();
     const lists = try self.heap.getList(list_id);
     vm_force.fanOutListShallow(self, list_id, lists);
-    for (lists) |list_item| {
+    // gc: re-fetch — the outer range may move across the force
+    const n = lists.len;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const list_item = try self.heap.getListItem(list_id, i);
         const list = try vm_force.forceValue(self, list_item);
         if (!list.isList()) return error.TypeError;
         try out.appendSlice(self.allocator, try self.heap.getList(list.asObjectId()));
@@ -59,8 +63,12 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
-    const items = try self.heap.getList(value.asObjectId());
-    for (items) |item| {
+    // gc: re-fetch — range may move across the force
+    const list_id = value.asObjectId();
+    const n = try self.heap.getListLen(list_id);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const item = try self.heap.getListItem(list_id, i);
         const item_value = try vm_force.forceValue(self, item);
         if (!item_value.isAttrs()) return error.TypeError;
 

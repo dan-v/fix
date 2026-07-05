@@ -67,22 +67,27 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
     force.rootKeep(self, Value.attrs(left_id));
     force.rootKeep(self, Value.attrs(right_id));
 
-    const left = try self.heap.getAttrs(left_id);
-    const right = try self.heap.getAttrs(right_id);
+    var left = try self.heap.getAttrs(left_id);
+    var right = try self.heap.getAttrs(right_id);
+    const left_len = left.len;
+    const right_len = right.len;
 
     // Reserve worst-case (no overlap) directly in heap attr storage
     // and walk both sides in lockstep, writing the merge in place.
     // Both inputs are sorted+deduped (heap invariant), so the output
     // is sorted+unique by construction. Skips a per-merge ArrayList
     // alloc + one copy compared to the staged-then-flush pattern.
-    const cap: u32 = @intCast(left.len + right.len);
+    const cap: u32 = @intCast(left_len + right_len);
     const reserved = try self.heap.reserveAttrsForMerge(cap);
     const dst = self.heap.attrsMutSlice(reserved);
 
     var out: usize = 0;
     var left_i: usize = 0;
     var right_i: usize = 0;
-    while (left_i < left.len and right_i < right.len) {
+    while (left_i < left_len and right_i < right_len) {
+        // gc: re-fetch — the input ranges may move across mergeAttrLiteralValue's force
+        left = try self.heap.getAttrs(left_id);
+        right = try self.heap.getAttrs(right_id);
         const l = left[left_i];
         const r = right[right_i];
         if (l.name < r.name) {
@@ -105,13 +110,16 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
             right_i += 1;
         }
     }
-    if (left_i < left.len) {
-        const n = left.len - left_i;
+    // gc: re-fetch — ranges may have moved across the loop's forces
+    left = try self.heap.getAttrs(left_id);
+    right = try self.heap.getAttrs(right_id);
+    if (left_i < left_len) {
+        const n = left_len - left_i;
         @memcpy(dst[out..][0..n], left[left_i..]);
         out += n;
     }
-    if (right_i < right.len) {
-        const n = right.len - right_i;
+    if (right_i < right_len) {
+        const n = right_len - right_i;
         @memcpy(dst[out..][0..n], right[right_i..]);
         out += n;
     }

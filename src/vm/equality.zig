@@ -18,20 +18,24 @@ pub fn valuesEqual(self: *VM, a: Value, b: Value) anyerror!bool {
     return valuesEqualSeen(self, a, b, &seen);
 }
 
-pub fn listContainsValue(self: *VM, needle: Value, items: []const Value) anyerror!bool {
-    if (items.len == 0) return false;
+pub fn listContainsValue(self: *VM, needle: Value, list_id: heap_mod.ObjectId) anyerror!bool {
+    if ((try self.heap.getListLen(list_id)) == 0) return false;
 
     const forced_needle = try force.forceValue(self, needle);
-    return valueSliceContainsForcedValue(self, forced_needle, items);
+    return valueSliceContainsForcedValue(self, forced_needle, list_id);
 }
 
-pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, items: []const Value) anyerror!bool {
-    if (items.len == 0) return false;
+pub fn valueSliceContainsForcedValue(self: *VM, forced_needle: Value, list_id: heap_mod.ObjectId) anyerror!bool {
+    const n = try self.heap.getListLen(list_id);
+    if (n == 0) return false;
 
     var seen: std.ArrayListUnmanaged(EqualityPair) = .empty;
     defer seen.deinit(self.allocator);
 
-    for (items) |item| {
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        // gc: re-fetch — range may move across the force
+        const item = try self.heap.getListItem(list_id, i);
         seen.clearRetainingCapacity();
         if (try valuesEqualSeenForcedLeft(self, forced_needle, item, &seen)) return true;
     }
@@ -93,11 +97,17 @@ pub fn listsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
     force.rootKeep(self, a);
     force.rootKeep(self, b);
 
-    const a_items = try self.heap.getList(a.asObjectId());
-    const b_items = try self.heap.getList(b.asObjectId());
-    if (a_items.len != b_items.len) return false;
+    const a_id = a.asObjectId();
+    const b_id = b.asObjectId();
+    const a_len = try self.heap.getListLen(a_id);
+    const b_len = try self.heap.getListLen(b_id);
+    if (a_len != b_len) return false;
 
-    for (a_items, b_items) |a_item, b_item| {
+    var i: usize = 0;
+    while (i < a_len) : (i += 1) {
+        // gc: re-fetch — ranges may move across valuesEqualSeen's force
+        const a_item = try self.heap.getListItem(a_id, i);
+        const b_item = try self.heap.getListItem(b_id, i);
         if (!try valuesEqualSeen(self, a_item, b_item, seen)) return false;
     }
     return true;
@@ -115,13 +125,19 @@ pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
     force.rootKeep(self, a);
     force.rootKeep(self, b);
 
-    const a_entries = try self.heap.getAttrs(a.asObjectId());
-    const b_entries = try self.heap.getAttrs(b.asObjectId());
-    if (try derivationAttrsEqual(self, a_entries, b_entries, seen)) |equal| return equal;
+    const a_id = a.asObjectId();
+    const b_id = b.asObjectId();
+    if (try derivationAttrsEqual(self, a_id, b_id, seen)) |equal| return equal;
 
-    if (a_entries.len != b_entries.len) return false;
+    const a_len = (try self.heap.getAttrs(a_id)).len;
+    const b_len = (try self.heap.getAttrs(b_id)).len;
+    if (a_len != b_len) return false;
 
-    for (a_entries, b_entries) |a_entry, b_entry| {
+    var i: usize = 0;
+    while (i < a_len) : (i += 1) {
+        // gc: re-fetch — ranges may move across valuesEqualSeen's force
+        const a_entry = (try self.heap.getAttrs(a_id))[i];
+        const b_entry = (try self.heap.getAttrs(b_id))[i];
         if (a_entry.name != b_entry.name) return false;
         if (!try valuesEqualSeen(self, a_entry.value, b_entry.value, seen)) return false;
     }
@@ -130,30 +146,31 @@ pub fn attrsEqual(self: *VM, a: Value, b: Value, seen: *std.ArrayListUnmanaged(E
 
 pub fn derivationAttrsEqual(
     self: *VM,
-    a_entries: []const heap_mod.AttrEntry,
-    b_entries: []const heap_mod.AttrEntry,
+    a_id: heap_mod.ObjectId,
+    b_id: heap_mod.ObjectId,
     seen: *std.ArrayListUnmanaged(EqualityPair),
 ) !?bool {
     const type_name = try self.intern.intern("type");
     const derivation_type = try self.intern.intern("derivation");
 
-    if (!try attrsHaveDerivationType(self, a_entries, type_name, derivation_type)) return null;
-    if (!try attrsHaveDerivationType(self, b_entries, type_name, derivation_type)) return null;
+    if (!try attrsHaveDerivationType(self, a_id, type_name, derivation_type)) return null;
+    if (!try attrsHaveDerivationType(self, b_id, type_name, derivation_type)) return null;
 
     const out_path_name = try self.intern.intern("outPath");
-    const a_out_path = attrValue(a_entries, out_path_name) orelse return null;
-    const b_out_path = attrValue(b_entries, out_path_name) orelse return null;
+    // gc: re-fetch — ranges may move across attrsHaveDerivationType's force
+    const a_out_path = attrValue(try self.heap.getAttrs(a_id), out_path_name) orelse return null;
+    const b_out_path = attrValue(try self.heap.getAttrs(b_id), out_path_name) orelse return null;
 
     return try valuesEqualSeen(self, a_out_path, b_out_path, seen);
 }
 
 pub fn attrsHaveDerivationType(
     self: *VM,
-    entries: []const heap_mod.AttrEntry,
+    id: heap_mod.ObjectId,
     type_name: InternId,
     derivation_type: InternId,
 ) !bool {
-    const type_value = attrValue(entries, type_name) orelse return false;
+    const type_value = attrValue(try self.heap.getAttrs(id), type_name) orelse return false;
     const forced = try force.forceValue(self, type_value);
     if (!isStringComparable(forced)) return false;
     const text_id = try strings.stringTextInternId(self, forced);

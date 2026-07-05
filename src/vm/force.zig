@@ -252,12 +252,23 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
                 if (!try enterDeep(self, .list, id, seen)) return;
                 const items = try self.heap.getList(id);
                 fanOutListShallow(self, id, items);
-                for (items) |item| try forceDeepInner(self, item, seen);
+                // gc: re-fetch — range may move across the recursive force
+                const n = items.len;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    try forceDeepInner(self, try self.heap.getListItem(id, i), seen);
+                }
             } else {
                 if (!try enterDeep(self, .attrs, id, seen)) return;
                 const entries = try self.heap.getAttrs(id);
                 fanOutAttrsShallow(self, entries);
-                for (entries) |entry| try forceDeepInner(self, entry.value, seen);
+                // gc: re-fetch — range may move across the recursive force
+                const n = entries.len;
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    const entry = (try self.heap.getAttrs(id))[i];
+                    try forceDeepInner(self, entry.value, seen);
+                }
             }
         },
         else => {},

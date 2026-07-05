@@ -59,7 +59,12 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
 
     const path_id = try self.intern.intern("path");
     const prefix_id = try self.intern.intern("prefix");
-    for (try self.heap.getList(search_path.asObjectId())) |item| {
+    // gc: re-fetch — range may move across the force
+    const list_id = search_path.asObjectId();
+    const n = try self.heap.getListLen(list_id);
+    var idx: usize = 0;
+    while (idx < n) : (idx += 1) {
+        const item = try self.heap.getListItem(list_id, idx);
         const entry = try vm_force.forceValue(self, item);
         if (!entry.isAttrs()) return error.TypeError;
 

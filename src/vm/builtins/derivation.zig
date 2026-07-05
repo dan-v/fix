@@ -318,7 +318,11 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
             drv_probe.recordFanout(ok);
             if (!ok) break;
         }
-        for (original_attrs) |entry| {
+        // gc: re-fetch — range may move across the forces below
+        const attrs_len = original_attrs.len;
+        var ai: usize = 0;
+        while (ai < attrs_len) : (ai += 1) {
+            const entry = (try self.heap.getAttrs(attrs_id))[ai];
             const attr_name_text = self.intern.get(entry.name);
             const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
             if (std.mem.eql(u8, attr_name, "args")) continue;
@@ -447,10 +451,12 @@ fn derivationArgs(
     };
     const list = try vm_force.forceValue(self, args_value);
     if (!list.isList()) return error.TypeError;
-    const items = try self.heap.getList(list.asObjectId());
+    const list_id = list.asObjectId();
+    const items = try self.heap.getList(list_id);
     const args = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(args);
-    for (items, args) |item, *arg| arg.* = try derivationAttrString(self, item, inputs, owned_strings);
+    // gc: re-fetch — range may move across derivationAttrString's force
+    for (args, 0..) |*arg, i| arg.* = try derivationAttrString(self, try self.heap.getListItem(list_id, i), inputs, owned_strings);
     return args;
 }
 
@@ -556,9 +562,12 @@ fn appendStructuredJsonValue(
             defer _ = seen.pop();
 
             try out.append(self.allocator, '[');
-            for (try self.heap.getList(list_id), 0..) |item, index| {
+            // gc: re-fetch — range may move across the recursive force
+            const n = try self.heap.getListLen(list_id);
+            var index: usize = 0;
+            while (index < n) : (index += 1) {
                 if (index != 0) try out.append(self.allocator, ',');
-                try appendStructuredJsonValue(self, out, item, inputs, owned_strings, seen);
+                try appendStructuredJsonValue(self, out, try self.heap.getListItem(list_id, index), inputs, owned_strings, seen);
             }
             try out.append(self.allocator, ']');
         },
@@ -726,11 +735,13 @@ fn contextOutputs(
     if (self.heap.getAttrValue(attrs.asObjectId(), try self.intern.intern("outputs"))) |outputs_value| {
         const list = try vm_force.forceValue(self, outputs_value);
         if (!list.isList()) return error.TypeError;
-        const items = try self.heap.getList(list.asObjectId());
+        const list_id = list.asObjectId();
+        const items = try self.heap.getList(list_id);
         const outputs = try self.allocator.alloc([]const u8, items.len);
         errdefer self.allocator.free(outputs);
-        for (items, outputs) |item, *output| {
-            const item_value = try vm_force.forceValue(self, item);
+        // gc: re-fetch — range may move across the force
+        for (outputs, 0..) |*output, i| {
+            const item_value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
             if (!isPlainString(item_value)) return error.TypeError;
             output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
         }
@@ -803,13 +814,15 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, outputs_list);
-    const items = try self.heap.getList(outputs_list.asObjectId());
+    const list_id = outputs_list.asObjectId();
+    const items = try self.heap.getList(list_id);
     if (items.len == 0) return error.InvalidDerivationOutput;
 
     const names = try self.allocator.alloc(InternId, items.len);
     errdefer self.allocator.free(names);
-    for (items, names) |item, *name| {
-        const value = try vm_force.forceValue(self, item);
+    // gc: re-fetch — range may move across the force
+    for (names, 0..) |*name, i| {
+        const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
         name.* = try stringTextInternId(self, value);
         if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;

@@ -43,7 +43,8 @@ pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !
     vm_force.fanOutListShallow(self, list_id, items);
     const item_values = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(item_values);
-    for (items, item_values) |item, *value| value.* = try coerceStringContextValue(self, item);
+    // gc: re-fetch — range may move across coerceStringContextValue's force
+    for (item_values, 0..) |*value, i| value.* = try coerceStringContextValue(self, try self.heap.getListItem(list_id, i));
 
     const sep = self.intern.get(try stringTextInternId(self, sep_value));
 
@@ -224,10 +225,12 @@ pub fn stringListArg(self: anytype, arg: Value) ![][]const u8 {
     const list = try vm_force.forceValue(self, arg);
     if (!list.isList()) return error.TypeError;
 
-    const items = try self.heap.getList(list.asObjectId());
+    const list_id = list.asObjectId();
+    const items = try self.heap.getList(list_id);
     const out = try self.allocator.alloc([]const u8, items.len);
     errdefer self.allocator.free(out);
-    for (items, out) |item, *string| string.* = try stringArg(self, item);
+    // gc: re-fetch — range may move across stringArg's force
+    for (out, 0..) |*string, i| string.* = try stringArg(self, try self.heap.getListItem(list_id, i));
     return out;
 }
 
@@ -235,11 +238,13 @@ pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
     const list = try vm_force.forceValue(self, arg);
     if (!list.isList()) return error.TypeError;
 
-    const items = try self.heap.getList(list.asObjectId());
+    const list_id = list.asObjectId();
+    const items = try self.heap.getList(list_id);
     const ids = try self.allocator.alloc(InternId, items.len);
     errdefer self.allocator.free(ids);
-    for (items, ids) |item, *id| {
-        const value = try vm_force.forceValue(self, item);
+    // gc: re-fetch — range may move across the force
+    for (ids, 0..) |*id, i| {
+        const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
         id.* = try stringTextInternId(self, value);
     }
@@ -250,11 +255,13 @@ pub fn stringListValuesArg(self: anytype, arg: Value) ![]Value {
     const list = try vm_force.forceValue(self, arg);
     if (!list.isList()) return error.TypeError;
 
-    const items = try self.heap.getList(list.asObjectId());
+    const list_id = list.asObjectId();
+    const items = try self.heap.getList(list_id);
     const values = try self.allocator.alloc(Value, items.len);
     errdefer self.allocator.free(values);
-    for (items, values) |item, *dest| {
-        const value = try vm_force.forceValue(self, item);
+    // gc: re-fetch — range may move across the force
+    for (values, 0..) |*dest, i| {
+        const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
         if (!isPlainString(value)) return error.TypeError;
         dest.* = value;
     }
@@ -309,7 +316,11 @@ pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
 
     var first = true;
     var trailing_empty_list = false;
-    for (try self.heap.getList(list_id)) |item| {
+    // gc: re-fetch — range may move across the force
+    const list_len = try self.heap.getListLen(list_id);
+    var i: usize = 0;
+    while (i < list_len) : (i += 1) {
+        const item = try self.heap.getListItem(list_id, i);
         // GC: re-root the accumulated context values across each item's forces.
         const iter_roots = vm_force.rootsBegin(self);
         defer vm_force.rootsEnd(self, iter_roots);
@@ -396,7 +407,11 @@ pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Valu
 
     var first = true;
     var trailing_empty_list = false;
-    for (try self.heap.getList(list_id)) |item| {
+    // gc: re-fetch — range may move across the force
+    const list_len = try self.heap.getListLen(list_id);
+    var i: usize = 0;
+    while (i < list_len) : (i += 1) {
+        const item = try self.heap.getListItem(list_id, i);
         // GC: the `ctx` accumulator holds merged context values (new attrs) in
         // Zig memory across each later item's forces; re-root them per item.
         const iter_roots = vm_force.rootsBegin(self);

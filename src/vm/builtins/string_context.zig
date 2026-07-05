@@ -131,15 +131,20 @@ pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !
     defer vm_force.rootsEnd(self, gc_roots);
     vm_force.rootKeep(self, Value.attrs(left_id));
     vm_force.rootKeep(self, Value.attrs(right_id));
-    const left = try self.heap.getAttrs(left_id);
-    const right = try self.heap.getAttrs(right_id);
+    var left = try self.heap.getAttrs(left_id);
+    var right = try self.heap.getAttrs(right_id);
+    const left_len = left.len;
+    const right_len = right.len;
 
-    var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left.len + right.len);
+    var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left_len + right_len);
     defer merged.deinit(self.allocator);
 
     var left_i: usize = 0;
     var right_i: usize = 0;
-    while (left_i < left.len and right_i < right.len) {
+    while (left_i < left_len and right_i < right_len) {
+        // gc: re-fetch — ranges may move across mergeContextAttrValue's force
+        left = try self.heap.getAttrs(left_id);
+        right = try self.heap.getAttrs(right_id);
         const l = left[left_i];
         const r = right[right_i];
         if (l.name < r.name) {
@@ -155,10 +160,13 @@ pub fn mergeContextAttrs(self: anytype, left_id: ObjectId, right_id: ObjectId) !
             right_i += 1;
         }
     }
-    while (left_i < left.len) : (left_i += 1) {
+    // gc: re-fetch — ranges may have moved across the loop's forces
+    left = try self.heap.getAttrs(left_id);
+    right = try self.heap.getAttrs(right_id);
+    while (left_i < left_len) : (left_i += 1) {
         merged.appendAssumeCapacity(left[left_i]);
     }
-    while (right_i < right.len) : (right_i += 1) {
+    while (right_i < right_len) : (right_i += 1) {
         merged.appendAssumeCapacity(right[right_i]);
     }
 
@@ -184,8 +192,15 @@ pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
     var outputs: std.ArrayListUnmanaged(Value) = .empty;
     defer outputs.deinit(self.allocator);
 
-    for (try self.heap.getList(left_list.asObjectId())) |item| try appendUniqueContextOutput(self, &outputs, item);
-    for (try self.heap.getList(right_list.asObjectId())) |item| try appendUniqueContextOutput(self, &outputs, item);
+    // gc: re-fetch — ranges may move across appendUniqueContextOutput's force
+    const left_id = left_list.asObjectId();
+    const left_n = try self.heap.getListLen(left_id);
+    var li: usize = 0;
+    while (li < left_n) : (li += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(left_id, li));
+    const right_id = right_list.asObjectId();
+    const right_n = try self.heap.getListLen(right_id);
+    var ri: usize = 0;
+    while (ri < right_n) : (ri += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(right_id, ri));
 
     return Value.list(try self.heap.addList(outputs.items));
 }
