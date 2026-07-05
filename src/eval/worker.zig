@@ -397,16 +397,27 @@ pub const Worker = struct {
         }
     }
 
-    /// Timeline: sample heap cursors + RSS as counter tracks (time-series graphs
-    /// in Perfetto) so we can see memory grow over the eval and correlate GC
-    /// pauses with allocation. Throttled to ~1ms; RSS is a /proc read.
+    /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks
+    /// (time-series graphs in Perfetto) so memory growth, the speculation flood,
+    /// and steal activity are visible over the eval and correlatable with GC
+    /// pauses. Throttled to ~1ms; RSS is a /proc read.
     fn sampleTimelineCounters(f: *Fiber) void {
         if (!timeline.shouldSample(1_000_000)) return;
         const heap = f.vm.heap;
         var buf: [192]u8 = undefined;
         timeline.counter("heap_slots", std.fmt.bufPrint(&buf, "\"objects\":{d},\"values\":{d},\"attrs\":{d}", .{ heap.objects.count(), heap.values.count(), heap.attrs.count() }) catch return);
-        var rbuf: [48]u8 = undefined;
-        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d}", .{gc.peakRssBytes() >> 20}) catch return);
+        // RSS (peak so far) + total bytes reserved across the object stores — the
+        // memory-growth curve, correlatable with the speculation backlog below.
+        var rbuf: [96]u8 = undefined;
+        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d},\"reserved\":{d}", .{ gc.peakRssBytes() >> 20, heap.totalReservedBytes() >> 20 }) catch return);
+        // Scheduler: live task backlog (the speculation flood as it happens) +
+        // cumulative speculation submitted/rejected and steals. Together with
+        // rss_mb this is the spec-flood-vs-RSS "money chart".
+        const s = f.vm.scheduler;
+        var sbuf: [96]u8 = undefined;
+        timeline.counter("sched_backlog", std.fmt.bufPrint(&sbuf, "\"pending\":{d}", .{s.pending_tasks.load(.monotonic)}) catch return);
+        var pbuf: [160]u8 = undefined;
+        timeline.counter("spec", std.fmt.bufPrint(&pbuf, "\"submitted\":{d},\"rejected\":{d},\"steals\":{d}", .{ s.n_speculative_ok.load(.monotonic), s.n_speculative_rej.load(.monotonic), s.n_steals.load(.monotonic) }) catch return);
     }
 
     fn runFiber(self: *Worker, f: *Fiber) void {
