@@ -387,14 +387,41 @@ fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
     // The outer thunk is busy (evaluating) → its target arm is live.
     const th = self.heap.getThunkAssumeValid(thunk_id);
     const label = critTargetLabel(self, th, buf, true);
-    // Never leave a bare "wait": fall back to the thunk kind (e.g. a chunk with
-    // no source map, or a cell whose forwarded value already resolved).
-    return if (label.len > 0) label else @tagName(th.targetKind());
+    if (label.len > 0) return label;
+    // No resolvable location. Usually the RACE: the busy thunk resolved between
+    // our `.busy` observation and this read (a short wait), clobbering its
+    // target union — only the stale kind survives. Long (meaningful) waits stay
+    // busy throughout and label above. Fall back to the kind.
+    return @tagName(th.targetKind());
 }
 
 fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) []const u8 {
     return switch (th.targetKind()) {
-        .bytecode => critChunkLoc(self, th.payload.target.bytecode.chunk_id, buf),
+        .bytecode => blk: {
+            const b = &th.payload.target.bytecode;
+            const loc = critChunkLoc(self, b.chunk_id, buf);
+            if (loc.len > 0) break :blk loc;
+            // Source-less chunk — a compiler-generated apply-glue. The
+            // well-known map/genList/mapAttrs stubs are the common ones;
+            // name the operation and, where the applied function (upvalue 0)
+            // is INLINE-safe to read, its location too.
+            //
+            // Only the inline slot is read (upvalue_count <= INLINE_CAP) and
+            // via a raw ptrCast (not the union field): a busy thunk can resolve
+            // mid-read and clobber the union — an inline read then yields a
+            // garbage Value (handled by critClosureLabel's bounds-checked
+            // accessors), whereas the spilled slice would deref a garbage ptr.
+            if (b.chunk_id == self.registry.well_known.mapattrs_apply) break :blk "mapAttrs"; // 3 ups → spilled
+            if (b.upvalue_count >= 1 and b.upvalue_count <= thunk_mod.BytecodeThunk.INLINE_CAP) {
+                const fn_val: Value = @as(*const Value, @ptrCast(@alignCast(&b.storage))).*;
+                const fn_loc = critClosureLabel(self, fn_val, buf);
+                if (fn_loc.len > 0) break :blk fn_loc;
+            }
+            // genlist_apply is the SHARED single-arg-application stub — used by
+            // both builtins.genList AND builtins.map — so name it for both.
+            if (b.chunk_id == self.registry.well_known.genlist_apply) break :blk "map/genList";
+            break :blk "";
+        },
         .closure => critClosureLabel(self, th.payload.target.closure, buf),
         .attr_access => std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(th.payload.target.attr_access.name)}) catch "",
         .pass_through => blk: {

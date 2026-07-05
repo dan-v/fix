@@ -87,8 +87,28 @@ pub fn ensureLineIndex(self: *Compiler) !*diagnostic.LineIndex {
 }
 
 pub fn optionalSourceFileId(self: *Compiler) !?InternId {
+    // Child compilers inherit `source_file_id` but NOT `source_path` (imports
+    // set the path, nested chunk builders only copy the id) — so check the
+    // cached/inherited id first, else fall back to deriving one from the path.
+    // Without this, a nested chunk's spans carry a valid line but a null file,
+    // which the timeline (and error traces) can't name.
+    if (self.source_file_id) |id| return id;
     if (self.source_path == null) return null;
     return try attrs.sourceFileId(self);
+}
+
+/// Like `sourceSpanForNode`, but from a bare source atom (offset/len) — used to
+/// give attrset-body thunks (which compile a list of entries, not a single
+/// node) a representative `Chunk.body_span` for timeline labelling.
+pub fn sourceSpanForAtom(self: *Compiler, atom: Node.Atom) !?chunk.Chunk.SourceSpan {
+    const position = try sourcePositionForOffset(self, atom.offset);
+    return .{
+        .file = try optionalSourceFileId(self),
+        .offset = atom.offset,
+        .len = atom.len,
+        .line = position.line,
+        .column = position.column,
+    };
 }
 
 pub fn sourceSpanForNode(self: *Compiler, node: *const Node) !?chunk.Chunk.SourceSpan {

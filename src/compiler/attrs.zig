@@ -185,6 +185,10 @@ fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEnt
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
+    // Attrset-body thunk has no single body node (and an empty source map — its
+    // values are separate thunks), so give it a representative body_span from
+    // the first entry for the timeline. See Chunk.body_span.
+    if (entries.len > 0) child_builder.body_span = diagnostics.sourceSpanForNode(&child, entries[0].expr) catch null;
     const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
@@ -624,6 +628,10 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
+    // Attrset-body thunk has no single body node (and an empty source map — its
+    // values are separate thunks), so give it a representative body_span from
+    // the first entry for the timeline. See Chunk.body_span.
+    if (entries.len > 0) child_builder.body_span = diagnostics.sourceSpanForNode(&child, entries[0].expr) catch null;
     const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const child_id = try self.registry.register(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
