@@ -351,20 +351,24 @@ pub const Worker = struct {
             return true;
         }
         var victim: ?u8 = null;
-        if (self.pickTask(&victim)) |task| {
+        var push_ts: u64 = 0;
+        if (self.pickTask(&victim, &push_ts)) |task| {
             const f = try self.acquireFreeFiber();
             f.current_task = task;
-            // Timeline: a stolen task's run draws a victim→stealer arrow. Emit
-            // the producer end on the victim's track (only while the victim is
-            // in a quantum, so the arrow binds — else FLOW_INVALID_ID) with a
-            // unique id (no FLOW_DUPLICATE_ID), and carry it to the quantum for
-            // the matching consumer end. flow_in_id stays 0 (no arrow) otherwise.
+            // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
+            // the producer end to `push_ts` — the moment the victim *pushed* this
+            // task — so the arrow originates from the quantum that created the
+            // work, not whatever the victim is running now. push_ts is nonzero
+            // only when flow tracing is on and the task was stolen (not popped
+            // locally). Unique id → no FLOW_DUPLICATE_ID; the ts lands inside the
+            // producing quantum → binds cleanly. flow_in_id carries the id to the
+            // consumer end; stays 0 (no arrow) when not traced.
             f.flow_in_id = 0;
             if (victim) |vtid| {
-                if (timeline.on() and timeline.workerHasOpenSpan(vtid)) {
+                if (timeline.on() and push_ts != 0) {
                     const fid = timeline.nextFlowId();
                     f.flow_in_id = fid;
-                    timeline.flowOut(.steal, fid, vtid);
+                    timeline.flowOutAt(.steal, fid, vtid, push_ts);
                 }
             }
             f.inner.reset(slotEntry, @ptrCast(f));
@@ -541,15 +545,17 @@ pub const Worker = struct {
 
     /// Pick a task from own queues (not stolen → `victim` stays null) or steal
     /// one (→ `victim.*` = the victim worker id, for the timeline flow arrow).
-    fn pickTask(self: *Worker, victim: *?u8) ?Task {
+    fn pickTask(self: *Worker, victim: *?u8, push_ts: *u64) ?Task {
         // Once a top-level result is ready, don't start new background
         // work — only drive already-suspended fibers to completion. Bounds
         // the dead-speculation tail (see Scheduler.suppress_background).
         if (self.scheduler.backgroundSuppressed()) return null;
         if (self.scheduler.pop(self.worker_id)) |t| return t;
         var v: u8 = 0;
-        if (self.scheduler.stealAnyVictim(self.worker_id, &v)) |t| {
+        var pts: u64 = 0;
+        if (self.scheduler.stealAnyVictim(self.worker_id, &v, &pts)) |t| {
             victim.* = v;
+            push_ts.* = pts;
             return t;
         }
         return null;

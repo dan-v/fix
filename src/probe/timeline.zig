@@ -420,7 +420,15 @@ pub const FlowCat = enum(u8) {
 /// whatever slice is open on `tid` at this instant. An unmatched `out` (id
 /// never consumed) draws nothing.
 pub inline fn flowOut(cat: FlowCat, id: u64, tid: u16) void {
-    flowImpl(.flow_out, cat, id, tid);
+    flowImpl(.flow_out, cat, id, tid, nowNs());
+}
+
+/// Producer endpoint anchored to an EXPLICIT timestamp — use the moment the
+/// work was *created* (e.g. when a task was pushed onto its queue) rather than
+/// "now". The arrow then originates from the quantum that actually produced the
+/// work, not from whatever the victim happens to be running at steal time.
+pub inline fn flowOutAt(cat: FlowCat, id: u64, tid: u16, ts_ns: u64) void {
+    flowImpl(.flow_out, cat, id, tid, ts_ns);
 }
 
 /// Flow-arrow consumer endpoint (`ph:"f"`, `bp:"e"`) on track `tid` (usually
@@ -428,7 +436,7 @@ pub inline fn flowOut(cat: FlowCat, id: u64, tid: u16) void {
 /// that consumes the work (e.g. the quantum running a stolen task) so the
 /// arrow lands on it. An unmatched `in` draws nothing.
 pub inline fn flowIn(cat: FlowCat, id: u64, tid: u16) void {
-    flowImpl(.flow_in, cat, id, tid);
+    flowImpl(.flow_in, cat, id, tid, nowNs());
 }
 
 /// Flow sampling (`--timeline-flows`): 0 = none, 1 = every flow (default),
@@ -447,23 +455,13 @@ pub fn nextFlowId() u64 {
     return next_flow.fetchAdd(1, .monotonic);
 }
 
-/// True if worker `tid` currently has an open span. A flow endpoint binds to
-/// the enclosing slice, so a flowOut is only valid while the victim is inside a
-/// quantum — checking this avoids FLOW_INVALID_ID from arrows anchored to a
-/// parked/idle track. Cross-thread read of a per-worker u8 (atomic on x86;
-/// best-effort — a tiny race just drops/keeps one arrow).
-pub inline fn workerHasOpenSpan(tid: u16) bool {
-    if (!active or tid >= stacks.len) return false;
-    return stacks[tid].len > 0;
-}
-
-fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16) void {
+fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16, ts_ns: u64) void {
     if (!active) return;
     if (id == 0) return; // 0 = "no flow" sentinel
     if (flow_sample == 0) return;
     if (flow_sample > 1 and id % flow_sample != 0) return;
     appendEvent(.{
-        .ts_ns = nowNs(),
+        .ts_ns = ts_ns,
         .dur_ns = 0,
         .tid = tid,
         .kind = kind,

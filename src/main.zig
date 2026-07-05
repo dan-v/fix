@@ -136,6 +136,8 @@ pub fn main(init: std.process.Init) !void {
     if (timeline_path != null) {
         timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
         timeline.setFlowSample(options.timeline_flows);
+        // Stamp push times so steal arrows anchor to the producing quantum.
+        ev.scheduler.setTraceFlows(true);
         timeline.setSource(switch (source_arg) {
             .file => |p| p,
             .expr => "(expression)",

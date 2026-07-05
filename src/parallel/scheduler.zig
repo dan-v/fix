@@ -130,7 +130,18 @@ const ReadyQueue = struct {
 /// The generic engine lives in `containers.Deque` (extracted so GC mark
 /// work can reuse the same lock-free ring for `Deque(ObjectId)`); this is a
 /// thin alias plus the `Task`-specific `gcMark` helper.
-const TaskQueue = containers.Deque(Task);
+/// A queued task plus the monotonic-ns timestamp of when it was pushed. The
+/// timestamp is only populated when flow tracing is on (`trace_flows`) — it
+/// costs one clock read per push and lets the timeline anchor the work-stealing
+/// arrow's producer end to the quantum that actually *created* the task (see
+/// `Worker.drainStep`). Off the tracing path it's a dead `0` (negligible: the
+/// deque slot grows 8 bytes, no clock read).
+pub const TracedTask = struct {
+    task: Task,
+    push_ts: u64 = 0,
+};
+
+const TaskQueue = containers.Deque(TracedTask);
 
 /// GC (`-Dgc`): mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,
@@ -141,11 +152,23 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
     const b = q.bottom.load(.monotonic);
     var i = t;
     while (i != b) : (i +%= 1) {
-        switch (q.items[@intCast(i & q.mask)]) {
+        switch (q.items[@intCast(i & q.mask)].task) {
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
         }
     }
+}
+
+/// Monotonic-ns clock, matching `probe/timeline.zig`'s `nowNs` domain so the
+/// push timestamps and the timeline's quantum spans share one time base. The
+/// scheduler can't import the probe layer, so the formula is duplicated here.
+fn monotonicNs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+    return sec * std.time.ns_per_s + nsec;
 }
 
 // Demand-driven fanout arrives in bursts: when the urgent queue rejects,
@@ -267,6 +290,11 @@ pub const Scheduler = struct {
     /// work contributes how much to wall time.
     disable_speculation: bool,
     disable_fanout: bool,
+
+    /// When set (by `setTraceFlows`, driven by `--timeline`), `pushOwn` stamps
+    /// each task with its push time so the timeline can anchor the steal arrow
+    /// to the producing quantum. Off by default — one dead branch per push.
+    trace_flows: bool = false,
 
     /// Set once a top-level demanded result is ready, to stop workers
     /// from *starting* new background (speculative / fan-out) tasks while
@@ -568,6 +596,12 @@ pub const Scheduler = struct {
     /// mutex on the hot path; this trades that for a steal
     /// round-trip on the cold path, which has been hidden by spin-
     /// before-park (project-tier1-perf-session).
+    /// Enable push-time stamping for the work-stealing flow arrows. Called
+    /// once at startup when `--timeline` is active.
+    pub fn setTraceFlows(self: *Scheduler, on: bool) void {
+        self.trace_flows = on;
+    }
+
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;
@@ -604,7 +638,12 @@ pub const Scheduler = struct {
         // non-worker callers (none today) would need their own
         // submission path.
         if (submitter_id >= self.worker_count) return false;
-        if (!queues[submitter_id].push(task)) return false;
+        // Stamp the push time only when tracing flows — the timeline anchors
+        // the steal arrow's producer end here (the creating quantum). Submits
+        // always happen inside a fiber quantum, so this ts falls within the
+        // submitter's open span and the arrow binds cleanly.
+        const push_ts: u64 = if (self.trace_flows) monotonicNs() else 0;
+        if (!queues[submitter_id].push(.{ .task = task, .push_ts = push_ts })) return false;
         // Ramp worker wakeups at the start of a burst. A single submit
         // only needs one wake, but fanout submits dozens or thousands of
         // tasks back-to-back; waking only on 0 -> 1 leaves the burst at
@@ -628,18 +667,18 @@ pub const Scheduler = struct {
     /// queues post-F1.
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
-        const task = self.urgent_queues[worker_id].pop() orelse
+        const traced = self.urgent_queues[worker_id].pop() orelse
             self.spec_queues[worker_id].pop() orelse
             return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
         _ = self.n_pops.fetchAdd(1, .monotonic);
-        return task;
+        return traced.task;
     }
 
     /// Try to steal one task from any worker's queues, urgent first
     /// then speculative, excluding the caller's own (`worker_id`).
     pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
-        return self.stealAnyVictimOpt(worker_id, null);
+        return self.stealAnyVictimOpt(worker_id, null, null);
     }
 
     /// Alias for `stealForWorker` — workers use this from their drain
@@ -649,30 +688,32 @@ pub const Scheduler = struct {
         return self.stealForWorker(worker_id);
     }
 
-    /// Like `stealForWorker`, but reports the victim worker id so a
-    /// timeline-capable caller can draw the work-stealing flow arrow. The
-    /// scheduler stays free of the probe layer (it returns data, not events).
-    pub fn stealAnyVictim(self: *Scheduler, worker_id: u8, victim: *u8) ?Task {
-        return self.stealAnyVictimOpt(worker_id, victim);
+    /// Like `stealForWorker`, but reports the victim worker id and the stolen
+    /// task's push timestamp so a timeline-capable caller can draw the work-
+    /// stealing flow arrow anchored to the producing quantum. The scheduler
+    /// stays free of the probe layer (it returns data, not events).
+    pub fn stealAnyVictim(self: *Scheduler, worker_id: u8, victim: *u8, push_ts: *u64) ?Task {
+        return self.stealAnyVictimOpt(worker_id, victim, push_ts);
     }
 
-    fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8) ?Task {
+    fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         if (self.worker_count < 2) return null;
-        if (self.stealExcluding(self.urgent_queues, worker_id, victim)) |t| return t;
-        return self.stealExcluding(self.spec_queues, worker_id, victim);
+        if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| return t;
+        return self.stealExcluding(self.spec_queues, worker_id, victim, push_ts);
     }
 
-    fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8) ?Task {
+    fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == exclude) continue;
-            if (queues[idx].steal()) |task| {
+            if (queues[idx].steal()) |traced| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
                 _ = self.n_steals.fetchAdd(1, .monotonic);
                 if (victim) |v| v.* = idx;
-                return task;
+                if (push_ts) |p| p.* = traced.push_ts;
+                return traced.task;
             }
         }
         return null;
@@ -828,8 +869,8 @@ test "scheduler push/pop/steal work for a single worker" {
     defer sched.deinit();
     try std.testing.expectEqual(@as(u8, 2), sched.worker_count);
 
-    const t1: Task = .{ .force_thunk = 7 };
-    const t2: Task = .{ .force_thunk = 13 };
+    const t1: TracedTask = .{ .task = .{ .force_thunk = 7 } };
+    const t2: TracedTask = .{ .task = .{ .force_thunk = 13 } };
     // Push directly to worker 1's urgent queue.
     try std.testing.expect(sched.urgent_queues[1].push(t1));
     try std.testing.expect(sched.urgent_queues[1].push(t2));
@@ -840,7 +881,7 @@ test "scheduler push/pop/steal work for a single worker" {
 
     // Steal sees the older one.
     const stolen = sched.urgent_queues[1].steal().?;
-    try std.testing.expectEqual(@as(types.ObjectId, 7), stolen.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 7), stolen.task.force_thunk);
 
     try std.testing.expectEqual(@as(?Task, null), sched.pop(1));
 }
@@ -899,8 +940,8 @@ test "stealForWorker: each worker excludes its own queue" {
     try std.testing.expectEqual(@as(u8, 3), sched.worker_count);
 
     // Put one task in each of worker 1 and worker 2's urgent queues.
-    try std.testing.expect(sched.urgent_queues[1].push(.{ .force_thunk = 100 }));
-    try std.testing.expect(sched.urgent_queues[2].push(.{ .force_thunk = 200 }));
+    try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 100 } }));
+    try std.testing.expect(sched.urgent_queues[2].push(.{ .task = .{ .force_thunk = 200 } }));
     sched.pending_tasks.store(2, .release);
 
     // Worker 1 must not steal from its own queue.
@@ -916,7 +957,7 @@ test "stealForWorker: each worker excludes its own queue" {
 
     // Worker 0 (main) likewise excludes its own queue but can take
     // from any other.
-    try std.testing.expect(sched.urgent_queues[1].push(.{ .force_thunk = 7 }));
+    try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 7 } }));
     sched.pending_tasks.store(1, .release);
     const stolen_by_main = sched.stealForWorker(0).?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen_by_main.force_thunk);
