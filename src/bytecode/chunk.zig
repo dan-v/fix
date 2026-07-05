@@ -65,6 +65,12 @@ pub const Chunk = struct {
     function_args: []const AttrEntry = &.{},
     /// Source span ranges for cold-path error traces.
     source_map: []const SourceMapEntry = &.{},
+    /// The span of the whole body node this chunk was compiled from — a
+    /// representative source location for the chunk even when `source_map` is
+    /// empty (it's sparse: entries are added only for tail apply/if/let/…
+    /// constructs). Used by the timeline to label a thunk quantum / demand
+    /// wait. Set at `stampOnBuilder`; null for chunks that skip it.
+    body_span: ?SourceSpan = null,
     /// Optional native-code entry point produced by the JIT. Null
     /// means "interpret the bytecode normally" — the canonical path
     /// and the only one available without `-Djit`. See `src/jit.zig`.
@@ -207,6 +213,8 @@ pub const ChunkBuilder = struct {
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
+    /// The body node's span (see `Chunk.body_span`). Set by `stampOnBuilder`.
+    body_span: ?Chunk.SourceSpan = null,
     /// Byte offset of the start of the most recently written opcode.
     /// `null` when no op has been written or when the tail is no
     /// longer a single rewritable opcode (e.g. after a branch fixup
@@ -332,6 +340,7 @@ pub const ChunkBuilder = struct {
             },
             .function_args = function_args,
             .source_map = source_map,
+            .body_span = self.body_span,
         };
     }
 };

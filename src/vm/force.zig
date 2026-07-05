@@ -378,17 +378,84 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 /// still collects while an import nested inside another builtin does not.
 pub threadlocal var native_depth: u32 = 0;
 
-/// Timeline: "basename:line" source location of a busy thunk the demand fiber
-/// is blocking on. A busy thunk is mid-evaluation, so its bare target arm is
-/// live — safe to read here (call it BEFORE the yield). Best-effort → "".
+/// Timeline: a label for a busy thunk the demand fiber is blocking on —
+/// "basename:line" for a bytecode/user-closure body, or "builtins.import
+/// giant.nix" for a builtin (the path arg is the useful bit). A busy thunk is
+/// mid-evaluation, so its bare target arm is live — safe to read here (call it
+/// BEFORE the yield). Best-effort → "".
 fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) []const u8 {
+    // The outer thunk is busy (evaluating) → its target arm is live.
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.targetKind() != .bytecode) return "";
-    const ch = self.registry.get(th.payload.target.bytecode.chunk_id) orelse return "";
-    const span = vm_errors.sourceSpanForChunk(ch, 0) orelse return "";
+    const label = critTargetLabel(self, th, buf, true);
+    // Never leave a bare "wait": fall back to the thunk kind (e.g. a chunk with
+    // no source map, or a cell whose forwarded value already resolved).
+    return if (label.len > 0) label else @tagName(th.targetKind());
+}
+
+fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) []const u8 {
+    return switch (th.targetKind()) {
+        .bytecode => critChunkLoc(self, th.payload.target.bytecode.chunk_id, buf),
+        .closure => critClosureLabel(self, th.payload.target.closure, buf),
+        .attr_access => std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(th.payload.target.attr_access.name)}) catch "",
+        .pass_through => blk: {
+            // A cell forwards to another value; label what it points at (one
+            // level, no further pass_through recursion). Guard the inner read:
+            // it may already be resolved (target arm dead).
+            if (!follow) break :blk "";
+            const pv = th.payload.target.pass_through;
+            if (!pv.isThunk()) break :blk "";
+            const inner = self.heap.getThunkAssumeValid(pv.asObjectId());
+            if (inner.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) break :blk "";
+            break :blk critTargetLabel(self, inner, buf, false);
+        },
+        // A lazy-compiled attr body — resolve file:line from its AST node via
+        // the table's cached per-source line index (built once; `lineForOffset`
+        // is cache-free so it's safe even while the compiler shares the index).
+        .deferred => blk: {
+            const table = self.deferred_table orelse break :blk "deferred";
+            const entry = table.get(th.payload.target.deferred.deferred_id);
+            const fid = entry.source_file_id orelse break :blk "deferred";
+            const base = std.fs.path.basename(self.intern.get(fid));
+            const off = if (entry.node.span) |s| s.offset else break :blk std.fmt.bufPrint(buf, "{s}", .{base}) catch "deferred";
+            const idx = table.lineIndexFor(entry.source) catch break :blk std.fmt.bufPrint(buf, "{s}", .{base}) catch "deferred";
+            break :blk std.fmt.bufPrint(buf, "{s}:{d}", .{ base, idx.lineForOffset(off) }) catch base;
+        },
+    };
+}
+
+fn critChunkLoc(self: *VM, chunk_id: ChunkId, buf: []u8) []const u8 {
+    const ch = self.registry.get(chunk_id) orelse return "";
+    const span = vm_errors.chunkEntrySpan(ch) orelse return "";
     const file_id = span.file orelse return "";
-    const base = std.fs.path.basename(self.intern.get(file_id));
-    return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch "";
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ std.fs.path.basename(self.intern.get(file_id)), span.line }) catch "";
+}
+
+fn critClosureLabel(self: *VM, cv: Value, buf: []u8) []const u8 {
+    return switch (cv.kind()) {
+        .closure => blk: {
+            const cl = self.heap.getClosure(cv.asObjectId()) catch break :blk "";
+            break :blk critChunkLoc(self, cl.chunk_id, buf);
+        },
+        .builtin_closure => blk: {
+            const bc = self.heap.getBuiltinClosure(cv.asObjectId()) catch break :blk "";
+            break :blk critBuiltinLabel(self, @enumFromInt(bc.builtin_id), bc.args, buf);
+        },
+        .builtin => critBuiltinLabel(self, @enumFromInt(cv.asBuiltinId()), &.{}, buf),
+        else => "",
+    };
+}
+
+fn critBuiltinLabel(self: *VM, id: BuiltinId, args: []const Value, buf: []u8) []const u8 {
+    const name = @tagName(id);
+    // Path-taking builtins (import, readFile, ...) carry the file as arg[0] —
+    // the "which giant file is main blocked on" bit worth surfacing.
+    if (args.len > 0) {
+        const a = args[0];
+        if (a.kind() == .path or a.kind() == .string) {
+            return std.fmt.bufPrint(buf, "builtins.{s} {s}", .{ name, std.fs.path.basename(self.intern.get(a.asInternId())) }) catch name;
+        }
+    }
+    return std.fmt.bufPrint(buf, "builtins.{s}", .{name}) catch name;
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {

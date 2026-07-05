@@ -42,6 +42,7 @@ const types = @import("runtime").types;
 const intern_mod = @import("runtime").intern;
 const chunk_mod = @import("../bytecode/chunk.zig");
 const prof = @import("../probe/prof.zig");
+const diagnostics = @import("diagnostics.zig");
 
 const Node = ast.Node;
 const InternId = types.InternId;
@@ -434,6 +435,11 @@ const Compiler = @import("../compiler.zig").Compiler;
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {
     const _pt = prof.start(.strictness);
     defer prof.end(.strictness, _pt);
+
+    // Record the chunk's body span as a representative source location (the
+    // source map is sparse — see Chunk.body_span). Best-effort; never fails the
+    // compile. Done before the no-capture early return so all chunks get it.
+    c.builder.body_span = diagnostics.sourceSpanForNode(c, body) catch null;
 
     // The strictness signature is purely an upvalue (capture) mask:
     // `nameSetToMask` only sets bits for names that match a capture slot.

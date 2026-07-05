@@ -117,6 +117,15 @@ pub const LineIndex = struct {
         }
         return low - 1;
     }
+
+    /// 1-based line for a byte offset, WITHOUT touching the mutable lookup
+    /// cache — safe to call concurrently (`line_starts` is immutable after
+    /// `init`). For read-only consumers that share a `LineIndex` with the
+    /// compiler (e.g. the timeline labelling a deferred body mid-compile).
+    pub fn lineForOffset(self: *const LineIndex, offset: u32) u32 {
+        if (self.line_starts.len == 0) return 0;
+        return @as(u32, @intCast(self.lineIndexForTarget(offset))) + 1;
+    }
 };
 
 pub const RenderOptions = struct {

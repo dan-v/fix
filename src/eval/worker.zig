@@ -423,7 +423,7 @@ pub const Worker = struct {
                 if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) break :blk null;
                 if (th.targetKind() != .bytecode) break :blk null;
                 const ch = f.vm.registry.get(th.payload.target.bytecode.chunk_id) orelse break :blk null;
-                break :blk vm_errors.sourceSpanForChunk(ch, 0);
+                break :blk vm_errors.chunkEntrySpan(ch);
             },
             .force_list_range => null,
         } orelse return "";

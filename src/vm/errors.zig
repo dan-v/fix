@@ -49,6 +49,19 @@ pub fn sourceSpanForFrame(frame: Frame) ?chunk.Chunk.SourceSpan {
     return sourceSpanForChunk(frame.chunk_ptr, frame.ip);
 }
 
+/// A chunk's representative source span for labelling a THUNK (which starts at
+/// ip 0). Source maps are SPARSE — spans are added only for tail/apply
+/// constructs, in code order — so ip 0 is usually uncovered by
+/// `sourceSpanForChunk`; use the earliest recorded span instead. Null if the
+/// chunk has no source map.
+pub fn chunkEntrySpan(chunk_ptr: *const chunk.Chunk) ?chunk.Chunk.SourceSpan {
+    // The body span covers every chunk (set at compile from the body node);
+    // fall back to the earliest source-map entry for chunks that skipped it.
+    if (chunk_ptr.body_span) |s| return s;
+    if (chunk_ptr.source_map.len == 0) return null;
+    return chunk_ptr.source_map[0].span;
+}
+
 /// The tightest source span covering `ip` in `chunk_ptr` (or null if the chunk
 /// carries no source map). `ip == 0` resolves the chunk's entry point — used by
 /// the timeline to label a thunk quantum with the expression it forces.

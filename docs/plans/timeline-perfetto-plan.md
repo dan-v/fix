@@ -13,10 +13,25 @@ stacks (src/probe/timeline.zig). Nesting constraint (spans mustn't straddle a fi
 yield) is solved for new fine-grained work by using **async events** (don't nest).
 
 ## Status (branch feat/timeline-perfetto, off main)
-A/B/C/D-core DONE + verified (byte-identical off-path, valid Perfetto JSON via
-FIX_TIMELINE on a normal build). Remaining: stall markers, critical-path track,
-async fibers, flamegraph naming, GC coarse spans (-Dgc). Commits 697ed5e (A),
-b921deb (B), 2b72a58 (C), e2ff910 (D-core).
+A/B/C/D DONE + verified (byte-identical off-path, valid Perfetto JSON via
+`--timeline=path` on a NORMAL build). All four lenses live in one trace.
+Commits: 697ed5e (A foundation), b921deb (B steal flows), 2b72a58 (C spec/RSS
+counters), 5d77357 (--timeline trigger), e2ff910 (D source labels), ab4e099
+(critical-path track).
+
+Remaining, with ROI assessment:
+- **crit-wait labels for non-bytecode waits** (imports/derivation builtins show
+  as bare "wait") — worthwhile follow-up (label with builtin name).
+- **GC coarse STW spans** (-Dgc-only; fine minor/conc ride from gc-concurrent).
+- **async fibers** — LOW ROI: per-fiber tracks explode; a single stacked async
+  band adds little over the source-labelled quanta + fiber args (already show
+  per-fiber activity, filterable via Perfetto SQL). Skipped.
+- **wake arrows** — the demand-chain subset is already the crit-wait track;
+  full graph is too dense (millions of resolves). Skipped.
+- **stall markers** — redundant: the pre-park spin already avoids parking with
+  work pending; idle-because-no-work is shown by park spans + the crit track.
+- **flamegraph naming** — effectively DONE: quanta named `run: file:line` let
+  Perfetto's slice aggregation / pivot table produce a source-level breakdown.
 
 ## Stages
 
