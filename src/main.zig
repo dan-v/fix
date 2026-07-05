@@ -133,7 +133,10 @@ pub fn main(init: std.process.Init) !void {
     // calls `init()` which flips the runtime gate on; without it the probe
     // stays dormant (one predictable branch at quantum granularity, ~free).
     const timeline_path = options.timeline_path;
-    if (timeline_path != null) timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
+    if (timeline_path != null) {
+        timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
+        timeline.setFlowSample(options.timeline_flows);
+    }
 
     const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);

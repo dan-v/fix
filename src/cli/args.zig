@@ -67,6 +67,9 @@ pub const Options = struct {
     disable_fanout: bool = false,
     print_sched_stats: bool = false,
     timeline_path: ?[]const u8 = null,
+    /// `--timeline-flows`: steal-arrow flow-event volume. 0 = off, 1 = all
+    /// (default), N>1 = keep 1/N (flows are ~half the trace by event count).
+    timeline_flows: u32 = 1,
 
     fn setSource(self: *Options, source: SourceArg) !void {
         if (self.source != null) return error.TooManySources;
@@ -165,6 +168,9 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.timeline_path = "fix-timeline.json";
         } else if (std.mem.startsWith(u8, arg, "--timeline=")) {
             options.timeline_path = arg["--timeline=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--timeline-flows=")) {
+            const v = arg["--timeline-flows=".len..];
+            options.timeline_flows = if (std.mem.eql(u8, v, "off")) 0 else if (std.mem.eql(u8, v, "all")) 1 else (std.fmt.parseInt(u32, v, 10) catch return error.UnknownOption);
         } else {
             return error.UnknownOption;
         }

@@ -19,6 +19,12 @@ Commits: 697ed5e (A foundation), b921deb (B steal flows), 2b72a58 (C spec/RSS
 counters), 5d77357 (--timeline trigger), e2ff910 (D source labels), ab4e099
 (critical-path track).
 
+DONE since: rich label coverage (attrset thunks, file-id fix, deferred via cached
+line index, mapAttrs/map-genList apply-glue by applied fn); #1 unified quantum +
+crit-wait labels (shared `thunkLabel`); #2 source labels as interned (file_id,line)
+refs resolved at dump (no arena dup → dropped-names eliminated). Commits 215ab38
+(#1), 2881d51 (#2) + the label batch.
+
 Remaining, with ROI assessment:
 - **crit-wait labels for non-bytecode waits** (imports/derivation builtins show
   as bare "wait") — worthwhile follow-up (label with builtin name).

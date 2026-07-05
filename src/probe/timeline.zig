@@ -416,9 +416,19 @@ pub inline fn flowIn(cat: FlowCat, id: u64, tid: u16) void {
     flowImpl(.flow_in, cat, id, tid);
 }
 
+/// Flow sampling (`--timeline-flows`): 0 = none, 1 = every flow (default),
+/// N>1 = keep 1/N. Sampled by `flow_id` so BOTH endpoints of an arrow agree
+/// (same id → both kept or both dropped) — never a dangling half-arrow.
+var flow_sample: u32 = 1;
+pub fn setFlowSample(n: u32) void {
+    flow_sample = n;
+}
+
 fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16) void {
     if (!active) return;
     if (id == 0) return; // 0 = "no flow" sentinel
+    if (flow_sample == 0) return;
+    if (flow_sample > 1 and id % flow_sample != 0) return;
     appendEvent(.{
         .ts_ns = nowNs(),
         .dur_ns = 0,
