@@ -692,19 +692,23 @@ fn slotEntry(arg: *anyopaque) void {
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
         },
         .force_list_range => |range| {
-            // `items` is a RAW slice into the list's value range, held across
+            // The list's value range is a RAW store slice held across
             // `forceValueSpeculative` — which can drive a GC collection. We
-            // nulled `current_task` above, so nothing else roots this list; at
-            // --workers>1 a collection would sweep it, free+reuse its range,
-            // and the slice would dangle (garbage item -> bogus thunk ->
-            // corrupt waiter list -> SIGSEGV). Keep the list rooted for the
-            // duration. Zero cost without -Dgc.
+            // nulled `current_task` above, so nothing else roots this list.
+            // Rooting keeps the list *object* live, but the copying nursery
+            // collector EVACUATES (moves) its value range to to-space, so a
+            // slice captured before the force dangles even though the object
+            // survives. Re-fetch each element from the id per iteration
+            // (`getListItem` re-derives the range from the moved object) so we
+            // always read the live copy. Zero cost without -Dgc.
             const gc_roots = vm_force.rootsBegin(&f.vm);
             defer vm_force.rootsEnd(&f.vm, gc_roots);
             vm_force.rootKeep(&f.vm, Value.list(range.list_id));
-            const items = f.vm.heap.getList(range.list_id) catch return;
-            const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
-            for (items[range.offset..end]) |item| {
+            const len = (f.vm.heap.getList(range.list_id) catch return).len;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), len);
+            var i: usize = range.offset;
+            while (i < end) : (i += 1) {
+                const item = f.vm.heap.getListItem(range.list_id, i) catch return;
                 if (!item.isThunk()) continue;
                 _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
             }
