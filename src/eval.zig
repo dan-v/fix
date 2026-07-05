@@ -833,30 +833,41 @@ pub const Evaluator = struct {
     /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
     fn gcCollect(self: *Evaluator, collector_id: u8) void {
         if (comptime !gc.enabled) return;
-        _ = collector_id;
-        // Copying minor collection (STW). At --workers>1 the peers are already
-        // parked at safepoints (gcWaitAllParked in force.zig), so the minor runs
-        // single-threaded on the collector regardless of worker count. The young
-        // set is small (most objects die young), so a serial mark is cheap — no
-        // parallel mark needed for a minor.
+        // Copying minor collection (STW). The young-gated mark runs from roots +
+        // the old→young remembered set. At --workers>1 the parked peers HELP the
+        // mark (parallel young-gated drain); at --workers=1 it's serial.
         const tr = &self.gc_tracer;
         const t0 = gcNowNs();
-        tr.resetMinor(self.heap.objects.count()) catch {
-            self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-            return;
-        };
-        // Young-gated mark from every root; the trace stops at old objects.
-        self.gcMarkRoots(tr);
-        // Seed young objects kept alive only through an old parent (the
-        // remembered set of old→young edges recorded by the write barrier).
         const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
         const Seed = struct {
             fn cb(ctx: SeedCtx, source: types.ObjectId) void {
                 ctx.tr.markRemsetSource(ctx.heap, source);
             }
         };
-        self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
-        tr.drainMinor(&self.heap);
+        if (self.worker_count > 1) {
+            tr.resetParallelMinor(self.heap.objects.count(), self.worker_count) catch {
+                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+                return;
+            };
+            // Seed roots + remset into the collector's own marker deque, open
+            // the mark so parked peers help drain it, then drain alongside them.
+            tr.beginSeeding(collector_id);
+            self.gcMarkRoots(tr);
+            self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
+            tr.endSeeding();
+            self.scheduler.gcOpenMark();
+            tr.drainParallel(&self.heap, collector_id); // returns at termination
+            self.scheduler.gcCloseMark();
+            tr.sumStats();
+        } else {
+            tr.resetMinor(self.heap.objects.count()) catch {
+                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
+                return;
+            };
+            self.gcMarkRoots(tr);
+            self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
+            tr.drainMinor(&self.heap);
+        }
         const t1 = gcNowNs();
         const st = self.heap.gcMinorCollect(tr.mark_bits);
         const t2 = gcNowNs();

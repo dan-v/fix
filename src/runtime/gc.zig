@@ -85,12 +85,18 @@ pub const Marker = struct {
     /// Shared with every other marker and the Tracer; set in `resetParallel`.
     mark_bits: []u64 = &.{},
     allocator: std.mem.Allocator,
+    /// Minor-collection young-gate (set by `resetParallelMinor`): stop the
+    /// trace at old objects. Matches `Tracer.minor_gate` for the serial path.
+    minor_gate: bool = false,
 
     inline fn markValue(self: *Marker, heap: *const ObjectHeap, v: Value) void {
         if (hasObjectRef(v)) self.markObject(heap, v.asObjectId());
     }
     inline fn markObject(self: *Marker, heap: *const ObjectHeap, id: ObjectId) void {
-        _ = heap;
+        // Minor collection: the trace stops at old objects (their young
+        // referents arrive via the remembered set). Same gate as the serial
+        // `Tracer.markObject`, so parallel and serial minors agree.
+        if (self.minor_gate and !heap.gcIsYoung(id)) return;
         // OOM: undercount rather than crash, matching the serial path. In
         // practice the worklist peaks near the live-set size and never OOMs.
         if (atomicTestAndSet(self.mark_bits, id)) self.deque.push(self.allocator, id) catch {};
@@ -283,6 +289,17 @@ pub const Tracer = struct {
         self.marker_count = marker_count;
         self.active_idle = .init(0);
         self.parallel_seed = null;
+        self.minor_gate = false;
+    }
+
+    /// Like `resetParallel` but young-gated (minor collection): the serial
+    /// root-seed path (`Tracer.markObject`) and every parallel `Marker` stop the
+    /// trace at old objects. Roots + remembered-set seeds reach the young set;
+    /// old objects are assumed live.
+    pub fn resetParallelMinor(self: *Tracer, object_count: u32, marker_count: u32) !void {
+        try self.resetParallel(object_count, marker_count);
+        self.minor_gate = true;
+        for (self.markers[0..marker_count]) |*m| m.minor_gate = true;
     }
 
     /// Seed subsequent `markObject`/`markValue` root marks into marker `id`'s
