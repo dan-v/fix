@@ -111,6 +111,11 @@ pub const Fiber = struct {
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
+    /// Timeline (`FIX_TIMELINE`): flow-arrow id for a STOLEN task's quantum,
+    /// so the run emits a `flowIn` matching the steal's `flowOut` (→ a
+    /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
+    /// `flowIn` treats 0 as "no flow", so this is inert when tracing is off.
+    flow_in_id: u64 = 0,
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*Fiber,
     /// Ready-queue node (scheduler-owned linked list). Set by
@@ -339,9 +344,21 @@ pub const Worker = struct {
             self.runFiber(f);
             return true;
         }
-        if (self.pickTask()) |task| {
+        var victim: ?u8 = null;
+        if (self.pickTask(&victim)) |task| {
             const f = try self.acquireFreeFiber();
             f.current_task = task;
+            // Timeline: a stolen task's run draws a victim→stealer arrow. Emit
+            // the producer end (on the victim's track) now and carry the id to
+            // the quantum, which emits the matching consumer end. Inert off.
+            f.flow_in_id = 0;
+            if (victim) |vtid| {
+                if (timeline.on()) {
+                    const fid = Scheduler.flowId(task);
+                    f.flow_in_id = fid;
+                    timeline.flowOut(.steal, fid, vtid);
+                }
+            }
             f.inner.reset(slotEntry, @ptrCast(f));
             f.state = .running;
             self.runFiber(f);
@@ -367,9 +384,14 @@ pub const Worker = struct {
     /// "run"). Rich `args` carry the thunk/list id for click-through.
     fn timelineQuantumBegin(f: *Fiber) void {
         var buf: [80]u8 = undefined;
-        if (f.current_task) |task| switch (task) {
-            .force_thunk => |id| timeline.beginArgs(.run, "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
-            .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
+        if (f.current_task) |task| {
+            switch (task) {
+                .force_thunk => |id| timeline.beginArgs(.run, "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
+                .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
+            }
+            // Consumer end of the work-stealing arrow — inside this quantum so
+            // the arrow lands on it. No-op unless this task was stolen (id != 0).
+            timeline.flowIn(.steal, f.flow_in_id, worker_id_mod.current);
         } else {
             timeline.begin(.run, "resume", f.fiber_id);
         }
@@ -468,13 +490,19 @@ pub const Worker = struct {
         if (t1 > t0) self.idle_ns += t1 - t0;
     }
 
-    fn pickTask(self: *Worker) ?Task {
+    /// Pick a task from own queues (not stolen → `victim` stays null) or steal
+    /// one (→ `victim.*` = the victim worker id, for the timeline flow arrow).
+    fn pickTask(self: *Worker, victim: *?u8) ?Task {
         // Once a top-level result is ready, don't start new background
         // work — only drive already-suspended fibers to completion. Bounds
         // the dead-speculation tail (see Scheduler.suppress_background).
         if (self.scheduler.backgroundSuppressed()) return null;
         if (self.scheduler.pop(self.worker_id)) |t| return t;
-        if (self.scheduler.stealAny(self.worker_id)) |t| return t;
+        var v: u8 = 0;
+        if (self.scheduler.stealAnyVictim(self.worker_id, &v)) |t| {
+            victim.* = v;
+            return t;
+        }
         return null;
     }
 

@@ -639,9 +639,7 @@ pub const Scheduler = struct {
     /// Try to steal one task from any worker's queues, urgent first
     /// then speculative, excluding the caller's own (`worker_id`).
     pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
-        if (self.worker_count < 2) return null;
-        if (self.stealExcluding(self.urgent_queues, worker_id)) |t| return t;
-        return self.stealExcluding(self.spec_queues, worker_id);
+        return self.stealAnyVictimOpt(worker_id, null);
     }
 
     /// Alias for `stealForWorker` — workers use this from their drain
@@ -651,7 +649,31 @@ pub const Scheduler = struct {
         return self.stealForWorker(worker_id);
     }
 
-    fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8) ?Task {
+    /// Like `stealForWorker`, but reports the victim worker id so a
+    /// timeline-capable caller can draw the work-stealing flow arrow. The
+    /// scheduler stays free of the probe layer (it returns data, not events).
+    pub fn stealAnyVictim(self: *Scheduler, worker_id: u8, victim: *u8) ?Task {
+        return self.stealAnyVictimOpt(worker_id, victim);
+    }
+
+    fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8) ?Task {
+        if (self.worker_count < 2) return null;
+        if (self.stealExcluding(self.urgent_queues, worker_id, victim)) |t| return t;
+        return self.stealExcluding(self.spec_queues, worker_id, victim);
+    }
+
+    /// Stable flow-arrow id for a task (see `timeline.flowOut`/`flowIn`): the
+    /// producer (steal) and consumer (the quantum that runs it) derive the same
+    /// id. Disjoint high tag bits per variant; never 0 (the "no flow" sentinel).
+    pub fn flowId(task: Task) u64 {
+        return switch (task) {
+            .force_thunk => |id| (@as(u64, 1) << 62) | id,
+            .force_list_range => |r| (@as(u64, 2) << 62) |
+                (@as(u64, r.list_id) << 24) | (@as(u64, r.offset) & 0xFFFFFF),
+        };
+    }
+
+    fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
@@ -660,6 +682,7 @@ pub const Scheduler = struct {
             if (queues[idx].steal()) |task| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
                 _ = self.n_steals.fetchAdd(1, .monotonic);
+                if (victim) |v| v.* = idx;
                 return task;
             }
         }

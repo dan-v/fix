@@ -102,7 +102,11 @@ const StackEntry = struct {
     args_len: u32,
 };
 
-const Kind = enum(u8) { span, instant, counter };
+/// `flow_out`/`flow_in` are Perfetto flow-event endpoints (ph:"s"/"f") — a
+/// directed arrow from the slice enclosing the `out` (on the producer's track)
+/// to the slice enclosing the `in` (on the consumer's), matched by `flow_id`.
+/// Used for work-stealing (victim push → stealer run) and thunk-resolve wakes.
+const Kind = enum(u8) { span, instant, counter, flow_out, flow_in };
 
 const Event = struct {
     ts_ns: u64,
@@ -120,6 +124,8 @@ const Event = struct {
     /// For counters: the counter track name, stored in the name arena.
     ctr_off: u32 = 0,
     ctr_len: u32 = 0,
+    /// For flow endpoints: the matching id (producer + consumer share it).
+    flow_id: u64 = 0,
 };
 
 const WorkerStack = struct {
@@ -321,6 +327,52 @@ pub inline fn counter(name: []const u8, args: []const u8) void {
     });
 }
 
+/// Flow categories — a fixed set (mapped to a name at dump time) so hot flow
+/// events store a 1-byte tag instead of a repeated string in the name arena.
+pub const FlowCat = enum(u8) {
+    steal,
+    wake,
+
+    fn text(self: FlowCat) []const u8 {
+        return switch (self) {
+            .steal => "steal",
+            .wake => "wake",
+        };
+    }
+};
+
+/// Flow-arrow producer endpoint (`ph:"s"`) on track `tid` (usually a peer's,
+/// e.g. the victim of a steal), matched to a consumer by `id`. Binds to
+/// whatever slice is open on `tid` at this instant. An unmatched `out` (id
+/// never consumed) draws nothing.
+pub inline fn flowOut(cat: FlowCat, id: u64, tid: u16) void {
+    flowImpl(.flow_out, cat, id, tid);
+}
+
+/// Flow-arrow consumer endpoint (`ph:"f"`, `bp:"e"`) on track `tid` (usually
+/// the current worker), matched to a producer by `id`. Emit inside the slice
+/// that consumes the work (e.g. the quantum running a stolen task) so the
+/// arrow lands on it. An unmatched `in` draws nothing.
+pub inline fn flowIn(cat: FlowCat, id: u64, tid: u16) void {
+    flowImpl(.flow_in, cat, id, tid);
+}
+
+fn flowImpl(kind: Kind, cat: FlowCat, id: u64, tid: u16) void {
+    if (!active) return;
+    if (id == 0) return; // 0 = "no flow" sentinel
+    appendEvent(.{
+        .ts_ns = nowNs(),
+        .dur_ns = 0,
+        .tid = tid,
+        .kind = kind,
+        .label = .run,
+        .subj_off = 0,
+        .subj_len = 0,
+        .arg = @intFromEnum(cat),
+        .flow_id = id,
+    });
+}
+
 /// Throttle helper for periodic sampling: returns true at most once per
 /// `min_gap_ns` (per calling worker is fine — counters merge by name/ts).
 var last_sample_ns: std.atomic.Value(u64) = .init(0);
@@ -434,6 +486,21 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
             );
             try writeJsonString(w, counterNameOf(e));
             try w.print(",\"args\":{{{s}}}", .{body});
+            try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
+            continue;
+        }
+        // Flow endpoints: a directed arrow matched by id across tracks. `s` =
+        // producer (binds to the open slice on its track), `f`+`bp:e` = consumer
+        // (binds to the enclosing slice). Unmatched endpoints render nothing.
+        if (e.kind == .flow_out or e.kind == .flow_in) {
+            const ph = if (e.kind == .flow_out) "s" else "f";
+            try w.print(
+                "{{\"ph\":\"{s}\",\"id\":{d},\"cat\":\"flow\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3}",
+                .{ ph, e.flow_id, e.tid, usFromNs(rel_ns) },
+            );
+            if (e.kind == .flow_in) try w.writeAll(",\"bp\":\"e\"");
+            try w.writeAll(",\"name\":");
+            try writeJsonString(w, (@as(FlowCat, @enumFromInt(@as(u8, @intCast(e.arg)))).text()));
             try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
             continue;
         }
