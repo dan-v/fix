@@ -852,13 +852,22 @@ pub const ObjectHeap = struct {
         _ = initial_threshold;
         self.gc_threshold_bytes = std.math.maxInt(u64);
         self.gc_track_from = self.objects.count();
-        // Flush each worker's range TLABs so the first post-enable allocation
-        // refills from the nursery instead of draining a leftover tenured
-        // chunk carried over from bootstrap.
+        // Flush each worker's TLABs so the first post-enable allocation refills
+        // fresh instead of draining a leftover chunk carried over from bootstrap.
+        // The object TLAB matters for correctness, not just the range TLABs: a
+        // bootstrap object chunk reserves a whole span up to `objects.count()`
+        // but leaves most of it UNFILLED. Since `gc_track_from` is that count,
+        // any object later drained from those leftover low slots would land
+        // BELOW `gc_track_from` — untracked — yet be born post-enable with a
+        // YOUNG range. The nursery reset would then reclaim that range out from
+        // under a live, never-evacuated object (untracked objects are never
+        // marked/evacuated). Flushing forces post-enable objects onto fresh
+        // slots at/above `gc_track_from`, so they are tracked and evacuated.
         for (self.worker_locals) |*l| {
             l.value = .{};
             l.attr = .{};
             l.attr_pos = .{};
+            l.object = .{};
         }
         // Detector build: pre-size the alloc bitmap to the whole object id
         // space so the incremental per-fill bit-set never reallocs (which
@@ -1133,7 +1142,10 @@ pub const ObjectHeap = struct {
             }
         }.f;
         var shown: u32 = 0;
-        var id: ObjectId = self.gc_track_from;
+        // From 0, not gc_track_from: catches the class where a post-enable
+        // object lands in a leftover bootstrap slot BELOW track_from (untracked)
+        // with a young range — the bug the object-TLAB-flush fix closed.
+        var id: ObjectId = 0;
         const n = self.objects.count();
         while (id < n and shown < 8) : (id += 1) {
             const word = id >> 6;
@@ -1236,7 +1248,7 @@ pub const ObjectHeap = struct {
     /// missed-evacuation bug is caught at its source, not downstream.
     fn gcVerifyNoYoungRangesInOld(self: *ObjectHeap) void {
         const n = self.objects.count();
-        var id: ObjectId = self.gc_track_from;
+        var id: ObjectId = 0; // from 0: also catch untracked (<track_from) young ranges
         while (id < n) : (id += 1) {
             const word = id >> 6;
             if (word >= self.gc_alloc_bits.len) break;
