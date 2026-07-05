@@ -27,15 +27,30 @@
 //! `end` asserts the popped label matches, so if a span ever straddles a
 //! yield the imbalance trips the assertion at its source.
 //!
-//! Compile-time gated by `build_options.timeline`; when off, every entry
-//! point is an empty inline fn and the module costs nothing.
+//! Runtime-gated (`FIX_TIMELINE` env or `--timeline[=path]`): always compiled
+//! in, `init()` flips `active` on. When off, each entry point is one
+//! predictable branch on `active`; the hot instrumentation sits at
+//! fiber-quantum / park granularity (not per-op), so it is effectively free.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const worker_id_mod = @import("runtime").worker_id;
 
-pub const enabled: bool = build_options.timeline;
+/// Always compiled in — timeline is now RUNTIME-gated (`FIX_TIMELINE` env or
+/// `--timeline[=path]`): `init()` flips `active` on. When off, every entry
+/// point is one predictable-not-taken branch on `active`; the hot
+/// instrumentation is at fiber-quantum / park granularity (not per-op), so it
+/// is effectively free. Kept as a `pub const true` so existing
+/// `if (comptime timeline.enabled)` sites fold to the taken branch — the real
+/// switch is the runtime `active` flag, read via `on()`.
+pub const enabled = true;
+
+/// Runtime switch: true between `init()` and `dump()`. THE gate — a plain
+/// global load, predictable when off. Gate expensive arg prep (formatting,
+/// /proc reads) behind this so it's skipped when tracing is off.
+pub inline fn on() bool {
+    return active;
+}
 
 /// Static span/marker categories. Keeping these as an enum (rather than
 /// a copied string) means the hot per-quantum path stores no bytes in
@@ -48,6 +63,16 @@ pub const Label = enum(u8) {
     render,
     evaluate,
     import,
+    /// GC work (subject = phase: "mark"/"sweep"/"minor"/"init-stw"/
+    /// "conc-mark"/"final-stw"). Synchronous at a safepoint → nests cleanly
+    /// inside the running quantum. `arg` carries a phase-specific count.
+    gc,
+    /// A worker stopped at a GC safepoint waiting for the collector (the STW
+    /// pause as seen by a peer — distinct from a plain no-work `park`).
+    gc_wait,
+    /// A builtin on the critical path (subject = builtin name). Instant marker
+    /// — many builtins force args and thus straddle a yield.
+    builtin,
 
     fn text(self: Label) []const u8 {
         return switch (self) {
@@ -58,6 +83,9 @@ pub const Label = enum(u8) {
             .render => "render",
             .evaluate => "evaluate",
             .import => "import",
+            .gc => "gc",
+            .gc_wait => "gc-wait",
+            .builtin => "builtin",
         };
     }
 };
@@ -70,17 +98,28 @@ const StackEntry = struct {
     subj_off: u32,
     subj_len: u32,
     arg: u64,
+    args_off: u32,
+    args_len: u32,
 };
+
+const Kind = enum(u8) { span, instant, counter };
 
 const Event = struct {
     ts_ns: u64,
     dur_ns: u64,
     tid: u16,
-    is_instant: bool,
+    kind: Kind,
     label: Label,
     subj_off: u32,
     subj_len: u32,
     arg: u64,
+    /// A pre-formatted JSON object *body* (no braces), stored in the name
+    /// arena — e.g. `"chunk":123,"depth":7`. Rendered as the event's `args`.
+    args_off: u32 = 0,
+    args_len: u32 = 0,
+    /// For counters: the counter track name, stored in the name arena.
+    ctr_off: u32 = 0,
+    ctr_len: u32 = 0,
 };
 
 const WorkerStack = struct {
@@ -163,22 +202,32 @@ fn appendEvent(e: Event) void {
 /// `arg` is a free numeric annotation (used for the fiber id on quanta).
 pub inline fn begin(label: Label, subject: []const u8, arg: u64) void {
     if (!enabled) return;
-    beginImpl(label, subject, arg);
+    beginImpl(label, subject, arg, "");
 }
 
-fn beginImpl(label: Label, subject: []const u8, arg: u64) void {
+/// Like `begin`, plus a pre-formatted JSON object body (no braces) shown in
+/// Perfetto's detail panel — e.g. `"chunk":123,"builtin":"map"`.
+pub inline fn beginArgs(label: Label, subject: []const u8, arg: u64, args: []const u8) void {
+    if (!enabled) return;
+    beginImpl(label, subject, arg, args);
+}
+
+fn beginImpl(label: Label, subject: []const u8, arg: u64, args: []const u8) void {
     if (!active) return;
     const wid = worker_id_mod.current;
     if (wid >= stacks.len) return;
     const st = &stacks[wid];
     if (st.len >= MAX_DEPTH) return;
     const nm = storeName(subject);
+    const ar = storeName(args);
     st.items[st.len] = .{
         .ts_ns = nowNs(),
         .label = label,
         .subj_off = nm.off,
         .subj_len = nm.len,
         .arg = arg,
+        .args_off = ar.off,
+        .args_len = ar.len,
     };
     st.len += 1;
 }
@@ -205,11 +254,13 @@ fn endImpl(label: Label) void {
         .ts_ns = e.ts_ns,
         .dur_ns = if (now > e.ts_ns) now - e.ts_ns else 0,
         .tid = @intCast(wid),
-        .is_instant = false,
+        .kind = .span,
         .label = e.label,
         .subj_off = e.subj_off,
         .subj_len = e.subj_len,
         .arg = e.arg,
+        .args_off = e.args_off,
+        .args_len = e.args_len,
     });
 }
 
@@ -217,29 +268,84 @@ fn endImpl(label: Label) void {
 /// for moments that bracket yielding work (render start, etc.).
 pub inline fn instant(label: Label, subject: []const u8) void {
     if (!enabled) return;
-    instantImpl(label, subject);
+    instantImpl(label, subject, "");
 }
 
-fn instantImpl(label: Label, subject: []const u8) void {
+/// Like `instant`, plus a JSON args body (no braces).
+pub inline fn instantArgs(label: Label, subject: []const u8, args: []const u8) void {
+    if (!enabled) return;
+    instantImpl(label, subject, args);
+}
+
+fn instantImpl(label: Label, subject: []const u8, args: []const u8) void {
     if (!active) return;
     const wid = worker_id_mod.current;
     const nm = storeName(subject);
+    const ar = storeName(args);
     appendEvent(.{
         .ts_ns = nowNs(),
         .dur_ns = 0,
         .tid = wid,
-        .is_instant = true,
+        .kind = .instant,
         .label = label,
         .subj_off = nm.off,
         .subj_len = nm.len,
         .arg = 0,
+        .args_off = ar.off,
+        .args_len = ar.len,
     });
+}
+
+/// Emit a counter sample (`ph:"C"`) — a time-series track named `name` whose
+/// series/values are the `args` JSON body, e.g. `"objects":1000,"attrs":500`.
+/// Perfetto draws one stacked graph per counter name. Cheap: no syscalls here,
+/// the caller supplies the already-read values. Emitted on any worker.
+pub inline fn counter(name: []const u8, args: []const u8) void {
+    if (!enabled) return;
+    if (!active) return;
+    const nm = storeName(name);
+    const ar = storeName(args);
+    appendEvent(.{
+        .ts_ns = nowNs(),
+        .dur_ns = 0,
+        .tid = worker_id_mod.current,
+        .kind = .counter,
+        .label = .run,
+        .subj_off = 0,
+        .subj_len = 0,
+        .arg = 0,
+        .args_off = ar.off,
+        .args_len = ar.len,
+        .ctr_off = nm.off,
+        .ctr_len = nm.len,
+    });
+}
+
+/// Throttle helper for periodic sampling: returns true at most once per
+/// `min_gap_ns` (per calling worker is fine — counters merge by name/ts).
+var last_sample_ns: std.atomic.Value(u64) = .init(0);
+pub fn shouldSample(min_gap_ns: u64) bool {
+    if (!enabled or !active) return false;
+    const now = nowNs();
+    const last = last_sample_ns.load(.monotonic);
+    if (now < last + min_gap_ns) return false;
+    return last_sample_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) == null;
 }
 
 fn subjectOf(e: Event) []const u8 {
     if (e.subj_len == 0) return "";
     const off: usize = e.subj_off;
     return names[off..][0..e.subj_len];
+}
+fn argsBodyOf(e: Event) []const u8 {
+    if (e.args_len == 0) return "";
+    const off: usize = e.args_off;
+    return names[off..][0..e.args_len];
+}
+fn counterNameOf(e: Event) []const u8 {
+    if (e.ctr_len == 0) return "counter";
+    const off: usize = e.ctr_off;
+    return names[off..][0..e.ctr_len];
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -319,7 +425,19 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
         const e = events[i];
         const rel_ns = if (e.ts_ns > start_ns) e.ts_ns - start_ns else 0;
         const subj = subjectOf(e);
-        if (e.is_instant) {
+        const body = argsBodyOf(e);
+        // Counter: a time-series track named `ctr`, values = the args body.
+        if (e.kind == .counter) {
+            try w.print(
+                "{{\"ph\":\"C\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"name\":",
+                .{ e.tid, usFromNs(rel_ns) },
+            );
+            try writeJsonString(w, counterNameOf(e));
+            try w.print(",\"args\":{{{s}}}", .{body});
+            try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
+            continue;
+        }
+        if (e.kind == .instant) {
             try w.print(
                 "{{\"ph\":\"i\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"s\":\"t\",\"name\":",
                 .{ e.tid, usFromNs(rel_ns) },
@@ -338,14 +456,17 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
             const full = std.fmt.bufPrint(&namebuf, "{s}: {s}", .{ e.label.text(), subj }) catch e.label.text();
             try writeJsonString(w, full);
         }
-        if (e.arg != 0) {
-            try w.print(",\"args\":{{\"fiber\":{d}}}", .{e.arg});
+        // args = {fiber, <body>} — fiber id (quanta) plus any rich fields.
+        if (e.arg != 0 or body.len != 0) {
+            try w.writeAll(",\"args\":{");
+            if (e.arg != 0) {
+                try w.print("\"fiber\":{d}", .{e.arg});
+                if (body.len != 0) try w.writeByte(',');
+            }
+            if (body.len != 0) try w.writeAll(body);
+            try w.writeByte('}');
         }
-        if (i + 1 < count) {
-            try w.writeAll("},\n");
-        } else {
-            try w.writeAll("}\n");
-        }
+        try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
     }
 
     try w.writeAll("]\n");

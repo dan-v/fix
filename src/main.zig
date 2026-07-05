@@ -129,18 +129,19 @@ pub fn main(init: std.process.Init) !void {
         tjit_hot.report_enabled = options.print_sched_stats;
     }
 
-    if (comptime timeline.enabled) {
-        if (options.timeline_path != null) timeline.init(allocator, worker_count, 1 << 21);
-    } else if (options.timeline_path != null) {
-        std.debug.print("warning: --timeline requires a build with -Dtimeline; ignoring\n", .{});
-    }
+    // Timeline is always compiled in and RUNTIME-gated: enable via
+    // `--timeline[=path]` OR the `FIX_TIMELINE[=path]` env var. `init()` flips
+    // the runtime gate on; with neither set the probe stays dormant (~free).
+    const timeline_path: ?[]const u8 = options.timeline_path orelse blk: {
+        const v = init.environ_map.get("FIX_TIMELINE") orelse break :blk null;
+        break :blk if (v.len == 0) "fix-timeline.json" else v;
+    };
+    if (timeline_path != null) timeline.init(allocator, worker_count, 1 << 21);
 
     const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
     progress.deinit(ok);
 
-    if (comptime timeline.enabled) {
-        if (options.timeline_path) |p| timeline.dump(init.io, p, worker_count);
-    }
+    if (timeline_path) |p| timeline.dump(init.io, p, worker_count);
     vm_trace.finish();
     thunks_setup.finish();
     if (options.print_sched_stats) stats.report(&ev);

@@ -362,12 +362,46 @@ pub const Worker = struct {
     /// so `resume_` never overlaps with another `resume_` on the same
     /// fiber. In normal (uncontended) execution the lock/unlock is
     /// two atomic ops.
+    /// Timeline (`-Dtimeline`): open the run quantum labelled with the task it
+    /// processes, so worker 0's track shows WHAT each quantum computes (not just
+    /// "run"). Rich `args` carry the thunk/list id for click-through.
+    fn timelineQuantumBegin(f: *Fiber) void {
+        var buf: [80]u8 = undefined;
+        if (f.current_task) |task| switch (task) {
+            .force_thunk => |id| timeline.beginArgs(.run, "force-thunk", f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
+            .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
+        } else {
+            timeline.begin(.run, "resume", f.fiber_id);
+        }
+    }
+
+    /// Timeline: sample heap cursors + RSS as counter tracks (time-series graphs
+    /// in Perfetto) so we can see memory grow over the eval and correlate GC
+    /// pauses with allocation. Throttled to ~1ms; RSS is a /proc read.
+    fn sampleTimelineCounters(f: *Fiber) void {
+        if (!timeline.shouldSample(1_000_000)) return;
+        const heap = f.vm.heap;
+        var buf: [192]u8 = undefined;
+        timeline.counter("heap_slots", std.fmt.bufPrint(&buf, "\"objects\":{d},\"values\":{d},\"attrs\":{d}", .{ heap.objects.count(), heap.values.count(), heap.attrs.count() }) catch return);
+        var rbuf: [48]u8 = undefined;
+        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d}", .{gc.peakRssBytes() >> 20}) catch return);
+    }
+
     fn runFiber(self: *Worker, f: *Fiber) void {
         f.run_mu.lock();
         defer f.run_mu.unlock();
 
         const t0 = nanoMonotonic();
-        timeline.begin(.run, "", f.fiber_id);
+        // Runtime-gated: when tracing is off this is one predictable branch and
+        // we open the cheap unlabelled quantum; when on, sample counters + label
+        // the quantum with the task it runs (both do arg formatting / a /proc
+        // read, so they stay behind `on()`).
+        if (timeline.on()) {
+            sampleTimelineCounters(f);
+            timelineQuantumBegin(f);
+        } else {
+            timeline.begin(.run, "", f.fiber_id);
+        }
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
         f.in_runfiber.store(0, .release);
