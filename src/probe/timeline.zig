@@ -663,25 +663,23 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
             try w.writeAll(if (i + 1 < count) "},\n" else "}\n");
             continue;
         }
+        // Idiomatic Chrome/Perfetto split: `cat` = the operation (run/park/
+        // import/gc/wait — colors + filters the slice), `name` = the specific
+        // thing (source loc / file / mapAttrs), `args` = structured extras.
         if (e.kind == .instant) {
             try w.print(
-                "{{\"ph\":\"i\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"s\":\"t\",\"name\":",
-                .{ e.tid, usFromNs(rel_ns) },
+                "{{\"ph\":\"i\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"s\":\"t\",\"cat\":\"{s}\",\"name\":",
+                .{ e.tid, usFromNs(rel_ns), e.label.text() },
             );
         } else {
             try w.print(
-                "{{\"ph\":\"X\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"dur\":{d:.3},\"name\":",
-                .{ e.tid, usFromNs(rel_ns), usFromNs(e.dur_ns) },
+                "{{\"ph\":\"X\",\"pid\":1,\"tid\":{d},\"ts\":{d:.3},\"dur\":{d:.3},\"cat\":\"{s}\",\"name\":",
+                .{ e.tid, usFromNs(rel_ns), usFromNs(e.dur_ns), e.label.text() },
             );
         }
-        // name = label, optionally suffixed with ": <subject>".
-        if (subj.len == 0) {
-            try writeJsonString(w, e.label.text());
-        } else {
-            var namebuf: [512]u8 = undefined;
-            const full = std.fmt.bufPrint(&namebuf, "{s}: {s}", .{ e.label.text(), subj }) catch e.label.text();
-            try writeJsonString(w, full);
-        }
+        // name = the detail (subject), or the operation itself when there's no
+        // detail (e.g. a bare "park" or an unlabelled "force-thunk" quantum).
+        try writeJsonString(w, if (subj.len == 0) e.label.text() else subj);
         // args = {fiber, <body>} — fiber id (quanta) plus any rich fields.
         if (e.arg != 0 or body.len != 0) {
             try w.writeAll(",\"args\":{");
