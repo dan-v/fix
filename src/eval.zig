@@ -125,6 +125,14 @@ pub const Evaluator = struct {
     /// after it's quiesced, and during a stop-the-world all live workers are
     /// parked — so the collector reads a stable set.
     gc_workers: if (gc.enabled) []std.atomic.Value(?*worker_mod.Worker) else void,
+    /// GC (`-Dgc`): chunk-constant root scan is INCREMENTAL across minors. A
+    /// chunk constant's referent is promoted to old at the first minor that
+    /// scans it and stays old (a later young reference it gains is caught by
+    /// the remembered-set barrier, not the constant). So each minor scans only
+    /// chunks `[gc_chunks_scanned, registry.count())`; re-scanning all of them
+    /// every minor was ~77% of the serial root-scan. A future MAJOR resets this
+    /// to 0 (a full mark re-scans every constant).
+    gc_chunks_scanned: if (gc.enabled) ChunkId else void = if (gc.enabled) 0 else {},
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -924,13 +932,18 @@ pub const Evaluator = struct {
         @import("vm/access.zig").gcMarkAttrCache(tr, &self.heap);
         // Chunk constants can hold heap references (e.g. a scoped-import's
         // ambient-scope attrset baked in via emitConstant). Chunks are never
-        // GC'd, so their constants are permanent roots.
+        // GC'd, so their constants are permanent roots — but INCREMENTALLY:
+        // only chunks compiled since the last minor can reference a still-young
+        // object (earlier ones' referents were promoted at their first scan;
+        // post-promotion young refs come via the remembered set). See
+        // `gc_chunks_scanned`.
         const chunk_count = self.registry.count();
-        var cid: ChunkId = 0;
+        var cid: ChunkId = self.gc_chunks_scanned;
         while (cid < chunk_count) : (cid += 1) {
             const ch = self.registry.get(cid) orelse continue;
             for (ch.constants) |c| tr.markValue(&self.heap, c);
         }
+        self.gc_chunks_scanned = chunk_count;
         // Resolved import results.
         var it = self.imports.entries.iterator();
         while (it.next()) |e| {
