@@ -381,6 +381,13 @@ pub const ObjectHeap = struct {
     gc_evac_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
     gc_evac_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
     gc_evac_count: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
+    /// Dynamic marker-slot dispenser. The parallel collection is CAPPED at
+    /// `min(worker_count, GC_PAR_CAP)` participants because the mark+evac is
+    /// contention-bound: it bottoms out around 8 workers and gets *worse* past
+    /// that (shared mark bitmap + old-bits + TLAB-refill cache-line bouncing).
+    /// Each helping worker grabs the next slot; a worker whose slot is beyond
+    /// the cap parks idle rather than piling on. Reset per collection.
+    gc_mark_slot: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
     gc_evac_promoted: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     gc_evac_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
@@ -1321,9 +1328,17 @@ pub const ObjectHeap = struct {
     /// Collector: arm the evac work queue. Called before `gcOpenMark` (grows the
     /// generation bitmap while the object count is quiescent; the phase stays
     /// closed until `gcOpenEvac`).
+    /// Grab the next marker slot for this worker (collector or peer). A slot
+    /// `>= marker_count` means "don't participate — park idle".
+    pub fn gcMarkSlotGrab(self: *ObjectHeap) u32 {
+        if (comptime !build_options.gc) return 0;
+        return self.gc_mark_slot.fetchAdd(1, .acq_rel);
+    }
+
     pub fn gcBeginEvac(self: *ObjectHeap, worker_count: u8) void {
         if (comptime !build_options.gc) return;
         self.gcGrowOldBits(self.objects.count());
+        self.gc_mark_slot.store(0, .release);
         self.gc_evac_count = worker_count;
         self.gc_evac_next.store(0, .monotonic);
         self.gc_evac_done.store(0, .monotonic);

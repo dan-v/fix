@@ -46,6 +46,12 @@ const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
 const gc = @import("runtime").gc;
+/// Max workers that participate in one STW minor collection. The mark+evac is
+/// contention-bound (shared mark bitmap / old-bits / TLAB refills): it bottoms
+/// out near 8 participants and regresses past that, so throttling the
+/// collection while the eval runs full-width is a net win at high `--workers`.
+/// `FIX_GC_PAR_CAP` overrides for per-machine tuning.
+var gc_par_cap: u32 = 8;
 const thunk_mod = @import("runtime").thunk;
 const trace_probe = @import("probe/trace_probe.zig");
 const drv_probe = @import("probe/drv_probe.zig");
@@ -782,6 +788,12 @@ pub const Evaluator = struct {
             const gc_off = if (self.env_map) |em| em.get("FIX_GC_OFF") != null else false;
             if (self.env_map) |em|
                 if (em.get("FIX_GC_NOREUSE") != null) ObjectHeap.gcSetDisableReuse(true);
+            if (self.env_map) |em|
+                if (em.get("FIX_GC_PAR_CAP")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |c| {
+                        if (c >= 1) gc_par_cap = c;
+                    } else |_| {}
+                };
             if (!gc_off) {
                 // FIX_GC_STEP_MB (validation): collect every N MB of fresh
                 // allocation so the detector exercises every builtin loop.
@@ -832,10 +844,17 @@ pub const Evaluator = struct {
     /// peer helps drain marker slot `worker_id` to termination.
     fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        _ = worker_id;
+        // Grab a marker slot. The collection is capped at GC_PAR_CAP
+        // participants (contention-bound past ~8); a peer over the cap parks
+        // idle rather than piling on. The collector already grabbed slot 0.
+        const marker_count = @min(@as(u32, self.worker_count), gc_par_cap);
+        const slot = self.heap.gcMarkSlotGrab();
+        if (slot >= marker_count) return;
         // Drain the mark to global termination, then help evacuate: the young-
-        // object lists are a shared work queue, so this parked peer claims and
-        // copies survivors into its own tenured TLAB alongside the collector.
-        self.gc_tracer.drainParallel(&self.heap, worker_id);
+        // object lists are a shared work queue, so this peer claims and copies
+        // survivors into its own tenured TLAB alongside the collector.
+        self.gc_tracer.drainParallel(&self.heap, slot);
         self.heap.gcEvacClaimLoop(self.gc_tracer.mark_bits);
     }
 
@@ -845,6 +864,7 @@ pub const Evaluator = struct {
     /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
     fn gcCollect(self: *Evaluator, collector_id: u8) void {
         if (comptime !gc.enabled) return;
+        _ = collector_id; // marker slot is grabbed dynamically (capped participants)
         // Copying minor collection (STW). The young-gated mark runs from roots +
         // the old→young remembered set. At --workers>1 the parked peers HELP the
         // mark (parallel young-gated drain); at --workers=1 it's serial.
@@ -857,19 +877,24 @@ pub const Evaluator = struct {
             }
         };
         if (self.worker_count > 1) {
-            tr.resetParallelMinor(self.heap.objects.count(), self.worker_count) catch {
+            // Cap the collection's participants (contention-bound past ~8) —
+            // the eval still runs `worker_count`-wide; only the mark+evac is
+            // throttled. Peers over the cap park idle (see gcHelpMarkThunk).
+            const marker_count = @min(@as(u32, self.worker_count), gc_par_cap);
+            tr.resetParallelMinor(self.heap.objects.count(), marker_count) catch {
                 self.heap.gcAfterCollect(self.heap.totalReservedBytes());
                 return;
             };
-            self.heap.gcBeginEvac(self.worker_count); // arm the evac work queue (phase closed)
+            self.heap.gcBeginEvac(self.worker_count); // arm the evac work queue (resets slot dispenser)
+            const collector_slot = self.heap.gcMarkSlotGrab(); // grabbed before gcOpenMark ⇒ slot 0
             // Seed roots + remset into the collector's own marker deque, open
             // the mark so parked peers help drain it, then drain alongside them.
-            tr.beginSeeding(collector_id);
+            tr.beginSeeding(collector_slot);
             self.gcMarkRoots(tr);
             self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
             tr.endSeeding();
             self.scheduler.gcOpenMark();
-            tr.drainParallel(&self.heap, collector_id); // returns at termination
+            tr.drainParallel(&self.heap, collector_slot); // returns at termination
             // Mark closed. Verify closure while peers spin (no range moves yet),
             // then open the evac phase and evacuate alongside them.
             self.heap.gcVerifyMinorClosure(tr.mark_bits);
