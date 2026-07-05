@@ -1120,11 +1120,83 @@ pub const ObjectHeap = struct {
     /// young object's ranges to tenured + promote it, reclaim dead young slot
     /// ids, then reset the nursery (bulk-reclaiming all dead young storage).
     /// Runs at a safepoint; single-threaded at `--workers=1`.
+    /// Detector: verify the minor mark is CLOSED before we sweep — every young
+    /// object referenced by a live (filled) object must be marked. An unmarked
+    /// young child of any parent means the tracer/remembered-set missed an edge
+    /// and is about to sweep a live object. Panics with parent→child so a missed
+    /// barrier/root is caught at its source, before any downstream misread.
+    fn gcVerifyMinorClosure(self: *ObjectHeap, mark_bits: []const u64) void {
+        const marked = struct {
+            fn f(mb: []const u64, id: ObjectId) bool {
+                const w = id >> 6;
+                return w < mb.len and (mb[w] & (@as(u64, 1) << @intCast(id & 63))) != 0;
+            }
+        }.f;
+        var shown: u32 = 0;
+        var id: ObjectId = self.gc_track_from;
+        const n = self.objects.count();
+        while (id < n and shown < 8) : (id += 1) {
+            const word = id >> 6;
+            if (word >= self.gc_alloc_bits.len) break;
+            if (self.gc_alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0) continue;
+            // Only LIVE parents constrain the mark: a dead young object
+            // (unmarked, about to be swept) may freely reference dead young
+            // children. Old and marked-young parents are live.
+            if (self.gcIsYoung(id) and !marked(mark_bits, id)) continue;
+            const obj = self.objects.get(id);
+            const check = struct {
+                fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, sh: *u32) void {
+                    const cid = gcHeapId(child_v) orelse return;
+                    if (!h.gcIsYoung(cid)) return; // old child: fine (not in minor set)
+                    if (!marked(mb, cid) and sh.* < 8) {
+                        std.debug.print("GC MISSED EDGE: {s} {d} -> unmarked young {s} {d}\n", .{ @tagName(h.objects.get(parent).*), parent, @tagName(h.objects.get(cid).*), cid });
+                        sh.* += 1;
+                    }
+                }
+            }.f;
+            switch (obj.*) {
+                .list => |r| for (self.values.slice(r)) |v| check(self, mark_bits, id, v, &shown),
+                .attrs => |a| for (self.attrs.slice(a.range)) |e| check(self, mark_bits, id, e.value, &shown),
+                .closure => |c| for (self.values.slice(c.upvalues)) |v| check(self, mark_bits, id, v, &shown),
+                .builtin_closure => |c| for (self.values.slice(c.args)) |v| check(self, mark_bits, id, v, &shown),
+                .partial_app => |p| {
+                    check(self, mark_bits, id, p.func, &shown);
+                    for (self.values.slice(p.args)) |v| check(self, mark_bits, id, v, &shown);
+                },
+                .context_string => |c| for (self.attrs.slice(c.context)) |e| check(self, mark_bits, id, e.value, &shown),
+                .merge_attrs => |m| {
+                    check(self, mark_bits, id, Value.attrs(m.base), &shown);
+                    check(self, mark_bits, id, Value.attrs(m.overlay), &shown);
+                    const flat = m.flattened.load(.monotonic);
+                    if (flat != NO_FLAT) check(self, mark_bits, id, Value.attrs(flat), &shown);
+                },
+                .thunk => |*t| {
+                    const FutureState = @import("thunk.zig").FutureState;
+                    const fs = @as(FutureState, @enumFromInt(t.future.state.load(.monotonic)));
+                    switch (fs) {
+                        .resolved => check(self, mark_bits, id, t.payload.result, &shown),
+                        .errored, .blackhole => {},
+                        .unresolved, .evaluating => switch (t.future.target_kind) {
+                            .closure => check(self, mark_bits, id, t.payload.target.closure, &shown),
+                            .pass_through => check(self, mark_bits, id, t.payload.target.pass_through, &shown),
+                            .attr_access => check(self, mark_bits, id, t.payload.target.attr_access.base, &shown),
+                            .bytecode => for (t.payload.target.bytecode.upvalues()) |v| check(self, mark_bits, id, v, &shown),
+                            .deferred => for (t.payload.target.deferred.env()) |v| check(self, mark_bits, id, v, &shown),
+                        },
+                    }
+                },
+                .boxed_int => {},
+            }
+        }
+        if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
+    }
+
     pub fn gcMinorCollect(self: *ObjectHeap, mark_bits: []const u64) MinorStats {
         var st: MinorStats = .{};
         if (comptime !build_options.gc) return st;
         if (comptime !gc_debug) self.gcReconstructAllocBits();
         self.gcGrowOldBits(self.objects.count());
+        if (comptime gc_debug) self.gcVerifyMinorClosure(mark_bits);
         const n = self.objects.count();
         var id: ObjectId = self.gc_track_from;
         while (id < n) : (id += 1) {
@@ -1140,14 +1212,63 @@ pub const ObjectHeap = struct {
                 st.promoted += 1;
             } else {
                 // Dead young: reclaim the slot id. Its young ranges are in the
-                // nursery, reclaimed wholesale by the reset below.
-                self.currentLocal().gc_free_objects.append(self.allocator, id) catch {};
-                if (comptime gc_debug) self.gc_alloc_bits[word] &= ~bit;
+                // nursery, reclaimed wholesale by the reset below. In the
+                // detector we DON'T recycle the id (just clear its alloc bit),
+                // so any dangling reference — a missed root or an unrecorded
+                // old→young edge — traps at `gcAssertLive` with the object kind
+                // instead of silently reading a reused slot.
+                if (comptime gc_debug) {
+                    self.gc_alloc_bits[word] &= ~bit;
+                } else {
+                    self.currentLocal().gc_free_objects.append(self.allocator, id) catch {};
+                }
                 st.freed += 1;
             }
         }
+        if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
         self.gcResetNursery();
         return st;
+    }
+
+    /// Detector: after evacuation every reachable object's owned ranges must be
+    /// tenured (the nursery is about to be reset). A live object still pointing
+    /// at a young range would dangle. Panics with the offending id/kind so a
+    /// missed-evacuation bug is caught at its source, not downstream.
+    fn gcVerifyNoYoungRangesInOld(self: *ObjectHeap) void {
+        const n = self.objects.count();
+        var id: ObjectId = self.gc_track_from;
+        while (id < n) : (id += 1) {
+            const word = id >> 6;
+            if (word >= self.gc_alloc_bits.len) break;
+            const bit = @as(u64, 1) << @intCast(id & 63);
+            if (self.gc_alloc_bits[word] & bit == 0) continue; // freed/unfilled
+            if (self.gcIsYoung(id)) continue; // young dead-but-unreclaimed (detector leaks these)
+            const obj = self.objects.get(id);
+            const yv = struct {
+                fn v(store: anytype, r: anytype) bool {
+                    return r.len > 0 and store.isYoung(r);
+                }
+            }.v;
+            const young = switch (obj.*) {
+                .list => |r| yv(&self.values, r),
+                .attrs => |a| yv(&self.attrs, a.range) or yv(&self.attr_positions, a.positions),
+                .closure => |c| yv(&self.values, c.upvalues),
+                .builtin_closure => |c| yv(&self.values, c.args),
+                .partial_app => |p| yv(&self.values, p.args),
+                .context_string => |c| yv(&self.attrs, c.context),
+                .thunk, .merge_attrs, .boxed_int => false,
+            };
+            if (young) {
+                const seg = switch (obj.*) {
+                    .closure => |c| c.upvalues.segment,
+                    .list => |r| r.segment,
+                    .attrs => |a| a.range.segment,
+                    else => 999,
+                };
+                std.debug.print("GC BUG: old object {d} (kind={s}) YOUNG range seg={d} (values nursery_segs={d}, tenured cursor seg starts at {d}) collect_enabled={}\n", .{ id, @tagName(obj.*), seg, NURSERY_SEGS_VALUES, NURSERY_SEGS_VALUES, self.gc_collect_enabled });
+                @panic("gc: old object with young range");
+            }
+        }
     }
 
     /// Rewind the nursery bump cursors (reclaiming all young slots at once) and
@@ -1160,7 +1281,7 @@ pub const ObjectHeap = struct {
         if (comptime gc_debug) {
             const poison = Value.thunk(OBJECT_MAX_SLOTS - 1);
             self.values.poisonYoung(poison);
-            self.attrs.poisonYoung(.{ .name = 0, .value = poison });
+            self.attrs.poisonYoung(.{ .name = GC_POISON_NAME, .value = poison });
         }
         self.values.resetYoung();
         self.attrs.resetYoung();
@@ -2035,12 +2156,23 @@ fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
     return entries[idx].value;
 }
 
+/// Detector sentinel: `poisonYoung` stamps freed young attr entries with this
+/// name. Any name scan that observes it is reading a dangling attr slice held
+/// across a collection — the panic's stack trace names the buggy caller.
+const GC_POISON_NAME: InternId = std.math.maxInt(InternId) - 7;
+
+inline fn gcAssertNotPoisonName(name: InternId) void {
+    if (comptime !gc_debug) return;
+    if (name == GC_POISON_NAME) @panic("gc: read poisoned attr name — dangling attr slice held across a collection");
+}
+
 fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {
     var lo: usize = 0;
     var hi: usize = entries.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         const entry_name = entries[mid].name;
+        gcAssertNotPoisonName(entry_name);
         if (entry_name == name) return mid;
         if (entry_name < name) {
             lo = mid + 1;
