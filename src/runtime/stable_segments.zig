@@ -132,6 +132,19 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
         },
         write_mu: SpinMutex = .{},
 
+        // --- copying-nursery support (GC) ---
+        //
+        // When `nursery_segs > 0` the low segments `[0, nursery_segs)` form a
+        // resettable young-generation arena (its own bump cursor
+        // `young_cursor`), and the tenured region is segments
+        // `[nursery_segs, SEGMENT_COUNT)` (the ordinary `cursor`, pre-positioned
+        // by `enableNursery`). A range is "young" iff `range.segment <
+        // nursery_segs` — so `slice`/`get` route by segment index with no tag
+        // bit and no per-access branch. `resetYoung` rewinds `young_cursor` to
+        // reclaim the whole nursery in O(1) after survivors are evacuated out.
+        young_cursor: std.atomic.Value(u64) = .init(0),
+        nursery_segs: u32 = 0,
+
         pub const empty: Self = .{};
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -176,6 +189,79 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             const range: Range = .{ .segment = seg, .offset = used, .len = len };
             self.cursor.store(packCursor(seg, used + len), .release);
             return range;
+        }
+
+        /// Partition the store into a young nursery (`[0, nursery_segs)`) and a
+        /// tenured region (`[nursery_segs, SEGMENT_COUNT)`). Must be called
+        /// before any `reserve` (the tenured cursor is moved to the first
+        /// tenured segment so ordinary reservations never land in the nursery).
+        /// Idempotent-safe only from a fresh (`empty`) store.
+        pub fn enableNursery(self: *Self, nursery_segs: u32) void {
+            std.debug.assert(nursery_segs > 0 and nursery_segs < SEGMENT_COUNT);
+            std.debug.assert(self.count() == 0);
+            self.nursery_segs = nursery_segs;
+            self.young_cursor.store(0, .monotonic);
+            self.cursor.store(packCursor(nursery_segs, 0), .release);
+        }
+
+        /// Reserve `len` slots in the young nursery. Returns `null` when the
+        /// nursery is full (the caller then triggers a minor collection, or
+        /// spills to the tenured `reserve`). Never grows past `nursery_segs`.
+        pub fn reserveYoung(self: *Self, allocator: std.mem.Allocator, len: u32) !?Range {
+            if (len == 0) return Range{ .segment = 0, .offset = 0, .len = 0 };
+            self.write_mu.lock();
+            defer self.write_mu.unlock();
+
+            const cur = self.young_cursor.load(.monotonic);
+            var seg = segmentOf(cur);
+            var used = usedOf(cur);
+            while (true) {
+                if (seg >= self.nursery_segs) return null; // nursery exhausted
+                const cap = segmentCapacity(seg);
+                if (len <= cap and used + len <= cap) break;
+                seg += 1;
+                used = 0;
+            }
+            try self.ensureSegment(allocator, seg);
+            const range: Range = .{ .segment = seg, .offset = used, .len = len };
+            self.young_cursor.store(packCursor(seg, used + len), .release);
+            return range;
+        }
+
+        /// Rewind the nursery bump cursor, reclaiming every young slot at once.
+        /// Segment backing arrays stay allocated (reused next cycle); an
+        /// optional `MADV_DONTNEED` to return their pages is layered on top by
+        /// the heap. Call at a stop-the-world safepoint after survivors have
+        /// been evacuated to the tenured region.
+        pub fn resetYoung(self: *Self) void {
+            self.young_cursor.store(0, .release);
+        }
+
+        /// Young slots reserved (high-water within the nursery). O(1).
+        pub fn youngCount(self: *const Self) u32 {
+            const cur = self.young_cursor.load(.acquire);
+            return segmentStart(segmentOf(cur)) + usedOf(cur);
+        }
+
+        /// Tenured slots reserved (excludes the nursery capacity that
+        /// `count()`'s `segmentStart` would otherwise fold in).
+        pub fn tenuredCount(self: *const Self) u32 {
+            if (self.nursery_segs == 0) return self.count();
+            return self.count() - segmentStart(self.nursery_segs);
+        }
+
+        /// Total committed slots across both regions (RSS proxy for the GC
+        /// threshold). Excludes the un-backed nursery-capacity gap.
+        pub fn reservedSlots(self: *const Self) u32 {
+            if (self.nursery_segs == 0) return self.count();
+            return self.tenuredCount() + self.youngCount();
+        }
+
+        /// Base address + capacity of nursery segment `i` for `MADV_DONTNEED`
+        /// on reset. Null if the segment was never touched.
+        pub fn nurserySegmentPages(self: *const Self, i: u32) ?[]T {
+            const ptr = self.segments[i].load(.monotonic) orelse return null;
+            return ptr[0..segmentCapacity(i)];
         }
 
         /// Append a single value. Returns its global u32 id.

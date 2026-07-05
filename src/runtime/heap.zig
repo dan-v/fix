@@ -205,6 +205,16 @@ const VALUE_CHUNK_SIZE: u32 = 1024;
 const ATTR_CHUNK_SIZE: u32 = 512;
 const ATTR_POS_CHUNK_SIZE: u32 = 256;
 
+// Copying nursery (`-Dgc`): the low `NURSERY_SEGS_*` segments of each range
+// store are the resettable young generation; the rest is tenured. Capacity =
+// first_segment_size * (2^N - 1) slots. With first_segment_size {values 1024,
+// attrs 512, attr_pos 512} and N below the nursery is ~16 MB for values and
+// ~16 MB for attrs — a minor fires when whichever store's nursery fills. A
+// young range is one whose `segment < nursery_segs` (no tag bit needed).
+const NURSERY_SEGS_VALUES: u32 = 11;
+const NURSERY_SEGS_ATTRS: u32 = 11;
+const NURSERY_SEGS_ATTR_POS: u32 = 11;
+
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
 const LocalChunk = struct {
@@ -346,12 +356,24 @@ pub const ObjectHeap = struct {
         errdefer objects.deinit(allocator);
         const locals = try allocator.alloc(HeapLocal, @max(worker_count, 1));
         for (locals) |*l| l.* = .{};
+        var values: ValueStore = .empty;
+        var attrs: AttrStore = .empty;
+        var attr_positions: AttrPosStore = .empty;
+        // Partition each range store into a young nursery (low segments) +
+        // tenured region. Done here, before any allocation, so pre-collect
+        // bootstrap (builtins) tenures directly and post-collect allocations
+        // bump the nursery. Zero-cost in non-`-Dgc` builds.
+        if (comptime build_options.gc) {
+            values.enableNursery(NURSERY_SEGS_VALUES);
+            attrs.enableNursery(NURSERY_SEGS_ATTRS);
+            attr_positions.enableNursery(NURSERY_SEGS_ATTR_POS);
+        }
         return .{
             .allocator = allocator,
             .objects = objects,
-            .values = .empty,
-            .attrs = .empty,
-            .attr_positions = .empty,
+            .values = values,
+            .attrs = attrs,
+            .attr_positions = attr_positions,
             .worker_locals = locals,
             .errored_infos = .empty,
             .errored_infos_mu = .{},
@@ -597,26 +619,54 @@ pub const ObjectHeap = struct {
         return &self.worker_locals[worker_id_mod.current];
     }
 
-    fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
-        const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
-                // Lock-free: this worker's OWN free-list shard.
-                if (local.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
-        }
-        const chunk = &local.value;
+    /// TLAB reserve shared by the three range stores. When the copying
+    /// nursery is active (`gc_collect_enabled`) a fresh chunk is bumped from
+    /// the young nursery; if the nursery is full the reservation spills to the
+    /// tenured region so the allocation always succeeds, and a minor is
+    /// requested (`gcNurseryFull`) to reset the nursery at the next safepoint.
+    /// Otherwise it is the ordinary tenured bump (identical to a non-`-Dgc`
+    /// build). A returned range is young iff `segment < nursery_segs`.
+    inline fn reserveRangeLocal(
+        self: *ObjectHeap,
+        comptime StoreT: type,
+        store: *StoreT,
+        chunk: *LocalChunk,
+        chunk_size: u32,
+        n: u32,
+    ) !StoreT.Range {
         if (chunk.fits(n)) {
             const r = chunk.take(n);
             return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
         }
-        if (n > VALUE_CHUNK_SIZE) return self.values.reserve(self.allocator, n);
-        const refilled = try self.values.reserve(self.allocator, VALUE_CHUNK_SIZE);
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled) {
+                if (n > chunk_size) {
+                    // Oversized reservations bypass the TLAB; tenure directly
+                    // if they don't fit a nursery segment.
+                    if (try store.reserveYoung(self.allocator, n)) |yr| return yr;
+                } else if (try store.reserveYoung(self.allocator, chunk_size)) |cr| {
+                    chunk.segment = cr.segment;
+                    chunk.cursor = cr.offset;
+                    chunk.end = cr.offset + cr.len;
+                    const r = chunk.take(n);
+                    return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+                }
+                // Nursery full: request a minor and spill to tenured below.
+                self.gcNurseryFull();
+            }
+        }
+        if (n > chunk_size) return store.reserve(self.allocator, n);
+        const refilled = try store.reserve(self.allocator, chunk_size);
         chunk.segment = refilled.segment;
         chunk.cursor = refilled.offset;
         chunk.end = refilled.offset + refilled.len;
         const r = chunk.take(n);
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+    }
+
+    fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
+        const local = self.currentLocal();
+        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, VALUE_CHUNK_SIZE, n);
     }
 
     /// Reserve `n` slots of attr storage for a merge in progress.
@@ -648,44 +698,20 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
-                if (local.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
-        }
-        const chunk = &local.attr;
-        if (chunk.fits(n)) {
-            const r = chunk.take(n);
-            return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
-        }
-        if (n > ATTR_CHUNK_SIZE) return self.attrs.reserve(self.allocator, n);
-        const refilled = try self.attrs.reserve(self.allocator, ATTR_CHUNK_SIZE);
-        chunk.segment = refilled.segment;
-        chunk.cursor = refilled.offset;
-        chunk.end = refilled.offset + refilled.len;
-        const r = chunk.take(n);
-        return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, ATTR_CHUNK_SIZE, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         const local = self.currentLocal();
-        if (comptime build_options.gc) {
-            if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug and n > 0) {
-                if (local.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
-            }
-        }
-        const chunk = &local.attr_pos;
-        if (chunk.fits(n)) {
-            const r = chunk.take(n);
-            return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
-        }
-        if (n > ATTR_POS_CHUNK_SIZE) return self.attr_positions.reserve(self.allocator, n);
-        const refilled = try self.attr_positions.reserve(self.allocator, ATTR_POS_CHUNK_SIZE);
-        chunk.segment = refilled.segment;
-        chunk.cursor = refilled.offset;
-        chunk.end = refilled.offset + refilled.len;
-        const r = chunk.take(n);
-        return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
+        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
+    }
+
+    /// Nursery-exhausted hook: request a minor collection to run at the next
+    /// safepoint (which evacuates survivors and resets the nursery). No-op in
+    /// Phase 1 (the reservation has already spilled to the tenured region).
+    inline fn gcNurseryFull(self: *ObjectHeap) void {
+        if (comptime !build_options.gc) return;
+        _ = self;
     }
 
     /// Register the collect callback (no-op in non-`-Dgc` builds). Fired at
@@ -795,11 +821,21 @@ pub const ObjectHeap = struct {
         if (comptime !build_options.gc) return;
         self.gc_collect_enabled = true;
         gc_step_bytes = step_bytes;
-        self.gc_threshold_bytes = if (gc_step_bytes > 0)
-            self.totalReservedBytes() + gc_step_bytes
-        else
-            initial_threshold;
+        // The copying nursery drives collection off nursery-full (see
+        // `gcNurseryFull`), not the old byte threshold — disable the latter so
+        // the legacy mark-sweep trigger never fires. (`initial_threshold` /
+        // `step_bytes` are retained for the report/A-B knobs.)
+        _ = initial_threshold;
+        self.gc_threshold_bytes = std.math.maxInt(u64);
         self.gc_track_from = self.objects.count();
+        // Flush each worker's range TLABs so the first post-enable allocation
+        // refills from the nursery instead of draining a leftover tenured
+        // chunk carried over from bootstrap.
+        for (self.worker_locals) |*l| {
+            l.value = .{};
+            l.attr = .{};
+            l.attr_pos = .{};
+        }
         // Detector build: pre-size the alloc bitmap to the whole object id
         // space so the incremental per-fill bit-set never reallocs (which
         // would free the array under a concurrent reader/setter at
@@ -838,9 +874,9 @@ pub const ObjectHeap = struct {
     /// plateaus near the threshold once collection keeps up.
     pub fn totalReservedBytes(self: *const ObjectHeap) u64 {
         return @as(u64, self.objects.count()) * @sizeOf(Object) +
-            @as(u64, self.values.count()) * @sizeOf(Value) +
-            @as(u64, self.attrs.count()) * @sizeOf(AttrEntry) +
-            @as(u64, self.attr_positions.count()) * @sizeOf(AttrPosEntry);
+            @as(u64, self.values.reservedSlots()) * @sizeOf(Value) +
+            @as(u64, self.attrs.reservedSlots()) * @sizeOf(AttrEntry) +
+            @as(u64, self.attr_positions.reservedSlots()) * @sizeOf(AttrPosEntry);
     }
 
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
