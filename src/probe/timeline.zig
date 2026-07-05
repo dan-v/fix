@@ -569,6 +569,19 @@ pub fn dump(io: std.Io, path: []const u8, n_workers: usize) void {
 fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
     const count = @min(events_len.load(.monotonic), events_cap);
 
+    // Events are appended in END order (a span is recorded when it closes), so
+    // the array is NOT start-ordered — and Perfetto infers X-event nesting from
+    // order, flagging an earlier-starting container that arrives after its
+    // child as a SLICE_SPILL overlap. Sort into canonical nesting order:
+    // ascending ts, then DESCENDING duration (a container sorts before the
+    // shorter slices it encloses, incl. equal-start / equal-end ties).
+    std.mem.sort(Event, events[0..count], {}, struct {
+        fn lt(_: void, a: Event, b: Event) bool {
+            if (a.ts_ns != b.ts_ns) return a.ts_ns < b.ts_ns;
+            return a.dur_ns > b.dur_ns;
+        }
+    }.lt);
+
     const file = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
     var buf: [64 * 1024]u8 = undefined;
