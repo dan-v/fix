@@ -810,6 +810,12 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         eager_flags,
         must_force_flags,
     );
+    // Eager elision may hoist a binding's evaluation ahead of the body's
+    // reduction; if it isn't the FIRST thing the body demands, that reorders
+    // which error surfaces (observable under `builtins.tryEval`: caught
+    // `throw` vs uncaught `1/0`). Restrict elision to the single
+    // first-demanded binding so eager order == lazy order. See firstForcedName.
+    const first_demanded: ?InternId = try strictness.firstForcedName(self.intern, self.source, let_in.body);
 
     for (let_in.bindings, kinds, 0..) |binding, kind, index| {
         if (bindingRootSeen(self, let_in.bindings[0..index], binding.path[0])) continue;
@@ -839,7 +845,9 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         // body unconditionally forces, with a computational RHS that
         // references no later binding — evaluate it straight into the
         // slot, skipping the thunk alloc + force + frame entirely.
-        if (kind == .uncaptured and must_force_flags[index]) {
+        if (kind == .uncaptured and must_force_flags[index] and
+            first_demanded != null and binding_name_ids[index] == first_demanded.?)
+        {
             if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
                 try self.compileNode(leaf.expr);
                 try emit.emitSetLocal(self, slot);

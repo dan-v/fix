@@ -443,6 +443,54 @@ pub fn bodyMustForceName(
     return strict.shallow_must.contains(name_id);
 }
 
+/// The first free identifier forced when reducing `body` to WHNF, in
+/// evaluation order — or null when the first thing forced is not a bare name
+/// (a nested computation, a literal/structure that forces nothing, or a
+/// construct we don't model: lambda/let/with/attrset/list).
+///
+/// Used to bound eager let-binding elision (`compileLetIn`) to the SINGLE
+/// binding the body demands first. Eager elision evaluates a binding before
+/// the body runs; if the binding is not the body's first demand, that hoists
+/// its evaluation ahead of whatever the body would otherwise force first —
+/// reordering which error surfaces, which is observable under
+/// `builtins.tryEval` (a caught `throw` vs an uncaught `1/0`). Restricting
+/// elision to the first-demanded binding makes eager order == lazy order.
+/// Conservative (returns null / a non-matching name) is always sound: the
+/// binding then stays a lazy thunk.
+pub fn firstForcedName(intern: *InternTable, source: []const u8, body: *const Node) anyerror!?InternId {
+    switch (body.tag) {
+        .identifier => {
+            const atom = body.data.atom;
+            return try intern.intern(source[atom.offset .. atom.offset + atom.len]);
+        },
+        .parens => return firstForcedName(intern, source, body.data.parens),
+        .unary_op => return firstForcedName(intern, source, body.data.unary.expr),
+        .binary_op => {
+            const b = body.data.binary;
+            switch (b.op) {
+                // Strict in the left operand, then the right.
+                .add, .sub, .mul, .div, .eq, .neq, .lt, .lte, .gt, .gte, .update, .concat => {
+                    if (try firstForcedName(intern, source, b.left)) |n| return n;
+                    return try firstForcedName(intern, source, b.right);
+                },
+                // Short-circuiting: only the left is unconditionally forced.
+                .and_, .or_, .impl => return firstForcedName(intern, source, b.left),
+            }
+        },
+        .apply => return firstForcedName(intern, source, body.data.apply.func),
+        .if_else => return firstForcedName(intern, source, body.data.if_else.cond),
+        .assert => return firstForcedName(intern, source, body.data.assert.cond),
+        .attr_path => return firstForcedName(intern, source, body.data.attr_path.root),
+        .attr_dynamic => return firstForcedName(intern, source, body.data.attr_dynamic.root),
+        .has_attr => return firstForcedName(intern, source, body.data.has_attr.root),
+        .has_attr_dynamic => return firstForcedName(intern, source, body.data.has_attr_dynamic.root),
+        .has_attr_mixed => return firstForcedName(intern, source, body.data.has_attr_mixed.root),
+        // Everything else forces nothing to WHNF as a bare name first, or is
+        // a scope-introducing / unmodeled construct → conservative null.
+        else => return null,
+    }
+}
+
 const Compiler = @import("../compiler.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {

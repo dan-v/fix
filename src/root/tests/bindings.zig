@@ -4,6 +4,35 @@ const Evaluator = fix.Evaluator;
 const value = fix.value;
 const ValueType = value.ValueType;
 
+test "end-to-end: eager let-elision preserves error order under tryEval (§G)" {
+    // Must-force eager elision must not hoist a binding's evaluation ahead of
+    // the body's first demand — doing so reorders which error surfaces, which
+    // is observable under `builtins.tryEval` (caught `throw` vs uncaught
+    // `div 1 0`). Only the first-demanded binding may be elided. Verified
+    // against the Lix oracle. See strictness.firstForcedName / compileLetIn.
+    const alloc = std.testing.allocator;
+    var ev = try Evaluator.init(alloc, 0);
+    defer ev.deinit();
+
+    // Body forces `b` (uncaught div-by-zero) FIRST → the error propagates,
+    // tryEval does NOT catch it → the whole eval errors.
+    try std.testing.expectError(
+        error.DivisionByZero,
+        ev.evaluate("builtins.tryEval (let a = throw \"A\"; b = builtins.div 1 0; in b + a)"),
+    );
+
+    // Body forces `a` (caught throw) FIRST → tryEval catches it →
+    // `{ success = false; value = false; }` (a resolved value, not an error).
+    const caught = try ev.evaluate("builtins.tryEval (let a = throw \"A\"; b = builtins.div 1 0; in a + b)");
+    try std.testing.expect(caught.isAttrs());
+
+    // Three bindings, uncaught demanded first among them → propagates.
+    try std.testing.expectError(
+        error.DivisionByZero,
+        ev.evaluate("builtins.tryEval (let a = throw \"A\"; b = throw \"B\"; c = builtins.div 1 0; in c + b + a)"),
+    );
+}
+
 test "end-to-end: let binding" {
     const alloc = std.testing.allocator;
 
