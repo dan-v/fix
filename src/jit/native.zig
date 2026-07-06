@@ -363,6 +363,46 @@ pub const Counts = struct {
     unsupported_by_first_op: [256]u32 = [_]u32{0} ** 256,
 };
 
+/// Dump the per-shape JIT compile counters (`--print-sched-stats`). Lives
+/// beside `compile_counts`, the data it reads.
+pub fn report() void {
+    const c = compile_counts;
+    std.debug.print(
+        "jit: constant_ret={d} push_lit_ret={d} get_upvalue_ret={d} get_upvalue_attr_ret={d} get_upvalue_attr_attr_ret={d} get_upvalue_attr3_ret={d} eq_null={d} neq_null={d} not={d} builtin_attr_ret={d} upvalue_call_const_ret={d} upvalue_call_upvalue_ret={d} mapattrs_apply={d} genlist_apply={d} unsupported={d}\n",
+        .{ c.constant_ret, c.push_lit_ret, c.get_upvalue_ret, c.get_upvalue_attr_ret, c.get_upvalue_attr_attr_ret, c.get_upvalue_attr3_ret, c.get_upvalue_eq_null_ret, c.get_upvalue_neq_null_ret, c.get_upvalue_not_ret, c.builtin_attr_ret, c.upvalue_call_const_ret, c.upvalue_call_upvalue_ret, c.mapattrs_apply, c.genlist_apply, c.unsupported },
+    );
+    std.debug.print(
+        "jit lambdas: identity={d} local_attr_ret={d} local_eq_null={d} local_neq_null={d} local_not={d} as_thunk={d} unsupported={d}\n",
+        .{ c.lambda_identity, c.lambda_local_attr_ret, c.lambda_local_eq_null_ret, c.lambda_local_neq_null_ret, c.lambda_local_not_ret, c.lambda_as_thunk, c.unsupported_lambda },
+    );
+    // Top-10 unsupported chunks by first opcode — useful for picking the next
+    // shape to JIT.
+    const Slot = struct { op: u8, n: u32 };
+    var top: [10]Slot = .{Slot{ .op = 0, .n = 0 }} ** 10;
+    for (c.unsupported_by_first_op, 0..) |n, op| {
+        if (n == 0) continue;
+        var slot: usize = 10;
+        for (top, 0..) |t, i| {
+            if (n > t.n) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 10) {
+            var j: usize = 9;
+            while (j > slot) : (j -= 1) top[j] = top[j - 1];
+            top[slot] = .{ .op = @intCast(op), .n = n };
+        }
+    }
+    std.debug.print("jit unsupported by first op:", .{});
+    for (top) |t| {
+        if (t.n == 0) break;
+        const name = @tagName(@as(OpCode, @enumFromInt(t.op)));
+        std.debug.print(" {s}={d}", .{ name, t.n });
+    }
+    std.debug.print("\n", .{});
+}
+
 /// Try to JIT-compile `ch` as a lambda body. Caller guarantees
 /// `ch.local_count >= 1`. Returns null when the shape isn't yet
 /// supported — the interpreter handles the chunk via the usual

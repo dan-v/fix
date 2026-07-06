@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const worker_id = @import("runtime").worker_id;
+const BuiltinId = @import("runtime").builtins.BuiltinId;
 
 /// Compile-time switch. False when `-Dprof-main` wasn't passed.
 /// `rdtsc` is x86_64-only, so we additionally gate on arch.
@@ -232,5 +233,47 @@ pub inline fn end(comptime path: Path, t: u64) void {
     // child_exclusion so the parent's exclusive time skips it.
     if (prof_stack_len > 0) {
         prof_stack[prof_stack_len - 1].child_exclusion += inclusive;
+    }
+}
+
+/// Dump the main-thread path + per-builtin cycle samples
+/// (`--print-sched-stats`). Lives beside the counters it reads.
+pub fn report() void {
+    inline for (@typeInfo(Path).@"enum".fields) |f| {
+        const samp = samples[f.value];
+        if (samp.calls != 0) {
+            std.debug.print("prof: {s}: excl_cy={d} incl_cy={d} calls={d} avg_excl={d}\n", .{
+                f.name,
+                samp.cycles,
+                samp.cycles_inclusive,
+                samp.calls,
+                samp.cycles / samp.calls,
+            });
+        }
+    }
+    // Top builtins by inclusive cycles on main.
+    const N = 20;
+    const BSlot = struct { id: u16, cycles: u64, incl: u64, calls: u64 };
+    var top_b: [N]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** N;
+    for (builtin_samples, 0..) |samp, id| {
+        if (samp.calls == 0) continue;
+        var slot: usize = N;
+        for (top_b, 0..) |entry, i| {
+            if (samp.cycles > entry.cycles) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < N) {
+            var j: usize = N - 1;
+            while (j > slot) : (j -= 1) top_b[j] = top_b[j - 1];
+            top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
+        }
+    }
+    std.debug.print("prof builtins (top-20 by EXCL cycles — own-body cost):\n", .{});
+    for (top_b) |entry| {
+        if (entry.cycles == 0) break;
+        const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
+        std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
     }
 }
