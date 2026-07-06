@@ -34,7 +34,24 @@ pub const InternTable = intern.InternTable;
 pub const BuiltinId = builtins.BuiltinId;
 
 test {
+    _ = types;
+    _ = value;
     _ = heap;
+    _ = thunk;
+    _ = intern;
+    _ = numeric;
+    _ = int;
+    _ = hash;
+    _ = version;
+    _ = nar;
+    _ = regex;
+    _ = toml;
+    _ = paths;
+    _ = worker_id;
     _ = stable_segments;
+    _ = struct_census;
     _ = gc;
+    _ = builtins;
+    _ = file_cache;
+    _ = fetch_cache;
 }
