@@ -3,6 +3,7 @@ const aterm = @import("aterm.zig");
 const paths = @import("paths.zig");
 const codec = @import("hash_codec.zig");
 const types = @import("types.zig");
+const clone = @import("clone.zig");
 
 const ComputedPaths = types.ComputedPaths;
 const DrvInput = types.DrvInput;
@@ -110,8 +111,8 @@ pub const Drv = struct {
             const hash_modulo = try resolver.resolvePath(input.path) orelse return error.UnknownInputDerivation;
             switch (hash_modulo) {
                 .drv => |hash| {
-                    const outputs = try types.cloneStringListDeep(allocator, input.outputs);
-                    errdefer types.freeStringListDeep(allocator, outputs);
+                    const outputs = try clone.cloneStringListDeep(allocator, input.outputs);
+                    errdefer clone.freeStringListDeep(allocator, outputs);
                     const owned_hash = try allocator.dupe(u8, hash);
                     errdefer allocator.free(owned_hash);
                     try appendMergedInput(allocator, &inputs, owned_hash, outputs);

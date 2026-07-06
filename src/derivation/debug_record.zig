@@ -2,6 +2,7 @@ const std = @import("std");
 const drv_mod = @import("drv.zig");
 const codec = @import("hash_codec.zig");
 const types = @import("types.zig");
+const clone = @import("clone.zig");
 
 const DebugHashModuloStep = types.DebugHashModuloStep;
 const DebugRecord = types.DebugRecord;
@@ -25,16 +26,16 @@ pub fn debugRecordFromDrv(
     errdefer allocator.free(record.system);
     record.builder = try allocator.dupe(u8, drv.builder);
     errdefer allocator.free(record.builder);
-    record.args = try types.cloneStringListDeep(allocator, drv.args);
-    errdefer types.freeStringListDeep(allocator, record.args);
-    record.outputs = try types.cloneDrvOutputsDeep(allocator, drv.outputs);
-    errdefer types.freeDrvOutputsDeep(allocator, record.outputs);
-    record.input_drvs = try types.cloneDrvInputsDeep(allocator, drv.input_drvs);
-    errdefer types.freeDrvInputsDeep(allocator, record.input_drvs);
-    record.input_srcs = try types.cloneStringListDeep(allocator, drv.input_srcs);
-    errdefer types.freeStringListDeep(allocator, record.input_srcs);
-    record.env = try types.cloneEnvVarsDeep(allocator, drv.env);
-    errdefer types.freeEnvVarsDeep(allocator, record.env);
+    record.args = try clone.cloneStringListDeep(allocator, drv.args);
+    errdefer clone.freeStringListDeep(allocator, record.args);
+    record.outputs = try clone.cloneDrvOutputsDeep(allocator, drv.outputs);
+    errdefer clone.freeDrvOutputsDeep(allocator, record.outputs);
+    record.input_drvs = try clone.cloneDrvInputsDeep(allocator, drv.input_drvs);
+    errdefer clone.freeDrvInputsDeep(allocator, record.input_drvs);
+    record.input_srcs = try clone.cloneStringListDeep(allocator, drv.input_srcs);
+    errdefer clone.freeStringListDeep(allocator, record.input_srcs);
+    record.env = try clone.cloneEnvVarsDeep(allocator, drv.env);
+    errdefer clone.freeEnvVarsDeep(allocator, record.env);
 
     record.drv_aterm = try drv.toATerm(allocator, false, null);
     errdefer allocator.free(record.drv_aterm);
@@ -43,8 +44,8 @@ pub fn debugRecordFromDrv(
 
     const references = try drv.textReferences(allocator);
     defer allocator.free(references);
-    record.drv_text_references = try types.cloneStringListDeep(allocator, references);
-    errdefer types.freeStringListDeep(allocator, record.drv_text_references);
+    record.drv_text_references = try clone.cloneStringListDeep(allocator, references);
+    errdefer clone.freeStringListDeep(allocator, record.drv_text_references);
 
     record.output_hash = try debugHashModuloStep(allocator, drv, resolver, true);
     errdefer record.output_hash.deinit(allocator);
@@ -76,8 +77,8 @@ fn debugHashModuloStep(
     const borrowed_inputs = try drv.hashModuloInputs(allocator, resolver);
     defer drv_mod.freeHashModuloInputs(allocator, borrowed_inputs);
 
-    const inputs = try types.cloneDrvInputsDeep(allocator, borrowed_inputs);
-    errdefer types.freeDrvInputsDeep(allocator, inputs);
+    const inputs = try clone.cloneDrvInputsDeep(allocator, borrowed_inputs);
+    errdefer clone.freeDrvInputsDeep(allocator, inputs);
     const aterm = try drv.toATerm(allocator, mask_outputs, borrowed_inputs);
     errdefer allocator.free(aterm);
     const hash = try codec.sha256Hex(allocator, aterm);

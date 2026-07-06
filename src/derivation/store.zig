@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
+const clone = @import("clone.zig");
 const stable = @import("runtime").stable_segments;
 
 const DebugRecord = types.DebugRecord;
@@ -11,9 +12,9 @@ const DrvOutput = types.DrvOutput;
 const HashModulo = types.HashModulo;
 const HashModuloResolver = types.HashModuloResolver;
 const HashModuloView = types.HashModuloView;
-const cloneHashModulo = types.cloneHashModulo;
-const cloneOutputNames = types.cloneOutputNames;
-const freeOutputNames = types.freeOutputNames;
+const cloneHashModulo = clone.cloneHashModulo;
+const cloneOutputNames = clone.cloneOutputNames;
+const freeOutputNames = clone.freeOutputNames;
 
 /// Thread safety: all access to `records` and `debug_records` goes through
 /// `mu`. The store is read-mostly during evaluation but writes (record /
