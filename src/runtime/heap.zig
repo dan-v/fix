@@ -893,7 +893,7 @@ pub const ObjectHeap = struct {
     /// Headroom of genuinely-fresh committed pages between collections
     /// (additive, anchored to the cursor at last collect — see
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
-    pub const GC_HEADROOM: u64 = 256 << 20;
+    pub const GC_HEADROOM: u64 = 1024 << 20;
 
     /// Validation knob (`FIX_GC_STEP_MB`, `-Dgc` only): when > 0, collect
     /// every this-many MB of fresh allocation instead of the normal additive-
