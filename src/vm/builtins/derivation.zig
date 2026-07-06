@@ -6,7 +6,7 @@ const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const derivation = @import("derivation");
 const source_paths = @import("derivation").source_path;
-const collections = @import("collections.zig");
+const attrsets = @import("attrsets.zig");
 const serial = @import("serial.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
@@ -29,7 +29,7 @@ const isPlainString = strings.isPlainString;
 const isStringLike = strings.isStringLike;
 const sourcePathStringValue = strings.sourcePathStringValue;
 const stringTextInternId = strings.stringTextInternId;
-const sortedAttrEntries = collections.sortedAttrEntries;
+const sortedAttrEntries = attrsets.sortedAttrEntries;
 
 const SeenJsonObject = shared.SeenJsonObject;
 

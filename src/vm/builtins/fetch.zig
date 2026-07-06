@@ -10,7 +10,7 @@ const derivation = @import("derivation");
 const nar = @import("runtime").nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("derivation").source_path;
-const collections = @import("collections.zig");
+const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
@@ -19,7 +19,7 @@ const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
 
-const attrEntryNameIndex = collections.attrEntryNameIndex;
+const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 const coerceStringContextValue = strings.coerceStringContextValue;
 const contextEntriesForValue = string_context.contextEntriesForValue;
 const contextStringWithPath = string_context.contextStringWithPath;

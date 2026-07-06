@@ -1,6 +1,7 @@
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
+const InternId = @import("runtime").types.InternId;
 const ObjectId = @import("runtime").types.ObjectId;
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -34,4 +35,26 @@ pub fn makeBuiltinClosure(self: anytype, builtin_id: u16, args: []const Value) !
 
 pub fn makeBuiltinThunk(self: anytype, id: BuiltinId, args: []const Value) !Value {
     return vm_force.makeThunk(self, try makeBuiltinClosure(self, @intFromEnum(id), args));
+}
+
+/// Cross-category helper: linear index of a group whose `.name` matches
+/// `name`. Used by both `zipAttrsWith` (attrsets) and `groupBy` (lists).
+pub fn groupIndex(groups: anytype, name: InternId) ?usize {
+    for (groups, 0..) |group, i| {
+        if (group.name == name) return i;
+    }
+    return null;
+}
+
+/// Cross-category helper: the closure half of
+/// `force.isSpeculatableBuiltinClosure`'s map-style branch: speculate iff
+/// the user function is a `.closure` whose body chunk is substantial. (That
+/// branch also speculates on expensive builtins via `isSpeculatableMapFunc`;
+/// this fast path only handles the closure case.) Used by `map`/`genList`
+/// (lists) and `mapAttrs` (attrsets).
+pub fn isSpeculatableUserFunc(self: anytype, func: Value) bool {
+    if (!func.isClosure()) return false;
+    const closure = self.heap.getClosure(func.asObjectId()) catch return false;
+    const ch = self.registry.get(closure.chunk_id) orelse return false;
+    return ch.scheduling.body_is_substantial;
 }

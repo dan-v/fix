@@ -8,7 +8,7 @@ const version = @import("runtime").version;
 const regex = @import("runtime").regex;
 const toml = @import("runtime").toml;
 const FutureState = @import("runtime").thunk.FutureState;
-const collections = @import("collections.zig");
+const attrsets = @import("attrsets.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
@@ -26,7 +26,7 @@ const isPlainString = strings.isPlainString;
 const sourcePathStringValue = strings.sourcePathStringValue;
 const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
-const sortedAttrEntries = collections.sortedAttrEntries;
+const sortedAttrEntries = attrsets.sortedAttrEntries;
 
 pub fn builtinToJSON(self: anytype, arg: Value) !Value {
     var out: std.Io.Writer.Allocating = .init(self.allocator);
