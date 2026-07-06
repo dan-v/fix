@@ -247,6 +247,19 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
+
+    // Parse microbenchmark: `zig build bench -- <file.nix> ...`
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/parse_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("syntax", syntax_mod);
+    const bench_exe = b.addExecutable(.{ .name = "parse-bench", .root_module = bench_mod, .use_llvm = true });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Parse microbenchmark");
+    bench_step.dependOn(&run_bench.step);
 }
 
 const SharedImports = struct {

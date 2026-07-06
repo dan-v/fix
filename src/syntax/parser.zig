@@ -24,22 +24,11 @@ const Scanner = @import("scanner.zig").Scanner;
 const grammar = @import("grammar.zig");
 const lr = @import("lr.zig");
 
-/// Comptime-generated LALR tables (see `tools/gen_parser_tables.zig`).
+/// Comptime-generated LALR tables (see `gen_parser_tables.zig`). Unit `pass`
+/// productions are eliminated during generation, so the driver never performs a
+/// do-nothing chain reduction — every reduce runs a real semantic action.
 const Tab = @import("parser_tables");
 const Act = grammar.Act;
-
-/// Whether production `p` is a unit `pass` rule (single RHS symbol, identity
-/// action). Such reductions relabel a symbol without touching the value or the
-/// state below them, so the driver collapses runs of them into one tight loop
-/// instead of a full dispatch each. Computed from the generated tables — no
-/// grammar-specific knowledge, works for any grammar.
-const unit_pass: [Tab.num_productions]bool = blk: {
-    var u: [Tab.num_productions]bool = undefined;
-    for (0..Tab.num_productions) |p| {
-        u[p] = grammar.act_of_prod[p] == .pass and Tab.prod_rhs_len[p] == 1;
-    }
-    break :blk u;
-};
 
 /// One attribute-path segment: a static name or a dynamic `${expr}`.
 const Seg = union(enum) {
@@ -212,41 +201,19 @@ pub const Parser = struct {
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
                 lr.ACT_REDUCE => {
-                    var p = lr.cellArg(c);
-                    if (unit_pass[p]) {
-                        // Collapse a run of unit `pass` reductions. Each pops one
-                        // symbol and pushes one, so the state *below* the run
-                        // stays fixed and the value passes through untouched —
-                        // chain the gotos in a tight loop with no re-dispatch.
-                        const s = states[sp - 2];
-                        const value = vals[sp - 1];
-                        sp -= 1;
-                        while (true) {
-                            const g = Tab.goto_table[s * Tab.num_nonterminals + Tab.prod_lhs[p]];
-                            states[sp] = @intCast(g);
-                            vals[sp] = value;
-                            sp += 1;
-                            const c2 = Tab.action[@as(usize, @intCast(g)) * Tab.num_terminals + la];
-                            if (lr.cellKind(c2) != lr.ACT_REDUCE) break;
-                            const p2 = lr.cellArg(c2);
-                            if (!unit_pass[p2]) break;
-                            p = p2;
-                            sp -= 1;
-                        }
-                    } else {
-                        const n = Tab.prod_rhs_len[p];
-                        const base = sp - n;
-                        const result = try self.runAction(grammar.act_of_prod[p], vals[base .. base + n]);
-                        sp = base;
-                        const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + Tab.prod_lhs[p]];
-                        if (g < 0) {
-                            self.report(toks[ip], "Internal parser error (no goto).");
-                            return null;
-                        }
-                        states[sp] = @intCast(g);
-                        vals[sp] = result;
-                        sp += 1;
+                    const p = lr.cellArg(c);
+                    const n = Tab.prod_rhs_len[p];
+                    const base = sp - n;
+                    const result = try self.runAction(grammar.act_of_prod[p], vals[base .. base + n]);
+                    sp = base;
+                    const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + Tab.prod_lhs[p]];
+                    if (g < 0) {
+                        self.report(toks[ip], "Internal parser error (no goto).");
+                        return null;
                     }
+                    states[sp] = @intCast(g);
+                    vals[sp] = result;
+                    sp += 1;
                 },
                 lr.ACT_ACCEPT => {
                     return vals[sp - 1].node;

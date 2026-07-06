@@ -318,9 +318,54 @@ const prec = [_]lr.RawPrec{
 
 // ---- assembled grammar description + generated tables ----------------------
 
+// ---- comptime unit-production elimination ----------------------------------
+// A unit `pass` rule `A -> B` (single nonterminal RHS, identity action) forces
+// a do-nothing reduction at runtime. Eliminate them: for every non-unit rule
+// `B -> γ`, add `A -> γ` (keeping B's action) for each A that reaches B through
+// unit rules, then drop the unit rules. The generated automaton then performs
+// zero chain reductions. This grows the table substantially, but the cost is
+// paid once by the cached codegen step (see gen_parser_tables.zig), not on
+// every build — so it is free at the point of use.
+
+const num_nt = @typeInfo(NT).@"enum".fields.len;
+
+fn isUnitPass(p: P) bool {
+    return p.act == .pass and p.rhs.len == 1 and p.rhs[0] >= num_terminals;
+}
+
+const expanded = blk: {
+    @setEvalBranchQuota(10_000_000);
+    // reach[a][b]: nonterminal a derives b through a chain of unit rules.
+    var reach = [_][num_nt]bool{[_]bool{false} ** num_nt} ** num_nt;
+    for (0..num_nt) |a| reach[a][a] = true;
+    for (productions) |p| {
+        if (isUnitPass(p)) reach[@intFromEnum(p.lhs)][p.rhs[0] - num_terminals] = true;
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (0..num_nt) |a| for (0..num_nt) |b| {
+            if (!reach[a][b]) continue;
+            for (0..num_nt) |c| if (reach[b][c] and !reach[a][c]) {
+                reach[a][c] = true;
+                changed = true;
+            };
+        };
+    }
+    var out: []const P = &.{};
+    for (productions) |q| {
+        if (isUnitPass(q)) continue; // drop the unit rules themselves
+        const b = @intFromEnum(q.lhs);
+        for (0..num_nt) |a| {
+            if (reach[a][b]) out = out ++ &[_]P{.{ .lhs = @enumFromInt(a), .rhs = q.rhs, .act = q.act, .prec = q.prec }};
+        }
+    }
+    break :blk out;
+};
+
 const raw_productions = blk: {
-    var r: [productions.len]lr.RawProd = undefined;
-    for (productions, 0..) |p, i| r[i] = .{ .lhs = @intFromEnum(p.lhs), .rhs = p.rhs, .prec = p.prec };
+    var r: [expanded.len]lr.RawProd = undefined;
+    for (expanded, 0..) |p, i| r[i] = .{ .lhs = @intFromEnum(p.lhs), .rhs = p.rhs, .prec = p.prec };
     break :blk r;
 };
 
@@ -340,13 +385,13 @@ pub const desc = lr.GrammarDesc{
 /// Action tag per production index (index 0 is the augmented rule the generator
 /// prepends). Cheap to compute — kept here so it stays beside the grammar.
 pub const act_of_prod = blk: {
-    var a: [productions.len + 1]Act = undefined;
+    var a: [expanded.len + 1]Act = undefined;
     a[0] = .augmented;
-    for (productions, 0..) |p, i| a[i + 1] = p.act;
+    for (expanded, 0..) |p, i| a[i + 1] = p.act;
     break :blk a;
 };
 
 test "grammar action table aligns with productions" {
-    try std.testing.expect(act_of_prod.len == productions.len + 1);
+    try std.testing.expect(act_of_prod.len == expanded.len + 1);
     try std.testing.expect(act_of_prod[0] == .augmented);
 }
