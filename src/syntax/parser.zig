@@ -36,6 +36,38 @@ const Seg = union(enum) {
     dynamic: *Node,
 };
 
+/// Accumulator for an attribute path's segments. Almost every attrpath is 1-2
+/// segments (`x`, `x.y`), so those live inline with no allocation; longer paths
+/// spill to a heap list. The segments are transient scratch — every consumer
+/// (`foldBind`/`buildSelect`/`makeHasAttr`) copies them into a right-sized arena
+/// structure — so inline storage never escapes.
+const seg_inline = 2;
+const SegAccum = struct {
+    buf: [seg_inline]Seg = undefined,
+    len: u32 = 0,
+    spill: ?*std.ArrayListUnmanaged(Seg) = null,
+
+    fn push(self: *SegAccum, a: std.mem.Allocator, seg: Seg) !void {
+        if (self.spill) |s| {
+            try s.append(a, seg);
+        } else if (self.len < seg_inline) {
+            self.buf[self.len] = seg;
+        } else {
+            const s = try a.create(std.ArrayListUnmanaged(Seg));
+            s.* = .empty;
+            try s.ensureTotalCapacity(a, seg_inline * 2);
+            s.appendSliceAssumeCapacity(self.buf[0..self.len]);
+            s.appendAssumeCapacity(seg);
+            self.spill = s;
+        }
+        self.len += 1;
+    }
+
+    fn items(self: *const SegAccum) []const Seg {
+        return if (self.spill) |s| s.items else self.buf[0..self.len];
+    }
+};
+
 /// One element inside a `{ ... }`. The parser cannot know whether a brace is an
 /// attribute set or a lambda pattern until it sees what follows the `}`, so
 /// each element is parsed into this union and validated once the role is known.
@@ -59,7 +91,7 @@ const Value = union {
     tok: Token,
     node: *Node,
     seg: Seg,
-    segs: std.ArrayListUnmanaged(Seg),
+    segs: SegAccum,
     entries: std.ArrayListUnmanaged(Node.AttrSetEntry),
     names: std.ArrayListUnmanaged(Node.Atom),
     nodes: std.ArrayListUnmanaged(*Node),
@@ -416,13 +448,13 @@ pub const Parser = struct {
 
             // ---- attrpath / attr ----
             .attrpath_one => {
-                var segs: std.ArrayListUnmanaged(Seg) = .empty;
-                try segs.append(a, rhs[0].seg);
+                var segs: SegAccum = .{};
+                try segs.push(a, rhs[0].seg);
                 return .{ .segs = segs };
             },
             .attrpath_append => {
                 var segs = rhs[0].segs;
-                try segs.append(a, rhs[2].seg);
+                try segs.push(a, rhs[2].seg);
                 return .{ .segs = segs };
             },
             .attr_static => return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } },
@@ -460,9 +492,8 @@ pub const Parser = struct {
                 .default = rhs[2].node,
             } } },
             .tclause_bind => {
-                var segs = rhs[0].segs;
-                const entry = try self.foldBind(segs.items, rhs[2].node);
-                segs.deinit(a);
+                const segs = rhs[0].segs;
+                const entry = try self.foldBind(segs.items(), rhs[2].node);
                 return .{ .clause = .{ .bind = entry } };
             },
             .tclause_inherit => return .{ .clause = .{ .inherit = try self.inheritEntries(null, rhs[1].names, rhs[0].tok) } },
@@ -487,9 +518,8 @@ pub const Parser = struct {
                 return .{ .entries = acc };
             },
             .bind_normal => {
-                var segs = rhs[0].segs;
-                const entry = try self.foldBind(segs.items, rhs[2].node);
-                segs.deinit(a);
+                const segs = rhs[0].segs;
+                const entry = try self.foldBind(segs.items(), rhs[2].node);
                 var list: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
                 try list.append(a, entry);
                 return .{ .entries = list };
@@ -588,13 +618,11 @@ pub const Parser = struct {
 
     /// `root.a.b.${x}.c` — replicate dot-access folding: runs of static names
     /// become an `attr_path`; each dynamic segment wraps in an `attr_dynamic`.
-    fn buildSelect(self: *Parser, root: *Node, segs: std.ArrayListUnmanaged(Seg)) !*Node {
-        var mutable = segs;
-        defer mutable.deinit(self.arenaAllocator());
+    fn buildSelect(self: *Parser, root: *Node, segs: SegAccum) !*Node {
         const a = self.arenaAllocator();
         var current = root;
         var pending: std.ArrayListUnmanaged(Node.Atom) = .empty;
-        for (mutable.items) |seg| {
+        for (segs.items()) |seg| {
             switch (seg) {
                 .static => |atomv| try pending.append(a, atomv),
                 .dynamic => |name| {
@@ -621,17 +649,16 @@ pub const Parser = struct {
         return current;
     }
 
-    fn makeHasAttr(self: *Parser, root: *Node, segs_in: std.ArrayListUnmanaged(Seg)) !Value {
-        var segs = segs_in;
-        defer segs.deinit(self.arenaAllocator());
+    fn makeHasAttr(self: *Parser, root: *Node, segs: SegAccum) !Value {
         const a = self.arenaAllocator();
+        const seg_items = segs.items();
         var has_dynamic = false;
-        for (segs.items) |seg| {
+        for (seg_items) |seg| {
             if (seg == .dynamic) has_dynamic = true;
         }
         if (has_dynamic) {
-            const mixed = try a.alloc(Node.HasAttrMixedSegment, segs.items.len);
-            for (segs.items, mixed) |seg, *m| {
+            const mixed = try a.alloc(Node.HasAttrMixedSegment, seg_items.len);
+            for (seg_items, mixed) |seg, *m| {
                 m.* = switch (seg) {
                     .static => |atomv| .{ .static = atomv },
                     .dynamic => |name| .{ .dynamic = name },
@@ -642,8 +669,8 @@ pub const Parser = struct {
                 .segments = mixed,
             } }) };
         }
-        const statics = try a.alloc(Node.Atom, segs.items.len);
-        for (segs.items, statics) |seg, *s| s.* = seg.static;
+        const statics = try a.alloc(Node.Atom, seg_items.len);
+        for (seg_items, statics) |seg, *s| s.* = seg.static;
         return .{ .node = try self.arena.createNode(.has_attr, .{ .has_attr = .{
             .root = root,
             .segments = statics,
