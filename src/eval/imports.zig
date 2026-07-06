@@ -145,7 +145,7 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry, parent_dep
             .busy => {
                 const inner = fiber_mod.currentFiber() orelse
                     @panic("forceEntry hit .busy outside a fiber");
-                const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+                const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
                 if (entry.future.enrollWaiter(&wf.waiter)) {
                     wf.state = .suspended;
                     fiber_mod.Fiber.yield();
@@ -184,7 +184,7 @@ fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
 
 fn currentClaimer() thunk_mod.ClaimerId {
     const inner = fiber_mod.currentFiber() orelse return thunk_mod.INVALID_CLAIMER;
-    const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
     return wf.vm.claimer_id;
 }
 

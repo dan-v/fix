@@ -674,7 +674,7 @@ pub const Evaluator = struct {
         // which would collide with pool fiber #0's pre-allocated VM
         // and cause spurious blackholes when fiber #0 runs a task.
         if (fiber_mod.currentFiber()) |inner| {
-            const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+            const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.claimer_id = wf.vm.claimer_id;
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
@@ -1076,7 +1076,7 @@ pub const Evaluator = struct {
     /// pairs stay balanced. No current fiber = early single-threaded setup.
     fn progressEligible() bool {
         const inner = fiber_mod.currentFiber() orelse return true;
-        const wf: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+        const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
         return !wf.vm.in_speculation;
     }
 

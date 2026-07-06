@@ -655,7 +655,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // bug.
                 const inner = fiber_mod.currentFiber() orelse
                     @panic("forceThunkImpl hit .busy outside a fiber — every caller must run on a worker fiber");
-                const worker_fiber: *worker_mod.Fiber = @fieldParentPtr("inner", inner);
+                const worker_fiber: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
                 if (thunk.enrollWaiter(&worker_fiber.waiter)) {
                     worker_fiber.state = .suspended;
                     // Timeline: if the DEMAND fiber blocks here, this wait is on
