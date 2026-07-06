@@ -116,13 +116,6 @@ pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
     try emit.writeStaticAttrPathOperand(self, has_attr.segments, hasAttrDiagnosticAtom(has_attr), wide);
 }
 
-pub fn compileHasAttrDynamic(self: *Compiler, node: *const Node) !void {
-    const dynamic = node.data.has_attr_dynamic;
-    try self.compileNode(dynamic.root);
-    try self.compileNode(dynamic.name);
-    try emit.emitOp(self, .has_attr_dynamic);
-}
-
 pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
     const has_attr = node.data.has_attr_mixed;
     try self.compileNode(has_attr.root);

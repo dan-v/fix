@@ -1021,25 +1021,6 @@ fn opHasAttrPathLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_d
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
 
-fn opHasAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const name_val = try force.forceValue(vm, stack.pop(vm));
-    if (!name_val.isString()) return error.TypeError;
-    const attrs_val = try force.forceValue(vm, stack.pop(vm));
-    if (!attrs_val.isAttrs()) {
-        try stack.push(vm, Value.boolVal(false));
-    } else {
-        const present = if (vm.heap.getAttrValue(attrs_val.asObjectId(), name_val.asInternId())) |_|
-            true
-        else |err| switch (err) {
-            error.MissingAttribute => false,
-            else => return err,
-        };
-        try stack.push(vm, Value.boolVal(present));
-    }
-    return dispatch(vm, frame, code, ip, stop_depth);
-}
-
 fn opHasAttrPathMixed(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const segment_count = code[ip];
@@ -1288,7 +1269,6 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.get_attr_path_mixed_or)] = opGetAttrPathMixedOr;
     table[@intFromEnum(OpCode.has_attr_path)] = opHasAttrPath;
     table[@intFromEnum(OpCode.has_attr_path_long)] = opHasAttrPathLong;
-    table[@intFromEnum(OpCode.has_attr_dynamic)] = opHasAttrDynamic;
     table[@intFromEnum(OpCode.has_attr_path_mixed)] = opHasAttrPathMixed;
     table[@intFromEnum(OpCode.validate_attrs)] = opValidateAttrs;
     table[@intFromEnum(OpCode.validate_attrs_long)] = opValidateAttrsLong;

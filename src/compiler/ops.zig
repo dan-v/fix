@@ -1038,10 +1038,6 @@ fn collectReferencedNames(self: *Compiler, node: *const Node, out: *std.StringHa
             try collectReferencedNames(self, node.data.has_attr.root, out);
             for (node.data.has_attr.segments) |seg| try collectIdentifiersInSpan(self, seg, out);
         },
-        .has_attr_dynamic => {
-            try collectReferencedNames(self, node.data.has_attr_dynamic.root, out);
-            try collectReferencedNames(self, node.data.has_attr_dynamic.name, out);
-        },
         .has_attr_mixed => {
             const ham = node.data.has_attr_mixed;
             try collectReferencedNames(self, ham.root, out);

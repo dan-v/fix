@@ -33,7 +33,6 @@ pub const NodeTag = enum(u8) {
     attr_dynamic, // foo.${expr}
     attr_or, // foo.bar or default
     has_attr, // foo ? bar.baz
-    has_attr_dynamic, // foo ? ${expr}
     has_attr_mixed, // foo ? bar.${expr}
     list,
     parens, // parenthesized subexpression
@@ -106,7 +105,6 @@ pub const Node = struct {
         attr_dynamic: AttrDynamic,
         attr_or: AttrOr,
         has_attr: HasAttr,
-        has_attr_dynamic: AttrDynamic,
         has_attr_mixed: HasAttrMixed,
         list: List,
         parens: *Node,
@@ -299,7 +297,6 @@ fn nodeSourceSpan(tag: NodeTag, data: Node.Data) ?Node.Atom {
         .attr_dynamic => combineAtoms(data.attr_dynamic.root.span, data.attr_dynamic.name.span),
         .attr_or => combineAtoms(data.attr_or.attr_path.span, data.attr_or.default.span),
         .has_attr => hasAttrSourceSpan(data.has_attr),
-        .has_attr_dynamic => combineAtoms(data.has_attr_dynamic.root.span, data.has_attr_dynamic.name.span),
         .has_attr_mixed => hasAttrMixedSourceSpan(data.has_attr_mixed),
         .list => listSourceSpan(data.list),
         .parens => data.parens.span,
@@ -454,10 +451,6 @@ pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
         .has_attr => arena.createNode(.has_attr, .{ .has_attr = .{
             .root = try cloneNode(arena, node.data.has_attr.root),
             .segments = try cloneAtoms(arena, node.data.has_attr.segments),
-        } }),
-        .has_attr_dynamic => arena.createNode(.has_attr_dynamic, .{ .has_attr_dynamic = .{
-            .root = try cloneNode(arena, node.data.has_attr_dynamic.root),
-            .name = try cloneNode(arena, node.data.has_attr_dynamic.name),
         } }),
         .has_attr_mixed => arena.createNode(.has_attr_mixed, .{ .has_attr_mixed = .{
             .root = try cloneNode(arena, node.data.has_attr_mixed.root),
@@ -635,10 +628,6 @@ pub fn offsetNode(node: *Node, offset: u32) void {
             for (node.data.has_attr.segments) |*segment| {
                 segment.offset += offset;
             }
-        },
-        .has_attr_dynamic => {
-            offsetNode(node.data.has_attr_dynamic.root, offset);
-            offsetNode(node.data.has_attr_dynamic.name, offset);
         },
         .has_attr_mixed => {
             offsetNode(node.data.has_attr_mixed.root, offset);

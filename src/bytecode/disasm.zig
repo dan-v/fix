@@ -191,7 +191,7 @@ fn writeOperands(
         .eq, .neq, .eq_null, .neq_null, .lt, .lte, .gt, .gte, .not,
         .fail_assertion, .push_builtins,
         .merge_attrs, .merge_attrs_strict, .concat_lists,
-        .get_attr_dynamic, .has_attr_dynamic,
+        .get_attr_dynamic,
         .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
 
         .call_n, .tail_call_n => {

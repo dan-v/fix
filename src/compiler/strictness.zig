@@ -306,7 +306,6 @@ const Analyzer = struct {
             .attr_or => try self.analyzeAttrOrChain(node.data.attr_or.attr_path, out),
 
             .has_attr => try self.analyzeInto(node.data.has_attr.root, out),
-            .has_attr_dynamic => try self.analyzeInto(node.data.has_attr_dynamic.root, out),
             .has_attr_mixed => try self.analyzeInto(node.data.has_attr_mixed.root, out),
 
             .parens => try self.analyzeInto(node.data.parens, out),
@@ -324,7 +323,6 @@ const Analyzer = struct {
             .attr_path => try self.analyzeInto(node.data.attr_path.root, out),
             .attr_dynamic => try self.analyzeAttrOrChain(node.data.attr_dynamic.root, out),
             .has_attr => try self.analyzeInto(node.data.has_attr.root, out),
-            .has_attr_dynamic => try self.analyzeAttrOrChain(node.data.has_attr_dynamic.root, out),
             .has_attr_mixed => try self.analyzeInto(node.data.has_attr_mixed.root, out),
             .parens => try self.analyzeAttrOrChain(node.data.parens, out),
             else => try self.analyzeInto(node, out),
@@ -483,7 +481,6 @@ pub fn firstForcedName(intern: *InternTable, source: []const u8, body: *const No
         .attr_path => return firstForcedName(intern, source, body.data.attr_path.root),
         .attr_dynamic => return firstForcedName(intern, source, body.data.attr_dynamic.root),
         .has_attr => return firstForcedName(intern, source, body.data.has_attr.root),
-        .has_attr_dynamic => return firstForcedName(intern, source, body.data.has_attr_dynamic.root),
         .has_attr_mixed => return firstForcedName(intern, source, body.data.has_attr_mixed.root),
         // Everything else forces nothing to WHNF as a bare name first, or is
         // a scope-introducing / unmodeled construct → conservative null.

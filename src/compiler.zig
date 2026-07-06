@@ -219,7 +219,6 @@ pub const Compiler = struct {
             .attr_dynamic => try access.compileAttrDynamic(self, node),
             .attr_or => try access.compileAttrOr(self, node),
             .has_attr => try access.compileHasAttr(self, node),
-            .has_attr_dynamic => try access.compileHasAttrDynamic(self, node),
             .has_attr_mixed => try access.compileHasAttrMixed(self, node),
             .list => try access.compileList(self, node),
             .parens => try self.compileNode(node.data.parens),
