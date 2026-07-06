@@ -201,6 +201,8 @@ fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: anytype) !void {
     });
     try writer.print("  pops:              {d:>8}  (helper popped own queue)\n", .{s.pops});
     try writer.print("  steals:            {d:>8}\n", .{s.steals});
+    try writer.print("  cont pushes:       {d:>8}\n", .{s.cont_pushes});
+    try writer.print("  cont steals:       {d:>8}\n", .{s.cont_steals});
     try writer.print("  parks:             {d:>8}\n", .{s.parks});
     try writer.print("  max fiber stack:   {d:>8} bytes  (peak depth touched)\n", .{s.max_fiber_stack_used_bytes});
     try writer.print("  max VM sp:         {d:>8}        (peak value-stack depth)\n", .{s.max_vm_sp});

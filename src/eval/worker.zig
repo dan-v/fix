@@ -39,6 +39,7 @@ const stable = @import("runtime").stable_segments;
 const scheduler_mod = @import("parallel").scheduler;
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
+const Continuation = scheduler_mod.Continuation;
 const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("../vm/force.zig");
@@ -112,6 +113,10 @@ pub const WorkerFiber = struct {
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
+    /// Work-first continuation assigned to this fiber (mutually exclusive with
+    /// `current_task` — set only for a stolen continuation run via
+    /// `contEntry`). Nil'd before processing, like `current_task`.
+    current_cont: ?Continuation = null,
     /// Timeline (`--timeline`): flow-arrow id for a STOLEN task's quantum,
     /// so the run emits a `flowIn` matching the steal's `flowOut` (→ a
     /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
@@ -376,6 +381,16 @@ pub const Worker = struct {
             self.runFiber(f);
             return true;
         }
+        if (self.pickCont()) |cont| {
+            const f = try self.acquireFreeFiber();
+            f.current_cont = cont;
+            f.current_task = null;
+            f.flow_in_id = 0;
+            f.inner.reset(contEntry, @ptrCast(f));
+            f.state = .running;
+            self.runFiber(f);
+            return true;
+        }
         return false;
     }
 
@@ -526,7 +541,8 @@ pub const Worker = struct {
             // When background work is suppressed (result ready, draining the
             // tail), the queued backlog won't be pulled — don't treat it as
             // available work and busy-spin on it.
-            if (!self.scheduler.backgroundSuppressed() and self.scheduler.pending_tasks.load(.monotonic) > 0) return;
+            if (!self.scheduler.backgroundSuppressed() and
+                (self.scheduler.pending_tasks.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
             if (self.shouldStop()) return;
             if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
             std.atomic.spinLoopHint();
@@ -559,6 +575,15 @@ pub const Worker = struct {
             return t;
         }
         return null;
+    }
+
+    /// Steal a work-first continuation from another worker (this worker's own
+    /// continuations are reclaimed inline by `forceRangeWorkFirst`'s pop-back,
+    /// never here). Suppressed once a top-level result is ready, like
+    /// `pickTask` — no need to start new parallel collection work past the answer.
+    fn pickCont(self: *Worker) ?Continuation {
+        if (self.scheduler.backgroundSuppressed()) return null;
+        return self.scheduler.stealCont(self.worker_id);
     }
 
     /// Pop a fiber from the free list (LIFO — best cache locality), or
@@ -596,6 +621,7 @@ pub const Worker = struct {
             .in_runfiber = .init(0),
             .run_mu = .{},
             .current_task = null,
+            .current_cont = null,
             .next_free = null,
             .ready_node = .{},
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },
@@ -716,6 +742,23 @@ fn slotEntry(arg: *anyopaque) void {
             }
         },
     }
+}
+
+/// Fiber entry for a STOLEN work-first continuation. Mirrors `slotEntry`'s
+/// setup (reset VM stack, point at the local scratch trace so a speculative
+/// throw can't pollute the user trace) then forces the continuation's range,
+/// re-splitting onto this worker's own cont deque.
+fn contEntry(arg: *anyopaque) void {
+    const f: *WorkerFiber = @ptrCast(@alignCast(arg));
+    f.vm.sp = 0;
+    f.vm.frames_len = 0;
+    const cont = f.current_cont orelse return;
+    f.current_cont = null;
+    const saved_trace = f.vm.trace;
+    f.local_trace.clear();
+    f.vm.trace = &f.local_trace;
+    defer f.vm.trace = saved_trace;
+    vm_force.forceContinuation(&f.vm, cont);
 }
 
 // ---- Tests ----

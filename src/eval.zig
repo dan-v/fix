@@ -568,6 +568,9 @@ pub const Evaluator = struct {
         if (self.env_map) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
             if (std.fmt.parseInt(u32, s, 10)) |n| @import("parallel").scheduler.setSpecBacklog(n) else |_| {}
         };
+        // FIX_WORK_FIRST: route strict collection-force acceleration through the
+        // work-first split-and-steal primitive instead of the eager fan-out.
+        if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
