@@ -554,12 +554,14 @@ pub const Parser = struct {
                 },
             }
         }
-        return .{ .node = try self.arena.createNode(.lambda_attrs, .{ .lambda_attrs = .{
+        const la = try a.create(Node.LambdaAttrs);
+        la.* = .{
             .bind_name = bind_name,
             .params = try params.toOwnedSlice(a),
             .allow_extra = allow_extra,
             .body = body,
-        } }) };
+        };
+        return .{ .node = try self.arena.createNode(.lambda_attrs, .{ .lambda_attrs = la }) };
     }
 
     /// Validate a `{ ... }` group as an attribute set and build the node.

@@ -92,7 +92,11 @@ pub const Node = struct {
         binary: Binary,
         apply: Apply,
         lambda: Lambda,
-        lambda_attrs: LambdaAttrs,
+        // Boxed: `LambdaAttrs` is the largest variant (40B) but rare (only
+        // lambda patterns), so keeping it inline would bloat *every* node's
+        // by-value write. Behind a pointer the whole `Data` union — and thus
+        // `Node` — is much smaller (64B -> 40B). Field reads auto-deref.
+        lambda_attrs: *LambdaAttrs,
         let_in: LetIn,
         if_else: IfElse,
         assert: Assert,
@@ -285,7 +289,7 @@ fn nodeSourceSpan(tag: NodeTag, data: Node.Data) ?Node.Atom {
             .{ .offset = data.lambda.param_offset, .len = data.lambda.param_len },
             data.lambda.body.span,
         ),
-        .lambda_attrs => lambdaAttrsSourceSpan(data.lambda_attrs),
+        .lambda_attrs => lambdaAttrsSourceSpan(data.lambda_attrs.*),
         .let_in => letSourceSpan(data.let_in),
         .if_else => combineAtoms(data.if_else.cond.span, combineAtoms(data.if_else.then_branch.span, data.if_else.else_branch.span)),
         .assert => combineAtoms(data.assert.cond.span, data.assert.body.span),
@@ -404,12 +408,16 @@ pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
             .param_len = node.data.lambda.param_len,
             .body = try cloneNode(arena, node.data.lambda.body),
         } }),
-        .lambda_attrs => arena.createNode(.lambda_attrs, .{ .lambda_attrs = .{
-            .bind_name = node.data.lambda_attrs.bind_name,
-            .params = try cloneLambdaParams(arena, node.data.lambda_attrs.params),
-            .allow_extra = node.data.lambda_attrs.allow_extra,
-            .body = try cloneNode(arena, node.data.lambda_attrs.body),
-        } }),
+        .lambda_attrs => blk: {
+            const la = try arena.allocator().create(Node.LambdaAttrs);
+            la.* = .{
+                .bind_name = node.data.lambda_attrs.bind_name,
+                .params = try cloneLambdaParams(arena, node.data.lambda_attrs.params),
+                .allow_extra = node.data.lambda_attrs.allow_extra,
+                .body = try cloneNode(arena, node.data.lambda_attrs.body),
+            };
+            break :blk arena.createNode(.lambda_attrs, .{ .lambda_attrs = la });
+        },
         .let_in => arena.createNode(.let_in, .{ .let_in = .{
             .bindings = try cloneBindings(arena, node.data.let_in.bindings),
             .body = try cloneNode(arena, node.data.let_in.body),
