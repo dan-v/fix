@@ -41,6 +41,8 @@ const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
 const ngram_probe = @import("../probe/ngram_probe.zig");
 const tjit_record = @import("../jit/record.zig");
+const thunk_census = @import("../probe/thunk_census.zig");
+const BuiltinId = @import("runtime").builtins.BuiltinId;
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -602,12 +604,42 @@ fn opApplyArg(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     // The callee is already on the stack just below where the argument
     // goes. If it forces its parameter, evaluate the argument eagerly to
     // a value; otherwise materialise the usual thunk.
-    if (closures.calleeForcesArg(vm, vm.stack[vm.sp - 1])) {
+    const callee = vm.stack[vm.sp - 1];
+    const forces = closures.calleeForcesArg(vm, callee);
+    if (comptime thunk_census.enabled) censusApplyArg(vm, callee, forces, ch_id);
+    if (forces) {
         try closures.evalArgEager(vm, ch_id, descriptors, frame);
     } else {
         try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
     }
     return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+}
+
+/// `-Dthunk-census` (comptime-gated): classify an executed `apply_arg` by
+/// callee shape × whether the argument body is trivial (already object-free),
+/// to size the statically-eliminable thunk set. See thunk_census.zig.
+inline fn censusApplyArg(vm: *VM, callee: Value, forces: bool, arg_chunk: ChunkId) void {
+    const bucket: thunk_census.CalleeBucket = if (callee.isBuiltin())
+        (if (isUnaryStrictBuiltin(callee.asBuiltinId())) .unary_strict_builtin else .other_builtin)
+    else if (callee.isBuiltinClosure())
+        .builtin_closure
+    else if (callee.isClosure())
+        (if (forces) .strict_closure else .other_closure)
+    else
+        .non_callable;
+    // Trivial arg body = already short-circuited to a value with no thunk.
+    const arg_trivial = if (vm.registry.get(arg_chunk)) |ch| ch.scheduling.trivial != .none else false;
+    thunk_census.recordApplyArg(bucket, arg_trivial);
+}
+
+/// The arity-1, unconditionally-arg-strict, never-catch builtins — the
+/// Stage-2 admissible set (hand-verified against their builtin bodies). Used
+/// by the census now; the eager-arg lever (if the gate says GO) later.
+fn isUnaryStrictBuiltin(id: u16) bool {
+    return switch (@as(BuiltinId, @enumFromInt(id))) {
+        .head, .tail, .length, .attrNames, .attrValues, .stringLength, .typeOf, .floor, .ceil, .isAttrs, .isList, .isString, .isInt, .isBool, .isNull, .isFloat, .isFunction, .isPath => true,
+        else => false,
+    };
 }
 
 fn opThunkCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {

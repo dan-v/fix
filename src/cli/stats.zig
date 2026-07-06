@@ -10,6 +10,7 @@ const Evaluator = @import("../eval.zig").Evaluator;
 const jit = @import("../jit/native.zig");
 const prof = @import("../probe/prof.zig");
 const prof_path = @import("../probe/prof_path.zig");
+const thunk_census = @import("../probe/thunk_census.zig");
 const OpCode = @import("../bytecode/opcode.zig").OpCode;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 
@@ -55,6 +56,7 @@ pub fn report(ev: *Evaluator) void {
             .{ created, tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
         );
     }
+    if (comptime thunk_census.enabled) thunk_census.report();
     if (comptime jit.enabled) reportJit();
     if (comptime prof.enabled) reportProf();
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
