@@ -279,6 +279,11 @@ pub const Scanner = struct {
             self.pos += 1;
             return self.makeToken(.search_path, start, self.pos - start);
         }
+        // No closing `>`: this wasn't a search path after all. Rewind the
+        // chars we speculatively consumed (`<foo` in e.g. `a<b`) and emit the
+        // bare `<` operator so `foo` re-lexes as a normal token — matching
+        // Nix's maximal-munch backtracking (`a<b` is `a < b`).
+        self.pos = start + 1;
         return self.makeToken(.less, start, 1);
     }
 
@@ -359,6 +364,19 @@ test "scanner keeps single '<' and '|' behaviour intact" {
     try std.testing.expectEqual(TokenType.identifier, orop.next().type);
     try std.testing.expectEqual(TokenType.pipe_pipe, orop.next().type);
     try std.testing.expectEqual(TokenType.identifier, orop.next().type);
+}
+
+test "scanner: space-free '<' comparison is not a truncated search path" {
+    // `a<b` speculatively looks like `<b...>` but has no closing `>`, so it
+    // must fall back to `<` + `b` (Nix maximal-munch backtracking) — not
+    // swallow `b`. Regression for the search-path rewind.
+    var s = Scanner.init("a<b");
+    try std.testing.expectEqual(TokenType.identifier, s.next().type);
+    const lt = s.next();
+    try std.testing.expectEqual(TokenType.less, lt.type);
+    const rhs = s.next();
+    try std.testing.expectEqual(TokenType.identifier, rhs.type);
+    try std.testing.expectEqualStrings("b", s.source[rhs.offset .. rhs.offset + rhs.len]);
 }
 
 test "scanner recognizes lambda colon" {
