@@ -12,6 +12,7 @@ pub const record_driver = @import("jit/record_driver.zig");
 pub const recorder = @import("jit/recorder.zig");
 pub const opt = @import("jit/opt.zig");
 pub const codegen = @import("jit/codegen.zig");
+pub const emit = @import("jit/emit.zig");
 pub const linear = @import("jit/linear.zig");
 pub const native = @import("jit/native.zig");
 pub const exec = @import("jit/exec.zig");
@@ -24,6 +25,7 @@ test {
     _ = recorder;
     _ = opt;
     _ = codegen;
+    _ = emit;
     _ = linear;
     _ = native;
     _ = exec;

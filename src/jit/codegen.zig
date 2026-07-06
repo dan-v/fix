@@ -2,7 +2,7 @@
 //!
 //! Lowers a recorded+optimized trace IR to a `LambdaCompiledFn`
 //! (`fn(vm, upvalues_ptr, arg) -> JitResult`), reusing the proven
-//! `jit_linear.Emitter` (stack-slot model, C-ABI helper calls, error/epilogue
+//! shared `emit.Emitter` (stack-slot model, C-ABI helper calls, error/epilogue
 //! patching) and the C-ABI op helpers in `jit_helpers.zig`. Each SSA `Ref` is
 //! given one native-stack slot (`Ref i` → `[rsp + i*8]`); ops load operands
 //! from slots and store results to their own. Guards and errors funnel through
@@ -18,7 +18,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const jit = @import("native.zig");
 const helpers = @import("jit_helpers.zig");
-const Emitter = @import("linear.zig").Emitter;
+const Emitter = @import("emit.zig").Emitter;
 const Value = @import("runtime").value.Value;
 
 const CodeBuffer = jit.CodeBuffer;
