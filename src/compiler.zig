@@ -135,6 +135,29 @@ pub const Compiler = struct {
         };
     }
 
+    /// Bootstrap a child compiler for a nested body (thunk, apply-arg,
+    /// attr-entry, or lambda body): share the parent's allocators, registry,
+    /// source, intern table, and heap via `init`, then inherit the source-
+    /// location context (`parent`, `base_path`, `source_path`,
+    /// `source_file_id`). Every nested-body compile goes through here so the
+    /// inherited-field set lives in exactly one place.
+    pub fn initChild(self: *Compiler, builder: *ChunkBuilder) Compiler {
+        var child = Compiler.init(
+            self.allocator,
+            self.persistent,
+            builder,
+            self.registry,
+            self.source,
+            self.intern,
+            self.heap,
+        );
+        child.parent = self;
+        child.base_path = self.base_path;
+        child.source_path = self.source_path;
+        child.source_file_id = self.source_file_id;
+        return child;
+    }
+
     pub fn deinit(self: *Compiler) void {
         for (self.owned_diagnostic_messages.items) |message| {
             self.allocator.free(message);

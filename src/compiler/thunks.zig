@@ -38,19 +38,7 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
 
-    var child = Compiler.init(
-        self.allocator,
-        self.persistent,
-        &child_builder,
-        self.registry,
-        self.source,
-        self.intern,
-        self.heap,
-    );
-    child.parent = self;
-    child.base_path = self.base_path;
-    child.source_path = self.source_path;
-    child.source_file_id = self.source_file_id;
+    var child = self.initChild(&child_builder);
     defer child.deinit();
 
     child.compileNode(expr) catch |err| {
@@ -74,19 +62,7 @@ pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
     var child_builder = try ChunkBuilder.init(self.allocator);
     defer child_builder.deinit(self.allocator);
 
-    var child = Compiler.init(
-        self.allocator,
-        self.persistent,
-        &child_builder,
-        self.registry,
-        self.source,
-        self.intern,
-        self.heap,
-    );
-    child.parent = self;
-    child.base_path = self.base_path;
-    child.source_path = self.source_path;
-    child.source_file_id = self.source_file_id;
+    var child = self.initChild(&child_builder);
     defer child.deinit();
 
     child.compileNode(expr) catch |err| {
