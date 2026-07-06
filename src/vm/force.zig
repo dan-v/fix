@@ -532,7 +532,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 const b0 = gc.nowNs();
                 self.scheduler.gcWaitAllParked(self.workerId());
                 const b1 = gc.nowNs();
-                self.heap.gcRunCollect(self.workerId());
+                heap_mod.heap_gc.runCollect(self.heap, self.workerId());
                 const b2 = gc.nowNs();
                 self.scheduler.gcEndCollection(self.workerId());
                 gc.recordBarrier((b1 - b0) + (gc.nowNs() - b2));

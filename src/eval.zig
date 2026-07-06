@@ -18,6 +18,7 @@ const VM = vm_mod.VM;
 const vm_force = @import("vm/force.zig");
 const vm_builtins = @import("vm/builtins.zig");
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const heap_gc = @import("runtime").heap.heap_gc;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const DerivationStore = @import("derivation").DerivationStore;
@@ -38,6 +39,7 @@ const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 
 const worker_mod = @import("eval/worker.zig");
+const eval_gc = @import("eval/gc.zig");
 const fiber_mod = @import("parallel").fiber;
 const prof = @import("probe/prof.zig");
 const compiler_mod = @import("compiler.zig");
@@ -46,12 +48,6 @@ const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
 const gc = @import("runtime").gc;
-/// Max workers that participate in one STW minor collection. The mark+evac is
-/// contention-bound (shared mark bitmap / old-bits / TLAB refills): it bottoms
-/// out near 8 participants and regresses past that, so throttling the
-/// collection while the eval runs full-width is a net win at high `--workers`.
-/// `FIX_GC_PAR_CAP` overrides for per-machine tuning.
-var gc_par_cap: u32 = 8;
 const thunk_mod = @import("runtime").thunk;
 const trace_probe = @import("probe/trace_probe.zig");
 const drv_probe = @import("probe/drv_probe.zig");
@@ -722,8 +718,8 @@ pub const Evaluator = struct {
         if (fiber_mod.currentFiber() != null) {
             var vm = try self.initVm(0);
             defer vm.deinit();
-            if (comptime gc.enabled) self.gcRegisterVm(&vm);
-            defer if (comptime gc.enabled) self.gcUnregisterVm(&vm);
+            if (comptime gc.enabled) eval_gc.registerVm(self, &vm);
+            defer if (comptime gc.enabled) eval_gc.unregisterVm(self, &vm);
             return @call(.auto, body, .{&vm} ++ args);
         }
         const Args = @TypeOf(args);
@@ -741,8 +737,8 @@ pub const Evaluator = struct {
                     return;
                 };
                 defer vm.deinit();
-                if (comptime gc.enabled) ctx.ev.gcRegisterVm(&vm);
-                defer if (comptime gc.enabled) ctx.ev.gcUnregisterVm(&vm);
+                if (comptime gc.enabled) eval_gc.registerVm(ctx.ev, &vm);
+                defer if (comptime gc.enabled) eval_gc.unregisterVm(ctx.ev, &vm);
                 const result = @call(.auto, body, .{&vm} ++ ctx.body_args) catch |e| {
                     ctx.err = e;
                     return;
@@ -791,7 +787,7 @@ pub const Evaluator = struct {
             if (self.env_map) |em|
                 if (em.get("FIX_GC_PAR_CAP")) |s| {
                     if (std.fmt.parseInt(u32, s, 10)) |c| {
-                        if (c >= 1) gc_par_cap = c;
+                        if (c >= 1) eval_gc.gc_par_cap = c;
                     } else |_| {}
                 };
             if (!gc_off) {
@@ -803,214 +799,27 @@ pub const Evaluator = struct {
                         if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
                     }
                 }
-                self.heap.gcEnableCollect(ObjectHeap.GC_MIN_THRESHOLD, step_bytes);
+                heap_gc.enableCollect(&self.heap, ObjectHeap.GC_MIN_THRESHOLD, step_bytes);
             }
         }
         return w;
     }
 
-    /// GC (`-Dgc`): register a stack-local VM (the top-level entry's VM, a
-    /// nested-eval VM, or an import VM) so the collector scans its roots.
-    /// These VMs are NOT in any worker's `fibers` list, so without this their
-    /// operand stack / frames / force-chain / temp-roots are invisible and
-    /// their live objects get swept. Concurrent imports at --workers>1
-    /// interleave, hence the mutex + remove-by-value.
-    pub fn gcRegisterVm(self: *Evaluator, vm: *VM) void {
-        if (comptime !gc.enabled) return;
-        self.gc_import_vms_mu.lock();
-        defer self.gc_import_vms_mu.unlock();
-        self.gc_import_vms.append(self.allocator, vm) catch {};
-    }
-    pub fn gcUnregisterVm(self: *Evaluator, vm: *VM) void {
-        if (comptime !gc.enabled) return;
-        self.gc_import_vms_mu.lock();
-        defer self.gc_import_vms_mu.unlock();
-        for (self.gc_import_vms.items, 0..) |ivm, i| {
-            if (ivm == vm) {
-                _ = self.gc_import_vms.swapRemove(i);
-                break;
-            }
-        }
-    }
-
-    /// Type-erased trampoline for the heap's collect callback. `collector_id`
-    /// is the worker that won the collection (its parallel-mark slot).
+    /// Type-erased trampoline for the heap's collect callback. Kept here
+    /// (next to `setGcHook`) so the `*const fn(*anyopaque, u8) void` ABI
+    /// stays exact; the body lives in `eval/gc.zig`. `collector_id` is the
+    /// worker that won the collection (its parallel-mark slot).
     fn gcCollectThunk(ctx: *anyopaque, collector_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        self.gcCollect(collector_id);
+        eval_gc.collect(self, collector_id);
     }
 
     /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
-    /// peer helps drain marker slot `worker_id` to termination.
+    /// peer helps drain marker slot `worker_id` to termination. Kept here for
+    /// the exact fn-pointer ABI; the body lives in `eval/gc.zig`.
     fn gcHelpMarkThunk(ctx: *anyopaque, worker_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        _ = worker_id;
-        // Grab a marker slot. The collection is capped at GC_PAR_CAP
-        // participants (contention-bound past ~8); a peer over the cap parks
-        // idle rather than piling on. The collector already grabbed slot 0.
-        const marker_count = @min(@as(u32, self.worker_count), gc_par_cap);
-        const slot = self.heap.gcMarkSlotGrab();
-        if (slot >= marker_count) return;
-        // Drain the mark to global termination, then help evacuate: the young-
-        // object lists are a shared work queue, so this peer claims and copies
-        // survivors into its own tenured TLAB alongside the collector.
-        self.gc_tracer.drainParallel(&self.heap, slot);
-        self.heap.gcEvacClaimLoop(self.gc_tracer.mark_bits);
-    }
-
-    /// GC (`-Dgc`): one stop-the-world mark-sweep at a safepoint. Mark the
-    /// live graph from roots, sweep dead objects/ranges into the free
-    /// lists, set the next threshold from the surviving live set. Runs on
-    /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
-    fn gcCollect(self: *Evaluator, collector_id: u8) void {
-        if (comptime !gc.enabled) return;
-        _ = collector_id; // marker slot is grabbed dynamically (capped participants)
-        // Copying minor collection (STW). The young-gated mark runs from roots +
-        // the old→young remembered set. At --workers>1 the parked peers HELP the
-        // mark (parallel young-gated drain); at --workers=1 it's serial.
-        const tr = &self.gc_tracer;
-        const t0 = gcNowNs();
-        const SeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap };
-        const Seed = struct {
-            fn cb(ctx: SeedCtx, source: types.ObjectId) void {
-                ctx.tr.markRemsetSource(ctx.heap, source);
-            }
-        };
-        if (self.worker_count > 1) {
-            // Cap the collection's participants (contention-bound past ~8) —
-            // the eval still runs `worker_count`-wide; only the mark+evac is
-            // throttled. Peers over the cap park idle (see gcHelpMarkThunk).
-            const marker_count = @min(@as(u32, self.worker_count), gc_par_cap);
-            tr.resetParallelMinor(self.heap.objects.count(), marker_count) catch {
-                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-                return;
-            };
-            self.heap.gcBeginEvac(self.worker_count); // arm the evac work queue (resets slot dispenser)
-            const collector_slot = self.heap.gcMarkSlotGrab(); // grabbed before gcOpenMark ⇒ slot 0
-            // Seed roots + remset into the collector's own marker deque, open
-            // the mark so parked peers help drain it, then drain alongside them.
-            tr.beginSeeding(collector_slot);
-            self.gcMarkRoots(tr);
-            self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
-            tr.endSeeding();
-            self.scheduler.gcOpenMark();
-            tr.drainParallel(&self.heap, collector_slot); // returns at termination
-            // Mark closed. Verify closure while peers spin (no range moves yet),
-            // then open the evac phase and evacuate alongside them.
-            self.heap.gcVerifyMinorClosure(tr.mark_bits);
-            self.heap.gcOpenEvac();
-            self.heap.gcEvacClaimLoop(tr.mark_bits);
-            self.heap.gcWaitEvacDone();
-            self.scheduler.gcCloseMark();
-            tr.sumStats();
-        } else {
-            tr.resetMinor(self.heap.objects.count()) catch {
-                self.heap.gcAfterCollect(self.heap.totalReservedBytes());
-                return;
-            };
-            self.gcMarkRoots(tr);
-            self.heap.gcForEachRemsetSource(SeedCtx{ .tr = tr, .heap = &self.heap }, Seed.cb);
-            tr.drainMinor(&self.heap);
-        }
-        const t1 = gcNowNs();
-        // w>1 already evacuated in parallel (claim loop); just finish (verify +
-        // reset nursery). w=1 runs the whole serial minor here.
-        const st = if (self.worker_count > 1)
-            self.heap.gcFinishEvac()
-        else
-            self.heap.gcMinorCollect(tr.mark_bits);
-        const t2 = gcNowNs();
-        self.heap.gcRemsetClear();
-        self.heap.gcAfterCollect(tr.stats.bytes);
-        gc.recordCollection(st.freed, tr.stats.bytes, self.heap.totalReservedBytes());
-        gc.recordTiming(t1 - t0, t2 - t1);
-        gc.recordBreakdown(.{
-            .obj_live = tr.stats.objects,
-            .obj_reserved = self.heap.objects.count(),
-            .val_live = tr.stats.values,
-            .val_reserved = self.heap.values.reservedSlots(),
-            .attr_live = tr.stats.attrs,
-            .attr_reserved = self.heap.attrs.reservedSlots(),
-        });
-    }
-
-    fn gcNowNs() u64 {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-    }
-
-    /// Mark all GC roots into `tr` (without draining). See docs/plans/gc-plan.md.
-    fn gcMarkRoots(self: *Evaluator, tr: *gc.Tracer) void {
-        if (self.builtins_value) |b| tr.markValue(&self.heap, b);
-        // Every worker's fibers' VM stack/frames/upvalues. At a stop-the-
-        // world every live worker is parked at a safepoint, so its fiber
-        // list is stable and its fibers' VMs hold that worker's roots. The
-        // registry is published by each worker before it can allocate.
-        for (self.gc_workers) |*slot| {
-            const w = slot.load(.acquire) orelse continue;
-            for (w.fibers.items) |f| {
-                // Precise, for every fiber: operand stack + frames + upvalues +
-                // in-flight force chain + builtin temp-roots (see force.zig).
-                gcMarkVm(tr, &self.heap, &f.vm);
-                // A task assigned to a fiber is out of the scheduler queue
-                // but still a live reference until the fiber processes it.
-                if (f.current_task) |task| switch (task) {
-                    .force_thunk => |id| tr.markObject(&self.heap, id),
-                    .force_list_range => |r| tr.markObject(&self.heap, r.list_id),
-                };
-            }
-        }
-        // Transient import VMs (not in any fiber list).
-        self.gc_import_vms_mu.lock();
-        for (self.gc_import_vms.items) |ivm| gcMarkVm(tr, &self.heap, ivm);
-        self.gc_import_vms_mu.unlock();
-        // Pending scheduler tasks reference thunks/lists that will be forced.
-        self.scheduler.gcMarkPendingTasks(tr, &self.heap);
-        // Thread-local caches hold Values that can be the momentary sole
-        // reference to a shared object during forcing — mark them.
-        vm_force.gcMarkThunkMemo(tr, &self.heap);
-        @import("vm/access.zig").gcMarkAttrCache(tr, &self.heap);
-        // Chunk constants can hold heap references (e.g. a scoped-import's
-        // ambient-scope attrset baked in via emitConstant). Chunks are never
-        // GC'd, so their constants are permanent roots — but INCREMENTALLY:
-        // only chunks compiled since the last minor can reference a still-young
-        // object (earlier ones' referents were promoted at their first scan;
-        // post-promotion young refs come via the remembered set). See
-        // `gc_chunks_scanned`.
-        const chunk_count = self.registry.count();
-        var cid: ChunkId = self.gc_chunks_scanned;
-        while (cid < chunk_count) : (cid += 1) {
-            const ch = self.registry.get(cid) orelse continue;
-            for (ch.constants) |c| tr.markValue(&self.heap, c);
-        }
-        self.gc_chunks_scanned = chunk_count;
-        // Resolved import results.
-        var it = self.imports.entries.iterator();
-        while (it.next()) |e| {
-            const entry = e.value_ptr.*;
-            if (entry.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved))
-                tr.markValue(&self.heap, entry.result);
-        }
-        // Lazy-derivation cache (Value bits keyed by attrs id). Only current-
-        // token entries are live roots; stale ones (pre-GC id, now reused) are
-        // dead and will miss on lookup, so don't retain them.
-        var dit = self.derivations.lazy_drv_cache.iterator();
-        while (dit.next()) |e| if (e.value_ptr.token == self.heap.token)
-            tr.markValue(&self.heap, .{ .bits = e.value_ptr.bits });
-    }
-
-    fn gcMarkVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: *const VM) void {
-        if (comptime !gc.enabled) return;
-        tr.markValue(heap, vm.builtins);
-        tr.markValue(heap, vm.gc_extra_root); // value in-flight at the safepoint
-        for (vm.gc_force_chain.items) |id| tr.markObject(heap, id); // in-flight force chain
-        for (vm.gc_temp_roots.items) |v| tr.markValue(heap, v); // native builtin roots
-        for (vm.stack[0..vm.sp]) |v| tr.markValue(heap, v);
-        for (vm.frames[0..vm.frames_len]) |frame| {
-            if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
-        }
-        for (vm.native_upvalues) |v| tr.markValue(heap, v);
+        eval_gc.helpMark(self, worker_id);
     }
 
     fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {

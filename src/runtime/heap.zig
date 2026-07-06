@@ -26,9 +26,15 @@ const types = @import("types.zig");
 /// slot's alloc-bit is set — so a collection that frees a still-live object
 /// traps at the first stale read with a stack trace, instead of a
 /// nondeterministic segfault much later. Off in ReleaseFast (production).
-const gc_debug = build_options.gc and builtin.mode == .ReleaseSafe;
+pub const gc_debug = build_options.gc and builtin.mode == .ReleaseSafe;
 const stable = @import("stable_segments.zig");
 const worker_id_mod = @import("worker_id.zig");
+/// GC (`-Dgc`) collector driver: the non-inline mark/sweep/evac/minor-collect
+/// machinery, extracted to keep this file from being a god-file. Free
+/// functions over `*ObjectHeap`; the hot inline alloc-path helpers stay here.
+/// Re-exported (`pub`) so out-of-module callers reach it as
+/// `@import("runtime").heap.heap_gc`.
+pub const heap_gc = @import("heap/gc.zig");
 const struct_census = @import("struct_census.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
@@ -65,13 +71,13 @@ pub const AttrPosEntry = struct {
 /// tens of millions of times. `OBJECT_MAX_SLOTS` is a virtual reservation
 /// (MAP_NORESERVE), so the headroom over the ~6M objects a real eval
 /// produces costs no physical memory.
-const OBJECT_MAX_SLOTS: u32 = 1 << 30;
+pub const OBJECT_MAX_SLOTS: u32 = 1 << 30;
 const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS });
 const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024 });
 const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512 });
 const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512 });
 
-var next_heap_token: std.atomic.Value(u64) = .init(1);
+pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
 pub const ValueRange = ValueStore.Range;
 pub const AttrRange = AttrStore.Range;
@@ -291,7 +297,7 @@ pub const GcHook = struct {
 const RangeFreeList = struct {
     map: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u64)) = .empty,
 
-    fn push(self: *RangeFreeList, allocator: std.mem.Allocator, segment: u32, offset: u32, len: u32) void {
+    pub fn push(self: *RangeFreeList, allocator: std.mem.Allocator, segment: u32, offset: u32, len: u32) void {
         const gop = self.map.getOrPut(allocator, len) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.append(allocator, (@as(u64, segment) << 32) | offset) catch {};
@@ -679,7 +685,7 @@ pub const ObjectHeap = struct {
         return set;
     }
 
-    inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
+    pub inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
         return &self.worker_locals[worker_id_mod.current];
     }
 
@@ -898,7 +904,7 @@ pub const ObjectHeap = struct {
     /// headroom policy. Drives many collections so the detector exercises
     /// every builtin loop. 0 = normal policy. Set from the evaluator (which
     /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
-    var gc_step_bytes: u64 = 0;
+    pub var gc_step_bytes: u64 = 0;
 
     /// A/B knob (`FIX_GC_NOREUSE`): skip free-list reuse on the allocation hot
     /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
@@ -907,49 +913,6 @@ pub const ObjectHeap = struct {
     pub fn gcSetDisableReuse(v: bool) void {
         if (comptime !build_options.gc) return;
         gc_disable_reuse = v;
-    }
-
-    /// Turn on reclaim (alloc-bitmap maintenance + free-list reuse +
-    /// sweep) with an initial threshold. The evaluator calls this only at
-    /// `--workers=1` (alloc-bitmap maintenance isn't yet thread-safe).
-    pub fn gcEnableCollect(self: *ObjectHeap, initial_threshold: u64, step_bytes: u64) void {
-        if (comptime !build_options.gc) return;
-        self.gc_collect_enabled = true;
-        gc_step_bytes = step_bytes;
-        // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
-        // in place; there is no nursery to fill/reset). `gcNurseryFull` now only
-        // requests a collect once the cursor has grown a headroom past the last
-        // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
-        // every TLAB refill.
-        self.gc_threshold_bytes = initial_threshold;
-        self.gc_track_from = self.objects.count();
-        // Flush each worker's TLABs so the first post-enable allocation refills
-        // fresh instead of draining a leftover chunk carried over from bootstrap.
-        // The object TLAB matters for correctness, not just the range TLABs: a
-        // bootstrap object chunk reserves a whole span up to `objects.count()`
-        // but leaves most of it UNFILLED. Since `gc_track_from` is that count,
-        // any object later drained from those leftover low slots would land
-        // BELOW `gc_track_from` — untracked — yet be born post-enable with a
-        // YOUNG range. The nursery reset would then reclaim that range out from
-        // under a live, never-evacuated object (untracked objects are never
-        // marked/evacuated). Flushing forces post-enable objects onto fresh
-        // slots at/above `gc_track_from`, so they are tracked and evacuated.
-        for (self.worker_locals) |*l| {
-            l.value = .{};
-            l.attr = .{};
-            l.attr_pos = .{};
-            l.object = .{};
-        }
-        // Detector build: pre-size the alloc bitmap to the whole object id
-        // space so the incremental per-fill bit-set never reallocs (which
-        // would free the array under a concurrent reader/setter at
-        // --workers>1). With a stable array, set uses atomic-or and read uses
-        // atomic-load — no lock on the hot detector paths. ~128 MB, debug only.
-        if (comptime gc_debug) {
-            const words = (@as(usize, OBJECT_MAX_SLOTS) + 63) >> 6;
-            self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch self.gc_alloc_bits;
-            @memset(self.gc_alloc_bits, 0);
-        }
     }
 
     /// Is the alloc-bit set for `id`? (Detector helper.) Atomic load — the
@@ -986,39 +949,6 @@ pub const ObjectHeap = struct {
     pub fn gcCollectRequested(self: *const ObjectHeap) bool {
         if (comptime !build_options.gc) return false;
         return self.gc_collect_requested;
-    }
-
-    /// Run a collection now via the registered callback (the evaluator's
-    /// mark+sweep). Caller must be at a safepoint. `collector_id` is the
-    /// worker driving the collection (its slot in the parallel mark).
-    pub fn gcRunCollect(self: *ObjectHeap, collector_id: u8) void {
-        if (comptime !build_options.gc) return;
-        if (self.gc_hook) |h| h.sample(h.ctx, collector_id);
-    }
-
-    /// Called by the evaluator after a sweep: clear the request and set the
-    /// next threshold. The store cursors are monotonic — non-moving reuse
-    /// returns freed ranges to the free lists but never lowers
-    /// `totalReservedBytes` — so the threshold must be relative to the
-    /// CURSOR NOW, not the live set: collect again only once we've committed
-    /// another `GC_HEADROOM` of genuinely fresh pages (i.e. the free lists
-    /// drained and the cursor actually grew). Anchoring to live would leave
-    /// the threshold permanently below the cursor → collect every safepoint
-    /// (livelock). `live_bytes` is accepted for stats only.
-    pub fn gcAfterCollect(self: *ObjectHeap, live_bytes: u64) void {
-        if (comptime !build_options.gc) return;
-        _ = live_bytes;
-        self.gc_collect_requested = false;
-        self.gc_threshold_bytes = if (gc_step_bytes > 0)
-            self.totalReservedBytes() + gc_step_bytes
-        else
-            @max(GC_MIN_THRESHOLD, self.totalReservedBytes() + GC_HEADROOM);
-        // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
-        // that key on `token`: they hold Values weakly (not GC roots), so a
-        // swept object could still be reachable through a stale cache slot.
-        // A fresh unique token makes every existing slot miss. This is why
-        // caches needn't be traced (see docs/plans/gc-plan.md).
-        self.token = next_heap_token.fetchAdd(1, .monotonic);
     }
 
     /// Rebuild the alloc bitmap (which slots are filled-and-live) from
@@ -1101,7 +1031,7 @@ pub const ObjectHeap = struct {
         return self.gc_old_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0;
     }
 
-    inline fn gcSetOld(self: *ObjectHeap, id: ObjectId) void {
+    pub inline fn gcSetOld(self: *ObjectHeap, id: ObjectId) void {
         const word = id >> 6;
         if (word >= self.gc_old_bits.len) return;
         // Atomic OR: parallel evacuation promotes concurrently from multiple
@@ -1112,7 +1042,7 @@ pub const ObjectHeap = struct {
 
     /// Grow the generation bitmap to cover `[0, count)` (new words zeroed ⇒
     /// young). STW only, so plain (non-atomic).
-    fn gcGrowOldBits(self: *ObjectHeap, count: u32) void {
+    pub fn gcGrowOldBits(self: *ObjectHeap, count: u32) void {
         const words = (@as(usize, count) + 63) >> 6;
         if (self.gc_old_bits.len < words) {
             const old_len = self.gc_old_bits.len;
@@ -1123,7 +1053,7 @@ pub const ObjectHeap = struct {
 
     /// If a Value carries a heap ObjectId, return it (inlined here to avoid a
     /// gc-module import cycle — mirrors `gc.hasObjectRef`).
-    inline fn gcHeapId(v: Value) ?ObjectId {
+    pub inline fn gcHeapId(v: Value) ?ObjectId {
         if (v.isList() or v.isAttrs() or v.isThunk() or v.isClosure() or
             v.isBuiltinClosure() or v.isContextString() or v.isBoxedInt() or
             v.isPartialApp()) return v.asObjectId();
@@ -1143,162 +1073,9 @@ pub const ObjectHeap = struct {
         self.currentLocal().gc_remset.append(self.allocator, source) catch {};
     }
 
-    /// Visit every remembered old source (STW). `cb(ctx, source_id)`.
-    pub fn gcForEachRemsetSource(self: *ObjectHeap, ctx: anytype, comptime cb: fn (@TypeOf(ctx), ObjectId) void) void {
-        if (comptime !build_options.gc) return;
-        for (self.worker_locals) |*wl| for (wl.gc_remset.items) |sid| cb(ctx, sid);
-    }
-
-    pub fn gcRemsetClear(self: *ObjectHeap) void {
-        for (self.worker_locals) |*wl| wl.gc_remset.clearRetainingCapacity();
-    }
-
-
+    /// GC minor-collect statistics (`-Dgc`); populated by the collector
+    /// driver in `heap/gc.zig`.
     pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
-
-    /// One stop-the-world minor collection. The evaluator has already marked
-    /// the reachable young set into `mark_bits` (young-gated: roots + the
-    /// old→young remembered set, stopping at old). Here: evacuate every marked
-    /// young object's ranges to tenured + promote it, reclaim dead young slot
-    /// ids, then reset the nursery (bulk-reclaiming all dead young storage).
-    /// Runs at a safepoint; single-threaded at `--workers=1`.
-    /// Detector: verify the minor mark is CLOSED before we sweep — every young
-    /// object referenced by a live (filled) object must be marked. An unmarked
-    /// young child of any parent means the tracer/remembered-set missed an edge
-    /// and is about to sweep a live object. Panics with parent→child so a missed
-    /// barrier/root is caught at its source, before any downstream misread.
-    pub fn gcVerifyMinorClosure(self: *ObjectHeap, mark_bits: []const u64) void {
-        if (comptime !gc_debug) return;
-        const marked = struct {
-            fn f(mb: []const u64, id: ObjectId) bool {
-                const w = id >> 6;
-                return w < mb.len and (mb[w] & (@as(u64, 1) << @intCast(id & 63))) != 0;
-            }
-        }.f;
-        var shown: u32 = 0;
-        // From 0, not gc_track_from: catches the class where a post-enable
-        // object lands in a leftover bootstrap slot BELOW track_from (untracked)
-        // with a young range — the bug the object-TLAB-flush fix closed.
-        var id: ObjectId = 0;
-        const n = self.objects.count();
-        while (id < n and shown < 8) : (id += 1) {
-            const word = id >> 6;
-            if (word >= self.gc_alloc_bits.len) break;
-            if (self.gc_alloc_bits[word] & (@as(u64, 1) << @intCast(id & 63)) == 0) continue;
-            // Only LIVE parents constrain the mark: a dead young object
-            // (unmarked, about to be swept) may freely reference dead young
-            // children. Old and marked-young parents are live.
-            if (self.gcIsYoung(id) and !marked(mark_bits, id)) continue;
-            const obj = self.objects.get(id);
-            const check = struct {
-                fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, sh: *u32) void {
-                    const cid = gcHeapId(child_v) orelse return;
-                    if (!h.gcIsYoung(cid)) return; // old child: fine (not in minor set)
-                    if (!marked(mb, cid) and sh.* < 8) {
-                        std.debug.print("GC MISSED EDGE: {s} {d} -> unmarked young {s} {d}\n", .{ @tagName(h.objects.get(parent).*), parent, @tagName(h.objects.get(cid).*), cid });
-                        sh.* += 1;
-                    }
-                }
-            }.f;
-            switch (obj.*) {
-                .list => |r| for (self.values.slice(r)) |v| check(self, mark_bits, id, v, &shown),
-                .attrs => |a| for (self.attrs.slice(a.range)) |e| check(self, mark_bits, id, e.value, &shown),
-                .closure => |c| for (self.values.slice(c.upvalues)) |v| check(self, mark_bits, id, v, &shown),
-                .builtin_closure => |c| for (self.values.slice(c.args)) |v| check(self, mark_bits, id, v, &shown),
-                .partial_app => |p| {
-                    check(self, mark_bits, id, p.func, &shown);
-                    for (self.values.slice(p.args)) |v| check(self, mark_bits, id, v, &shown);
-                },
-                .context_string => |c| for (self.attrs.slice(c.context)) |e| check(self, mark_bits, id, e.value, &shown),
-                .merge_attrs => |m| {
-                    check(self, mark_bits, id, Value.attrs(m.base), &shown);
-                    check(self, mark_bits, id, Value.attrs(m.overlay), &shown);
-                    const flat = m.flattened.load(.monotonic);
-                    if (flat != NO_FLAT) check(self, mark_bits, id, Value.attrs(flat), &shown);
-                },
-                .thunk => |*t| {
-                    const FutureState = @import("thunk.zig").FutureState;
-                    const fs = @as(FutureState, @enumFromInt(t.future.state.load(.monotonic)));
-                    switch (fs) {
-                        .resolved => check(self, mark_bits, id, t.payload.result, &shown),
-                        .errored, .blackhole => {},
-                        .unresolved, .evaluating => switch (t.future.target_kind) {
-                            .closure => check(self, mark_bits, id, t.payload.target.closure, &shown),
-                            .pass_through => check(self, mark_bits, id, t.payload.target.pass_through, &shown),
-                            .attr_access => check(self, mark_bits, id, t.payload.target.attr_access.base, &shown),
-                            .bytecode => for (t.payload.target.bytecode.upvalues()) |v| check(self, mark_bits, id, v, &shown),
-                            .deferred => for (t.payload.target.deferred.env()) |v| check(self, mark_bits, id, v, &shown),
-                        },
-                    }
-                },
-                .boxed_int => {},
-            }
-        }
-        if (shown > 0) @panic("gc: minor mark not closed — missed edge (see MISSED EDGE lines)");
-    }
-
-    /// One minor collection — **O(young)**, not O(total objects). The young
-    /// generation is the contiguous slot range `[gc_young_slot_start, count)`.
-    /// Slot ids are NOT recycled between minors (dead young slots leak until a
-    /// rare major), so the range is gap-free and holds exactly this cycle's new
-    /// objects. `gcResetNursery` flushes the OBJECT TLABs too, so after a minor
-    /// `count()` is the true next-allocatable id — the frontier — and the next
-    /// generation's objects are all born at or above it (the reserved-vs-filled
-    /// TLAB-tail hazard is why an earlier frontier=count attempt leaked
-    /// below-frontier survivors). Only MARKED (survivor) slots do work; unmarked
-    /// slots are dead young or unfilled tails and need nothing. No
-    /// `gcReconstructAllocBits`, no O(count) walk.
-    pub fn gcMinorCollect(self: *ObjectHeap, mark_bits: []const u64) MinorStats {
-        var st: MinorStats = .{};
-        if (comptime !build_options.gc) return st;
-        self.gcGrowOldBits(self.objects.count());
-        self.gcVerifyMinorClosure(mark_bits);
-        // Iterate exactly this cycle's young objects (per-worker lists), all into
-        // the calling worker's tenured TLAB / free shard.
-        const dst = self.currentLocal();
-        for (self.worker_locals) |*local| {
-            self.gcEvacListInto(local.gc_young_slots.items, dst, mark_bits, &st);
-            local.gc_young_slots.clearRetainingCapacity();
-        }
-        // NON-MOVING: do NOT reset the nursery — survivor ranges stay in place
-        // (they were not evacuated), and dead ranges were returned to the free
-        // lists individually above. Resetting would discard the live survivors.
-        return st;
-    }
-
-    /// Evacuate one young-object list into `dst` (the *processing* worker's
-    /// tenured TLAB + free shard — NOT necessarily the list's owner). Marked ⇒
-    /// live survivor: evacuate its young ranges + promote. Unmarked ⇒ dead:
-    /// reclaim its slot id (its young ranges vanish with the nursery reset).
-    /// Safe to run concurrently on DISJOINT lists: each object id lives in
-    /// exactly one list, ranges are single-owner, `gcSetOld` is atomic, and each
-    /// worker writes only its own `dst`.
-    fn gcEvacListInto(self: *ObjectHeap, src_ids: []const ObjectId, dst: *HeapLocal, mark_bits: []const u64, st: *MinorStats) void {
-        for (src_ids) |id| {
-            const word = id >> 6;
-            const bit = @as(u64, 1) << @intCast(id & 63);
-            const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
-            if (marked) {
-                // NON-MOVING: promote in place — the object's ranges stay put
-                // (no evacuation), so no `gc_debug` re-fetch discipline and no
-                // relocation. Just flip the generation bit; the id is unchanged.
-                self.gcSetOld(id);
-                st.promoted += 1;
-            } else {
-                // Dead: return its ranges to the free lists IN PLACE (reused by
-                // the next allocation) and recycle its slot id. The detector
-                // leaks the id (no reuse) + clears the alloc bit atomically so a
-                // dangling read traps; `gcFreeObjectRanges` poisons the ranges.
-                self.gcFreeObjectRanges(dst, self.objects.get(id));
-                if (comptime gc_debug) {
-                    if (word < self.gc_alloc_bits.len) _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .And, ~bit, .monotonic);
-                } else {
-                    dst.gc_free_objects.append(self.allocator, id) catch {};
-                }
-                st.freed += 1;
-            }
-        }
-    }
 
     // --- parallel evacuation phase (`--workers>1`) ---------------------------
     //
@@ -1308,67 +1085,14 @@ pub const ObjectHeap = struct {
     // claiming young-object lists and evacuating them into its own TLAB. The
     // collector then `gcWaitEvacDone` + `gcFinishEvac` (reset the nursery).
 
-    /// Collector: arm the evac work queue. Called before `gcOpenMark` (grows the
-    /// generation bitmap while the object count is quiescent; the phase stays
-    /// closed until `gcOpenEvac`).
     /// Grab the next marker slot for this worker (collector or peer). A slot
-    /// `>= marker_count` means "don't participate — park idle".
+    /// `>= marker_count` means "don't participate — park idle". Called by both
+    /// the collector and the parallel-mark helper hook. (The rest of the evac
+    /// phase — beginEvac/openEvac/evacClaimLoop/waitEvacDone/finishEvac — lives
+    /// in the collector driver, `heap/gc.zig`.)
     pub fn gcMarkSlotGrab(self: *ObjectHeap) u32 {
         if (comptime !build_options.gc) return 0;
         return self.gc_mark_slot.fetchAdd(1, .acq_rel);
-    }
-
-    pub fn gcBeginEvac(self: *ObjectHeap, worker_count: u8) void {
-        if (comptime !build_options.gc) return;
-        self.gcGrowOldBits(self.objects.count());
-        self.gc_mark_slot.store(0, .release);
-        self.gc_evac_count = worker_count;
-        self.gc_evac_next.store(0, .monotonic);
-        self.gc_evac_done.store(0, .monotonic);
-        self.gc_evac_promoted.store(0, .monotonic);
-        self.gc_evac_freed.store(0, .monotonic);
-        self.gc_evac_open.store(false, .release);
-    }
-
-    /// Collector: release helpers into the evac phase. Called only after mark
-    /// closure is verified, so no worker moves a range the collector is still
-    /// reading.
-    pub fn gcOpenEvac(self: *ObjectHeap) void {
-        if (comptime !build_options.gc) return;
-        self.gc_evac_open.store(true, .release);
-    }
-
-    /// Any worker (collector or parked peer): claim + evacuate young-object
-    /// lists until the queue drains. Spins until the collector opens the phase.
-    pub fn gcEvacClaimLoop(self: *ObjectHeap, mark_bits: []const u64) void {
-        if (comptime !build_options.gc) return;
-        while (!self.gc_evac_open.load(.acquire)) std.atomic.spinLoopHint();
-        const dst = self.currentLocal();
-        var local_st: MinorStats = .{};
-        while (true) {
-            const i = self.gc_evac_next.fetchAdd(1, .monotonic);
-            if (i >= self.gc_evac_count) break;
-            self.gcEvacListInto(self.worker_locals[i].gc_young_slots.items, dst, mark_bits, &local_st);
-            self.worker_locals[i].gc_young_slots.clearRetainingCapacity();
-            _ = self.gc_evac_done.fetchAdd(1, .release);
-        }
-        _ = self.gc_evac_promoted.fetchAdd(local_st.promoted, .monotonic);
-        _ = self.gc_evac_freed.fetchAdd(local_st.freed, .monotonic);
-    }
-
-    /// Collector: block until every young-object list has been evacuated.
-    pub fn gcWaitEvacDone(self: *ObjectHeap) void {
-        if (comptime !build_options.gc) return;
-        while (self.gc_evac_done.load(.acquire) < self.gc_evac_count) std.atomic.spinLoopHint();
-    }
-
-    /// Collector: post-evac finish (all lists drained). Verify + reset nursery.
-    pub fn gcFinishEvac(self: *ObjectHeap) MinorStats {
-        if (comptime !build_options.gc) return .{};
-        // NON-MOVING: survivors were promoted in place (not evacuated) and dead
-        // ranges freed to the free lists individually — do NOT reset the
-        // nursery (that would discard the live survivors' ranges).
-        return .{ .promoted = self.gc_evac_promoted.load(.monotonic), .freed = self.gc_evac_freed.load(.monotonic) };
     }
 
     /// Detector: after evacuation every reachable object's owned ranges must be
@@ -1386,7 +1110,7 @@ pub const ObjectHeap = struct {
         // Release builds don't maintain the alloc bitmap incrementally —
         // rebuild it here from the live id range minus the free lists.
         if (comptime !gc_debug) self.gcReconstructAllocBits();
-        if (comptime gc_debug) self.gcVerifyMarkClosed(mark_bits);
+        if (comptime gc_debug) heap_gc.verifyMarkClosed(self, mark_bits);
         const n = self.objects.count();
         // Round-robin distribution across per-worker free-list shards. STW, so
         // the collector alone writes every shard (no concurrency); post-sweep
@@ -1402,7 +1126,7 @@ pub const ObjectHeap = struct {
             const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
             if (marked) continue;
             const local = &self.worker_locals[shard];
-            self.gcFreeObjectRanges(local, self.objects.get(id));
+            heap_gc.freeObjectRanges(self, local, self.objects.get(id));
             self.gc_alloc_bits[word] &= ~bit;
             local.gc_free_objects.append(self.allocator, id) catch {};
             st.objects_freed += 1;
@@ -1410,119 +1134,6 @@ pub const ObjectHeap = struct {
             if (shard >= nshards) shard = 0;
         }
         return st;
-    }
-
-    /// Debug: verify the mark is closed — no MARKED object may reference an
-    /// unmarked filled object. A violation means the tracer missed an edge
-    /// (systematic bug); silence means marking is complete and any swept
-    /// object is genuinely unreachable (held only by a Zig local / untracked
-    /// root). Prints up to a few violations. STW-only.
-    fn gcVerifyMarkClosed(self: *ObjectHeap, mark_bits: []const u64) void {
-        const marked = struct {
-            fn f(mb: []const u64, ab: []const u64, id: ObjectId) bool {
-                const w = id >> 6;
-                const bit = @as(u64, 1) << @intCast(id & 63);
-                if (w >= ab.len or ab[w] & bit == 0) return false; // not filled
-                return w < mb.len and (mb[w] & bit != 0);
-            }
-        }.f;
-        const check = struct {
-            fn f(h: *ObjectHeap, mb: []const u64, parent: ObjectId, child_v: Value, shown: *u32) void {
-                if (!(child_v.isList() or child_v.isAttrs() or child_v.isThunk() or child_v.isClosure() or
-                    child_v.isBuiltinClosure() or child_v.isContextString() or child_v.isBoxedInt() or child_v.isPartialApp())) return;
-                const child = child_v.asObjectId();
-                const w = child >> 6;
-                const bit = @as(u64, 1) << @intCast(child & 63);
-                const filled = w < h.gc_alloc_bits.len and (h.gc_alloc_bits[w] & bit != 0);
-                if (!filled) return;
-                const cmarked = w < mb.len and (mb[w] & bit != 0);
-                if (!cmarked and shown.* < 8) {
-                    std.debug.print("  TRACER-MISSED EDGE: marked {d} ({s}) -> unmarked {d} ({s})\n", .{ parent, @tagName(h.objects.get(parent).*), child, @tagName(h.objects.get(child).*) });
-                    shown.* += 1;
-                }
-            }
-        }.f;
-        var shown: u32 = 0;
-        var id: ObjectId = 0;
-        const n = self.objects.count();
-        while (id < n and shown < 8) : (id += 1) {
-            if (!marked(mark_bits, self.gc_alloc_bits, id)) continue;
-            const obj = self.objects.get(id);
-            switch (obj.*) {
-                .list => |r| for (self.values.slice(r)) |v| check(self, mark_bits, id, v, &shown),
-                .attrs => |a| for (self.attrs.slice(a.range)) |e| check(self, mark_bits, id, e.value, &shown),
-                .closure => |c| for (self.values.slice(c.upvalues)) |v| check(self, mark_bits, id, v, &shown),
-                .builtin_closure => |c| for (self.values.slice(c.args)) |v| check(self, mark_bits, id, v, &shown),
-                .partial_app => |p| {
-                    check(self, mark_bits, id, p.func, &shown);
-                    for (self.values.slice(p.args)) |v| check(self, mark_bits, id, v, &shown);
-                },
-                .context_string => |c| for (self.attrs.slice(c.context)) |e| check(self, mark_bits, id, e.value, &shown),
-                .merge_attrs => |m| {
-                    check(self, mark_bits, id, Value.attrs(m.base), &shown);
-                    check(self, mark_bits, id, Value.attrs(m.overlay), &shown);
-                },
-                .thunk => |*t| {
-                    if (@as(@import("thunk.zig").FutureState, @enumFromInt(t.future.state.load(.monotonic))) == .resolved)
-                        check(self, mark_bits, id, t.payload.result, &shown);
-                },
-                else => {},
-            }
-        }
-        if (shown > 0) std.debug.print("=== ^ mark NOT closed: tracer missed edges (bug) ===\n", .{});
-    }
-
-    /// Return a dead object's owned store ranges to the free lists. Ranges
-    /// are single-owner (every construction site reserves fresh + copies),
-    /// so this is the only owner — see docs/plans/gc-plan.md. Thunk *spilled*
-    /// upvalue/env storage is a bare slice (no segment/offset to recover),
-    /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
-    /// `merge_attrs`/`boxed_int` own no ranges.
-    fn gcFreeObjectRanges(self: *ObjectHeap, local: *HeapLocal, obj: *const Object) void {
-        // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
-        // slice (owner swept while a Zig local held the slice — the class the
-        // reuse-off object-read assert can't see) traps on next access instead
-        // of silently reading stale-but-valid data. Poison is a thunk to an
-        // unallocated id, so forcing/reading a poisoned element hits gcAssertLive.
-        if (comptime gc_debug) {
-            const poison = Value.thunk(OBJECT_MAX_SLOTS - 1);
-            switch (obj.*) {
-                .list => |r| for (self.values.sliceMut(r)) |*v| {
-                    v.* = poison;
-                },
-                .attrs => |a| for (self.attrs.sliceMut(a.range)) |*e| {
-                    e.value = poison;
-                },
-                .builtin_closure => |c| for (self.values.sliceMut(c.args)) |*v| {
-                    v.* = poison;
-                },
-                .partial_app => |p| for (self.values.sliceMut(p.args)) |*v| {
-                    v.* = poison;
-                },
-                .context_string => |c| for (self.attrs.sliceMut(c.context)) |*e| {
-                    e.value = poison;
-                },
-                else => {},
-            }
-        }
-        switch (obj.*) {
-            .list => |r| if (r.len > 0) local.gc_free_values.push(self.allocator, r.segment, r.offset, r.len),
-            .attrs => |a| {
-                if (a.range.len > 0) local.gc_free_attrs.push(self.allocator, a.range.segment, a.range.offset, a.range.len);
-                if (a.positions.len > 0) local.gc_free_attr_pos.push(self.allocator, a.positions.segment, a.positions.offset, a.positions.len);
-            },
-            .builtin_closure => |c| if (c.args.len > 0) local.gc_free_values.push(self.allocator, c.args.segment, c.args.offset, c.args.len),
-            .partial_app => |p| if (p.args.len > 0) local.gc_free_values.push(self.allocator, p.args.segment, p.args.offset, p.args.len),
-            .context_string => |c| if (c.context.len > 0) local.gc_free_attrs.push(self.allocator, c.context.segment, c.context.offset, c.context.len),
-            // NOT reclaimed yet: an executing frame aliases its
-            // `upvalues` slice, which is owned by the .closure object (or a
-            // .thunk's spilled storage). Freeing the range while a frame
-            // runs would dangle it. Reclaiming these needs the frame to
-            // root its executing closure/thunk (a follow-up RSS opt);
-            // until then their ranges leak. `merge_attrs`/`boxed_int` own
-            // no reclaimable range.
-            .closure, .thunk, .merge_attrs, .boxed_int => {},
-        }
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {

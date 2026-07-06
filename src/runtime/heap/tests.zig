@@ -212,7 +212,7 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
 
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
-    heap.gcEnableCollect(64 << 20, 0);
+    heap_mod.heap_gc.enableCollect(&heap, 64 << 20, 0);
 
     // Two live (reachable) lists, two dead (unreferenced) lists.
     const live_a = try heap.addList(&.{Value.int(1)});
