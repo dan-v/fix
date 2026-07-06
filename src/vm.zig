@@ -33,7 +33,7 @@ const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
-const tjit_record = @import("jit/record.zig");
+const tjit_record = @import("jit/record_driver.zig");
 const DeferredTable = @import("compiler/deferred_table.zig").Table;
 const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 

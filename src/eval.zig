@@ -59,7 +59,7 @@ const ngram_probe = @import("probe/ngram_probe.zig");
 const depth0_probe = @import("probe/depth0_probe.zig");
 const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
-const tjit_record = @import("jit/record.zig");
+const tjit_record = @import("jit/record_driver.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;

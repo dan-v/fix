@@ -6,7 +6,7 @@ const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
 const hot_mod = @import("../jit/hot.zig");
-const record_mod = @import("../jit/record.zig");
+const record_mod = @import("../jit/record_driver.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;

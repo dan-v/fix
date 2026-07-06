@@ -40,7 +40,7 @@ const stack = @import("stack.zig");
 const strings = @import("strings.zig");
 const trace_log = @import("trace_log.zig");
 const ngram_probe = @import("../probe/ngram_probe.zig");
-const tjit_record = @import("../jit/record.zig");
+const tjit_record = @import("../jit/record_driver.zig");
 const thunk_census = @import("../probe/thunk_census.zig");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 

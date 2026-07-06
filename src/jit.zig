@@ -8,7 +8,7 @@
 
 pub const ir = @import("jit/ir.zig");
 pub const hot = @import("jit/hot.zig");
-pub const record = @import("jit/record.zig");
+pub const record_driver = @import("jit/record_driver.zig");
 pub const recorder = @import("jit/recorder.zig");
 pub const opt = @import("jit/opt.zig");
 pub const codegen = @import("jit/codegen.zig");
@@ -20,7 +20,7 @@ pub const jit_helpers = @import("jit/jit_helpers.zig");
 test {
     _ = ir;
     _ = hot;
-    _ = record;
+    _ = record_driver;
     _ = recorder;
     _ = opt;
     _ = codegen;
