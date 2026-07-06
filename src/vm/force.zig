@@ -250,25 +250,17 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
             const id = forced.asObjectId();
             if (forced.kind() == .list) {
                 if (!try enterDeep(self, .list, id, seen)) return;
+                // NON-MOVING GC: `rootKeep` keeps the list live, and ranges
+                // never relocate/are-swept while rooted, so the slice is stable
+                // across the recursive forces — no per-element re-fetch.
                 const items = try self.heap.getList(id);
                 fanOutListShallow(self, id, items);
-                // gc: re-fetch — range may move across the recursive force
-                const n = items.len;
-                var i: usize = 0;
-                while (i < n) : (i += 1) {
-                    try forceDeepInner(self, try self.heap.getListItem(id, i), seen);
-                }
+                for (items) |item| try forceDeepInner(self, item, seen);
             } else {
                 if (!try enterDeep(self, .attrs, id, seen)) return;
                 const entries = try self.heap.getAttrs(id);
                 fanOutAttrsShallow(self, entries);
-                // gc: re-fetch — range may move across the recursive force
-                const n = entries.len;
-                var i: usize = 0;
-                while (i < n) : (i += 1) {
-                    const entry = (try self.heap.getAttrs(id))[i];
-                    try forceDeepInner(self, entry.value, seen);
-                }
+                for (entries) |entry| try forceDeepInner(self, entry.value, seen);
             }
         },
         else => {},

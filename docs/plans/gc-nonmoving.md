@@ -35,9 +35,15 @@ disposition and the range allocator.
      resetting; they're a non-moving region reused via free lists). Can keep `reserveYoung`
      as-is initially; the free-list pop makes reuse work without the reset.
    - Gate: gauntlet clean (no missed-edge/poison/UAF), byte-identical, measure wall.
-2. **Delete the re-fetch discipline** (the perf payoff, ~0.7s target): the ~51 `if (comptime
-   build_options.gc)` re-fetch sites in `src/vm/builtins/*` + force.zig become unnecessary
-   (ranges never move) — revert them to holding the slice across forces. Measure wall drop.
+2. **Delete the re-fetch discipline** — **MEASURED WALL-NEUTRAL → NOT the tax.** Deleted it
+   at the two hottest sites (`forceDeepInner`, `force_list_range`); gauntlet clean w=1/w=32
+   (holding a slice across a force IS safe under non-moving: rooted ⇒ not swept, ranges never
+   move), but w=32 wall **1.93→1.92s (~0)**. `getListItem` (a bounds-check + segment index)
+   is cheap; the residual GC cost (non-moving 1.93 vs no-GC 1.41 = ~0.5s) is mark + the
+   always-on barriers (`gcRecordEdge` per resolve) + per-alloc bookkeeping + safepoints — NOT
+   the re-fetch. The remaining ~49 sites are low-priority *cleanup* (uniformity), not a perf
+   lever. The non-moving win over copying (2.25→1.93) came from cheaper collection (no
+   evacuation copy) + fewer collections (HEADROOM 32→256MB), not from re-fetch.
 3. **Cleanup**: delete `gcEvacuateObject`/`gcEvacValues`/`gcEvacAttrs`/the parallel-evac
    queue/`gcResetNursery`/`reserveYoung`/`resetYoung`/`poisonYoung` and the young-range
    partition in stable_segments once #1/#2 prove out.

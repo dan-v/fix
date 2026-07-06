@@ -701,16 +701,18 @@ fn slotEntry(arg: *anyopaque) void {
             // survives. Re-fetch each element from the id per iteration
             // (`getListItem` re-derives the range from the moved object) so we
             // always read the live copy. Zero cost without -Dgc.
+            // NON-MOVING GC: `rootKeep` keeps the list live and ranges never
+            // relocate/are-swept while rooted, so the slice is stable across the
+            // element forces — hold it, no per-element re-fetch.
             const gc_roots = vm_force.rootsBegin(&f.vm);
             defer vm_force.rootsEnd(&f.vm, gc_roots);
             vm_force.rootKeep(&f.vm, Value.list(range.list_id));
-            const len = (f.vm.heap.getList(range.list_id) catch return).len;
-            const end = @min(@as(usize, range.offset) + @as(usize, range.len), len);
+            const items = f.vm.heap.getList(range.list_id) catch return;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
             var i: usize = range.offset;
             while (i < end) : (i += 1) {
-                const item = f.vm.heap.getListItem(range.list_id, i) catch return;
-                if (!item.isThunk()) continue;
-                _ = vm_force.forceValueSpeculative(&f.vm, item) catch {};
+                if (!items[i].isThunk()) continue;
+                _ = vm_force.forceValueSpeculative(&f.vm, items[i]) catch {};
             }
         },
     }
