@@ -165,7 +165,7 @@ pub const MergeAttrsObject = struct {
 };
 
 /// Sentinel for `MergeAttrsObject.flattened` meaning "not yet flattened".
-const NO_FLAT: ObjectId = std.math.maxInt(ObjectId);
+pub const NO_FLAT: ObjectId = std.math.maxInt(ObjectId);
 
 /// Only layer `a // b` when `a` is at least this large — small merges
 /// (literal `{..} // {..}`) stay eager so the common cheap case keeps its

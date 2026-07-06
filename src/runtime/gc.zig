@@ -31,9 +31,9 @@ const FutureState = thunk_mod.FutureState;
 
 pub const enabled: bool = build_options.gc;
 
-/// `NO_FLAT` from heap.zig (private there) — a `merge_attrs` whose
-/// `flattened` memo equals this has no flattened object to follow.
-const NO_FLAT: ObjectId = std.math.maxInt(ObjectId);
+/// A `merge_attrs` whose `flattened` memo equals this has no flattened
+/// object to follow. Single source of truth in `heap.zig`.
+const NO_FLAT: ObjectId = heap_mod.NO_FLAT;
 
 /// Live-set tally accumulated by one mark pass: object slots reached, the
 /// value/attr/attr-pos store slots they own, and the total live bytes

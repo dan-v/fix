@@ -7,7 +7,7 @@
 //! resumption.
 //!
 //! Stack switching is done via a small naked assembly routine
-//! (`fix_swap_context`, see src/fiber/swap_x86_64.S) that saves the
+//! (`fix_swap_context`, see src/parallel/fiber/swap_x86_64.S) that saves the
 //! callee-saved register set + rsp into a `Context` and loads a new one.
 //! Caller-saved registers are clobbered on swap — Zig's calling convention
 //! lets the compiler handle that around the swap call site.
@@ -47,7 +47,7 @@ comptime {
 pub const stack_probe_enabled: bool = build_options.fiber_stack_probe;
 
 /// Callee-saved register set + saved stack pointer.
-/// Layout must match src/fiber/swap_x86_64.S exactly.
+/// Layout must match src/parallel/fiber/swap_x86_64.S exactly.
 pub const Context = extern struct {
     rbx: u64 = 0,
     rbp: u64 = 0,
@@ -58,7 +58,7 @@ pub const Context = extern struct {
     rsp: u64 = 0,
 };
 
-/// Implemented in src/fiber/swap_x86_64.S.
+/// Implemented in src/parallel/fiber/swap_x86_64.S.
 extern fn fix_swap_context(from: *Context, to: *Context) callconv(.c) void;
 
 pub const State = enum(u8) {
