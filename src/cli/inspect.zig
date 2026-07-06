@@ -8,7 +8,6 @@ const std = @import("std");
 const eval = @import("../eval.zig");
 const bytecode = @import("../bytecode.zig");
 const intern_mod = @import("runtime").intern;
-const cli = @import("../cli.zig");
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;
@@ -297,7 +296,6 @@ fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
         } else {
-            _ = cli;
             return error.UnknownOption;
         }
     }
