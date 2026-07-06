@@ -259,13 +259,6 @@ pub const HeapLocal = struct {
     /// exactly these — O(young) — and clears the list. Reuse- and TLAB-tail-
     /// safe, unlike an id-range frontier.
     gc_young_slots: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
-    /// Per-worker tenured allocation buffers used ONLY during evacuation, so the
-    /// parallel copying collector's workers each bump their own tenured cursor
-    /// instead of serializing on the store's `write_mu`. Persist across minors
-    /// (tenured space is permanent); never reset.
-    evac_v: if (build_options.gc) ValueStore.Tlab else void = if (build_options.gc) .{} else {},
-    evac_a: if (build_options.gc) AttrStore.Tlab else void = if (build_options.gc) .{} else {},
-    evac_p: if (build_options.gc) AttrPosStore.Tlab else void = if (build_options.gc) .{} else {},
 
     fn deinit(self: *HeapLocal, allocator: std.mem.Allocator) void {
         if (comptime !build_options.gc) return;
@@ -371,12 +364,14 @@ pub const ObjectHeap = struct {
     /// free), so there is NO allocation-path barrier — a freshly bumped slot is
     /// young by default. Grown (zeroed) at each minor to cover the object count.
     gc_old_bits: if (build_options.gc) []u64 else void = if (build_options.gc) &.{} else {},
-    /// Parallel-evacuation coordination (`--workers>1`). The young-object lists
-    /// (`worker_locals[*].gc_young_slots`) form a work queue: each helping
-    /// worker atomically claims a list index via `gc_evac_next`, evacuates it
-    /// into ITS OWN tenured TLAB, and bumps `gc_evac_done`. The collector opens
-    /// the phase via `gc_evac_open` (after it has verified mark closure) and
-    /// waits until `gc_evac_done == gc_evac_count` before resetting the nursery.
+    /// Parallel non-moving SWEEP coordination (`--workers>1`; the `gc_evac_*`
+    /// names are historical — the minor no longer evacuates). The young-object
+    /// lists (`worker_locals[*].gc_young_slots`) form a work queue: each helping
+    /// worker atomically claims a list index via `gc_evac_next` and sweeps it
+    /// (promote marked survivors in place; free dead ranges to ITS OWN free-list
+    /// shard), then bumps `gc_evac_done`. The collector opens the phase via
+    /// `gc_evac_open` (after verifying mark closure) and waits until
+    /// `gc_evac_done == gc_evac_count`.
     gc_evac_open: if (build_options.gc) std.atomic.Value(bool) else void = if (build_options.gc) .init(false) else {},
     gc_evac_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
     gc_evac_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
@@ -688,11 +683,13 @@ pub const ObjectHeap = struct {
         return &self.worker_locals[worker_id_mod.current];
     }
 
-    /// TLAB reserve shared by the three range stores. When the copying
-    /// nursery is active (`gc_collect_enabled`) a fresh chunk is bumped from
-    /// the young nursery; if the nursery is full the reservation spills to the
-    /// tenured region so the allocation always succeeds, and a minor is
-    /// requested (`gcNurseryFull`) to reset the nursery at the next safepoint.
+    /// TLAB reserve shared by the three range stores. When reclaim is active
+    /// (`gc_collect_enabled`) a reused range is popped from the free list (see
+    /// the callers) or a fresh chunk is bumped from the young region; if that
+    /// region is full the reservation spills to the tenured region so the
+    /// allocation always succeeds, and — past the reserved-bytes threshold — a
+    /// collection is requested (`gcNurseryFull`). Non-moving: nothing is reset
+    /// or relocated; the minor frees dead ranges to the free lists in place.
     /// Otherwise it is the ordinary tenured bump (identical to a non-`-Dgc`
     /// build). A returned range is young iff `segment < nursery_segs`.
     inline fn reserveRangeLocal(
@@ -801,8 +798,9 @@ pub const ObjectHeap = struct {
         return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
     }
 
-    /// Nursery-exhausted hook: request a minor collection to run at the next
-    /// forceThunk safepoint (which evacuates survivors and resets the nursery).
+    /// Threshold hook: once reserved bytes cross `gc_threshold_bytes`, request a
+    /// (non-moving) collection to run at the next forceThunk safepoint — it marks
+    /// live, promotes survivors in place, and frees dead ranges to the free lists.
     /// The reservation that triggered this has already spilled to the tenured
     /// region so the allocation succeeds now; the spill window (until the
     /// safepoint) is small because forces are frequent.
@@ -1155,47 +1153,6 @@ pub const ObjectHeap = struct {
         for (self.worker_locals) |*wl| wl.gc_remset.clearRetainingCapacity();
     }
 
-    // --- evacuation: copy a survivor's young ranges into the tenured region ---
-    //
-    // The ObjectIds *inside* a range are untouched (slots never move), so
-    // evacuation is a raw memcpy + one back-pointer rewrite. Ranges already
-    // tenured (segment ≥ nursery_segs — oversized spills, or thunk spilled
-    // upvalues which are born tenured) are left in place.
-
-    fn gcEvacValues(self: *ObjectHeap, local: *HeapLocal, r: *ValueRange) void {
-        if (r.len == 0 or !self.values.isYoung(r.*)) return;
-        const dst = self.values.reserveLocal(self.allocator, &local.evac_v, r.len) catch @panic("gc: nursery evacuation OOM (values)");
-        @memcpy(self.values.sliceMut(dst), self.values.slice(r.*));
-        r.* = dst;
-    }
-    fn gcEvacAttrs(self: *ObjectHeap, local: *HeapLocal, r: *AttrRange) void {
-        if (r.len == 0 or !self.attrs.isYoung(r.*)) return;
-        const dst = self.attrs.reserveLocal(self.allocator, &local.evac_a, r.len) catch @panic("gc: nursery evacuation OOM (attrs)");
-        @memcpy(self.attrs.sliceMut(dst), self.attrs.slice(r.*));
-        r.* = dst;
-    }
-    fn gcEvacAttrPos(self: *ObjectHeap, local: *HeapLocal, r: *AttrPosRange) void {
-        if (r.len == 0 or !self.attr_positions.isYoung(r.*)) return;
-        const dst = self.attr_positions.reserveLocal(self.allocator, &local.evac_p, r.len) catch @panic("gc: nursery evacuation OOM (attr_pos)");
-        @memcpy(self.attr_positions.sliceMut(dst), self.attr_positions.slice(r.*));
-        r.* = dst;
-    }
-
-    fn gcEvacuateObject(self: *ObjectHeap, local: *HeapLocal, id: ObjectId) void {
-        const obj = self.objects.getMut(id);
-        switch (obj.*) {
-            .list => |*r| self.gcEvacValues(local, r),
-            .attrs => |*a| {
-                self.gcEvacAttrs(local, &a.range);
-                self.gcEvacAttrPos(local, &a.positions);
-            },
-            .closure => |*c| self.gcEvacValues(local, &c.upvalues),
-            .builtin_closure => |*c| self.gcEvacValues(local, &c.args),
-            .partial_app => |*p| self.gcEvacValues(local, &p.args),
-            .context_string => |*c| self.gcEvacAttrs(local, &c.context),
-            .thunk, .merge_attrs, .boxed_int => {},
-        }
-    }
 
     pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
 
@@ -1418,65 +1375,6 @@ pub const ObjectHeap = struct {
     /// tenured (the nursery is about to be reset). A live object still pointing
     /// at a young range would dangle. Panics with the offending id/kind so a
     /// missed-evacuation bug is caught at its source, not downstream.
-    fn gcVerifyNoYoungRangesInOld(self: *ObjectHeap) void {
-        const n = self.objects.count();
-        var id: ObjectId = 0; // from 0: also catch untracked (<track_from) young ranges
-        while (id < n) : (id += 1) {
-            const word = id >> 6;
-            if (word >= self.gc_alloc_bits.len) break;
-            const bit = @as(u64, 1) << @intCast(id & 63);
-            if (self.gc_alloc_bits[word] & bit == 0) continue; // freed/unfilled
-            if (self.gcIsYoung(id)) continue; // young dead-but-unreclaimed (detector leaks these)
-            const obj = self.objects.get(id);
-            const yv = struct {
-                fn v(store: anytype, r: anytype) bool {
-                    return r.len > 0 and store.isYoung(r);
-                }
-            }.v;
-            const young = switch (obj.*) {
-                .list => |r| yv(&self.values, r),
-                .attrs => |a| yv(&self.attrs, a.range) or yv(&self.attr_positions, a.positions),
-                .closure => |c| yv(&self.values, c.upvalues),
-                .builtin_closure => |c| yv(&self.values, c.args),
-                .partial_app => |p| yv(&self.values, p.args),
-                .context_string => |c| yv(&self.attrs, c.context),
-                .thunk, .merge_attrs, .boxed_int => false,
-            };
-            if (young) {
-                const seg = switch (obj.*) {
-                    .closure => |c| c.upvalues.segment,
-                    .list => |r| r.segment,
-                    .attrs => |a| a.range.segment,
-                    else => 999,
-                };
-                std.debug.print("GC BUG: old object {d} (kind={s}) YOUNG range seg={d} (values nursery_segs={d}, tenured cursor seg starts at {d}) collect_enabled={}\n", .{ id, @tagName(obj.*), seg, NURSERY_SEGS_VALUES, NURSERY_SEGS_VALUES, self.gc_collect_enabled });
-                @panic("gc: old object with young range");
-            }
-        }
-    }
-
-    /// Rewind the nursery bump cursors (reclaiming all young slots at once) and
-    /// flush every worker's young TLAB (which points into the just-reset space).
-    fn gcResetNursery(self: *ObjectHeap) void {
-        // Detector: poison the dead young region so any slice that dangled
-        // across this collection (held a raw value/attr store slice over a
-        // force) traps on its next read instead of reading stale data. Poison
-        // is a thunk to an unallocated id → forcing/reading it hits gcAssertLive.
-        if (comptime gc_debug) {
-            const poison = Value.thunk(OBJECT_MAX_SLOTS - 1);
-            self.values.poisonYoung(poison);
-            self.attrs.poisonYoung(.{ .name = GC_POISON_NAME, .value = poison });
-        }
-        self.values.resetYoung();
-        self.attrs.resetYoung();
-        self.attr_positions.resetYoung();
-        for (self.worker_locals) |*l| {
-            l.value = .{};
-            l.attr = .{};
-            l.attr_pos = .{};
-        }
-    }
-
     /// Sweep: free every filled object that `mark_bits` left unmarked —
     /// return its owned ranges to the free lists and its slot to the
     /// object free list. `mark_bits` is the marker's live-bitmap (same
