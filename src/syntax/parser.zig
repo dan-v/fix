@@ -1,15 +1,15 @@
 //! Table-driven LALR(1) parser.
 //!
-//! The grammar and its ACTION/GOTO tables are generated at compile time
-//! (`grammar.zig` → `lr.zig`). This file is the runtime: a tight shift/reduce
-//! loop over the flat tables, plus the semantic actions that build the AST.
+//! The ACTION/GOTO tables are generated from the grammar (`grammar.zig` →
+//! `lr.zig`) by a cached codegen step (`gen_parser_tables.zig`) and imported
+//! here as `parser_tables`. This file is the runtime: a tight shift/reduce loop
+//! over the flat tables, plus the semantic actions that build the AST.
 //!
-//! Pipeline: source → scanner → token array. A single O(n) brace-matching pass
-//! retags a lambda pattern's opening `{` to the synthetic `pattern_lbrace`
-//! terminal (the one context-sensitive decision Nix's grammar needs). Then the
-//! driver consumes the token/terminal arrays, maintaining a state stack and a
-//! parallel semantic-value stack; each reduce runs one action to fold children
-//! into an AST node. Nodes live in the caller's arena, exactly as before.
+//! Pipeline: source → scanner → token array → driver. The driver maintains a
+//! state stack and a parallel semantic-value stack; each reduce runs one action
+//! to fold children into an AST node. Nodes live in the caller's arena. The
+//! grammar is pure LR — the lambda-pattern-vs-attrset ambiguity is resolved
+//! inside the grammar (a unified `brace` nonterminal), not by any pre-pass.
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -24,8 +24,22 @@ const Scanner = @import("scanner.zig").Scanner;
 const grammar = @import("grammar.zig");
 const lr = @import("lr.zig");
 
-const Tab = grammar.Tables;
+/// Comptime-generated LALR tables (see `tools/gen_parser_tables.zig`).
+const Tab = @import("parser_tables");
 const Act = grammar.Act;
+
+/// Whether production `p` is a unit `pass` rule (single RHS symbol, identity
+/// action). Such reductions relabel a symbol without touching the value or the
+/// state below them, so the driver collapses runs of them into one tight loop
+/// instead of a full dispatch each. Computed from the generated tables — no
+/// grammar-specific knowledge, works for any grammar.
+const unit_pass: [Tab.num_productions]bool = blk: {
+    var u: [Tab.num_productions]bool = undefined;
+    for (0..Tab.num_productions) |p| {
+        u[p] = grammar.act_of_prod[p] == .pass and Tab.prod_rhs_len[p] == 1;
+    }
+    break :blk u;
+};
 
 /// One attribute-path segment: a static name or a dynamic `${expr}`.
 const Seg = union(enum) {
@@ -49,10 +63,10 @@ const Brace = struct {
     lbrace: Token,
 };
 
-/// A semantic value on the parse stack. Which variant is live is determined by
-/// the grammar symbol, so reads are unchecked in spirit — the tagged union just
-/// keeps development honest.
-const Value = union(enum) {
+/// A semantic value on the parse stack. Which variant is live is fully
+/// determined by the grammar symbol reduced, so the union is untagged: no tag
+/// byte in the (hot, per-symbol) value stack and no discriminant checks.
+const Value = union {
     tok: Token,
     node: *Node,
     seg: Seg,
@@ -136,8 +150,9 @@ pub const Parser = struct {
 
         var toks: std.ArrayListUnmanaged(Token) = .empty;
         defer toks.deinit(gpa);
-        var ids: std.ArrayListUnmanaged(u32) = .empty;
-        defer ids.deinit(gpa);
+        // Preallocate for the common token density to avoid mid-scan reallocs
+        // (append still grows safely if a token-dense file exceeds this).
+        try toks.ensureTotalCapacity(gpa, self.source.len / 3 + 16);
 
         var scanner = Scanner.init(self.source);
         while (true) {
@@ -147,11 +162,10 @@ pub const Parser = struct {
                 continue;
             }
             try toks.append(gpa, tk);
-            try ids.append(gpa, @intFromEnum(tk.type));
             if (tk.type == .eof) break;
         }
 
-        const root = try self.drive(toks.items, ids.items);
+        const root = try self.drive(toks.items);
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
@@ -159,8 +173,12 @@ pub const Parser = struct {
 
     // ---- the shift/reduce driver ----
 
-    fn drive(self: *Parser, toks: []const Token, ids: []const u32) !?*Node {
+    fn drive(self: *Parser, toks: []const Token) !?*Node {
         const gpa = self.allocator;
+        // One slot per token is a safe upper bound on stack depth; the buffer is
+        // a single allocation that's never touched past the actual (shallow,
+        // thanks to left recursion) depth, so over-allocation is effectively
+        // free and keeps a capacity check out of the hot loop.
         const cap = toks.len + 16;
         const states = try gpa.alloc(u32, cap);
         defer gpa.free(states);
@@ -169,7 +187,7 @@ pub const Parser = struct {
 
         var sp: usize = 0; // number of entries on the stack
         states[sp] = Tab.start_state;
-        vals[sp] = .nil;
+        vals[sp] = .{ .nil = {} };
         sp += 1;
 
         var ip: usize = 0;
@@ -183,7 +201,7 @@ pub const Parser = struct {
         var quiet_shifts: u32 = cooldown;
         while (true) {
             const state = states[sp - 1];
-            const la = ids[ip];
+            const la = @intFromEnum(toks[ip].type);
             const c = Tab.action[state * Tab.num_terminals + la];
             switch (lr.cellKind(c)) {
                 lr.ACT_SHIFT => {
@@ -194,20 +212,41 @@ pub const Parser = struct {
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
                 lr.ACT_REDUCE => {
-                    const p = lr.cellArg(c);
-                    const n = Tab.prod_rhs_len[p];
-                    const base = sp - n;
-                    const result = try self.runAction(grammar.act_of_prod[p], vals[base .. base + n]);
-                    sp = base;
-                    const lhs = Tab.prod_lhs[p];
-                    const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + lhs];
-                    if (g < 0) {
-                        self.report(toks[ip], "Internal parser error (no goto).");
-                        return null;
+                    var p = lr.cellArg(c);
+                    if (unit_pass[p]) {
+                        // Collapse a run of unit `pass` reductions. Each pops one
+                        // symbol and pushes one, so the state *below* the run
+                        // stays fixed and the value passes through untouched —
+                        // chain the gotos in a tight loop with no re-dispatch.
+                        const s = states[sp - 2];
+                        const value = vals[sp - 1];
+                        sp -= 1;
+                        while (true) {
+                            const g = Tab.goto_table[s * Tab.num_nonterminals + Tab.prod_lhs[p]];
+                            states[sp] = @intCast(g);
+                            vals[sp] = value;
+                            sp += 1;
+                            const c2 = Tab.action[@as(usize, @intCast(g)) * Tab.num_terminals + la];
+                            if (lr.cellKind(c2) != lr.ACT_REDUCE) break;
+                            const p2 = lr.cellArg(c2);
+                            if (!unit_pass[p2]) break;
+                            p = p2;
+                            sp -= 1;
+                        }
+                    } else {
+                        const n = Tab.prod_rhs_len[p];
+                        const base = sp - n;
+                        const result = try self.runAction(grammar.act_of_prod[p], vals[base .. base + n]);
+                        sp = base;
+                        const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + Tab.prod_lhs[p]];
+                        if (g < 0) {
+                            self.report(toks[ip], "Internal parser error (no goto).");
+                            return null;
+                        }
+                        states[sp] = @intCast(g);
+                        vals[sp] = result;
+                        sp += 1;
                     }
-                    states[sp] = @intCast(g);
-                    vals[sp] = result;
-                    sp += 1;
                 },
                 lr.ACT_ACCEPT => {
                     return vals[sp - 1].node;
@@ -221,7 +260,7 @@ pub const Parser = struct {
                         self.had_error = true;
                     }
                     quiet_shifts = 0;
-                    if (!recover(states[sp - 1], ids, &ip)) return null;
+                    if (!recover(states[sp - 1], toks, &ip)) return null;
                 },
             }
         }
@@ -235,12 +274,13 @@ pub const Parser = struct {
     /// running safely; the recovered tree is discarded anyway, since the
     /// recorded error forces `parse` to return `ParseError`. Returns false at
     /// EOF (nothing left to resynchronize on).
-    fn recover(top_state: u32, ids: []const u32, ip: *usize) bool {
+    fn recover(top_state: u32, toks: []const Token, ip: *usize) bool {
         const NT = Tab.num_terminals;
         while (true) {
-            if (ids[ip.*] == grammar.t_eof) return false;
+            if (toks[ip.*].type == .eof) return false;
             ip.* += 1; // discard a token (starting with the offending one)
-            if (lr.cellKind(Tab.action[top_state * NT + ids[ip.*]]) != lr.ACT_ERROR) return true;
+            const la = @intFromEnum(toks[ip.*].type);
+            if (lr.cellKind(Tab.action[top_state * NT + la]) != lr.ACT_ERROR) return true;
         }
     }
 

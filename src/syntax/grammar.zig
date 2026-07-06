@@ -324,7 +324,11 @@ const raw_productions = blk: {
     break :blk r;
 };
 
-const desc = lr.GrammarDesc{
+/// The grammar description consumed by `lr.Generate`. Building the LALR tables
+/// from this is expensive at comptime, so it is done *once* by the codegen tool
+/// (`tools/gen_parser_tables.zig`, wired in `build.zig`) rather than every time
+/// the `syntax` module compiles — the parser imports the generated `.zig`.
+pub const desc = lr.GrammarDesc{
     .num_terminals = num_terminals,
     .num_nonterminals = @typeInfo(NT).@"enum".fields.len,
     .eof = t_eof,
@@ -333,9 +337,8 @@ const desc = lr.GrammarDesc{
     .precedence = &prec,
 };
 
-pub const Tables = lr.Generate(desc);
-
-/// Action tag per production index (index 0 is the augmented rule).
+/// Action tag per production index (index 0 is the augmented rule the generator
+/// prepends). Cheap to compute — kept here so it stays beside the grammar.
 pub const act_of_prod = blk: {
     var a: [productions.len + 1]Act = undefined;
     a[0] = .augmented;
@@ -343,9 +346,7 @@ pub const act_of_prod = blk: {
     break :blk a;
 };
 
-test "grammar tables build without conflicts" {
-    // Reaching this test at all means `lr.Generate` produced a conflict-free
-    // table (conflicts are `@compileError`s).
-    try std.testing.expect(Tables.num_states > 0);
-    try std.testing.expect(Tables.num_productions == productions.len + 1);
+test "grammar action table aligns with productions" {
+    try std.testing.expect(act_of_prod.len == productions.len + 1);
+    try std.testing.expect(act_of_prod[0] == .augmented);
 }

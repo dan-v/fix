@@ -58,6 +58,26 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
 
+    // The LALR parser tables are expensive to construct at comptime, so a
+    // standalone codegen tool builds them once (cached by the build system;
+    // only rebuilt when the grammar or generator changes) and emits a plain
+    // `.zig` of literal arrays. The `syntax` module imports it as
+    // `@import("parser_tables")`, keeping the cost off every ordinary rebuild.
+    const gen_tables_exe = b.addExecutable(.{
+        .name = "gen-parser-tables",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/syntax/gen_parser_tables.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+        .use_llvm = true,
+    });
+    const run_gen_tables = b.addRunArtifact(gen_tables_exe);
+    const parser_tables_path = run_gen_tables.addOutputFileArg("parser_tables.zig");
+    syntax_mod.addAnonymousImport("parser_tables", .{ .root_source_file = parser_tables_path });
+    const gen_tables_step = b.step("gen-parser-tables", "Regenerate the LALR parser tables");
+    gen_tables_step.dependOn(&run_gen_tables.step);
+
     const containers_mod = b.addModule("containers", .{
         .root_source_file = b.path("src/containers.zig"),
         .target = target,
