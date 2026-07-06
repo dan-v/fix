@@ -331,6 +331,16 @@ pub const Future = struct {
         return self.demanded.load(.acquire) != 0;
     }
 
+    /// Non-claiming peek: is this future still being evaluated by *someone*?
+    /// A single acquire-load, no CAS — safe to poll from a waiter that wants
+    /// to spin briefly before committing to enroll+suspend (see
+    /// `force.zig`'s `.busy` spin-before-enroll). A `false` return means the
+    /// state left `.evaluating` (resolved / errored / reset); the caller
+    /// should re-`tryClaim` to observe the terminal state.
+    pub inline fn isEvaluating(self: *const Future) bool {
+        return self.state.load(.acquire) == @intFromEnum(FutureState.evaluating);
+    }
+
     /// Try to claim this future for evaluation by `claimer`. Returns a
     /// bare outcome tag; on `.already_resolved`/`.errored` the caller
     /// reads the value/error from the embedder's own result slot.
@@ -579,6 +589,12 @@ pub const Thunk = struct {
 
     pub inline fn isDemanded(self: *const Thunk) bool {
         return self.future.isDemanded();
+    }
+
+    /// Non-claiming peek at whether the thunk is still evaluating. See
+    /// `Future.isEvaluating`.
+    pub inline fn isEvaluating(self: *const Thunk) bool {
+        return self.future.isEvaluating();
     }
 
     /// The active arm of the bare `payload.target` union. Only meaningful

@@ -29,6 +29,13 @@ const thunk_trace = @import("../probe/thunk_trace.zig");
 const ChunkId = types.ChunkId;
 const deferred_compile = @import("../compiler/deferred.zig");
 
+/// Bounded spin a demanded fiber does on a `.busy` (helper-owned) thunk
+/// before enrolling as a waiter and suspending. Sized to catch a resolve
+/// that lands within a few hundred nanoseconds — the common case when the
+/// owner is nearly done — while still falling through to a real yield for
+/// long waits (so the worker can run other fibers). See the `.busy` arm.
+const BUSY_SPIN_BEFORE_ENROLL: u32 = 1024;
+
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
 /// builtin closures, a synthetic key for pass-through cells. Only
@@ -644,6 +651,24 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return result;
             },
             .busy => {
+                // Spin-before-enroll: a helper that is nearly done publishes
+                // within a few hundred ns. Catching the resolve here skips the
+                // whole enroll→suspend→yield→resume→re-tryForce cycle (µs of
+                // machinery). Bounded so a genuinely long wait falls through to
+                // the proper yield below, which lets the worker run other
+                // fibers / drain the queue instead of burning CPU. Re-`tryForce`
+                // is cheap on an `.evaluating` thunk (one acquire-load + claimer
+                // compare, no CAS); on resolve it returns the terminal state and
+                // we `continue` to the top where the outer switch handles it.
+                {
+                    var spins: u32 = 0;
+                    while (spins < BUSY_SPIN_BEFORE_ENROLL and thunk.isEvaluating()) : (spins += 1) {
+                        std.atomic.spinLoopHint();
+                    }
+                    // Left `.evaluating` during the spin → re-loop so the outer
+                    // `tryForce` observes (and claims/reads) the terminal state.
+                    if (!thunk.isEvaluating()) continue;
+                }
                 // Enroll on the thunk's fiber-waiter list and yield back
                 // to our worker so it can run other fibers / drain the
                 // queue while we wait. On resume, the outer while loop
