@@ -228,8 +228,16 @@ pub const Node = struct {
     };
 };
 
-/// Arena allocator wrapper for building ASTs.
-/// All nodes and their children live here.
+/// Arena allocator wrapper for building ASTs. All nodes and their children
+/// live here and are freed together at `deinit`.
+///
+/// Note (perf): node building is ~40-55% of parse time and is
+/// memory-bandwidth-bound — the cost is writing the ~64-byte `Node`s and their
+/// child slices, not the allocator. A custom inline bump allocator here was
+/// measured ~neutral; skipping span computation was ~neutral too. The only
+/// lever left is a smaller `Node` (box the rare large union variants; drop the
+/// optional on `span`), which is an AST-wide change touching the compiler and
+/// evaluator — deliberately out of scope for the parser.
 pub const AstArena = struct {
     inner: std.heap.ArenaAllocator,
 
