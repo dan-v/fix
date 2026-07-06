@@ -33,10 +33,20 @@ const Seg = union(enum) {
     dynamic: *Node,
 };
 
-/// Accumulated lambda formals: `{ a, b ? d, ... }`.
-const Formals = struct {
-    params: std.ArrayListUnmanaged(Node.LambdaAttrParam) = .empty,
-    allow_extra: bool = false,
+/// One element inside a `{ ... }`. The parser cannot know whether a brace is an
+/// attribute set or a lambda pattern until it sees what follows the `}`, so
+/// each element is parsed into this union and validated once the role is known.
+const Clause = union(enum) {
+    formal: Node.LambdaAttrParam, // pattern: `a` or `a ? default`
+    ellipsis, // pattern: `...`
+    bind: Node.AttrSetEntry, // attrset: `attrpath = expr`
+    inherit: []Node.AttrSetEntry, // attrset: `inherit ...` (one or more names)
+};
+
+/// A parsed `{ ... }` group plus its opening brace (for diagnostics).
+const Brace = struct {
+    clauses: std.ArrayListUnmanaged(Clause),
+    lbrace: Token,
 };
 
 /// A semantic value on the parse stack. Which variant is live is determined by
@@ -50,8 +60,9 @@ const Value = union(enum) {
     entries: std.ArrayListUnmanaged(Node.AttrSetEntry),
     names: std.ArrayListUnmanaged(Node.Atom),
     nodes: std.ArrayListUnmanaged(*Node),
-    formals: Formals,
-    formal: Node.LambdaAttrParam,
+    clause: Clause,
+    clauses: std.ArrayListUnmanaged(Clause),
+    brace: Brace,
     nil: void,
 };
 
@@ -140,46 +151,10 @@ pub const Parser = struct {
             if (tk.type == .eof) break;
         }
 
-        retagPatterns(toks.items, ids.items);
-
         const root = try self.drive(toks.items, ids.items);
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
-    }
-
-    /// Retag the opening brace of every lambda pattern to `pattern_lbrace`.
-    /// A `{` starts a pattern (rather than an attribute set) exactly when its
-    /// matching `}` is immediately followed by `:` or `@`, and it is not the
-    /// brace of a `rec { ... }`. One linear pass with a bracket stack.
-    fn retagPatterns(toks: []Token, ids: []u32) void {
-        var stack: [512]usize = undefined; // indices of open brackets
-        var sp: usize = 0;
-        var overflow = false;
-        for (toks, 0..) |tk, i| {
-            switch (tk.type) {
-                .left_brace, .left_bracket, .left_paren, .dollar_curly => {
-                    if (sp < stack.len) {
-                        stack[sp] = i;
-                        sp += 1;
-                    } else overflow = true;
-                },
-                .right_brace, .right_bracket, .right_paren => {
-                    if (sp == 0) continue;
-                    sp -= 1;
-                    const open_i = stack[sp];
-                    if (overflow) continue;
-                    if (toks[open_i].type != .left_brace) continue;
-                    // not a `rec {`
-                    if (open_i > 0 and toks[open_i - 1].type == .kw_rec) continue;
-                    const next = if (i + 1 < toks.len) toks[i + 1].type else TokenType.eof;
-                    if (next == .colon or next == .at) {
-                        ids[open_i] = grammar.t_pattern_lbrace;
-                    }
-                },
-                else => {},
-            }
-        }
     }
 
     // ---- the shift/reduce driver ----
@@ -267,14 +242,14 @@ pub const Parser = struct {
                     .body = rhs[2].node,
                 } }) };
             },
-            .lambda_no_bind => return self.makeLambdaAttrs(null, rhs[1].formals, rhs[4].node),
+            .lambda_no_bind => return self.buildLambda(rhs[0].brace, null, rhs[2].node),
             .lambda_bind_before => {
                 const bind = rhs[0].tok;
-                return self.makeLambdaAttrs(.{ .offset = bind.offset, .len = bind.len }, rhs[3].formals, rhs[6].node);
+                return self.buildLambda(rhs[2].brace, .{ .offset = bind.offset, .len = bind.len }, rhs[4].node);
             },
             .lambda_bind_after => {
-                const bind = rhs[4].tok;
-                return self.makeLambdaAttrs(.{ .offset = bind.offset, .len = bind.len }, rhs[1].formals, rhs[6].node);
+                const bind = rhs[2].tok;
+                return self.buildLambda(rhs[0].brace, .{ .offset = bind.offset, .len = bind.len }, rhs[4].node);
             },
             .assert_ => return .{ .node = try self.arena.createNode(.assert, .{ .assert = .{
                 .cond = rhs[1].node,
@@ -384,13 +359,7 @@ pub const Parser = struct {
             .bool_false => return .{ .node = try self.arena.createNode(.bool_false, .{ .atom = .{ .offset = 0, .len = 0 } }) },
             .null_lit => return .{ .node = try self.arena.createNode(.null, .{ .atom = .{ .offset = 0, .len = 0 } }) },
             .parens => return .{ .node = try self.arena.createNode(.parens, .{ .parens = rhs[1].node }) },
-            .attr_set => {
-                var entries = rhs[1].entries;
-                return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
-                    .entries = try entries.toOwnedSlice(a),
-                    .recursive = false,
-                } }) };
-            },
+            .attrset_from_brace => return self.buildAttrSet(rhs[0].brace),
             .rec_attr_set => {
                 var entries = rhs[2].entries;
                 return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
@@ -419,34 +388,54 @@ pub const Parser = struct {
             .attr_static => return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } },
             .attr_dynamic => return .{ .seg = .{ .dynamic = rhs[1].node } },
 
-            // ---- formals ----
-            .formals_empty => return .{ .formals = .{} },
-            .formals_ellipsis => return .{ .formals = .{ .allow_extra = true } },
-            .formals_list => return rhs[0],
-            .formals_list_comma => return rhs[0],
-            .formals_list_ellipsis => {
-                var f = rhs[0].formals;
-                f.allow_extra = true;
-                return .{ .formals = f };
+            // ---- brace / clauses (unified attrset-or-pattern body) ----
+            .brace_group => return .{ .brace = .{ .clauses = rhs[1].clauses, .lbrace = rhs[0].tok } },
+            .brace_empty => return .{ .clauses = .empty },
+            .bc_final => {
+                var list: std.ArrayListUnmanaged(Clause) = .empty;
+                try list.append(a, rhs[0].clause);
+                return .{ .clauses = list };
             },
-            .formal_list_one => {
-                var f: Formals = .{};
-                try f.params.append(a, rhs[0].formal);
-                return .{ .formals = f };
+            .bc_terms_final => {
+                var list = rhs[0].clauses;
+                try list.append(a, rhs[1].clause);
+                return .{ .clauses = list };
             },
-            .formal_list_append => {
-                var f = rhs[0].formals;
-                try f.params.append(a, rhs[2].formal);
-                return .{ .formals = f };
+            .term_clauses_one => {
+                var list: std.ArrayListUnmanaged(Clause) = .empty;
+                try list.append(a, rhs[0].clause);
+                return .{ .clauses = list };
             },
-            .formal_plain => return .{ .formal = .{
+            .term_clauses_append => {
+                var list = rhs[0].clauses;
+                try list.append(a, rhs[1].clause);
+                return .{ .clauses = list };
+            },
+            .tclause_formal_comma => return .{ .clause = .{ .formal = .{
                 .name = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len },
                 .default = null,
-            } },
-            .formal_default => return .{ .formal = .{
+            } } },
+            .tclause_formal_default_comma => return .{ .clause = .{ .formal = .{
                 .name = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len },
                 .default = rhs[2].node,
-            } },
+            } } },
+            .tclause_bind => {
+                var segs = rhs[0].segs;
+                const entry = try self.foldBind(segs.items, rhs[2].node);
+                segs.deinit(a);
+                return .{ .clause = .{ .bind = entry } };
+            },
+            .tclause_inherit => return .{ .clause = .{ .inherit = try self.inheritEntries(null, rhs[1].names, rhs[0].tok) } },
+            .tclause_inherit_from => return .{ .clause = .{ .inherit = try self.inheritEntries(rhs[2].node, rhs[4].names, rhs[0].tok) } },
+            .fclause_formal => return .{ .clause = .{ .formal = .{
+                .name = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len },
+                .default = null,
+            } } },
+            .fclause_formal_default => return .{ .clause = .{ .formal = .{
+                .name = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len },
+                .default = rhs[2].node,
+            } } },
+            .fclause_ellipsis => return .{ .clause = .ellipsis },
 
             // ---- binds ----
             .binds_empty => return .{ .entries = .empty },
@@ -465,8 +454,16 @@ pub const Parser = struct {
                 try list.append(a, entry);
                 return .{ .entries = list };
             },
-            .bind_inherit => return self.makeInherit(null, rhs[1].names, rhs[0].tok),
-            .bind_inherit_from => return self.makeInherit(rhs[2].node, rhs[4].names, rhs[0].tok),
+            .bind_inherit => {
+                var list: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
+                try list.appendSlice(a, try self.inheritEntries(null, rhs[1].names, rhs[0].tok));
+                return .{ .entries = list };
+            },
+            .bind_inherit_from => {
+                var list: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
+                try list.appendSlice(a, try self.inheritEntries(rhs[2].node, rhs[4].names, rhs[0].tok));
+                return .{ .entries = list };
+            },
             .inherit_names_empty => return .{ .names = .empty },
             .inherit_names_append => {
                 var names = rhs[0].names;
@@ -498,13 +495,52 @@ pub const Parser = struct {
         } }) };
     }
 
-    fn makeLambdaAttrs(self: *Parser, bind_name: ?Node.Atom, formals_in: Formals, body: *Node) !Value {
-        var formals = formals_in;
+    /// Validate a `{ ... }` group as a lambda pattern and build the node. The
+    /// grammar already guarantees formal ordering (commas between formals,
+    /// `...` last), so this only rejects bind/inherit clauses.
+    fn buildLambda(self: *Parser, brace: Brace, bind_name: ?Node.Atom, body: *Node) !Value {
+        const a = self.arenaAllocator();
+        var clauses = brace.clauses;
+        defer clauses.deinit(a);
+        var params: std.ArrayListUnmanaged(Node.LambdaAttrParam) = .empty;
+        var allow_extra = false;
+        for (clauses.items) |clause| {
+            switch (clause) {
+                .formal => |p| try params.append(a, p),
+                .ellipsis => allow_extra = true,
+                .bind, .inherit => {
+                    self.report(brace.lbrace, "Function argument pattern cannot contain attribute assignments.");
+                    return error.ParseError;
+                },
+            }
+        }
         return .{ .node = try self.arena.createNode(.lambda_attrs, .{ .lambda_attrs = .{
             .bind_name = bind_name,
-            .params = try formals.params.toOwnedSlice(self.arenaAllocator()),
-            .allow_extra = formals.allow_extra,
+            .params = try params.toOwnedSlice(a),
+            .allow_extra = allow_extra,
             .body = body,
+        } }) };
+    }
+
+    /// Validate a `{ ... }` group as an attribute set and build the node.
+    fn buildAttrSet(self: *Parser, brace: Brace) !Value {
+        const a = self.arenaAllocator();
+        var clauses = brace.clauses;
+        defer clauses.deinit(a);
+        var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
+        for (clauses.items) |clause| {
+            switch (clause) {
+                .bind => |e| try entries.append(a, e),
+                .inherit => |es| try entries.appendSlice(a, es),
+                .formal, .ellipsis => {
+                    self.report(brace.lbrace, "Expected '=' after attribute name.");
+                    return error.ParseError;
+                },
+            }
+        }
+        return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
+            .entries = try entries.toOwnedSlice(a),
+            .recursive = false,
         } }) };
     }
 
@@ -603,7 +639,9 @@ pub const Parser = struct {
         } });
     }
 
-    fn makeInherit(self: *Parser, source: ?*Node, names_in: std.ArrayListUnmanaged(Node.Atom), inherit_tok: Token) !Value {
+    /// Build the attribute-set entries for one `inherit ...;` clause (shared by
+    /// `let`/`rec` bindings and by attribute-set braces).
+    fn inheritEntries(self: *Parser, source: ?*Node, names_in: std.ArrayListUnmanaged(Node.Atom), inherit_tok: Token) ![]Node.AttrSetEntry {
         var names = names_in;
         defer names.deinit(self.arenaAllocator());
         if (names.items.len == 0) {
@@ -612,21 +650,21 @@ pub const Parser = struct {
             return error.ParseError;
         }
         const a = self.arenaAllocator();
-        var entries: std.ArrayListUnmanaged(Node.AttrSetEntry) = .empty;
-        for (names.items) |name| {
+        const entries = try a.alloc(Node.AttrSetEntry, names.items.len);
+        for (names.items, entries) |name, *entry| {
             const path = try a.alloc(Node.Atom, 1);
             path[0] = name;
             const expr: *Node = if (source) |src|
                 try self.inheritSourceAttr(src, name)
             else
                 try self.arena.createNode(.identifier, .{ .atom = name });
-            try entries.append(a, .{
+            entry.* = .{
                 .path = path,
                 .expr = expr,
                 .inherit_outer = source == null,
-            });
+            };
         }
-        return .{ .entries = entries };
+        return entries;
     }
 
     fn inheritSourceAttr(self: *Parser, source: *Node, name: Node.Atom) !*Node {

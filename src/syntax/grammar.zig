@@ -4,12 +4,17 @@
 //! driver (`parser.zig`) switches on the action tag to build the AST.
 //!
 //! Structure follows canonical Nix (Bison `parser.y`): an ambiguous
-//! `expr_op OP expr_op` operator layer resolved by precedence, a *stratified*
-//! application/selection layer (juxtaposition), and simple atoms. The one
-//! genuinely non-context-free wrinkle — telling a lambda pattern `{ x }:` from
-//! an attribute set `{ x = 1; }` — is removed before the driver runs: the
-//! pre-pass retags a pattern's opening brace to the synthetic `pattern_lbrace`
-//! terminal, so the grammar sees two distinct tokens and has no conflict.
+//! `expr_op OP expr_op` operator layer resolved by precedence, plus a
+//! *stratified* application/selection layer.
+//!
+//! The one genuinely hard case — telling a lambda pattern `{ x }:` from an
+//! attribute set `{ x = 1; }` — needs lookahead *past* the closing brace, which
+//! LALR(1) cannot do at the brace's contents. Rather than a lexer pre-pass, we
+//! keep the parser pure: `{ ... }` reduces to a single permissive `brace`
+//! nonterminal whose contents (`brace_content`) is the *union* of formals and
+//! bindings. The parser only commits to lambda-vs-attrset one token later —
+//! when it sees (or does not see) the `:`/`@` after `}` — and a small semantic
+//! check validates the contents against the chosen interpretation.
 
 const std = @import("std");
 const lr = @import("lr.zig");
@@ -17,14 +22,13 @@ const tok = @import("token.zig");
 const TokenType = tok.TokenType;
 
 // ---- terminal symbol ids ---------------------------------------------------
-// Real tokens keep their `TokenType` value as their id. Two synthetic
-// terminals follow: `pattern_lbrace` (emitted by the pre-pass) and `neg` (a
-// precedence-only marker for unary minus, never present in the token stream).
+// Real tokens keep their `TokenType` value as their id. One synthetic terminal
+// follows: `neg`, a precedence-only marker for unary minus (never present in
+// the token stream).
 
 pub const num_tokens = @typeInfo(TokenType).@"enum".fields.len;
-pub const t_pattern_lbrace: u32 = num_tokens;
-pub const t_neg: u32 = num_tokens + 1;
-pub const num_terminals: u32 = num_tokens + 2;
+pub const t_neg: u32 = num_tokens;
+pub const num_terminals: u32 = num_tokens + 1;
 pub const t_eof: u32 = @intFromEnum(TokenType.eof);
 
 inline fn t(tt: TokenType) u32 {
@@ -42,10 +46,12 @@ pub const NT = enum(u32) {
     expr_simple,
     attrpath,
     attr,
-    formals,
-    formal_list,
-    formal,
-    binds,
+    brace, // `{ brace_content }` — attrset or lambda formals, decided later
+    brace_content,
+    term_clauses, // comma-/semicolon-terminated clauses (may be followed by more)
+    term_clause,
+    final_clause, // the one trailing clause with no terminator (only before `}`)
+    binds, // bindings for `let` / `rec { }` (formals not allowed there)
     bind,
     inherit_names,
     list_items,
@@ -63,9 +69,9 @@ pub const Act = enum {
 
     // Expr (function level)
     lambda_id, // ID : Expr
-    lambda_no_bind, // PATLBRACE Formals RBRACE : Expr
-    lambda_bind_before, // ID @ PATLBRACE Formals RBRACE : Expr
-    lambda_bind_after, // PATLBRACE Formals RBRACE @ ID : Expr
+    lambda_no_bind, // brace : Expr
+    lambda_bind_before, // ID @ brace : Expr
+    lambda_bind_after, // brace @ ID : Expr
     assert_, // assert Expr ; Expr
     with_, // with Expr ; Expr
     let_in, // let Binds in Expr
@@ -113,7 +119,7 @@ pub const Act = enum {
     bool_false,
     null_lit,
     parens,
-    attr_set, // { Binds }
+    attrset_from_brace, // brace used as an expression → attribute set
     rec_attr_set, // rec { Binds }
     list, // [ ListItems ]
 
@@ -123,18 +129,26 @@ pub const Act = enum {
     attr_static, // ID/STRING/OR/TRUE/FALSE/NULL
     attr_dynamic, // ${ Expr }
 
-    // Formals
-    formals_empty,
-    formals_ellipsis,
-    formals_list,
-    formals_list_comma,
-    formals_list_ellipsis,
-    formal_list_one,
-    formal_list_append,
-    formal_plain,
-    formal_default,
+    // brace / clauses (the unified formals-or-binds body). Clauses split into
+    // "terminated" (end in `,` or `;`, so more may follow) and a single
+    // unterminated "final" clause, which keeps a default's expr from being
+    // followed by another clause's leading token.
+    brace_group, // { brace_content } → clause list
+    brace_empty, // (empty content)
+    bc_final, // brace_content → final_clause
+    bc_terms_final, // brace_content → term_clauses final_clause
+    term_clauses_one,
+    term_clauses_append,
+    tclause_formal_comma, // name ,
+    tclause_formal_default_comma, // name ? expr ,
+    tclause_bind, // attrpath = expr ;
+    tclause_inherit, // inherit names ;
+    tclause_inherit_from, // inherit ( expr ) names ;
+    fclause_formal, // name
+    fclause_formal_default, // name ? expr
+    fclause_ellipsis, // ...
 
-    // Binds
+    // Binds (let / rec)
     binds_empty,
     binds_append,
     bind_normal, // AttrPath = Expr
@@ -162,9 +176,9 @@ const P = struct {
 const productions = [_]P{
     // Expr
     .{ .lhs = .expr, .rhs = &.{ t(.identifier), t(.colon), n(.expr) }, .act = .lambda_id },
-    .{ .lhs = .expr, .rhs = &.{ t_pattern_lbrace, n(.formals), t(.right_brace), t(.colon), n(.expr) }, .act = .lambda_no_bind },
-    .{ .lhs = .expr, .rhs = &.{ t(.identifier), t(.at), t_pattern_lbrace, n(.formals), t(.right_brace), t(.colon), n(.expr) }, .act = .lambda_bind_before },
-    .{ .lhs = .expr, .rhs = &.{ t_pattern_lbrace, n(.formals), t(.right_brace), t(.at), t(.identifier), t(.colon), n(.expr) }, .act = .lambda_bind_after },
+    .{ .lhs = .expr, .rhs = &.{ n(.brace), t(.colon), n(.expr) }, .act = .lambda_no_bind },
+    .{ .lhs = .expr, .rhs = &.{ t(.identifier), t(.at), n(.brace), t(.colon), n(.expr) }, .act = .lambda_bind_before },
+    .{ .lhs = .expr, .rhs = &.{ n(.brace), t(.at), t(.identifier), t(.colon), n(.expr) }, .act = .lambda_bind_after },
     .{ .lhs = .expr, .rhs = &.{ t(.kw_assert), n(.expr), t(.semicolon), n(.expr) }, .act = .assert_ },
     .{ .lhs = .expr, .rhs = &.{ t(.kw_with), n(.expr), t(.semicolon), n(.expr) }, .act = .with_ },
     .{ .lhs = .expr, .rhs = &.{ t(.kw_let), n(.binds), t(.kw_in), n(.expr) }, .act = .let_in },
@@ -217,7 +231,7 @@ const productions = [_]P{
     .{ .lhs = .expr_simple, .rhs = &.{t(.kw_false)}, .act = .bool_false },
     .{ .lhs = .expr_simple, .rhs = &.{t(.kw_null)}, .act = .null_lit },
     .{ .lhs = .expr_simple, .rhs = &.{ t(.left_paren), n(.expr), t(.right_paren) }, .act = .parens },
-    .{ .lhs = .expr_simple, .rhs = &.{ t(.left_brace), n(.binds), t(.right_brace) }, .act = .attr_set },
+    .{ .lhs = .expr_simple, .rhs = &.{n(.brace)}, .act = .attrset_from_brace },
     .{ .lhs = .expr_simple, .rhs = &.{ t(.kw_rec), t(.left_brace), n(.binds), t(.right_brace) }, .act = .rec_attr_set },
     .{ .lhs = .expr_simple, .rhs = &.{ t(.left_bracket), n(.list_items), t(.right_bracket) }, .act = .list },
 
@@ -234,20 +248,30 @@ const productions = [_]P{
     .{ .lhs = .attr, .rhs = &.{t(.kw_null)}, .act = .attr_static },
     .{ .lhs = .attr, .rhs = &.{ t(.dollar_curly), n(.expr), t(.right_brace) }, .act = .attr_dynamic },
 
-    // Formals
-    .{ .lhs = .formals, .rhs = &.{}, .act = .formals_empty },
-    .{ .lhs = .formals, .rhs = &.{t(.ellipsis)}, .act = .formals_ellipsis },
-    .{ .lhs = .formals, .rhs = &.{n(.formal_list)}, .act = .formals_list },
-    .{ .lhs = .formals, .rhs = &.{ n(.formal_list), t(.comma) }, .act = .formals_list_comma },
-    .{ .lhs = .formals, .rhs = &.{ n(.formal_list), t(.comma), t(.ellipsis) }, .act = .formals_list_ellipsis },
-    .{ .lhs = .formal_list, .rhs = &.{n(.formal)}, .act = .formal_list_one },
-    .{ .lhs = .formal_list, .rhs = &.{ n(.formal_list), t(.comma), n(.formal) }, .act = .formal_list_append },
-    .{ .lhs = .formal, .rhs = &.{t(.identifier)}, .act = .formal_plain },
-    .{ .lhs = .formal, .rhs = &.{t(.kw_or)}, .act = .formal_plain },
-    .{ .lhs = .formal, .rhs = &.{ t(.identifier), t(.question_mark), n(.expr) }, .act = .formal_default },
-    .{ .lhs = .formal, .rhs = &.{ t(.kw_or), t(.question_mark), n(.expr) }, .act = .formal_default },
+    // brace: the unified `{ ... }` body
+    .{ .lhs = .brace, .rhs = &.{ t(.left_brace), n(.brace_content), t(.right_brace) }, .act = .brace_group },
+    .{ .lhs = .brace_content, .rhs = &.{}, .act = .brace_empty },
+    .{ .lhs = .brace_content, .rhs = &.{n(.term_clauses)}, .act = .pass },
+    .{ .lhs = .brace_content, .rhs = &.{n(.final_clause)}, .act = .bc_final },
+    .{ .lhs = .brace_content, .rhs = &.{ n(.term_clauses), n(.final_clause) }, .act = .bc_terms_final },
+    .{ .lhs = .term_clauses, .rhs = &.{n(.term_clause)}, .act = .term_clauses_one },
+    .{ .lhs = .term_clauses, .rhs = &.{ n(.term_clauses), n(.term_clause) }, .act = .term_clauses_append },
+    // terminated clauses (formals end in `,`; binds end in `;`)
+    .{ .lhs = .term_clause, .rhs = &.{ t(.identifier), t(.comma) }, .act = .tclause_formal_comma },
+    .{ .lhs = .term_clause, .rhs = &.{ t(.kw_or), t(.comma) }, .act = .tclause_formal_comma },
+    .{ .lhs = .term_clause, .rhs = &.{ t(.identifier), t(.question_mark), n(.expr), t(.comma) }, .act = .tclause_formal_default_comma },
+    .{ .lhs = .term_clause, .rhs = &.{ t(.kw_or), t(.question_mark), n(.expr), t(.comma) }, .act = .tclause_formal_default_comma },
+    .{ .lhs = .term_clause, .rhs = &.{ n(.attrpath), t(.equal), n(.expr), t(.semicolon) }, .act = .tclause_bind },
+    .{ .lhs = .term_clause, .rhs = &.{ t(.kw_inherit), n(.inherit_names), t(.semicolon) }, .act = .tclause_inherit },
+    .{ .lhs = .term_clause, .rhs = &.{ t(.kw_inherit), t(.left_paren), n(.expr), t(.right_paren), n(.inherit_names), t(.semicolon) }, .act = .tclause_inherit_from },
+    // the single unterminated trailing clause (only valid right before `}`)
+    .{ .lhs = .final_clause, .rhs = &.{t(.identifier)}, .act = .fclause_formal },
+    .{ .lhs = .final_clause, .rhs = &.{t(.kw_or)}, .act = .fclause_formal },
+    .{ .lhs = .final_clause, .rhs = &.{ t(.identifier), t(.question_mark), n(.expr) }, .act = .fclause_formal_default },
+    .{ .lhs = .final_clause, .rhs = &.{ t(.kw_or), t(.question_mark), n(.expr) }, .act = .fclause_formal_default },
+    .{ .lhs = .final_clause, .rhs = &.{t(.ellipsis)}, .act = .fclause_ellipsis },
 
-    // Binds
+    // Binds (let / rec) — bindings only, no formals
     .{ .lhs = .binds, .rhs = &.{}, .act = .binds_empty },
     .{ .lhs = .binds, .rhs = &.{ n(.binds), n(.bind), t(.semicolon) }, .act = .binds_append },
     .{ .lhs = .bind, .rhs = &.{ n(.attrpath), t(.equal), n(.expr) }, .act = .bind_normal },
