@@ -280,17 +280,14 @@ const prec = [_]lr.RawPrec{
     .{ .term = t(.less_equal), .level = 6, .assoc = .nonassoc },
     .{ .term = t(.greater), .level = 6, .assoc = .nonassoc },
     .{ .term = t(.greater_equal), .level = 6, .assoc = .nonassoc },
-    // `//` and `++` are associative operations; canonical Nix parses them
-    // right-associative, but the parser this replaces built them
-    // left-associative. We match the incumbent so the compiled bytecode stays
-    // byte-identical (the evaluated result is the same either way).
-    .{ .term = t(.double_slash), .level = 7, .assoc = .left },
+    // Canonical Nix associativity: `//` and `++` are right-associative.
+    .{ .term = t(.double_slash), .level = 7, .assoc = .right },
     .{ .term = t(.bang), .level = 8, .assoc = .left },
     .{ .term = t(.plus), .level = 9, .assoc = .left },
     .{ .term = t(.minus), .level = 9, .assoc = .left },
     .{ .term = t(.star), .level = 10, .assoc = .left },
     .{ .term = t(.slash), .level = 10, .assoc = .left },
-    .{ .term = t(.double_plus), .level = 11, .assoc = .left },
+    .{ .term = t(.double_plus), .level = 11, .assoc = .right },
     .{ .term = t(.question_mark), .level = 12, .assoc = .nonassoc },
     .{ .term = t_neg, .level = 13, .assoc = .right },
 };
