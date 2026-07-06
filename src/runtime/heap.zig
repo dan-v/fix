@@ -1691,6 +1691,16 @@ pub const ObjectHeap = struct {
     /// operands are wrapped in a `merge_attrs` node instead of copied;
     /// small ones and over-deep chains fall back to the eager flat merge.
     pub fn mergeAttrsLayered(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
+        // `{} // x = x` / `x // {} = x`: an empty operand contributes nothing
+        // to the right-biased merge, so return the other id instead of
+        // building a merge node or copying. An empty attrset is always a
+        // plain `.attrs` of range.len 0 (merges of non-empties are never
+        // empty). `{} // x` in the module fixpoint is common — see census.
+        const l = self.getConst(left_id).*;
+        if (l == .attrs and l.attrs.range.len == 0) return right_id;
+        const r = self.getConst(right_id).*;
+        if (r == .attrs and r.attrs.range.len == 0) return left_id;
+
         const next_depth: u16 = switch (self.getConst(left_id).*) {
             .attrs => |a| if (a.range.len < MERGE_LAYER_MIN) 0 else 1,
             .merge_attrs => |m| if (m.depth + 1 > MERGE_FLATTEN_DEPTH) 0 else m.depth + 1,
@@ -1861,7 +1871,14 @@ pub const ObjectHeap = struct {
 
     pub fn addConcatenatedLists(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
         const left = try self.getList(left_id);
+        // `[] ++ x = x` / `x ++ [] = x`: skip allocating a fresh range and
+        // copying (the empty operand contributes nothing). `x ++ []` in
+        // particular avoided copying all of `x`. Lists are immutable, so
+        // returning an operand's id is safe. (A large share of single-use
+        // `++` intermediates have a literal `[]` operand — see struct-census.)
+        if (left.len == 0) return right_id;
         const right = try self.getList(right_id);
+        if (right.len == 0) return left_id;
 
         const range = try self.reserveValuesLocal(@intCast(left.len + right.len));
         const dst = self.values.sliceMut(range);
