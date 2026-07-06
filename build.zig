@@ -248,6 +248,12 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
 
+    // Quick syntax-only tests. The parser imports the build-generated
+    // `parser_tables`, so `zig test src/syntax/parser.zig` can't resolve it on
+    // its own — use this instead for fast iteration on the lexer/parser/AST.
+    const test_syntax_step = b.step("test-syntax", "Run only the syntax (lexer/parser/AST) tests");
+    test_syntax_step.dependOn(&run_syntax_tests.step);
+
     // Parse microbenchmark: `zig build bench -- <file.nix> ...`
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("tools/parse_bench.zig"),

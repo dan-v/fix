@@ -329,11 +329,15 @@ const prec = [_]lr.RawPrec{
 
 const num_nt = @typeInfo(NT).@"enum".fields.len;
 
+/// Eliminate unit productions at comptime. Faster runtime (no chain reductions)
+/// at the cost of a much larger table and slower generation.
+const eliminate_units = true;
+
 fn isUnitPass(p: P) bool {
     return p.act == .pass and p.rhs.len == 1 and p.rhs[0] >= num_terminals;
 }
 
-const expanded = blk: {
+const expanded: []const P = if (!eliminate_units) &productions else blk: {
     @setEvalBranchQuota(10_000_000);
     // reach[a][b]: nonterminal a derives b through a chain of unit rules.
     var reach = [_][num_nt]bool{[_]bool{false} ** num_nt} ** num_nt;

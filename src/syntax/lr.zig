@@ -123,6 +123,14 @@ fn buildAll(comptime g: GrammarDesc) Built {
     const prods = [_]RawProd{.{ .lhs = NN, .rhs = &[_]u32{start_sym} }} ++ g.productions;
     const P = prods.len;
 
+    // Productions grouped by left-hand-side nonterminal, so closure steps
+    // iterate only the relevant rules instead of scanning all P every time.
+    const prods_of = blk: {
+        var lists = [_][]const u32{&[_]u32{}} ** num_nt_total;
+        for (prods, 0..) |p, i| lists[p.lhs] = lists[p.lhs] ++ &[_]u32{@intCast(i)};
+        break :blk lists;
+    };
+
     // ---- helpers over the integer symbol space ----
     const H = struct {
         fn isTerm(s: u32) bool {
@@ -217,61 +225,46 @@ fn buildAll(comptime g: GrammarDesc) Built {
     // ---- LR(0) closure over a kernel item list ----
     const Clo0 = struct {
         fn run(kernel: []const Item) []const Item {
-            var items: []const Item = kernel;
-            var changed = true;
-            while (changed) {
-                changed = false;
-                var i: usize = 0;
-                while (i < items.len) : (i += 1) {
-                    const it = items[i];
-                    const rhs = prods[it.prod].rhs;
-                    if (it.dot >= rhs.len) continue;
-                    const sym = rhs[it.dot];
-                    if (sym < NT) continue; // terminal
-                    const nt = sym - NT;
-                    var p: u32 = 0;
-                    while (p < P) : (p += 1) {
-                        if (prods[p].lhs != nt) continue;
-                        const ni = Item{ .prod = p, .dot = 0 };
-                        var seen = false;
-                        for (items) |x| {
-                            if (x.prod == ni.prod and x.dot == ni.dot) {
-                                seen = true;
-                                break;
-                            }
-                        }
-                        if (!seen) {
-                            items = items ++ &[_]Item{ni};
-                            changed = true;
-                        }
+            // Worklist over a fixed buffer; `seen[p]` tracks whether the closure
+            // item (p, 0) is already present (closure only ever adds dot-0
+            // items), so both the "already there?" check and the rule lookup are
+            // O(1) instead of scanning every item / every production.
+            var buf: [2 * P + 64]Item = undefined;
+            var n: usize = 0;
+            var seen = [_]bool{false} ** P;
+            for (kernel) |it| {
+                buf[n] = it;
+                n += 1;
+                if (it.dot == 0) seen[it.prod] = true;
+            }
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const it = buf[i];
+                const rhs = prods[it.prod].rhs;
+                if (it.dot >= rhs.len) continue;
+                const sym = rhs[it.dot];
+                if (sym < NT) continue; // terminal
+                for (prods_of[sym - NT]) |p| {
+                    if (!seen[p]) {
+                        seen[p] = true;
+                        buf[n] = .{ .prod = p, .dot = 0 };
+                        n += 1;
                     }
                 }
             }
-            return items;
+            var out: [n]Item = undefined;
+            for (buf[0..n], 0..) |it, k| out[k] = it;
+            const frozen = out;
+            return &frozen;
         }
     };
 
-    // GOTO on the LR(0) closure `clos` over symbol `sym`: sorted, unique kernel.
-    const Goto0 = struct {
-        fn run(clos: []const Item, sym: u32) []const Item {
-            var out: []const Item = &[_]Item{};
-            for (clos) |it| {
-                const rhs = prods[it.prod].rhs;
-                if (it.dot >= rhs.len) continue;
-                if (rhs[it.dot] != sym) continue;
-                const ni = Item{ .prod = it.prod, .dot = it.dot + 1 };
-                var seen = false;
-                for (out) |x| {
-                    if (x.prod == ni.prod and x.dot == ni.dot) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) out = out ++ &[_]Item{ni};
-            }
-            // insertion sort by (prod, dot) for canonical kernels
-            var arr: [out.len]Item = undefined;
-            for (out, 0..) |v, ix| arr[ix] = v;
+    // Sort an item list into canonical (prod, dot) order so equal kernels hash
+    // and compare equal regardless of discovery order.
+    const sortKernel = struct {
+        fn run(list: []const Item) []const Item {
+            var arr: [list.len]Item = undefined;
+            for (list, 0..) |v, ix| arr[ix] = v;
             var i: usize = 1;
             while (i < arr.len) : (i += 1) {
                 var j = i;
@@ -288,7 +281,7 @@ fn buildAll(comptime g: GrammarDesc) Built {
             if (a.prod != b.prod) return a.prod < b.prod;
             return a.dot < b.dot;
         }
-    };
+    }.run;
 
     const kernelEq = struct {
         fn eq(a: []const Item, b: []const Item) bool {
@@ -298,32 +291,61 @@ fn buildAll(comptime g: GrammarDesc) Built {
             }
             return true;
         }
-    }.eq;
+        fn hash(k: []const Item) u64 {
+            var h: u64 = 1469598103934665603; // FNV-1a
+            for (k) |it| {
+                h = (h ^ it.prod) *% 1099511628211;
+                h = (h ^ it.dot) *% 1099511628211;
+            }
+            return h;
+        }
+    };
 
     // ---- build the canonical LR(0) collection ----
+    // Kernels are deduplicated through a hash table (`buckets` maps a kernel's
+    // FNV hash to the state indices in that bucket), so finding whether a GOTO
+    // target already exists is O(1) average rather than a scan of every state.
+    const NB = 8192;
+    const NSYM = NT + NN;
     const start_kernel = &[_]Item{.{ .prod = 0, .dot = 0 }};
     var kernels: []const []const Item = &[_][]const Item{start_kernel};
     const Trans = struct { from: u32, sym: u32, to: u32 };
     var trans: []const Trans = &[_]Trans{};
+    var buckets = [_][]const u32{&[_]u32{}} ** NB;
+    buckets[kernelEq.hash(start_kernel) & (NB - 1)] = &[_]u32{0};
 
     {
         var s: usize = 0;
         while (s < kernels.len) : (s += 1) {
             const clos = Clo0.run(kernels[s]);
+            // One pass over the closure: bucket each advanced item by its next
+            // symbol (closure items are distinct, so advanced items are too — no
+            // dedup needed). Replaces NSYM full re-scans of the closure.
+            var g_items = [_][]const Item{&[_]Item{}} ** NSYM;
+            for (clos) |it| {
+                const rhs = prods[it.prod].rhs;
+                if (it.dot >= rhs.len) continue;
+                const sym = rhs[it.dot];
+                g_items[sym] = g_items[sym] ++ &[_]Item{.{ .prod = it.prod, .dot = it.dot + 1 }};
+            }
             var x: u32 = 0;
-            while (x < NT + NN) : (x += 1) { // never GOTO on S'
-                const gk = Goto0.run(clos, x);
-                if (gk.len == 0) continue;
+            while (x < NSYM) : (x += 1) { // never GOTO on S'
+                if (g_items[x].len == 0) continue;
+                const gk = sortKernel(g_items[x]);
+                const h = kernelEq.hash(gk);
+                const b = h & (NB - 1);
                 var target: i64 = -1;
-                for (kernels, 0..) |k, ki| {
-                    if (kernelEq(k, gk)) {
+                for (buckets[b]) |ki| {
+                    if (kernelEq.eq(kernels[ki], gk)) {
                         target = @intCast(ki);
                         break;
                     }
                 }
                 if (target < 0) {
+                    const ni: u32 = @intCast(kernels.len);
                     kernels = kernels ++ &[_][]const Item{gk};
-                    target = @intCast(kernels.len - 1);
+                    buckets[b] = buckets[b] ++ &[_]u32{ni};
+                    target = ni;
                 }
                 trans = trans ++ &[_]Trans{.{ .from = @intCast(s), .sym = x, .to = @intCast(target) }};
             }
@@ -332,13 +354,15 @@ fn buildAll(comptime g: GrammarDesc) Built {
 
     const num_states = kernels.len;
 
-    // transition lookup: transition(state, sym) -> target state or -1
+    // Dense transition table (state,sym) -> target state or -1, for O(1) lookup.
+    const trans_dense = blk: {
+        var td = [_]i32{-1} ** (num_states * NSYM);
+        for (trans) |e| td[e.from * NSYM + e.sym] = @intCast(e.to);
+        break :blk td;
+    };
     const Tr = struct {
-        fn find(t: []const Trans, from: u32, sym: u32) i64 {
-            for (t) |e| {
-                if (e.from == from and e.sym == sym) return e.to;
-            }
-            return -1;
+        fn find(from: u32, sym: u32) i64 {
+            return trans_dense[from * NSYM + sym];
         }
     };
 
@@ -354,11 +378,17 @@ fn buildAll(comptime g: GrammarDesc) Built {
     //      propagation pass and final table construction ----
     const LItem = struct { prod: u32, dot: u32, la: [W]bool };
     const Clo1 = struct {
-        fn run(seeds: []const LItem) []const LItem {
-            var buf: [P + 256]LItem = undefined;
+        // Fills `buf` with the LR(1) closure of `seeds` and returns its length.
+        // The caller owns/reuses `buf`, so there is no per-call result copy.
+        // `pos[p]` = buffer index of the closure item (p, 0), or -1. Closure only
+        // adds dot-0 items, so "find existing" is O(1) and the rule lookup uses
+        // the by-LHS index — both were O(P·n) linear scans.
+        fn run(seeds: []const LItem, buf: *[2 * P + 64]LItem) usize {
             var n: usize = 0;
+            var pos = [_]i32{-1} ** P;
             for (seeds) |it| {
                 buf[n] = it;
+                if (it.dot == 0) pos[it.prod] = @intCast(n);
                 n += 1;
             }
             var changed = true;
@@ -371,27 +401,16 @@ fn buildAll(comptime g: GrammarDesc) Built {
                     if (it.dot >= rhs.len) continue;
                     const sym = rhs[it.dot];
                     if (sym < NT) continue;
-                    const nt = sym - NT;
                     const beta = rhs[it.dot + 1 ..];
                     const fs = FIRST.seq(&first, &nullable, beta, it.la);
-                    var p: u32 = 0;
-                    while (p < P) : (p += 1) {
-                        if (prods[p].lhs != nt) continue;
-                        // find existing (p, 0)
-                        var idx: i64 = -1;
-                        var q: usize = 0;
-                        while (q < n) : (q += 1) {
-                            if (buf[q].prod == p and buf[q].dot == 0) {
-                                idx = @intCast(q);
-                                break;
-                            }
-                        }
-                        if (idx < 0) {
+                    for (prods_of[sym - NT]) |p| {
+                        if (pos[p] < 0) {
                             buf[n] = .{ .prod = p, .dot = 0, .la = fs };
+                            pos[p] = @intCast(n);
                             n += 1;
                             changed = true;
                         } else {
-                            const qi: usize = @intCast(idx);
+                            const qi: usize = @intCast(pos[p]);
                             var a: u32 = 0;
                             while (a < W) : (a += 1) {
                                 if (fs[a] and !buf[qi].la[a]) {
@@ -403,8 +422,7 @@ fn buildAll(comptime g: GrammarDesc) Built {
                     }
                 }
             }
-            const frozen = buf;
-            return frozen[0..n];
+            return n;
         }
     };
 
@@ -419,11 +437,13 @@ fn buildAll(comptime g: GrammarDesc) Built {
     };
 
     // ---- spontaneous lookaheads + propagation links ----
+    // `prop[src]` = the kernel-item ids that `src` propagates lookaheads to
+    // (per-source lists, so building them is O(links) not O(links²) via `++`).
     var la_sets = [_][NT]bool{[_]bool{false} ** NT} ** K;
-    const Link = struct { src: u32, dst: u32 };
-    var links: []const Link = &[_]Link{};
+    var prop = [_][]const u32{&[_]u32{}} ** K;
 
     {
+        var cbuf: [2 * P + 64]LItem = undefined;
         var s: usize = 0;
         while (s < num_states) : (s += 1) {
             var j: usize = 0;
@@ -432,22 +452,22 @@ fn buildAll(comptime g: GrammarDesc) Built {
                 var seed_la = [_]bool{false} ** W;
                 seed_la[HASH] = true;
                 const seeds = [_]LItem{.{ .prod = kit.prod, .dot = kit.dot, .la = seed_la }};
-                const clos = Clo1.run(&seeds);
-                for (clos) |ci| {
+                const nc = Clo1.run(&seeds, &cbuf);
+                const src_id = offset[s] + @as(u32, @intCast(j));
+                for (cbuf[0..nc]) |ci| {
                     const rhs = prods[ci.prod].rhs;
                     if (ci.dot >= rhs.len) continue;
                     const x = rhs[ci.dot];
-                    const t = Tr.find(trans, @intCast(s), x);
+                    const t = Tr.find(@intCast(s), x);
                     if (t < 0) continue;
                     const ts: u32 = @intCast(t);
                     const dst_j = kidx.find(kernels[ts], ci.prod, ci.dot + 1);
                     const dst_id = offset[ts] + dst_j;
-                    const src_id = offset[s] + @as(u32, @intCast(j));
                     var a: u32 = 0;
                     while (a < NT) : (a += 1) {
                         if (ci.la[a]) la_sets[dst_id][a] = true;
                     }
-                    if (ci.la[HASH]) links = links ++ &[_]Link{.{ .src = src_id, .dst = dst_id }};
+                    if (ci.la[HASH]) prop[src_id] = prop[src_id] ++ &[_]u32{dst_id};
                 }
             }
         }
@@ -461,12 +481,15 @@ fn buildAll(comptime g: GrammarDesc) Built {
         var changed = true;
         while (changed) {
             changed = false;
-            for (links) |lk| {
-                var a: u32 = 0;
-                while (a < NT) : (a += 1) {
-                    if (la_sets[lk.src][a] and !la_sets[lk.dst][a]) {
-                        la_sets[lk.dst][a] = true;
-                        changed = true;
+            var src: usize = 0;
+            while (src < K) : (src += 1) {
+                for (prop[src]) |dst| {
+                    var a: u32 = 0;
+                    while (a < NT) : (a += 1) {
+                        if (la_sets[src][a] and !la_sets[dst][a]) {
+                            la_sets[dst][a] = true;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -498,10 +521,11 @@ fn buildAll(comptime g: GrammarDesc) Built {
     var goto_table = [_]i32{-1} ** (num_states * num_nt_total);
 
     {
+        var cbuf: [2 * P + 64]LItem = undefined;
         var s: usize = 0;
         while (s < num_states) : (s += 1) {
             // seed LR(1) closure with kernel items + their propagated lookaheads
-            var seeds: [64]LItem = undefined;
+            var seeds: [256]LItem = undefined;
             var ns: usize = 0;
             var j: usize = 0;
             while (j < kernels[s].len) : (j += 1) {
@@ -512,13 +536,14 @@ fn buildAll(comptime g: GrammarDesc) Built {
                 seeds[ns] = .{ .prod = kernels[s][j].prod, .dot = kernels[s][j].dot, .la = la };
                 ns += 1;
             }
-            const clos = Clo1.run(seeds[0..ns]);
+            const nc = Clo1.run(seeds[0..ns], &cbuf);
+            const clos = cbuf[0..nc];
 
             for (clos) |ci| {
                 const rhs = prods[ci.prod].rhs;
                 if (ci.dot < rhs.len) {
                     const x = rhs[ci.dot];
-                    const t = Tr.find(trans, @intCast(s), x);
+                    const t = Tr.find(@intCast(s), x);
                     if (t < 0) continue;
                     if (x < NT) {
                         setAction(&action, s * NT + x, cell(ACT_SHIFT, @intCast(t)), x, g, Prec.ofProd, Prec.ofTerm, s);
