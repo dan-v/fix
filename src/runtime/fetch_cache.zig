@@ -351,18 +351,56 @@ pub const FetchCache = struct {
         const dot_git = try std.fs.path.join(self.allocator, &.{ repo_path, ".git" });
         defer self.allocator.free(dot_git);
         if (!try files.pathExists(dot_git)) return null;
-        if ((try files.fileType(dot_git)) != .directory) return null;
 
-        const head_path = try std.fs.path.join(self.allocator, &.{ dot_git, "HEAD" });
+        // Resolve the actual git directory. In a normal checkout `.git` is a
+        // directory; in a linked WORKTREE it is a FILE containing
+        // `gitdir: <path-to-worktree-git-dir>` (matching Nix/Lix, which follow
+        // it). HEAD is per-worktree, so read it from the resolved git dir…
+        const git_dir = (try self.resolveGitDir(files, dot_git, repo_path)) orelse return null;
+        defer self.allocator.free(git_dir);
+        // …but branches (refs) are SHARED across worktrees — they live in the
+        // common dir (`<git_dir>/commondir` → the main `.git`).
+        const common_dir = try self.resolveGitCommonDir(files, git_dir);
+        defer self.allocator.free(common_dir);
+
+        const head_path = try std.fs.path.join(self.allocator, &.{ git_dir, "HEAD" });
         defer self.allocator.free(head_path);
         const head = std.mem.trim(u8, files.readFile(head_path) catch return null, " \t\r\n");
         if (std.mem.startsWith(u8, head, "ref:")) {
             const ref_name = std.mem.trim(u8, head[4..], " \t\r\n");
-            if (try self.readGitRef(files, dot_git, ref_name)) |rev| return rev;
-            return self.readPackedGitRef(files, dot_git, ref_name);
+            if (try self.readGitRef(files, common_dir, ref_name)) |rev| return rev;
+            return self.readPackedGitRef(files, common_dir, ref_name);
         }
         if (head.len == 0) return null;
         return try self.allocator.dupe(u8, head);
+    }
+
+    /// The real git directory for `dot_git` (= `<repo>/.git`). A directory is
+    /// returned as-is; a worktree's `.git` file (`gitdir: <path>`) is followed
+    /// (path resolved relative to the repo when not absolute). Caller owns the
+    /// result. Null when `.git` is neither a usable dir nor a gitdir pointer.
+    fn resolveGitDir(self: *FetchCache, files: *FileCache, dot_git: []const u8, repo_path: []const u8) !?[]u8 {
+        if ((try files.fileType(dot_git)) == .directory) return try self.allocator.dupe(u8, dot_git);
+        const contents = std.mem.trim(u8, files.readFile(dot_git) catch return null, " \t\r\n");
+        const prefix = "gitdir:";
+        if (!std.mem.startsWith(u8, contents, prefix)) return null;
+        const target = std.mem.trim(u8, contents[prefix.len..], " \t\r\n");
+        if (target.len == 0) return null;
+        if (std.fs.path.isAbsolute(target)) return try self.allocator.dupe(u8, target);
+        return try std.fs.path.join(self.allocator, &.{ repo_path, target });
+    }
+
+    /// The common git directory holding shared refs (`packed-refs`,
+    /// `refs/heads/*`). For a linked worktree `<git_dir>/commondir` points at
+    /// the main `.git`; otherwise the git dir is its own common dir. Caller
+    /// owns the result.
+    fn resolveGitCommonDir(self: *FetchCache, files: *FileCache, git_dir: []const u8) ![]u8 {
+        const cd_path = try std.fs.path.join(self.allocator, &.{ git_dir, "commondir" });
+        defer self.allocator.free(cd_path);
+        const contents = std.mem.trim(u8, files.readFile(cd_path) catch return try self.allocator.dupe(u8, git_dir), " \t\r\n");
+        if (contents.len == 0) return try self.allocator.dupe(u8, git_dir);
+        if (std.fs.path.isAbsolute(contents)) return try self.allocator.dupe(u8, contents);
+        return try std.fs.path.join(self.allocator, &.{ git_dir, contents });
     }
 
     fn readGitRef(self: *FetchCache, files: *FileCache, dot_git: []const u8, ref_name: []const u8) !?[]u8 {
