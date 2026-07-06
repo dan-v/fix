@@ -735,6 +735,14 @@ pub const ObjectHeap = struct {
 
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         const local = self.currentLocal();
+        // NON-MOVING reuse: a swept dead range of exactly `n` is reused in
+        // place before touching the bump cursor. Ranges never relocate, so the
+        // returned slice is stable across forces (no re-fetch needed).
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled) {
+                if (local.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            }
+        }
         return self.reserveRangeLocal(ValueStore, &self.values, &local.value, VALUE_CHUNK_SIZE, n);
     }
 
@@ -775,11 +783,21 @@ pub const ObjectHeap = struct {
 
     fn reserveAttrsLocal(self: *ObjectHeap, n: u32) !AttrRange {
         const local = self.currentLocal();
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled) {
+                if (local.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            }
+        }
         return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, ATTR_CHUNK_SIZE, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
         const local = self.currentLocal();
+        if (comptime build_options.gc) {
+            if (self.gc_collect_enabled) {
+                if (local.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+            }
+        }
         return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
     }
 
@@ -790,7 +808,10 @@ pub const ObjectHeap = struct {
     /// safepoint) is small because forces are frequent.
     inline fn gcNurseryFull(self: *ObjectHeap) void {
         if (comptime !build_options.gc) return;
-        self.gc_collect_requested = true;
+        // NON-MOVING: request a collect only once reserved bytes cross the
+        // threshold (re-armed to cursor+headroom after each collect). Called
+        // frequently (every young-full TLAB refill), so it polls the threshold.
+        if (self.totalReservedBytes() >= self.gc_threshold_bytes) self.gc_collect_requested = true;
     }
 
     /// Register the collect callback (no-op in non-`-Dgc` builds). Fired at
@@ -868,11 +889,11 @@ pub const ObjectHeap = struct {
     // --- GC reclaim (`-Dgc`, single-threaded for now) ---
 
     /// Floor on the collection threshold.
-    pub const GC_MIN_THRESHOLD: u64 = 64 << 20;
+    pub const GC_MIN_THRESHOLD: u64 = 256 << 20;
     /// Headroom of genuinely-fresh committed pages between collections
     /// (additive, anchored to the cursor at last collect — see
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
-    pub const GC_HEADROOM: u64 = 32 << 20;
+    pub const GC_HEADROOM: u64 = 256 << 20;
 
     /// Validation knob (`FIX_GC_STEP_MB`, `-Dgc` only): when > 0, collect
     /// every this-many MB of fresh allocation instead of the normal additive-
@@ -897,12 +918,12 @@ pub const ObjectHeap = struct {
         if (comptime !build_options.gc) return;
         self.gc_collect_enabled = true;
         gc_step_bytes = step_bytes;
-        // The copying nursery drives collection off nursery-full (see
-        // `gcNurseryFull`), not the old byte threshold — disable the latter so
-        // the legacy mark-sweep trigger never fires. (`initial_threshold` /
-        // `step_bytes` are retained for the report/A-B knobs.)
-        _ = initial_threshold;
-        self.gc_threshold_bytes = std.math.maxInt(u64);
+        // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
+        // in place; there is no nursery to fill/reset). `gcNurseryFull` now only
+        // requests a collect once the cursor has grown a headroom past the last
+        // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
+        // every TLAB refill.
+        self.gc_threshold_bytes = initial_threshold;
         self.gc_track_from = self.objects.count();
         // Flush each worker's TLABs so the first post-enable allocation refills
         // fresh instead of draining a leftover chunk carried over from bootstrap.
@@ -1282,8 +1303,9 @@ pub const ObjectHeap = struct {
             self.gcEvacListInto(local.gc_young_slots.items, dst, mark_bits, &st);
             local.gc_young_slots.clearRetainingCapacity();
         }
-        if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
-        self.gcResetNursery();
+        // NON-MOVING: do NOT reset the nursery — survivor ranges stay in place
+        // (they were not evacuated), and dead ranges were returned to the free
+        // lists individually above. Resetting would discard the live survivors.
         return st;
     }
 
@@ -1300,13 +1322,17 @@ pub const ObjectHeap = struct {
             const bit = @as(u64, 1) << @intCast(id & 63);
             const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
             if (marked) {
-                self.gcEvacuateObject(dst, id);
-                self.gcSetOld(id); // promote (bit-flip; slot id unchanged)
+                // NON-MOVING: promote in place — the object's ranges stay put
+                // (no evacuation), so no `gc_debug` re-fetch discipline and no
+                // relocation. Just flip the generation bit; the id is unchanged.
+                self.gcSetOld(id);
                 st.promoted += 1;
             } else {
-                // Detector leaks dead ids (no reuse) + clears the alloc bit so a
-                // dangling read traps (atomic — parallel evac shares the word);
-                // release recycles the id into the processing worker's shard.
+                // Dead: return its ranges to the free lists IN PLACE (reused by
+                // the next allocation) and recycle its slot id. The detector
+                // leaks the id (no reuse) + clears the alloc bit atomically so a
+                // dangling read traps; `gcFreeObjectRanges` poisons the ranges.
+                self.gcFreeObjectRanges(dst, self.objects.get(id));
                 if (comptime gc_debug) {
                     if (word < self.gc_alloc_bits.len) _ = @atomicRmw(u64, &self.gc_alloc_bits[word], .And, ~bit, .monotonic);
                 } else {
@@ -1382,8 +1408,9 @@ pub const ObjectHeap = struct {
     /// Collector: post-evac finish (all lists drained). Verify + reset nursery.
     pub fn gcFinishEvac(self: *ObjectHeap) MinorStats {
         if (comptime !build_options.gc) return .{};
-        if (comptime gc_debug) self.gcVerifyNoYoungRangesInOld();
-        self.gcResetNursery();
+        // NON-MOVING: survivors were promoted in place (not evacuated) and dead
+        // ranges freed to the free lists individually — do NOT reset the
+        // nursery (that would discard the live survivors' ranges).
         return .{ .promoted = self.gc_evac_promoted.load(.monotonic), .freed = self.gc_evac_freed.load(.monotonic) };
     }
 
