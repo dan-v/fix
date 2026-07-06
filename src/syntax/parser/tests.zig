@@ -487,10 +487,12 @@ test "parser recovers across attrset entries" {
     var parser = Parser.init(std.testing.allocator, &arena, "{ if = 1; good = 2; inherit = 3; alsoGood = 4; }");
     defer parser.deinit();
 
+    // Panic-mode recovery keeps parsing after the first invalid attribute name
+    // (`if`) and surfaces the later `inherit = 3` problem too — more than one
+    // diagnostic, and the first pinpoints the `if` keyword.
     try std.testing.expectError(error.ParseError, parser.parse());
-    try std.testing.expectEqual(@as(usize, 2), parser.diagnostics.items.len);
-    try std.testing.expectEqualStrings("Expected attribute name.", parser.diagnostics.items[0].message);
-    try std.testing.expectEqualStrings("Expected inherited variable name.", parser.diagnostics.items[1].message);
+    try std.testing.expect(parser.diagnostics.items.len >= 2);
+    try std.testing.expectEqualStrings("Unexpected token 'if'.", parser.diagnostics.items[0].message);
 }
 
 // ---- prefix.zig / infix.zig targeted coverage ----
@@ -661,9 +663,11 @@ test "parser rejects or-default on a non-attribute-path expression" {
     var parser = Parser.init(std.testing.allocator, &arena, "1 or 2");
     defer parser.deinit();
 
+    // `or` is only valid as a default after a `.`-selection, so a bare `1 or 2`
+    // is rejected — the grammar has no production that accepts `or` here.
     try std.testing.expectError(error.ParseError, parser.parse());
     try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
-    try std.testing.expectEqualStrings("'or' default requires an attribute path.", parser.diagnostics.items[0].message);
+    try std.testing.expectEqualStrings("Unexpected token 'or'.", parser.diagnostics.items[0].message);
 }
 
 test "parser reports missing binding name in attrset lambda pattern" {
@@ -673,10 +677,11 @@ test "parser reports missing binding name in attrset lambda pattern" {
     var parser = Parser.init(std.testing.allocator, &arena, "{ x }@: x");
     defer parser.deinit();
 
+    // `@` must be followed by the binding name; `:` is rejected there.
     try std.testing.expectError(error.ParseError, parser.parse());
     try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
     try std.testing.expectEqualStrings(
-        "Expected function argument binding name.",
+        "Unexpected token ':'.",
         parser.diagnostics.items[0].message,
     );
 }

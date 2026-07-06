@@ -60,6 +60,26 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
 
+    // The LALR parser tables are expensive to construct at comptime, so a
+    // standalone codegen tool builds them once (cached by the build system;
+    // only rebuilt when the grammar or generator changes) and emits a plain
+    // `.zig` of literal arrays. The `syntax` module imports it as
+    // `@import("parser_tables")`, keeping the cost off every ordinary rebuild.
+    const gen_tables_exe = b.addExecutable(.{
+        .name = "gen-parser-tables",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/syntax/gen_parser_tables.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+        .use_llvm = true,
+    });
+    const run_gen_tables = b.addRunArtifact(gen_tables_exe);
+    const parser_tables_path = run_gen_tables.addOutputFileArg("parser_tables.zig");
+    syntax_mod.addAnonymousImport("parser_tables", .{ .root_source_file = parser_tables_path });
+    const gen_tables_step = b.step("gen-parser-tables", "Regenerate the LALR parser tables");
+    gen_tables_step.dependOn(&run_gen_tables.step);
+
     const containers_mod = b.addModule("containers", .{
         .root_source_file = b.path("src/containers.zig"),
         .target = target,
@@ -229,6 +249,25 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
+
+    // Quick syntax-only tests. The parser imports the build-generated
+    // `parser_tables`, so `zig test src/syntax/parser.zig` can't resolve it on
+    // its own — use this instead for fast iteration on the lexer/parser/AST.
+    const test_syntax_step = b.step("test-syntax", "Run only the syntax (lexer/parser/AST) tests");
+    test_syntax_step.dependOn(&run_syntax_tests.step);
+
+    // Parse microbenchmark: `zig build bench -- <file.nix> ...`
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/parse_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("syntax", syntax_mod);
+    const bench_exe = b.addExecutable(.{ .name = "parse-bench", .root_module = bench_mod, .use_llvm = true });
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Parse microbenchmark");
+    bench_step.dependOn(&run_bench.step);
 }
 
 const SharedImports = struct {

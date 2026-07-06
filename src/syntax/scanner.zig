@@ -8,6 +8,34 @@ const string_syntax = @import("string_syntax.zig");
 const TokenType = token.TokenType;
 const Token = token.Token;
 
+// Branchless character classification: one table lookup + mask instead of a
+// chain of range comparisons, run once per source byte in the identifier /
+// number / path scanning loops.
+const C_IDENT_START: u8 = 1; // a-z A-Z _
+const C_DIGIT: u8 = 2; // 0-9
+const C_IDENT_CONT: u8 = 4; // ident-start, digit, '-', '\'', '_'
+const C_PATH_CONT: u8 = 8; // ident, digit, '/', '.', '-', '_', '+'
+
+const class_table = blk: {
+    var tbl = [_]u8{0} ** 256;
+    for (0..256) |ci| {
+        const c: u8 = @intCast(ci);
+        const alpha = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+        const digit = c >= '0' and c <= '9';
+        var f: u8 = 0;
+        if (alpha) f |= C_IDENT_START;
+        if (digit) f |= C_DIGIT;
+        if (alpha or digit or c == '-' or c == '\'' or c == '_') f |= C_IDENT_CONT;
+        if (alpha or digit or c == '/' or c == '.' or c == '-' or c == '_' or c == '+') f |= C_PATH_CONT;
+        tbl[ci] = f;
+    }
+    break :blk tbl;
+};
+
+inline fn hasClass(c: u8, mask: u8) bool {
+    return class_table[c] & mask != 0;
+}
+
 pub const Scanner = struct {
     source: []const u8,
     pos: u32,
@@ -168,9 +196,7 @@ pub const Scanner = struct {
     }
 
     fn lexIdentOrKeyword(self: *Scanner, start: u32) Token {
-        while (self.pos < self.source.len) {
-            const c = self.source[self.pos];
-            if (!isAlpha(c) and !isDigit(c) and c != '-' and c != '\'' and c != '_') break;
+        while (self.pos < self.source.len and hasClass(self.source[self.pos], C_IDENT_CONT)) {
             self.pos += 1;
         }
         const len = self.pos - start;
@@ -257,43 +283,39 @@ pub const Scanner = struct {
     }
 
     fn isAlpha(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+        return hasClass(c, C_IDENT_START);
     }
 
     fn isDigit(c: u8) bool {
-        return c >= '0' and c <= '9';
+        return hasClass(c, C_DIGIT);
     }
 
     fn isPathContinue(c: u8) bool {
-        return isAlpha(c) or isDigit(c) or c == '/' or c == '.' or c == '-' or c == '_' or c == '+';
+        return hasClass(c, C_PATH_CONT);
     }
 
     fn isSearchPathStart(c: u8) bool {
-        return isAlpha(c) or c == '.' or c == '_' or c == '-';
+        return hasClass(c, C_IDENT_START) or c == '.' or c == '-';
     }
 
     fn isSearchPathContinue(c: u8) bool {
-        return isPathContinue(c);
+        return hasClass(c, C_PATH_CONT);
     }
 
+    // Keyword lookup: dispatch on length (a jump table) then compare the few
+    // candidates of that length. Non-keyword identifiers — the common case —
+    // fall straight through, and long identifiers match no length bucket at all.
     fn keywordType(s: []const u8) TokenType {
-        // Static lookup using a comptime map.
-        const mapping = std.StaticStringMap(TokenType).initComptime(.{
-            .{ "if", .kw_if },
-            .{ "then", .kw_then },
-            .{ "else", .kw_else },
-            .{ "assert", .kw_assert },
-            .{ "with", .kw_with },
-            .{ "let", .kw_let },
-            .{ "in", .kw_in },
-            .{ "rec", .kw_rec },
-            .{ "inherit", .kw_inherit },
-            .{ "or", .kw_or },
-            .{ "true", .kw_true },
-            .{ "false", .kw_false },
-            .{ "null", .kw_null },
-        });
-        return mapping.get(s) orelse .identifier;
+        const eql = std.mem.eql;
+        return switch (s.len) {
+            2 => if (eql(u8, s, "if")) .kw_if else if (eql(u8, s, "in")) .kw_in else if (eql(u8, s, "or")) .kw_or else .identifier,
+            3 => if (eql(u8, s, "let")) .kw_let else if (eql(u8, s, "rec")) .kw_rec else .identifier,
+            4 => if (eql(u8, s, "then")) .kw_then else if (eql(u8, s, "else")) .kw_else else if (eql(u8, s, "with")) .kw_with else if (eql(u8, s, "true")) .kw_true else if (eql(u8, s, "null")) .kw_null else .identifier,
+            5 => if (eql(u8, s, "false")) .kw_false else .identifier,
+            6 => if (eql(u8, s, "assert")) .kw_assert else .identifier,
+            7 => if (eql(u8, s, "inherit")) .kw_inherit else .identifier,
+            else => .identifier,
+        };
     }
 };
 
