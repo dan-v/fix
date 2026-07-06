@@ -23,10 +23,7 @@ const usage =
     \\
 ;
 
-const SourceArg = union(enum) {
-    expr: []const u8,
-    file: []const u8,
-};
+const SourceArg = @import("args.zig").SourceArg;
 
 const Options = struct {
     source: ?SourceArg = null,
