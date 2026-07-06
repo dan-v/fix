@@ -63,11 +63,14 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
-    /// Speculation (eager background thunk forcing) is OPT-IN: it is the
-    /// dominant source of young garbage and RSS, so it defaults OFF and the
-    /// GC nursery mostly sees real work. `--speculate` turns it on for maximum
-    /// parallelism at the cost of higher RSS / GC pressure.
-    disable_spec_thunks: bool = true,
+    /// Speculation (eager background thunk forcing) is ON by default: it is
+    /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
+    /// 2.10→1.43s without), and the RSS it costs is absorbed by the GC without
+    /// thrashing (3→9 minor collections, +70ms mark — measured, see
+    /// docs/plans/inlining-demand-compilation.md era). `--no-spec-thunks` opts
+    /// out (bounds RSS at the cost of that wall); it was the pre-2026-07
+    /// default when RSS was over-weighted vs the measured GC cost.
+    disable_spec_thunks: bool = false,
     disable_fanout: bool = false,
     print_sched_stats: bool = false,
     timeline_path: ?[]const u8 = null,
