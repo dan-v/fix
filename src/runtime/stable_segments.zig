@@ -312,6 +312,50 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return globalIdOf(range.segment, range.offset);
         }
 
+        /// Lock-free single-slot append: reserve a slot by CAS-bumping the
+        /// cursor (no `write_mu`), ensure its segment exists via a CAS-alloc,
+        /// then write the value. Lets many workers register concurrently
+        /// without serializing on the writer mutex — the compile hot path
+        /// (ChunkRegistry.register) registers ~700K chunks. `count()` stays
+        /// accurate (each reserved slot is written by its own call before the
+        /// id escapes); a reserved-but-unwritten slot is transient and only
+        /// observable by a full-store scan, which never races registration
+        /// (scans run at teardown / STW / after eval). NOT for the nursery
+        /// variant — asserts no nursery is active.
+        pub fn appendAtomic(self: *Self, allocator: std.mem.Allocator, value: T) !u32 {
+            std.debug.assert(self.nursery_segs == 0);
+            while (true) {
+                const cur = self.cursor.load(.acquire);
+                const seg = segmentOf(cur);
+                const used = usedOf(cur);
+                const cap = segmentCapacity(seg);
+                if (used >= cap) {
+                    if (seg + 1 >= SEGMENT_COUNT) return error.OutOfMemory;
+                    // Advance to the next segment; whoever wins the CAS moves
+                    // the cursor, everyone retries and reserves in the new one.
+                    _ = self.cursor.cmpxchgWeak(cur, packCursor(seg + 1, 0), .acq_rel, .monotonic);
+                    continue;
+                }
+                if (self.cursor.cmpxchgWeak(cur, packCursor(seg, used + 1), .acq_rel, .monotonic) != null) continue;
+                // Won slot (seg, used). Ensure the segment is allocated, then write.
+                try self.ensureSegmentAtomic(allocator, seg);
+                const slot = self.segments[seg].load(.acquire).?;
+                slot[used] = value;
+                return globalIdOf(seg, used);
+            }
+        }
+
+        /// Allocate `segment`'s backing buffer if absent, racing-safe: the CAS
+        /// loser frees its buffer and uses the winner's.
+        fn ensureSegmentAtomic(self: *Self, allocator: std.mem.Allocator, segment: u32) !void {
+            if (self.segments[segment].load(.acquire) != null) return;
+            const cap = segmentCapacity(segment);
+            const buf = try allocator.alloc(T, cap);
+            if (self.segments[segment].cmpxchgStrong(null, buf.ptr, .acq_rel, .acquire) != null) {
+                allocator.free(buf);
+            }
+        }
+
         /// Rollback the most recently reserved range. UB if `range` is not the
         /// tail of allocations — call sites should `errdefer` immediately
         /// after a reserve.

@@ -669,7 +669,10 @@ pub const ChunkRegistry = struct {
                 }
             }
         }
-        return try self.chunks.append(self.allocator, stored);
+        // Lock-free registration: many workers compile (deferred bodies +
+        // speculative imports) concurrently; the writer-mutex append serialized
+        // them per-chunk. `appendAtomic` CAS-bumps the cursor instead.
+        return try self.chunks.appendAtomic(self.allocator, stored);
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
