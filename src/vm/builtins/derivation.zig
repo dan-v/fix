@@ -31,20 +31,7 @@ const sourcePathStringValue = strings.sourcePathStringValue;
 const stringTextInternId = strings.stringTextInternId;
 const sortedAttrEntries = collections.sortedAttrEntries;
 
-const SeenJsonKind = enum { list, attrs };
-
-const SeenJsonObject = struct {
-    kind: SeenJsonKind,
-    id: ObjectId,
-};
-
-fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !bool {
-    for (seen.items) |item| {
-        if (item.kind == kind and item.id == id) return false;
-    }
-    try seen.append(self.allocator, .{ .kind = kind, .id = id });
-    return true;
-}
+const SeenJsonObject = shared.SeenJsonObject;
 
 pub const DerivationMode = enum { lazy, strict };
 
@@ -558,7 +545,7 @@ fn appendStructuredJsonValue(
         },
         .list => {
             const list_id = forced.asObjectId();
-            if (!try enterJsonObject(self, .list, list_id, seen)) return error.RecursiveThunk;
+            if (!try shared.enterJsonObject(self, .list, list_id, seen)) return error.RecursiveThunk;
             defer _ = seen.pop();
 
             try out.append(self.allocator, '[');
@@ -578,7 +565,7 @@ fn appendStructuredJsonValue(
             }
 
             const attrs_id = forced.asObjectId();
-            if (!try enterJsonObject(self, .attrs, attrs_id, seen)) return error.RecursiveThunk;
+            if (!try shared.enterJsonObject(self, .attrs, attrs_id, seen)) return error.RecursiveThunk;
             defer _ = seen.pop();
 
             try out.append(self.allocator, '{');

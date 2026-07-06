@@ -9,6 +9,7 @@ const regex = @import("runtime").regex;
 const toml = @import("runtime").toml;
 const FutureState = @import("runtime").thunk.FutureState;
 const collections = @import("collections.zig");
+const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
@@ -61,12 +62,7 @@ fn writeJsonValueWithPathMode(
     try writeJsonValueInner(self, writer, value, &seen, path_mode, context);
 }
 
-const SeenJsonKind = enum { list, attrs };
-
-const SeenJsonObject = struct {
-    kind: SeenJsonKind,
-    id: ObjectId,
-};
+const SeenJsonObject = shared.SeenJsonObject;
 
 fn writeJsonValueInner(
     self: anytype,
@@ -167,7 +163,7 @@ fn writeJsonList(
     path_mode: JsonPathMode,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
-    if (!try enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
+    if (!try shared.enterJsonObject(self, .list, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
     // GC: `id` is a bare list id whose element slice is force-walked below; keep
@@ -195,7 +191,7 @@ fn writeJsonAttrs(
     path_mode: JsonPathMode,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
-    if (!try enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
+    if (!try shared.enterJsonObject(self, .attrs, id, seen)) return error.RecursiveThunk;
     defer _ = seen.pop();
 
     // GC: `sorted` is a private copy of the attr entries whose values reference
@@ -216,14 +212,6 @@ fn writeJsonAttrs(
         try writeJsonValueInner(self, writer, entry.value, seen, path_mode, context);
     }
     try writer.writeByte('}');
-}
-
-fn enterJsonObject(self: anytype, kind: SeenJsonKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenJsonObject)) !bool {
-    for (seen.items) |item| {
-        if (item.kind == kind and item.id == id) return false;
-    }
-    try seen.append(self.allocator, .{ .kind = kind, .id = id });
-    return true;
 }
 
 pub fn builtinToXML(self: anytype, arg: Value) !Value {
