@@ -52,19 +52,46 @@ const ChunkStrictness = chunk_mod.ChunkStrictness;
 const NameSet = std.AutoHashMapUnmanaged(InternId, void);
 
 const Strictness = struct {
+    /// May-force shallow set: names forced on *some* path as the expr is
+    /// reduced to WHNF. Superset of `shallow_must`.
     shallow: NameSet,
+    /// May-force deep set (superset of `shallow`): additionally forced
+    /// when the result is deep-forced. Always may-mode — no consumer needs
+    /// a must-force deep variant.
     deep: NameSet,
+    /// Must-force shallow set: names forced on *every* path before any
+    /// other observable effect (sound under-approximation). Differs from
+    /// `shallow` only at `assert` (body may be skipped) and `with` (scope
+    /// forced lazily). By construction `shallow_must ⊆ shallow`. Computed
+    /// alongside `shallow` in one walk so the eager-submit and eager-elision
+    /// analyses no longer need separate AST traversals.
+    shallow_must: NameSet,
 
     fn empty() Strictness {
-        return .{ .shallow = .empty, .deep = .empty };
+        return .{ .shallow = .empty, .deep = .empty, .shallow_must = .empty };
     }
 
     fn deinit(self: *Strictness, allocator: std.mem.Allocator) void {
         self.shallow.deinit(allocator);
         self.deep.deinit(allocator);
+        self.shallow_must.deinit(allocator);
     }
 
     fn unionInto(self: *Strictness, allocator: std.mem.Allocator, other: *const Strictness) !void {
+        var it = other.shallow.iterator();
+        while (it.next()) |e| try self.shallow.put(allocator, e.key_ptr.*, {});
+        var it2 = other.deep.iterator();
+        while (it2.next()) |e| try self.deep.put(allocator, e.key_ptr.*, {});
+        var it3 = other.shallow_must.iterator();
+        while (it3.next()) |e| try self.shallow_must.put(allocator, e.key_ptr.*, {});
+    }
+
+    /// Union `other` in a *may-only* context: its may-force names count
+    /// (they're reached on some path) but not its must-force names — used
+    /// for the conditionally-run child of `assert` (body) and the lazily-
+    /// forced child of `with` (scope), which must NOT contribute to our
+    /// must-force set.
+    fn unionMayOnly(self: *Strictness, allocator: std.mem.Allocator, other: *const Strictness) !void {
         var it = other.shallow.iterator();
         while (it.next()) |e| try self.shallow.put(allocator, e.key_ptr.*, {});
         var it2 = other.deep.iterator();
@@ -97,14 +124,6 @@ const Analyzer = struct {
     intern: *InternTable,
     source: []const u8,
     bound_stack: std.ArrayListUnmanaged(BoundFrame),
-    /// When true, `shallow` is a sound *must-force* under-approximation
-    /// (a name is included only if it is forced on every path, before
-    /// any other observable effect). Differs from the default may-force
-    /// set only at `assert` (body may be skipped if the assertion
-    /// fails) and `with` (the scope expr is forced lazily). Used by
-    /// `analyzeLetMustForce` to drive eager-binding elision, where
-    /// being wrong would force a value lazy eval wouldn't.
-    must_force: bool = false,
 
     fn deinit(self: *Analyzer) void {
         for (self.bound_stack.items) |*frame| {
@@ -162,8 +181,11 @@ const Analyzer = struct {
                         try out.unionInto(self.allocator, rhs);
                     }
                 } else {
+                    // A free identifier is forced unconditionally on every
+                    // path — it's in all three sets.
                     try out.shallow.put(self.allocator, name_id, {});
                     try out.deep.put(self.allocator, name_id, {});
+                    try out.shallow_must.put(self.allocator, name_id, {});
                 }
             },
 
@@ -231,6 +253,8 @@ const Analyzer = struct {
                 defer then_s.deinit(self.allocator);
                 var else_s = try self.analyze(i.else_branch);
                 defer else_s.deinit(self.allocator);
+                // A name is forced by the `if` only if BOTH branches force
+                // it — intersect per-branch, independently for each set.
                 var it = then_s.shallow.iterator();
                 while (it.next()) |entry| {
                     if (else_s.shallow.contains(entry.key_ptr.*)) {
@@ -243,22 +267,32 @@ const Analyzer = struct {
                         try out.deep.put(self.allocator, entry.key_ptr.*, {});
                     }
                 }
+                var it_must = then_s.shallow_must.iterator();
+                while (it_must.next()) |entry| {
+                    if (else_s.shallow_must.contains(entry.key_ptr.*)) {
+                        try out.shallow_must.put(self.allocator, entry.key_ptr.*, {});
+                    }
+                }
             },
 
             .assert => {
                 const a = node.data.assert;
                 try self.analyzeInto(a.cond, out);
-                // The body runs only if the assertion passes, so under
-                // must-force we can't promise its names are forced.
-                if (!self.must_force) try self.analyzeInto(a.body, out);
+                // The body runs only if the assertion passes, so its names
+                // are may-forced but NOT must-forced.
+                var body_s = try self.analyze(a.body);
+                defer body_s.deinit(self.allocator);
+                try out.unionMayOnly(self.allocator, &body_s);
             },
 
             .with_expr => {
                 const w = node.data.with_expr;
                 // The scope expr is forced lazily (only when the body
-                // resolves a name through it), so exclude it under
-                // must-force. The body always runs.
-                if (!self.must_force) try self.analyzeInto(w.attr_set, out);
+                // resolves a name through it) → may-force only. The body
+                // always runs → full contribution.
+                var scope_s = try self.analyze(w.attr_set);
+                defer scope_s.deinit(self.allocator);
+                try out.unionMayOnly(self.allocator, &scope_s);
                 try self.analyzeInto(w.body, out);
             },
 
@@ -330,77 +364,57 @@ pub fn analyzeChunkBody(
     for (params) |p| {
         _ = strict.shallow.remove(p);
         _ = strict.deep.remove(p);
+        _ = strict.shallow_must.remove(p);
     }
 
     return .{ .strict = strict, .allocator = allocator };
 }
 
-/// For each binding name, decide whether the let-block's body will
-/// unconditionally force it. Used by `compileLetIn` to emit
-/// `thunk_captures_eager` for those bindings — they get submitted to
-/// the urgent scheduler queue at creation instead of waiting for the
-/// chunk-size speculation heuristic.
+/// For each binding name, decide in ONE walk of the let body:
+///   - `out_eager[i]`       — the body *may* force it (shallow may-force
+///                            set). Drives the `thunk_captures_eager`
+///                            submit hint: helpers race the binding ahead
+///                            of demand instead of waiting for the
+///                            chunk-size speculation heuristic.
+///   - `out_must_force[i]`  — the body forces it on *every* path before any
+///                            observable effect (sound must-force set).
+///                            Drives eager elision: such a binding is
+///                            evaluated straight into its slot with no
+///                            thunk, safe because lazy eval would force it
+///                            anyway (can't turn a success into an error,
+///                            only reorder which error surfaces).
 ///
-/// Analyzes `body` with an empty bound_stack so binding names appear
-/// as free identifiers in the strict set. Inner scopes (nested lets,
-/// lambdas) correctly shadow via the analyzer's bound_stack
-/// management, so a shadowed outer name doesn't get a false positive.
-pub fn analyzeLetEagerness(
+/// Replaces the former separate `analyzeLetEagerness` + `analyzeLetMustForce`
+/// walks: the may-force and must-force sets are computed together (they
+/// differ only at `assert`/`with`), so one traversal yields both. Analyzes
+/// `body` with an empty bound_stack so binding names appear as free
+/// identifiers; inner scopes (nested lets, lambdas) correctly shadow via
+/// the analyzer's bound_stack management.
+pub fn analyzeLetBindings(
     allocator: std.mem.Allocator,
     intern: *InternTable,
     source: []const u8,
     body: *const Node,
     binding_names: []const InternId,
     out_eager: []bool,
-) !void {
-    std.debug.assert(binding_names.len == out_eager.len);
-    var an: Analyzer = .{
-        .allocator = allocator,
-        .intern = intern,
-        .source = source,
-        .bound_stack = .empty,
-    };
-    defer an.deinit();
-
-    var strict = try an.analyze(body);
-    defer strict.deinit(allocator);
-
-    for (binding_names, out_eager) |name, *eager| {
-        eager.* = strict.shallow.contains(name);
-    }
-}
-
-/// Sound *must-force* version of `analyzeLetEagerness`: sets
-/// `out_must_force[i]` iff the let-block body unconditionally forces
-/// `binding_names[i]` to WHNF on every path before any other
-/// observable effect. Used by `compileLetIn` to eagerly evaluate such
-/// bindings directly into their slot instead of emitting a thunk —
-/// which is safe precisely because lazy evaluation would force them
-/// anyway, so eager eval can't turn a success into an error (only
-/// possibly change which error surfaces in an already-failing eval).
-pub fn analyzeLetMustForce(
-    allocator: std.mem.Allocator,
-    intern: *InternTable,
-    source: []const u8,
-    body: *const Node,
-    binding_names: []const InternId,
     out_must_force: []bool,
 ) !void {
+    std.debug.assert(binding_names.len == out_eager.len);
     std.debug.assert(binding_names.len == out_must_force.len);
     var an: Analyzer = .{
         .allocator = allocator,
         .intern = intern,
         .source = source,
         .bound_stack = .empty,
-        .must_force = true,
     };
     defer an.deinit();
 
     var strict = try an.analyze(body);
     defer strict.deinit(allocator);
 
-    for (binding_names, out_must_force) |name, *mf| {
-        mf.* = strict.shallow.contains(name);
+    for (binding_names, out_eager, out_must_force) |name, *eager, *mf| {
+        eager.* = strict.shallow.contains(name);
+        mf.* = strict.shallow_must.contains(name);
     }
 }
 
@@ -422,12 +436,11 @@ pub fn bodyMustForceName(
         .intern = intern,
         .source = source,
         .bound_stack = .empty,
-        .must_force = true,
     };
     defer an.deinit();
     var strict = try an.analyze(body);
     defer strict.deinit(allocator);
-    return strict.shallow.contains(name_id);
+    return strict.shallow_must.contains(name_id);
 }
 
 const Compiler = @import("../compiler.zig").Compiler;
@@ -551,7 +564,9 @@ test "analyzeLetEagerness flags a binding the body forces directly" {
 
     const eager = try allocator.alloc(bool, names.len);
     defer allocator.free(eager);
-    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+    const mf_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(mf_unused);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager, mf_unused);
 
     // Body is `a + 0`: forces `a` shallowly, never mentions `b`.
     try std.testing.expect(eager[0]);
@@ -572,7 +587,9 @@ test "analyzeLetEagerness does not flag names only referenced in binding right-h
 
     const eager = try allocator.alloc(bool, names.len);
     defer allocator.free(eager);
-    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+    const mf_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(mf_unused);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager, mf_unused);
 
     try std.testing.expect(!eager[0]); // a: not a free name in the body
     try std.testing.expect(eager[1]); // b: forced directly by the body
@@ -592,7 +609,9 @@ test "analyzeLetEagerness treats attrset/list construction as non-forcing (deep 
 
     const eager = try allocator.alloc(bool, names.len);
     defer allocator.free(eager);
-    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+    const mf_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(mf_unused);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager, mf_unused);
 
     try std.testing.expect(!eager[0]);
 }
@@ -611,7 +630,9 @@ test "analyzeLetEagerness unions if-branch strictness only over names common to 
 
     const eager = try allocator.alloc(bool, names.len);
     defer allocator.free(eager);
-    try analyzeLetEagerness(allocator, &parsed.intern, source, parsed.body(), names, eager);
+    const mf_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(mf_unused);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager, mf_unused);
 
     // `a` is forced unconditionally as the `if` condition regardless of
     // branch outcome.
@@ -631,9 +652,11 @@ test "analyzeLetMustForce excludes names only forced inside an assert body" {
     const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
     defer allocator.free(names);
 
+    const eager_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager_unused);
     const must_force = try allocator.alloc(bool, names.len);
     defer allocator.free(must_force);
-    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager_unused, must_force);
 
     try std.testing.expect(!must_force[0]);
 }
@@ -649,9 +672,11 @@ test "analyzeLetMustForce excludes names only forced inside a with scope express
     const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
     defer allocator.free(names);
 
+    const eager_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager_unused);
     const must_force = try allocator.alloc(bool, names.len);
     defer allocator.free(must_force);
-    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager_unused, must_force);
 
     try std.testing.expect(!must_force[0]);
 }
@@ -665,9 +690,11 @@ test "analyzeLetMustForce flags a name forced on every path of an if-else" {
     const names = try bindingNameIds(allocator, &parsed.intern, source, parsed.bindings());
     defer allocator.free(names);
 
+    const eager_unused = try allocator.alloc(bool, names.len);
+    defer allocator.free(eager_unused);
     const must_force = try allocator.alloc(bool, names.len);
     defer allocator.free(must_force);
-    try analyzeLetMustForce(allocator, &parsed.intern, source, parsed.body(), names, must_force);
+    try analyzeLetBindings(allocator, &parsed.intern, source, parsed.body(), names, eager_unused, must_force);
 
     try std.testing.expect(must_force[0]);
 }

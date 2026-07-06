@@ -799,20 +799,15 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
     defer self.allocator.free(eager_flags);
     const must_force_flags = try self.allocator.alloc(bool, let_in.bindings.len);
     defer self.allocator.free(must_force_flags);
-    try strictness.analyzeLetEagerness(
+    // One walk of the let body yields both the may-force (eager submit)
+    // and must-force (eager elision) sets — they differ only at assert/with.
+    try strictness.analyzeLetBindings(
         self.allocator,
         self.intern,
         self.source,
         let_in.body,
         binding_name_ids,
         eager_flags,
-    );
-    try strictness.analyzeLetMustForce(
-        self.allocator,
-        self.intern,
-        self.source,
-        let_in.body,
-        binding_name_ids,
         must_force_flags,
     );
 
