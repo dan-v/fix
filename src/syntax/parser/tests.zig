@@ -487,11 +487,11 @@ test "parser recovers across attrset entries" {
     var parser = Parser.init(std.testing.allocator, &arena, "{ if = 1; good = 2; inherit = 3; alsoGood = 4; }");
     defer parser.deinit();
 
-    // The table-driven parser fails fast at the first invalid attribute name
-    // (the `if` keyword) with a precise "unexpected token" diagnostic rather
-    // than recovering across entries.
+    // Panic-mode recovery keeps parsing after the first invalid attribute name
+    // (`if`) and surfaces the later `inherit = 3` problem too — more than one
+    // diagnostic, and the first pinpoints the `if` keyword.
     try std.testing.expectError(error.ParseError, parser.parse());
-    try std.testing.expect(parser.diagnostics.items.len >= 1);
+    try std.testing.expect(parser.diagnostics.items.len >= 2);
     try std.testing.expectEqualStrings("Unexpected token 'if'.", parser.diagnostics.items[0].message);
 }
 

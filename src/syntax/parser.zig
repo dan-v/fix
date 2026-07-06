@@ -173,6 +173,14 @@ pub const Parser = struct {
         sp += 1;
 
         var ip: usize = 0;
+        var error_count: usize = 0;
+        const max_errors = 32;
+        // Error cooldown: after reporting an error, stay quiet until the parser
+        // has shifted a few real tokens again. This collapses the cascade of
+        // spurious follow-on errors panic-mode recovery would otherwise emit.
+        // Starts "elapsed" so the first error always reports.
+        const cooldown = 3;
+        var quiet_shifts: u32 = cooldown;
         while (true) {
             const state = states[sp - 1];
             const la = ids[ip];
@@ -183,6 +191,7 @@ pub const Parser = struct {
                     vals[sp] = .{ .tok = toks[ip] };
                     sp += 1;
                     ip += 1;
+                    if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
                 lr.ACT_REDUCE => {
                     const p = lr.cellArg(c);
@@ -204,10 +213,34 @@ pub const Parser = struct {
                     return vals[sp - 1].node;
                 },
                 else => {
-                    self.reportUnexpected(state, toks[ip]);
-                    return null;
+                    if (quiet_shifts >= cooldown) {
+                        self.reportUnexpected(state, toks[ip]);
+                        error_count += 1;
+                        if (error_count >= max_errors) return null;
+                    } else {
+                        self.had_error = true;
+                    }
+                    quiet_shifts = 0;
+                    if (!recover(states[sp - 1], ids, &ip)) return null;
                 },
             }
+        }
+    }
+
+    /// Panic-mode recovery. Keep the parse stack intact (preserving the current
+    /// context, e.g. the enclosing `{ ... }`) and discard input tokens until the
+    /// current top state has a real action on one — typically the next clause
+    /// separator or the context's closing token. The value stack is untouched,
+    /// so it stays consistent with the state stack and semantic actions keep
+    /// running safely; the recovered tree is discarded anyway, since the
+    /// recorded error forces `parse` to return `ParseError`. Returns false at
+    /// EOF (nothing left to resynchronize on).
+    fn recover(top_state: u32, ids: []const u32, ip: *usize) bool {
+        const NT = Tab.num_terminals;
+        while (true) {
+            if (ids[ip.*] == grammar.t_eof) return false;
+            ip.* += 1; // discard a token (starting with the offending one)
+            if (lr.cellKind(Tab.action[top_state * NT + ids[ip.*]]) != lr.ACT_ERROR) return true;
         }
     }
 
