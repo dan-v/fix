@@ -1,6 +1,7 @@
 const std = @import("std");
 const aterm = @import("aterm.zig");
 const paths = @import("paths.zig");
+const codec = @import("hash_codec.zig");
 const types = @import("types.zig");
 
 const ComputedPaths = types.ComputedPaths;
@@ -69,7 +70,7 @@ pub const Drv = struct {
             errdefer allocator.free(outputs);
             const name = try allocator.dupe(u8, output.name);
             errdefer allocator.free(name);
-            const hash = try paths.sha256Hex(allocator, inner);
+            const hash = try codec.sha256Hex(allocator, inner);
             errdefer allocator.free(hash);
             outputs[0] = .{
                 .output = name,
@@ -82,7 +83,7 @@ pub const Drv = struct {
         defer freeHashModuloInputs(allocator, actual_inputs);
         const text = try self.toATerm(allocator, mask_outputs, actual_inputs);
         defer allocator.free(text);
-        return .{ .drv = try paths.sha256Hex(allocator, text) };
+        return .{ .drv = try codec.sha256Hex(allocator, text) };
     }
 
     pub fn toATerm(self: *const Drv, allocator: std.mem.Allocator, mask_outputs: bool, actual_inputs: ?[]const DrvInput) ![]u8 {

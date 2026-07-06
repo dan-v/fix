@@ -1,7 +1,7 @@
 const std = @import("std");
 const derivation = @import("../derivation.zig");
 const sort = @import("sort.zig");
-const paths_mod = @import("paths.zig");
+const hash_codec = @import("hash_codec.zig");
 const runtime = @import("runtime");
 const debug_record_mod = @import("debug_record.zig");
 const types_mod = @import("types.zig");
@@ -23,7 +23,7 @@ const storeDigest = derivation.storeDigest;
 const outputPathName = derivation.outputPathName;
 const drvPathName = derivation.drvPathName;
 const hashAlgorithmSeparator = derivation.hashAlgorithmSeparator;
-const sha256Hex = paths_mod.sha256Hex;
+const sha256Hex = hash_codec.sha256Hex;
 
 const InternTable = runtime.intern.InternTable;
 const ObjectHeap = runtime.heap.ObjectHeap;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const drv_mod = @import("drv.zig");
-const paths = @import("paths.zig");
+const codec = @import("hash_codec.zig");
 const types = @import("types.zig");
 
 const DebugHashModuloStep = types.DebugHashModuloStep;
@@ -38,7 +38,7 @@ pub fn debugRecordFromDrv(
 
     record.drv_aterm = try drv.toATerm(allocator, false, null);
     errdefer allocator.free(record.drv_aterm);
-    record.drv_text_hash = try paths.sha256Hex(allocator, record.drv_aterm);
+    record.drv_text_hash = try codec.sha256Hex(allocator, record.drv_aterm);
     errdefer allocator.free(record.drv_text_hash);
 
     const references = try drv.textReferences(allocator);
@@ -80,7 +80,7 @@ fn debugHashModuloStep(
     errdefer types.freeDrvInputsDeep(allocator, inputs);
     const aterm = try drv.toATerm(allocator, mask_outputs, borrowed_inputs);
     errdefer allocator.free(aterm);
-    const hash = try paths.sha256Hex(allocator, aterm);
+    const hash = try codec.sha256Hex(allocator, aterm);
     errdefer allocator.free(hash);
 
     return .{
