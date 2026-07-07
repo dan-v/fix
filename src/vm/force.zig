@@ -789,6 +789,28 @@ noinline fn logTouch(self: *VM, thunk_id: ObjectId, demand: bool) void {
     });
 }
 
+/// Cold: log a creation-time speculative SUBMIT of a thunk whose source file
+/// basename matches the `FIX_TOUCH_LOG` substring. Paired with `logTouch`
+/// (claims) so a probe run shows the full submit→claim latency of the seed
+/// tasks and whether the submit was accepted or dropped (queue/cap full).
+pub noinline fn logSpawn(self: *VM, thunk_id: ObjectId, accepted: bool) void {
+    const filt = self.scheduler.touch_log orelse return;
+    var buf: [160]u8 = undefined;
+    const subj = thunkLabel(self, thunk_id, &buf);
+    if (subj.file == 0) return;
+    const base = std.fs.path.basename(self.intern.get(subj.file));
+    if (std.mem.indexOf(u8, base, filt) == null) return;
+    std.debug.print("spawn {s}:{d} id={d} t_us={d} worker={d} spec={} ok={}\n", .{
+        base,
+        subj.line,
+        thunk_id,
+        diagNowUs(),
+        self.workerId(),
+        self.in_speculation,
+        accepted,
+    });
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
     // safepoint by native_depth + allocation cursor. Independent of -Dgc.
@@ -1174,7 +1196,8 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
     if (shouldSpeculateClosure(self, closure)) {
-        _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+        const ok = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+        if (self.scheduler.touch_log != null) logSpawn(self, id, ok);
     }
     return Value.thunk(id);
 }

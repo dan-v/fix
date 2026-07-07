@@ -152,7 +152,8 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (slot.body_is_substantial) {
-        _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+        const ok = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+        if (self.scheduler.touch_log != null) force.logSpawn(self, id, ok);
     }
     try stack.push(self, Value.thunk(id));
 }
