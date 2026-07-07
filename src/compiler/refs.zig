@@ -117,8 +117,11 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
 /// Hand every identifier-shaped substring in a source span to
 /// `ctx.mark`. Catches references inside `${...}` interpolation in
 /// atom-typed fields without expanding through the string parser.
+/// A span with no `${` at all cannot reference anything — skip it
+/// (its words would only ever be false positives).
 fn walkIdentifiersInSpan(self: *Compiler, atom: Node.Atom, ctx: anytype) void {
     const text = self.source[atom.offset .. atom.offset + atom.len];
+    if (std.mem.indexOf(u8, text, "${") == null) return;
     var i: usize = 0;
     while (i < text.len) {
         if (isIdentStart(text[i])) {
