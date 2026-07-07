@@ -103,7 +103,10 @@ const ReadyQueue = struct {
     /// every peer's queue: worker i's push/pop invalidated the line
     /// under workers i±1's queues too.
     mu: stable.SpinMutex align(std.atomic.cache_line),
-    head: ?*ReadyNode,
+    /// Mutated only under `mu`; additionally probed lock-free by `pop`'s
+    /// empty fast path (monotonic — the lock provides the real
+    /// synchronization for any node actually taken).
+    head: std.atomic.Value(?*ReadyNode),
     tail: ?*ReadyNode,
 
     comptime {
@@ -111,7 +114,7 @@ const ReadyQueue = struct {
     }
 
     fn init() ReadyQueue {
-        return .{ .mu = .{}, .head = null, .tail = null };
+        return .{ .mu = .{}, .head = .init(null), .tail = null };
     }
 
     fn push(self: *ReadyQueue, node: *ReadyNode) void {
@@ -121,17 +124,25 @@ const ReadyQueue = struct {
         if (self.tail) |t| {
             t.next = node;
         } else {
-            self.head = node;
+            self.head.store(node, .monotonic);
         }
         self.tail = node;
     }
 
     fn pop(self: *ReadyQueue) ?*ReadyNode {
+        // Read-only empty probe BEFORE touching the lock. Idle workers'
+        // steal scans call `pop` on every peer's (almost always empty)
+        // queue each rescan; the unconditional `mu.lock()` CAS was a
+        // read-for-ownership that ping-ponged the queue's line between
+        // every scanning core even when nothing was queued. A stale null
+        // here is benign — same outcome as scanning just before the
+        // racing push; the wake/futex protocol re-engages parked workers.
+        if (self.head.load(.monotonic) == null) return null;
         self.mu.lock();
         defer self.mu.unlock();
-        const n = self.head orelse return null;
-        self.head = n.next;
-        if (self.head == null) self.tail = null;
+        const n = self.head.load(.monotonic) orelse return null;
+        self.head.store(n.next, .monotonic);
+        if (n.next == null) self.tail = null;
         n.next = null;
         // Mark off-queue so the next `enqueueReady` for this node can
         // win its CAS. Release-store so it's visible to the next
