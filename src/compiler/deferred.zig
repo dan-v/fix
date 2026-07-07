@@ -59,7 +59,12 @@ pub fn compile(
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
     // Shared line index — avoid rebuilding it over the whole source per body.
-    parent.external_line_index = line_index;
+    // Take a by-value copy: `line_starts` is immutable and safely shared, but
+    // `positionForOffset` mutates the embedded last-lookup cache, and
+    // concurrent force-time compiles of bodies from the same file race on it
+    // (a torn cache read makes `target - cache_line_start` underflow).
+    var local_line_index = line_index.*;
+    parent.external_line_index = &local_line_index;
     defer parent.deinit();
     for (entry.scope) |cap| {
         _ = try scope.declareLocal(&parent, cap.name, cap.name_id);
