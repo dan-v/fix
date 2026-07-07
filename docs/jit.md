@@ -1,6 +1,6 @@
 # JIT
 
-*A generic tracing/inlining JIT that emits native x86-64 and stays byte-identical to the interpreter. STATUS: fully built, correct, native — and MEASURED-DEAD on nixpkgs (allocation-sink ceiling ~15 thunks/eval). Experimental, opt-in, off by default.*
+*A generic tracing/inlining JIT that emits native x86-64 and stays byte-identical to the interpreter. STATUS: fully built, correct, native — and MEASURED-DEAD on nixpkgs (allocation-sink ceiling ~15 thunks/eval; re-confirmed 2026-07, see below). Experimental, opt-in, off by default.*
 
 Two experimental compilers gate behind build flags; the [interpreter](vm/dispatch.md) is canonical and always maintained:
 
@@ -74,6 +74,17 @@ The full chain is built, correct, native, and **byte-identical at w=1 and w=32**
 - Truncated traces are reconstruct-bound (rebuilding inlined frames on side-exit, not interpreting the prefix), so the *only* possible net win is the sink — and the sink's ceiling is the workload's, ~15/eval → negligible.
 
 **Conclusion:** a generic tracing/inlining JIT is architecturally complete and correct here, but the shared-graph structure of nixpkgs eval leaves no allocation to eliminate. The lever is a different eval strategy or on-chain work-elimination ([perf/model.md](perf/model.md)), not code generation.
+
+## 2026-07 resurrection check
+
+Both flags were re-exercised on current main (post ops-split, dense chunk-slot registry, GC hooks). Both build clean; one runtime correctness bug had rotted in and is fixed:
+
+- **Stale-recording poisoning (fixed):** a recording left live by an errored speculative force survived fiber recycling (`slotEntry` resets `sp`/`frames_len` but not `tjit_rec`), letting the recorder splice the *next task's* chunk into a trace anchored at the old chunk. Poisoned side-exit snapshots then resumed the interpreter at wrong-chunk ips → flaky wild-decode segfault at w=32 (and a silent wrong-output risk). Fixes: recordings abort at task boundaries (`abortStale`), and `observe` cross-checks the VM's top-frame chunk against the model each op. The desync guard fires ~41x/run at w=32 and ~19x/run even at w=1 — errors *caught* mid-recording (tryEval, speculative unwinds) desynced single-threaded too.
+- **Correctness re-verified:** stdout byte-identical vs non-JIT at w=1/8/16/32 on `nixos_toplevel` + 3 secondary files, 20x w=32 stress clean, `zig build test` green with both flags.
+- **Fresh walls (interleaved A/B, idle machine, `nixos_toplevel`):** non-JIT w=1 2.425 / w=8 0.898; `-Djit` 2.439 / 0.913 (**neutral**, within ~2%); `-Dtjit` 2.700 / 0.995 (**~11% slower** — record + hot-check + side-exit tax with nothing to sink).
+- **Fresh ceiling:** sink stats at w=1: **0 thunks sunk, sink-ceiling 13** (w=32: 0 sunk, ceiling 26) out of ~370-800 alloc_thunks in completed traces — unchanged from the historical measurement. tjit at w=1: 1.93M native runs, 356K interpreted trace runs, 325K side-exits; traces are 2-15 instrs. Per-body `-Djit` compiles ~75K trivial accessor shapes vs ~246K unsupported.
+
+**Verdict unchanged: do not invest.** Keep both gated off as reference implementations; `-Dtjit` is a delete candidate if the maintenance tax (its dispatch-loop `observe` hook and force-path inline hook) ever bites.
 
 See [docs/plans/tracing-jit.md](plans/tracing-jit.md) and [docs/plans/tjit-mid-inline-truncation-plan.md](plans/tjit-mid-inline-truncation-plan.md) for the design history.
 
