@@ -84,6 +84,10 @@ pub const ImportHost = struct {
 };
 
 /// Per-thread VM state. Each worker thread has one of these.
+/// Sentinel for `VM.spec_budget`: no bound on speculative work. (Never
+/// reachable by decrement — 2^64 claimed forces don't happen.)
+pub const NO_SPEC_BUDGET: u64 = std.math.maxInt(u64);
+
 pub const VM = struct {
     allocator: std.mem.Allocator,
     /// Global chunk registry (shared across all VMs). Mutable: the
@@ -171,6 +175,37 @@ pub const VM = struct {
     /// entry points (see `vm/force.zig`).
     in_speculation: bool,
 
+    /// Bounded speculation (`FIX_SIBLING`): remaining claimed-force budget
+    /// for the current speculative task. `NO_SPEC_BUDGET` (the default)
+    /// disables the bound; a sibling-sweep task arms it per member force
+    /// so a wrongly-predicted member cascading into a huge evaluation
+    /// (`warnings`, `vmVariant`, ...) is abandoned via
+    /// `error.SpeculativeBail` after at most this many claimed forces —
+    /// while its already-resolved sub-thunks stay resolved (a later real
+    /// demand reuses them). Decremented only on the speculative path (see
+    /// `forceThunkImpl`'s claimed arm); zero cost on the demand path.
+    /// Fiber-local by construction (lives on the VM, travels with the
+    /// fiber across yields/steals).
+    spec_budget: u64,
+
+    /// Bounded speculation, creation side (`FIX_SIBLING`): bail the
+    /// current speculative task once this worker's thunk-creation counter
+    /// (`HeapLocal.thunks_created`) exceeds this value. The claimed-force
+    /// budget above cannot bound creation-heavy builtins (one claimed
+    /// force through zipAttrsWith/mapAttrs can materialize 100Ks of
+    /// thunks); this catches those on the next speculative force.
+    /// `NO_SPEC_BUDGET` disables. Best-effort across fiber migration (the
+    /// counter is per-worker): a migrated fiber may bail early or late —
+    /// both benign (bail is a transient reset).
+    spec_create_limit: u64,
+    /// Worker the creation limit was armed on. The counter comparison is
+    /// only meaningful on that worker; if the fiber resumes elsewhere
+    /// (it yielded on a busy thunk and was stolen), treat the budget as
+    /// exhausted — the awaited value is being computed by someone else
+    /// anyway, and an unbounded escape here was the observed failure
+    /// mode (300K+-creation cascades sailing past the limit).
+    spec_create_worker: u8,
+
     /// True only when the result will be rendered as lazy XML, where
     /// eagerly-built shapes (list/attrset/lambda) must appear unevaluated
     /// (`<unevaluated />`) until demanded. The compiler emits
@@ -251,6 +286,9 @@ pub const VM = struct {
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
+            .spec_budget = NO_SPEC_BUDGET,
+            .spec_create_limit = NO_SPEC_BUDGET,
+            .spec_create_worker = 0,
             .lazy_shells_visible = false,
         };
     }

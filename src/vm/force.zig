@@ -224,6 +224,16 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 }
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
+    // Bounded speculation (`FIX_SIBLING`): a sweep member's cascade is
+    // abandoned once it has created more thunks than its budget. Checked
+    // here (not just at claimed forces) because creation-heavy builtins
+    // force sub-values far more often than they claim thunks. One
+    // predictable `in_speculation` branch on the demand path.
+    if (self.in_speculation and self.spec_create_limit != vm_mod.NO_SPEC_BUDGET) {
+        if (self.workerId() != self.spec_create_worker or
+            self.heap.currentLocal().thunks_created > self.spec_create_limit)
+            return error.SpeculativeBail;
+    }
     if (!value.isThunk()) return value;
     if (comptime trace_probe.enabled) trace_probe.recordRead(value.asObjectId());
     // Inline the resolved-thunk fast path. The vast majority of forces
@@ -499,7 +509,11 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 /// never-demanded body can't run an allocation loop to completion. Off the
 /// demand path entirely (the `in_speculation` check short-circuits).
 pub inline fn specBailRequested(self: *const VM) bool {
-    return self.in_speculation and self.scheduler.backgroundSuppressed();
+    if (!self.in_speculation) return false;
+    if (self.scheduler.backgroundSuppressed() or self.spec_budget == 0) return true;
+    return self.spec_create_limit != vm_mod.NO_SPEC_BUDGET and
+        (self.workerId() != self.spec_create_worker or
+            self.heap.currentLocal().thunks_created > self.spec_create_limit);
 }
 
 /// Force the operand at stack depth `depth` (0 = top) IN PLACE: force it
@@ -703,6 +717,31 @@ pub inline fn scavShouldTake(chunk_id: u32) bool {
     return true;
 }
 
+/// Demand-sibling prefetch (`FIX_SIBLING`) member admission: skip
+/// members whose speculative force is known to wander into unbounded
+/// package evaluation. The sweep-log diagnosis showed the RSS blowups
+/// come from sweeping DERIVATION attrsets — their members are
+/// `derivationLazyAttr` builtin closures, the one builtin the creation-
+/// time speculation policy also refuses (forcing one recursively
+/// evaluates arbitrary package inputs). Racy-benign union read, same as
+/// `scavengeStep`: the thunk may resolve concurrently; a torn read at
+/// worst misclassifies, the claim CAS inside the force is authoritative.
+pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
+    const th = self.heap.getThunkAssumeValid(thunk_id);
+    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
+    switch (th.targetKind()) {
+        .closure => {
+            const cv = th.payload.target.closure;
+            if (cv.isBuiltinClosure()) {
+                const bc = self.heap.getBuiltinClosure(cv.asObjectId()) catch return false;
+                if (@as(BuiltinId, @enumFromInt(bc.builtin_id)) == .derivationLazyAttr) return false;
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
 inline fn scavRdtsc() u64 {
     if (comptime builtin.cpu.arch != .x86_64) return 0;
     var low: u32 = undefined;
@@ -804,9 +843,23 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // speculative guess (see docs/plans/parallel-redesign-plan.md).
                 // Speculative path only — demand never bails — and the
                 // atomic load is off the resolved fast path.
-                if (self.in_speculation and self.scheduler.backgroundSuppressed()) {
-                    publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
-                    return error.SpeculativeBail;
+                if (self.in_speculation) {
+                    if (self.scheduler.backgroundSuppressed()) {
+                        publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
+                        return error.SpeculativeBail;
+                    }
+                    // Bounded speculation (`FIX_SIBLING`): a sweep task arms
+                    // a per-member claimed-force budget; when it runs dry,
+                    // abandon the cascade the same way. Sub-thunks already
+                    // resolved below this one stay resolved, so the partial
+                    // work is kept if the value is demanded later.
+                    if (self.spec_budget != vm_mod.NO_SPEC_BUDGET) {
+                        if (self.spec_budget == 0) {
+                            publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
+                            return error.SpeculativeBail;
+                        }
+                        self.spec_budget -= 1;
+                    }
                 }
                 // Thunk-result memo: reuse a previous identical pure
                 // computation on this worker, skipping re-running the body.

@@ -492,6 +492,7 @@ pub const Worker = struct {
             switch (task) {
                 .force_thunk => |id| timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("force-thunk") else loc, f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
                 .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
+                .force_attrs_sweep => |id| timeline.beginArgs(.run, "sweep-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d}", .{id}) catch ""),
             }
             // Consumer end of the work-stealing arrow — inside this quantum so
             // the arrow lands on it. No-op unless this task was stolen (id != 0).
@@ -513,7 +514,7 @@ pub const Worker = struct {
             // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range => .{},
+            .force_list_range, .force_attrs_sweep => .{},
         };
     }
 
@@ -837,6 +838,77 @@ fn slotEntry(arg: *anyopaque) void {
             while (i < end) : (i += 1) {
                 if (!items[i].isThunk()) continue;
                 _ = vm_force.forceValueSpeculative(&f.vm, items[i]) catch {};
+            }
+        },
+        .force_attrs_sweep => |attrs_id| {
+            // Demand-sibling prefetch (`FIX_SIBLING`): force every still-
+            // unresolved thunk member of one attrset. Rooting mirrors the
+            // list case above; the submitter only ever sweeps plain
+            // `.attrs` objects, so `getAttrs` never flattens here. Members
+            // resolved since submission fall through the resolved fast
+            // path in `forceValueSpeculative` — the sweep is idempotent.
+            const gc_roots = vm_force.rootsBegin(&f.vm);
+            defer vm_force.rootsEnd(&f.vm, gc_roots);
+            vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
+            const entries = f.vm.heap.getAttrs(attrs_id) catch return;
+            const log = f.vm.scheduler.sibling_log;
+            const objs_before: u32 = if (log) f.vm.heap.objects.count() else 0;
+            var lbuf: [160]u8 = undefined;
+            var rbuf: [224]u8 = undefined;
+            if (log) {
+                // Identify the sweep target: first attr name + first
+                // unresolved member's body label (best-effort).
+                var label: []const u8 = "?";
+                for (entries) |entry| {
+                    if (!entry.value.isThunk()) continue;
+                    const subj = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), &lbuf);
+                    if (subj.isEmpty()) continue;
+                    label = if (subj.file != 0)
+                        (std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(subj.file)), subj.line }) catch "?")
+                    else
+                        subj.text;
+                    break;
+                }
+                std.debug.print("sweep attrs={d} n={d} first_attr={s} member={s}\n", .{
+                    attrs_id, entries.len,
+                    f.vm.intern.get(entries[0].name), label,
+                });
+            }
+            // Arm the per-member cascade bounds (claimed forces AND thunk
+            // creations); restore before the fiber is recycled for tasks
+            // that must run unbounded.
+            defer {
+                f.vm.spec_budget = vm_mod.NO_SPEC_BUDGET;
+                f.vm.spec_create_limit = vm_mod.NO_SPEC_BUDGET;
+            }
+            for (entries) |entry| {
+                if (!entry.value.isThunk()) continue;
+                if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
+                f.vm.spec_budget = f.vm.scheduler.sibling_budget;
+                f.vm.spec_create_limit = f.vm.heap.currentLocal().thunks_created + f.vm.scheduler.sibling_budget;
+                f.vm.spec_create_worker = worker_id_mod.current;
+                if (log) {
+                    // Per-member cascade attribution: this worker's own
+                    // thunk-creation counter around the force. Best-effort —
+                    // a mid-force fiber migration garbles one sample.
+                    const before = f.vm.heap.currentLocal().thunks_created;
+                    const subj = vm_force.thunkLabel(&f.vm, entry.value.asObjectId(), &lbuf);
+                    _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+                    const created = f.vm.heap.currentLocal().thunks_created -| before;
+                    if (created > 2000) {
+                        const mlabel: []const u8 = if (subj.file != 0)
+                            (std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(subj.file)), subj.line }) catch "?")
+                        else if (subj.text.len != 0) subj.text else "?";
+                        std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d}\n", .{
+                            attrs_id, f.vm.intern.get(entry.name), mlabel, created,
+                        });
+                    }
+                    continue;
+                }
+                _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
+            }
+            if (log) {
+                std.debug.print("sweep attrs={d} done: heap_growth={d}\n", .{ attrs_id, f.vm.heap.objects.count() -| objs_before });
             }
         },
     }

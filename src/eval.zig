@@ -598,6 +598,29 @@ pub const Evaluator = struct {
             self.scheduler.setScavenge(scav_on, scav_margin);
             self.heap.scav_record = scav_on;
         }
+        // FIX_SIBLING: demand-sibling prefetch — a demand fiber's first touch
+        // of an unresolved member of a mid-sized attrset submits a speculative
+        // whole-set sweep. FIX_SIBLING_MIN/MAX tune the entry-count gate
+        // (defaults 16/64, from the -Dprof-main sibling census).
+        if (self.env_map) |em| {
+            const sib_on = em.get("FIX_SIBLING") != null;
+            var sib_min: u32 = 16;
+            var sib_max: u32 = 64;
+            if (em.get("FIX_SIBLING_MIN")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |n| sib_min = n else |_| {}
+            }
+            if (em.get("FIX_SIBLING_MAX")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |n| sib_max = n else |_| {}
+            }
+            if (em.get("FIX_SIBLING_BUDGET")) |s| {
+                if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_budget = n else |_| {}
+            }
+            self.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
+            if (em.get("FIX_SIBLING_URGENT")) |s| {
+                self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
+            }
+            self.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
+        }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();

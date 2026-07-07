@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
+const thunk_mod = @import("runtime").thunk;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const bytecode_mod = @import("../bytecode.zig");
@@ -80,7 +81,38 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
     slot.obj_id = obj_id;
     slot.name_id = name_id;
     slot.value = raw;
+    // Demand-sibling prefetch (`FIX_SIBLING`): a cache MISS on an attr
+    // member is the first touch of this (obj, name) on this worker —
+    // the trigger point for sweeping the member's siblings. One dead
+    // branch here when the flag is off; everything else lives in the
+    // cold helper.
+    if (self.scheduler.sibling_prefetch) maybeSiblingSweep(self, obj_id, raw);
     return raw;
+}
+
+/// Cold path of the demand-sibling prefetch trigger. Submits ONE
+/// speculative whole-set sweep task when:
+///   - we're on a demand fiber (speculative work must not cascade),
+///   - the just-looked-up member is itself a still-unresolved thunk
+///     (if creation-time speculation already resolved it, its siblings
+///     are likely resolved too — nothing to prefetch), and
+///   - the attrset passes the size gate + once-per-set dedup
+///     (`ObjectHeap.trySiblingSweep`).
+/// The sweep task forces members via `forceValueSpeculative`, so it is
+/// demand-invisible (no `demanded` marks, sticky-error rules unchanged).
+fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
+    if (self.in_speculation) return;
+    if (!member.isThunk()) return;
+    const th = self.heap.getThunkAssumeValid(member.asObjectId());
+    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return;
+    const sched = self.scheduler;
+    if (!self.heap.trySiblingSweep(obj_id, sched.sibling_min, sched.sibling_max)) return;
+    const task: @import("parallel").scheduler.Task = .{ .force_attrs_sweep = obj_id };
+    const ok = if (sched.sibling_urgent)
+        sched.submitUrgent(task, self.workerId())
+    else
+        sched.submit(task, self.workerId());
+    if (ok) sched.bumpSweeps(self.workerId());
 }
 
 const attr_cache_size: usize = 256;

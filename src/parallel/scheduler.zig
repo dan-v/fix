@@ -45,6 +45,14 @@ pub const Task = union(enum) {
     /// `len` is u8 — batches are O(10s) of items; longer lists submit
     /// multiple batched tasks.
     force_list_range: ForceListRange,
+    /// Demand-sibling prefetch (`FIX_SIBLING`): speculatively force every
+    /// still-unresolved thunk member of one attrset. Submitted (once per
+    /// attrset — see `AttrsObject.sibling_swept`) when a DEMAND fiber's
+    /// attr lookup misses the inline cache and lands on an unresolved
+    /// member of a mid-sized attrset: reading one member of such a set
+    /// strongly predicts reading its siblings (measured junk ratio
+    /// 17-29% at 16-63 entries vs 99% at >=256 — hence the size gate).
+    force_attrs_sweep: types.ObjectId,
 };
 
 pub const ForceListRange = struct {
@@ -174,6 +182,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
         switch (q.items[@intCast(i & q.mask)].task) {
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
+            .force_attrs_sweep => |id| tr.markObject(heap, id),
         }
     }
 }
@@ -243,7 +252,8 @@ pub const Scheduler = struct {
         cont_pushes: u64 = 0,
         parks: u64 = 0,
         scavenges: u64 = 0,
-        _pad: [128 - 10 * @sizeOf(u64)]u8 = undefined,
+        sweeps: u64 = 0,
+        _pad: [128 - 11 * @sizeOf(u64)]u8 = undefined,
     };
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
@@ -269,6 +279,8 @@ pub const Scheduler = struct {
         parks: u64,
         /// Thunks pre-forced by the idle scavenger (FIX_SCAVENGE).
         scavenges: u64 = 0,
+        /// Attrset sibling sweeps submitted (FIX_SIBLING).
+        sweeps: u64 = 0,
         /// Deepest fiber native stack high-water seen across all workers
         /// since startup. Use to size `Fiber.min_stack_bytes` against a
         /// representative workload.
@@ -389,6 +401,36 @@ pub const Scheduler = struct {
     scav_margin: u64 = 4096,
     /// Highest worker id allowed to scavenge. `FIX_SCAV_WORKERS` overrides.
     scav_workers: u8 = 7,
+
+    /// `FIX_SIBLING`: demand-sibling prefetch. On a demand fiber's
+    /// inline-cache MISS landing on a still-unresolved thunk member of a
+    /// plain attrset with entry count in `[sibling_min, sibling_max)`,
+    /// submit ONE speculative `force_attrs_sweep` task for the whole set
+    /// (deduped by `AttrsObject.sibling_swept`). Set once before helpers
+    /// start, read-only during eval.
+    sibling_prefetch: bool = false,
+    /// Attrset entry-count gate. Defaults from the `-Dprof-main` sibling
+    /// census: 16-63 entries = 17-29% junk; >=64 grows to 51%, >=256 is
+    /// 99% junk (pkgs-like sets — sweeping those evaluates all of
+    /// nixpkgs). `FIX_SIBLING_MIN`/`FIX_SIBLING_MAX` override.
+    sibling_min: u32 = 16,
+    sibling_max: u32 = 64,
+    /// Per-member claimed-force budget for sweep tasks (see
+    /// `VM.spec_budget`): a wrongly-predicted member's cascade is
+    /// abandoned after this many claimed forces. `FIX_SIBLING_BUDGET`
+    /// overrides.
+    sibling_budget: u64 = 4096,
+    /// Submit sweeps to the urgent queue (drained before the speculative
+    /// backlog) instead of the spec queue. Default ON — measured strictly
+    /// better on the NixOS toplevel (w=8 median 1.24s→1.03s vs ~1.3s at
+    /// spec priority, and LOWER RSS: urgent sweeps start early enough to
+    /// win the race with main, and they displace never-demanded
+    /// creation-time speculation). `FIX_SIBLING_URGENT=0` reverts to
+    /// spec priority.
+    sibling_urgent: bool = true,
+    /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
+    /// member body locations, heap-growth delta). Debug-only.
+    sibling_log: bool = false,
 
     /// When set (by `setTraceFlows`, driven by `--timeline`), `pushOwn` stamps
     /// each task with its push time so the timeline can anchor the steal arrow
@@ -558,6 +600,7 @@ pub const Scheduler = struct {
             c.cont_pushes += w.cont_pushes;
             c.parks += w.parks;
             c.scavenges += w.scavenges;
+            c.sweeps += w.sweeps;
         }
         return .{
             .speculative_submitted = c.spec_ok,
@@ -570,6 +613,7 @@ pub const Scheduler = struct {
             .cont_pushes = c.cont_pushes,
             .parks = c.parks,
             .scavenges = c.scavenges,
+            .sweeps = c.sweeps,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
@@ -761,6 +805,17 @@ pub const Scheduler = struct {
     }
     pub inline fn bumpScavenges(self: *Scheduler, id: u8) void {
         self.bump(id, "scavenges");
+    }
+
+    /// Enable/configure demand-sibling prefetch. Set once before helpers
+    /// start (from `FIX_SIBLING` / `FIX_SIBLING_MIN` / `FIX_SIBLING_MAX`).
+    pub fn setSiblingPrefetch(self: *Scheduler, on: bool, min: u32, max: u32) void {
+        self.sibling_prefetch = on;
+        self.sibling_min = min;
+        self.sibling_max = max;
+    }
+    pub inline fn bumpSweeps(self: *Scheduler, id: u8) void {
+        self.bump(id, "sweeps");
     }
 
     /// Push a work-first continuation onto `worker_id`'s own continuation deque
@@ -1227,7 +1282,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
-                    .force_list_range => 0,
+                    .force_list_range, .force_attrs_sweep => 0,
                 }, .acq_rel);
             }
         }

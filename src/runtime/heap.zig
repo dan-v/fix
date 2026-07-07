@@ -151,6 +151,12 @@ const ContextStringObject = struct {
 pub const AttrsObject = struct {
     range: AttrRange,
     positions: AttrPosRange = EMPTY_ATTR_POS,
+    /// Demand-sibling prefetch (`FIX_SIBLING`): has this set already been
+    /// swept? Once-per-attrset dedup for `force_attrs_sweep` submission.
+    /// Plain bool in existing union padding (the thunk variant sizes the
+    /// union); racy-benign — a lost race means one duplicate sweep task,
+    /// which the per-thunk claim CAS makes idempotent.
+    sibling_swept: bool = false,
 };
 
 /// A lazy, layered `//` (update) result: `base // overlay`, both attrset
@@ -262,6 +268,11 @@ pub const HeapLocal = struct {
     scav_ring: [SCAV_RING_SIZE]ObjectId = undefined,
     scav_head_local: u64 = 0,
     scav_head: std.atomic.Value(u64) = .init(0),
+    /// Monotonic count of thunks this worker has created. One plain add
+    /// on a cache line the allocation already touches; used by the
+    /// sibling-sweep diagnostics (`FIX_SIBLING_LOG`) to attribute
+    /// evaluation cascades to individual speculative member forces.
+    thunks_created: u64 = 0,
     /// Creation-context flag: true while the fiber currently running on
     /// this worker thread is doing SPECULATIVE work (any
     /// `forceValueSpeculative`, including nested import VMs it spawns),
@@ -896,6 +907,23 @@ pub const ObjectHeap = struct {
         self.currentLocal().spec_ctx = spec;
     }
 
+    /// Demand-sibling prefetch admission (`FIX_SIBLING`): true iff `id`
+    /// is a plain attrset with entry count in `[min, max)` that has not
+    /// been swept yet — and marks it swept. Racy-benign (see
+    /// `AttrsObject.sibling_swept`). `merge_attrs` layers are excluded:
+    /// sweeping them would force a flatten on the demand path.
+    pub fn trySiblingSweep(self: *ObjectHeap, id: ObjectId, min: u32, max: u32) bool {
+        switch (self.objects.getMut(id).*) {
+            .attrs => |*a| {
+                if (a.range.len < min or a.range.len >= max) return false;
+                if (a.sibling_swept) return false;
+                a.sibling_swept = true;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// TLAB reserve shared by the three range stores. When reclaim is active
     /// (`gc_collect_enabled`) a reused range is popped from the free list (see
     /// the callers) or a fresh chunk is bumped from the young region; if that
@@ -1052,6 +1080,7 @@ pub const ObjectHeap = struct {
             local.scav_head_local += 1;
             local.scav_head.store(local.scav_head_local, .release);
         }
+        if (object == .thunk) self.currentLocal().thunks_created += 1;
         // `-Dprof-main` creation-context probe: tag the thunk with whether
         // it was created on the demand chain (vs. inside speculative work).
         // Post-fill, pre-publish — no reader can observe the slot yet.
