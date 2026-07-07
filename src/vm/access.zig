@@ -73,7 +73,13 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
     const slot = &attr_cache[slot_idx];
     const token = self.heap.token;
     if (slot.heap_token == token and slot.obj_id == obj_id and slot.name_id == name_id) {
+        if (comptime prof.enabled) {
+            if (self.workerId() == 0) prof.attr_cache_hits += 1;
+        }
         return slot.value;
+    }
+    if (comptime prof.enabled) {
+        if (self.workerId() == 0) prof.attr_cache_misses += 1;
     }
 
     const raw = try self.heap.getAttrValue(obj_id, name_id);
@@ -115,7 +121,7 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     if (ok) sched.bumpSweeps(self.workerId());
 }
 
-const attr_cache_size: usize = 256;
+const attr_cache_size: usize = 8192;
 
 const AttrCacheSlot = struct {
     heap_token: u64 = 0,

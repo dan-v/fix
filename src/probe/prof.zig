@@ -124,6 +124,11 @@ pub const Disc = struct {
 };
 pub var disc: Disc = .{};
 
+/// Attr inline-cache hit/miss census (piggybacks on `-Dprof-main`).
+/// Main-thread-only writes (guarded at the call site); zero-cost off.
+pub var attr_cache_hits: u64 = 0;
+pub var attr_cache_misses: u64 = 0;
+
 /// Age-at-force probe (piggybacks on `-Dprof-main`). For every thunk
 /// main CLAIMS on its demand path, buckets the thunk's age (force TSC
 /// minus creation TSC — how long the thunk sat forcible before main
@@ -455,6 +460,16 @@ pub fn report(registry: anytype, intern: anytype) void {
         if (entry.cycles == 0) break;
         const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
         std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
+    }
+    // Attr inline-cache census.
+    {
+        const total = attr_cache_hits + attr_cache_misses;
+        if (total != 0) {
+            std.debug.print(
+                "prof attr-cache: lookups={d} hits={d} ({d:.1}%) misses={d}\n",
+                .{ total, attr_cache_hits, pct(attr_cache_hits, total), attr_cache_misses },
+            );
+        }
     }
     // Discovery-serialization breakdown of main's demand forces.
     {
