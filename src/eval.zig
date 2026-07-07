@@ -586,6 +586,15 @@ pub const Evaluator = struct {
             if (em.get("FIX_SCAV_WORKERS")) |s| {
                 if (std.fmt.parseInt(u8, s, 10)) |n| self.scheduler.scav_workers = n else |_| {}
             }
+            if (em.get("FIX_SCAV_MULT")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_take_mult = n else |_| {}
+            }
+            if (em.get("FIX_SCAV_SLACK")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_take_slack = n else |_| {}
+            }
+            if (em.get("FIX_SCAV_MINDEM")) |s| {
+                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_min_demand = n else |_| {}
+            }
             self.scheduler.setScavenge(scav_on, scav_margin);
             self.heap.scav_record = scav_on;
         }

@@ -655,6 +655,19 @@ var scav_hot_chunks: [SCAV_CHUNK_CAP]u8 = @splat(0);
 /// `FIX_SCAV_HOT` overrides.
 pub var scav_hot_threshold_cy: u64 = 100_000;
 
+/// Admission governor tunables (`FIX_SCAV_MULT` / `FIX_SCAV_SLACK`):
+/// the scavenger may take at most `demand * mult + slack` instances of a
+/// hot chunk. Junk volume (never-demanded whole-graph eval, the RSS
+/// blowup) scales with these; wins come from tightening them.
+pub var scav_take_mult: u32 = 2;
+pub var scav_take_slack: u32 = 16;
+/// Minimum observed demand count before a hot chunk is scavengeable at
+/// all (`FIX_SCAV_MINDEM`). Single-demand chunks are the junk-diversity
+/// source: their remaining instances are usually never demanded, and one
+/// take can force a whole never-demanded subgraph. Repeat-demanded
+/// chunks (module merges, byName bodies) are where conversion happens.
+pub var scav_min_demand: u32 = 0;
+
 /// Feedback governor: per chunk, how many instances MAIN has demanded
 /// vs how many the scavenger has taken. A chunk shared between demanded
 /// and junk instances (make-derivation bodies!) would otherwise let the
@@ -674,8 +687,9 @@ pub inline fn scavShouldTake(chunk_id: u32) bool {
     if (scav_hot_chunks[chunk_id] == 0) return false;
     const taken = scav_taken_n[chunk_id];
     const demand = scav_demand_n[chunk_id];
+    if (demand < scav_min_demand) return false;
     if (taken == std.math.maxInt(u16)) return false;
-    if (@as(u32, taken) >= @as(u32, demand) * 2 + 16) return false;
+    if (@as(u32, taken) >= @as(u32, demand) * scav_take_mult + scav_take_slack) return false;
     scav_taken_n[chunk_id] = taken + 1;
     return true;
 }
