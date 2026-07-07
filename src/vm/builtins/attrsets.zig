@@ -289,7 +289,9 @@ pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Va
         try entries.append(self.allocator, entry);
     }
 
-    return Value.attrs(try self.heap.addAttrs(entries.items));
+    // Surviving entries are a subsequence of the (sorted, unique) input,
+    // so the output is sorted+unique by construction — skip the re-sort.
+    return Value.attrs(try self.heap.addAttrsSorted(entries.items));
 }
 
 /// Binary search a sorted attr-entry slice by name (heap invariant:
