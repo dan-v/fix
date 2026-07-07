@@ -26,6 +26,7 @@ pub const gc = @import("runtime/gc.zig");
 pub const builtins = @import("runtime/builtins.zig");
 pub const file_cache = @import("runtime/file_cache.zig");
 pub const fetch_cache = @import("runtime/fetch_cache.zig");
+pub const block_cache = @import("runtime/block_cache.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Value = value.Value;
@@ -54,4 +55,5 @@ test {
     _ = builtins;
     _ = file_cache;
     _ = fetch_cache;
+    _ = block_cache;
 }

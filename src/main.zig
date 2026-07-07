@@ -15,6 +15,7 @@ const args = @import("cli/args.zig");
 const run = @import("cli/run.zig");
 const trace_setup = @import("cli/trace_setup.zig");
 const tjit_hot = @import("jit/hot.zig");
+const block_cache = @import("runtime").block_cache;
 const Evaluator = eval.Evaluator;
 
 const usage = args.usage;
@@ -40,7 +41,13 @@ pub fn main(init: std.process.Init) !void {
     // the fast std `gpa` untouched (perf numbers depend on it).
     var debug_gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer _ = debug_gpa.deinit();
-    const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else init.gpa;
+    // Release: wrap the gpa in the large-block reuse cache — SmpAllocator
+    // maps/unmaps every >=64KB allocation, and the eval's ~9K large
+    // temporaries otherwise re-minor-fault ~2GB of pages per run (>20% of
+    // w=1 wall in fault handling). See runtime/block_cache.zig.
+    var big_blocks = block_cache.BlockCacheAllocator.init(init.gpa);
+    defer big_blocks.deinit();
+    const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
     defer args_iter.deinit();
