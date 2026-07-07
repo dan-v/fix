@@ -21,6 +21,7 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_gc = @import("runtime").heap.heap_gc;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const regex_mod = @import("runtime").regex;
 const DerivationStore = @import("derivation").DerivationStore;
 const derivation = @import("derivation");
 const Value = @import("runtime").value.Value;
@@ -70,6 +71,8 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
+    /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
+    regexes: regex_mod.PatternCache,
     imports: imports_mod.Registry,
     search_paths: search_path_mod.Paths,
     /// One arena per worker. Each VM allocates its stack, frames, and
@@ -186,6 +189,7 @@ pub const Evaluator = struct {
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
+            .regexes = regex_mod.PatternCache.init(allocator),
             .imports = .{},
             .search_paths = .{},
             .worker_arenas = arenas,
@@ -341,6 +345,7 @@ pub const Evaluator = struct {
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
         self.derivations.deinit();
+        self.regexes.deinit();
         self.files.deinit();
         self.heap.deinit();
         for (self.worker_arenas) |*arena| arena.deinit();
@@ -856,6 +861,7 @@ pub const Evaluator = struct {
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.deferred_table = &self.deferred_table;
+        vm.regexes = &self.regexes;
         return vm;
     }
 

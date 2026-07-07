@@ -99,6 +99,11 @@ pub const VM = struct {
     /// (which never create `.deferred` thunks). See
     /// `compiler/deferred_table.zig`.
     deferred_table: ?*DeferredTable = null,
+    /// Evaluator-owned compiled-regex cache for `builtins.match`/`split`
+    /// (see `runtime.regex.PatternCache`). Set post-init by
+    /// `Evaluator.initVm`; null in standalone test VMs, which fall back
+    /// to compiling per call.
+    regexes: ?*@import("runtime").regex.PatternCache = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `jit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses

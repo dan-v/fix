@@ -513,6 +513,66 @@ fn matchesPosixClass(class: PosixClass, c: u8) bool {
     };
 }
 
+/// Compiled-pattern cache for the regex builtins (`builtins.match` /
+/// `builtins.split`). C++ Nix keeps the equivalent per-EvalState
+/// `regexCache`: NixOS evals call `match` thousands of times over a
+/// handful of distinct patterns, and compiling dwarfs matching for the
+/// short subjects involved. Keyed by the pattern text's InternId (the
+/// intern table dedupes by content, and its byte storage is stable, so
+/// compiled nodes may reference the source slice safely). Entries live
+/// until `deinit`. A compiled `Pattern` is immutable after `compile`
+/// (matching uses per-call scratch), so concurrent workers share them.
+pub const PatternCache = struct {
+    allocator: std.mem.Allocator,
+    mu: @import("stable_segments.zig").SpinMutex = .{},
+    map: std.AutoHashMapUnmanaged(u32, *Pattern) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) PatternCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *PatternCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |p| {
+            p.*.deinit();
+            self.allocator.destroy(p.*);
+        }
+        self.map.deinit(self.allocator);
+    }
+
+    /// The compiled pattern for `source` (interned under `key`),
+    /// compiling and caching on first use. Compile errors are not
+    /// cached — they propagate each time (regex errors are terminal
+    /// in practice, so the recompile cost is irrelevant).
+    pub fn get(self: *PatternCache, key: u32, source: []const u8) !*const Pattern {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const gop = try self.map.getOrPut(self.allocator, key);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer _ = self.map.remove(key);
+        const p = try self.allocator.create(Pattern);
+        errdefer self.allocator.destroy(p);
+        p.* = try Pattern.compile(self.allocator, source);
+        gop.value_ptr.* = p;
+        return p;
+    }
+};
+
+test "PatternCache returns the same compiled pattern for repeated keys" {
+    var cache = PatternCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const a = try cache.get(7, "a(b|c)*");
+    const b = try cache.get(7, "a(b|c)*");
+    try std.testing.expectEqual(a, b);
+
+    const other = try cache.get(9, "[[:digit:]]+");
+    try std.testing.expect(a != other);
+
+    const matched = (try a.matchFull(std.testing.allocator, "abcb")).?;
+    defer matched.deinit(std.testing.allocator);
+}
+
 test "regex match returns captures for full matches" {
     var pattern = try Pattern.compile(std.testing.allocator, "(.*)e?abi.*");
     defer pattern.deinit();

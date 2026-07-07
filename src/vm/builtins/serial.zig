@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
+const InternId = types.InternId;
 const heap_mod = @import("runtime").heap;
 const int_mod = @import("runtime").int;
 const version = @import("runtime").version;
@@ -489,15 +490,26 @@ pub fn builtinSplitVersion(self: anytype, arg: Value) !Value {
     return Value.list(try self.heap.addList(values));
 }
 
+/// Resolve the compiled pattern for a regex builtin: through the
+/// evaluator's shared `PatternCache` when wired (`owned` stays null),
+/// else compiled locally into `owned` (standalone test VMs), which the
+/// caller deinits via `defer`.
+fn resolvePattern(self: anytype, pattern_id: InternId, owned: *?regex.Pattern) !*const regex.Pattern {
+    if (self.regexes) |cache| return cache.get(pattern_id, self.intern.get(pattern_id));
+    owned.* = try regex.Pattern.compile(self.allocator, self.intern.get(pattern_id));
+    return &owned.*.?;
+}
+
 pub fn builtinMatch(self: anytype, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
-    const pattern_text = self.intern.get(try stringTextInternId(self, pattern_value));
+    const pattern_id = try stringTextInternId(self, pattern_value);
     const text = self.intern.get(try stringTextInternId(self, text_value));
 
-    var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
-    defer pattern.deinit();
+    var owned: ?regex.Pattern = null;
+    defer if (owned) |*p| p.deinit();
+    const pattern = try resolvePattern(self, pattern_id, &owned);
 
     const matched = (try pattern.matchFull(self.allocator, text)) orelse return Value.null_val;
     defer matched.deinit(self.allocator);
@@ -508,11 +520,12 @@ pub fn builtinSplit(self: anytype, regex_arg: Value, text_arg: Value) !Value {
     const pattern_value = try vm_force.forceValue(self, regex_arg);
     const text_value = try vm_force.forceValue(self, text_arg);
     if (!isPlainString(pattern_value) or !isPlainString(text_value)) return error.TypeError;
-    const pattern_text = self.intern.get(try stringTextInternId(self, pattern_value));
+    const pattern_id = try stringTextInternId(self, pattern_value);
     const text = self.intern.get(try stringTextInternId(self, text_value));
 
-    var pattern = try regex.Pattern.compile(self.allocator, pattern_text);
-    defer pattern.deinit();
+    var owned: ?regex.Pattern = null;
+    defer if (owned) |*p| p.deinit();
+    const pattern = try resolvePattern(self, pattern_id, &owned);
 
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);
