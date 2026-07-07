@@ -148,6 +148,11 @@ pub const Task = union(enum) {
     force_attrs_sweep: types.ObjectId,
 };
 
+/// Which queue a popped/stolen task came from. Purely informational —
+/// used by the `-Dprof-main` task census to attribute a `force_thunk`
+/// to its submission class (urgent fan-out vs novel-lane vs bulk spec).
+pub const Lane = enum(u8) { urgent, novel, spec };
+
 pub const ForceListRange = struct {
     list_id: types.ObjectId,
     offset: u32,
@@ -1450,11 +1455,18 @@ pub const Scheduler = struct {
     /// speculative. Every worker — main and helpers — owns both
     /// queues post-F1.
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
+        return self.popLane(worker_id, null);
+    }
+
+    /// `pop`, additionally reporting which lane the task came from (for
+    /// the `-Dprof-main` task census). `lane` may be null.
+    pub fn popLane(self: *Scheduler, worker_id: u8, lane: ?*Lane) ?Task {
         if (worker_id >= self.worker_count) return null;
         const t0 = rdtscScan();
         const traced: TracedTask = blk: {
             if (self.urgent_queues[worker_id].pop()) |t| {
                 _ = self.urgent_pending.v.fetchSub(1, .monotonic);
+                if (lane) |l| l.* = .urgent;
                 break :blk t;
             }
             // Lane masks also spare the OWN-pop mutex locks: the novel
@@ -1465,10 +1477,16 @@ pub const Scheduler = struct {
             // ring's mutex) modulo a racing steal, which the pop re-checks.
             const own_bit: u64 = if (worker_id < 64) @as(u64, 1) << @intCast(worker_id) else 0;
             if (worker_id >= 64 or self.novel_mask.v.load(.monotonic) & own_bit != 0) {
-                if (self.novel_queues[worker_id].popNewest(&self.novel_mask.v)) |t| break :blk t;
+                if (self.novel_queues[worker_id].popNewest(&self.novel_mask.v)) |t| {
+                    if (lane) |l| l.* = .novel;
+                    break :blk t;
+                }
             }
             if (worker_id >= 64 or self.spec_mask.v.load(.monotonic) & own_bit != 0) {
-                if (self.spec_queues[worker_id].popNewest(&self.spec_mask.v)) |t| break :blk t;
+                if (self.spec_queues[worker_id].popNewest(&self.spec_mask.v)) |t| {
+                    if (lane) |l| l.* = .spec;
+                    break :blk t;
+                }
             }
             scanEnd("pop_own", t0, false);
             return null;
@@ -1482,7 +1500,7 @@ pub const Scheduler = struct {
     /// Try to steal one task from any worker's queues, urgent first
     /// then speculative, excluding the caller's own (`worker_id`).
     pub fn stealForWorker(self: *Scheduler, worker_id: u8) ?Task {
-        return self.stealAnyVictimOpt(worker_id, null, null);
+        return self.stealAnyVictimOpt(worker_id, null, null, null);
     }
 
     /// Alias for `stealForWorker` — workers use this from their drain
@@ -1497,10 +1515,15 @@ pub const Scheduler = struct {
     /// stealing flow arrow anchored to the producing quantum. The scheduler
     /// stays free of the probe layer (it returns data, not events).
     pub fn stealAnyVictim(self: *Scheduler, worker_id: u8, victim: *u8, push_ts: *u64) ?Task {
-        return self.stealAnyVictimOpt(worker_id, victim, push_ts);
+        return self.stealAnyVictimOpt(worker_id, victim, push_ts, null);
     }
 
-    fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
+    /// `stealAnyVictim`, additionally reporting the lane (task census).
+    pub fn stealAnyVictimLane(self: *Scheduler, worker_id: u8, victim: *u8, push_ts: *u64, lane: ?*Lane) ?Task {
+        return self.stealAnyVictimOpt(worker_id, victim, push_ts, lane);
+    }
+
+    fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64, lane: ?*Lane) ?Task {
         if (self.worker_count < 2) return null;
         // Per-lane stealable-work summaries: one load per class replaces
         // the O(N) per-peer probe walk when the class has nothing queued
@@ -1510,6 +1533,7 @@ pub const Scheduler = struct {
             if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| {
                 _ = self.urgent_pending.v.fetchSub(1, .monotonic);
                 scanEnd("urgent_steal", t0, true);
+                if (lane) |l| l.* = .urgent;
                 return t;
             }
             scanEnd("urgent_steal", t0, false);
@@ -1519,6 +1543,7 @@ pub const Scheduler = struct {
             const t1 = rdtscScan();
             if (self.stealSpecExcluding(self.novel_queues, &self.novel_mask.v, worker_id, true, victim, push_ts)) |t| {
                 scanEnd("novel_steal", t1, true);
+                if (lane) |l| l.* = .novel;
                 return t;
             }
             scanEnd("novel_steal", t1, false);
@@ -1527,6 +1552,7 @@ pub const Scheduler = struct {
             const t2 = rdtscScan();
             if (self.stealSpecExcluding(self.spec_queues, &self.spec_mask.v, worker_id, self.spec_lifo, victim, push_ts)) |t| {
                 scanEnd("spec_steal", t2, true);
+                if (lane) |l| l.* = .spec;
                 return t;
             }
             scanEnd("spec_steal", t2, false);

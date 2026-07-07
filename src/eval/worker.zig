@@ -137,6 +137,10 @@ pub const WorkerFiber = struct {
     /// and consumed under `run_mu` (runFiber's state switch), reset before
     /// the fiber is recycled.
     census_suspends: if (census_on) u32 else void = if (census_on) 0 else {},
+    /// Task census: submission class of `current_task`/`current_cont`
+    /// (spec/novel/urgent force_thunk, scavenge, range, sweep, cont).
+    /// Set alongside the task assignment; read by the fiber entry.
+    census_class: if (census_on) prof.TaskClass else void = if (census_on) .spec_thunk else {},
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*WorkerFiber,
     /// Ready-queue node (scheduler-owned linked list). Set by
@@ -384,10 +388,20 @@ pub const Worker = struct {
         }
         var victim: ?u8 = null;
         var push_ts: u64 = 0;
-        if (self.pickTask(&victim, &push_ts)) |task| {
+        var lane: scheduler_mod.Lane = .spec;
+        if (self.pickTask(&victim, &push_ts, &lane)) |task| {
             const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = task;
+            if (comptime census_on) f.census_class = switch (task) {
+                .force_thunk => switch (lane) {
+                    .urgent => .urgent_thunk,
+                    .novel => .novel_thunk,
+                    .spec => .spec_thunk,
+                },
+                .force_list_range => .list_range,
+                .force_attrs_sweep => .attrs_sweep,
+            };
             // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
             // the producer end to `push_ts` — the moment the victim *pushed* this
             // task — so the arrow originates from the quantum that created the
@@ -419,6 +433,7 @@ pub const Worker = struct {
             const f = try self.acquireFreeFiber();
             f.current_cont = cont;
             f.current_task = null;
+            if (comptime census_on) f.census_class = .cont;
             f.flow_in_id = 0;
             f.inner.reset(contEntry, @ptrCast(f));
             if (comptime census_on) {
@@ -490,6 +505,7 @@ pub const Worker = struct {
             const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = .{ .force_thunk = id };
+            if (comptime census_on) f.census_class = .scav_thunk;
             f.flow_in_id = 0;
             f.inner.reset(slotEntry, @ptrCast(f));
             if (comptime census_on) {
@@ -729,15 +745,15 @@ pub const Worker = struct {
 
     /// Pick a task from own queues (not stolen → `victim` stays null) or steal
     /// one (→ `victim.*` = the victim worker id, for the timeline flow arrow).
-    fn pickTask(self: *Worker, victim: *?u8, push_ts: *u64) ?Task {
+    fn pickTask(self: *Worker, victim: *?u8, push_ts: *u64, lane: *scheduler_mod.Lane) ?Task {
         // Once a top-level result is ready, don't start new background
         // work — only drive already-suspended fibers to completion. Bounds
         // the dead-speculation tail (see Scheduler.suppress_background).
         if (self.scheduler.backgroundSuppressed()) return null;
-        if (self.scheduler.pop(self.worker_id)) |t| return t;
+        if (self.scheduler.popLane(self.worker_id, lane)) |t| return t;
         var v: u8 = 0;
         var pts: u64 = 0;
-        if (self.scheduler.stealAnyVictim(self.worker_id, &v, &pts)) |t| {
+        if (self.scheduler.stealAnyVictimLane(self.worker_id, &v, &pts, lane)) |t| {
             victim.* = v;
             push_ts.* = pts;
             return t;
@@ -885,6 +901,59 @@ fn slotEntry(arg: *anyopaque) void {
     f.local_trace.clear();
     f.vm.trace = &f.local_trace;
     defer f.vm.trace = saved_trace;
+    if (comptime census_on) {
+        var live: u64 = 0;
+        var total: u64 = 0;
+        var busy = false;
+        censusScanTask(f, task, &live, &total, &busy);
+        const t0 = fiber_mod.censusNow();
+        runTask(f, task);
+        prof.taskCensusRecord(f.census_class, live, total, busy, fiber_mod.censusNow() -| t0);
+    } else {
+        runTask(f, task);
+    }
+}
+
+/// Task census pre-scan: how much unresolved work does this task find on
+/// arrival? `total` = thunk-typed items it covers; `live` = those still
+/// `.unresolved`; `busy` = a force_thunk target currently `.evaluating`
+/// (owned by another fiber — this task can only spin/enroll). Racy-benign:
+/// a state can flip between the scan and the force; the census is
+/// approximate by design.
+fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *bool) void {
+    const heap = f.vm.heap;
+    const unresolved = @intFromEnum(thunk_mod.FutureState.unresolved);
+    switch (task) {
+        .force_thunk => |thunk_id| {
+            total.* = 1;
+            const st = heap.getThunkAssumeValid(thunk_id).future.state.load(.monotonic);
+            if (st == unresolved) live.* = 1;
+            if (st == @intFromEnum(thunk_mod.FutureState.evaluating)) busy.* = true;
+        },
+        .force_list_range => |range| {
+            const items = heap.getList(range.list_id) catch return;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), items.len);
+            var i: usize = range.offset;
+            while (i < end) : (i += 1) {
+                if (!items[i].isThunk()) continue;
+                total.* += 1;
+                if (heap.getThunkAssumeValid(items[i].asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+            }
+        },
+        .force_attrs_sweep => |attrs_id| {
+            const entries = heap.getAttrs(attrs_id) catch return;
+            for (entries) |entry| {
+                if (!entry.value.isThunk()) continue;
+                total.* += 1;
+                if (heap.getThunkAssumeValid(entry.value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+            }
+        },
+    }
+}
+
+/// Run one scheduled task's body (the entry's dispatch switch, factored
+/// out so the census wrapper can bracket it without duplicating arms).
+fn runTask(f: *WorkerFiber, task: Task) void {
     switch (task) {
         .force_thunk => |thunk_id| {
             const v = Value.thunk(thunk_id);
@@ -1008,7 +1077,46 @@ fn contEntry(arg: *anyopaque) void {
     f.local_trace.clear();
     f.vm.trace = &f.local_trace;
     defer f.vm.trace = saved_trace;
-    vm_force.forceContinuation(&f.vm, cont);
+    if (comptime census_on) {
+        var live: u64 = 0;
+        var total: u64 = 0;
+        censusScanCont(f, cont, &live, &total);
+        const t0 = fiber_mod.censusNow();
+        vm_force.forceContinuation(&f.vm, cont);
+        prof.taskCensusRecord(.cont, live, total, false, fiber_mod.censusNow() -| t0);
+    } else {
+        vm_force.forceContinuation(&f.vm, cont);
+    }
+}
+
+/// Census pre-scan for a stolen work-first continuation (see
+/// `censusScanTask`): thunk-typed items in `[lo, hi)` and how many are
+/// still unresolved on arrival.
+fn censusScanCont(f: *WorkerFiber, cont: Continuation, live: *u64, total: *u64) void {
+    const heap = f.vm.heap;
+    const unresolved = @intFromEnum(thunk_mod.FutureState.unresolved);
+    switch (cont.kind) {
+        .list => {
+            const items = heap.getList(cont.id) catch return;
+            const end = @min(@as(usize, cont.hi), items.len);
+            var i: usize = cont.lo;
+            while (i < end) : (i += 1) {
+                if (!items[i].isThunk()) continue;
+                total.* += 1;
+                if (heap.getThunkAssumeValid(items[i].asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+            }
+        },
+        .attrs => {
+            const entries = heap.getAttrs(cont.id) catch return;
+            const end = @min(@as(usize, cont.hi), entries.len);
+            var i: usize = cont.lo;
+            while (i < end) : (i += 1) {
+                if (!entries[i].value.isThunk()) continue;
+                total.* += 1;
+                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+            }
+        },
+    }
 }
 
 // ---- Tests ----

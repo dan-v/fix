@@ -230,6 +230,77 @@ pub inline fn fiberLiveDec() void {
     _ = fib_live.fetchSub(1, .monotonic);
 }
 
+/// Per-task-class census (piggybacks on `-Dprof-main`). Every SCHEDULED
+/// work item pays a fixed dispatch cost (queue push + wake + steal +
+/// fiber acquire/reset/swap) before any useful work; this census sizes
+/// what each task CLASS actually delivers per item:
+///   - counts per class (creation-spec / novel-lane / urgent fan-out
+///     force_thunk, scavenged force_thunk, list ranges, attr sweeps,
+///     work-first continuations);
+///   - the no-op rate: tasks whose target was ALREADY fully resolved on
+///     arrival (pure scheduling overhead);
+///   - the useful-work cycle distribution (log2 buckets) for the rest.
+/// Recorded at fiber entry (slotEntry/contEntry) from any worker —
+/// shared atomics, monotonic; the write rate is one task, not one
+/// force, so contention is negligible next to the work itself. Cycles
+/// are wall-rdtsc across the task INCLUDING suspended time (98.4% of
+/// tasks never suspend, so the tail barely smears the histogram).
+pub const TaskClass = enum(u8) {
+    /// Creation-time speculative `force_thunk` (bulk spec lane).
+    spec_thunk,
+    /// First-instance-of-chunk `force_thunk` (novel lane, FIX_SPEC_NOVEL).
+    novel_thunk,
+    /// Demand fan-out `force_thunk` (urgent lane: fanOutAttrsShallow,
+    /// drv-attr fan-out, strictness-driven submits).
+    urgent_thunk,
+    /// Idle-scavenger `force_thunk` (FIX_SCAVENGE; default off).
+    scav_thunk,
+    /// `force_list_range` batch (urgent lane).
+    list_range,
+    /// `force_attrs_sweep` whole-set sweep (FIX_SIBLING).
+    attrs_sweep,
+    /// Stolen work-first continuation (FIX_WORK_FIRST).
+    cont,
+};
+pub const TASK_CLASS_COUNT = @typeInfo(TaskClass).@"enum".fields.len;
+pub const TC_CY_BUCKETS = 26; // bucket i = task cycles in [2^i, 2^(i+1))
+
+const AtomicU64 = std.atomic.Value(u64);
+const tc_zero: AtomicU64 = AtomicU64.init(0);
+/// Tasks seen per class.
+pub var tc_n: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+/// Of `tc_n`, tasks that found ZERO unresolved work on arrival.
+pub var tc_noop: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+/// force_thunk tasks whose target arrived `.evaluating` (another fiber
+/// owns it — the task can only spin/enroll, never compute).
+pub var tc_busy: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+/// Items covered by range/sweep tasks (1 for force_thunk) and how many
+/// of those were still unresolved thunks on arrival.
+pub var tc_items: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_items_live: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+/// Task cycles, split by whether the task had any unresolved work.
+pub var tc_cy_useful: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_cy_noop: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+/// log2 histogram of per-task cycles for tasks WITH work.
+pub var tc_hist: [TASK_CLASS_COUNT][TC_CY_BUCKETS]AtomicU64 = @splat(@splat(tc_zero));
+
+pub fn taskCensusRecord(class: TaskClass, live_items: u64, total_items: u64, arrived_busy: bool, cycles: u64) void {
+    if (!enabled) return;
+    const ci = @intFromEnum(class);
+    _ = tc_n[ci].fetchAdd(1, .monotonic);
+    _ = tc_items[ci].fetchAdd(total_items, .monotonic);
+    _ = tc_items_live[ci].fetchAdd(live_items, .monotonic);
+    if (arrived_busy) _ = tc_busy[ci].fetchAdd(1, .monotonic);
+    if (live_items == 0) {
+        _ = tc_noop[ci].fetchAdd(1, .monotonic);
+        _ = tc_cy_noop[ci].fetchAdd(cycles, .monotonic);
+        return;
+    }
+    _ = tc_cy_useful[ci].fetchAdd(cycles, .monotonic);
+    const lg: usize = if (cycles == 0) 0 else @min(63 - @clz(cycles), TC_CY_BUCKETS - 1);
+    _ = tc_hist[ci][lg].fetchAdd(1, .monotonic);
+}
+
 /// Age-at-force probe (piggybacks on `-Dprof-main`). For every thunk
 /// main CLAIMS on its demand path, buckets the thunk's age (force TSC
 /// minus creation TSC — how long the thunk sat forcible before main
@@ -624,6 +695,42 @@ pub fn report(registry: anytype, intern: anytype) void {
                 }
             }
             std.debug.print(" (max={d})\n", .{fib_live_max.load(.monotonic)});
+        }
+    }
+    // Per-task-class census: what each scheduled item delivered.
+    {
+        var any: u64 = 0;
+        for (&tc_n) |*n| any += n.load(.monotonic);
+        if (any != 0) {
+            std.debug.print("prof task-census (per scheduled item; cycles incl. suspended wall):\n", .{});
+            var ci: usize = 0;
+            while (ci < TASK_CLASS_COUNT) : (ci += 1) {
+                const n = tc_n[ci].load(.monotonic);
+                if (n == 0) continue;
+                const noop = tc_noop[ci].load(.monotonic);
+                const busy = tc_busy[ci].load(.monotonic);
+                const items = tc_items[ci].load(.monotonic);
+                const live = tc_items_live[ci].load(.monotonic);
+                const cy_u = tc_cy_useful[ci].load(.monotonic);
+                const cy_n = tc_cy_noop[ci].load(.monotonic);
+                const useful_n = n - noop;
+                std.debug.print(
+                    "  {s}: n={d} noop={d} ({d:.1}%) busy_arrival={d} items={d} live_items={d} ({d:.1}%) useful_cy={d} (avg={d}) noop_cy={d} (avg={d})\n",
+                    .{
+                        @tagName(@as(TaskClass, @enumFromInt(ci))),
+                        n,    noop, pct(noop, n), busy, items, live, pct(live, items),
+                        cy_u, if (useful_n == 0) 0 else cy_u / useful_n,
+                        cy_n, if (noop == 0) 0 else cy_n / noop,
+                    },
+                );
+                std.debug.print("    cy-hist:", .{});
+                for (&tc_hist[ci], 0..) |*b, i| {
+                    const v = b.load(.monotonic);
+                    if (v == 0) continue;
+                    std.debug.print(" [2^{d}]={d}", .{ i, v });
+                }
+                std.debug.print("\n", .{});
+            }
         }
     }
     // Discovery-serialization breakdown of main's demand forces.
