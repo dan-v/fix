@@ -599,6 +599,7 @@ pub fn report() void {
     // runner (the tjit work hit this). Stay silent under the test runner.
     if (builtin.is_test) return;
     std.debug.print("\n=== GC (-Dgc, stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
+    std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(heap_mod.ObjectHeap.gc_budget_bytes)});
     std.debug.print("collections: {d}\n", .{collections});
     std.debug.print("objects freed (total): {d}\n", .{objects_freed_total});
     std.debug.print("live after last collect: {d:.1} MB\n", .{mb(last_live_bytes)});

@@ -25,19 +25,22 @@ const Value = @import("../value.zig").Value;
 
 const gc_debug = heap_mod.gc_debug;
 
-/// Turn on reclaim (alloc-bitmap maintenance + free-list reuse +
-/// sweep) with an initial threshold. The evaluator calls this only at
-/// `--workers=1` (alloc-bitmap maintenance isn't yet thread-safe).
-pub fn enableCollect(heap: *ObjectHeap, initial_threshold: u64, step_bytes: u64) void {
+/// Turn on reclaim (alloc-bitmap maintenance + free-list reuse + sweep)
+/// with a memory `budget` (the reserved-bytes ceiling the collector
+/// defends — see `ObjectHeap.gc_budget_bytes`). `step_bytes` > 0 is the
+/// validation override: collect every that-many bytes of fresh allocation
+/// from a low starting threshold, ignoring the budget.
+pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     if (comptime !build_options.gc) return;
     heap.gc_collect_enabled = true;
     ObjectHeap.gc_step_bytes = step_bytes;
+    ObjectHeap.gc_budget_bytes = budget;
     // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
     // in place; there is no nursery to fill/reset). `gcNurseryFull` now only
     // requests a collect once the cursor has grown a headroom past the last
     // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
     // every TLAB refill.
-    heap.gc_threshold_bytes = initial_threshold;
+    heap.gc_threshold_bytes = if (step_bytes > 0) ObjectHeap.GC_MIN_THRESHOLD else budget;
     heap.gc_track_from = heap.objects.count();
     // Flush each worker's TLABs so the first post-enable allocation refills
     // fresh instead of draining a leftover chunk carried over from bootstrap.
@@ -89,10 +92,16 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     if (comptime !build_options.gc) return;
     _ = live_bytes;
     heap.gc_collect_requested = false;
+    // Post-collect headroom scales with the budget (an eighth, clamped to
+    // [64 MB, GC_HEADROOM]): a small-RAM budget must not grant itself a
+    // flat 1 GB of growth per cycle, and a huge budget needn't collect
+    // every 64 MB once it has (somehow) been crossed.
+    const budget = ObjectHeap.gc_budget_bytes;
+    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.GC_HEADROOM);
     heap.gc_threshold_bytes = if (ObjectHeap.gc_step_bytes > 0)
         heap.totalReservedBytes() + ObjectHeap.gc_step_bytes
     else
-        @max(ObjectHeap.GC_MIN_THRESHOLD, heap.totalReservedBytes() + ObjectHeap.GC_HEADROOM);
+        @max(budget, heap.totalReservedBytes() + headroom);
     // Invalidate all thread-local caches (thunk memo, attr IC, call IC)
     // that key on `token`: they hold Values weakly (not GC roots), so a
     // swept object could still be reachable through a stale cache slot.

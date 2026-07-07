@@ -135,6 +135,12 @@ pub const Evaluator = struct {
     /// every minor was ~77% of the serial root-scan. A future MAJOR resets this
     /// to 0 (a full mark re-scans every constant).
     gc_chunks_scanned: if (gc.enabled) ChunkId else void = if (gc.enabled) 0 else {},
+    /// GC (`-Dgc`): `--max-memory` override for the collector's memory
+    /// budget, in bytes (0 = never collect). `null` = resolve the default
+    /// (`FIX_MAX_MEMORY`, else half of MemAvailable) — see
+    /// `eval/gc.zig:memoryBudget`. Set by the CLI before evaluation;
+    /// ignored by non-`-Dgc` builds.
+    max_memory_bytes: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -891,7 +897,15 @@ pub const Evaluator = struct {
                         if (std.fmt.parseInt(u64, s, 10)) |mb| step_bytes = mb << 20 else |_| {}
                     }
                 }
-                heap_gc.enableCollect(&self.heap, ObjectHeap.GC_MIN_THRESHOLD, step_bytes);
+                // Memory budget: no collection runs until heap-reserved bytes
+                // cross it (`--max-memory` / `FIX_MAX_MEMORY`; default half of
+                // MemAvailable). On a big-RAM machine that is never — zero
+                // pauses; on a small-RAM device it fires before the eval OOMs.
+                // Budget 0 = never collect (leave reclaim disabled entirely:
+                // no young-slot tracking, no free-list checks — bump-only).
+                const budget = eval_gc.memoryBudget(self);
+                if (budget > 0 or step_bytes > 0)
+                    heap_gc.enableCollect(&self.heap, budget, step_bytes);
             }
         }
         return w;

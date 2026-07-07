@@ -85,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
     ev.pipe_operators_enabled = options.pipe_operators;
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
+    ev.max_memory_bytes = options.max_memory;
     ev.setEnvironment(init.environ_map);
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);

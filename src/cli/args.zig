@@ -3,6 +3,7 @@
 const std = @import("std");
 const cli = @import("../cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
+const eval_gc = @import("../eval/gc.zig");
 
 pub const usage =
     \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)
@@ -22,6 +23,9 @@ pub const usage =
     \\                         only show derivations with exactly NAME
     \\  --debug-derivation-drv PATH
     \\                         only show the derivation with exactly PATH
+    \\  --max-memory SIZE      memory budget before garbage collection kicks in
+    \\                         (MiB, or with a k/m/g suffix; 0 = never collect;
+    \\                         default: half of MemAvailable). -Dgc builds only.
     \\  --show-trace           show full evaluation traces
     \\  --color[=when]         color diagnostics: auto, always, never
     \\  --no-color             disable color diagnostics
@@ -63,6 +67,10 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
+    /// GC (`-Dgc`) memory budget in bytes (`--max-memory`); see
+    /// `eval/gc.zig:memoryBudget`. `null` = resolve the default at eval
+    /// setup; `0` = never collect.
+    max_memory: ?u64 = null,
     /// Speculation (eager background thunk forcing) is ON by default: it is
     /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
     /// 2.10→1.43s without), and the RSS it costs is absorbed by the GC without
@@ -158,6 +166,11 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
         } else if (std.mem.eql(u8, arg, "--vm-trace-main-only")) {
             options.vm_trace_main_only = true;
+        } else if (std.mem.eql(u8, arg, "--max-memory")) {
+            const text = args_iter.next() orelse return error.MissingMaxMemory;
+            options.max_memory = eval_gc.parseMemorySize(text) orelse return error.InvalidMaxMemory;
+        } else if (std.mem.startsWith(u8, arg, "--max-memory=")) {
+            options.max_memory = eval_gc.parseMemorySize(arg["--max-memory=".len..]) orelse return error.InvalidMaxMemory;
         } else if (std.mem.eql(u8, arg, "--workers")) {
             const text = args_iter.next() orelse return error.MissingWorkers;
             options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
@@ -211,6 +224,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.MissingWorkers => "missing N after --workers",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
+        error.MissingMaxMemory => "missing size after --max-memory",
+        error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };

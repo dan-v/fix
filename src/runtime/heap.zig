@@ -1232,6 +1232,15 @@ pub const ObjectHeap = struct {
     /// owns the env map) via the `step_bytes` arg to `gcEnableCollect`.
     pub var gc_step_bytes: u64 = 0;
 
+    /// Memory budget (`--max-memory` / `FIX_MAX_MEMORY`, `-Dgc` only): the
+    /// heap-reserved-bytes ceiling the collector defends. No collection runs
+    /// until reserved bytes cross it, so on a machine whose budget exceeds
+    /// the eval's total allocation the collector never fires (zero pauses);
+    /// on a small-RAM device it kicks in before the eval OOMs. Defaults to
+    /// half of `MemAvailable` (see `eval/gc.zig:memoryBudget`). Set via the
+    /// `budget` arg to `gcEnableCollect`.
+    pub var gc_budget_bytes: u64 = 0;
+
     /// A/B knob (`FIX_GC_NOREUSE`): skip free-list reuse on the allocation hot
     /// paths (bump-allocate instead). Measurement only — loses the RSS bound.
     /// Lets us isolate reclaim's reuse cost/benefit. Set from the evaluator.

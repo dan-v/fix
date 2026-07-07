@@ -152,6 +152,95 @@ pub fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+// --- memory budget (the collection-threshold policy) ----------------------
+//
+// Deliberately simple (owner's brief): one number — the heap-reserved-bytes
+// ceiling the collector defends. On a big-RAM machine the default budget
+// dwarfs any eval, so the collector never fires and a `-Dgc` build behaves
+// like a non-gc build; on a small-RAM device collections start well before
+// the eval OOMs. One flag (`--max-memory`) / env var (`FIX_MAX_MEMORY`)
+// overrides it; `0` disables collection outright.
+
+/// Parse a `--max-memory` / `FIX_MAX_MEMORY` size: a decimal integer with an
+/// optional k/m/g (KiB/MiB/GiB) suffix; a bare integer is MiB. Returns bytes,
+/// or null if malformed.
+pub fn parseMemorySize(text: []const u8) ?u64 {
+    if (text.len == 0) return null;
+    var num = text;
+    var mult: u64 = 1 << 20; // bare integer = MiB
+    switch (text[text.len - 1]) {
+        'k', 'K' => {
+            mult = 1 << 10;
+            num = text[0 .. text.len - 1];
+        },
+        'm', 'M' => {
+            mult = 1 << 20;
+            num = text[0 .. text.len - 1];
+        },
+        'g', 'G' => {
+            mult = 1 << 30;
+            num = text[0 .. text.len - 1];
+        },
+        else => {},
+    }
+    const n = std.fmt.parseInt(u64, num, 10) catch return null;
+    return n *| mult;
+}
+
+/// Resolve the memory budget: `--max-memory` if given, else `FIX_MAX_MEMORY`,
+/// else half of `/proc/meminfo` MemAvailable (fallbacks: half of MemTotal,
+/// then 2 GiB). Half, because the budget bounds only the four heap stores —
+/// side allocations (chunks, interner, strings, thread stacks) ride on top,
+/// and other processes need to keep running.
+pub fn memoryBudget(ev: anytype) u64 {
+    if (ev.max_memory_bytes) |b| return b;
+    if (ev.env_map) |em| if (em.get("FIX_MAX_MEMORY")) |s|
+        if (parseMemorySize(s)) |b| return b;
+    return halfSystemMemory() orelse (2 << 30);
+}
+
+/// Half of MemAvailable (fallback: MemTotal) from /proc/meminfo, in bytes.
+fn halfSystemMemory() ?u64 {
+    var buf: [8192]u8 = undefined;
+    const linux = std.os.linux;
+    const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
+    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+    if (fd < 0) return null;
+    defer _ = linux.close(fd);
+    const n = linux.read(fd, &buf, buf.len);
+    const rd: isize = @bitCast(n);
+    if (rd <= 0) return null;
+    const text = buf[0..@intCast(rd)];
+    if (meminfoKb(text, "MemAvailable:")) |kb| return (kb << 10) / 2;
+    if (meminfoKb(text, "MemTotal:")) |kb| return (kb << 10) / 2;
+    return null;
+}
+
+/// Extract `<key>   <n> kB` from /proc/meminfo text.
+fn meminfoKb(text: []const u8, key: []const u8) ?u64 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        var it = std.mem.tokenizeScalar(u8, line[key.len..], ' ');
+        const tok = it.next() orelse return null;
+        return std.fmt.parseInt(u64, tok, 10) catch null;
+    }
+    return null;
+}
+
+test "parseMemorySize accepts bare-MiB and k/m/g suffixes, rejects junk" {
+    try std.testing.expectEqual(@as(?u64, 512 << 20), parseMemorySize("512"));
+    try std.testing.expectEqual(@as(?u64, 4 << 30), parseMemorySize("4g"));
+    try std.testing.expectEqual(@as(?u64, 4 << 30), parseMemorySize("4G"));
+    try std.testing.expectEqual(@as(?u64, 64 << 20), parseMemorySize("64m"));
+    try std.testing.expectEqual(@as(?u64, 128 << 10), parseMemorySize("128k"));
+    try std.testing.expectEqual(@as(?u64, 0), parseMemorySize("0"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemorySize(""));
+    try std.testing.expectEqual(@as(?u64, null), parseMemorySize("g"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemorySize("12x"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemorySize("-1"));
+}
+
 /// Mark all GC roots into `tr` (without draining). See docs/plans/gc-plan.md.
 pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     if (ev.builtins_value) |b| tr.markValue(&ev.heap, b);
