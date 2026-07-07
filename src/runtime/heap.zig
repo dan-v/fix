@@ -1654,8 +1654,84 @@ pub const ObjectHeap = struct {
         const reserved = try self.reserveAttrsLocal(cap);
         const dst = self.attrs.sliceMut(reserved);
         var out: usize = 0;
+        if (n > @bitSizeOf(usize)) {
+            // Leaf sets wider than the cursor bitmask (only reachable via
+            // deeply-nested overlay-of-overlay chains) take the simple
+            // per-name walk.
+            out = kwayMergeWide(slices, cursors, dst);
+        } else while (true) {
+            // One scan: the smallest name across all cursors, the set of
+            // leaves sitting on it (bitmask — depth is bounded, so k is
+            // small), and the smallest name any OTHER leaf is at (`next`).
+            // Every remaining name < `next` lives only in min-name leaves
+            // (a leaf's cursor is its minimum remaining name).
+            var min_name: InternId = undefined;
+            var mask: usize = 0;
+            var next: InternId = std.math.maxInt(InternId);
+            for (slices, cursors, 0..) |s, c, i| {
+                if (c >= s.len) continue;
+                const nm = s[c].name;
+                if (mask == 0 or nm < min_name) {
+                    if (mask != 0 and min_name < next) next = min_name;
+                    min_name = nm;
+                    mask = @as(usize, 1) << @intCast(i);
+                } else if (nm == min_name) {
+                    mask |= @as(usize, 1) << @intCast(i);
+                } else if (nm < next) {
+                    next = nm;
+                }
+            }
+            if (mask == 0) break;
+            // Highest-indexed (newest) leaf at `min_name` wins its entry.
+            const winner: usize = @bitSizeOf(usize) - 1 - @clz(mask);
+            if (mask & (mask - 1) == 0) {
+                // `min_name` is unique to one leaf: every entry with a name
+                // < `next` is too. Bulk-copy that whole run instead of
+                // re-scanning all cursors per entry — overlay leaves are
+                // typically tiny next to the accumulated base, so runs are
+                // long and this skips almost all per-entry scans.
+                const s = slices[winner];
+                var end = cursors[winner] + 1;
+                // Gallop: exponential probe, then binary search for the
+                // first entry >= `next`.
+                var step: usize = 1;
+                while (end + step <= s.len and s[end + step - 1].name < next) {
+                    end += step;
+                    step *= 2;
+                }
+                var hi = @min(end + step - 1, s.len);
+                while (end < hi) {
+                    const mid = end + (hi - end) / 2;
+                    if (s[mid].name < next) end = mid + 1 else hi = mid;
+                }
+                const run = s[cursors[winner]..end];
+                @memcpy(dst[out..][0..run.len], run);
+                out += run.len;
+                cursors[winner] = end;
+            } else {
+                dst[out] = slices[winner][cursors[winner]];
+                out += 1;
+                var rest = mask;
+                while (rest != 0) {
+                    const i = @ctz(rest);
+                    cursors[i] += 1;
+                    rest &= rest - 1;
+                }
+            }
+        }
+
+        const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
+        return self.add(.{ .attrs = .{ .range = range } });
+    }
+
+    /// Per-name k-way merge for leaf counts too wide for the bitmask fast
+    /// path in `kwayMergeLeaves`. Identical output: at each smallest
+    /// remaining name the highest-indexed (newest) leaf wins; every cursor
+    /// at that name advances. Returns the number of entries written.
+    fn kwayMergeWide(slices: []const []const AttrEntry, cursors: []usize, dst: []AttrEntry) usize {
+        const n = slices.len;
+        var out: usize = 0;
         while (true) {
-            // Smallest name still available across all cursors.
             var min_name: ?InternId = null;
             for (slices, cursors) |s, c| {
                 if (c < s.len) {
@@ -1664,8 +1740,6 @@ pub const ObjectHeap = struct {
                 }
             }
             const name = min_name orelse break;
-            // Among leaves positioned at `name`, the last (newest) wins;
-            // advance every cursor sitting on `name`.
             var winner: usize = 0;
             var i: usize = 0;
             while (i < n) : (i += 1) {
@@ -1680,9 +1754,7 @@ pub const ObjectHeap = struct {
                 if (cursors[i] < slices[i].len and slices[i][cursors[i]].name == name) cursors[i] += 1;
             }
         }
-
-        const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
-        return self.add(.{ .attrs = .{ .range = range } });
+        return out;
     }
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
