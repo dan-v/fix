@@ -210,7 +210,16 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
     // can cascade into the rest of the dependency graph.
     const saved = self.in_speculation;
     self.in_speculation = true;
-    defer self.in_speculation = saved;
+    // Mirror the fiber-state flag into the per-worker-thread creation-
+    // context flag so thunks created inside this speculative force (incl.
+    // by nested import VMs, which never toggle `in_speculation`) are
+    // tagged as spec-context. `Worker.runFiber` re-syncs it whenever a
+    // different fiber resumes on this thread.
+    self.heap.setSpecCtx(true);
+    defer {
+        self.in_speculation = saved;
+        self.heap.setSpecCtx(saved);
+    }
     return forceValueImpl(self, value, false);
 }
 

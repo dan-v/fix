@@ -41,6 +41,9 @@ const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
 const DeferredThunk = @import("thunk.zig").DeferredThunk;
 const ErrorInfo = @import("thunk.zig").ErrorInfo;
+/// `-Dprof-main`: the creation-context / demanded-age probe fields on
+/// `Future` are live (see thunk.zig `created_tsc_enabled`).
+const prof_census_enabled = @import("thunk.zig").created_tsc_enabled;
 
 pub const ObjectId = types.ObjectId;
 pub const ChunkId = types.ChunkId;
@@ -259,6 +262,15 @@ pub const HeapLocal = struct {
     scav_ring: [SCAV_RING_SIZE]ObjectId = undefined,
     scav_head_local: u64 = 0,
     scav_head: std.atomic.Value(u64) = .init(0),
+    /// Creation-context flag: true while the fiber currently running on
+    /// this worker thread is doing SPECULATIVE work (any
+    /// `forceValueSpeculative`, including nested import VMs it spawns),
+    /// false on the demand chain. Maintained by `Worker.runFiber` (from
+    /// the resumed fiber's `vm.in_speculation`) and toggled by
+    /// `forceValueSpeculative` itself. Single-writer (the owning thread);
+    /// read at thunk creation to tag demand-created thunks for the
+    /// scavenger / `-Dprof-main` creation-context probe.
+    spec_ctx: bool = false,
     // GC per-worker free lists (`-Dgc`): lock-free reclaim reuse. The sweep
     // (STW, single collector) distributes freed slots/ranges round-robin
     // across every worker's shard; each worker's allocation hot path then pops
@@ -658,6 +670,177 @@ pub const ObjectHeap = struct {
         return result;
     }
 
+    // ---- `-Dprof-main` demand-prediction de-risk censuses ----
+    //
+    // Exit-time (no concurrent writers) heap walks that size the junk
+    // ratio of two candidate prefetch mechanisms BEFORE building them:
+    //   - creation census: thunks by creation context (demand chain vs.
+    //     speculative work) × final observation state — the selection
+    //     precision of a "scavenge only demand-fiber creations" policy.
+    //   - sibling census: for attrsets with >= 1 demanded member, what
+    //     fraction of their thunk members is ever demanded — the junk
+    //     ratio of a "first member access sweeps the siblings" prefetch.
+    // Print-only; compiled out unless `-Dprof-main`.
+
+    pub fn profCreationCensus(self: *const ObjectHeap) void {
+        if (comptime !prof_census_enabled) return;
+        const Cell = struct {
+            n: u64 = 0,
+            dem_old: u64 = 0,
+            dem_young: u64 = 0,
+            never_resolved_spec: u64 = 0, // resolved but never demanded
+            never_unresolved: u64 = 0,
+            errored: u64 = 0,
+        };
+        var cells: [2]Cell = @splat(.{}); // [0]=demand-created, [1]=spec-created
+        const obj_skip = self.collectUnfilled(.object);
+        var id: u32 = 0;
+        const total = self.objects.count();
+        scan: while (id < total) : (id += 1) {
+            if (obj_skip.skipPast(id)) |next| {
+                id = next - 1;
+                continue :scan;
+            }
+            switch (self.objects.get(id).*) {
+                .thunk => |t| {
+                    const cell = &cells[if (t.future.created_demand) 0 else 1];
+                    cell.n += 1;
+                    const state = t.future.state.load(.acquire);
+                    if (t.future.isDemanded()) {
+                        if (t.future.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
+                    } else switch (state) {
+                        2 => cell.never_resolved_spec += 1, // resolved
+                        3, 4 => cell.errored += 1, // blackhole / errored
+                        else => cell.never_unresolved += 1,
+                    }
+                },
+                else => {},
+            }
+        }
+        for (cells, 0..) |c, i| {
+            if (c.n == 0) continue;
+            std.debug.print(
+                "prof creation-census [{s}]: n={d} demanded_old={d} ({d:.1}%) demanded_young={d} ({d:.1}%) never:spec_resolved={d} ({d:.1}%) never:unresolved={d} ({d:.1}%) errored={d}\n",
+                .{
+                    if (i == 0) "demand-created" else "spec-created",
+                    c.n,
+                    c.dem_old,             profPct(c.dem_old, c.n),
+                    c.dem_young,           profPct(c.dem_young, c.n),
+                    c.never_resolved_spec, profPct(c.never_resolved_spec, c.n),
+                    c.never_unresolved,    profPct(c.never_unresolved, c.n),
+                    c.errored,
+                },
+            );
+        }
+    }
+
+    pub fn profSiblingCensus(self: *const ObjectHeap) void {
+        if (comptime !prof_census_enabled) return;
+        // Size buckets: [4,8) [8,16) [16,32) [32,64) [64,256) [256,inf)
+        const bucket_lo = [_]usize{ 4, 8, 16, 32, 64, 256 };
+        const Bucket = struct {
+            sets: u64 = 0,
+            touched: u64 = 0,
+            all_demanded_sets: u64 = 0,
+            // Members of TOUCHED sets only (thunk-valued members):
+            members: u64 = 0,
+            dem_old: u64 = 0,
+            dem_young: u64 = 0,
+            spec_resolved: u64 = 0, // resolved, never demanded
+            unresolved: u64 = 0,
+        };
+        var buckets: [bucket_lo.len]Bucket = @splat(.{});
+        var merge_attrs_n: u64 = 0;
+        const obj_skip = self.collectUnfilled(.object);
+        var id: u32 = 0;
+        const total = self.objects.count();
+        scan: while (id < total) : (id += 1) {
+            if (obj_skip.skipPast(id)) |next| {
+                id = next - 1;
+                continue :scan;
+            }
+            const entries: []const AttrEntry = switch (self.objects.get(id).*) {
+                .attrs => |a| self.attrs.slice(a.range),
+                .merge_attrs => {
+                    merge_attrs_n += 1;
+                    continue :scan;
+                },
+                else => continue :scan,
+            };
+            if (entries.len < bucket_lo[0]) continue :scan;
+            var bi: usize = bucket_lo.len - 1;
+            while (entries.len < bucket_lo[bi]) bi -= 1;
+            const b = &buckets[bi];
+            b.sets += 1;
+            var members: u64 = 0;
+            var dem_old: u64 = 0;
+            var dem_young: u64 = 0;
+            var spec_resolved: u64 = 0;
+            var unresolved: u64 = 0;
+            for (entries) |entry| {
+                if (!entry.value.isThunk()) continue;
+                switch (self.objects.get(entry.value.asObjectId()).*) {
+                    .thunk => |t| {
+                        members += 1;
+                        if (t.future.isDemanded()) {
+                            if (t.future.demanded_old) dem_old += 1 else dem_young += 1;
+                        } else if (t.future.state.load(.acquire) == 2) {
+                            spec_resolved += 1;
+                        } else {
+                            unresolved += 1;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (dem_old + dem_young == 0) continue :scan; // untouched set
+            b.touched += 1;
+            if (dem_old + dem_young == members) b.all_demanded_sets += 1;
+            b.members += members;
+            b.dem_old += dem_old;
+            b.dem_young += dem_young;
+            b.spec_resolved += spec_resolved;
+            b.unresolved += unresolved;
+        }
+        std.debug.print("prof sibling-census (attrsets by entry count; member stats over TOUCHED sets = >=1 demanded member; merge_attrs skipped n={d}):\n", .{merge_attrs_n});
+        var tot: Bucket = .{};
+        for (buckets, 0..) |b, i| {
+            tot.sets += b.sets;
+            tot.touched += b.touched;
+            tot.all_demanded_sets += b.all_demanded_sets;
+            tot.members += b.members;
+            tot.dem_old += b.dem_old;
+            tot.dem_young += b.dem_young;
+            tot.spec_resolved += b.spec_resolved;
+            tot.unresolved += b.unresolved;
+            if (b.sets == 0) continue;
+            std.debug.print(
+                "  size>={d:<3}: sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
+                .{
+                    bucket_lo[i], b.sets, b.touched, b.all_demanded_sets, b.members,
+                    b.dem_old,       profPct(b.dem_old, b.members),
+                    b.dem_young,     profPct(b.dem_young, b.members),
+                    b.spec_resolved, profPct(b.spec_resolved, b.members),
+                    b.unresolved,    profPct(b.unresolved, b.members),
+                },
+            );
+        }
+        std.debug.print(
+            "  TOTAL     : sets={d} touched={d} all_dem={d} members={d} dem_old={d} ({d:.1}%) dem_young={d} ({d:.1}%) spec_res={d} ({d:.1}%) unres={d} ({d:.1}%)\n",
+            .{
+                tot.sets, tot.touched, tot.all_demanded_sets, tot.members,
+                tot.dem_old,       profPct(tot.dem_old, tot.members),
+                tot.dem_young,     profPct(tot.dem_young, tot.members),
+                tot.spec_resolved, profPct(tot.spec_resolved, tot.members),
+                tot.unresolved,    profPct(tot.unresolved, tot.members),
+            },
+        );
+    }
+
+    fn profPct(x: u64, total: u64) f64 {
+        return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
+    }
+
     const Store = enum { object, value, attr };
     const SkipSet = struct {
         starts: [256]u32 = undefined,
@@ -705,6 +888,12 @@ pub const ObjectHeap = struct {
 
     pub inline fn currentLocal(self: *ObjectHeap) *HeapLocal {
         return &self.worker_locals[worker_id_mod.current];
+    }
+
+    /// Update this worker thread's creation-context flag (see
+    /// `HeapLocal.spec_ctx`). One store to the worker's own cache line.
+    pub inline fn setSpecCtx(self: *ObjectHeap, spec: bool) void {
+        self.currentLocal().spec_ctx = spec;
     }
 
     /// TLAB reserve shared by the three range stores. When reclaim is active
@@ -862,6 +1051,13 @@ pub const ObjectHeap = struct {
             @atomicStore(ObjectId, slot, id, .release);
             local.scav_head_local += 1;
             local.scav_head.store(local.scav_head_local, .release);
+        }
+        // `-Dprof-main` creation-context probe: tag the thunk with whether
+        // it was created on the demand chain (vs. inside speculative work).
+        // Post-fill, pre-publish — no reader can observe the slot yet.
+        if (comptime prof_census_enabled) {
+            if (object == .thunk)
+                self.objects.getMut(id).thunk.future.created_demand = !self.currentLocal().spec_ctx;
         }
         return id;
     }

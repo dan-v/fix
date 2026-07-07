@@ -564,6 +564,12 @@ pub const Worker = struct {
         } else {
             timeline.begin(.run, "", f.fiber_id);
         }
+        // Creation-context flag: creations during this quantum belong to
+        // the resumed fiber's context (demand chain vs. speculative work).
+        // `in_speculation` is fiber-state (saved on its VM across yields);
+        // the heap flag is per worker THREAD, so refresh it on every
+        // resume. `forceValueSpeculative` keeps it in sync mid-quantum.
+        f.vm.heap.setSpecCtx(f.vm.in_speculation);
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
         f.in_runfiber.store(0, .release);

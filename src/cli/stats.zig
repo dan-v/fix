@@ -56,6 +56,12 @@ pub fn report(ev: *Evaluator) void {
     }
     if (comptime thunk_census.enabled) thunk_census.report();
     if (comptime jit.enabled) jit.report();
-    if (comptime prof.enabled) prof.report(ev.chunkRegistry(), ev.internTable());
+    if (comptime prof.enabled) {
+        prof.report(ev.chunkRegistry(), ev.internTable());
+        // Demand-prediction de-risk censuses (see heap.zig): junk ratios
+        // for demand-descendant scavenging and sibling prefetch.
+        ev.heap.profCreationCensus();
+        ev.heap.profSiblingCensus();
+    }
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
 }

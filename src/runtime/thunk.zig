@@ -55,6 +55,16 @@ pub const created_tsc_enabled: bool = build_options.prof_main and builtin.cpu.ar
 
 const CreatedTsc = if (created_tsc_enabled) u64 else void;
 
+/// `-Dprof-main` demand-context probe support: was this thunk created by
+/// a DEMAND fiber (main's chain) vs. a speculative helper task? Set by
+/// `ObjectHeap.add` from the per-worker `spec_ctx` flag right after the
+/// slot is filled. Zero bytes on normal builds.
+pub const CreatedDemand = if (created_tsc_enabled) bool else void;
+
+pub inline fn initCreatedDemand() CreatedDemand {
+    return if (comptime created_tsc_enabled) false else {};
+}
+
 inline fn nowCreatedTsc() CreatedTsc {
     if (comptime !created_tsc_enabled) return {};
     var low: u32 = undefined;
@@ -293,6 +303,15 @@ pub const Future = struct {
     /// Creation TSC for the `-Dprof-main` age-at-force probe; zero bytes
     /// (`void`) on normal builds. See `created_tsc_enabled`.
     created_tsc: CreatedTsc,
+    /// Demand-context bit for the `-Dprof-main` creation-context probe;
+    /// zero bytes (`void`) on normal builds. See `CreatedDemand`.
+    created_demand: CreatedDemand = initCreatedDemand(),
+    /// `-Dprof-main` only: was this future OLD (existed >= 2^21 cycles,
+    /// ~0.6ms — the age-at-force probe's offloadable threshold) when the
+    /// first real demand observed it? Distinguishes "prefetchable ahead
+    /// of demand" from "demanded immediately, no headroom" in the exit
+    /// census. Racy-benign (racing first-demanders write ~the same value).
+    demanded_old: CreatedDemand = initCreatedDemand(),
 
     pub fn init() Future {
         return .{
@@ -351,6 +370,12 @@ pub const Future = struct {
         // the line even though the value didn't change. Idempotent
         // write — racing observers all store the same value.
         if (self.demanded.load(.monotonic) == 0) {
+            // Probe (`-Dprof-main`): record whether the future sat >= 2^21
+            // cycles (~0.6ms) before its first real demand — matches
+            // `prof.AGE_OLD_THRESHOLD` (can't import probe code from runtime).
+            if (comptime created_tsc_enabled) {
+                self.demanded_old = (nowCreatedTsc() -| self.created_tsc) >= (1 << 21);
+            }
             self.demanded.store(1, .release);
         }
     }
