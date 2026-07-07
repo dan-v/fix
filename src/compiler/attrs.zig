@@ -305,16 +305,30 @@ fn rootCompiler(self: *Compiler) *Compiler {
     return c;
 }
 
-/// Any `with` scope active at this point (in self or any ancestor)?
-/// Deferral is disabled under an enclosing `with` — the flat snapshot
-/// can't model its dynamic lookups (the with itself, INSIDE a value body,
-/// is fine; it compiles at force time).
-fn hasAnyWithScope(self: *Compiler) bool {
-    var c: ?*Compiler = self;
-    while (c) |comp| : (c = comp.parent) {
-        if (comp.with_scopes.items.len > 0) return true;
+/// Append the `with` scopes active at this point (in self or any
+/// ancestor) to the snapshot as captures of their *subject values*,
+/// innermost-first — `collectWithScopes` does the cross-chunk capture
+/// plumbing (parent with-subjects become upvalues of this chunk, exactly
+/// as an eager body's with-lookup would). Returns false (fall back to
+/// eager) if the combined snapshot would exceed `MAX_SCOPE`. The
+/// force-time compile re-establishes these as with-scopes on the
+/// synthetic parent (see `compiler/deferred.zig`), preserving resolution
+/// order: lexical bindings first, then withs innermost-first.
+fn appendWithSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)) !bool {
+    var wscopes: std.ArrayListUnmanaged(compiler_mod.WithScope) = .empty;
+    defer wscopes.deinit(self.allocator);
+    try scope.collectWithScopes(self, &wscopes);
+    if (out.items.len + wscopes.items.len > deferred_table.MAX_SCOPE) return false;
+    const with_name_id = try self.intern.intern(compiler_mod.with_capture_name);
+    for (wscopes.items) |ws| {
+        try out.append(self.allocator, .{
+            .name = compiler_mod.with_capture_name,
+            .name_id = with_name_id,
+            .kind = ws.kind,
+            .index = ws.index,
+        });
     }
-    return false;
+    return true;
 }
 
 /// A value body is deferrable iff it is NOT an immediate/trivial shape —
@@ -359,13 +373,14 @@ fn containsNameId(items: []const Capture, name_id: InternId) bool {
 }
 
 /// Whether this plain attrset qualifies for lazy per-attr compilation.
+/// (Enclosing `with` scopes are fine: their subject values are
+/// snapshotted alongside the lexical bindings — see `appendWithSnapshot`.)
 fn shouldDeferSet(self: *Compiler, group_count: usize) bool {
     if (rootCompiler(self).deferred_table == null) return false;
     if (group_count < deferred_table.MIN_ENTRIES) return false;
     // File/import compiles only: source + (retained) arena are
     // evaluator-lived; sidesteps top-level-string source ownership.
     if (self.source_path == null) return false;
-    if (hasAnyWithScope(self)) return false;
     return true;
 }
 
@@ -383,6 +398,11 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
         while (i > 0) {
             i -= 1;
             const local = c.locals.items[i];
+            // Skip anonymous with-subject slots (declared by
+            // `compileWithBody` under the empty name): they are not
+            // lexically referencable, and the with chain is snapshotted
+            // separately by `appendWithSnapshot`.
+            if (local.name.len == 0) continue;
             if (containsNameId(out.items, local.name_id)) continue;
             const cap: Capture = if (scope.resolveLocalId(self, local.name_id)) |slot|
                 .{ .name = local.name, .name_id = local.name_id, .kind = .local, .index = slot }
@@ -397,19 +417,27 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
     return true;
 }
 
+/// The per-set deferral snapshot: lexical bindings followed by
+/// `with_count` with-subject captures (innermost-first).
+const DeferScope = struct {
+    caps: []const Capture,
+    with_count: u16,
+};
+
 /// Register a deferred value body and emit `defer_attr_value`.
-fn deferLeaf(self: *Compiler, body: *const Node, snapshot: []const Capture) !void {
+fn deferLeaf(self: *Compiler, body: *const Node, snapshot: DeferScope) !void {
     const root = rootCompiler(self);
     const table = root.deferred_table.?;
     const id = try table.register(.{
         .node = body,
-        .scope = snapshot,
+        .scope = snapshot.caps,
+        .with_count = snapshot.with_count,
         .source = self.source,
         .base_path = self.base_path,
         .source_path = self.source_path,
         .source_file_id = self.source_file_id,
     });
-    try emit.emitDeferAttrValue(self, id, snapshot);
+    try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;
 }
 
@@ -425,9 +453,15 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
     // see the same scope). Null if the set doesn't qualify.
     var snapshot: std.ArrayListUnmanaged(Capture) = .empty;
     defer snapshot.deinit(self.allocator);
-    var defer_scope: ?[]const Capture = null;
+    var defer_scope: ?DeferScope = null;
     if (shouldDeferSet(self, grouped.groups.len) and setHasDeferrableLeaf(grouped.groups)) {
-        if (try buildEnclosingSnapshot(self, &snapshot)) defer_scope = snapshot.items;
+        if (try buildEnclosingSnapshot(self, &snapshot)) {
+            const lexical_len = snapshot.items.len;
+            if (try appendWithSnapshot(self, &snapshot)) defer_scope = .{
+                .caps = snapshot.items,
+                .with_count = @intCast(snapshot.items.len - lexical_len),
+            };
+        }
     }
 
     for (grouped.groups) |group| {
@@ -455,7 +489,7 @@ fn compilePlainAttrGroup(
     self: *Compiler,
     positions: *std.ArrayListUnmanaged(heap_mod.AttrPosEntry),
     group: AttrEntryGroup,
-    defer_scope: ?[]const Capture,
+    defer_scope: ?DeferScope,
 ) anyerror!void {
     const leaf = group.leaf;
     if (leaf == null) {

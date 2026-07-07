@@ -42,9 +42,12 @@ pub const MIN_ENTRIES: usize = 64;
 /// `callPackage ../path {}` bodies (mostly forced). Tunable by measurement.
 pub const MIN_BODY_BYTES: usize = 100;
 
-/// `MAX_SCOPE`: cap on the enclosing-scope snapshot size. Keeps the env
-/// gather cheap and bounds the runtime stack buffer. The hotspot needs 4.
-pub const MAX_SCOPE: usize = 8;
+/// `MAX_SCOPE`: cap on the enclosing-scope snapshot size (lexical
+/// bindings + active `with` scopes). Keeps the env gather cheap and
+/// bounds the runtime stack buffer. hackage-packages.nix needs 4;
+/// perl-packages.nix (13 formals + `self:` + a `let` + `with self`)
+/// needs ~16.
+pub const MAX_SCOPE: usize = 32;
 
 /// One deferred value body. Structurally immutable after registration
 /// except for `compiled`, the publish-once compile cache.
@@ -58,7 +61,16 @@ pub const Entry = struct {
     /// `.deferred` thunk gathers these into its `env` at creation; the
     /// force-time compile presents them as the body's upvalues 0..k in
     /// this same order (see `compiler/deferred.zig`).
+    ///
+    /// The trailing `with_count` entries are not lexical bindings but the
+    /// *subject values* of the `with` scopes active at the set site,
+    /// innermost-first (named `with_capture_name`). The force-time compile
+    /// re-establishes them as with-scopes on the synthetic parent so the
+    /// body's name resolution (lexical-first, then withs innermost-first)
+    /// matches the eager compile exactly.
     scope: []const Capture,
+    /// How many trailing `scope` entries are `with`-subject captures.
+    with_count: u16 = 0,
     /// Source text for offset resolution. Retained for the evaluator
     /// lifetime (FileCache for imports; static for corepkgs).
     source: []const u8,

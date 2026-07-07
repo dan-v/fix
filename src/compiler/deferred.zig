@@ -48,7 +48,10 @@ pub fn compile(
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    // Synthetic parent: snapshot names as locals 0..k-1, in order.
+    // Synthetic parent: snapshot names as locals 0..k-1, in order. The
+    // trailing `with_count` entries are with-subject values, not lexical
+    // bindings — declared as anonymous locals at the SAME slot positions
+    // (slot i == env index i) and re-established as with-scopes.
     var parent_builder = try ChunkBuilder.init(sa);
     defer parent_builder.deinit(sa);
     var parent = Compiler.init(sa, allocator, &parent_builder, registry, entry.source, intern, heap);
@@ -60,6 +63,18 @@ pub fn compile(
     defer parent.deinit();
     for (entry.scope) |cap| {
         _ = try scope.declareLocal(&parent, cap.name, cap.name_id);
+    }
+    // Re-establish the set site's with nesting. `entry.scope` stores the
+    // withs innermost-first at env indices k..k+w-1; `with_scopes` is a
+    // stack (outermost appended first), so push them in reverse. The
+    // body's with-lookups then collect them innermost-first — the same
+    // order the eager compile saw — and each capture dedups against the
+    // pre-seeded child capture at its env index.
+    const lexical_len = entry.scope.len - entry.with_count;
+    var wi: usize = entry.scope.len;
+    while (wi > lexical_len) {
+        wi -= 1;
+        try parent.with_scopes.append(sa, .{ .kind = .local, .index = @intCast(wi) });
     }
 
     // Child compiles the body against that parent. Pre-seed captures with
@@ -107,10 +122,12 @@ test "an imported file large enough to defer per-attr compilation evaluates the 
     var i: usize = 0;
     while (i < 80) : (i += 1) {
         // Each body references the enclosing `shared` binding (forcing a
-        // real scope-snapshot capture) and pads past MIN_BODY_BYTES.
+        // real scope-snapshot capture) and pads past MIN_BODY_BYTES. The
+        // padding must be inside the expression itself (`+ 0` chain):
+        // comments and parens are not part of the body node's span.
         const line = try std.fmt.allocPrint(
             std.testing.allocator,
-            "  attr{d} = shared + {d} /* padding padding padding padding padding padding padding */;\n",
+            "  attr{d} = shared + {d} + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0;\n",
             .{ i, i },
         );
         defer std.testing.allocator.free(line);
@@ -136,4 +153,61 @@ test "an imported file large enough to defer per-attr compilation evaluates the 
 
     const result = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 45), result.asInt());
+}
+
+test "deferred bodies under enclosing with scopes resolve names like the eager compile" {
+    // Deferral under `with` (perl-packages.nix / python-packages.nix
+    // shape): the with-subject values are snapshotted into the deferred
+    // thunk's env and re-established as with-scopes at force-time compile.
+    // Exercises the three resolution rules: (1) with-bound names resolve,
+    // (2) lexical bindings shadow any with, (3) inner withs shadow outer.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    // `shared` is BOTH let-bound (3) and bound by both withs (30, 300):
+    // lexical must win. `bonus` comes only from the withs: the INNER
+    // with's value (20) must shadow the outer's (2000).
+    try contents.appendSlice(std.testing.allocator,
+        \\let shared = 3; in
+        \\with { shared = 300; bonus = 2000; unused = 9; };
+        \\with { shared = 30; bonus = 20; };
+        \\{
+        \\
+    );
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        // Padding inside the expression (`+ 0` chain): comments/parens are
+        // not part of the body node's span, so they don't count toward
+        // MIN_BODY_BYTES.
+        const line = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "  attr{d} = shared + bonus + {d} + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0;\n",
+            .{ i, i },
+        );
+        defer std.testing.allocator.free(line);
+        try contents.appendSlice(std.testing.allocator, line);
+    }
+    try contents.appendSlice(std.testing.allocator, "}\n");
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bigwith.nix", .data = contents.items });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{
+        cwd, ".zig-cache", "tmp", &tmp.sub_path, "bigwith.nix",
+    });
+    defer std.testing.allocator.free(file_path);
+
+    // 3 (lexical shared) + 20 (inner-with bonus) + 42 = 65.
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).attr42", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 65), result.asInt());
 }

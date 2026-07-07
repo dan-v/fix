@@ -26,21 +26,20 @@ Some Nix files are enormous machine-generated attrsets (e.g. `hackage-packages.n
 | file / import scope | `source_path != null` | need retained source + AST arena to recompile later |
 | ≥ 64 entries | `MIN_ENTRIES = 64` | coarse pre-filter; skip the snapshot machinery for small sets |
 | body ≥ ~100 bytes | `MIN_BODY_BYTES = 100` | **the real lever** — defer only when the compile cost beats the deferral bookkeeping |
-| ≤ 8 visible bindings | `MAX_SCOPE = 8` | snapshot must stay small |
-| no enclosing `with` | — | `with` scope can't be snapshotted as fixed slots (dynamic, lazy) |
+| ≤ 32 snapshot entries | `MAX_SCOPE = 32` | snapshot must stay small (lexical bindings + active `with` subjects; perl-packages.nix needs ~16) |
 | deferrable leaves | — | value bodies must be recompilable in isolation |
 
 ### Mechanism
 
 At compile time, for a deferring set:
 
-1. **Snapshot the enclosing scope** — capture the ancestor bindings visible to the value bodies, each resolved to a `.local` slot or `.upvalue` index, capped at `MAX_SCOPE`.
+1. **Snapshot the enclosing scope** — capture the ancestor bindings visible to the value bodies, each resolved to a `.local` slot or `.upvalue` index, then the subject values of the active `with` scopes (innermost-first, via `collectWithScopes` — the same capture plumbing a with-lookup uses), all capped at `MAX_SCOPE`. The entry records how many trailing snapshot slots are with-subjects (`with_count`).
 2. **Register an `Entry` per leaf** — the value's AST node + that scope snapshot, into the deferred table (keyed by a table id). The evaluator **retains the file's source text and AST arena** so the node stays live.
 3. **Emit `defer_attr_value`** — carrying the table id + an environment descriptor array (the snapshot, as [capture descriptors](scopes.md)). The attrset is built with these as deferred thunks.
 
 At **force time** (`deferred.compile`), on first demand:
 
-1. Build a **synthetic single-level parent** whose locals `0..k-1` are exactly the snapshot names, in declaration order.
+1. Build a **synthetic single-level parent** whose locals `0..k-1` are exactly the snapshot names, in declaration order — and whose `with_scopes` stack re-establishes the set site's with nesting over the trailing `with_count` env slots (pushed outermost-first, so the body's with-lookups collect them innermost-first, exactly as the eager compile saw them).
 2. Compile the value body as a **child of that parent**, pre-seeding the child's captures with the same snapshot names 1:1 — so `resolveCaptureId`'s dedup maps every free variable to a fixed upvalue index `i` **equal to its position in the thunk's env** (env index `i`). No force-time remap.
 3. Funnel through **`finishCompiledChild`** (the same tail eager compilation uses — strictness stamp, terminate, finish, register), then **CAS-cache** the resulting `ChunkId` so concurrent forcers converge on one chunk.
 
