@@ -1751,6 +1751,15 @@ pub const ObjectHeap = struct {
     /// held outside the object graph — spilled thunk upvalues (see
     /// `addBytecodeThunk`).
     fn appendValuesTenured(self: *ObjectHeap, items: []const Value) !ValueRange {
+        // Without an active copying nursery, TLAB ranges are just as stable
+        // as direct tenured reservations (StableSegments never relocates) —
+        // use the per-worker TLAB and skip the store's global `write_mu`.
+        // This is the thunk/closure spilled-upvalue path (every capture
+        // wider than INLINE_CAP), so at high worker counts the direct
+        // `values.reserve` was a spinlock convoy dominating the profile.
+        // Mirrors `appendAttrEntriesTenured`'s guard.
+        if (comptime !build_options.gc) return self.appendValues(items);
+        if (!self.gc_collect_enabled) return self.appendValues(items);
         const range = try self.values.reserve(self.allocator, @intCast(items.len));
         @memcpy(self.values.sliceMut(range), items);
         return range;
