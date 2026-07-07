@@ -320,13 +320,21 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 /// toplevel sit at 2-4 items.
 const fan_out_min_items: usize = 4;
 
-/// Items-per-batch when submitting `force_list_range` tasks. With
-/// average per-thunk force ≈ 15 µs, a 16-item batch lands at ~240 µs
-/// of helper work — comfortably above the per-task scheduling overhead
-/// without serialising the list too coarsely. The scheduler queue is
-/// sized in tasks, not items, so batching also lets a fixed-cap queue
-/// describe much more pending work.
-const fan_out_batch_items: u8 = 16;
+/// Items-per-batch when submitting `force_list_range` /
+/// `force_attrs_range` tasks. The scheduler queue is sized in tasks,
+/// not items, so batching also lets a fixed-cap queue describe much
+/// more pending work. `var` so `FIX_FANOUT_BATCH` can sweep it.
+///
+/// Batch-size history: a 2026-07 census-driven re-derivation moved the
+/// default to 8 on the pre-scan-summary scheduler (interleaved w=8: 8
+/// beat 16 in both series, median 0.894 vs 0.907 and 0.886 vs 0.935,
+/// n=10 pairs each; batch 32 regressed hard). Re-measured while porting
+/// onto the per-lane scan-summary scheduler (413fc60/556af1a): the w=8
+/// win did not survive (neutral, 10 interleaved pairs), and 8 REGRESSED
+/// w=16 (wall median 0.905 vs 0.825, max-RSS 2.9-3.5GB vs 2.2GB —
+/// finer urgent batches feed the spec churn there). Default stays 16;
+/// `FIX_FANOUT_BATCH` remains for re-sweeps.
+pub var fan_out_batch_items: u8 = 16;
 
 pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) void {
     // Allow helpers running speculative tasks to fan out further list

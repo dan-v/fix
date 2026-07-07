@@ -612,6 +612,18 @@ pub const Evaluator = struct {
         // FIX_WORK_FIRST: route strict collection-force acceleration through the
         // work-first split-and-steal primitive instead of the eager fan-out.
         if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
+        // FIX_NO_EAGER: disable the strictness-driven eager thunk submit
+        // (see closures.zig makeBytecodeThunkFromCapturesEager) — A/B knob.
+        if (self.env_map) |em| if (em.get("FIX_NO_EAGER")) |s| {
+            @import("vm/closures.zig").eager_submit_enabled = std.mem.eql(u8, s, "0");
+        };
+        // FIX_FANOUT_BATCH: items per force_list_range/force_attrs_range
+        // task (default 16) — batch-size sweep knob.
+        if (self.env_map) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
+            if (std.fmt.parseInt(u8, s, 10)) |v| {
+                if (v > 0) @import("vm/force.zig").fan_out_batch_items = v;
+            } else |_| {}
+        };
         // FIX_SCAVENGE: idle helpers pre-force old unresolved thunks from the
         // per-worker creation rings. FIX_SCAV_MARGIN tunes how many of the
         // newest entries stay reserved to their creator (default 4096).

@@ -336,11 +336,17 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
     }
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (!self.in_speculation) {
+    if (!self.in_speculation and eager_submit_enabled) {
         _ = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
 }
+
+/// `FIX_NO_EAGER=1` disables the eager strictness submit above (A/B
+/// experiment: the w=8 task census measured 81% of these tasks arriving
+/// at an already-resolved thunk, and a useful-work median of ~2K cycles
+/// — below the per-task scheduling round-trip).
+pub var eager_submit_enabled: bool = true;
 
 inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const Frame, chunk_id: ChunkId) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
