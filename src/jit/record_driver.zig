@@ -43,6 +43,8 @@ const op_count = @import("../bytecode/opcode.zig").count;
 var abort_underflow: u64 = 0; // VM popped above our model (defensive abort)
 var abort_call: u64 = 0; // call/tail_call to a non-arity-1 / non-closure callee
 var abort_error: u64 = 0; // recorder error (stack underflow, depth/emit overflow)
+var abort_stale: u64 = 0; // recording spanned a task boundary (fiber recycled)
+var abort_desync: u64 = 0; // VM frame chunk != modeled chunk (error caught mid-trace)
 var abort_op: [op_count]u64 = @splat(0); // unhandled opcode, by op
 var traces_done: u64 = 0;
 var suppress_spans: u64 = 0; // implicit-force bodies skipped (recorded as re-force)
@@ -54,7 +56,7 @@ var alloc_thunks_done: u64 = 0;
 pub fn report() void {
     if (comptime !enabled) return;
     if (!hot.report_enabled) return;
-    std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error });
+    std.debug.print("=== tjit recording aborts: {d} done, suppressed-force-spans={d} underflow={d} call={d} error={d} stale={d} desync={d} ===\n", .{ traces_done, suppress_spans, abort_underflow, abort_call, abort_error, abort_stale, abort_desync });
     std.debug.print("=== tjit force-inline: {d} attempted, {d} survived into completed traces; {d} traces truncated; {d} thunks SUNK; {d} alloc_thunks in completed traces; {d} SINK-CEILING ===\n", .{ force_inlines, force_inlines_in_done, truncated, opt.sink_count, alloc_thunks_done, opt.sink_ceiling });
     // Top unhandled ops.
     var shown: usize = 0;
@@ -171,6 +173,21 @@ pub fn cleanup(vm: *VM) void {
     teardown(vm);
 }
 
+/// Abort a recording that survived past its task: a worker fiber is being
+/// recycled and this VM's stack is about to be rebuilt for unrelated work.
+/// A speculative force that *errors* unwinds past the anchor frame with the
+/// recording still live; without this, the stale recorder (whose modeled
+/// depth the new task's frames can match, e.g. a root_depth-1 anchor) would
+/// seamlessly observe the NEW chunk's ops into a trace anchored at the OLD
+/// chunk — publishing a poisoned trace whose side-exit snapshots resume at
+/// ips of the wrong chunk (observed as a wild-decode segfault at w=32).
+/// Called from the fiber entry points before any dispatch.
+pub fn abortStale(vm: *VM) void {
+    if (vm.tjit_rec == null) return;
+    abort_stale += 1;
+    abort(vm);
+}
+
 /// Observe one about-to-execute op. Called from `dispatch` only while
 /// `vm.tjit_rec != null`.
 pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) void {
@@ -214,6 +231,17 @@ pub fn observe(vm: *VM, frame: *Frame, code: []const u8, ip: usize, op: OpCode) 
         return;
     }
     r.suppressing = false;
+    // Desync cross-check: the VM frame we're about to observe must run the
+    // chunk our model says is on top. An error *caught* mid-recording
+    // (tryEval, a speculative-force unwind) rebuilds different frames at a
+    // matching depth; recording on would splice another chunk's ips into
+    // this trace's snapshots. Abort instead — same defensive class as the
+    // underflow check above.
+    if (vm.frames[vm.frames_len - 1].chunk_id != r.rec.curChunkId()) {
+        abort_desync += 1;
+        abort(vm);
+        return;
+    }
     // A pending force is only live for the gap between forceTop and the
     // interpreter's immediate force; once we reach the next op it's resolved
     // (or was consumed by the inline hook). Clear it so a later implicit force

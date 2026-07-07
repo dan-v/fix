@@ -116,6 +116,12 @@ pub const Recorder = struct {
         return self.frames.items.len;
     }
 
+    /// Chunk the model says the top (deepest) frame is running — the driver
+    /// cross-checks it against the VM's actual top frame each observed op.
+    pub fn curChunkId(self: *const Recorder) ChunkId {
+        return self.frames.items[self.frames.items.len - 1].chunk_id;
+    }
+
     pub fn operandLen(self: *const Recorder) usize {
         return self.operand.items.len;
     }
