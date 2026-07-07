@@ -579,8 +579,16 @@ pub const Evaluator = struct {
         if (self.env_map) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
             self.scheduler.spec_lifo = !std.mem.eql(u8, s, "0");
         };
-        // FIX_SPEC_NOVEL: first-ever speculation of each chunk goes to the
-        // high-priority novel lane (see scheduler.spec_novel).
+        // Novel-chunk priority lane: first-ever speculation of each chunk
+        // goes to the high-priority novel lane (see scheduler.spec_novel).
+        // ON by default at 2-16 workers - it deterministically kills the
+        // tail-chain lottery (w=8 slow tail 7/26 -> 0/26 interleaved runs,
+        // RSS neutral-to-lower, w=16 within noise). At --workers=1 nothing
+        // drains speculation, so it stays off; past 16 workers it stays
+        // off too - the lane is exempt from the backlog cap, and 31 idle
+        // helpers chase every novel root deep (measured w=32: median 1.06
+        // -> 1.11, median RSS 2940 -> 3581MB). FIX_SPEC_NOVEL=0/1 overrides.
+        self.scheduler.spec_novel = self.worker_count > 1 and self.worker_count <= 16;
         if (self.env_map) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
             self.scheduler.spec_novel = !std.mem.eql(u8, s, "0");
         };
