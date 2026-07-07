@@ -53,7 +53,36 @@ const Counters = struct {
 
     // Per-build input-drv fan-in.
     fanin_sum: std.atomic.Value(u64) = .init(0),
+
+    // Phase-cost split (ns): normalize (attr forcing + env string building)
+    // vs computePaths (ATerm serializations + sha256 + hashModuloInputs).
+    normalize_ns: std.atomic.Value(u64) = .init(0),
+    compute_ns: std.atomic.Value(u64) = .init(0),
+
+    // EXCLUSIVE build time (inclusive minus nested child builds), split by
+    // whether the build produced an already-recorded drv path (duplicate).
+    dup_builds: std.atomic.Value(u64) = .init(0),
+    dup_excl_ns: std.atomic.Value(u64) = .init(0),
+    first_excl_ns: std.atomic.Value(u64) = .init(0),
+    dup_compute_ns: std.atomic.Value(u64) = .init(0),
+
+    // Builds whose lazy_drv_cache insert found a live entry for the SAME
+    // attrs_id — a concurrent same-instance race (two workers built the
+    // same lazy drv simultaneously).
+    same_id_races: std.atomic.Value(u64) = .init(0),
+
+    // Builds running under speculation (helper speculative work) vs demand.
+    spec_builds: std.atomic.Value(u64) = .init(0),
+    spec_dup_builds: std.atomic.Value(u64) = .init(0),
+
+    // Content-keyed computePaths dedup: hits skip ATerm+sha256+record.
+    content_hits: std.atomic.Value(u64) = .init(0),
+    content_misses: std.atomic.Value(u64) = .init(0),
 };
+
+const Frame = struct { start_ns: u64 = 0, child_ns: u64 = 0 };
+threadlocal var frames: [256]Frame = @splat(.{});
+threadlocal var frame_depth: usize = 0;
 
 var c: Counters = .{};
 
@@ -111,6 +140,65 @@ pub inline fn buildEnter() void {
 pub inline fn buildExit() void {
     if (comptime !enabled) return;
     _ = c.depth_cur.fetchSub(1, .monotonic);
+}
+
+/// Push an exclusive-time frame. Call right after `buildEnter`.
+pub inline fn frameEnter() void {
+    if (comptime !enabled) return;
+    if (frame_depth < frames.len) frames[frame_depth] = .{ .start_ns = nowNs() };
+    frame_depth += 1;
+}
+
+/// Pop the frame; `is_dup` = the build's drv path was already recorded
+/// (a duplicate rebuild), `compute_ns` = this build's computePaths time
+/// (0 when unknown, e.g. error exit).
+pub inline fn frameExit(is_dup: bool, compute_ns: u64) void {
+    if (comptime !enabled) return;
+    frame_depth -= 1;
+    if (frame_depth >= frames.len) return;
+    const frame = frames[frame_depth];
+    const inclusive = nowNs() - frame.start_ns;
+    const exclusive = inclusive -| frame.child_ns;
+    if (frame_depth > 0) frames[frame_depth - 1].child_ns += inclusive;
+    if (is_dup) {
+        _ = c.dup_builds.fetchAdd(1, .monotonic);
+        _ = c.dup_excl_ns.fetchAdd(exclusive, .monotonic);
+        _ = c.dup_compute_ns.fetchAdd(compute_ns, .monotonic);
+    } else {
+        _ = c.first_excl_ns.fetchAdd(exclusive, .monotonic);
+    }
+}
+
+pub inline fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+pub inline fn recordPhases(normalize_ns: u64, compute_ns: u64) void {
+    if (comptime !enabled) return;
+    _ = c.normalize_ns.fetchAdd(normalize_ns, .monotonic);
+    _ = c.compute_ns.fetchAdd(compute_ns, .monotonic);
+}
+
+pub inline fn recordSameIdRace(raced: bool) void {
+    if (comptime !enabled) return;
+    if (raced) _ = c.same_id_races.fetchAdd(1, .monotonic);
+}
+
+pub inline fn recordContent(hit: bool) void {
+    if (comptime !enabled) return;
+    if (hit) {
+        _ = c.content_hits.fetchAdd(1, .monotonic);
+    } else {
+        _ = c.content_misses.fetchAdd(1, .monotonic);
+    }
+}
+
+pub inline fn recordSpeculative(is_dup: bool) void {
+    if (comptime !enabled) return;
+    _ = c.spec_builds.fetchAdd(1, .monotonic);
+    if (is_dup) _ = c.spec_dup_builds.fetchAdd(1, .monotonic);
 }
 
 /// Call once per build with the number of distinct input derivations.
@@ -173,6 +261,25 @@ pub fn report() void {
 
     std.debug.print("\n=== drv-probe: derivation-build demand ===\n", .{});
     std.debug.print("derivations built (cache-miss): {d}\n", .{builds});
+
+    const norm_ns = c.normalize_ns.load(.monotonic);
+    const comp_ns = c.compute_ns.load(.monotonic);
+    std.debug.print("\nphase cost split (summed across workers):\n", .{});
+    std.debug.print("  normalize:    {d:.1} ms ({d:.1}%)\n", .{ @as(f64, @floatFromInt(norm_ns)) / 1e6, pct(norm_ns, norm_ns + comp_ns) });
+    std.debug.print("  computePaths: {d:.1} ms ({d:.1}%)\n", .{ @as(f64, @floatFromInt(comp_ns)) / 1e6, pct(comp_ns, norm_ns + comp_ns) });
+
+    const dup_builds = c.dup_builds.load(.monotonic);
+    const dup_excl = c.dup_excl_ns.load(.monotonic);
+    const first_excl = c.first_excl_ns.load(.monotonic);
+    const dup_comp = c.dup_compute_ns.load(.monotonic);
+    std.debug.print("\nexclusive build time (nested child builds subtracted; w=1 for clean numbers):\n", .{});
+    std.debug.print("  first builds: {d} taking {d:.1} ms exclusive\n", .{ builds - dup_builds, @as(f64, @floatFromInt(first_excl)) / 1e6 });
+    std.debug.print("  dup builds:   {d} taking {d:.1} ms exclusive (of which computePaths {d:.1} ms)\n", .{ dup_builds, @as(f64, @floatFromInt(dup_excl)) / 1e6, @as(f64, @floatFromInt(dup_comp)) / 1e6 });
+    std.debug.print("  same-attrs-id races (concurrent same-instance builds): {d}\n", .{c.same_id_races.load(.monotonic)});
+    std.debug.print("  speculative builds: {d} (of which dup: {d})\n", .{ c.spec_builds.load(.monotonic), c.spec_dup_builds.load(.monotonic) });
+    const chits = c.content_hits.load(.monotonic);
+    const cmiss = c.content_misses.load(.monotonic);
+    std.debug.print("  content-cache: {d} computePaths performed, {d} skipped ({d:.1}% dedup)\n", .{ cmiss, chits, pct(chits, chits + cmiss) });
 
     std.debug.print("\nattr-walk demand (per attr forced in normalizeDerivation):\n", .{});
     std.debug.print("  total attrs walked: {d}  ({d} thunked, {d} immediate)\n", .{ attrs_total, thunked, imm });
