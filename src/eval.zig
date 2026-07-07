@@ -290,9 +290,6 @@ pub const Evaluator = struct {
         if (comptime gc.enabled) {
             gc.recordFinalTotal(self.heap.totalReservedBytes());
             gc.report();
-            self.gc_tracer.deinit();
-            self.gc_import_vms.deinit(self.allocator);
-            self.allocator.free(self.gc_workers);
         }
         drv_probe.report();
         ngram_probe.report();
@@ -308,6 +305,20 @@ pub const Evaluator = struct {
         // worker. Doing this before scheduler shutdown could race with
         // a helper still resuming a stolen main fiber.
         if (self.main_worker) |w| w.deinit();
+        // GC bookkeeping is freed only AFTER the workers above are joined:
+        // a helper can still be finishing a speculative import when the
+        // main thread enters deinit, and its `evaluateSource` appends the
+        // nested VM into `gc_import_vms` (and its registered chunks come
+        // from the same allocator pools). Freeing the list before the join
+        // leaves a dangling `items.ptr`; the late append then writes a
+        // fiber-stack `*VM` into whatever recycled the freed buffer — the
+        // observed victim was a freshly registered Chunk whose stomped
+        // `code.ptr` detonated at `registry.deinit` (teardown SIGSEGV).
+        if (comptime gc.enabled) {
+            self.gc_tracer.deinit();
+            self.gc_import_vms.deinit(self.allocator);
+            self.allocator.free(self.gc_workers);
+        }
         if (self.base_path) |path| self.allocator.free(path);
         self.run.deinit();
         self.imports.deinit(self.allocator);
