@@ -385,6 +385,17 @@ pub const ObjectHeap = struct {
     /// Record thunk creations into the per-worker scavenger rings
     /// (FIX_SCAVENGE). Set once before helpers start; read-only after.
     scav_record: bool = false,
+    /// Object-store pre-toucher: a background thread that keeps the flat
+    /// reservation populated (`MADV_POPULATE_WRITE`) a few MB ahead of
+    /// the bump cursor, absorbing the store's first-touch minor faults
+    /// (~700 MB / ~170K faults per NixOS toplevel — the single biggest
+    /// fault surface) onto an idle core instead of the evaluating
+    /// thread. Spawned lazily once the store is big enough to matter, so
+    /// small evals (unit tests) never start it. Data-race-free by
+    /// construction: population is kernel-side and value-preserving.
+    toucher: ?std.Thread = null,
+    toucher_state: std.atomic.Value(u8) = .init(0), // 0 = not started, 1 = running
+    toucher_stop: std.atomic.Value(bool) = .init(false),
     /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
     /// builds so there is zero footprint.
     gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
@@ -492,6 +503,11 @@ pub const ObjectHeap = struct {
     }
 
     pub fn deinit(self: *ObjectHeap) void {
+        if (self.toucher) |t| {
+            self.toucher_stop.store(true, .release);
+            t.join();
+            self.toucher = null;
+        }
         self.freeErroredInfos();
         if (comptime build_options.gc) {
             self.allocator.free(self.gc_alloc_bits);
@@ -1093,6 +1109,40 @@ pub const ObjectHeap = struct {
         return id;
     }
 
+    /// Object count above which the pre-toucher pays for its thread:
+    /// ~6 MB of store. Real evals blow far past it; unit tests don't.
+    const TOUCHER_MIN_SLOTS: u32 = 64 * 1024;
+    /// How far past the bump cursor the toucher keeps pages populated.
+    /// The store grows ~270 KB/ms at w=1 peak, so 8 MB rides out many
+    /// wake-up periods; over-population waste at exit is at most this.
+    const TOUCHER_AHEAD_BYTES: usize = 8 << 20;
+
+    /// CAS-guarded lazy spawn (racing workers refill TLABs concurrently).
+    fn maybeStartToucher(self: *ObjectHeap) void {
+        if (self.toucher_state.cmpxchgStrong(0, 1, .acq_rel, .monotonic) != null) return;
+        self.toucher = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, toucherMain, .{self}) catch {
+            self.toucher_state.store(0, .monotonic);
+            return;
+        };
+    }
+
+    fn toucherMain(self: *ObjectHeap) void {
+        var populated: usize = self.objects.usedBytes();
+        var values_state: ValueStore.PopulateState = .{};
+        var attrs_state: AttrStore.PopulateState = .{};
+        while (!self.toucher_stop.load(.monotonic)) {
+            const target = self.objects.usedBytes() + TOUCHER_AHEAD_BYTES;
+            if (target > populated) {
+                self.objects.populateRange(populated, target);
+                populated = target;
+            }
+            self.values.populateAhead(&values_state, TOUCHER_AHEAD_BYTES);
+            self.attrs.populateAhead(&attrs_state, TOUCHER_AHEAD_BYTES);
+            var req: std.os.linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+            _ = std.os.linux.nanosleep(&req, null);
+        }
+    }
+
     /// Reserve an object slot and return its ObjectId without filling
     /// payload. The slot's contents are undefined until `fillObjectSlot`
     /// is called. The ID is only valid to expose once the slot has been
@@ -1120,6 +1170,13 @@ pub const ObjectHeap = struct {
             chunk.segment = refilled.segment;
             chunk.cursor = refilled.offset;
             chunk.end = refilled.offset + refilled.len;
+            // TLAB refill = every OBJECT_CHUNK_SIZE objects: cheap spot to
+            // lazily start the pre-toucher once the store is large enough.
+            if (comptime builtin.os.tag == .linux) {
+                if (refilled.offset >= TOUCHER_MIN_SLOTS and
+                    self.toucher_state.load(.monotonic) == 0)
+                    self.maybeStartToucher();
+            }
             const cid = ObjectStore.globalIdOf(chunk.segment, chunk.cursor);
             chunk.cursor += 1;
             break :blk cid;

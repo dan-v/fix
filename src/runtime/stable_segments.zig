@@ -408,6 +408,36 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return segmentStart(seg) + used;
         }
 
+        /// Cross-call state for `populateAhead` (segment base + populated-to).
+        pub const PopulateState = struct { base: usize = 0, populated: usize = 0 };
+
+        /// Pre-populate (`MADV_POPULATE_WRITE`) the cursor's segment up to
+        /// `ahead` bytes past the current fill point. Kernel-side and
+        /// value-preserving, so it is race-free against concurrent
+        /// writers; called from the heap's background pre-toucher to
+        /// absorb the store's first-touch minor faults. Only segments of
+        /// >=1 MB are touched (they are dedicated page-aligned mappings;
+        /// smaller ones ride allocator slabs that are already warm).
+        pub fn populateAhead(self: *const Self, state: *PopulateState, ahead: usize) void {
+            if (comptime builtin.os.tag != .linux) return;
+            const page = std.heap.page_size_min;
+            const cur = self.cursor.load(.acquire);
+            const seg = segmentOf(cur);
+            const used = @as(usize, usedOf(cur)) * @sizeOf(T);
+            const cap = @as(usize, segmentCapacity(seg)) * @sizeOf(T);
+            if (cap < (1 << 20)) return;
+            const ptr = self.segments[seg].load(.acquire) orelse return;
+            const base = @intFromPtr(ptr);
+            if (base & (page - 1) != 0) return;
+            if (state.base != base) state.* = .{ .base = base, .populated = std.mem.alignForward(usize, used, page) };
+            const target = std.mem.alignForward(usize, @min(used + ahead, cap), page);
+            if (target <= state.populated) return;
+            const MADV_POPULATE_WRITE: u32 = 23;
+            const addr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(base + state.populated);
+            _ = std.os.linux.madvise(addr, target - state.populated, MADV_POPULATE_WRITE);
+            state.populated = target;
+        }
+
         /// Translate a global id to (segment, offset).
         pub fn locationOf(id: u32) Range {
             // segment_start(i) = FIRST * (2^i - 1), so the segment containing
@@ -555,6 +585,27 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
         /// reflected) — same contract as `StableSegments.count`.
         pub fn count(self: *const Self) u32 {
             return self.cursor.load(.acquire);
+        }
+
+        /// Bytes of the reservation currently in use.
+        pub fn usedBytes(self: *const Self) usize {
+            return @as(usize, self.count()) * @sizeOf(T);
+        }
+
+        /// Fault in (as-if-written) reservation bytes `[from, to)` via
+        /// `MADV_POPULATE_WRITE` — kernel-side pre-population that never
+        /// modifies data, so it is race-free against concurrent writers.
+        /// Clamped to the reservation; best-effort (Linux-only no-op
+        /// elsewhere). Lets a background thread absorb the store's
+        /// first-touch minor faults off the evaluating thread.
+        pub fn populateRange(self: *Self, from: usize, to: usize) void {
+            if (comptime builtin.os.tag != .linux) return;
+            const MADV_POPULATE_WRITE: u32 = 23;
+            const lo = std.mem.alignBackward(usize, @min(from, BYTES), page_size_min);
+            const hi = std.mem.alignForward(usize, @min(to, BYTES), page_size_min);
+            if (hi <= lo) return;
+            const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
+            _ = std.os.linux.madvise(bytes + lo, hi - lo, MADV_POPULATE_WRITE);
         }
 
         /// A flat store has a single region, so the global id IS the
