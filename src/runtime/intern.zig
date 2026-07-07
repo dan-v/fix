@@ -30,7 +30,7 @@ const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
 const SHARD_COUNT: u32 = 64;
 const SHARD_MASK: u64 = SHARD_COUNT - 1;
 
-const cache_size: usize = 32;
+const cache_size: usize = 512;
 const cache_max_len: usize = 24;
 
 const CacheSlot = struct {
@@ -116,6 +116,15 @@ pub const InternTable = struct {
             .shards = [_]Shard{.{}} ** SHARD_COUNT,
             .token = next_table_token.fetchAdd(1, .monotonic),
         };
+        // Pre-size each shard's lookup map. A grow rehashes every stored id
+        // through `IdContext.hash` — a full Wyhash over the string bytes per
+        // key — so letting 64 shards grow from empty while a nixpkgs eval
+        // interns hundreds of thousands of strings burns >1% of wall on
+        // rehashing alone. ~3 MB total up front; over-full shards still grow.
+        const ctx = IdContext{ .table = &table };
+        for (&table.shards) |*s| {
+            s.lookup.ensureTotalCapacityContext(allocator, 8192, ctx) catch {};
+        }
         // Reserve id 0 as the empty string so `id == 0` is a valid "no string"
         // sentinel that `get` can resolve without touching the segments.
         const empty_id = try table.intern("");
