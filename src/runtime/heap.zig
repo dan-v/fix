@@ -35,6 +35,9 @@ const worker_id_mod = @import("worker_id.zig");
 /// Re-exported (`pub`) so out-of-module callers reach it as
 /// `@import("runtime").heap.heap_gc`.
 pub const heap_gc = @import("heap/gc.zig");
+/// ARC-feasibility census (`-Darc-census`): exit-time whole-heap cycle-mass
+/// + RC-traffic analysis. Print-only; compiles to nothing when off.
+pub const heap_arc = @import("heap/arc_census.zig");
 const struct_census = @import("struct_census.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
@@ -868,8 +871,8 @@ pub const ObjectHeap = struct {
         return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
     }
 
-    const Store = enum { object, value, attr };
-    const SkipSet = struct {
+    pub const Store = enum { object, value, attr };
+    pub const SkipSet = struct {
         starts: [256]u32 = undefined,
         ends: [256]u32 = undefined,
         len: usize = 0,
@@ -886,7 +889,7 @@ pub const ObjectHeap = struct {
         }
     };
 
-    fn collectUnfilled(self: *const ObjectHeap, comptime store: Store) SkipSet {
+    pub fn collectUnfilled(self: *const ObjectHeap, comptime store: Store) SkipSet {
         var set: SkipSet = .{};
         for (self.worker_locals) |local| {
             const chunk = switch (store) {

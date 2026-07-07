@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/plans/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
     const timeline = b.option(bool, "timeline", "Record a wall-clock event timeline (parse/compile/import phases, fiber-run quanta, idle parks) per worker; write Perfetto JSON via --timeline[=path].") orelse false;
     const gc = b.option(bool, "gc", "GC Phase 0: sample the live set periodically during eval (mark from roots, no reclaim) and report peak-live vs total-allocated — the reclaimable-RSS headroom. Run at --workers=1. See docs/plans/gc-plan.md.") orelse false;
+    const arc_census = b.option(bool, "arc-census", "ARC feasibility census: exit-time whole-heap object-graph analysis (cycle mass via Tarjan SCC + trial deletion, heap-edge counts, in-degree concentration). Run at --workers=1 with --print-sched-stats.") orelse false;
     const depth0_probe = b.option(bool, "depth0-probe", "Measure concurrent-SATB snapshot feasibility: at each forceThunk safepoint record native_depth + allocation cursor; report the depth-0 vs depth>0 split, the max allocation gap between depth-0 points (the RSS float), and a banded timeline. Run at --workers=1 WITHOUT -Dgc.") orelse false;
     const strip: ?bool = if (profile) false else null;
     const omit_frame_pointer: ?bool = if (profile) false else null;
@@ -42,6 +43,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
     build_options.addOption(bool, "gc", gc);
+    build_options.addOption(bool, "arc_census", arc_census);
     build_options.addOption(bool, "depth0_probe", depth0_probe);
     // One shared module instance — importing the same `build_options` into
     // several modules (runtime, fix, exe) within one compilation requires the
