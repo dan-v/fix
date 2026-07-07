@@ -98,12 +98,11 @@ const Strictness = struct {
         while (it2.next()) |e| try self.deep.put(allocator, e.key_ptr.*, {});
     }
 
-    /// Treat `other` as appearing in a deep-only context: its shallow
-    /// names *don't* contribute to our shallow (we're not forcing them
-    /// when we reduce), but they do contribute to our deep (they get
-    /// forced when our result is walked). Used by attr-set / list
-    /// element rules.
-    fn unionIntoDeepOnly(self: *Strictness, allocator: std.mem.Allocator, other: *const Strictness) !void {
+    /// Union `other`'s may-force names (shallow ∪ deep) into our deep
+    /// set: `other` appears in a deep-only context, so nothing it forces
+    /// counts until our result is walked. Must-force names are a subset
+    /// of shallow, so they're covered.
+    fn unionAllIntoDeep(self: *Strictness, allocator: std.mem.Allocator, other: *const Strictness) !void {
         var it = other.shallow.iterator();
         while (it.next()) |e| try self.deep.put(allocator, e.key_ptr.*, {});
         var it2 = other.deep.iterator();
@@ -191,19 +190,15 @@ const Analyzer = struct {
 
             .attr_set => {
                 // Building an attr-set forces nothing. Deep-forcing the
-                // result forces each value's deep set.
+                // result forces each value's may-force names.
                 for (node.data.attr_set.entries) |entry| {
-                    var entry_s = try self.analyze(entry.expr);
-                    defer entry_s.deinit(self.allocator);
-                    try out.unionIntoDeepOnly(self.allocator, &entry_s);
+                    try self.analyzeIntoDeepOnly(entry.expr, out);
                 }
             },
 
             .list => {
                 for (node.data.list.items) |item| {
-                    var item_s = try self.analyze(item);
-                    defer item_s.deinit(self.allocator);
-                    try out.unionIntoDeepOnly(self.allocator, &item_s);
+                    try self.analyzeIntoDeepOnly(item, out);
                 }
             },
 
@@ -309,6 +304,152 @@ const Analyzer = struct {
             .has_attr_mixed => try self.analyzeInto(node.data.has_attr_mixed.root, out),
 
             .parens => try self.analyzeInto(node.data.parens, out),
+        }
+    }
+
+    /// Analyze `node` in a deep-only context, writing every may-force
+    /// name (shallow ∪ deep) straight into `out.deep`. Equivalent to
+    /// `analyze(node)` + `unionAllIntoDeep`, without materializing the
+    /// intermediate sets — attr-set / list literals dominate module
+    /// files, so their element rule runs here on the direct path.
+    /// (must-force never applies: deep names are only forced if the
+    /// caller walks the result.)
+    fn analyzeIntoDeepOnly(self: *Analyzer, node: *const Node, out: *Strictness) anyerror!void {
+        switch (node.tag) {
+            .integer,
+            .float_val,
+            .string,
+            .path,
+            .search_path,
+            .bool_true,
+            .bool_false,
+            .null,
+            .lambda,
+            .lambda_attrs,
+            => {},
+
+            .identifier => {
+                const name_id = try self.identifierNameId(node);
+                if (self.findBound(name_id)) |idx| {
+                    if (self.bound_stack.items[idx].rhs) |*rhs| {
+                        try out.unionAllIntoDeep(self.allocator, rhs);
+                    }
+                } else {
+                    try out.deep.put(self.allocator, name_id, {});
+                }
+            },
+
+            .attr_set => {
+                for (node.data.attr_set.entries) |entry| {
+                    try self.analyzeIntoDeepOnly(entry.expr, out);
+                }
+            },
+
+            .list => {
+                for (node.data.list.items) |item| {
+                    try self.analyzeIntoDeepOnly(item, out);
+                }
+            },
+
+            .unary_op => try self.analyzeIntoDeepOnly(node.data.unary.expr, out),
+
+            .binary_op => {
+                const b = node.data.binary;
+                switch (b.op) {
+                    .add, .sub, .mul, .div, .eq, .neq, .lt, .lte, .gt, .gte, .update, .concat => {
+                        try self.analyzeIntoDeepOnly(b.left, out);
+                        try self.analyzeIntoDeepOnly(b.right, out);
+                    },
+                    .and_, .or_, .impl => {
+                        try self.analyzeIntoDeepOnly(b.left, out);
+                    },
+                }
+            },
+
+            .apply => try self.analyzeIntoDeepOnly(node.data.apply.func, out),
+
+            .let_in => {
+                const let = node.data.let_in;
+                const start_len = self.bound_stack.items.len;
+
+                for (let.bindings) |binding| {
+                    const name_id = try self.bindingNameId(binding);
+                    try self.bound_stack.append(self.allocator, .{ .name = name_id, .rhs = null });
+                }
+                for (let.bindings, 0..) |binding, i| {
+                    var rhs = try self.analyze(binding.expr);
+                    errdefer rhs.deinit(self.allocator);
+                    self.bound_stack.items[start_len + i].rhs = rhs;
+                }
+
+                try self.analyzeIntoDeepOnly(let.body, out);
+
+                while (self.bound_stack.items.len > start_len) {
+                    var frame = self.bound_stack.pop().?;
+                    if (frame.rhs) |*r| r.deinit(self.allocator);
+                }
+            },
+
+            .if_else => {
+                const i = node.data.if_else;
+                try self.analyzeIntoDeepOnly(i.cond, out);
+                var then_s = try self.analyze(i.then_branch);
+                defer then_s.deinit(self.allocator);
+                var else_s = try self.analyze(i.else_branch);
+                defer else_s.deinit(self.allocator);
+                // Branch-wise intersection as in `analyzeInto`, but both
+                // the shallow and deep intersections land in `deep`.
+                var it = then_s.shallow.iterator();
+                while (it.next()) |entry| {
+                    if (else_s.shallow.contains(entry.key_ptr.*)) {
+                        try out.deep.put(self.allocator, entry.key_ptr.*, {});
+                    }
+                }
+                var it_deep = then_s.deep.iterator();
+                while (it_deep.next()) |entry| {
+                    if (else_s.deep.contains(entry.key_ptr.*)) {
+                        try out.deep.put(self.allocator, entry.key_ptr.*, {});
+                    }
+                }
+            },
+
+            .assert => {
+                const a = node.data.assert;
+                try self.analyzeIntoDeepOnly(a.cond, out);
+                try self.analyzeIntoDeepOnly(a.body, out);
+            },
+
+            .with_expr => {
+                const w = node.data.with_expr;
+                try self.analyzeIntoDeepOnly(w.attr_set, out);
+                try self.analyzeIntoDeepOnly(w.body, out);
+            },
+
+            .attr_path => try self.analyzeIntoDeepOnly(node.data.attr_path.root, out),
+
+            .attr_dynamic => {
+                try self.analyzeIntoDeepOnly(node.data.attr_dynamic.root, out);
+                try self.analyzeIntoDeepOnly(node.data.attr_dynamic.name, out);
+            },
+
+            .attr_or => try self.analyzeAttrOrChainDeepOnly(node.data.attr_or.attr_path, out),
+
+            .has_attr => try self.analyzeIntoDeepOnly(node.data.has_attr.root, out),
+            .has_attr_mixed => try self.analyzeIntoDeepOnly(node.data.has_attr_mixed.root, out),
+
+            .parens => try self.analyzeIntoDeepOnly(node.data.parens, out),
+        }
+    }
+
+    /// Deep-only counterpart of `analyzeAttrOrChain`.
+    fn analyzeAttrOrChainDeepOnly(self: *Analyzer, node: *const Node, out: *Strictness) anyerror!void {
+        switch (node.tag) {
+            .attr_path => try self.analyzeIntoDeepOnly(node.data.attr_path.root, out),
+            .attr_dynamic => try self.analyzeAttrOrChainDeepOnly(node.data.attr_dynamic.root, out),
+            .has_attr => try self.analyzeIntoDeepOnly(node.data.has_attr.root, out),
+            .has_attr_mixed => try self.analyzeIntoDeepOnly(node.data.has_attr_mixed.root, out),
+            .parens => try self.analyzeAttrOrChainDeepOnly(node.data.parens, out),
+            else => try self.analyzeIntoDeepOnly(node, out),
         }
     }
 
