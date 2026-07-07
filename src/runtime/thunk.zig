@@ -40,10 +40,32 @@
 //!     waiter is drained.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
 const stable = @import("stable_segments.zig");
+
+/// `-Dprof-main` age-at-force probe support: every Future carries its
+/// creation TSC so the profiler can measure how long a thunk existed
+/// before main demanded it (the look-ahead speculation ceiling). The
+/// field is `void` (zero bytes) on normal builds.
+pub const created_tsc_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+
+const CreatedTsc = if (created_tsc_enabled) u64 else void;
+
+inline fn nowCreatedTsc() CreatedTsc {
+    if (comptime !created_tsc_enabled) return {};
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        :
+        : .{ .memory = true });
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
 
 /// `state` is a u32 so it's the right shape for futex-style ops if we
 /// ever need them. The low byte encodes the lifecycle (`FutureState`);
@@ -268,6 +290,9 @@ pub const Future = struct {
     /// where the claimer resolves before any other fiber tries to force.
     waiters_head: ?*Waiter,
     waiters_mu: stable.SpinMutex,
+    /// Creation TSC for the `-Dprof-main` age-at-force probe; zero bytes
+    /// (`void`) on normal builds. See `created_tsc_enabled`.
+    created_tsc: CreatedTsc,
 
     pub fn init() Future {
         return .{
@@ -276,6 +301,7 @@ pub const Future = struct {
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
+            .created_tsc = nowCreatedTsc(),
         };
     }
 
@@ -300,6 +326,7 @@ pub const Future = struct {
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
+            .created_tsc = nowCreatedTsc(),
         };
     }
 
@@ -313,6 +340,7 @@ pub const Future = struct {
             .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
+            .created_tsc = nowCreatedTsc(),
         };
     }
 

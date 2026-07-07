@@ -231,7 +231,7 @@ pub fn report(registry: anytype, intern: anytype) void {
 
 var name_scratch: [512]u8 = undefined;
 
-fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
+pub fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
     if (key == KEY_PASS_THROUGH) return "<pass_through cell>";
     if (key == KEY_OTHER) return "<other>";
     if (key >= BUILTIN_BASE) {

@@ -56,6 +56,6 @@ pub fn report(ev: *Evaluator) void {
     }
     if (comptime thunk_census.enabled) thunk_census.report();
     if (comptime jit.enabled) jit.report();
-    if (comptime prof.enabled) prof.report();
+    if (comptime prof.enabled) prof.report(ev.chunkRegistry(), ev.internTable());
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
 }
