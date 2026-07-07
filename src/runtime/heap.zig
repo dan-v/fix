@@ -1065,8 +1065,10 @@ pub const ObjectHeap = struct {
         self.fillObjectSlot(id, object);
         if (comptime struct_census.enabled) {
             switch (object) {
-                .list => struct_census.recordAlloc(id, .list),
-                .attrs, .merge_attrs => struct_census.recordAlloc(id, .attrs),
+                .list => |range| struct_census.recordAlloc(id, .list, range.len),
+                .attrs => |a| struct_census.recordAlloc(id, .attrs, a.range.len),
+                // Layer node is O(1); its structural cost is ~1 entry.
+                .merge_attrs => struct_census.recordAlloc(id, .attrs, 1),
                 else => {},
             }
         }
