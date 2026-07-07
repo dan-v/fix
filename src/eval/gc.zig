@@ -77,6 +77,15 @@ pub fn helpMark(ev: anytype, worker_id: u8) void {
 pub fn collect(ev: anytype, collector_id: u8) void {
     if (comptime !gc.enabled) return;
     _ = collector_id; // marker slot is grabbed dynamically (capped participants)
+    // Lazy policy (`enableBudget`): the first threshold (budget/2) crossing
+    // arms tracking instead of collecting — everything allocated so far
+    // becomes untracked/old, and the real collections start at the budget.
+    // We are inside the STW (all peers parked), which `armTracking` needs
+    // for the TLAB flush + flag publication.
+    if (!ev.heap.gc_collect_enabled) {
+        heap_gc.armLazy(&ev.heap);
+        return;
+    }
     // Copying minor collection (STW). The young-gated mark runs from roots +
     // the old→young remembered set. At --workers>1 the parked peers HELP the
     // mark (parallel young-gated drain); at --workers=1 it's serial.
@@ -116,13 +125,26 @@ pub fn collect(ev: anytype, collector_id: u8) void {
         ev.scheduler.gcCloseMark();
         tr.sumStats();
     } else {
+        var remset_sources: u64 = 0;
+        const CountSeedCtx = struct { tr: *gc.Tracer, heap: *ObjectHeap, n: *u64 };
+        const CountSeed = struct {
+            fn cb(ctx: CountSeedCtx, source: types.ObjectId) void {
+                ctx.n.* += 1;
+                ctx.tr.markRemsetSource(ctx.heap, source);
+            }
+        };
         tr.resetMinor(ev.heap.objects.count()) catch {
             heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
             return;
         };
+        const p0 = nowNs();
         markRoots(ev, tr);
-        heap_gc.forEachRemsetSource(&ev.heap, SeedCtx{ .tr = tr, .heap = &ev.heap }, Seed.cb);
+        const p1 = nowNs();
+        heap_gc.forEachRemsetSource(&ev.heap, CountSeedCtx{ .tr = tr, .heap = &ev.heap, .n = &remset_sources }, CountSeed.cb);
+        const p2 = nowNs();
         tr.drainMinor(&ev.heap);
+        const p3 = nowNs();
+        gc.recordMarkPhases(p0 - t0, p1 - p0, p2 - p1, p3 - p2, remset_sources);
     }
     const t1 = nowNs();
     // w>1 already evacuated in parallel (claim loop); just finish (verify +

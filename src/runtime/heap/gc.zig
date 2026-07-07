@@ -32,7 +32,6 @@ const gc_debug = heap_mod.gc_debug;
 /// from a low starting threshold, ignoring the budget.
 pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     if (comptime !build_options.gc) return;
-    heap.gc_collect_enabled = true;
     ObjectHeap.gc_step_bytes = step_bytes;
     ObjectHeap.gc_budget_bytes = budget;
     // NON-MOVING: collect on the reserved-bytes threshold (survivors stay
@@ -41,6 +40,35 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
     // every TLAB refill.
     heap.gc_threshold_bytes = if (step_bytes > 0) ObjectHeap.GC_MIN_THRESHOLD else budget;
+    armTracking(heap);
+}
+
+/// Lazy variant (the production `--max-memory` policy): don't start any
+/// per-allocation tracking yet — just watch the reserved-bytes cursor. At
+/// half the budget the safepoint driver arms tracking (STW, `armTracking`);
+/// at the budget it collects. A run that never reaches budget/2 pays ZERO
+/// tracking cost (no young-slot appends, no write barrier, no free-list
+/// probes) — on a big-RAM machine a `-Dgc` build stays at rooting-tax-only.
+/// The price: objects allocated before arming are permanently old
+/// (unreclaimable floor ≈ reserved at budget/2 — half the ceiling, by
+/// construction).
+pub fn enableBudget(heap: *ObjectHeap, budget: u64) void {
+    if (comptime !build_options.gc) return;
+    ObjectHeap.gc_step_bytes = 0;
+    ObjectHeap.gc_budget_bytes = budget;
+    heap.gc_threshold_bytes = budget / 2;
+}
+
+/// Start reclaim tracking: young-slot lists, the old→young write barrier,
+/// and free-list reuse, with everything allocated so far tenured
+/// (`gc_track_from` = the current count). Called either eagerly from
+/// `enableCollect` (validation) or at the first budget/2 STW safepoint
+/// (`enableBudget` → `armLazy`). Any later caller must hold the world
+/// stopped: the TLAB flush and `gc_collect_enabled` publication race
+/// mutators otherwise.
+pub fn armTracking(heap: *ObjectHeap) void {
+    if (comptime !build_options.gc) return;
+    heap.gc_collect_enabled = true;
     heap.gc_track_from = heap.objects.count();
     // Flush each worker's TLABs so the first post-enable allocation refills
     // fresh instead of draining a leftover chunk carried over from bootstrap.
@@ -69,6 +97,19 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
         heap.gc_alloc_bits = heap.allocator.realloc(heap.gc_alloc_bits, words) catch heap.gc_alloc_bits;
         @memset(heap.gc_alloc_bits, 0);
     }
+}
+
+/// The budget/2 STW safepoint under the lazy policy: arm tracking and
+/// re-arm the threshold to the full budget. No mark, no sweep, no token
+/// bump — nothing allocated so far is tracked, so there is nothing to
+/// reclaim yet.
+pub fn armLazy(heap: *ObjectHeap) void {
+    if (comptime !build_options.gc) return;
+    armTracking(heap);
+    heap.gc_collect_requested = false;
+    const budget = ObjectHeap.gc_budget_bytes;
+    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.GC_HEADROOM);
+    heap.gc_threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
 }
 
 /// Run a collection now via the registered callback (the evaluator's

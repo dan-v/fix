@@ -990,6 +990,12 @@ pub const ObjectHeap = struct {
                 }
                 // Nursery full: request a minor and spill to tenured below.
                 self.gcNurseryFull();
+            } else {
+                // Lazy policy, not yet armed (`gcEnableBudget`): poll the
+                // arming threshold (budget/2) on the same once-per-TLAB-refill
+                // cadence. One compare on a cold path — the whole pre-arming
+                // tracking cost of a `-Dgc` build.
+                self.gcNurseryFull();
             }
         }
         if (n > chunk_size) return store.reserve(self.allocator, n);

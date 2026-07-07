@@ -900,12 +900,16 @@ pub const Evaluator = struct {
                 // Memory budget: no collection runs until heap-reserved bytes
                 // cross it (`--max-memory` / `FIX_MAX_MEMORY`; default half of
                 // MemAvailable). On a big-RAM machine that is never — zero
-                // pauses; on a small-RAM device it fires before the eval OOMs.
-                // Budget 0 = never collect (leave reclaim disabled entirely:
-                // no young-slot tracking, no free-list checks — bump-only).
+                // pauses AND zero tracking (lazy arming at budget/2, see
+                // `heap_gc.enableBudget`); on a small-RAM device it fires
+                // before the eval OOMs. Budget 0 = never collect (reclaim
+                // stays disabled entirely — bump-only). FIX_GC_STEP_MB keeps
+                // the eager validation path (tracking from the start).
                 const budget = eval_gc.memoryBudget(self);
-                if (budget > 0 or step_bytes > 0)
-                    heap_gc.enableCollect(&self.heap, budget, step_bytes);
+                if (step_bytes > 0)
+                    heap_gc.enableCollect(&self.heap, budget, step_bytes)
+                else if (budget > 0)
+                    heap_gc.enableBudget(&self.heap, budget);
             }
         }
         return w;

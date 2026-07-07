@@ -532,6 +532,24 @@ pub fn recordTiming(mark_ns: u64, sweep_ns: u64) void {
     sweep_ns_total += sweep_ns;
 }
 
+// Mark-phase breakdown (w=1 serial path): bitmap reset / root scan /
+// remembered-set seeding / transitive drain. Answers "where does the
+// pause go" without a profiler run.
+var reset_ns_total: u64 = 0;
+var roots_ns_total: u64 = 0;
+var remset_ns_total: u64 = 0;
+var drain_ns_total: u64 = 0;
+var remset_sources_total: u64 = 0;
+
+pub fn recordMarkPhases(reset_ns: u64, roots_ns: u64, remset_ns: u64, drain_ns: u64, remset_sources: u64) void {
+    if (comptime !enabled) return;
+    reset_ns_total += reset_ns;
+    roots_ns_total += roots_ns;
+    remset_ns_total += remset_ns;
+    drain_ns_total += drain_ns;
+    remset_sources_total += remset_sources;
+}
+
 /// Record barrier wall time (time-to-safepoint + release) for one collection.
 pub fn recordBarrier(ns: u64) void {
     if (comptime !enabled) return;
@@ -606,6 +624,14 @@ pub fn report() void {
     std.debug.print("peak reserved (RSS ceiling held): {d:.1} MB\n", .{mb(peak_total_bytes)});
     std.debug.print("final reserved: {d:.1} MB\n", .{mb(final_total_bytes)});
     std.debug.print("mark time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(mark_ns_total)) / 1e6});
+    if (drain_ns_total > 0)
+        std.debug.print("  mark phases: reset {d:.1} / roots {d:.1} / remset {d:.1} ms ({d} sources) / drain {d:.1} ms\n", .{
+            @as(f64, @floatFromInt(reset_ns_total)) / 1e6,
+            @as(f64, @floatFromInt(roots_ns_total)) / 1e6,
+            @as(f64, @floatFromInt(remset_ns_total)) / 1e6,
+            remset_sources_total,
+            @as(f64, @floatFromInt(drain_ns_total)) / 1e6,
+        });
     std.debug.print("sweep time (total): {d:.1} ms\n", .{@as(f64, @floatFromInt(sweep_ns_total)) / 1e6});
     std.debug.print("barrier wait (total, w>1 spin): {d:.1} ms\n", .{@as(f64, @floatFromInt(barrier_ns_total)) / 1e6});
     std.debug.print("peak RSS (kernel high-water): {d:.1} MB\n", .{mb(peakRssBytes())});

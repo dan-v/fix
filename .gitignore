@@ -19,3 +19,4 @@ perf.data*
 # Generated Perfetto/Chrome traces (fix --timeline=...)
 *.perfetto.json
 .claude/
+zig-out-*/
