@@ -401,6 +401,7 @@ pub const Worker = struct {
                 },
                 .force_list_range => .list_range,
                 .force_attrs_sweep => .attrs_sweep,
+                .force_attrs_range => .attrs_range,
             };
             // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
             // the producer end to `push_ts` — the moment the victim *pushed* this
@@ -549,6 +550,7 @@ pub const Worker = struct {
                 .force_thunk => |id| timeline.beginSubj(.run, if (loc.isEmpty()) timeline.Subject.lit("force-thunk") else loc, f.fiber_id, std.fmt.bufPrint(&buf, "\"thunk\":{d}", .{id}) catch ""),
                 .force_list_range => |r| timeline.beginArgs(.run, "force-list", f.fiber_id, std.fmt.bufPrint(&buf, "\"list\":{d},\"off\":{d},\"len\":{d}", .{ r.list_id, r.offset, r.len }) catch ""),
                 .force_attrs_sweep => |id| timeline.beginArgs(.run, "sweep-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d}", .{id}) catch ""),
+                .force_attrs_range => |r| timeline.beginArgs(.run, "force-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d},\"off\":{d},\"len\":{d}", .{ r.attrs_id, r.offset, r.len }) catch ""),
             }
             // Consumer end of the work-stealing arrow — inside this quantum so
             // the arrow lands on it. No-op unless this task was stolen (id != 0).
@@ -570,7 +572,7 @@ pub const Worker = struct {
             // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range, .force_attrs_sweep => .{},
+            .force_list_range, .force_attrs_sweep, .force_attrs_range => .{},
         };
     }
 
@@ -948,6 +950,16 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
                 if (heap.getThunkAssumeValid(entry.value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
             }
         },
+        .force_attrs_range => |range| {
+            const entries = heap.getAttrs(range.attrs_id) catch return;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len);
+            var i: usize = range.offset;
+            while (i < end) : (i += 1) {
+                if (!entries[i].value.isThunk()) continue;
+                total.* += 1;
+                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
+            }
+        },
     }
 }
 
@@ -1057,6 +1069,22 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                 std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
                     attrs_id, vm_force.diagNowUs(), f.vm.heap.objects.count() -| objs_before,
                 });
+            }
+        },
+        .force_attrs_range => |range| {
+            // Batched attrs fan-out — the attrs analogue of
+            // `force_list_range` above (attrs are a positional slice in
+            // the heap, and the NON-MOVING GC note there applies
+            // identically: rooting keeps the entry range stable).
+            const gc_roots = vm_force.rootsBegin(&f.vm);
+            defer vm_force.rootsEnd(&f.vm, gc_roots);
+            vm_force.rootKeep(&f.vm, Value.attrs(range.attrs_id));
+            const entries = f.vm.heap.getAttrs(range.attrs_id) catch return;
+            const end = @min(@as(usize, range.offset) + @as(usize, range.len), entries.len);
+            var i: usize = range.offset;
+            while (i < end) : (i += 1) {
+                if (!entries[i].value.isThunk()) continue;
+                _ = vm_force.forceValueSpeculative(&f.vm, entries[i].value) catch {};
             }
         },
     }

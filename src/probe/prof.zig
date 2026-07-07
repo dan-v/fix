@@ -259,6 +259,8 @@ pub const TaskClass = enum(u8) {
     list_range,
     /// `force_attrs_sweep` whole-set sweep (FIX_SIBLING).
     attrs_sweep,
+    /// `force_attrs_range` batch (urgent lane).
+    attrs_range,
     /// Stolen work-first continuation (FIX_WORK_FIRST).
     cont,
 };

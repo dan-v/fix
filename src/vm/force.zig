@@ -350,20 +350,31 @@ pub fn fanOutListShallow(self: *VM, list_id: ObjectId, items: []const Value) voi
     }
 }
 
-pub fn fanOutAttrsShallow(self: *VM, entries: []const heap_mod.AttrEntry) void {
+pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
     // Symmetric with `fanOutListShallow`: speculative helpers may
     // cascade attr traversal further. NixOS module evaluation walks
     // attrsets at every level (option merging via `mapAttrs`, the
     // module config tree itself) and the cascade is what lets
     // independent contributions parallelise.
     if (entries.len < fan_out_min_items) return;
-    // No batched task type for attrs yet (the heap currently lays out
-    // attrs as a slice indexed by position, but we'd need a separate
-    // task variant). Attrsets in real evals tend to be smaller than
-    // lists; one-task-per-thunk is fine for now.
-    for (entries) |entry| {
-        if (!entry.value.isThunk()) continue;
-        if (!self.scheduler.submitUrgent(.{ .force_thunk = entry.value.asObjectId() }, self.workerId())) break;
+    // Batched like the list fan-out (attrs are a positional slice in the
+    // heap, so the same offset/len range shape works). The former
+    // one-task-per-thunk form cost the submitter — usually MAIN, on its
+    // demand path — a queue push + pending-counter bump (+ periodic
+    // futex wake) per entry; the w=8 task census additionally measured
+    // 82.5% of those tasks arriving at an already-resolved thunk. One
+    // task per ~16 entries pays the scheduling overhead once per
+    // meaningful chunk of work instead of once per thunk.
+    var offset: u32 = 0;
+    while (offset < entries.len) {
+        const remaining = entries.len - offset;
+        const this_len: u8 = @intCast(@min(@as(usize, fan_out_batch_items), remaining));
+        if (!self.scheduler.submitUrgent(.{ .force_attrs_range = .{
+            .attrs_id = attrs_id,
+            .offset = offset,
+            .len = this_len,
+        } }, self.workerId())) break;
+        offset += this_len;
     }
 }
 
@@ -404,7 +415,7 @@ pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []con
     if (self.scheduler.workFirst()) {
         forceCollectionWorkFirst(self, attrs_id, .attrs, @intCast(entries.len));
     } else {
-        fanOutAttrsShallow(self, entries);
+        fanOutAttrsShallow(self, attrs_id, entries);
     }
 }
 

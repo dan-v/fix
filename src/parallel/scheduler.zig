@@ -146,6 +146,13 @@ pub const Task = union(enum) {
     /// strongly predicts reading its siblings (measured junk ratio
     /// 17-29% at 16-63 entries vs 99% at >=256 — hence the size gate).
     force_attrs_sweep: types.ObjectId,
+    /// Force a contiguous range of an attrset's entries — the attrs
+    /// analogue of `force_list_range` (the heap lays attrs out as a
+    /// positional slice, so the same offset/len shape works). Used by
+    /// the strict-attrset-walk fan-out so a NixOS option-merge burst
+    /// costs the submitter one queue push per ~16 entries instead of
+    /// one per thunk.
+    force_attrs_range: ForceAttrsRange,
 };
 
 /// Which queue a popped/stolen task came from. Purely informational —
@@ -155,6 +162,12 @@ pub const Lane = enum(u8) { urgent, novel, spec };
 
 pub const ForceListRange = struct {
     list_id: types.ObjectId,
+    offset: u32,
+    len: u8,
+};
+
+pub const ForceAttrsRange = struct {
+    attrs_id: types.ObjectId,
     offset: u32,
     len: u8,
 };
@@ -430,6 +443,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
+            .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
         }
     }
 }
@@ -443,6 +457,7 @@ fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
+            .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
         }
     }
 }
@@ -1966,7 +1981,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
-                    .force_list_range, .force_attrs_sweep => 0,
+                    .force_list_range, .force_attrs_sweep, .force_attrs_range => 0,
                 }, .acq_rel);
             }
         }
