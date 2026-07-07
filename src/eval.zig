@@ -571,6 +571,24 @@ pub const Evaluator = struct {
         // FIX_WORK_FIRST: route strict collection-force acceleration through the
         // work-first split-and-steal primitive instead of the eager fan-out.
         if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
+        // FIX_SCAVENGE: idle helpers pre-force old unresolved thunks from the
+        // per-worker creation rings. FIX_SCAV_MARGIN tunes how many of the
+        // newest entries stay reserved to their creator (default 4096).
+        if (self.env_map) |em| {
+            const scav_on = em.get("FIX_SCAVENGE") != null;
+            var scav_margin: u64 = 4096;
+            if (em.get("FIX_SCAV_MARGIN")) |s| {
+                if (std.fmt.parseInt(u64, s, 10)) |n| scav_margin = n else |_| {}
+            }
+            if (em.get("FIX_SCAV_HOT")) |s| {
+                if (std.fmt.parseInt(u64, s, 10)) |n| vm_force.scav_hot_threshold_cy = n else |_| {}
+            }
+            if (em.get("FIX_SCAV_WORKERS")) |s| {
+                if (std.fmt.parseInt(u8, s, 10)) |n| self.scheduler.scav_workers = n else |_| {}
+            }
+            self.scheduler.setScavenge(scav_on, scav_margin);
+            self.heap.scav_record = scav_on;
+        }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();

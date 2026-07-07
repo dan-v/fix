@@ -55,6 +55,7 @@ const timeline = @import("../probe/timeline.zig");
 const bytecode = @import("../bytecode.zig");
 const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
+const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const DerivationStore = @import("derivation").DerivationStore;
@@ -176,9 +177,13 @@ pub const Worker = struct {
     idle_ns: u64,
     /// Accumulated time this worker spent inside `runFiber` (i.e. inside
     /// `inner.resume_`). Excludes the brief pop-ready / pick-task probing
-    /// — that bookkeeping is negligible relative to either fiber work or
-    /// futex parks.
+    /// — that bookkeeping is negligible relative to either bucket.
     busy_ns: u64,
+
+    /// Scavenger scan position within main's creation ring, and the
+    /// ring head observed at the last completed lap (see scavengeStep).
+    scav_pos: u64 = 0,
+    scav_lap_head: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -391,6 +396,73 @@ pub const Worker = struct {
             self.runFiber(f);
             return true;
         }
+        if (try self.scavengeStep()) return true;
+        return false;
+    }
+
+    /// Lowest-priority idle work (`FIX_SCAVENGE`): pre-force old, still-
+    /// unresolved thunks from MAIN's creation ring whose body chunk has
+    /// PROVEN expensive on main's demand path (`vm_force.scavChunkHot`).
+    /// Mechanizes the age-at-force probe finding (~half of main's
+    /// on-chain cycles sit in thunks that existed ≥0.6ms before main
+    /// demanded them) without evaluating the whole lazy graph: cheap and
+    /// never-demanded thunks fail the hot-chunk filter. The scan re-laps
+    /// the ring window as new chunks turn hot. Worker 0 never scavenges —
+    /// a long speculative force there would add latency to the demand
+    /// fiber's wakes.
+    fn scavengeStep(self: *Worker) !bool {
+        if (self.worker_id == 0) return false;
+        const sched = self.scheduler;
+        // Cap the scavenging helpers (FIX_SCAV_WORKERS): at w=16/32,
+        // letting every idle helper scavenge amplifies wasted work and
+        // allocator contention into a large regression; at w=8 all 7
+        // helpers scavenging measured best.
+        if (self.worker_id > sched.scav_workers) return false;
+        if (!sched.scavengeEnabled()) return false;
+        if (sched.backgroundSuppressed()) return false;
+        if (self.fibers.items.len == 0) return false;
+        const heap = self.fibers.items[0].vm.heap;
+        const local = &heap.worker_locals[0];
+        const head = local.scav_head.load(.acquire);
+        const margin = sched.scav_margin;
+        if (head <= margin) return false;
+        const hi = head - margin;
+        const window_lo = head -| (heap_ring_size - 1024);
+        var pos = @max(self.scav_pos, window_lo);
+        if (pos >= hi) {
+            // Lap complete. Restart only after meaningful ring growth
+            // (new thunks and possibly newly-hot chunks) — re-lapping on
+            // every single creation would busy-spin the scan.
+            if (head < self.scav_lap_head + 8192) return false;
+            self.scav_lap_head = head;
+            pos = window_lo;
+        }
+        // Bound the skip scan per drain step so a cold backlog can't
+        // starve the park path.
+        var budget: u32 = 2048;
+        while (pos < hi and budget > 0) : ({
+            pos += 1;
+            budget -= 1;
+        }) {
+            const id = @atomicLoad(types.ObjectId, &local.scav_ring[@intCast(pos & (heap_ring_size - 1))], .acquire);
+            const th = heap.getThunkAssumeValid(id);
+            if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) continue;
+            if (th.targetKind() != .bytecode) continue;
+            // Racy read of the target union (the thunk may resolve
+            // concurrently): a torn chunk_id at worst misclassifies
+            // hotness; the claim CAS inside the force is authoritative.
+            if (!vm_force.scavShouldTake(th.payload.target.bytecode.chunk_id)) continue;
+            self.scav_pos = pos + 1;
+            const f = try self.acquireFreeFiber();
+            f.current_task = .{ .force_thunk = id };
+            f.flow_in_id = 0;
+            f.inner.reset(slotEntry, @ptrCast(f));
+            f.state = .running;
+            sched.bumpScavenges(self.worker_id);
+            self.runFiber(f);
+            return true;
+        }
+        self.scav_pos = pos;
         return false;
     }
 
@@ -544,6 +616,15 @@ pub const Worker = struct {
             // available work and busy-spin on it.
             if (!self.scheduler.backgroundSuppressed() and
                 (self.scheduler.pending_tasks.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
+            // Un-scanned scavengeable ring backlog counts as available
+            // work for a scavenging helper (see scavengeStep's cap).
+            if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
+                !self.scheduler.backgroundSuppressed() and self.fibers.items.len > 0)
+            {
+                const head = self.fibers.items[0].vm.heap.worker_locals[0].scav_head.load(.monotonic);
+                if (head > self.scheduler.scav_margin and
+                    (self.scav_pos < head - self.scheduler.scav_margin or head >= self.scav_lap_head + 8192)) return;
+            }
             if (self.shouldStop()) return;
             if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
             std.atomic.spinLoopHint();

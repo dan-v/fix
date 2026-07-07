@@ -211,6 +211,11 @@ const VALUE_CHUNK_SIZE: u32 = 1024;
 const ATTR_CHUNK_SIZE: u32 = 512;
 const ATTR_POS_CHUNK_SIZE: u32 = 256;
 
+/// Scavenger ring capacity (power of two). Each worker records the ids
+/// of thunks it creates; idle peers (FIX_SCAVENGE) force the oldest
+/// still-unresolved ones speculatively. 64K ids = 256KB per worker.
+pub const SCAV_RING_SIZE: u32 = 1 << 16;
+
 // Copying nursery (`-Dgc`): the low `NURSERY_SEGS_*` segments of each range
 // store are the resettable young generation; the rest is tenured. Capacity =
 // first_segment_size * (2^N - 1) slots. With first_segment_size {values 1024,
@@ -244,6 +249,16 @@ pub const HeapLocal = struct {
     value: LocalChunk = .{},
     attr: LocalChunk = .{},
     attr_pos: LocalChunk = .{},
+    /// Scavenger ring (FIX_SCAVENGE, see `Worker.scavengeStep`): ids of
+    /// thunks this worker created, in creation order. Single-writer (the
+    /// owning worker); idle helpers scan worker 0's ring for old,
+    /// still-unresolved thunks with proven-expensive bodies. `scav_head`
+    /// is the monotonic count of entries written, release-published
+    /// after each ring store; `scav_head_local` is the writer's
+    /// non-atomic mirror (avoids an RMW on the hot path).
+    scav_ring: [SCAV_RING_SIZE]ObjectId = undefined,
+    scav_head_local: u64 = 0,
+    scav_head: std.atomic.Value(u64) = .init(0),
     // GC per-worker free lists (`-Dgc`): lock-free reclaim reuse. The sweep
     // (STW, single collector) distributes freed slots/ranges round-robin
     // across every worker's shard; each worker's allocation hot path then pops
@@ -344,6 +359,9 @@ pub const ObjectHeap = struct {
     /// allocator can reuse heap addresses, so a stale slot would match
     /// pointer equality even though it refers to a freed heap.
     token: u64,
+    /// Record thunk creations into the per-worker scavenger rings
+    /// (FIX_SCAVENGE). Set once before helpers start; read-only after.
+    scav_record: bool = false,
     /// GC Phase 0 (`-Dgc`): periodic live-set sampler. `void` in normal
     /// builds so there is zero footprint.
     gc_hook: if (build_options.gc) ?GcHook else void = if (build_options.gc) null else {},
@@ -834,6 +852,16 @@ pub const ObjectHeap = struct {
                 .attrs, .merge_attrs => struct_census.recordAlloc(id, .attrs),
                 else => {},
             }
+        }
+        // Scavenger ring (FIX_SCAVENGE): record thunk creations, in
+        // order, for idle peers to pre-force. Three stores to this
+        // worker's own cache lines; a single predictable branch when off.
+        if (self.scav_record and object == .thunk) {
+            const local = self.currentLocal();
+            const slot = &local.scav_ring[@intCast(local.scav_head_local & (SCAV_RING_SIZE - 1))];
+            @atomicStore(ObjectId, slot, id, .release);
+            local.scav_head_local += 1;
+            local.scav_head.store(local.scav_head_local, .release);
         }
         return id;
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
@@ -637,6 +638,60 @@ fn critBuiltinLabel(self: *VM, id: BuiltinId, args: []const Value, buf: []u8) ti
     return timeline.Subject.lit(std.fmt.bufPrint(buf, "builtins.{s}", .{name}) catch name);
 }
 
+// ---- idle-scavenger support (FIX_SCAVENGE) ----
+//
+// Learned per-chunk cost filter. Worker 0 times the bytecode thunks it
+// claims on its demand path (two rdtscs per claimed force, gated on the
+// scavenger being enabled); a chunk whose single force exceeds
+// `scav_hot_threshold_cy` is marked HOT. Idle helpers then scavenge ONLY
+// ring thunks whose body chunk is hot (see `Worker.scavengeStep`):
+// repeated expensive bodies — option merges, module machinery, drv
+// builds — qualify after main pays for a few instances, while the
+// millions of cheap or never-demanded thunks stay untouched. Racy-benign
+// plain u8 stores (0→1, idempotent).
+pub const SCAV_CHUNK_CAP: usize = 1 << 20;
+var scav_hot_chunks: [SCAV_CHUNK_CAP]u8 = @splat(0);
+/// Single-force cost (cycles) above which a chunk is marked hot.
+/// `FIX_SCAV_HOT` overrides.
+pub var scav_hot_threshold_cy: u64 = 100_000;
+
+/// Feedback governor: per chunk, how many instances MAIN has demanded
+/// vs how many the scavenger has taken. A chunk shared between demanded
+/// and junk instances (make-derivation bodies!) would otherwise let the
+/// scavenger evaluate the junk wholesale; capping takes at ~2× observed
+/// demand keeps waste proportional to usefulness. Saturating, racy-
+/// benign (a few extra takes are harmless).
+var scav_demand_n: [SCAV_CHUNK_CAP]u16 = @splat(0);
+var scav_taken_n: [SCAV_CHUNK_CAP]u16 = @splat(0);
+
+pub inline fn scavChunkHot(chunk_id: u32) bool {
+    return chunk_id < SCAV_CHUNK_CAP and scav_hot_chunks[chunk_id] != 0;
+}
+
+/// Scavenger-side admission check; bumps the take counter on success.
+pub inline fn scavShouldTake(chunk_id: u32) bool {
+    if (chunk_id >= SCAV_CHUNK_CAP) return false;
+    if (scav_hot_chunks[chunk_id] == 0) return false;
+    const taken = scav_taken_n[chunk_id];
+    const demand = scav_demand_n[chunk_id];
+    if (taken == std.math.maxInt(u16)) return false;
+    if (@as(u32, taken) >= @as(u32, demand) * 2 + 16) return false;
+    scav_taken_n[chunk_id] = taken + 1;
+    return true;
+}
+
+inline fn scavRdtsc() u64 {
+    if (comptime builtin.cpu.arch != .x86_64) return 0;
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        :
+        : .{ .memory = true });
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
     // safepoint by native_depth + allocation cursor. Independent of -Dgc.
@@ -704,9 +759,20 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
             .claimed => {
                 // Discovery probe: main out-ran the helpers — this thunk was
                 // not resolved ahead of demand, so main must compute it itself.
+                // The age probe additionally buckets how long the thunk sat
+                // forcible before main reached it (look-ahead ceiling).
+                var age_t: u64 = std.math.maxInt(u64);
                 if (comptime prof.enabled) {
-                    if (demand and self.workerId() == 0) prof.disc.claimed_by_main += 1;
+                    if (demand and self.workerId() == 0) {
+                        prof.disc.claimed_by_main += 1;
+                        age_t = prof.ageForceBegin(
+                            thunk.future.created_tsc,
+                            @intFromEnum(thunk.targetKind()),
+                            pathKey(self, &thunk.payload.target, thunk.targetKind()),
+                        );
+                    }
                 }
+                defer if (comptime prof.enabled) prof.ageForceEnd(age_t);
                 // Bail out of in-flight speculation once the demanded
                 // result is ready: rather than run a (possibly large,
                 // never-needed) body to completion, abandon it at this safe
@@ -766,6 +832,19 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 defer if (comptime build_options.gc) {
                     _ = self.gc_force_chain.pop();
                 };
+                // Scavenger cost-learning: time this force on main's
+                // demand path so repeat-expensive chunks become
+                // scavengeable (see scavChunkHot). Off unless FIX_SCAVENGE.
+                var scav_t0: u64 = 0;
+                var scav_chunk: u32 = 0;
+                if (demand and thunk.targetKind() == .bytecode and
+                    self.scheduler.scavengeEnabled() and self.workerId() == 0)
+                {
+                    scav_chunk = thunk.payload.target.bytecode.chunk_id;
+                    scav_t0 = scavRdtsc();
+                    if (scav_chunk < SCAV_CHUNK_CAP and scav_demand_n[scav_chunk] != std.math.maxInt(u16))
+                        scav_demand_n[scav_chunk] += 1;
+                }
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {
@@ -773,6 +852,11 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
                 };
+                if (scav_t0 != 0 and scav_chunk < SCAV_CHUNK_CAP and
+                    scavRdtsc() - scav_t0 > scav_hot_threshold_cy)
+                {
+                    scav_hot_chunks[scav_chunk] = 1;
+                }
                 thunk.resolve(result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
                 if (memo_key) |k| thunk_memo[k.idx] = .{

@@ -234,7 +234,8 @@ pub const Scheduler = struct {
         cont_steals: u64 = 0,
         cont_pushes: u64 = 0,
         parks: u64 = 0,
-        _pad: [128 - 9 * @sizeOf(u64)]u8 = undefined,
+        scavenges: u64 = 0,
+        _pad: [128 - 10 * @sizeOf(u64)]u8 = undefined,
     };
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
@@ -258,6 +259,8 @@ pub const Scheduler = struct {
         cont_steals: u64 = 0,
         cont_pushes: u64 = 0,
         parks: u64,
+        /// Thunks pre-forced by the idle scavenger (FIX_SCAVENGE).
+        scavenges: u64 = 0,
         /// Deepest fiber native stack high-water seen across all workers
         /// since startup. Use to size `Fiber.min_stack_bytes` against a
         /// representative workload.
@@ -359,6 +362,17 @@ pub const Scheduler = struct {
     /// the eager `fanOut*Shallow`. Set once before helpers start, read-only
     /// during eval (plain bool — no atomic needed). Default off while landing.
     work_first: bool,
+
+    /// `FIX_SCAVENGE`: idle helpers pre-force old unresolved thunks from
+    /// the per-worker creation rings (`ObjectHeap.scavengeSteal`) —
+    /// lowest-priority work, after ready fibers / tasks / continuations.
+    /// Set once before helpers start, read-only during eval.
+    scavenge_enabled: bool = false,
+    /// Skip the newest N ring entries when scavenging (see
+    /// `scavengeSteal`). `FIX_SCAV_MARGIN` overrides.
+    scav_margin: u64 = 4096,
+    /// Highest worker id allowed to scavenge. `FIX_SCAV_WORKERS` overrides.
+    scav_workers: u8 = 7,
 
     /// When set (by `setTraceFlows`, driven by `--timeline`), `pushOwn` stamps
     /// each task with its push time so the timeline can anchor the steal arrow
@@ -526,6 +540,7 @@ pub const Scheduler = struct {
             c.cont_steals += w.cont_steals;
             c.cont_pushes += w.cont_pushes;
             c.parks += w.parks;
+            c.scavenges += w.scavenges;
         }
         return .{
             .speculative_submitted = c.spec_ok,
@@ -537,6 +552,7 @@ pub const Scheduler = struct {
             .cont_steals = c.cont_steals,
             .cont_pushes = c.cont_pushes,
             .parks = c.parks,
+            .scavenges = c.scavenges,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
@@ -715,6 +731,19 @@ pub const Scheduler = struct {
     }
     pub inline fn workFirst(self: *const Scheduler) bool {
         return self.work_first;
+    }
+
+    /// Enable/configure the idle-helper thunk scavenger. Set once before
+    /// helpers start (from `FIX_SCAVENGE` / `FIX_SCAV_MARGIN`).
+    pub fn setScavenge(self: *Scheduler, on: bool, margin: u64) void {
+        self.scavenge_enabled = on;
+        self.scav_margin = margin;
+    }
+    pub inline fn scavengeEnabled(self: *const Scheduler) bool {
+        return self.scavenge_enabled;
+    }
+    pub inline fn bumpScavenges(self: *Scheduler, id: u8) void {
+        self.bump(id, "scavenges");
     }
 
     /// Push a work-first continuation onto `worker_id`'s own continuation deque
