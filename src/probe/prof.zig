@@ -80,6 +80,17 @@ pub const Path = enum {
     /// second AST walk building NameSets). Sub-phase of `compile`; its
     /// exclusive cycles are carved out of the `compile` bucket.
     strictness,
+    /// `normalizeDerivation` — env-string assembly, attr walk, string
+    /// dupes, context scans. Sub-phase of the `derivationLazyAttr` /
+    /// `derivation` builtin bodies; nested force/call regions are
+    /// carved out, so EXCL here is the raw assembly cost.
+    drv_normalize,
+    /// `Drv.computePaths` — ATerm serializations + sha256 +
+    /// hashModuloInputs. No nested regions; EXCL is the whole phase.
+    drv_compute,
+    /// `derivation.buildValue`/`buildStrictValue` — result attrset
+    /// construction after paths are known.
+    drv_build_value,
 };
 
 pub const Sample = struct {
@@ -500,7 +511,13 @@ const StackFrame = struct {
     builtin_id: u16 = NO_BUILTIN,
 };
 
-const stack_cap: usize = 256;
+// Must comfortably exceed the deepest instrumented-region nesting: force
+// chains alone reach depth 269+ on the NixOS toplevel (see the age-at-force
+// `max_depth` diag) and each force level pushes ~3-4 region frames. At 256
+// the overflow silently dropped deep frames, so their time was misattributed
+// to whatever shallow ancestor happened to be tracked — e.g. `map`'s
+// per-builtin excl read 661M cy when its true body cost is ~60M.
+const stack_cap: usize = 4096;
 
 /// Per-thread instrumentation stack. Only worker 0 writes to it.
 threadlocal var prof_stack: [stack_cap]StackFrame = undefined;
