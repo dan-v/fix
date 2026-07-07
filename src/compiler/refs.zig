@@ -10,98 +10,121 @@ const Node = compiler_mod.Node;
 /// positives just keep cells (and bindings) around, never break
 /// semantics.
 pub fn collectReferencedNames(self: *Compiler, node: *const Node, out: *std.StringHashMapUnmanaged(void)) anyerror!void {
+    var ctx: CollectCtx = .{ .allocator = self.allocator, .out = out };
+    walkReferencedNames(self, node, &ctx);
+    if (ctx.err) |err| return err;
+}
+
+const CollectCtx = struct {
+    allocator: std.mem.Allocator,
+    out: *std.StringHashMapUnmanaged(void),
+    err: ?anyerror = null,
+
+    fn mark(self: *CollectCtx, name: []const u8) void {
+        self.out.put(self.allocator, name, {}) catch |err| {
+            self.err = err;
+        };
+    }
+};
+
+/// Walk `node` with exactly `collectReferencedNames`' coverage, but hand
+/// each encountered name to `ctx.mark(name)` instead of accumulating a
+/// set. For callers that only test membership of a small fixed name set
+/// (let-binding classification) this skips building — and allocating —
+/// a full subtree name set per region.
+pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) void {
     switch (node.tag) {
         .integer, .float_val, .bool_true, .bool_false, .null, .search_path => {},
-        .string, .path => try collectIdentifiersInSpan(self, node.data.atom, out),
+        .string, .path => walkIdentifiersInSpan(self, node.data.atom, ctx),
         .identifier => {
             const ident = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
-            try out.put(self.allocator, ident, {});
+            ctx.mark(ident);
         },
-        .unary_op => try collectReferencedNames(self, node.data.unary.expr, out),
+        .unary_op => walkReferencedNames(self, node.data.unary.expr, ctx),
         .binary_op => {
-            try collectReferencedNames(self, node.data.binary.left, out);
-            try collectReferencedNames(self, node.data.binary.right, out);
+            walkReferencedNames(self, node.data.binary.left, ctx);
+            walkReferencedNames(self, node.data.binary.right, ctx);
         },
         .apply => {
-            try collectReferencedNames(self, node.data.apply.func, out);
-            try collectReferencedNames(self, node.data.apply.arg, out);
+            walkReferencedNames(self, node.data.apply.func, ctx);
+            walkReferencedNames(self, node.data.apply.arg, ctx);
         },
-        .lambda => try collectReferencedNames(self, node.data.lambda.body, out),
+        .lambda => walkReferencedNames(self, node.data.lambda.body, ctx),
         .lambda_attrs => {
             const la = node.data.lambda_attrs;
             for (la.params) |param| {
-                if (param.default) |default| try collectReferencedNames(self, default, out);
+                if (param.default) |default| walkReferencedNames(self, default, ctx);
             }
-            try collectReferencedNames(self, la.body, out);
+            walkReferencedNames(self, la.body, ctx);
         },
         .let_in => {
             const li = node.data.let_in;
-            for (li.bindings) |b| try collectReferencedNames(self, b.expr, out);
-            try collectReferencedNames(self, li.body, out);
+            for (li.bindings) |b| walkReferencedNames(self, b.expr, ctx);
+            walkReferencedNames(self, li.body, ctx);
         },
         .if_else => {
             const ie = node.data.if_else;
-            try collectReferencedNames(self, ie.cond, out);
-            try collectReferencedNames(self, ie.then_branch, out);
-            try collectReferencedNames(self, ie.else_branch, out);
+            walkReferencedNames(self, ie.cond, ctx);
+            walkReferencedNames(self, ie.then_branch, ctx);
+            walkReferencedNames(self, ie.else_branch, ctx);
         },
         .assert => {
-            try collectReferencedNames(self, node.data.assert.cond, out);
-            try collectReferencedNames(self, node.data.assert.body, out);
+            walkReferencedNames(self, node.data.assert.cond, ctx);
+            walkReferencedNames(self, node.data.assert.body, ctx);
         },
         .with_expr => {
-            try collectReferencedNames(self, node.data.with_expr.attr_set, out);
-            try collectReferencedNames(self, node.data.with_expr.body, out);
+            walkReferencedNames(self, node.data.with_expr.attr_set, ctx);
+            walkReferencedNames(self, node.data.with_expr.body, ctx);
         },
         .attr_set => {
             for (node.data.attr_set.entries) |entry| {
-                if (entry.dynamic_name) |dn| try collectReferencedNames(self, dn, out);
-                for (entry.path) |seg| try collectIdentifiersInSpan(self, seg, out);
-                try collectReferencedNames(self, entry.expr, out);
+                if (entry.dynamic_name) |dn| walkReferencedNames(self, dn, ctx);
+                for (entry.path) |seg| walkIdentifiersInSpan(self, seg, ctx);
+                walkReferencedNames(self, entry.expr, ctx);
             }
         },
         .attr_path => {
-            try collectReferencedNames(self, node.data.attr_path.root, out);
-            for (node.data.attr_path.segments) |seg| try collectIdentifiersInSpan(self, seg, out);
+            walkReferencedNames(self, node.data.attr_path.root, ctx);
+            for (node.data.attr_path.segments) |seg| walkIdentifiersInSpan(self, seg, ctx);
         },
         .attr_dynamic => {
-            try collectReferencedNames(self, node.data.attr_dynamic.root, out);
-            try collectReferencedNames(self, node.data.attr_dynamic.name, out);
+            walkReferencedNames(self, node.data.attr_dynamic.root, ctx);
+            walkReferencedNames(self, node.data.attr_dynamic.name, ctx);
         },
         .attr_or => {
-            try collectReferencedNames(self, node.data.attr_or.attr_path, out);
-            try collectReferencedNames(self, node.data.attr_or.default, out);
+            walkReferencedNames(self, node.data.attr_or.attr_path, ctx);
+            walkReferencedNames(self, node.data.attr_or.default, ctx);
         },
         .has_attr => {
-            try collectReferencedNames(self, node.data.has_attr.root, out);
-            for (node.data.has_attr.segments) |seg| try collectIdentifiersInSpan(self, seg, out);
+            walkReferencedNames(self, node.data.has_attr.root, ctx);
+            for (node.data.has_attr.segments) |seg| walkIdentifiersInSpan(self, seg, ctx);
         },
         .has_attr_mixed => {
             const ham = node.data.has_attr_mixed;
-            try collectReferencedNames(self, ham.root, out);
+            walkReferencedNames(self, ham.root, ctx);
             for (ham.segments) |seg| switch (seg) {
-                .static => |a| try collectIdentifiersInSpan(self, a, out),
-                .dynamic => |n| try collectReferencedNames(self, n, out),
+                .static => |a| walkIdentifiersInSpan(self, a, ctx),
+                .dynamic => |n| walkReferencedNames(self, n, ctx),
             };
         },
         .list => {
-            for (node.data.list.items) |item| try collectReferencedNames(self, item, out);
+            for (node.data.list.items) |item| walkReferencedNames(self, item, ctx);
         },
-        .parens => try collectReferencedNames(self, node.data.parens, out),
+        .parens => walkReferencedNames(self, node.data.parens, ctx),
     }
 }
 
-/// Pull out every identifier-shaped substring from a source span and
-/// add it to `out`. Catches references inside `${...}` interpolation
-/// in atom-typed fields without expanding through the string parser.
-fn collectIdentifiersInSpan(self: *Compiler, atom: Node.Atom, out: *std.StringHashMapUnmanaged(void)) !void {
+/// Hand every identifier-shaped substring in a source span to
+/// `ctx.mark`. Catches references inside `${...}` interpolation in
+/// atom-typed fields without expanding through the string parser.
+fn walkIdentifiersInSpan(self: *Compiler, atom: Node.Atom, ctx: anytype) void {
     const text = self.source[atom.offset .. atom.offset + atom.len];
     var i: usize = 0;
     while (i < text.len) {
         if (isIdentStart(text[i])) {
             const start = i;
             while (i < text.len and isIdentChar(text[i])) : (i += 1) {}
-            try out.put(self.allocator, text[start..i], {});
+            ctx.mark(text[start..i]);
         } else {
             i += 1;
         }

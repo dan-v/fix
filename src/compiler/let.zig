@@ -164,26 +164,55 @@ const LetBindingKind = enum { unreferenced, literal, uncaptured, needs_cell };
 /// always see the bound value because pass 2 fills slots in source
 /// order before the body emits.
 ///
-/// To keep compile cost reasonable on big lets the analysis builds
-/// per-RHS reference hashsets once up front. Per-binding membership
-/// checks are then O(1) instead of O(total source bytes) — a
-/// measurable `mem.eql`-dominance saving on workloads with hundreds
-/// of let bindings (e.g. nixpkgs).
+/// To keep compile cost reasonable on big lets, all queries below are
+/// membership tests against the let's OWN binding names — so instead of
+/// materializing a name set per region (body + every RHS), one walk per
+/// region marks which binding names it mentions. Per name we keep how
+/// many RHS regions mention it and the earliest such binding index;
+/// that pair answers both the "referenced by another RHS" and the
+/// "referenced at-or-before index" (cell-needed) predicates exactly.
 fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *const Node) ![]LetBindingKind {
     const kinds = try self.allocator.alloc(LetBindingKind, bindings.len);
     errdefer self.allocator.free(kinds);
 
-    var body_refs: std.StringHashMapUnmanaged(void) = .empty;
-    defer body_refs.deinit(self.allocator);
-    try refs_mod.collectReferencedNames(self, body, &body_refs);
-
-    const rhs_refs = try self.allocator.alloc(std.StringHashMapUnmanaged(void), bindings.len);
-    defer {
-        for (rhs_refs) |*s| s.deinit(self.allocator);
-        self.allocator.free(rhs_refs);
+    // Slot per unique binding-root name, in first-occurrence order.
+    var slots: std.StringHashMapUnmanaged(u32) = .empty;
+    defer slots.deinit(self.allocator);
+    try slots.ensureTotalCapacity(self.allocator, @intCast(bindings.len));
+    var slot_count: u32 = 0;
+    for (bindings) |binding| {
+        const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const gop = slots.getOrPutAssumeCapacity(name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = slot_count;
+            slot_count += 1;
+        }
     }
-    for (rhs_refs) |*s| s.* = .empty;
+
+    const body_hit = try self.allocator.alloc(bool, slot_count);
+    defer self.allocator.free(body_hit);
+    @memset(body_hit, false);
+    var body_marker: BodyMarker = .{ .slots = &slots, .hit = body_hit };
+    refs_mod.walkReferencedNames(self, body, &body_marker);
+
+    const rhs_counts = try self.allocator.alloc(u32, slot_count);
+    defer self.allocator.free(rhs_counts);
+    @memset(rhs_counts, 0);
+    const rhs_first = try self.allocator.alloc(u32, slot_count);
+    defer self.allocator.free(rhs_first);
+    const rhs_stamp = try self.allocator.alloc(u32, slot_count);
+    defer self.allocator.free(rhs_stamp);
+    @memset(rhs_stamp, 0);
+
     var any_path_nested = false;
+    var rhs_marker: RhsMarker = .{
+        .slots = &slots,
+        .counts = rhs_counts,
+        .first = rhs_first,
+        .stamp_seen = rhs_stamp,
+        .stamp = 0,
+        .index = 0,
+    };
     for (bindings, 0..) |binding, i| {
         if (binding.path.len > 1) {
             // Nested-path bindings synthesise an attr-set thunk
@@ -191,7 +220,9 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             // any such binding "references" every other.
             any_path_nested = true;
         }
-        try refs_mod.collectReferencedNames(self, binding.expr, &rhs_refs[i]);
+        rhs_marker.stamp += 1;
+        rhs_marker.index = @intCast(i);
+        refs_mod.walkReferencedNames(self, binding.expr, &rhs_marker);
     }
 
     for (bindings, 0..) |binding, i| {
@@ -200,9 +231,12 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             continue;
         }
         const name = attrs.attrSegmentSpan(self, binding.path[0]);
+        const slot = slots.get(name).?;
 
-        const externally_referenced = body_refs.contains(name) or any_path_nested or
-            referencedByOtherRhs(rhs_refs, i, name);
+        const referenced_by_other_rhs = rhs_counts[slot] > 1 or
+            (rhs_counts[slot] == 1 and rhs_first[slot] != i);
+        const externally_referenced = body_hit[slot] or any_path_nested or
+            referenced_by_other_rhs;
         if (!externally_referenced) {
             kinds[i] = .unreferenced;
             continue;
@@ -211,7 +245,11 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
             kinds[i] = .literal;
             continue;
         }
-        if (groupNeedsCellFromSets(rhs_refs, i, name)) {
+        // A binding needs its cell when some RHS at-or-before it (earlier
+        // sibling, or itself via self-recursion) mentions the name: that's
+        // exactly the set whose pass-2 compile would capture before the
+        // slot is filled.
+        if (rhs_counts[slot] > 0 and rhs_first[slot] <= i) {
             kinds[i] = .needs_cell;
         } else {
             kinds[i] = .uncaptured;
@@ -220,34 +258,36 @@ fn classifyLetBindings(self: *Compiler, bindings: []const Node.Binding, body: *c
     return kinds;
 }
 
-fn referencedByOtherRhs(
-    rhs_refs: []const std.StringHashMapUnmanaged(void),
-    target_index: usize,
-    name: []const u8,
-) bool {
-    for (rhs_refs, 0..) |s, i| {
-        if (i == target_index) continue;
-        if (s.contains(name)) return true;
-    }
-    return false;
-}
+const BodyMarker = struct {
+    slots: *const std.StringHashMapUnmanaged(u32),
+    hit: []bool,
 
-/// Cell-needed predicate using the precomputed reference sets. A
-/// binding's name is "earlier-or-self referenced" when any binding
-/// in `0..=target_index` mentions it: that's exactly the set whose
-/// pass-2 compile would either capture before the slot is filled
-/// (earlier sibling) or during its own thunk construction (self).
-fn groupNeedsCellFromSets(
-    rhs_refs: []const std.StringHashMapUnmanaged(void),
-    target_index: usize,
-    name: []const u8,
-) bool {
-    var i: usize = 0;
-    while (i <= target_index) : (i += 1) {
-        if (rhs_refs[i].contains(name)) return true;
+    pub fn mark(self: *BodyMarker, name: []const u8) void {
+        if (self.slots.get(name)) |slot| self.hit[slot] = true;
     }
-    return false;
-}
+};
+
+/// Per-slot RHS aggregation: `counts[slot]` = number of RHS regions
+/// mentioning the name, `first[slot]` = earliest such binding index.
+/// `stamp_seen` dedups within one region so a name mentioned twice in
+/// the same RHS counts once (region semantics, matching the former
+/// per-RHS hashsets).
+const RhsMarker = struct {
+    slots: *const std.StringHashMapUnmanaged(u32),
+    counts: []u32,
+    first: []u32,
+    stamp_seen: []u32,
+    stamp: u32,
+    index: u32,
+
+    pub fn mark(self: *RhsMarker, name: []const u8) void {
+        const slot = self.slots.get(name) orelse return;
+        if (self.stamp_seen[slot] == self.stamp) return;
+        self.stamp_seen[slot] = self.stamp;
+        self.counts[slot] += 1;
+        if (self.counts[slot] == 1) self.first[slot] = self.index;
+    }
+};
 
 /// True when the binding group sharing `root` is exactly one leaf
 /// (no nested attr paths, no duplicates) and that leaf's RHS is a
