@@ -10,10 +10,12 @@ const source_paths = @import("derivation").source_path;
 const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
+const prof = @import("../probe/prof.zig");
 
 const VM = vm_mod.VM;
 
 pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
+    const t_start = prof.tscMainOnly();
     const s_a = self.intern.get(a);
     const s_b = self.intern.get(b);
     const buf = try self.allocator.alloc(u8, s_a.len + s_b.len);
@@ -22,7 +24,18 @@ pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
     @memcpy(buf[0..s_a.len], s_a);
     @memcpy(buf[s_a.len..], s_b);
 
-    return self.intern.intern(buf);
+    const pre_entries = if (prof.enabled) self.intern.entries.count() else 0;
+    const id = try self.intern.intern(buf);
+    if (prof.enabled and t_start != 0) {
+        prof.str.concat_calls += 1;
+        prof.str.concat_cycles += prof.tscMainOnly() - t_start;
+        prof.str.concat_bytes += buf.len;
+        if (self.intern.entries.count() != pre_entries) {
+            prof.str.concat_new += 1;
+            prof.str.concat_new_bytes += buf.len;
+        }
+    }
+    return id;
 }
 
 pub fn stringLikeValue(self: *VM, value: Value) !Value {

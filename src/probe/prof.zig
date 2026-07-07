@@ -145,6 +145,27 @@ pub var attr_cache_misses: u64 = 0;
 pub var memo_probes: u64 = 0;
 pub var memo_hits: u64 = 0;
 
+/// String-machinery census (piggybacks on `-Dprof-main`). Sizes the
+/// byte-assembly cost of the interning value representation: every
+/// binary concat (`+` and each `${...}` interpolation boundary)
+/// allocates a temp buffer, copies both sides, and interns the
+/// intermediate — a k-part interpolation pays O(k) passes over its
+/// prefix bytes and leaks every intermediate into the intern table.
+/// Worker-0-only writes (guarded at the call sites via `tscMainOnly`).
+pub const StrCensus = struct {
+    /// `concatInternedString` — the pure assembly step of every binary
+    /// string/path concat (no forcing inside; excl == incl).
+    concat_calls: u64 = 0,
+    concat_cycles: u64 = 0,
+    /// Result bytes per call, summed — the bytes copied AND hashed.
+    concat_bytes: u64 = 0,
+    /// Calls whose result was a first-time intern (table miss): these
+    /// bytes stay in the intern table forever.
+    concat_new: u64 = 0,
+    concat_new_bytes: u64 = 0,
+};
+pub var str: StrCensus = .{};
+
 /// Fiber cost/benefit census (piggybacks on `-Dprof-main`). Sizes what
 /// the fiber machinery costs (dispatch + swap cycles per task) and what
 /// it buys (how many tasks ever suspend; how many fibers are live
@@ -629,8 +650,20 @@ pub fn report(registry: anytype, intern: anytype) void {
             });
         }
     }
+    // String-machinery census.
+    if (str.concat_calls != 0) {
+        std.debug.print(
+            "prof str-concat: calls={d} cycles={d} avg_cy={d} bytes={d} new={d} ({d:.1}%) new_bytes={d}\n",
+            .{
+                str.concat_calls,           str.concat_cycles,
+                str.concat_cycles / str.concat_calls, str.concat_bytes,
+                str.concat_new,             pct(str.concat_new, str.concat_calls),
+                str.concat_new_bytes,
+            },
+        );
+    }
     // Top builtins by inclusive cycles on main.
-    const N = 20;
+    const N = 40;
     const BSlot = struct { id: u16, cycles: u64, incl: u64, calls: u64 };
     var top_b: [N]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** N;
     for (builtin_samples, 0..) |samp, id| {
@@ -648,7 +681,7 @@ pub fn report(registry: anytype, intern: anytype) void {
             top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
         }
     }
-    std.debug.print("prof builtins (top-20 by EXCL cycles — own-body cost):\n", .{});
+    std.debug.print("prof builtins (top-{d} by EXCL cycles — own-body cost):\n", .{N});
     for (top_b) |entry| {
         if (entry.cycles == 0) break;
         const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
