@@ -96,9 +96,19 @@ pub const ReadyNode = struct {
 /// only the owner consumed, but stealing needs MPMC pop and Treiber's
 /// CAS pop has ABA hazards under concurrent consumers.
 const ReadyQueue = struct {
-    mu: stable.SpinMutex,
+    /// `align(cache_line)`: one ready queue per destructive-interference
+    /// block (128B). `mu`/`head`/`tail` are written together under the
+    /// lock, so they SHOULD share a line — but at 24B packed, ~2.7
+    /// queues shared one, and every idle worker's steal scan probes
+    /// every peer's queue: worker i's push/pop invalidated the line
+    /// under workers i±1's queues too.
+    mu: stable.SpinMutex align(std.atomic.cache_line),
     head: ?*ReadyNode,
     tail: ?*ReadyNode,
+
+    comptime {
+        std.debug.assert(@sizeOf(ReadyQueue) % std.atomic.cache_line == 0);
+    }
 
     fn init() ReadyQueue {
         return .{ .mu = .{}, .head = null, .tail = null };
@@ -128,6 +138,18 @@ const ReadyQueue = struct {
         // would-be enqueuer.
         n.queued.store(0, .release);
         return n;
+    }
+};
+
+/// One worker's futex wake word, alone in its destructive-interference
+/// block (128B). As a bare `[]std.atomic.Value(u32)`, 32 workers' wake
+/// words all sat in ONE cache line: every park (store 0) and every wake
+/// (swap 1) invalidated the line under every other parking/waking core.
+pub const WakeWord = struct {
+    word: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+
+    comptime {
+        std.debug.assert(@sizeOf(WakeWord) % std.atomic.cache_line == 0);
     }
 };
 
@@ -183,11 +205,22 @@ const TaskQueue = containers.Deque(TracedTask);
 /// occupancy is `head -% tail`. All mutation is under `mu`; the GC mark walk
 /// (`specQueueGcMark`) runs at the STW safepoint where no mutator is live.
 const SpecQueue = struct {
-    mu: stable.SpinMutex,
+    /// `align(cache_line)`: one spec ring per destructive-interference
+    /// block (128B), same rationale as `ReadyQueue`. `mu`/`head`/`tail`
+    /// are mutated together under the lock so they SHOULD share a line —
+    /// but at ~40B packed, adjacent workers' rings shared one, and the
+    /// idle steal scan (`stealSpecExcluding`, on both the novel and bulk
+    /// lanes) locks every peer's ring each rescan: worker i's push/pop
+    /// invalidated the line under workers i±1's rings too.
+    mu: stable.SpinMutex align(std.atomic.cache_line),
     items: []TracedTask,
     mask: u32,
     head: u32,
     tail: u32,
+
+    comptime {
+        std.debug.assert(@sizeOf(SpecQueue) % std.atomic.cache_line == 0);
+    }
 
     const PushResult = enum { pushed, pushed_evicted, full };
 
@@ -258,8 +291,8 @@ const ContQueue = containers.Deque(Continuation);
 /// after this collection, demand — may still force it). Called only at
 /// the STW safepoint, so `top..bottom` is stable.
 fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    const t = q.top.load(.monotonic);
-    const b = q.bottom.load(.monotonic);
+    const t = q.top.v.load(.monotonic);
+    const b = q.bottom.v.load(.monotonic);
     var i = t;
     while (i != b) : (i +%= 1) {
         switch (q.items[@intCast(i & q.mask)].task) {
@@ -334,11 +367,14 @@ pub const GcMarkHook = struct {
 pub const Scheduler = struct {
     /// Per-worker, cache-line-padded activity counters. A worker only
     /// ever touches `worker_counters[its_own_id]`, so the adds need no
-    /// atomics and generate no inter-core coherence traffic. 9 u64s =
-    /// 72B; padded to 128B so two workers' hot counters can't land in
-    /// the same 64B line.
+    /// atomics and generate no inter-core coherence traffic. The
+    /// `align(cache_line)` on the first field (128B on x86_64) rounds
+    /// `@sizeOf(Counters)` up to a whole interference block AND aligns
+    /// the slice allocation — a trailing `_pad` alone left the array
+    /// 8-aligned, so slot boundaries could straddle line pairs and
+    /// adjacent workers still shared a line.
     pub const Counters = struct {
-        spec_ok: u64 = 0,
+        spec_ok: u64 align(std.atomic.cache_line) = 0,
         spec_rej: u64 = 0,
         urgent_ok: u64 = 0,
         urgent_rej: u64 = 0,
@@ -351,7 +387,10 @@ pub const Scheduler = struct {
         sweeps: u64 = 0,
         evicts: u64 = 0,
         novel_ok: u64 = 0,
-        _pad: [128 - 13 * @sizeOf(u64)]u8 = undefined,
+
+        comptime {
+            std.debug.assert(@sizeOf(Counters) % std.atomic.cache_line == 0);
+        }
     };
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
@@ -446,25 +485,33 @@ pub const Scheduler = struct {
     /// queue is empty. Indexed by worker_id.
     ready_queues: []ReadyQueue,
     threads: []std.Thread,
-    wake_words: []std.atomic.Value(u32),
+    wake_words: []WakeWord,
     shutdown_flag: std.atomic.Value(bool),
     /// Count of helper threads that have stopped forcing (exited `run`)
     /// at shutdown. The quiescence barrier (`awaitHelpersQuiescent`) waits
     /// on this so no helper destroys its fibers while another could still
     /// resolve a thunk and wake a just-freed enrolled fiber.
     stopped_helpers: std.atomic.Value(u32) = .init(0),
-    next_victim: std.atomic.Value(u32),
+    // The five globally-hot atomics below each get their own 128B
+    // destructive-interference block (`align(cache_line)`), and the
+    // comptime check at the end of the struct proves no other field
+    // shares a block with any of them. Packed together (and next to
+    // read-mostly fields like `worker_count` / `suppress_background`
+    // that every drain-loop iteration reads), each `fetchAdd` here
+    // invalidated its neighbors' lines on every submit/pop/steal scan
+    // across all workers.
+    next_victim: containers.Isolated(u32),
     /// Monotonic counter handing out fresh fiber ids at allocation.
     /// Fiber ids are scheduler-global so a fiber's identity doesn't
     /// change when it migrates across workers (F1 unpin). Used to
     /// construct `ClaimerId` and to label the fiber in traces.
-    next_fiber_id: std.atomic.Value(u32),
+    next_fiber_id: containers.Isolated(u32),
     started: std.atomic.Value(bool),
     /// Total tasks currently pending across all helper queues. Used to
     /// (a) skip submissions when the backlog already saturates helpers
     /// and (b) skip futex_wake syscalls when at least one helper has
     /// work to do and is therefore not parked.
-    pending_tasks: std.atomic.Value(u32),
+    pending_tasks: containers.Isolated(u32),
     /// Number of helpers currently in the idle spin-rescan loop
     /// (parkAndAccount's pre-park spin + immediate rescan). Capped at
     /// `max_spinners` so at high worker counts the idle scan churn
@@ -472,12 +519,12 @@ pub const Scheduler = struct {
     /// the SMT siblings of busy workers) stays bounded: workers past
     /// the cap park on their futex immediately and are re-engaged by
     /// submit-side wakes. Worker 0 is exempt (it's the demand thread).
-    spinners: std.atomic.Value(u32),
+    spinners: containers.Isolated(u32),
     /// Net work-first continuations currently sitting on all `cont_queues`
     /// (pushed − popped/stolen). A single shared counter the pre-park spin
     /// reads to decide whether to keep spinning for stealable continuation
     /// work, without per-queue CAS probes (same design as `pending_tasks`).
-    cont_pending: std.atomic.Value(u32),
+    cont_pending: containers.Isolated(u32),
     /// Per-worker activity counters. Each worker writes ONLY its own
     /// slot — single-writer, plain non-atomic adds. This kills the
     /// cross-core cache-line contention that shared-atomic counters
@@ -688,9 +735,9 @@ pub const Scheduler = struct {
         const threads = try allocator.alloc(std.Thread, helper_thread_count);
         errdefer allocator.free(threads);
 
-        const wake_words = try allocator.alloc(std.atomic.Value(u32), safe_worker_count);
+        const wake_words = try allocator.alloc(WakeWord, safe_worker_count);
         errdefer allocator.free(wake_words);
-        for (wake_words) |*w| w.* = .init(0);
+        for (wake_words) |*w| w.* = .{};
 
         const worker_counters = try allocator.alloc(Counters, safe_worker_count);
         errdefer allocator.free(worker_counters);
@@ -751,7 +798,7 @@ pub const Scheduler = struct {
     /// `Worker.allocateFiber` so claimer identity doesn't depend on
     /// the worker that happened to create the fiber.
     pub fn allocFiberId(self: *Scheduler) u32 {
-        return self.next_fiber_id.fetchAdd(1, .monotonic);
+        return self.next_fiber_id.v.fetchAdd(1, .monotonic);
     }
 
     pub fn stats(self: *const Scheduler) Stats {
@@ -829,8 +876,8 @@ pub const Scheduler = struct {
         // Work-first continuations reference a live collection each; mark it
         // (the range's items are reachable through the list/attrs). STW-only.
         for (self.cont_queues) |*q| {
-            const t = q.top.load(.monotonic);
-            const b = q.bottom.load(.monotonic);
+            const t = q.top.v.load(.monotonic);
+            const b = q.bottom.v.load(.monotonic);
             var i = t;
             while (i != b) : (i +%= 1) tr.markObject(heap, q.items[@intCast(i & q.mask)].id);
         }
@@ -876,7 +923,7 @@ pub const Scheduler = struct {
     /// woken on a busy worker still gets resumed promptly.
     pub fn stealReady(self: *Scheduler, my_worker_id: u8) ?*ReadyNode {
         if (self.worker_count < 2) return null;
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
@@ -1003,11 +1050,11 @@ pub const Scheduler = struct {
         if (worker_id >= self.worker_count) return false;
         if (!self.cont_queues[worker_id].push(cont)) return false;
         self.bump(worker_id, "cont_pushes");
-        const prev = self.cont_pending.fetchAdd(1, .release);
+        const prev = self.cont_pending.v.fetchAdd(1, .release);
         if (self.worker_count > 1) {
             const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
             if (prev < wake_budget) {
-                const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+                const wake_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
                 const target = if (wake_idx == worker_id) (wake_idx + 1) % self.worker_count else wake_idx;
                 self.wakeWorker(target);
             }
@@ -1020,7 +1067,7 @@ pub const Scheduler = struct {
     pub fn popCont(self: *Scheduler, worker_id: u8) ?Continuation {
         if (worker_id >= self.worker_count) return null;
         const c = self.cont_queues[worker_id].pop() orelse return null;
-        _ = self.cont_pending.fetchSub(1, .monotonic);
+        _ = self.cont_pending.v.fetchSub(1, .monotonic);
         return c;
     }
 
@@ -1029,13 +1076,13 @@ pub const Scheduler = struct {
     /// caller's own. Null if none available.
     pub fn stealCont(self: *Scheduler, worker_id: u8) ?Continuation {
         if (self.worker_count < 2) return null;
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == worker_id) continue;
             if (self.cont_queues[idx].steal()) |c| {
-                _ = self.cont_pending.fetchSub(1, .monotonic);
+                _ = self.cont_pending.v.fetchSub(1, .monotonic);
                 self.bump(worker_id, "cont_steals");
                 return c;
             }
@@ -1045,7 +1092,7 @@ pub const Scheduler = struct {
 
     /// Pre-park spin probe: is there stealable continuation work outstanding?
     pub inline fn contPending(self: *const Scheduler) u32 {
-        return self.cont_pending.load(.monotonic);
+        return self.cont_pending.v.load(.monotonic);
     }
 
     /// Try to become one of the `max_spinners` idle spinners. Returns
@@ -1053,9 +1100,9 @@ pub const Scheduler = struct {
     /// instead of spin-rescanning.
     pub fn tryBeginSpin(self: *Scheduler) bool {
         const cap = maxSpinners(self.worker_count);
-        var cur = self.spinners.load(.monotonic);
+        var cur = self.spinners.v.load(.monotonic);
         while (cur < cap) {
-            if (self.spinners.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic)) |actual| {
+            if (self.spinners.v.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic)) |actual| {
                 cur = actual;
             } else return true;
         }
@@ -1063,7 +1110,7 @@ pub const Scheduler = struct {
     }
 
     pub fn endSpin(self: *Scheduler) void {
-        _ = self.spinners.fetchSub(1, .release);
+        _ = self.spinners.v.fetchSub(1, .release);
     }
 
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
@@ -1071,7 +1118,7 @@ pub const Scheduler = struct {
         if (self.disable_speculation) return false;
         if (submitter_id >= self.worker_count) return false;
         const cap: u32 = @as(u32, self.worker_count - 1) * spec_backlog_per_helper;
-        if (self.pending_tasks.load(.monotonic) >= cap) {
+        if (self.pending_tasks.v.load(.monotonic) >= cap) {
             // At the cap: with `FIX_SPEC_EVICT`, make room by dropping the
             // oldest queued spec task (ring semantics — see `spec_evict`);
             // otherwise reject the fresh submission (historical behavior).
@@ -1089,18 +1136,18 @@ pub const Scheduler = struct {
                 self.bump(submitter_id, "spec_rej");
                 return false;
             },
-            .pushed => self.pending_tasks.fetchAdd(1, .release),
+            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
             // Ring overwrite inside our own queue: one task dropped, one
             // added — pending count is unchanged.
             .pushed_evicted => blk: {
                 self.bump(submitter_id, "evicts");
-                break :blk self.pending_tasks.load(.monotonic);
+                break :blk self.pending_tasks.v.load(.monotonic);
             },
         };
         // Same burst-ramp + periodic re-wake as `pushOwn` (see there).
         const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
         if (prev < wake_budget or (prev & 63) == 0) {
-            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const wake_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
             const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
             self.wakeWorker(target);
         }
@@ -1123,15 +1170,15 @@ pub const Scheduler = struct {
             true,
         )) {
             .full => unreachable, // evicting push never reports full
-            .pushed => self.pending_tasks.fetchAdd(1, .release),
+            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
             .pushed_evicted => blk: {
                 self.bump(submitter_id, "evicts");
-                break :blk self.pending_tasks.load(.monotonic);
+                break :blk self.pending_tasks.v.load(.monotonic);
             },
         };
         const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
         if (prev < wake_budget or (prev & 63) == 0) {
-            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const wake_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
             const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
             self.wakeWorker(target);
         }
@@ -1149,17 +1196,17 @@ pub const Scheduler = struct {
     fn evictOldestSpec(self: *Scheduler, submitter_id: u8) bool {
         if (!self.spec_evict) return false;
         if (self.spec_queues[submitter_id].evictOldest()) {
-            _ = self.pending_tasks.fetchSub(1, .monotonic);
+            _ = self.pending_tasks.v.fetchSub(1, .monotonic);
             self.bump(submitter_id, "evicts");
             return true;
         }
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == submitter_id) continue;
             if (self.spec_queues[idx].evictOldest()) {
-                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(submitter_id, "evicts");
                 return true;
             }
@@ -1201,7 +1248,7 @@ pub const Scheduler = struct {
         // Bound this so steady backlog does not turn every submit into
         // a futex wake. These wake words also pre-signal workers that
         // are between the pre-park spin and the futex call.
-        const prev = self.pending_tasks.fetchAdd(1, .release);
+        const prev = self.pending_tasks.v.fetchAdd(1, .release);
         const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
         // Burst ramp (prev < budget) plus a periodic re-wake under steady
         // backlog: once prev >= budget the ramp alone never wakes anyone,
@@ -1211,7 +1258,7 @@ pub const Scheduler = struct {
         // rise). Every 64th submit into a standing backlog re-nudges one
         // worker — bounded futex traffic, keeps parked helpers engaged.
         if (prev < wake_budget or (prev & 63) == 0) {
-            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const wake_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
             const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
             self.wakeWorker(target);
         }
@@ -1227,7 +1274,7 @@ pub const Scheduler = struct {
             self.novel_queues[worker_id].popNewest() orelse
             self.spec_queues[worker_id].popNewest() orelse
             return null;
-        _ = self.pending_tasks.fetchSub(1, .monotonic);
+        _ = self.pending_tasks.v.fetchSub(1, .monotonic);
         self.bump(worker_id, "pops");
         return traced.task;
     }
@@ -1264,13 +1311,13 @@ pub const Scheduler = struct {
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
     /// bets), oldest-first otherwise.
     fn stealSpecExcluding(self: *Scheduler, queues: []SpecQueue, exclude: u8, lifo: bool, victim: ?*u8, push_ts: ?*u64) ?Task {
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == exclude) continue;
             if (queues[idx].steal(lifo)) |traced| {
-                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(exclude, "steals");
                 if (victim) |v| v.* = idx;
                 if (push_ts) |p| p.* = traced.push_ts;
@@ -1281,13 +1328,13 @@ pub const Scheduler = struct {
     }
 
     fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
-        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == exclude) continue;
             if (queues[idx].steal()) |traced| {
-                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(exclude, "steals");
                 if (victim) |v| v.* = idx;
                 if (push_ts) |p| p.* = traced.push_ts;
@@ -1301,7 +1348,7 @@ pub const Scheduler = struct {
     /// shutdown. Works for any worker, including worker 0.
     pub fn parkWorker(self: *Scheduler, worker_id: u8) void {
         self.bump(worker_id, "parks");
-        const word = &self.wake_words[worker_id];
+        const word = &self.wake_words[worker_id].word;
         // Try to atomically transition 0 → "waiting" (still 0; we just check
         // before sleeping). The futex syscall's "expected" param is the safe
         // way to avoid lost wakeups: if a wake arrives between our check and
@@ -1427,7 +1474,7 @@ pub const Scheduler = struct {
     }
 
     fn wakeWorker(self: *Scheduler, worker_id: u8) void {
-        const word = &self.wake_words[worker_id];
+        const word = &self.wake_words[worker_id].word;
         // Already signalled → a prior waker's futex_wake is still in
         // flight for this word; skip the redundant syscall. (If the
         // sleeper consumed the old signal it also cleared the word, so
@@ -1442,6 +1489,26 @@ pub const Scheduler = struct {
                 );
             },
             else => {},
+        }
+    }
+
+    comptime {
+        // Prove the isolation the `Isolated` wrappers intend:
+        // each globally write-hot atomic sits alone in its 128B block —
+        // no pair shares one, and no other (read-mostly or cold) field
+        // lands inside one. Layout is otherwise the compiler's business,
+        // so this is what keeps a future field-shuffle honest.
+        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending" };
+        const blk = std.atomic.cache_line;
+        for (@typeInfo(Scheduler).@"struct".fields) |f| {
+            if (@sizeOf(f.type) == 0) continue;
+            const lo = @offsetOf(Scheduler, f.name) / blk;
+            const hi = (@offsetOf(Scheduler, f.name) + @sizeOf(f.type) - 1) / blk;
+            for (hot) |h| {
+                if (std.mem.eql(u8, f.name, h)) continue;
+                const h_blk = @offsetOf(Scheduler, h) / blk;
+                std.debug.assert(lo > h_blk or hi < h_blk);
+            }
         }
     }
 };
@@ -1546,7 +1613,7 @@ test "spec ring: FIX_SPEC_EVICT admits at the cap by dropping the oldest" {
     // At the cap the submit must still succeed (ring semantics), dropping
     // the oldest (id 0) and keeping the count at the cap.
     try std.testing.expect(sched.submit(.{ .force_thunk = 999 }, 0));
-    try std.testing.expectEqual(spec_backlog_per_helper, sched.pending_tasks.load(.monotonic));
+    try std.testing.expectEqual(spec_backlog_per_helper, sched.pending_tasks.v.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), sched.stats().evicts);
 
     // The oldest remaining is now id 1; the newest is the fresh 999.
@@ -1578,7 +1645,7 @@ test "stealForWorker: each worker excludes its own queue" {
     // Put one task in each of worker 1 and worker 2's urgent queues.
     try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 100 } }));
     try std.testing.expect(sched.urgent_queues[2].push(.{ .task = .{ .force_thunk = 200 } }));
-    sched.pending_tasks.store(2, .release);
+    sched.pending_tasks.v.store(2, .release);
 
     // Worker 1 must not steal from its own queue.
     const stolen_by_w1 = sched.stealForWorker(1).?;
@@ -1594,7 +1661,7 @@ test "stealForWorker: each worker excludes its own queue" {
     // Worker 0 (main) likewise excludes its own queue but can take
     // from any other.
     try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 7 } }));
-    sched.pending_tasks.store(1, .release);
+    sched.pending_tasks.v.store(1, .release);
     const stolen_by_main = sched.stealForWorker(0).?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen_by_main.force_thunk);
 }
@@ -1755,11 +1822,11 @@ test "parkWorker returns immediately when already woken" {
     defer sched.deinit();
 
     sched.wakeWorkerPublic(1);
-    try std.testing.expectEqual(@as(u32, 1), sched.wake_words[1].load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), sched.wake_words[1].word.load(.monotonic));
 
     // Must return promptly (no real wait to service) and drain the word.
     sched.parkWorker(1);
-    try std.testing.expectEqual(@as(u32, 0), sched.wake_words[1].load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), sched.wake_words[1].word.load(.monotonic));
 }
 
 test "parkWorker returns immediately once shutdown is flagged" {

@@ -12,6 +12,7 @@ pub const deque = @import("containers/deque.zig");
 
 pub const Deque = deque.Deque;
 pub const GrowableDeque = deque.GrowableDeque;
+pub const Isolated = deque.Isolated;
 
 test {
     _ = deque;

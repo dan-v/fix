@@ -1,5 +1,28 @@
 const std = @import("std");
 
+/// A `std.atomic.Value(T)` alone in one full destructive-interference
+/// block (128B on x86_64 — the L2 spatial prefetcher pulls line PAIRS,
+/// so 64B isolation still ping-pongs). The `align` pins the block start
+/// and the pad fills the rest, so the layout can never place another
+/// field in the block — field `align` alone does not give that: Zig
+/// backfills the alignment gap with whatever fields fit.
+///
+/// Access the value through `.v`.
+pub fn Isolated(comptime T: type) type {
+    return struct {
+        v: std.atomic.Value(T) align(std.atomic.cache_line),
+        _pad: [std.atomic.cache_line - @sizeOf(std.atomic.Value(T))]u8 = undefined,
+
+        pub fn init(value: T) @This() {
+            return .{ .v = .init(value) };
+        }
+
+        comptime {
+            std.debug.assert(@sizeOf(@This()) == std.atomic.cache_line);
+        }
+    };
+}
+
 /// Shared Chase-Lev work-stealing deque protocol, comptime-specialized over
 /// payload `T` and `growable`.
 ///
@@ -83,9 +106,27 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         retired: if (growable) std.ArrayListUnmanaged(*Buffer) else void = if (growable) .empty else {},
 
         /// Owner-only writes (push/pop). Stealers read with acquire.
-        bottom: std.atomic.Value(u64),
+        ///
+        /// `bottom` and `top` each own a full destructive-interference
+        /// block (`Isolated`). Un-isolated they sat 8 bytes apart: every
+        /// stealer's CAS on `top` (or even its failed empty-probe load)
+        /// invalidated the owner's line under `bottom`, and with 40B
+        /// deques packed contiguously, ADJACENT WORKERS' deques also
+        /// shared lines. Idle workers rescan every peer's deque
+        /// top+bottom per drain step, so at w=16 these probes were the
+        /// top source of cross-CCX cache fills (24% of
+        /// ls_dmnd_fills_from_sys.ext_cache_local landed in drainStep).
+        /// The buffer fields (`items`/`mask`/`array`) stay on their own
+        /// read-mostly block, shared harmlessly in S-state.
+        bottom: Isolated(u64),
         /// CAS by stealers (and the owner's last-element pop).
-        top: std.atomic.Value(u64),
+        top: Isolated(u64),
+
+        comptime {
+            // Adjacent array elements (per-worker queues) must not share
+            // a block either.
+            std.debug.assert(@sizeOf(Self) % std.atomic.cache_line == 0);
+        }
 
         pub fn init(allocator: std.mem.Allocator, capacity: u32) !Self {
             if (growable) {
@@ -172,13 +213,13 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// (caller drops the item — speculation is best-effort).
         fn pushFixed(self: *Self, item: T) bool {
             comptime std.debug.assert(!growable);
-            const b = self.bottom.load(.monotonic);
-            const t = self.top.load(.acquire);
+            const b = self.bottom.v.load(.monotonic);
+            const t = self.top.v.load(.acquire);
             if (b -% t > self.mask) return false; // full
             self.items[@intCast(b & self.mask)] = item;
             // Release: the slot write must be visible before stealers
             // see the updated bottom.
-            self.bottom.store(b + 1, .release);
+            self.bottom.v.store(b + 1, .release);
             return true;
         }
 
@@ -187,8 +228,8 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// `error.OutOfMemory` only if a grow's allocation fails).
         fn pushGrowable(self: *Self, allocator: std.mem.Allocator, item: T) !void {
             comptime std.debug.assert(growable);
-            const b = self.bottom.load(.monotonic);
-            const t = self.top.load(.acquire);
+            const b = self.bottom.v.load(.monotonic);
+            const t = self.top.v.load(.acquire);
             var buf = self.array.load(.monotonic);
             if (b -% t > buf.mask) {
                 // Full — grow to 2x and copy live elements at their logical index.
@@ -197,7 +238,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             buf.items[@intCast(b & buf.mask)] = item;
             // Release: the slot write must be visible before stealers see the
             // updated bottom.
-            self.bottom.store(b + 1, .release);
+            self.bottom.v.store(b + 1, .release);
         }
 
         /// Owner-only. Fixed: `push(item) bool`. Growable: `push(allocator,
@@ -207,28 +248,28 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
 
         /// Owner-only LIFO pop.
         pub fn pop(self: *Self) ?T {
-            const b = self.bottom.load(.monotonic) -% 1;
-            self.bottom.store(b, .monotonic);
+            const b = self.bottom.v.load(.monotonic) -% 1;
+            self.bottom.v.store(b, .monotonic);
             // seq_cst fence: prevents reordering of the bottom write
             // above with the top load below. Without it, the owner
             // could observe a stale `top` and dequeue a slot a stealer
             // is concurrently taking.
             asm volatile ("mfence" ::: .{ .memory = true });
-            const t = self.top.load(.monotonic);
+            const t = self.top.v.load(.monotonic);
             if (@as(i64, @bitCast(b -% t)) < 0) {
                 // Empty — restore bottom.
-                self.bottom.store(t, .monotonic);
+                self.bottom.v.store(t, .monotonic);
                 return null;
             }
             const item = self.bufferSlot(b, .monotonic).*;
             if (b != t) return item; // not the last element, no race
             // Last element: race a concurrent steal for it.
-            if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+            if (self.top.v.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
                 // Lost the race — stealer took it. Restore bottom.
-                self.bottom.store(t + 1, .monotonic);
+                self.bottom.v.store(t + 1, .monotonic);
                 return null;
             }
-            self.bottom.store(t + 1, .monotonic);
+            self.bottom.v.store(t + 1, .monotonic);
             return item;
         }
 
@@ -245,19 +286,19 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// Thus a stale `array` read never yields a wrong or double-taken
         /// element.
         pub fn steal(self: *Self) ?T {
-            const t = self.top.load(.acquire);
+            const t = self.top.v.load(.acquire);
             // Acquire-acquire fence: see `bottom` after `top`. Without
             // this we could observe a `bottom` from before `top` was
             // bumped by another stealer, leading to phantom reads of
             // already-claimed slots.
             asm volatile ("mfence" ::: .{ .memory = true });
-            const b = self.bottom.load(.acquire);
+            const b = self.bottom.v.load(.acquire);
             if (@as(i64, @bitCast(b -% t)) <= 0) return null;
             // Acquire (growable only): pair with the owner's release store
             // in `grow` so the copied slots are visible before we index
             // into a freshly-published buffer.
             const item = self.bufferSlot(t, .acquire).*;
-            if (self.top.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
+            if (self.top.v.cmpxchgStrong(t, t + 1, .seq_cst, .monotonic) != null) {
                 return null; // lost the race
             }
             return item;
@@ -267,13 +308,13 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
         /// NOT thread-safe — call only when no stealer can be running (e.g. a
         /// GC marker roster reused across stop-the-world collections).
         pub fn clear(self: *Self) void {
-            self.bottom.store(0, .monotonic);
-            self.top.store(0, .monotonic);
+            self.bottom.v.store(0, .monotonic);
+            self.top.v.store(0, .monotonic);
         }
 
         pub fn approxLen(self: *const Self) u64 {
-            const b = self.bottom.load(.monotonic);
-            const t = self.top.load(.monotonic);
+            const b = self.bottom.v.load(.monotonic);
+            const t = self.top.v.load(.monotonic);
             const cap = self.currentMask(.monotonic) + 1;
             // NOTE: the bound test intentionally differs between flavors,
             // matching each one's pre-collapse behavior exactly — fixed

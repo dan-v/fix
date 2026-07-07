@@ -584,7 +584,7 @@ pub const Worker = struct {
         // rss_mb this is the spec-flood-vs-RSS "money chart".
         const s = f.vm.scheduler;
         var sbuf: [96]u8 = undefined;
-        timeline.counter("sched_backlog", std.fmt.bufPrint(&sbuf, "\"pending\":{d}", .{s.pending_tasks.load(.monotonic)}) catch return);
+        timeline.counter("sched_backlog", std.fmt.bufPrint(&sbuf, "\"pending\":{d}", .{s.pending_tasks.v.load(.monotonic)}) catch return);
         var pbuf: [160]u8 = undefined;
         const st = s.stats();
         timeline.counter("spec", std.fmt.bufPrint(&pbuf, "\"submitted\":{d},\"rejected\":{d},\"steals\":{d}", .{ st.speculative_submitted, st.speculative_rejected, st.steals }) catch return);
@@ -700,7 +700,7 @@ pub const Worker = struct {
                 // tail), the queued backlog won't be pulled — don't treat it as
                 // available work and busy-spin on it.
                 if (!self.scheduler.backgroundSuppressed() and
-                    (self.scheduler.pending_tasks.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
+                    (self.scheduler.pending_tasks.v.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
                 // Un-scanned scavengeable ring backlog counts as available
                 // work for a scavenging helper (see scavengeStep's cap).
                 if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
