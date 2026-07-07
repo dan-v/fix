@@ -529,6 +529,17 @@ fn opConcatLists(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return dispatch(vm, frame, code, ip, stop_depth);
 }
 
+fn opConcatStrings(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    // Operands stay on the stack across the coercions/forces inside
+    // (precise GC roots); drop only after the result is built.
+    const result = try strings.concatStackStrings(vm, count);
+    stack.dropN(vm, count);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
 fn opPushBuiltins(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     try stack.push(vm, vm.builtins);
@@ -1227,6 +1238,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.merge_attrs_strict)] = opMergeAttrsStrict;
     table[@intFromEnum(OpCode.merge_attrs)] = opMergeAttrs;
     table[@intFromEnum(OpCode.concat_lists)] = opConcatLists;
+    table[@intFromEnum(OpCode.concat_strings)] = opConcatStrings;
     table[@intFromEnum(OpCode.push_builtins)] = opPushBuiltins;
     table[@intFromEnum(OpCode.find_file)] = opFindFile;
     table[@intFromEnum(OpCode.find_file_long)] = opFindFileLong;

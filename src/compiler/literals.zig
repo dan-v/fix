@@ -58,6 +58,12 @@ pub fn compileString(self: *Compiler, node: *const Node) !void {
     try compileStringAtom(self, node.data.atom);
 }
 
+/// Cap on operands accumulated for one `concat_strings`. Keeps the
+/// operand count in the opcode's u16 and bounds transient VM stack
+/// growth for pathological many-part literals; when the cap is hit the
+/// accumulated parts are folded into one operand and assembly continues.
+const max_concat_parts: u16 = 4096;
+
 pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     const literal = string_syntax.Span{
         .start = atom.offset,
@@ -66,26 +72,68 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     const parsed = try string_syntax.parseLiteral(self.allocator, self.source, literal);
     defer parsed.deinit();
 
-    var have_value = false;
+    // Push every part, then assemble with ONE `concat_strings` — the
+    // old `add_int` fold interned every intermediate prefix (hash +
+    // copy + permanent intern-table bytes per `${}` boundary).
+    var parts: u16 = 0;
+    var total_parts: u32 = 0;
+    var ops_emitted: u32 = 0;
+    var first_is_interp = false;
+    var single_is_text = false;
     for (parsed.parts) |part| {
         switch (part) {
-            .text => |text| try emitStringPart(self, text.bytes, &have_value),
-            .interpolation => |span| {
-                if (!have_value) {
-                    const empty_id = try self.intern.intern("");
-                    try self.builder.emitConstant(self.allocator, Value.string(empty_id));
-                    have_value = true;
-                }
-                try compileInterpolatedExpr(self, self.source[span.start..span.end], span.start);
-                try emit.emitOp(self, .add_int);
-                have_value = true;
+            .text => |text| {
+                if (text.bytes.len == 0) continue;
+                const id = try self.intern.intern(text.bytes);
+                try self.builder.emitConstant(self.allocator, Value.string(id));
+                parts += 1;
+                total_parts += 1;
+                single_is_text = total_parts == 1;
             },
+            .interpolation => |span| {
+                if (total_parts == 0) first_is_interp = true;
+                try compileInterpolatedExpr(self, self.source[span.start..span.end], span.start);
+                parts += 1;
+                total_parts += 1;
+                single_is_text = false;
+            },
+        }
+        if (parts == max_concat_parts) {
+            try emit.emitOpU16(self, .concat_strings, parts);
+            ops_emitted += 1;
+            parts = 1;
         }
     }
 
-    if (!have_value) {
-        const id = try self.intern.intern("");
-        try self.builder.emitConstant(self.allocator, Value.string(id));
+    switch (parts) {
+        0 => try self.builder.emitConstant(self.allocator, Value.string(try self.intern.intern(""))),
+        // A lone text part is already a string constant. A lone
+        // interpolation still needs the string coercion (`"${x}"`);
+        // `concat_strings 1` coerces without re-interning the text.
+        1 => if (!single_is_text) {
+            try emit.emitOpU16(self, .concat_strings, 1);
+            ops_emitted += 1;
+        },
+        else => {
+            try emit.emitOpU16(self, .concat_strings, parts);
+            ops_emitted += 1;
+        },
+    }
+
+    // Perceived-weight compensation: speculation admission
+    // (`body_is_substantial`) is keyed on encoded size, and its tuning
+    // "lives at a sharp cliff" (see `ChunkBuilder.fusion_savings`). The
+    // old encoding spent `total_parts - 1` add_int bytes (plus a 3-byte
+    // empty-string constant and one more add when the literal starts
+    // with an interpolation); the new one spends 3 bytes per concat op.
+    // Add the (saturating) difference back so many-part literals keep
+    // the scheduling weight they had under the add_int fold — dropping
+    // hot generated-config chunks below the cliff measurably starves
+    // the speculation avalanche at w>=8.
+    if (ops_emitted != 0) {
+        const old_extra: u32 = (total_parts - 1) + @as(u32, if (first_is_interp) 4 else 0);
+        const new_extra: u32 = 3 * ops_emitted;
+        self.builder.fusion_savings += old_extra -| new_extra;
     }
 }
 

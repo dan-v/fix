@@ -127,6 +127,63 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
+/// `concat_strings` opcode body: coerce the top `count` stack operands
+/// to language strings IN PLACE (each stays in its slot — a precise GC
+/// root — across the later parts' coercions), then assemble the result
+/// text in one pass and intern it once. The caller pops the operands
+/// after we return. Semantically identical to the left fold
+/// `((p1 + p2) + p3) + ...` over `concatStringLike`, minus the
+/// intermediate allocations/interns.
+pub fn concatStackStrings(self: *VM, count: u32) !Value {
+    std.debug.assert(count >= 1 and self.sp >= count);
+    const base = self.sp - count;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        self.stack[base + i] = try coerceLanguageStringValue(self, self.stack[base + i]);
+    }
+    // Single part: the coerced value is the result — its text is already
+    // interned, so re-interning (what `"" + x` pays) would be a no-op probe.
+    if (count == 1) return self.stack[base];
+
+    var total: usize = 0;
+    var any_context = false;
+    i = 0;
+    while (i < count) : (i += 1) {
+        const v = self.stack[base + i];
+        total += self.intern.get(try stringTextInternId(self, v)).len;
+        if (v.isContextString()) any_context = true;
+    }
+
+    const buf = try self.allocator.alloc(u8, total);
+    defer self.allocator.free(buf);
+    var off: usize = 0;
+    i = 0;
+    while (i < count) : (i += 1) {
+        const s = self.intern.get(try stringTextInternId(self, self.stack[base + i]));
+        @memcpy(buf[off..][0..s.len], s);
+        off += s.len;
+    }
+    const text_id = try self.intern.intern(buf);
+    if (!any_context) return Value.string(text_id);
+
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+    i = 0;
+    while (i < count) : (i += 1) {
+        // GC: appendStringContext can force (context merges); the
+        // already-accumulated context values live only in Zig memory,
+        // so re-root them across each part's walk. The parts themselves
+        // stay rooted in their stack slots.
+        const gc_roots = force.rootsBegin(self);
+        defer force.rootsEnd(self, gc_roots);
+        for (context.items) |e| force.rootKeep(self, e.value);
+        try appendStringContext(self, &context, self.stack[base + i]);
+    }
+    if (context.items.len == 0) return Value.string(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+}
+
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);

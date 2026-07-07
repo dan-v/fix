@@ -95,6 +95,17 @@ pub const OpCode = enum(u8) {
     merge_attrs,
     /// Concatenate two lists.
     concat_lists,
+    /// Concatenate N string-like values in a single pass. Stack before:
+    /// [part1, ..., partN] (part1 lowest); after: [result]. Each part is
+    /// coerced exactly like the binary `+` string path (string / path /
+    /// attrs-with-__toString), contexts are merged in part order, and the
+    /// text is assembled into one exact-size buffer and interned ONCE.
+    /// Emitted for `${...}` interpolation literals: the equivalent
+    /// `add_int` fold interns (hashes + copies + permanently retains)
+    /// every intermediate prefix of a k-part string. With N == 1 the op
+    /// is a bare string coercion — no re-intern of the coerced text.
+    /// Operand: 2-byte count (N >= 1).
+    concat_strings,
     /// Push the evaluator-owned builtins attrset.
     push_builtins,
     /// Resolve an evaluator search-path literal.

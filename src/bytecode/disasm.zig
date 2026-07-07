@@ -229,6 +229,11 @@ fn writeOperands(
             ip += 2;
             try writer.print("{d} items", .{n});
         },
+        .concat_strings => {
+            const n = readU16(code, ip);
+            ip += 2;
+            try writer.print("{d} parts", .{n});
+        },
 
         .find_file => {
             const id: InternId = @intCast(readU16(code, ip));

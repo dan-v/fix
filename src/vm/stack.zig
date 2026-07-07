@@ -96,3 +96,9 @@ pub inline fn binTop(self: *VM) struct { left: Value, right: Value } {
 pub inline fn dropBin(self: *VM) void {
     self.sp -= 2;
 }
+
+/// Drop the top `n` operands (same contract as `dropBin`: only after
+/// all forcing/allocation that needs them rooted has finished).
+pub inline fn dropN(self: *VM, n: u32) void {
+    self.sp -= n;
+}
