@@ -517,7 +517,11 @@ fn subjectOf(e: Event, buf: []u8) []const u8 {
     // intern table (never stored/duplicated in our name arena) and format now.
     if (e.src_file != 0) {
         const path = if (intern_table) |it| it.get(e.src_file) else "";
-        return std.fmt.bufPrint(buf, "{s}:{d}", .{ std.fs.path.basename(path), e.src_line }) catch "";
+        // Include the parent directory: bare "default.nix:282" is
+        // unidentifiable across nixpkgs' thousands of default.nix files.
+        const base = std.fs.path.basename(path);
+        const dir = std.fs.path.basename(std.fs.path.dirname(path) orelse "");
+        return std.fmt.bufPrint(buf, "{s}/{s}:{d}", .{ dir, base, e.src_line }) catch "";
     }
     if (e.subj_len == 0) return "";
     const off: usize = e.subj_off;
