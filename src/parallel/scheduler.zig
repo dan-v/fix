@@ -219,6 +219,33 @@ pub const GcMarkHook = struct {
 };
 
 pub const Scheduler = struct {
+    /// Per-worker, cache-line-padded activity counters. A worker only
+    /// ever touches `worker_counters[its_own_id]`, so the adds need no
+    /// atomics and generate no inter-core coherence traffic. 9 u64s =
+    /// 72B; padded to 128B so two workers' hot counters can't land in
+    /// the same 64B line.
+    pub const Counters = struct {
+        spec_ok: u64 = 0,
+        spec_rej: u64 = 0,
+        urgent_ok: u64 = 0,
+        urgent_rej: u64 = 0,
+        pops: u64 = 0,
+        steals: u64 = 0,
+        cont_steals: u64 = 0,
+        cont_pushes: u64 = 0,
+        parks: u64 = 0,
+        _pad: [128 - 9 * @sizeOf(u64)]u8 = undefined,
+    };
+
+    /// Bump one field of worker `id`'s own counter slot. `field` is the
+    /// `Counters` field name. Bounds-guarded so a stray id can never
+    /// corrupt memory — a miscounted stat is harmless, an OOB write is
+    /// not. Off the atomics entirely: single-writer per slot.
+    inline fn bump(self: *Scheduler, id: u8, comptime field: []const u8) void {
+        if (id >= self.worker_count) return;
+        @field(self.worker_counters[id], field) += 1;
+    }
+
     /// Cumulative scheduler activity counters. Read via `stats()`.
     /// All values are advisory — monotonic loads are fine.
     pub const Stats = struct {
@@ -305,17 +332,16 @@ pub const Scheduler = struct {
     /// reads to decide whether to keep spinning for stealable continuation
     /// work, without per-queue CAS probes (same design as `pending_tasks`).
     cont_pending: std.atomic.Value(u32),
-    /// Activity counters. Monotonic adds — the only consumer is the
-    /// stats report, which doesn't need strong ordering.
-    n_speculative_ok: std.atomic.Value(u64),
-    n_speculative_rej: std.atomic.Value(u64),
-    n_urgent_ok: std.atomic.Value(u64),
-    n_urgent_rej: std.atomic.Value(u64),
-    n_pops: std.atomic.Value(u64),
-    n_steals: std.atomic.Value(u64),
-    n_cont_steals: std.atomic.Value(u64) = .init(0),
-    n_cont_pushes: std.atomic.Value(u64) = .init(0),
-    n_parks: std.atomic.Value(u64),
+    /// Per-worker activity counters. Each worker writes ONLY its own
+    /// slot — single-writer, plain non-atomic adds. This kills the
+    /// cross-core cache-line contention that shared-atomic counters
+    /// caused on the hot submit/pop/steal/park path: at high worker
+    /// counts dozens of cores `fetchAdd`-ing the same lines was pure
+    /// coherence traffic that scaled *against* us (slower past ~8).
+    /// Summed at report time, after all workers have quiesced. Each
+    /// slot is padded to a cache line so adjacent workers never share
+    /// one (no false sharing).
+    worker_counters: []Counters,
     n_max_fiber_stack: std.atomic.Value(u64),
     n_max_vm_sp: std.atomic.Value(u64),
     n_idle_ns: std.atomic.Value(u64),
@@ -426,6 +452,10 @@ pub const Scheduler = struct {
         errdefer allocator.free(wake_words);
         for (wake_words) |*w| w.* = .init(0);
 
+        const worker_counters = try allocator.alloc(Counters, safe_worker_count);
+        errdefer allocator.free(worker_counters);
+        for (worker_counters) |*c| c.* = .{};
+
         const gc_worker_parked = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(bool), safe_worker_count);
             for (ws) |*w| w.* = .init(false);
@@ -448,13 +478,7 @@ pub const Scheduler = struct {
             .started = .init(false),
             .pending_tasks = .init(0),
             .cont_pending = .init(0),
-            .n_speculative_ok = .init(0),
-            .n_speculative_rej = .init(0),
-            .n_urgent_ok = .init(0),
-            .n_urgent_rej = .init(0),
-            .n_pops = .init(0),
-            .n_steals = .init(0),
-            .n_parks = .init(0),
+            .worker_counters = worker_counters,
             .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
             .n_idle_ns = .init(0),
@@ -489,16 +513,30 @@ pub const Scheduler = struct {
     }
 
     pub fn stats(self: *const Scheduler) Stats {
+        // Sum the per-worker slots. Called at report time, after the
+        // eval has quiesced, so plain loads are fine.
+        var c: Counters = .{};
+        for (self.worker_counters) |w| {
+            c.spec_ok += w.spec_ok;
+            c.spec_rej += w.spec_rej;
+            c.urgent_ok += w.urgent_ok;
+            c.urgent_rej += w.urgent_rej;
+            c.pops += w.pops;
+            c.steals += w.steals;
+            c.cont_steals += w.cont_steals;
+            c.cont_pushes += w.cont_pushes;
+            c.parks += w.parks;
+        }
         return .{
-            .speculative_submitted = self.n_speculative_ok.load(.monotonic),
-            .speculative_rejected = self.n_speculative_rej.load(.monotonic),
-            .urgent_submitted = self.n_urgent_ok.load(.monotonic),
-            .urgent_rejected = self.n_urgent_rej.load(.monotonic),
-            .pops = self.n_pops.load(.monotonic),
-            .steals = self.n_steals.load(.monotonic),
-            .cont_steals = self.n_cont_steals.load(.monotonic),
-            .cont_pushes = self.n_cont_pushes.load(.monotonic),
-            .parks = self.n_parks.load(.monotonic),
+            .speculative_submitted = c.spec_ok,
+            .speculative_rejected = c.spec_rej,
+            .urgent_submitted = c.urgent_ok,
+            .urgent_rejected = c.urgent_rej,
+            .pops = c.pops,
+            .steals = c.steals,
+            .cont_steals = c.cont_steals,
+            .cont_pushes = c.cont_pushes,
+            .parks = c.parks,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
@@ -558,6 +596,7 @@ pub const Scheduler = struct {
         self.allocator.free(self.cont_queues);
         self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
+        self.allocator.free(self.worker_counters);
         if (comptime gc.enabled) self.allocator.free(self.gc_worker_parked);
     }
 
@@ -686,7 +725,7 @@ pub const Scheduler = struct {
     pub fn pushCont(self: *Scheduler, worker_id: u8, cont: Continuation) bool {
         if (worker_id >= self.worker_count) return false;
         if (!self.cont_queues[worker_id].push(cont)) return false;
-        _ = self.n_cont_pushes.fetchAdd(1, .monotonic);
+        self.bump(worker_id, "cont_pushes");
         const prev = self.cont_pending.fetchAdd(1, .release);
         if (self.worker_count > 1) {
             const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
@@ -720,7 +759,7 @@ pub const Scheduler = struct {
             if (idx == worker_id) continue;
             if (self.cont_queues[idx].steal()) |c| {
                 _ = self.cont_pending.fetchSub(1, .monotonic);
-                _ = self.n_cont_steals.fetchAdd(1, .monotonic);
+                self.bump(worker_id, "cont_steals");
                 return c;
             }
         }
@@ -737,14 +776,14 @@ pub const Scheduler = struct {
         if (self.disable_speculation) return false;
         const cap: u32 = @as(u32, self.worker_count - 1) * spec_backlog_per_helper;
         if (self.pending_tasks.load(.monotonic) >= cap) {
-            _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
+            self.bump(submitter_id, "spec_rej");
             return false;
         }
         if (self.pushOwn(self.spec_queues, task, submitter_id)) {
-            _ = self.n_speculative_ok.fetchAdd(1, .monotonic);
+            self.bump(submitter_id, "spec_ok");
             return true;
         }
-        _ = self.n_speculative_rej.fetchAdd(1, .monotonic);
+        self.bump(submitter_id, "spec_rej");
         return false;
     }
 
@@ -755,10 +794,10 @@ pub const Scheduler = struct {
         if (self.worker_count <= 1) return false;
         if (self.disable_fanout) return false;
         if (self.pushOwn(self.urgent_queues, task, submitter_id)) {
-            _ = self.n_urgent_ok.fetchAdd(1, .monotonic);
+            self.bump(submitter_id, "urgent_ok");
             return true;
         }
-        _ = self.n_urgent_rej.fetchAdd(1, .monotonic);
+        self.bump(submitter_id, "urgent_rej");
         return false;
     }
 
@@ -801,7 +840,7 @@ pub const Scheduler = struct {
             self.spec_queues[worker_id].pop() orelse
             return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
-        _ = self.n_pops.fetchAdd(1, .monotonic);
+        self.bump(worker_id, "pops");
         return traced.task;
     }
 
@@ -840,7 +879,7 @@ pub const Scheduler = struct {
             if (idx == exclude) continue;
             if (queues[idx].steal()) |traced| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
-                _ = self.n_steals.fetchAdd(1, .monotonic);
+                self.bump(exclude, "steals");
                 if (victim) |v| v.* = idx;
                 if (push_ts) |p| p.* = traced.push_ts;
                 return traced.task;
@@ -852,7 +891,7 @@ pub const Scheduler = struct {
     /// Park `worker_id`'s thread on its wake word until awoken or
     /// shutdown. Works for any worker, including worker 0.
     pub fn parkWorker(self: *Scheduler, worker_id: u8) void {
-        _ = self.n_parks.fetchAdd(1, .monotonic);
+        self.bump(worker_id, "parks");
         const word = &self.wake_words[worker_id];
         // Try to atomically transition 0 → "waiting" (still 0; we just check
         // before sleeping). The futex syscall's "expected" param is the safe

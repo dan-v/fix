@@ -473,7 +473,8 @@ pub const Worker = struct {
         var sbuf: [96]u8 = undefined;
         timeline.counter("sched_backlog", std.fmt.bufPrint(&sbuf, "\"pending\":{d}", .{s.pending_tasks.load(.monotonic)}) catch return);
         var pbuf: [160]u8 = undefined;
-        timeline.counter("spec", std.fmt.bufPrint(&pbuf, "\"submitted\":{d},\"rejected\":{d},\"steals\":{d}", .{ s.n_speculative_ok.load(.monotonic), s.n_speculative_rej.load(.monotonic), s.n_steals.load(.monotonic) }) catch return);
+        const st = s.stats();
+        timeline.counter("spec", std.fmt.bufPrint(&pbuf, "\"submitted\":{d},\"rejected\":{d},\"steals\":{d}", .{ st.speculative_submitted, st.speculative_rejected, st.steals }) catch return);
     }
 
     fn runFiber(self: *Worker, f: *WorkerFiber) void {
