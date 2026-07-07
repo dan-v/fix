@@ -99,6 +99,10 @@ pub const Compiler = struct {
     /// compile so it doesn't rebuild the index over the whole (possibly
     /// huge) file per body. Not owned — never freed by `deinit`.
     external_line_index: ?*diagnostic.LineIndex = null,
+    /// Memoized result of `diagnostics.ensureLineIndex` — avoids walking
+    /// the parent chain per compiled node. Points at the root's
+    /// `line_index` (or `external_line_index`); never owned.
+    resolved_line_index: ?*diagnostic.LineIndex = null,
 
     pub fn init(
         allocator: std.mem.Allocator,

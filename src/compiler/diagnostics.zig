@@ -77,13 +77,23 @@ pub fn sourcePositionForOffset(self: *Compiler, offset: u32) !diagnostic.SourceP
 }
 
 pub fn ensureLineIndex(self: *Compiler) !*diagnostic.LineIndex {
-    if (self.parent) |parent| return ensureLineIndex(parent);
-    if (self.external_line_index) |idx| return idx;
-    if (!self.line_index_ready) {
-        self.line_index = try diagnostic.LineIndex.init(self.allocator, self.source);
-        self.line_index_ready = true;
-    }
-    return &self.line_index;
+    // Called per compiled node (source-map spans); memoize the resolved
+    // index so deeply nested child compilers don't re-walk the parent
+    // chain every time. Safe: the owning (root) compiler outlives every
+    // child, and the root's `line_index` field address is stable once
+    // built.
+    if (self.resolved_line_index) |idx| return idx;
+    const idx = blk: {
+        if (self.parent) |parent| break :blk try ensureLineIndex(parent);
+        if (self.external_line_index) |idx| break :blk idx;
+        if (!self.line_index_ready) {
+            self.line_index = try diagnostic.LineIndex.init(self.allocator, self.source);
+            self.line_index_ready = true;
+        }
+        break :blk &self.line_index;
+    };
+    self.resolved_line_index = idx;
+    return idx;
 }
 
 pub fn optionalSourceFileId(self: *Compiler) !?InternId {
