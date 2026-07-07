@@ -118,7 +118,13 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
         sched.submitUrgent(task, self.workerId())
     else
         sched.submit(task, self.workerId());
-    if (ok) sched.bumpSweeps(self.workerId());
+    if (ok)
+        sched.bumpSweeps(self.workerId())
+    else
+        // Rejected (queue full / no helpers): unmark so a later miss can
+        // retry — a set must not become permanently unsweepable because
+        // one submit lost a race to a full queue.
+        self.heap.clearSiblingSwept(obj_id);
 }
 
 const attr_cache_size: usize = 8192;

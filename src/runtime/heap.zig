@@ -940,6 +940,17 @@ pub const ObjectHeap = struct {
         }
     }
 
+    /// Undo `trySiblingSweep`'s mark when the sweep task could not be
+    /// submitted (queue full / no helpers) — otherwise the set becomes
+    /// permanently unsweepable on a transient rejection. Racy-benign
+    /// like the mark.
+    pub fn clearSiblingSwept(self: *ObjectHeap, id: ObjectId) void {
+        switch (self.objects.getMut(id).*) {
+            .attrs => |*a| a.sibling_swept = false,
+            else => {},
+        }
+    }
+
     /// TLAB reserve shared by the three range stores. When reclaim is active
     /// (`gc_collect_enabled`) a reused range is popped from the free list (see
     /// the callers) or a fresh chunk is bumped from the young region; if that
