@@ -44,15 +44,28 @@ pub fn builtinReadDir(self: anytype, arg: Value) !Value {
     defer attrs.deinit(self.allocator);
     try attrs.ensureTotalCapacity(self.allocator, dir_entries.len);
 
+    // The kind strings take one of four values — intern each once per call,
+    // not once per entry (pkgs/by-name enumeration alone is ~20K entries,
+    // and the redundant hash+shard-lock interning showed up on the
+    // critical chain in the braid-window perf decomposition).
+    var kind_values: [FileKindCount]?Value = @splat(null);
     for (dir_entries) |dir_entry| {
+        const ki = @intFromEnum(dir_entry.kind);
+        const kv = kind_values[ki] orelse blk: {
+            const v = Value.string(try self.intern.intern(dir_entry.kind.nixTypeName()));
+            kind_values[ki] = v;
+            break :blk v;
+        };
         attrs.appendAssumeCapacity(.{
             .name = try self.intern.intern(dir_entry.name),
-            .value = Value.string(try self.intern.intern(dir_entry.kind.nixTypeName())),
+            .value = kv,
         });
     }
 
     return Value.attrs(try self.heap.addAttrs(attrs.items));
 }
+
+const FileKindCount = @typeInfo(@import("runtime").file_cache.FileCache.FileKind).@"enum".fields.len;
 
 pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !Value {
     const search_path = try vm_force.forceValue(self, search_path_arg);
