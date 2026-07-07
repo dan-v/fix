@@ -754,6 +754,41 @@ inline fn scavRdtsc() u64 {
     return (@as(u64, high) << 32) | @as(u64, low);
 }
 
+// ---- temp diagnosis probe: claim-time touch logging ----
+
+/// Monotonic microseconds for diagnosis log lines (same clock domain as
+/// `probe/timeline.zig`); 0 off-linux.
+pub fn diagNowUs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+    return sec * 1_000_000 + nsec / 1_000;
+}
+
+/// Cold: log a claim of a thunk whose source file basename contains the
+/// `FIX_TOUCH_LOG` substring. Safe here — the caller just claimed the
+/// thunk, so its target union is readable.
+noinline fn logTouch(self: *VM, thunk_id: ObjectId, demand: bool) void {
+    const filt = self.scheduler.touch_log orelse return;
+    var buf: [160]u8 = undefined;
+    const subj = thunkLabel(self, thunk_id, &buf);
+    if (subj.file == 0) return;
+    const base = std.fs.path.basename(self.intern.get(subj.file));
+    if (std.mem.indexOf(u8, base, filt) == null) return;
+    std.debug.print("touch {s}:{d} id={d} t_us={d} worker={d} spec={} demand={} claimer={d}\n", .{
+        base,
+        subj.line,
+        thunk_id,
+        diagNowUs(),
+        self.workerId(),
+        self.in_speculation,
+        demand,
+        self.claimer_id,
+    });
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
     // safepoint by native_depth + allocation cursor. Independent of -Dgc.
@@ -819,6 +854,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
+                // Temp diagnosis probe (`FIX_TOUCH_LOG=<file substring>`):
+                // log every CLAIM of a thunk whose source file matches, with
+                // timestamp/worker/spec-vs-demand — who first computes the
+                // etc.nix-style tail chains, and when. Off = one branch on a
+                // lazily-initialized global.
+                if (self.scheduler.touch_log != null) logTouch(self, thunk_id, demand);
                 // Discovery probe: main out-ran the helpers — this thunk was
                 // not resolved ahead of demand, so main must compute it itself.
                 // The age probe additionally buckets how long the thunk sat

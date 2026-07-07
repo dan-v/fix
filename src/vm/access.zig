@@ -125,6 +125,16 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
         // retry — a set must not become permanently unsweepable because
         // one submit lost a race to a full queue.
         self.heap.clearSiblingSwept(obj_id);
+    if (sched.sibling_log) {
+        // Diagnostics only: submit timestamp + submitter, so a run log
+        // shows per-sweep submit->run latency and lost submits.
+        std.debug.print("sweep-submit attrs={d} t_us={d} worker={d} ok={}\n", .{
+            obj_id,
+            force.diagNowUs(),
+            self.workerId(),
+            ok,
+        });
+    }
 }
 
 const attr_cache_size: usize = 8192;

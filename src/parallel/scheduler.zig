@@ -440,6 +440,11 @@ pub const Scheduler = struct {
     /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
     /// member body locations, heap-growth delta). Debug-only.
     sibling_log: bool = false,
+    /// `FIX_TOUCH_LOG=<file substring>`: diagnosis probe — log every thunk
+    /// CLAIM whose source file basename matches, with timestamp, worker,
+    /// and spec/demand context (see `vm/force.zig logTouch`). Debug-only;
+    /// one null-check on the claim slow path when off.
+    touch_log: ?[]const u8 = null,
 
     /// When set (by `setTraceFlows`, driven by `--timeline`), `pushOwn` stamps
     /// each task with its push time so the timeline can anchor the steal arrow

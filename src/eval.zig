@@ -632,6 +632,7 @@ pub const Evaluator = struct {
                     self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
                 }
                 self.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
+                self.scheduler.touch_log = em.get("FIX_TOUCH_LOG");
             }
             self.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
         }

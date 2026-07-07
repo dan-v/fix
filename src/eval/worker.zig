@@ -869,8 +869,10 @@ fn slotEntry(arg: *anyopaque) void {
                         subj.text;
                     break;
                 }
-                std.debug.print("sweep attrs={d} n={d} first_attr={s} member={s}\n", .{
-                    attrs_id, entries.len,
+                std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
+                    attrs_id,             entries.len,
+                    vm_force.diagNowUs(), worker_id_mod.current,
+                    f.vm.claimer_id,
                     f.vm.intern.get(entries[0].name), label,
                 });
             }
@@ -899,8 +901,9 @@ fn slotEntry(arg: *anyopaque) void {
                         const mlabel: []const u8 = if (subj.file != 0)
                             (std.fmt.bufPrint(&rbuf, "{s}:{d}", .{ std.fs.path.basename(f.vm.intern.get(subj.file)), subj.line }) catch "?")
                         else if (subj.text.len != 0) subj.text else "?";
-                        std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d}\n", .{
-                            attrs_id, f.vm.intern.get(entry.name), mlabel, created,
+                        std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
+                            attrs_id,             f.vm.intern.get(entry.name), mlabel, created,
+                            vm_force.diagNowUs(), f.vm.claimer_id,
                         });
                     }
                     continue;
@@ -908,7 +911,9 @@ fn slotEntry(arg: *anyopaque) void {
                 _ = vm_force.forceValueSpeculative(&f.vm, entry.value) catch {};
             }
             if (log) {
-                std.debug.print("sweep attrs={d} done: heap_growth={d}\n", .{ attrs_id, f.vm.heap.objects.count() -| objs_before });
+                std.debug.print("sweep attrs={d} done: t_us={d} heap_growth={d}\n", .{
+                    attrs_id, vm_force.diagNowUs(), f.vm.heap.objects.count() -| objs_before,
+                });
             }
         },
     }
