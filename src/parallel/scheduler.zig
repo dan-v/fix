@@ -32,6 +32,99 @@ const stable = @import("runtime").stable_segments;
 const gc = @import("runtime").gc;
 const heap_mod = @import("runtime").heap;
 const containers = @import("containers");
+const build_options = @import("build_options");
+
+/// Idle-scan cost census (piggybacks on `-Dprof-main`, like the probes in
+/// `probe/prof.zig` — the scheduler can't import that layer, so the tiny
+/// rdtsc + flush machinery is local). Buckets the cycles each drain-loop
+/// probe class burns (own pops vs the O(N) per-peer steal scans over the
+/// ready queues / urgent deques / novel rings / spec rings / cont deques)
+/// so the w>16 idle-churn work targets the structure that actually
+/// dominates. Zero-cost when the build flag is off.
+const scan_census_on = build_options.prof_main and builtin.cpu.arch == .x86_64;
+
+pub const ScanCensus = struct {
+    ready_pop_cy: u64 = 0,
+    ready_pop_calls: u64 = 0,
+    ready_pop_hits: u64 = 0,
+    ready_steal_cy: u64 = 0,
+    ready_steal_calls: u64 = 0,
+    ready_steal_hits: u64 = 0,
+    pop_own_cy: u64 = 0,
+    pop_own_calls: u64 = 0,
+    pop_own_hits: u64 = 0,
+    urgent_steal_cy: u64 = 0,
+    urgent_steal_calls: u64 = 0,
+    urgent_steal_hits: u64 = 0,
+    novel_steal_cy: u64 = 0,
+    novel_steal_calls: u64 = 0,
+    novel_steal_hits: u64 = 0,
+    spec_steal_cy: u64 = 0,
+    spec_steal_calls: u64 = 0,
+    spec_steal_hits: u64 = 0,
+    cont_steal_cy: u64 = 0,
+    cont_steal_calls: u64 = 0,
+    cont_steal_hits: u64 = 0,
+};
+
+threadlocal var scan_local: if (scan_census_on) ScanCensus else void = if (scan_census_on) ScanCensus{} else {};
+var scan_totals_mu: std.atomic.Value(u8) = .init(0);
+var scan_totals: ScanCensus = .{};
+
+inline fn rdtscScan() u64 {
+    if (comptime !scan_census_on) return 0;
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        :
+        : .{ .memory = true });
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
+
+inline fn scanEnd(comptime prefix: []const u8, t0: u64, hit: bool) void {
+    if (comptime !scan_census_on) return;
+    @field(scan_local, prefix ++ "_cy") += rdtscScan() -% t0;
+    @field(scan_local, prefix ++ "_calls") += 1;
+    if (hit) @field(scan_local, prefix ++ "_hits") += 1;
+}
+
+/// Merge this thread's census into the global totals. Called on every
+/// park (natural batching point) and once from the quiescence barrier /
+/// report so helper exit paths don't strand their counters.
+fn scanFlush() void {
+    if (comptime !scan_census_on) return;
+    while (scan_totals_mu.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer scan_totals_mu.store(0, .release);
+    inline for (@typeInfo(ScanCensus).@"struct".fields) |f| {
+        @field(scan_totals, f.name) += @field(scan_local, f.name);
+    }
+    scan_local = .{};
+}
+
+/// `--print-sched-stats` (prof builds): dump the idle-scan cost breakdown.
+pub fn reportScanCensus() void {
+    if (comptime !scan_census_on) return;
+    scanFlush(); // caller's (worker 0's) residue
+    const t = &scan_totals;
+    const total = t.ready_pop_cy + t.ready_steal_cy + t.pop_own_cy +
+        t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy + t.cont_steal_cy;
+    if (total == 0) return;
+    std.debug.print("prof scan-census (all workers, drain-loop probe cycles, total={d}):\n", .{total});
+    inline for (.{ "ready_pop", "ready_steal", "pop_own", "urgent_steal", "novel_steal", "spec_steal", "cont_steal" }) |name| {
+        const cy = @field(t, name ++ "_cy");
+        const calls = @field(t, name ++ "_calls");
+        const hits = @field(t, name ++ "_hits");
+        std.debug.print("  {s}: cy={d} ({d:.1}%) calls={d} hits={d} ({d:.2}% hit) avg_cy={d}\n", .{
+            name,                cy,
+            if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(cy)) / @as(f64, @floatFromInt(total)),
+            calls,               hits,
+            if (calls == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(calls)),
+            if (calls == 0) 0 else cy / calls,
+        });
+    }
+}
 
 pub const Task = union(enum) {
     /// Speculatively force a thunk to its result. The thunk lives in the
@@ -926,7 +1019,10 @@ pub const Scheduler = struct {
 
     /// Pop from the given worker's own ready queue.
     pub fn popReady(self: *Scheduler, worker_id: u8) ?*ReadyNode {
-        return self.ready_queues[worker_id].pop();
+        const t0 = rdtscScan();
+        const n = self.ready_queues[worker_id].pop();
+        scanEnd("ready_pop", t0, n != null);
+        return n;
     }
 
     /// Try to steal a ready fiber from any other worker's queue. Used
@@ -934,13 +1030,18 @@ pub const Scheduler = struct {
     /// woken on a busy worker still gets resumed promptly.
     pub fn stealReady(self: *Scheduler, my_worker_id: u8) ?*ReadyNode {
         if (self.worker_count < 2) return null;
+        const t0 = rdtscScan();
         const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == my_worker_id) continue;
-            if (self.ready_queues[idx].pop()) |n| return n;
+            if (self.ready_queues[idx].pop()) |n| {
+                scanEnd("ready_steal", t0, true);
+                return n;
+            }
         }
+        scanEnd("ready_steal", t0, false);
         return null;
     }
 
@@ -986,6 +1087,7 @@ pub const Scheduler = struct {
     /// is past this point, no `wakeFiberWaiters` can run, so the orphaned
     /// dangling waiters are never walked.
     pub fn awaitHelpersQuiescent(self: *Scheduler) void {
+        if (comptime scan_census_on) scanFlush();
         const helpers: u32 = self.worker_count - 1;
         if (helpers == 0) return;
         _ = self.stopped_helpers.fetchAdd(1, .acq_rel);
@@ -1087,6 +1189,7 @@ pub const Scheduler = struct {
     /// caller's own. Null if none available.
     pub fn stealCont(self: *Scheduler, worker_id: u8) ?Continuation {
         if (self.worker_count < 2) return null;
+        const t0 = rdtscScan();
         const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
@@ -1095,9 +1198,11 @@ pub const Scheduler = struct {
             if (self.cont_queues[idx].steal()) |c| {
                 _ = self.cont_pending.v.fetchSub(1, .monotonic);
                 self.bump(worker_id, "cont_steals");
+                scanEnd("cont_steal", t0, true);
                 return c;
             }
         }
+        scanEnd("cont_steal", t0, false);
         return null;
     }
 
@@ -1281,10 +1386,15 @@ pub const Scheduler = struct {
     /// queues post-F1.
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
+        const t0 = rdtscScan();
         const traced = self.urgent_queues[worker_id].pop() orelse
             self.novel_queues[worker_id].popNewest() orelse
             self.spec_queues[worker_id].popNewest() orelse
-            return null;
+            {
+                scanEnd("pop_own", t0, false);
+                return null;
+            };
+        scanEnd("pop_own", t0, true);
         _ = self.pending_tasks.v.fetchSub(1, .monotonic);
         self.bump(worker_id, "pops");
         return traced.task;
@@ -1313,10 +1423,23 @@ pub const Scheduler = struct {
 
     fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         if (self.worker_count < 2) return null;
-        if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| return t;
+        const t0 = rdtscScan();
+        if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| {
+            scanEnd("urgent_steal", t0, true);
+            return t;
+        }
+        scanEnd("urgent_steal", t0, false);
         // Novel lane before the bulk backlog; always newest-first.
-        if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| return t;
-        return self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts);
+        const t1 = rdtscScan();
+        if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| {
+            scanEnd("novel_steal", t1, true);
+            return t;
+        }
+        scanEnd("novel_steal", t1, false);
+        const t2 = rdtscScan();
+        const r = self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts);
+        scanEnd("spec_steal", t2, r != null);
+        return r;
     }
 
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
@@ -1358,6 +1481,7 @@ pub const Scheduler = struct {
     /// Park `worker_id`'s thread on its wake word until awoken or
     /// shutdown. Works for any worker, including worker 0.
     pub fn parkWorker(self: *Scheduler, worker_id: u8) void {
+        if (comptime scan_census_on) scanFlush();
         self.bump(worker_id, "parks");
         const word = &self.wake_words[worker_id].word;
         // Try to atomically transition 0 → "waiting" (still 0; we just check

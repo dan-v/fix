@@ -59,6 +59,7 @@ pub fn report(ev: *Evaluator) void {
     if (comptime jit.enabled) jit.report();
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
+        @import("parallel").scheduler.reportScanCensus();
         // Demand-prediction de-risk censuses (see heap.zig): junk ratios
         // for demand-descendant scavenging and sibling prefetch.
         ev.heap.profCreationCensus();
