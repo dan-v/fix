@@ -172,29 +172,29 @@ pub const Table = struct {
 
     /// Content-dedupe an owned copy of a path string (base/source paths
     /// are transient — freed with the import's `stable_path` — but the
-    /// force-time compile needs them later). All registrations from one
-    /// file pass the same two paths; dupe each once.
-    fn internPath(self: *Table, path: []const u8) ![]const u8 {
+    /// force-time compile needs them later). Called once per deferring
+    /// set (alongside `adoptScope`), NOT per entry — the lock and hash
+    /// stay off the per-registration path.
+    pub fn internPath(self: *Table, path: ?[]const u8) !?[]const u8 {
+        const p = path orelse return null;
         self.shared_mu.lock();
         defer self.shared_mu.unlock();
-        const gop = try self.paths.getOrPut(self.allocator, path);
+        const gop = try self.paths.getOrPut(self.allocator, p);
         if (!gop.found_existing) {
-            errdefer _ = self.paths.remove(path);
-            gop.key_ptr.* = try self.allocator.dupe(u8, path);
+            errdefer _ = self.paths.remove(p);
+            gop.key_ptr.* = try self.allocator.dupe(u8, p);
         }
         return gop.key_ptr.*;
     }
 
     /// Register a deferred body and return its id (the operand the
     /// `defer_attr_value` op carries). `entry.scope` must be table-owned
-    /// (from `adoptScope`); the path strings may be temporary — they are
-    /// interned here.
+    /// (from `adoptScope`) and the path strings table-owned (from
+    /// `internPath`); registration itself is just an entry append.
     pub fn register(self: *Table, entry: Entry) !u32 {
         const stored = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(stored);
         stored.* = entry;
-        stored.base_path = if (entry.base_path) |p| try self.internPath(p) else null;
-        stored.source_path = if (entry.source_path) |p| try self.internPath(p) else null;
         return self.entries.append(self.allocator, stored);
     }
 

@@ -418,11 +418,14 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
 }
 
 /// The per-set deferral snapshot: lexical bindings followed by
-/// `with_count` with-subject captures (innermost-first). `caps` is
-/// table-owned (`adoptScope`) and shared by every deferred leaf of the set.
+/// `with_count` with-subject captures (innermost-first). `caps` and the
+/// paths are table-owned (`adoptScope`/`internPath`, resolved once per
+/// set) and shared by every deferred leaf of the set.
 const DeferScope = struct {
     caps: []const Capture,
     with_count: u16,
+    base_path: ?[]const u8,
+    source_path: ?[]const u8,
 };
 
 /// Register a deferred value body and emit `defer_attr_value`.
@@ -434,8 +437,8 @@ fn deferLeaf(self: *Compiler, body: *const Node, snapshot: DeferScope) !void {
         .scope = snapshot.caps,
         .with_count = snapshot.with_count,
         .source = self.source,
-        .base_path = self.base_path,
-        .source_path = self.source_path,
+        .base_path = snapshot.base_path,
+        .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
     });
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
@@ -458,10 +461,15 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
     if (shouldDeferSet(self, grouped.groups.len) and setHasDeferrableLeaf(grouped.groups)) {
         if (try buildEnclosingSnapshot(self, &snapshot)) {
             const lexical_len = snapshot.items.len;
-            if (try appendWithSnapshot(self, &snapshot)) defer_scope = .{
-                .caps = try rootCompiler(self).deferred_table.?.adoptScope(snapshot.items),
-                .with_count = @intCast(snapshot.items.len - lexical_len),
-            };
+            if (try appendWithSnapshot(self, &snapshot)) {
+                const table = rootCompiler(self).deferred_table.?;
+                defer_scope = .{
+                    .caps = try table.adoptScope(snapshot.items),
+                    .with_count = @intCast(snapshot.items.len - lexical_len),
+                    .base_path = try table.internPath(self.base_path),
+                    .source_path = try table.internPath(self.source_path),
+                };
+            }
         }
     }
 
