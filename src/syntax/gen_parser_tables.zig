@@ -39,8 +39,8 @@ pub fn main(init: std.process.Init) !void {
     try w.print("pub const num_productions: u32 = {d};\n", .{Tab.num_productions});
     try w.print("pub const start_state: u32 = {d};\n", .{Tab.start_state});
     try w.print("pub const eof: u32 = {d};\n\n", .{Tab.eof});
-    try emit(w, u32, "action", Tab.action);
-    try emit(w, i32, "goto_table", Tab.goto_table);
+    try emit(w, lr.Cell, "action", Tab.action);
+    try emit(w, i16, "goto_table", Tab.goto_table);
     try emit(w, u32, "prod_lhs", Tab.prod_lhs);
     try emit(w, u32, "prod_rhs_len", Tab.prod_rhs_len);
     try w.flush();

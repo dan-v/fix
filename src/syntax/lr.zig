@@ -54,20 +54,29 @@ pub const GrammarDesc = struct {
     precedence: []const RawPrec = &.{},
 };
 
-/// Packed action cell kinds (stored in the top 4 bits of a `u32`).
+/// Packed action cell kinds (stored in the top 2 bits of a `u16`).
+/// A `u16` cell keeps the whole ACTION table half the size it would be as
+/// `u32` — the driver does one dependent table load per input token, so
+/// the table living in L1 is worth real cycles. 14 bits of arg bound the
+/// grammar at 16384 states/productions (asserted in `Generate`; the Nix
+/// grammar has ~253/205).
 pub const ACT_ERROR: u32 = 0;
 pub const ACT_SHIFT: u32 = 1;
 pub const ACT_REDUCE: u32 = 2;
 pub const ACT_ACCEPT: u32 = 3;
 
-pub inline fn cell(kind: u32, arg: u32) u32 {
-    return (kind << 28) | (arg & 0x0FFF_FFFF);
+pub const Cell = u16;
+const cell_arg_bits = 14;
+const cell_arg_mask: u32 = (1 << cell_arg_bits) - 1;
+
+pub inline fn cell(kind: u32, arg: u32) Cell {
+    return @intCast((kind << cell_arg_bits) | (arg & cell_arg_mask));
 }
-pub inline fn cellKind(c: u32) u32 {
-    return c >> 28;
+pub inline fn cellKind(c: Cell) u32 {
+    return @as(u32, c) >> cell_arg_bits;
 }
-pub inline fn cellArg(c: u32) u32 {
-    return c & 0x0FFF_FFFF;
+pub inline fn cellArg(c: Cell) u32 {
+    return @as(u32, c) & cell_arg_mask;
 }
 
 const Item = struct {
@@ -80,6 +89,9 @@ const Item = struct {
 pub fn Generate(comptime g: GrammarDesc) type {
     @setEvalBranchQuota(200_000_000);
     const built = comptime buildAll(g);
+    comptime std.debug.assert(built.num_states <= cell_arg_mask + 1);
+    comptime std.debug.assert(built.num_productions <= cell_arg_mask + 1);
+    comptime std.debug.assert(built.num_states <= std.math.maxInt(i16));
     return struct {
         pub const num_states: u32 = built.num_states;
         pub const num_terminals: u32 = g.num_terminals;
@@ -90,9 +102,9 @@ pub fn Generate(comptime g: GrammarDesc) type {
         pub const start_state: u32 = 0;
 
         /// `action[state * num_terminals + term]` — a packed cell.
-        pub const action: []const u32 = built.action;
+        pub const action: []const Cell = built.action;
         /// `goto_table[state * num_nonterminals + nt]` — target state, or -1.
-        pub const goto_table: []const i32 = built.goto_table;
+        pub const goto_table: []const i16 = built.goto_table;
         /// Per-production left-hand-side nonterminal index (0-based).
         pub const prod_lhs: []const u32 = built.prod_lhs;
         /// Per-production right-hand-side length (symbols popped on reduce).
@@ -103,8 +115,8 @@ pub fn Generate(comptime g: GrammarDesc) type {
 const Built = struct {
     num_states: u32,
     num_productions: u32,
-    action: []const u32,
-    goto_table: []const i32,
+    action: []const Cell,
+    goto_table: []const i16,
     prod_lhs: []const u32,
     prod_rhs_len: []const u32,
 };
@@ -517,8 +529,8 @@ fn buildAll(comptime g: GrammarDesc) Built {
     };
 
     // ---- build ACTION / GOTO ----
-    var action = [_]u32{cell(ACT_ERROR, 0)} ** (num_states * NT);
-    var goto_table = [_]i32{-1} ** (num_states * num_nt_total);
+    var action = [_]Cell{cell(ACT_ERROR, 0)} ** (num_states * NT);
+    var goto_table = [_]i16{-1} ** (num_states * num_nt_total);
 
     {
         var cbuf: [2 * P + 64]LItem = undefined;
@@ -602,7 +614,7 @@ fn buildAll(comptime g: GrammarDesc) Built {
 fn setAction(
     action: anytype,
     idx: usize,
-    new_cell: u32,
+    new_cell: Cell,
     term: u32,
     comptime g: GrammarDesc,
     comptime prodPrec: anytype,

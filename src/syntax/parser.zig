@@ -178,26 +178,8 @@ pub const Parser = struct {
     // ---- entry point ----
 
     pub fn parse(self: *Parser) !*Node {
-        const gpa = self.allocator;
-
-        var toks: std.ArrayListUnmanaged(Token) = .empty;
-        defer toks.deinit(gpa);
-        // Preallocate for the common token density to avoid mid-scan reallocs
-        // (append still grows safely if a token-dense file exceeds this).
-        try toks.ensureTotalCapacity(gpa, self.source.len / 3 + 16);
-
         var scanner = Scanner.init(self.source);
-        while (true) {
-            const tk = scanner.next();
-            if (tk.type == .error_token) {
-                self.report(tk, "Invalid token.");
-                continue;
-            }
-            try toks.append(gpa, tk);
-            if (tk.type == .eof) break;
-        }
-
-        const root = try self.drive(toks.items);
+        const root = try self.drive(&scanner);
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
@@ -205,16 +187,28 @@ pub const Parser = struct {
 
     // ---- the shift/reduce driver ----
 
-    fn drive(self: *Parser, toks: []const Token) !?*Node {
+    /// Pull the next parseable token, reporting (and skipping) invalid ones.
+    fn nextToken(self: *Parser, scanner: *Scanner) Token {
+        while (true) {
+            const tk = scanner.next();
+            if (tk.type == .error_token) {
+                self.report(tk, "Invalid token.");
+                continue;
+            }
+            return tk;
+        }
+    }
+
+    fn drive(self: *Parser, scanner: *Scanner) !?*Node {
         const gpa = self.allocator;
-        // One slot per token is a safe upper bound on stack depth; the buffer is
-        // a single allocation that's never touched past the actual (shallow,
-        // thanks to left recursion) depth, so over-allocation is effectively
-        // free and keeps a capacity check out of the hot loop.
-        const cap = toks.len + 16;
-        const states = try gpa.alloc(u32, cap);
+        // Tokens stream straight from the scanner — no token array. The
+        // stack starts at a depth that covers any sane nesting (left
+        // recursion keeps lists flat, so depth tracks *nesting* only) and
+        // grows geometrically for pathological inputs.
+        var cap: usize = 4096;
+        var states = try gpa.alloc(u32, cap);
         defer gpa.free(states);
-        const vals = try gpa.alloc(Value, cap);
+        var vals = try gpa.alloc(Value, cap);
         defer gpa.free(vals);
 
         var sp: usize = 0; // number of entries on the stack
@@ -222,7 +216,7 @@ pub const Parser = struct {
         vals[sp] = .{ .nil = {} };
         sp += 1;
 
-        var ip: usize = 0;
+        var tok = self.nextToken(scanner);
         var error_count: usize = 0;
         const max_errors = 32;
         // Error cooldown: after reporting an error, stay quiet until the parser
@@ -233,14 +227,19 @@ pub const Parser = struct {
         var quiet_shifts: u32 = cooldown;
         while (true) {
             const state = states[sp - 1];
-            const la = @intFromEnum(toks[ip].type);
+            const la = @intFromEnum(tok.type);
             const c = Tab.action[state * Tab.num_terminals + la];
             switch (lr.cellKind(c)) {
                 lr.ACT_SHIFT => {
+                    if (sp == cap) {
+                        cap *= 2;
+                        states = try gpa.realloc(states, cap);
+                        vals = try gpa.realloc(vals, cap);
+                    }
                     states[sp] = lr.cellArg(c);
-                    vals[sp] = .{ .tok = toks[ip] };
+                    vals[sp] = .{ .tok = tok };
                     sp += 1;
-                    ip += 1;
+                    tok = self.nextToken(scanner);
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
                 lr.ACT_REDUCE => {
@@ -251,8 +250,13 @@ pub const Parser = struct {
                     sp = base;
                     const g = Tab.goto_table[states[sp - 1] * Tab.num_nonterminals + Tab.prod_lhs[p]];
                     if (g < 0) {
-                        self.report(toks[ip], "Internal parser error (no goto).");
+                        self.report(tok, "Internal parser error (no goto).");
                         return null;
+                    }
+                    if (sp == cap) { // only epsilon productions grow the stack here
+                        cap *= 2;
+                        states = try gpa.realloc(states, cap);
+                        vals = try gpa.realloc(vals, cap);
                     }
                     states[sp] = @intCast(g);
                     vals[sp] = result;
@@ -263,14 +267,14 @@ pub const Parser = struct {
                 },
                 else => {
                     if (quiet_shifts >= cooldown) {
-                        self.reportUnexpected(state, toks[ip]);
+                        self.reportUnexpected(state, tok);
                         error_count += 1;
                         if (error_count >= max_errors) return null;
                     } else {
                         self.had_error = true;
                     }
                     quiet_shifts = 0;
-                    if (!recover(states[sp - 1], toks, &ip)) return null;
+                    if (!self.recover(states[sp - 1], scanner, &tok)) return null;
                 },
             }
         }
@@ -284,12 +288,12 @@ pub const Parser = struct {
     /// running safely; the recovered tree is discarded anyway, since the
     /// recorded error forces `parse` to return `ParseError`. Returns false at
     /// EOF (nothing left to resynchronize on).
-    fn recover(top_state: u32, toks: []const Token, ip: *usize) bool {
+    fn recover(self: *Parser, top_state: u32, scanner: *Scanner, tok: *Token) bool {
         const NT = Tab.num_terminals;
         while (true) {
-            if (toks[ip.*].type == .eof) return false;
-            ip.* += 1; // discard a token (starting with the offending one)
-            const la = @intFromEnum(toks[ip.*].type);
+            if (tok.type == .eof) return false;
+            tok.* = self.nextToken(scanner); // discard a token (starting with the offending one)
+            const la = @intFromEnum(tok.type);
             if (lr.cellKind(Tab.action[top_state * NT + la]) != lr.ACT_ERROR) return true;
         }
     }
