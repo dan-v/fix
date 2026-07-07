@@ -46,6 +46,34 @@ comptime {
 /// want to size stacks against a representative workload.
 pub const stack_probe_enabled: bool = build_options.fiber_stack_probe;
 
+/// Fiber cost census (piggybacks on `-Dprof-main`): rdtsc bracketing of
+/// the swap-in (dispatcher → fiber body) and swap-out (fiber body →
+/// dispatcher) paths, threadlocal so the accumulation itself is free of
+/// coherence traffic. `Worker.runFiber` seeds `census_pre_swap` at its
+/// entry and drains `census_in_cy`/`census_in_n` after each resume, so
+/// the measured swap-in window covers the *whole* per-resume machinery
+/// (run_mu, timeline branch, spec-ctx refresh, `resume_` setup, the asm
+/// swap) and the swap-out window symmetric machinery on the way back.
+/// Zero-footprint when the build flag is off.
+pub const census_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+
+pub threadlocal var census_pre_swap: u64 = 0;
+pub threadlocal var census_exit_swap: u64 = 0;
+pub threadlocal var census_in_cy: u64 = 0;
+pub threadlocal var census_in_n: u64 = 0;
+
+pub inline fn censusNow() u64 {
+    if (comptime !census_enabled) return 0;
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        :
+        : .{ .memory = true });
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
+
 /// Callee-saved register set + saved stack pointer.
 /// Layout must match src/parallel/fiber/swap_x86_64.S exactly.
 pub const Context = extern struct {
@@ -234,7 +262,12 @@ pub const Fiber = struct {
         const self = current orelse @panic("Fiber.yield called outside a fiber");
         const back = self.caller_ctx orelse @panic("running fiber has no caller_ctx");
         self.state = .suspended;
+        if (comptime census_enabled) census_exit_swap = censusNow();
         fix_swap_context(&self.ctx, back);
+        if (comptime census_enabled) {
+            census_in_cy += censusNow() -| census_pre_swap;
+            census_in_n += 1;
+        }
         // Resumed: caller_ctx has been set to the new resumer.
         self.state = .running;
     }
@@ -246,6 +279,10 @@ pub const Fiber = struct {
 /// `resume_` before the swap), invoke the user entry, and then swap
 /// back permanently — `entry` returning means the fiber is done.
 fn trampoline() callconv(.c) void {
+    if (comptime census_enabled) {
+        census_in_cy += censusNow() -| census_pre_swap;
+        census_in_n += 1;
+    }
     const self = current orelse @panic("trampoline started with no current fiber");
     const arg = self.entry_arg orelse unreachable;
     const entry = self.entry orelse unreachable;
@@ -257,6 +294,7 @@ fn trampoline() callconv(.c) void {
     const back = self.caller_ctx orelse @panic("finished fiber has no caller_ctx");
     self.entry = null;
     self.entry_arg = null;
+    if (comptime census_enabled) census_exit_swap = censusNow();
     fix_swap_context(&self.ctx, back);
     // Should never get here — resuming a `.finished` fiber would re-run
     // the swap, which would land on whatever junk is below this point.

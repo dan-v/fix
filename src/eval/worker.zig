@@ -71,6 +71,11 @@ pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32) a
 /// flight than the prewarm count.
 pub const prewarm_fiber_count: u8 = 4;
 
+/// Fiber cost/benefit census (piggybacks on `-Dprof-main`; see
+/// `prof.FiberLocal`). Comptime-gated so the default build's structs
+/// and hot paths are untouched.
+const census_on = fiber_mod.census_enabled and prof.enabled;
+
 pub const FiberState = enum(u8) {
     /// Currently running on the CPU, or about to be resumed.
     running,
@@ -127,6 +132,10 @@ pub const WorkerFiber = struct {
     /// cleared when it finishes). Its blocking waits on busy thunks are the
     /// critical path — recorded on the dedicated crit track (see force.zig).
     is_demand: bool = false,
+    /// Fiber census: suspensions since the current task started. Updated
+    /// and consumed under `run_mu` (runFiber's state switch), reset before
+    /// the fiber is recycled.
+    census_suspends: if (census_on) u32 else void = if (census_on) 0 else {},
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*WorkerFiber,
     /// Ready-queue node (scheduler-owned linked list). Set by
@@ -184,6 +193,11 @@ pub const Worker = struct {
     /// ring head observed at the last completed lap (see scavengeStep).
     scav_pos: u64 = 0,
     scav_lap_head: u64 = 0,
+
+    /// Fiber cost/benefit census accumulator (`-Dprof-main` only; see
+    /// `prof.FiberLocal`). Owner-thread writes only; flushed to the
+    /// global totals on park and at drain-loop exit.
+    census: if (census_on) prof.FiberLocal else void = if (census_on) prof.FiberLocal{} else {},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -261,6 +275,7 @@ pub const Worker = struct {
     /// at the end of `runTopLevel` so the main thread's work is visible
     /// to `schedulerStats()` callers before the evaluator deinits.
     fn flushTimingToScheduler(self: *Worker) void {
+        if (comptime census_on) prof.fiberFlush(&self.census, self.worker_id == 0);
         if (self.idle_ns == 0 and self.busy_ns == 0) return;
         self.scheduler.reportWorkerTiming(self.idle_ns, self.busy_ns);
         self.idle_ns = 0;
@@ -324,10 +339,16 @@ pub const Worker = struct {
         if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
         // Each top-level entry begins able to start background work.
         self.scheduler.setSuppressBackground(false);
+        const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
         const top = try self.acquireFreeFiber();
         top.current_task = null;
         top.is_demand = true; // its blocking waits are the critical path
         top.inner.reset(entry, arg);
+        if (comptime census_on) {
+            self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
+            self.census.tasks += 1;
+            prof.fiberLiveInc();
+        }
         top.state = .running;
         self.runFiber(top);
 
@@ -363,6 +384,7 @@ pub const Worker = struct {
         var victim: ?u8 = null;
         var push_ts: u64 = 0;
         if (self.pickTask(&victim, &push_ts)) |task| {
+            const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = task;
             // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
@@ -382,16 +404,27 @@ pub const Worker = struct {
                 }
             }
             f.inner.reset(slotEntry, @ptrCast(f));
+            if (comptime census_on) {
+                self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
+                self.census.tasks += 1;
+                prof.fiberLiveInc();
+            }
             f.state = .running;
             self.runFiber(f);
             return true;
         }
         if (self.pickCont()) |cont| {
+            const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_cont = cont;
             f.current_task = null;
             f.flow_in_id = 0;
             f.inner.reset(contEntry, @ptrCast(f));
+            if (comptime census_on) {
+                self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
+                self.census.tasks += 1;
+                prof.fiberLiveInc();
+            }
             f.state = .running;
             self.runFiber(f);
             return true;
@@ -453,10 +486,16 @@ pub const Worker = struct {
             // hotness; the claim CAS inside the force is authoritative.
             if (!vm_force.scavShouldTake(th.payload.target.bytecode.chunk_id)) continue;
             self.scav_pos = pos + 1;
+            const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = .{ .force_thunk = id };
             f.flow_in_id = 0;
             f.inner.reset(slotEntry, @ptrCast(f));
+            if (comptime census_on) {
+                self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
+                self.census.tasks += 1;
+                prof.fiberLiveInc();
+            }
             f.state = .running;
             sched.bumpScavenges(self.worker_id);
             self.runFiber(f);
@@ -551,6 +590,12 @@ pub const Worker = struct {
     }
 
     fn runFiber(self: *Worker, f: *WorkerFiber) void {
+        // Census: seed the swap-in origin BEFORE any per-resume machinery
+        // (run_mu, timeline, spec-ctx) so `cy_in` covers the whole
+        // dispatcher→body path; the fiber-side hook (trampoline / yield
+        // return) closes the window. Symmetric `cy_out` closes at the end
+        // of this function's bookkeeping.
+        if (comptime census_on) fiber_mod.census_pre_swap = fiber_mod.censusNow();
         f.run_mu.lock();
         defer f.run_mu.unlock();
 
@@ -586,6 +631,16 @@ pub const Worker = struct {
                 // its `runTopLevel` loop observes the completion (it
                 // may be parked waiting on this very fiber).
                 f.is_demand = false; // clear before recycle (else a reused fiber mislabels)
+                if (comptime census_on) {
+                    self.census.finished += 1;
+                    if (f.census_suspends > 0) {
+                        self.census.finished_suspended += 1;
+                        const lg: usize = 63 - @clz(@as(u64, f.census_suspends));
+                        self.census.susp_hist[@min(lg, self.census.susp_hist.len - 1)] += 1;
+                        f.census_suspends = 0;
+                    }
+                    prof.fiberLiveDec();
+                }
                 f.state = .free;
                 f.worker.pushFree(f);
                 if (f.worker != self) f.worker.nudge();
@@ -596,8 +651,21 @@ pub const Worker = struct {
                 // wake_fn will have enqueued our ready_node — the
                 // `ReadyNode.queued` CAS gives us idempotent enqueue,
                 // so it's fine if multiple paths try to push.
+                if (comptime census_on) {
+                    self.census.suspend_events += 1;
+                    f.census_suspends += 1;
+                }
             },
             .ready, .running => unreachable,
+        }
+        if (comptime census_on) {
+            self.census.cy_out += fiber_mod.censusNow() -| fiber_mod.census_exit_swap;
+            self.census.n_out += 1;
+            self.census.cy_in += fiber_mod.census_in_cy;
+            self.census.n_in += fiber_mod.census_in_n;
+            fiber_mod.census_in_cy = 0;
+            fiber_mod.census_in_n = 0;
+            self.census.resumes += 1;
         }
     }
 
@@ -694,9 +762,11 @@ pub const Worker = struct {
             self.free_head = head.next_free;
             head.next_free = null;
             self.free_mu.unlock();
+            if (comptime census_on) self.census.free_hits += 1;
             return head;
         }
         self.free_mu.unlock();
+        if (comptime census_on) self.census.allocs += 1;
         return self.allocateFiber();
     }
 
