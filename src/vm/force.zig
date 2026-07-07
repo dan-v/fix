@@ -1196,10 +1196,25 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
     if (shouldSpeculateClosure(self, closure)) {
-        const ok = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
+        // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
+        // instance of a chunk goes to the high-priority novel lane.
+        // builtin_closure thunks carry no chunk of their own — bulk lane.
+        const ok = if (self.scheduler.spec_novel and novelClosureChunk(self, closure))
+            self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
+        else
+            self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
         if (self.scheduler.touch_log != null) logSpawn(self, id, ok);
     }
     return Value.thunk(id);
+}
+
+/// `FIX_SPEC_NOVEL` selector for `makeThunk`: is this closure the first
+/// speculative instance of its chunk? (Test-and-set — call at most once
+/// per submission, only when the knob is on.)
+fn novelClosureChunk(self: *VM, closure: Value) bool {
+    if (!closure.isClosure()) return false;
+    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
+    return self.registry.markSpecSubmitted(c.chunk_id);
 }
 
 inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {

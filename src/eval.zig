@@ -579,6 +579,11 @@ pub const Evaluator = struct {
         if (self.env_map) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
             self.scheduler.spec_lifo = !std.mem.eql(u8, s, "0");
         };
+        // FIX_SPEC_NOVEL: first-ever speculation of each chunk goes to the
+        // high-priority novel lane (see scheduler.spec_novel).
+        if (self.env_map) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
+            self.scheduler.spec_novel = !std.mem.eql(u8, s, "0");
+        };
         // FIX_WORK_FIRST: route strict collection-force acceleration through the
         // work-first split-and-steal primitive instead of the eager fan-out.
         if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);

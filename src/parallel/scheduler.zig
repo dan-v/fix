@@ -350,7 +350,8 @@ pub const Scheduler = struct {
         scavenges: u64 = 0,
         sweeps: u64 = 0,
         evicts: u64 = 0,
-        _pad: [128 - 12 * @sizeOf(u64)]u8 = undefined,
+        novel_ok: u64 = 0,
+        _pad: [128 - 13 * @sizeOf(u64)]u8 = undefined,
     };
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
@@ -381,6 +382,10 @@ pub const Scheduler = struct {
         /// Oldest-first spec-backlog evictions (FIX_SPEC_EVICT): queued
         /// speculative tasks dropped unrun to admit a fresher submission.
         evicts: u64 = 0,
+        /// Novel-chunk speculative submissions (FIX_SPEC_NOVEL) — first-
+        /// ever creation-time speculation of a code region, routed to the
+        /// high-priority novel lane.
+        novel_ok: u64 = 0,
         /// Deepest fiber native stack high-water seen across all workers
         /// since startup. Use to size `Fiber.min_stack_bytes` against a
         /// representative workload.
@@ -423,6 +428,13 @@ pub const Scheduler = struct {
     /// overwrite (`FIX_SPEC_EVICT`) and stealers can take newest-first
     /// (`FIX_SPEC_LIFO`).
     spec_queues: []SpecQueue,
+    /// Per-worker high-priority speculative lane (`FIX_SPEC_NOVEL`):
+    /// first-ever creation-time speculation of each chunk lands here (see
+    /// `ChunkRegistry.markSpecSubmitted`). Drained after urgent, before
+    /// the bulk spec lane; always newest-first and ring-overwriting, and
+    /// exempt from the bulk backlog cap (volume is bounded at one task
+    /// per chunk). Empty (and therefore free) when the knob is off.
+    novel_queues: []SpecQueue,
     /// Per-worker deque of work-first split-and-steal continuations. Owner
     /// pushes/pops LIFO on the unstolen fast path; idle workers take FIFO.
     /// Separate from the eager task queues so the work-first pop-back never
@@ -563,6 +575,16 @@ pub const Scheduler = struct {
     /// backlog, instead of waiting behind (or being evicted with) hundreds
     /// of stale speculations.
     spec_lifo: bool = false,
+    /// `FIX_SPEC_NOVEL`: route the FIRST-ever creation-time speculation of
+    /// each chunk (a new code region — potential subsystem/chain root) to
+    /// the high-priority `novel_queues` lane, drained before the bulk spec
+    /// backlog and exempt from its cap. Repeat instances of already-seen
+    /// chunks stay in the bulk lane. Measured motivation: the /etc chain
+    /// seed (etc.nix:248) is the single first instance of its chunk; in
+    /// the bulk lane it must win a pop/steal race against hundreds of
+    /// repeat-instance junk tasks within ~1ms of submit or the whole
+    /// ~300ms serial chain starts ~250ms late (w=8 wall 0.95 → 1.05-1.15).
+    spec_novel: bool = false,
     /// `FIX_TOUCH_LOG=<file substring>`: diagnosis probe — log every thunk
     /// CLAIM whose source file basename matches, with timestamp, worker,
     /// and spec/demand context (see `vm/force.zig logTouch`). Debug-only;
@@ -640,6 +662,15 @@ pub const Scheduler = struct {
             spec_init += 1;
         }
 
+        const novel_queues = try allocator.alloc(SpecQueue, safe_worker_count);
+        errdefer allocator.free(novel_queues);
+        var novel_init: usize = 0;
+        errdefer for (novel_queues[0..novel_init]) |*q| q.deinit(allocator);
+        for (novel_queues) |*q| {
+            q.* = try SpecQueue.init(allocator, spec_queue_capacity);
+            novel_init += 1;
+        }
+
         const cont_queues = try allocator.alloc(ContQueue, safe_worker_count);
         errdefer allocator.free(cont_queues);
         var cont_init: usize = 0;
@@ -677,6 +708,7 @@ pub const Scheduler = struct {
             .worker_count = safe_worker_count,
             .urgent_queues = urgent_queues,
             .spec_queues = spec_queues,
+            .novel_queues = novel_queues,
             .cont_queues = cont_queues,
             .ready_queues = ready_queues,
             .threads = threads,
@@ -739,6 +771,7 @@ pub const Scheduler = struct {
             c.scavenges += w.scavenges;
             c.sweeps += w.sweeps;
             c.evicts += w.evicts;
+            c.novel_ok += w.novel_ok;
         }
         return .{
             .speculative_submitted = c.spec_ok,
@@ -753,6 +786,7 @@ pub const Scheduler = struct {
             .scavenges = c.scavenges,
             .sweeps = c.sweeps,
             .evicts = c.evicts,
+            .novel_ok = c.novel_ok,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
@@ -791,6 +825,7 @@ pub const Scheduler = struct {
         if (comptime !gc.enabled) return;
         for (self.urgent_queues) |*q| taskQueueGcMark(q, tr, heap);
         for (self.spec_queues) |*q| specQueueGcMark(q, tr, heap);
+        for (self.novel_queues) |*q| specQueueGcMark(q, tr, heap);
         // Work-first continuations reference a live collection each; mark it
         // (the range's items are reachable through the list/attrs). STW-only.
         for (self.cont_queues) |*q| {
@@ -808,6 +843,8 @@ pub const Scheduler = struct {
         self.allocator.free(self.urgent_queues);
         for (self.spec_queues) |*q| q.deinit(self.allocator);
         self.allocator.free(self.spec_queues);
+        for (self.novel_queues) |*q| q.deinit(self.allocator);
+        self.allocator.free(self.novel_queues);
         for (self.cont_queues) |*q| q.deinit(self.allocator);
         self.allocator.free(self.cont_queues);
         self.allocator.free(self.ready_queues);
@@ -1071,6 +1108,37 @@ pub const Scheduler = struct {
         return true;
     }
 
+    /// Submit a NOVEL-chunk speculative task (`FIX_SPEC_NOVEL`) — the
+    /// first-ever creation-time speculation of its chunk. Bypasses the
+    /// bulk backlog cap (total volume is bounded at one per chunk) and
+    /// lands on the high-priority novel ring, which always ring-overwrites
+    /// on full and is consumed newest-first by owner and stealers alike.
+    pub fn submitNovel(self: *Scheduler, task: Task, submitter_id: u8) bool {
+        if (self.worker_count <= 1) return false;
+        if (self.disable_speculation) return false;
+        if (submitter_id >= self.worker_count) return false;
+        const push_ts: u64 = if (self.trace_flows) monotonicNs() else 0;
+        const prev: u32 = switch (self.novel_queues[submitter_id].push(
+            .{ .task = task, .push_ts = push_ts },
+            true,
+        )) {
+            .full => unreachable, // evicting push never reports full
+            .pushed => self.pending_tasks.fetchAdd(1, .release),
+            .pushed_evicted => blk: {
+                self.bump(submitter_id, "evicts");
+                break :blk self.pending_tasks.load(.monotonic);
+            },
+        };
+        const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
+        if (prev < wake_budget or (prev & 63) == 0) {
+            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
+            self.wakeWorker(target);
+        }
+        self.bump(submitter_id, "novel_ok");
+        return true;
+    }
+
     /// Ring-overwrite the speculation backlog (`FIX_SPEC_EVICT`): drop the
     /// OLDEST queued spec task — the submitter's own queue first (usually
     /// where its backlog lives, and the cheapest probe), then any peer's —
@@ -1156,6 +1224,7 @@ pub const Scheduler = struct {
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
         const traced = self.urgent_queues[worker_id].pop() orelse
+            self.novel_queues[worker_id].popNewest() orelse
             self.spec_queues[worker_id].popNewest() orelse
             return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
@@ -1187,18 +1256,20 @@ pub const Scheduler = struct {
     fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         if (self.worker_count < 2) return null;
         if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| return t;
-        return self.stealSpecExcluding(worker_id, victim, push_ts);
+        // Novel lane before the bulk backlog; always newest-first.
+        if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| return t;
+        return self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts);
     }
 
-    /// Spec-lane steal: newest-first under `FIX_SPEC_LIFO` (demand-head-
-    /// adjacent bets), oldest-first otherwise.
-    fn stealSpecExcluding(self: *Scheduler, exclude: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
+    /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
+    /// bets), oldest-first otherwise.
+    fn stealSpecExcluding(self: *Scheduler, queues: []SpecQueue, exclude: u8, lifo: bool, victim: ?*u8, push_ts: ?*u64) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == exclude) continue;
-            if (self.spec_queues[idx].steal(self.spec_lifo)) |traced| {
+            if (queues[idx].steal(lifo)) |traced| {
                 _ = self.pending_tasks.fetchSub(1, .monotonic);
                 self.bump(exclude, "steals");
                 if (victim) |v| v.* = idx;

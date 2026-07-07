@@ -552,6 +552,13 @@ pub const ChunkRegistry = struct {
         body_is_substantial: bool,
         strict_param: bool,
         strict_via_upvalue: ?u16,
+        /// Novelty gate (`FIX_SPEC_NOVEL`): set by the FIRST creation-time
+        /// speculative submission of any thunk of this chunk (see
+        /// `markSpecSubmitted`). A never-before-submitted chunk is a new
+        /// code region — a potential subsystem/chain root worth running
+        /// ahead of the repeat-instance churn; later instances of the same
+        /// chunk are the bulk speculation stream.
+        spec_submitted: std.atomic.Value(u8) = .init(0),
     };
 
     const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 });
@@ -719,6 +726,16 @@ pub const ChunkRegistry = struct {
     pub fn slot(self: *const ChunkRegistry, id: ChunkId) ?*const ChunkSlot {
         if (id >= self.chunks.count()) return null;
         return self.chunks.get(id);
+    }
+
+    /// Novelty test-and-set (`FIX_SPEC_NOVEL`): returns true exactly once
+    /// per chunk — for the first caller ever to submit a creation-time
+    /// speculation of this chunk. Atomic swap: concurrent first-instance
+    /// creations on different workers race benignly (one wins the novel
+    /// slot, the rest take the bulk lane).
+    pub fn markSpecSubmitted(self: *ChunkRegistry, id: ChunkId) bool {
+        if (id >= self.chunks.count()) return false;
+        return self.chunks.getMut(id).spec_submitted.swap(1, .monotonic) == 0;
     }
 
     pub fn count(self: *const ChunkRegistry) u32 {

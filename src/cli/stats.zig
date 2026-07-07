@@ -15,8 +15,8 @@ const thunk_census = @import("../probe/thunk_census.zig");
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
     std.debug.print(
-        "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d} scavenges={d} sweeps={d} evicts={d}\n",
-        .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks, s.scavenges, s.sweeps, s.evicts },
+        "sched: spec_ok={d} spec_rej={d} urgent_ok={d} urgent_rej={d} pops={d} steals={d} parks={d} scavenges={d} sweeps={d} evicts={d} novel={d}\n",
+        .{ s.speculative_submitted, s.speculative_rejected, s.urgent_submitted, s.urgent_rejected, s.pops, s.steals, s.parks, s.scavenges, s.sweeps, s.evicts, s.novel_ok },
     );
     std.debug.print("registry: chunks={d}\n", .{ev.chunkStats().chunks});
     {
