@@ -152,10 +152,21 @@ pub const Parser = struct {
 
     // ---- diagnostics ----
 
+    /// Line number for a token, recomputed from its offset (tokens don't
+    /// carry line numbers; diagnostics are cold). Reproduces the scanner's
+    /// old incremental counter exactly: it had counted every newline up to
+    /// the END of the token when the token was made — except an
+    /// unterminated string's `error_token` (spans to EOF, body newlines
+    /// never counted), which reported its start line.
+    pub fn tokenLine(source: []const u8, tok: Token) u32 {
+        const target = if (tok.type == .error_token) tok.offset else tok.offset + tok.len;
+        return diagnostic.lineForOffset(source, target);
+    }
+
     fn report(self: *Parser, tok: Token, msg: []const u8) void {
         self.had_error = true;
         self.diagnostics.append(self.allocator, .{
-            .line = tok.line,
+            .line = tokenLine(self.source, tok),
             .column = diagnostic.columnForOffset(self.source, tok.offset),
             .offset = tok.offset,
             .len = tok.len,

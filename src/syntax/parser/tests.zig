@@ -189,7 +189,6 @@ test "parser recognizes identifier lambda" {
         .type = .identifier,
         .offset = node.data.lambda.param_offset,
         .len = node.data.lambda.param_len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.binary_op, node.data.lambda.body.tag);
 }
@@ -250,19 +249,16 @@ test "parser recognizes nested attr declarations" {
         .type = .identifier,
         .offset = entries[0].path[0].offset,
         .len = entries[0].path[0].len,
-        .line = 1,
     }));
     try std.testing.expectEqualStrings("b", parser.span(.{
         .type = .identifier,
         .offset = entries[0].path[1].offset,
         .len = entries[0].path[1].len,
-        .line = 1,
     }));
     try std.testing.expectEqualStrings("\"c\"", parser.span(.{
         .type = .string,
         .offset = entries[1].path[1].offset,
         .len = entries[1].path[1].len,
-        .line = 1,
     }));
 }
 
@@ -281,14 +277,12 @@ test "parser desugars simple inherit in attrsets" {
         .type = .identifier,
         .offset = entries[0].path[0].offset,
         .len = entries[0].path[0].len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.identifier, entries[0].expr.tag);
     try std.testing.expectEqualStrings("or", parser.span(.{
         .type = .kw_or,
         .offset = entries[1].path[0].offset,
         .len = entries[1].path[0].len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.tag);
 }
@@ -310,7 +304,6 @@ test "parser desugars inherit from source expression" {
         .type = .identifier,
         .offset = entries[0].expr.data.attr_path.segments[0].offset,
         .len = entries[0].expr.data.attr_path.segments[0].len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.attr_path, entries[1].expr.tag);
     try std.testing.expectEqual(NodeTag.identifier, entries[1].expr.data.attr_path.root.tag);
@@ -330,13 +323,11 @@ test "parser recognizes contextual or attr names" {
         .type = .kw_or,
         .offset = entries[0].path[0].offset,
         .len = entries[0].path[0].len,
-        .line = 1,
     }));
     try std.testing.expectEqualStrings("or", parser.span(.{
         .type = .kw_or,
         .offset = entries[1].path[1].offset,
         .len = entries[1].path[1].len,
-        .line = 1,
     }));
 }
 
@@ -355,7 +346,6 @@ test "parser desugars inherit in let bindings" {
         .type = .identifier,
         .offset = bindings[0].name_offset,
         .len = bindings[0].name_len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.identifier, bindings[0].expr.tag);
     try std.testing.expect(bindings[0].inherit_outer);
@@ -363,7 +353,6 @@ test "parser desugars inherit in let bindings" {
         .type = .identifier,
         .offset = bindings[1].name_offset,
         .len = bindings[1].name_len,
-        .line = 1,
     }));
     try std.testing.expectEqual(NodeTag.attr_path, bindings[1].expr.tag);
     try std.testing.expectEqual(NodeTag.identifier, bindings[1].expr.data.attr_path.root.tag);

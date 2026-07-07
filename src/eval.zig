@@ -477,7 +477,7 @@ pub const Evaluator = struct {
             try self.copyDiagnostics(&.{.{
                 .severity = .err,
                 .kind = .compile,
-                .line = tok.line,
+                .line = parser_mod.Parser.tokenLine(source, tok),
                 .column = diagnostic.columnForOffset(source, tok.offset),
                 .offset = tok.offset,
                 .len = tok.len,

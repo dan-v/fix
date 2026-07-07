@@ -36,16 +36,43 @@ inline fn hasClass(c: u8, mask: u8) bool {
     return class_table[c] & mask != 0;
 }
 
+// SIMD block scanning for the three byte-run hot loops (layout runs,
+// identifier runs, string bodies). `vec_len == 0` (no SIMD on this target)
+// falls back to the scalar loops everywhere.
+const vec_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 0;
+const Vec = @Vector(vec_len, u8);
+const VMask = std.meta.Int(.unsigned, if (vec_len == 0) 1 else vec_len);
+
+inline fn maskEq(v: Vec, comptime c: u8) VMask {
+    return @bitCast(v == @as(Vec, @splat(c)));
+}
+
+inline fn maskGe(v: Vec, comptime c: u8) VMask {
+    return @bitCast(v >= @as(Vec, @splat(c)));
+}
+
+inline fn maskLe(v: Vec, comptime c: u8) VMask {
+    return @bitCast(v <= @as(Vec, @splat(c)));
+}
+
+/// Mask of bytes in the identifier-continue class (a-z A-Z 0-9 - ' _),
+/// mirroring `C_IDENT_CONT` in `class_table`.
+inline fn maskIdentCont(v: Vec) VMask {
+    const lower = maskGe(v, 'a') & maskLe(v, 'z');
+    const upper = maskGe(v, 'A') & maskLe(v, 'Z');
+    const digit = maskGe(v, '0') & maskLe(v, '9');
+    const other = maskEq(v, '-') | maskEq(v, '\'') | maskEq(v, '_');
+    return lower | upper | digit | other;
+}
+
 pub const Scanner = struct {
     source: []const u8,
     pos: u32,
-    line: u32,
 
     pub fn init(source: []const u8) Scanner {
         return .{
             .source = source,
             .pos = 0,
-            .line = 1,
         };
     }
 
@@ -157,34 +184,35 @@ pub const Scanner = struct {
     }
 
     fn makeToken(self: *Scanner, tt: TokenType, start: u32, len: u32) Token {
-        return Token{ .type = tt, .offset = start, .len = len, .line = self.line };
+        _ = self;
+        return Token{ .type = tt, .offset = start, .len = len };
     }
 
     fn skipLayout(self: *Scanner) void {
         while (self.pos < self.source.len) {
             switch (self.source[self.pos]) {
-                ' ', '\r', '\t' => self.pos += 1,
-                '\n' => {
-                    self.line += 1;
+                ' ', '\r', '\t', '\n' => {
                     self.pos += 1;
+                    self.skipWhitespaceRun();
                 },
                 '#' => {
-                    // Line comment
-                    while (self.pos < self.source.len and self.source[self.pos] != '\n') {
-                        self.pos += 1;
-                    }
+                    // Line comment: SIMD scan to the newline.
+                    self.pos = @intCast(std.mem.indexOfScalarPos(u8, self.source, self.pos, '\n') orelse self.source.len);
                 },
                 '/' => {
                     if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '*') {
                         // Block comment
-                        self.pos += 2;
-                        while (self.pos + 1 < self.source.len) {
-                            if (self.source[self.pos] == '*' and self.source[self.pos + 1] == '/') {
-                                self.pos += 2;
-                                break;
-                            }
-                            if (self.source[self.pos] == '\n') self.line += 1;
-                            self.pos += 1;
+                        const body_start = self.pos + 2;
+                        if (body_start >= self.source.len) {
+                            self.pos = @intCast(self.source.len);
+                            return;
+                        }
+                        if (std.mem.indexOfPos(u8, self.source, body_start, "*/")) |close| {
+                            self.pos = @intCast(close + 2);
+                        } else {
+                            // Unterminated: consume up to (not including) the
+                            // final byte, matching the scalar loop's exit.
+                            self.pos = @intCast(self.source.len - 1);
                         }
                     } else {
                         return; // single '/' is a token
@@ -195,7 +223,38 @@ pub const Scanner = struct {
         }
     }
 
+    /// SIMD fast path for runs of layout bytes (space/tab/cr/newline).
+    /// Stops at the first non-layout byte; `skipLayout` re-dispatches on it
+    /// (comment starts, token starts).
+    fn skipWhitespaceRun(self: *Scanner) void {
+        if (comptime vec_len == 0) return;
+        const src = self.source;
+        var pos: usize = self.pos;
+        while (pos + vec_len <= src.len) {
+            const v: Vec = src[pos..][0..vec_len].*;
+            const ws = maskEq(v, ' ') | maskEq(v, '\t') | maskEq(v, '\r') | maskEq(v, '\n');
+            if (ws != ~@as(VMask, 0)) {
+                pos += @ctz(~ws);
+                break;
+            }
+            pos += vec_len;
+        }
+        self.pos = @intCast(pos);
+        // Tail (< vec_len bytes) is handled by skipLayout's scalar dispatch.
+    }
+
     fn lexIdentOrKeyword(self: *Scanner, start: u32) Token {
+        if (comptime vec_len > 0) {
+            while (self.pos + vec_len <= self.source.len) {
+                const v: Vec = self.source[self.pos..][0..vec_len].*;
+                const cont = maskIdentCont(v);
+                if (cont != ~@as(VMask, 0)) {
+                    self.pos += @ctz(~cont);
+                    break;
+                }
+                self.pos += vec_len;
+            }
+        }
         while (self.pos < self.source.len and hasClass(self.source[self.pos], C_IDENT_CONT)) {
             self.pos += 1;
         }
@@ -239,15 +298,8 @@ pub const Scanner = struct {
             self.pos = @intCast(self.source.len);
             return self.makeToken(.error_token, start, self.pos - start);
         };
-        self.countNewlines(self.source[start..end]);
         self.pos = @intCast(end);
         return self.makeToken(.string, start, self.pos - start);
-    }
-
-    fn countNewlines(self: *Scanner, bytes: []const u8) void {
-        for (bytes) |byte| {
-            if (byte == '\n') self.line += 1;
-        }
     }
 
     fn lexPath(self: *Scanner, start: u32) Token {
@@ -261,7 +313,6 @@ pub const Scanner = struct {
                 self.source[self.pos + 1] == '{')
             {
                 const end = string_syntax.findInterpolationEnd(self.source, self.pos + 2) orelse break;
-                self.countNewlines(self.source[self.pos .. end + 1]);
                 self.pos = @intCast(end + 1);
                 continue;
             }

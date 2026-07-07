@@ -72,6 +72,8 @@ pub const Token = struct {
     /// Offset and length into the source.
     offset: u32,
     len: u32,
-    /// Line number (1-based).
-    line: u32,
+    // No line number: tokens are produced in the parse hot loop, and line
+    // numbers are only needed for diagnostics (cold) — recompute them from
+    // the offset there (see `Parser.tokenLine`). This also frees the
+    // scanner from counting newlines at all.
 };

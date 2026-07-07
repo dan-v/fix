@@ -6,6 +6,33 @@
 
 const std = @import("std");
 
+// SIMD find-first-of for the literal scanners: string bodies are long runs
+// of plain bytes; jump straight to the next structurally interesting byte.
+const vec_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 0;
+const Vec = @Vector(vec_len, u8);
+const VMask = std.meta.Int(.unsigned, if (vec_len == 0) 1 else vec_len);
+
+inline fn maskEq(v: Vec, comptime c: u8) VMask {
+    return @bitCast(v == @as(Vec, @splat(c)));
+}
+
+/// Advance `i` to the first occurrence of any of `chars` at or after `i`.
+/// Returns the index of that byte, or `source.len` if none remain in the
+/// SIMD-reachable prefix — the caller's scalar loop finishes the tail.
+inline fn skipToAnyOf(source: []const u8, start: usize, comptime chars: []const u8) usize {
+    var i = start;
+    if (comptime vec_len > 0) {
+        while (i + vec_len <= source.len) {
+            const v: Vec = source[i..][0..vec_len].*;
+            var m: VMask = 0;
+            inline for (chars) |c| m |= maskEq(v, c);
+            if (m != 0) return i + @ctz(m);
+            i += vec_len;
+        }
+    }
+    return i;
+}
+
 pub const LiteralKind = enum {
     double_quoted,
     indented,
@@ -91,6 +118,8 @@ fn scanDoubleQuoted(source: []const u8, start: usize) ?usize {
     if (start >= source.len or source[start] != '"') return null;
     var i = start + 1;
     while (i < source.len) {
+        i = skipToAnyOf(source, i, "\"\\$");
+        if (i >= source.len) break;
         switch (source[i]) {
             '"' => return i + 1,
             '\\' => i += if (i + 1 < source.len) 2 else 1,
@@ -112,6 +141,8 @@ fn scanIndented(source: []const u8, start: usize) ?usize {
     if (start + 1 >= source.len or source[start] != '\'' or source[start + 1] != '\'') return null;
     var i = start + 2;
     while (i < source.len) {
+        i = skipToAnyOf(source, i, "$'");
+        if (i >= source.len) break;
         if (source[i] == '$') {
             const run_start = i;
             while (i < source.len and source[i] == '$') i += 1;
@@ -139,6 +170,8 @@ pub fn findInterpolationEnd(source: []const u8, start: usize) ?usize {
     var depth: usize = 1;
     var i = start;
     while (i < source.len) {
+        i = skipToAnyOf(source, i, "\"'#/{}");
+        if (i >= source.len) break;
         if (source[i] == '"') {
             i = scanDoubleQuoted(source, i) orelse return null;
             continue;
