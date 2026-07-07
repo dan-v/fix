@@ -228,7 +228,14 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
     const state = thunk.future.state.load(.acquire);
     if (state == @intFromEnum(thunk_mod.FutureState.resolved)) {
-        if (demand) thunk.markDemanded();
+        if (demand) {
+            // Discovery probe: main is the first real demander of an
+            // already-resolved thunk ⇒ a helper resolved it ahead of demand.
+            if (comptime prof.enabled) {
+                if (self.workerId() == 0 and !thunk.isDemanded()) prof.disc.resolved_ahead += 1;
+            }
+            thunk.markDemanded();
+        }
         return thunk.payload.result;
     }
     return forceThunkImpl(self, value, demand);
@@ -695,6 +702,11 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return info.*.err;
             },
             .claimed => {
+                // Discovery probe: main out-ran the helpers — this thunk was
+                // not resolved ahead of demand, so main must compute it itself.
+                if (comptime prof.enabled) {
+                    if (demand and self.workerId() == 0) prof.disc.claimed_by_main += 1;
+                }
                 // Bail out of in-flight speculation once the demanded
                 // result is ready: rather than run a (possibly large,
                 // never-needed) body to completion, abandon it at this safe
@@ -777,6 +789,38 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 return result;
             },
             .busy => {
+                // Discovery probe: main (a demand fiber) blocked on a
+                // helper-owned (.busy) thunk — a serial stall on the critical
+                // path. Record it, note whether the awaited thunk is still
+                // un-demanded (spec-owned ⇒ a demand→spec promotion could pull
+                // it up), and time the whole wait.
+                var disc_start: u64 = 0;
+                var disc_spec = false;
+                if (comptime prof.enabled) {
+                    if (demand and self.workerId() == 0) {
+                        const is_dem = if (fiber_mod.currentFiber()) |inner| blk: {
+                            const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+                            break :blk wf.is_demand;
+                        } else false;
+                        if (is_dem) {
+                            disc_spec = !thunk.isDemanded();
+                            prof.disc.busy_wait += 1;
+                            if (disc_spec) prof.disc.busy_spec_owned += 1;
+                            disc_start = prof.tscMainOnly();
+                        }
+                    }
+                }
+                defer if (comptime prof.enabled) {
+                    // `tscMainOnly()` returns 0 off worker 0 — the top fiber can
+                    // resume on another worker after the yield, so only account
+                    // the wait when we're still on worker 0 (guards underflow).
+                    const end_tsc = prof.tscMainOnly();
+                    if (disc_start != 0 and end_tsc > disc_start) {
+                        const dt = end_tsc - disc_start;
+                        prof.disc.busy_cycles += dt;
+                        if (disc_spec) prof.disc.busy_spec_cycles += dt;
+                    }
+                };
                 // Spin-before-enroll: a helper that is nearly done publishes
                 // within a few hundred ns. Catching the resolve here skips the
                 // whole enroll→suspend→yield→resume→re-tryForce cycle (µs of

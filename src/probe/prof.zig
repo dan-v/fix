@@ -105,6 +105,25 @@ pub var samples: [path_count]Sample = @splat(.{});
 pub const max_builtin_id: usize = 256;
 pub var builtin_samples: [max_builtin_id]Sample = @splat(.{});
 
+/// Discovery-serialization probe (piggybacks on `-Dprof-main`).
+/// Classifies MAIN worker 0's demand-path forces to size the gap
+/// between "a helper resolved this ahead of me" (win), "I out-ran the
+/// helpers and had to compute it myself" (claimed), and "I blocked on
+/// a helper computing it" (busy_wait). At a busy-wait we also record
+/// whether the awaited thunk was still un-`demanded` — i.e. claimed
+/// speculatively at background priority, so a demand->spec PROMOTION
+/// would let the critical path pull it up. All writes are worker-0-only
+/// (no races); zero-cost when the build flag is off.
+pub const Disc = struct {
+    resolved_ahead: u64 = 0,
+    claimed_by_main: u64 = 0,
+    busy_wait: u64 = 0,
+    busy_spec_owned: u64 = 0,
+    busy_cycles: u64 = 0,
+    busy_spec_cycles: u64 = 0,
+};
+pub var disc: Disc = .{};
+
 /// Read TSC unconditionally. Used by `recordBuiltin` to get an
 /// inclusive timestamp without going through the prof stack.
 pub inline fn tscMainOnly() u64 {
@@ -276,4 +295,31 @@ pub fn report() void {
         const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));
         std.debug.print("  {s}: excl={d} incl={d} calls={d} avg_excl={d}\n", .{ name, entry.cycles, entry.incl, entry.calls, entry.cycles / entry.calls });
     }
+    // Discovery-serialization breakdown of main's demand forces.
+    {
+        const total = disc.resolved_ahead + disc.claimed_by_main + disc.busy_wait;
+        if (total != 0) {
+            std.debug.print(
+                "prof discovery (main demand-forces, n={d}): resolved_ahead={d} ({d:.1}%) claimed_by_main={d} ({d:.1}%) busy_wait={d} ({d:.1}%)\n",
+                .{
+                    total,
+                    disc.resolved_ahead,  pct(disc.resolved_ahead, total),
+                    disc.claimed_by_main, pct(disc.claimed_by_main, total),
+                    disc.busy_wait,       pct(disc.busy_wait, total),
+                },
+            );
+            std.debug.print(
+                "prof discovery (crit-path busy waits): busy_spec_owned={d}/{d} spec_wait_cy={d} total_wait_cy={d} ({d:.1}% of wait cycles is spec-owned = PROMOTION headroom)\n",
+                .{
+                    disc.busy_spec_owned, disc.busy_wait,
+                    disc.busy_spec_cycles, disc.busy_cycles,
+                    pct(disc.busy_spec_cycles, disc.busy_cycles),
+                },
+            );
+        }
+    }
+}
+
+fn pct(x: u64, total: u64) f64 {
+    return if (total == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(total));
 }
