@@ -53,6 +53,8 @@ pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Val
         for (groups.items) |*group| group.values.deinit(self.allocator);
         groups.deinit(self.allocator);
     }
+    var group_idx: shared.NameIndex = .{};
+    defer group_idx.deinit(self.allocator);
 
     // gc: re-fetch — range may move across the force
     const list_id = list.asObjectId();
@@ -64,9 +66,11 @@ pub fn builtinZipAttrsWith(self: anytype, func_arg: Value, list_arg: Value) !Val
         if (!attrs.isAttrs()) return error.TypeError;
 
         for (try self.heap.getAttrs(attrs.asObjectId())) |entry| {
-            const index = shared.groupIndex(groups.items, entry.name) orelse blk: {
+            const index = (try group_idx.find(self.allocator, groups.items, entry.name)) orelse blk: {
                 try groups.append(self.allocator, .{ .name = entry.name });
-                break :blk groups.items.len - 1;
+                const idx = groups.items.len - 1;
+                try group_idx.record(self.allocator, entry.name, idx);
+                break :blk idx;
             };
             try groups.items[index].values.append(self.allocator, entry.value);
         }

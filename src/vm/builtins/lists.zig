@@ -70,6 +70,8 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
     const value_id = try self.intern.intern("value");
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
+    var entry_idx: shared.NameIndex = .{};
+    defer entry_idx.deinit(self.allocator);
 
     // gc: re-fetch — range may move across the force
     const list_id = value.asObjectId();
@@ -83,12 +85,13 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
         const name_value = try vm_force.forceValue(self, try self.heap.getAttrValue(item_value.asObjectId(), name_id));
         if (!isPlainString(name_value)) return error.TypeError;
         const name_intern = try stringTextInternId(self, name_value);
-        if (attrEntryNameIndex(entries.items, name_intern) != null) continue;
+        if ((try entry_idx.find(self.allocator, entries.items, name_intern)) != null) continue;
 
         try entries.append(self.allocator, .{
             .name = name_intern,
             .value = try self.heap.getAttrValue(item_value.asObjectId(), value_id),
         });
+        try entry_idx.record(self.allocator, name_intern, entries.items.len - 1);
     }
 
     return Value.attrs(try self.heap.addAttrs(entries.items));
@@ -480,6 +483,8 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
         for (groups.items) |*group| group.items.deinit(self.allocator);
         groups.deinit(self.allocator);
     }
+    var group_idx: shared.NameIndex = .{};
+    defer group_idx.deinit(self.allocator);
 
     const list_id = list.asObjectId();
     const items = try self.heap.getList(list_id);
@@ -492,9 +497,11 @@ pub fn builtinGroupBy(self: anytype, fn_arg: Value, list_arg: Value) !Value {
         const key = try vm_force.forceValue(self, try vm_closures.callValue(self, func, item));
         if (!isPlainString(key)) return error.TypeError;
         const key_id = try stringTextInternId(self, key);
-        const index = shared.groupIndex(groups.items, key_id) orelse blk: {
+        const index = (try group_idx.find(self.allocator, groups.items, key_id)) orelse blk: {
             try groups.append(self.allocator, .{ .name = key_id });
-            break :blk groups.items.len - 1;
+            const idx = groups.items.len - 1;
+            try group_idx.record(self.allocator, key_id, idx);
+            break :blk idx;
         };
         try groups.items[index].items.append(self.allocator, item);
     }

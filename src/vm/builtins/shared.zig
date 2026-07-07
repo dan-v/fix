@@ -46,6 +46,45 @@ pub fn groupIndex(groups: anytype, name: InternId) ?usize {
     return null;
 }
 
+/// Adaptive name→index lookup for accumulate-by-name builtins
+/// (`zipAttrsWith`, `groupBy`, `listToAttrs`). Small accumulations keep
+/// the allocation-free linear scan; once the item list crosses a
+/// threshold, a hash map is built once and kept in sync, replacing the
+/// O(n) rescan per element (O(n²) total on large inputs — hit hard by
+/// nixpkgs-scale attrset merges, but generic to any large workload).
+/// Purely a lookup-structure swap: match results, and therefore
+/// insertion order and output bytes, are identical.
+pub const NameIndex = struct {
+    map: std.AutoHashMapUnmanaged(InternId, usize) = .empty,
+    built: bool = false,
+
+    /// Linear-scan cutoff. Below this the scan is cheaper than hashing;
+    /// crossing it pays one O(n) build and then O(1) per lookup.
+    const THRESHOLD: usize = 32;
+
+    pub fn deinit(self: *NameIndex, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+    }
+
+    /// Index of the item whose `.name == name`, or null. `items` must be
+    /// the same list every call and must only grow via `record`ed
+    /// appends (names unique), so the built map stays in sync.
+    pub fn find(self: *NameIndex, allocator: std.mem.Allocator, items: anytype, name: InternId) !?usize {
+        if (!self.built) {
+            if (items.len < THRESHOLD) return groupIndex(items, name);
+            try self.map.ensureTotalCapacity(allocator, @intCast(items.len));
+            for (items, 0..) |item, i| self.map.putAssumeCapacity(item.name, i);
+            self.built = true;
+        }
+        return self.map.get(name);
+    }
+
+    /// Tell the index the caller appended `name` at `index`.
+    pub fn record(self: *NameIndex, allocator: std.mem.Allocator, name: InternId, index: usize) !void {
+        if (self.built) try self.map.put(allocator, name, index);
+    }
+};
+
 /// Cross-category helper: the closure half of
 /// `force.isSpeculatableBuiltinClosure`'s map-style branch: speculate iff
 /// the user function is a `.closure` whose body chunk is substantial. (That
