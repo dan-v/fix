@@ -17,6 +17,7 @@ const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
 const drv_probe = @import("../../probe/drv_probe.zig");
+const prof = @import("../../probe/prof.zig");
 const thunk_mod = @import("runtime").thunk;
 
 const allOutputsContextValue = string_context.allOutputsContextValue;
@@ -177,9 +178,19 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
 
-    var normalized = try normalizeDerivation(self, attrs_id, drv_name, output_names);
+    const t_norm = prof.start(.drv_normalize);
+    var normalized = normalizeDerivation(self, attrs_id, drv_name, output_names) catch |err| {
+        prof.end(.drv_normalize, t_norm);
+        return err;
+    };
+    prof.end(.drv_normalize, t_norm);
     defer normalized.deinit(self.allocator);
-    const computed = try normalized.drv.computePaths(self.allocator, self.derivations.resolver());
+    const t_comp = prof.start(.drv_compute);
+    const computed = normalized.drv.computePaths(self.allocator, self.derivations.resolver()) catch |err| {
+        prof.end(.drv_compute, t_comp);
+        return err;
+    };
+    prof.end(.drv_compute, t_comp);
     defer self.allocator.free(computed.drv_path);
     defer computed.hash_modulo.deinit(self.allocator);
     try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
@@ -202,6 +213,8 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         .explicit_outputs = output_names.explicit,
         .original_attrs = try self.heap.getAttrs(attrs_id),
     };
+    const t_bv = prof.start(.drv_build_value);
+    defer prof.end(.drv_build_value, t_bv);
     return switch (mode) {
         .lazy => derivation.buildValue(self.allocator, self.intern, self.heap, spec),
         .strict => derivation.buildStrictValue(self.allocator, self.intern, self.heap, spec),
@@ -265,12 +278,20 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         for (owned_output_lists.items) |list| self.allocator.free(list);
         owned_output_lists.deinit(self.allocator);
     }
-    const drv_name_owned = try ownDerivationString(self, &owned_strings, drv_name);
+    // Interned text (`intern.get`) is stable for the evaluator's lifetime
+    // (append-only StableSegments), and everything downstream that needs a
+    // build's strings beyond the build itself (`DerivationStore.record`,
+    // `recordDebug`) clones its own copies. So strings that are already
+    // interned — the name, output/attr names, whole env values with no
+    // rewritten context — are used as-is instead of being duped into
+    // `owned_strings`; the dupes were pure alloc+memcpy waste on the
+    // (serial) normalize path. Only freshly-assembled strings are owned.
+    const drv_name_owned = drv_name;
 
     const outputs = try self.allocator.alloc(derivation.DrvOutput, output_names.names.len);
     errdefer self.allocator.free(outputs);
     for (output_names.names, outputs) |name, *output| {
-        output.* = .{ .name = try ownDerivationString(self, &owned_strings, self.intern.get(name)) };
+        output.* = .{ .name = self.intern.get(name) };
     }
 
     try applyFixedOutputAttrs(self, attrs_id, outputs, &owned_strings);
@@ -310,8 +331,8 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
         var ai: usize = 0;
         while (ai < attrs_len) : (ai += 1) {
             const entry = (try self.heap.getAttrs(attrs_id))[ai];
-            const attr_name_text = self.intern.get(entry.name);
-            const attr_name = try ownDerivationString(self, &owned_strings, attr_name_text);
+            // Interned attr name — stable, no dupe (see note above).
+            const attr_name = self.intern.get(entry.name);
             if (std.mem.eql(u8, attr_name, "args")) continue;
             if (std.mem.eql(u8, attr_name, "__ignoreNulls")) continue;
             // Classify the attr's thunk state at first touch — before either
@@ -394,7 +415,8 @@ fn applyFixedOutputAttrs(
         try owned_strings.append(self.allocator, text);
         break :blk text;
     } else if (std.mem.eql(u8, mode, "flat")) blk: {
-        break :blk try ownDerivationString(self, owned_strings, algo);
+        // `algo` is interned text or a slice of it — stable, no dupe.
+        break :blk algo;
     } else return error.InvalidHashMode;
     outputs[0].hash_algo = hash_algo;
     outputs[0].hash = hash_hex;
@@ -479,13 +501,6 @@ fn joinedOutputNames(self: anytype, names: []const InternId) ![]u8 {
         try out.appendSlice(self.allocator, self.intern.get(name));
     }
     return out.toOwnedSlice(self.allocator);
-}
-
-fn ownDerivationString(self: anytype, owned_strings: *std.ArrayListUnmanaged([]u8), text: []const u8) ![]const u8 {
-    const owned = try self.allocator.dupe(u8, text);
-    errdefer self.allocator.free(owned);
-    try owned_strings.append(self.allocator, owned);
-    return owned;
 }
 
 fn structuredAttrsJson(
@@ -660,12 +675,12 @@ fn normalizeDerivationString(
     for (try contextEntriesForValue(self, value)) |entry| {
         const path = self.intern.get(entry.name);
         if (std.mem.endsWith(u8, path, ".drv")) {
-            const owned_path = try ownDerivationString(self, owned_strings, path);
-            const outputs = try contextOutputs(self, path, entry.value, owned_strings);
+            // `path` is interned — stable, no dupe (see normalizeDerivation).
+            const outputs = try contextOutputs(self, path, entry.value);
             errdefer self.allocator.free(outputs);
             try inputs.owned_output_lists.append(self.allocator, outputs);
-            try appendInputDrv(self, inputs, owned_path, outputs);
-            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, owned_path);
+            try appendInputDrv(self, inputs, path, outputs);
+            if (std.mem.indexOf(u8, text, path) != null) try appendInputSrc(self, inputs, path);
         } else {
             const store_path = try sourceStorePathForContext(self, path, owned_strings);
             try appendInputSrc(self, inputs, store_path);
@@ -677,7 +692,10 @@ fn normalizeDerivationString(
             }
         }
     }
-    if (out.items.len == 0) return ownDerivationString(self, owned_strings, text);
+    // No source-path rewrites — the interned text itself is the normalized
+    // string. It's stable for the evaluator's lifetime; skipping the dupe
+    // avoids an alloc+memcpy per env value (build scripts run to KBs).
+    if (out.items.len == 0) return text;
     try out.appendSlice(self.allocator, text[cursor..]);
     const normalized = try out.toOwnedSlice(self.allocator);
     errdefer self.allocator.free(normalized);
@@ -696,7 +714,6 @@ fn contextOutputs(
     self: anytype,
     path: []const u8,
     value: Value,
-    owned_strings: *std.ArrayListUnmanaged([]u8),
 ) ![]const []const u8 {
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
@@ -710,9 +727,9 @@ fn contextOutputs(
             const known = self.derivations.outputNames(path) orelse return error.UnknownInputDerivation;
             const outputs = try self.allocator.alloc([]const u8, known.len);
             errdefer self.allocator.free(outputs);
-            for (known, outputs) |output, *dest| {
-                dest.* = try ownDerivationString(self, owned_strings, output);
-            }
+            // `DerivationStore.record` clones output names into store-owned
+            // storage that outlives the build — no per-name dupe needed.
+            @memcpy(outputs, known);
             return outputs;
         }
     } else |err| switch (err) {
@@ -730,7 +747,8 @@ fn contextOutputs(
         for (outputs, 0..) |*output, i| {
             const item_value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
             if (!isPlainString(item_value)) return error.TypeError;
-            output.* = try ownDerivationString(self, owned_strings, self.intern.get(try stringTextInternId(self, item_value)));
+            // Interned — stable, no dupe (see normalizeDerivation).
+            output.* = self.intern.get(try stringTextInternId(self, item_value));
         }
         return outputs;
     } else |err| switch (err) {
@@ -738,7 +756,7 @@ fn contextOutputs(
         else => return err,
     }
     const fallback = try self.allocator.alloc([]const u8, 1);
-    fallback[0] = try ownDerivationString(self, owned_strings, "out");
+    fallback[0] = "out"; // static literal — no dupe
     return fallback;
 }
 

@@ -30,7 +30,21 @@ pub const Drv = struct {
             }
         }
 
-        const output_hash_modulo = try self.hashModulo(allocator, resolver, true);
+        // Resolve the hash-modulo input set ONCE per build. Both
+        // `hashModulo` calls below (masked for output paths, unmasked for
+        // the dependency hash) need the same actual-inputs set; it's a
+        // pure function of `input_drvs` + resolver, and building it does
+        // per-input resolver lookups, hash dupes, and a quadratic merge —
+        // the second recomputation was measurable in the `drv_compute`
+        // bucket (~3.6% of w=1 in aggregate). Fixed-output derivations
+        // never read it.
+        const actual_inputs: ?[]DrvInput = if (self.isFixedOutput())
+            null
+        else
+            try self.hashModuloInputs(allocator, resolver);
+        defer if (actual_inputs) |inp| freeHashModuloInputs(allocator, inp);
+
+        const output_hash_modulo = try self.hashModuloWithInputs(allocator, actual_inputs, true);
         defer output_hash_modulo.deinit(allocator);
 
         for (self.outputs) |*output| {
@@ -54,7 +68,7 @@ pub const Drv = struct {
         const drv_name = try paths.drvPathName(allocator, self.name);
         defer allocator.free(drv_name);
         const drv_path = try paths.textPath(allocator, resolver.store_dir, drv_name, text, refs);
-        const dependency_hash_modulo = try self.hashModulo(allocator, resolver, false);
+        const dependency_hash_modulo = try self.hashModuloWithInputs(allocator, actual_inputs, false);
         errdefer dependency_hash_modulo.deinit(allocator);
         return .{
             .drv_path = drv_path,
@@ -63,6 +77,17 @@ pub const Drv = struct {
     }
 
     pub fn hashModulo(self: *const Drv, allocator: std.mem.Allocator, resolver: HashModuloResolver, mask_outputs: bool) !HashModulo {
+        if (self.isFixedOutput()) return self.hashModuloWithInputs(allocator, null, mask_outputs);
+        const actual_inputs = try self.hashModuloInputs(allocator, resolver);
+        defer freeHashModuloInputs(allocator, actual_inputs);
+        return self.hashModuloWithInputs(allocator, actual_inputs, mask_outputs);
+    }
+
+    /// `hashModulo` with the actual-inputs set already resolved
+    /// (`hashModuloInputs`), so one resolution can serve both the masked
+    /// and unmasked hashes of a single build. `actual_inputs` may be null
+    /// only for a fixed-output derivation (which never reads it).
+    pub fn hashModuloWithInputs(self: *const Drv, allocator: std.mem.Allocator, actual_inputs: ?[]const DrvInput, mask_outputs: bool) !HashModulo {
         if (self.isFixedOutput()) {
             const output = self.outputs[0];
             const inner = try std.fmt.allocPrint(allocator, "fixed:out:{s}:{s}:{s}", .{ output.hash_algo, output.hash, output.path });
@@ -80,9 +105,7 @@ pub const Drv = struct {
             return .{ .outputs = outputs };
         }
 
-        const actual_inputs = try self.hashModuloInputs(allocator, resolver);
-        defer freeHashModuloInputs(allocator, actual_inputs);
-        const text = try self.toATerm(allocator, mask_outputs, actual_inputs);
+        const text = try self.toATerm(allocator, mask_outputs, actual_inputs.?);
         defer allocator.free(text);
         return .{ .drv = try codec.sha256Hex(allocator, text) };
     }
