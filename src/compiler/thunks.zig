@@ -35,8 +35,8 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
 /// compile when strictness analysis on the let-body confirms the
 /// binding will be forced.
 pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void {
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();
@@ -59,8 +59,8 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
 /// short-circuit to a value with no thunk either way, so the adaptive
 /// runtime check would be pure overhead.
 pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();

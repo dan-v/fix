@@ -267,6 +267,23 @@ pub const ChunkBuilder = struct {
         self.source_map.deinit(allocator);
     }
 
+    /// Restore the freshly-initialized state, keeping buffer capacity —
+    /// for the compiler's child-builder pool (`Compiler.acquireBuilder`).
+    pub fn reset(self: *ChunkBuilder) void {
+        self.code.clearRetainingCapacity();
+        self.constants.clearRetainingCapacity();
+        self.function_args.clearRetainingCapacity();
+        self.source_map.clearRetainingCapacity();
+        self.body_span = null;
+        self.last_op_offset = null;
+        self.fusion_savings = 0;
+        self.strictness = .{};
+        self.strict_param = false;
+        self.strict_via_upvalue = null;
+        self.arity = 1;
+        self.strict_params = 0;
+    }
+
     /// Write a single opcode byte.
     pub fn writeOp(self: *ChunkBuilder, allocator: std.mem.Allocator, op: OpCode) !void {
         self.last_op_offset = self.code.items.len;

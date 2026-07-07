@@ -195,8 +195,8 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     }
     const body = cur;
 
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();
@@ -248,8 +248,8 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
 pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     const lambda = node.data.lambda_attrs;
 
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();
@@ -365,8 +365,8 @@ fn attrParamsNeedCells(self: *Compiler, params: []const Node.LambdaAttrParam) bo
 }
 
 fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();

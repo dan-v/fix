@@ -160,8 +160,8 @@ fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void
 }
 
 fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();
@@ -591,8 +591,8 @@ fn nonAttrSetDuplicateLeaf(group: AttrEntryGroup) ?AttrEntryView {
 }
 
 pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
-    var child_builder = try ChunkBuilder.init(self.allocator);
-    defer child_builder.deinit(self.allocator);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
 
     var child = self.initChild(&child_builder);
     defer child.deinit();

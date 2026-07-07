@@ -103,6 +103,11 @@ pub const Compiler = struct {
     /// the parent chain per compiled node. Points at the root's
     /// `line_index` (or `external_line_index`); never owned.
     resolved_line_index: ?*diagnostic.LineIndex = null,
+    /// Spare child ChunkBuilders, populated on the ROOT compiler only
+    /// (children route through it). One builder is created per emitted
+    /// chunk; recycling the buffers avoids paying the builder's initial
+    /// code/constants capacity allocation ~once per chunk.
+    builder_pool: std.ArrayListUnmanaged(ChunkBuilder) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -163,6 +168,8 @@ pub const Compiler = struct {
     }
 
     pub fn deinit(self: *Compiler) void {
+        for (self.builder_pool.items) |*builder| builder.deinit(self.allocator);
+        self.builder_pool.deinit(self.allocator);
         for (self.owned_diagnostic_messages.items) |message| {
             self.allocator.free(message);
         }
@@ -174,6 +181,33 @@ pub const Compiler = struct {
         if (self.parent == null and self.line_index_ready) {
             self.line_index.deinit(self.allocator);
         }
+    }
+
+    /// Take a ChunkBuilder for a nested chunk compile — recycled from the
+    /// root's pool when available. Pair with `releaseBuilder`.
+    pub fn acquireBuilder(self: *Compiler) !ChunkBuilder {
+        const root = self.rootCompiler();
+        if (root.builder_pool.pop()) |pooled| {
+            var builder = pooled;
+            builder.reset();
+            return builder;
+        }
+        return ChunkBuilder.init(self.allocator);
+    }
+
+    /// Return a finished child builder's buffers to the root's pool. The
+    /// builder must not be used again by the caller.
+    pub fn releaseBuilder(self: *Compiler, builder: *ChunkBuilder) void {
+        const root = self.rootCompiler();
+        root.builder_pool.append(root.allocator, builder.*) catch {
+            builder.deinit(self.allocator);
+        };
+    }
+
+    fn rootCompiler(self: *Compiler) *Compiler {
+        var compiler = self;
+        while (compiler.parent) |parent| compiler = parent;
+        return compiler;
     }
 
     pub fn compile(self: *Compiler, node: *const Node) !void {
