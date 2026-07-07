@@ -1,8 +1,16 @@
 # GC
 
-*An experimental non-moving precise mark-sweep collector (`-Dgc`), off by default, zero-cost when off. STATUS: w=1 works and is byte-identical (~-16% RSS, ~81% of heap reclaimable). w>1 collection is correct and byte-identical (parallel STW mark + per-worker sharded lock-free free lists) but stays dormant-by-default (`FIX_GC_WN` opts in) — the residual cost is now the inherent STW pause, not the alloc path (the shared free-list mutex, once the dominant w>1 cost, is gone). Experimental; interpreter canonical.*
+*A non-moving precise generational collector (`-Dgc`), off by default, zero-cost when off. STATUS: works and is byte-identical at ALL worker counts (serial minor at w=1; parallel STW mark + evac at w>1, per-worker sharded lock-free free lists). Collection is governed by a single **memory budget** (`--max-memory` / `FIX_MAX_MEMORY`, default half of MemAvailable): a run that never crosses half the budget pays only the mutator rooting tax (~2-2.5% wall, measured), because reclaim tracking is armed lazily at the first budget/2 STW safepoint. Experimental; interpreter canonical.*
 
 **Zero-cost when off.** `-Dgc` is a comptime `build_options.gc` flag; every root-enumeration, safepoint, and bitmap path is guarded and compiles to nothing when disabled. Enabling it never changes output — the [interpreter](vm/dispatch.md) is canonical and evaluation is byte-identical with the collector on or off.
+
+## Memory budget (the collection policy)
+
+One number decides when the collector runs: a heap-reserved-bytes budget.
+
+- Resolution order: `--max-memory=N` (MiB, or `Nk`/`Nm`/`Ng`) → `FIX_MAX_MEMORY` (same format) → **half of `/proc/meminfo` MemAvailable** (fallbacks: half MemTotal, then 2 GiB). `0` = never collect (reclaim machinery never enabled — bump-only, like `FIX_GC_OFF`).
+- **Lazy arming**: below budget/2 the heap only compares the reserved-bytes cursor against the threshold once per TLAB refill — no young-slot tracking, no write barrier, no free-list probes. The first budget/2 crossing runs an arming STW safepoint (everything allocated so far becomes untracked/old — the unreclaimable floor); real collections start at the budget, re-armed at `max(budget, reserved + clamp(budget/8, 64MB, 1GB))` after each.
+- Consequence: on a 128 GB machine the default budget dwarfs any eval → **zero collections, zero arming**; on a small-RAM device collections start well before OOM and peak reserved is bounded near the budget (measured: `--max-memory=512m` holds nixos_toplevel at 850 MB reserved vs ~1.4 GB unbounded, byte-identical).
 
 ## Why non-moving + precise
 
@@ -55,21 +63,21 @@ Every `ValueRange` / `AttrRange` (the backing store for lists and attrsets) has 
 
 | Mode | State |
 |------|-------|
-| w=1 | **Fully working, byte-identical.** ~0.2s per collection at deep fixpoint; ~5.6% mutator rooting tax. Measured ~81% of the heap reclaimable, ~-16% peak RSS (1208MB allocated vs 228MB live at w=1). |
-| w>1 | **Correct, byte-identical, still dormant-by-default (`FIX_GC_WN` opts in).** Enable it for validation with `FIX_GC_WN=1` (production `--workers>1` behaves as a non-GC build). The mark is **parallel** across idle workers (Phase 2a: atomic bitmap + per-worker work-stealing deques + STW help-mark, marker slot == worker id), and the free lists are **per-worker sharded** (lock-free reclaim reuse; the STW sweep distributes freed memory round-robin). 100-run byte-identical gauntlet (w=8/16/32). Earlier blocker chain: a missing speculative `force_list_range` root (fixed 2026-07-03); then — decisively measured — the dominant w>1 wall cost was NOT the mark (~58ms/collection) or the barrier (~235ms), but the **shared free-list mutex** on every allocation (3.8× regression even at 0 collections). Sharding it removed that: w=32 natural threshold 9.94s→**4.15s**; at a saner collection frequency **~1.8s (+31% vs dormant) for −24% RSS**. |
+| w=1 | **Fully working, byte-identical** (incl. ReleaseSafe UAF-detector gauntlet under `FIX_GC_STEP_MB=64`). Minor pause ~48ms (mark ~33ms — ~94% of it the young-survivor transitive drain; roots + remset are single-digit ms thanks to the incremental chunk-constant scan — plus sweep ~15ms). Dormant (budget never crossed): **+2.5% wall vs non-gc, no RSS delta** (interleaved medians, 2026-07-07). |
+| w>1 | **Fully working, byte-identical, on by default** (validated w=8: 512m/768m budgets, `FIX_GC_STEP_MB=64` ×13-28 collections, detector build). The mark is **parallel** across parked workers (atomic bitmap + per-worker work-stealing deques + STW help-mark, participants capped by `FIX_GC_PAR_CAP`, default 8), evacuation is a shared claim-loop, and the free lists are **per-worker sharded** (lock-free reuse). Barrier spin ~4-11ms/collection at w=8. Dormant: **+2.2% wall vs non-gc** (was +22% before lazy arming). |
 
-**Net verdict on time:** the alloc-path contention is gone (sharded free lists); what remains at w>1 is the **inherent STW pause** (mark + sweep + barrier × collection-count). Levers left: **collection frequency** (the natural threshold over-collects — 31 collections for marginal RSS; tuning `GC_HEADROOM` reaches the 2-collection/~1.8s point), **parallel sweep** (Phase 2a parallelized only the mark), and **futex-parking the barrier** instead of busy-spin. The RSS bound is real (live set plateaus while total allocation grows linearly); `madvise` page-return recovers only ~32MB (scattered non-moving death) → dead. The end goal remains concurrent SATB (Phase 2b), for which the parallel mark is the substrate.
+**Net verdict on time:** the dormant cost is the comptime rooting tax only (~2-2.5%): force-chain/temp-root maintenance must stay complete from process start (entries live across the arming boundary), so it cannot be runtime-gated. When collecting, the pause is the young-survivor drain + young-slot sweep; frequency is budget-driven, so total GC wall scales with allocation-past-budget, not run length. The RSS bound is real (live set plateaus while total allocation grows linearly); `madvise` page-return recovers only ~32MB (scattered non-moving death) → dead. The end goal remains concurrent SATB, for which the parallel mark is the substrate.
 
 ## Correctness tooling
 
 - **UAF detector** (ReleaseSafe + `-Dgc`): freed slots are *not reused* and every read asserts the alloc bit is set — surfaces dangling ObjectIds at the read, at their source.
 - **Swept-range poisoning**: freed ranges are overwritten with an invalid thunk so any stale reader trips immediately.
-- **`FIX_GC_STEP_MB`**: env override for the byte threshold — force aggressive/early collection to shake out rooting gaps.
+- **`FIX_GC_STEP_MB`**: env override — collect every N MB of fresh allocation from a low start threshold (eager tracking, ignores the budget) to shake out rooting gaps.
+- **`FIX_GC_OFF`** (never enable reclaim), **`FIX_GC_NOREUSE`** (bump-only A/B), **`FIX_GC_PAR_CAP`** (mark/evac participant cap), **`FIX_MAX_MEMORY`** (budget override) — measurement/tuning knobs.
+- **`gc_validate.sh`** (repo root): golden-hash + wall + GC-report one-liner per run.
 
 ## Not the Phase-0 probe
 
 `-Dgc` *also* names the **Phase-0 mark-only probe** (mark + headroom sampling, **no reclaim**) used to justify this work and measure the reclaimable fraction. This doc describes the **full collector** (mark + sweep + reuse). For the probe framing and its headroom numbers see [perf/probes.md](perf/probes.md); the ceiling analysis it feeds is in [perf/model.md](perf/model.md).
 
-See [docs/plans/gc-plan.md](plans/gc-plan.md) for the design and roadmap.
-
-Code: `src/runtime/gc.zig`
+Code: `src/runtime/gc.zig` (tracer), `src/runtime/heap/gc.zig` (collector driver: arm/evac/sweep/threshold), `src/eval/gc.zig` (roots, STW glue, budget resolution).
