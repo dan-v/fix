@@ -321,6 +321,10 @@ const SpecQueue = struct {
     mask: u32,
     head: u32,
     tail: u32,
+    /// This ring's index in its lane (owner worker id), i.e. its bit in
+    /// the lane's non-empty victim mask. Rings past bit 63 don't
+    /// participate (the scan falls back to a full walk there).
+    idx: u8,
 
     comptime {
         std.debug.assert(@sizeOf(SpecQueue) % std.atomic.cache_line == 0);
@@ -328,19 +332,33 @@ const SpecQueue = struct {
 
     const PushResult = enum { pushed, pushed_evicted, full };
 
-    fn init(allocator: std.mem.Allocator, capacity: u32) !SpecQueue {
+    fn init(allocator: std.mem.Allocator, capacity: u32, idx: u8) !SpecQueue {
         std.debug.assert(std.math.isPowerOfTwo(capacity));
         const items = try allocator.alloc(TracedTask, capacity);
-        return .{ .mu = .{}, .items = items, .mask = capacity - 1, .head = 0, .tail = 0 };
+        return .{ .mu = .{}, .items = items, .mask = capacity - 1, .head = 0, .tail = 0, .idx = idx };
     }
 
     fn deinit(self: *SpecQueue, allocator: std.mem.Allocator) void {
         allocator.free(self.items);
     }
 
+    /// Set/clear this ring's bit in the lane's non-empty victim mask.
+    /// Called ONLY while holding `mu`, so per-ring bit updates are
+    /// ordered exactly with the occupancy transitions they mirror — the
+    /// mask itself is never stale for a ring; only a scanner's loaded
+    /// copy can be (benign: it re-probes an emptied ring and moves on).
+    inline fn maskSet(self: *const SpecQueue, lane_mask: *std.atomic.Value(u64)) void {
+        if (self.idx >= 64) return;
+        _ = lane_mask.fetchOr(@as(u64, 1) << @intCast(self.idx), .release);
+    }
+    inline fn maskClear(self: *const SpecQueue, lane_mask: *std.atomic.Value(u64)) void {
+        if (self.idx >= 64) return;
+        _ = lane_mask.fetchAnd(~(@as(u64, 1) << @intCast(self.idx)), .release);
+    }
+
     /// Append at the newest end. On a full ring: drop the oldest when
     /// `evict`, else reject.
-    fn push(self: *SpecQueue, t: TracedTask, evict: bool) PushResult {
+    fn push(self: *SpecQueue, t: TracedTask, evict: bool, lane_mask: *std.atomic.Value(u64)) PushResult {
         self.mu.lock();
         defer self.mu.unlock();
         var evicted = false;
@@ -349,39 +367,43 @@ const SpecQueue = struct {
             self.tail +%= 1;
             evicted = true;
         }
+        if (self.head == self.tail) self.maskSet(lane_mask);
         self.items[self.head & self.mask] = t;
         self.head +%= 1;
         return if (evicted) .pushed_evicted else .pushed;
     }
 
     /// Owner pop — newest first (matches the old deque's owner LIFO).
-    fn popNewest(self: *SpecQueue) ?TracedTask {
+    fn popNewest(self: *SpecQueue, lane_mask: *std.atomic.Value(u64)) ?TracedTask {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.head == self.tail) return null;
         self.head -%= 1;
+        if (self.head == self.tail) self.maskClear(lane_mask);
         return self.items[self.head & self.mask];
     }
 
     /// Stealer take: newest-first when `lifo` (demand-head-adjacent bets),
     /// oldest-first otherwise (historical FIFO).
-    fn steal(self: *SpecQueue, lifo: bool) ?TracedTask {
-        if (lifo) return self.popNewest();
+    fn steal(self: *SpecQueue, lifo: bool, lane_mask: *std.atomic.Value(u64)) ?TracedTask {
+        if (lifo) return self.popNewest(lane_mask);
         self.mu.lock();
         defer self.mu.unlock();
         if (self.head == self.tail) return null;
         const t = self.items[self.tail & self.mask];
         self.tail +%= 1;
+        if (self.head == self.tail) self.maskClear(lane_mask);
         return t;
     }
 
     /// Drop the oldest queued task without running it (backlog-cap ring
     /// overwrite). Returns false when empty.
-    fn evictOldest(self: *SpecQueue) bool {
+    fn evictOldest(self: *SpecQueue, lane_mask: *std.atomic.Value(u64)) bool {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.head == self.tail) return false;
         self.tail +%= 1;
+        if (self.head == self.tail) self.maskClear(lane_mask);
         return true;
     }
 };
@@ -644,8 +666,16 @@ pub const Scheduler = struct {
     /// decision (`pending_tasks` still gates those).
     ready_pending: containers.Isolated(u32),
     urgent_pending: containers.Isolated(u32),
-    novel_pending: containers.Isolated(u32),
-    spec_pending: containers.Isolated(u32),
+    /// Non-empty VICTIM masks for the two mutexed spec-ring lanes: bit i
+    /// set ⇔ ring i holds at least one task. Stronger than a count — the
+    /// steal scan jumps straight to a non-empty victim instead of
+    /// locking every peer's ring in turn to find one (the census showed
+    /// even 60%-hit scans averaging thousands of cycles walking empty
+    /// rings). Maintained exactly, under each ring's own mutex, on its
+    /// empty↔non-empty transitions; flip volume is bounded by task
+    /// throughput on lanes that are low-volume by design.
+    novel_mask: containers.Isolated(u64),
+    spec_mask: containers.Isolated(u64),
     /// Per-worker activity counters. Each worker writes ONLY its own
     /// slot — single-writer, plain non-atomic adds. This kills the
     /// cross-core cache-line contention that shared-atomic counters
@@ -825,8 +855,8 @@ pub const Scheduler = struct {
         errdefer allocator.free(spec_queues);
         var spec_init: usize = 0;
         errdefer for (spec_queues[0..spec_init]) |*q| q.deinit(allocator);
-        for (spec_queues) |*q| {
-            q.* = try SpecQueue.init(allocator, spec_queue_capacity);
+        for (spec_queues, 0..) |*q, i| {
+            q.* = try SpecQueue.init(allocator, spec_queue_capacity, @intCast(i));
             spec_init += 1;
         }
 
@@ -834,8 +864,8 @@ pub const Scheduler = struct {
         errdefer allocator.free(novel_queues);
         var novel_init: usize = 0;
         errdefer for (novel_queues[0..novel_init]) |*q| q.deinit(allocator);
-        for (novel_queues) |*q| {
-            q.* = try SpecQueue.init(allocator, spec_queue_capacity);
+        for (novel_queues, 0..) |*q, i| {
+            q.* = try SpecQueue.init(allocator, spec_queue_capacity, @intCast(i));
             novel_init += 1;
         }
 
@@ -890,8 +920,8 @@ pub const Scheduler = struct {
             .cont_pending = .init(0),
             .ready_pending = .init(0),
             .urgent_pending = .init(0),
-            .novel_pending = .init(0),
-            .spec_pending = .init(0),
+            .novel_mask = .init(0),
+            .spec_mask = .init(0),
             .worker_counters = worker_counters,
             .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
@@ -1279,15 +1309,13 @@ pub const Scheduler = struct {
         const prev: u32 = switch (self.spec_queues[submitter_id].push(
             .{ .task = task, .push_ts = push_ts },
             self.spec_evict,
+            &self.spec_mask.v,
         )) {
             .full => {
                 self.bump(submitter_id, "spec_rej");
                 return false;
             },
-            .pushed => blk: {
-                _ = self.spec_pending.v.fetchAdd(1, .release);
-                break :blk self.pending_tasks.v.fetchAdd(1, .release);
-            },
+            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
             // Ring overwrite inside our own queue: one task dropped, one
             // added — pending count is unchanged.
             .pushed_evicted => blk: {
@@ -1319,12 +1347,10 @@ pub const Scheduler = struct {
         const prev: u32 = switch (self.novel_queues[submitter_id].push(
             .{ .task = task, .push_ts = push_ts },
             true,
+            &self.novel_mask.v,
         )) {
             .full => unreachable, // evicting push never reports full
-            .pushed => blk: {
-                _ = self.novel_pending.v.fetchAdd(1, .release);
-                break :blk self.pending_tasks.v.fetchAdd(1, .release);
-            },
+            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
             .pushed_evicted => blk: {
                 self.bump(submitter_id, "evicts");
                 break :blk self.pending_tasks.v.load(.monotonic);
@@ -1349,8 +1375,7 @@ pub const Scheduler = struct {
     /// speculation).
     fn evictOldestSpec(self: *Scheduler, submitter_id: u8) bool {
         if (!self.spec_evict) return false;
-        if (self.spec_queues[submitter_id].evictOldest()) {
-            _ = self.spec_pending.v.fetchSub(1, .monotonic);
+        if (self.spec_queues[submitter_id].evictOldest(&self.spec_mask.v)) {
             _ = self.pending_tasks.v.fetchSub(1, .monotonic);
             self.bump(submitter_id, "evicts");
             return true;
@@ -1360,8 +1385,7 @@ pub const Scheduler = struct {
         while (i < self.worker_count) : (i += 1) {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == submitter_id) continue;
-            if (self.spec_queues[idx].evictOldest()) {
-                _ = self.spec_pending.v.fetchSub(1, .monotonic);
+            if (self.spec_queues[idx].evictOldest(&self.spec_mask.v)) {
                 _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(submitter_id, "evicts");
                 return true;
@@ -1433,22 +1457,18 @@ pub const Scheduler = struct {
                 _ = self.urgent_pending.v.fetchSub(1, .monotonic);
                 break :blk t;
             }
-            // Lane summaries also spare the OWN-pop mutex locks: the novel
+            // Lane masks also spare the OWN-pop mutex locks: the novel
             // ring is empty for almost the entire eval (and permanently at
             // w>16, where the lane is gated off), and stealers hammering
             // an owner's ring line made even an empty-own-ring lock a
-            // cache miss.
-            if (self.novel_pending.v.load(.monotonic) != 0) {
-                if (self.novel_queues[worker_id].popNewest()) |t| {
-                    _ = self.novel_pending.v.fetchSub(1, .monotonic);
-                    break :blk t;
-                }
+            // cache miss. Own-bit test is exact (maintained under the
+            // ring's mutex) modulo a racing steal, which the pop re-checks.
+            const own_bit: u64 = if (worker_id < 64) @as(u64, 1) << @intCast(worker_id) else 0;
+            if (worker_id >= 64 or self.novel_mask.v.load(.monotonic) & own_bit != 0) {
+                if (self.novel_queues[worker_id].popNewest(&self.novel_mask.v)) |t| break :blk t;
             }
-            if (self.spec_pending.v.load(.monotonic) != 0) {
-                if (self.spec_queues[worker_id].popNewest()) |t| {
-                    _ = self.spec_pending.v.fetchSub(1, .monotonic);
-                    break :blk t;
-                }
+            if (worker_id >= 64 or self.spec_mask.v.load(.monotonic) & own_bit != 0) {
+                if (self.spec_queues[worker_id].popNewest(&self.spec_mask.v)) |t| break :blk t;
             }
             scanEnd("pop_own", t0, false);
             return null;
@@ -1495,19 +1515,17 @@ pub const Scheduler = struct {
             scanEnd("urgent_steal", t0, false);
         }
         // Novel lane before the bulk backlog; always newest-first.
-        if (self.novel_pending.v.load(.monotonic) != 0) {
+        if (self.novel_mask.v.load(.monotonic) != 0 or self.worker_count > 64) {
             const t1 = rdtscScan();
-            if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| {
-                _ = self.novel_pending.v.fetchSub(1, .monotonic);
+            if (self.stealSpecExcluding(self.novel_queues, &self.novel_mask.v, worker_id, true, victim, push_ts)) |t| {
                 scanEnd("novel_steal", t1, true);
                 return t;
             }
             scanEnd("novel_steal", t1, false);
         }
-        if (self.spec_pending.v.load(.monotonic) != 0) {
+        if (self.spec_mask.v.load(.monotonic) != 0 or self.worker_count > 64) {
             const t2 = rdtscScan();
-            if (self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts)) |t| {
-                _ = self.spec_pending.v.fetchSub(1, .monotonic);
+            if (self.stealSpecExcluding(self.spec_queues, &self.spec_mask.v, worker_id, self.spec_lifo, victim, push_ts)) |t| {
                 scanEnd("spec_steal", t2, true);
                 return t;
             }
@@ -1517,19 +1535,40 @@ pub const Scheduler = struct {
     }
 
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
-    /// bets), oldest-first otherwise.
-    fn stealSpecExcluding(self: *Scheduler, queues: []SpecQueue, exclude: u8, lifo: bool, victim: ?*u8, push_ts: ?*u64) ?Task {
+    /// bets), oldest-first otherwise. Victim-mask-guided: walks only the
+    /// rings whose non-empty bit is set (one mask load instead of locking
+    /// every peer's ring), rotating the start the same way the full walk
+    /// did. Rings past bit 63 (worker_count > 64) get the historical full
+    /// walk as a tail.
+    fn stealSpecExcluding(self: *Scheduler, queues: []SpecQueue, lane_mask: *std.atomic.Value(u64), exclude: u8, lifo: bool, victim: ?*u8, push_ts: ?*u64) ?Task {
         const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
-        var i: u8 = 0;
-        while (i < self.worker_count) : (i += 1) {
-            const idx = (start_idx + i) % self.worker_count;
-            if (idx == exclude) continue;
-            if (queues[idx].steal(lifo)) |traced| {
+        var m: u64 = lane_mask.load(.monotonic);
+        if (exclude < 64) m &= ~(@as(u64, 1) << @intCast(exclude));
+        while (m != 0) {
+            // Next set bit at or past the rotated start, wrapping.
+            const hi = m & (~@as(u64, 0) << @intCast(@min(start_idx, 63)));
+            const idx: u8 = @intCast(@ctz(if (hi != 0) hi else m));
+            m &= ~(@as(u64, 1) << @intCast(idx));
+            if (queues[idx].steal(lifo, lane_mask)) |traced| {
                 _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(exclude, "steals");
                 if (victim) |v| v.* = idx;
                 if (push_ts) |p| p.* = traced.push_ts;
                 return traced.task;
+            }
+        }
+        // Rings without a mask bit (only when worker_count > 64).
+        if (self.worker_count > 64) {
+            var i: u8 = 64;
+            while (i < self.worker_count) : (i += 1) {
+                if (i == exclude) continue;
+                if (queues[i].steal(lifo, lane_mask)) |traced| {
+                    _ = self.pending_tasks.v.fetchSub(1, .monotonic);
+                    self.bump(exclude, "steals");
+                    if (victim) |v| v.* = i;
+                    if (push_ts) |p| p.* = traced.push_ts;
+                    return traced.task;
+                }
             }
         }
         return null;
@@ -1708,7 +1747,7 @@ pub const Scheduler = struct {
         // lands inside one. Layout is otherwise the compiler's business,
         // so this is what keeps a future field-shuffle honest.
         @setEvalBranchQuota(8000);
-        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending", "ready_pending", "urgent_pending", "novel_pending", "spec_pending" };
+        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending", "ready_pending", "urgent_pending", "novel_mask", "spec_mask" };
         const blk = std.atomic.cache_line;
         for (@typeInfo(Scheduler).@"struct".fields) |f| {
             if (@sizeOf(f.type) == 0) continue;
@@ -1761,7 +1800,7 @@ test "scheduler.submit round-robins across workers" {
     var total: u32 = 0;
     for (sched.spec_queues) |*q| {
         var count: u32 = 0;
-        while (q.steal(false)) |_| count += 1;
+        while (q.steal(false, &sched.spec_mask.v)) |_| count += 1;
         total += count;
     }
     try std.testing.expectEqual(@as(u32, 6), total);
@@ -1785,7 +1824,7 @@ test "submitUrgent bypasses the speculation backlog cap" {
 
     var drained: u32 = 0;
     for (sched.urgent_queues) |*q| while (q.steal()) |_| { drained += 1; };
-    for (sched.spec_queues) |*q| while (q.steal(false)) |_| { drained += 1; };
+    for (sched.spec_queues) |*q| while (q.steal(false, &sched.spec_mask.v)) |_| { drained += 1; };
     // spec_backlog_per_helper (128) speculative tasks + 2 urgent tasks
     // that bypassed the cap. This was 66 (64 + 2) back when the cap was
     // helper_count * 64; when the cap was raised to 128 (commit
@@ -1806,10 +1845,10 @@ test "spec ring: LIFO owner pop, FIFO steal, reject when full (knobs off)" {
     // Owner pops newest.
     try std.testing.expectEqual(@as(types.ObjectId, 3), sched.pop(0).?.force_thunk);
     // Default steal takes oldest.
-    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false, &sched.spec_mask.v).?.task.force_thunk);
     // LIFO steal takes newest.
-    try std.testing.expectEqual(@as(types.ObjectId, 2), sched.spec_queues[0].steal(true).?.task.force_thunk);
-    try std.testing.expectEqual(@as(?TracedTask, null), sched.spec_queues[0].steal(false));
+    try std.testing.expectEqual(@as(types.ObjectId, 2), sched.spec_queues[0].steal(true, &sched.spec_mask.v).?.task.force_thunk);
+    try std.testing.expectEqual(@as(?TracedTask, null), sched.spec_queues[0].steal(false, &sched.spec_mask.v));
 }
 
 test "spec ring: FIX_SPEC_EVICT admits at the cap by dropping the oldest" {
@@ -1829,8 +1868,8 @@ test "spec ring: FIX_SPEC_EVICT admits at the cap by dropping the oldest" {
     try std.testing.expectEqual(@as(u64, 1), sched.stats().evicts);
 
     // The oldest remaining is now id 1; the newest is the fresh 999.
-    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false).?.task.force_thunk);
-    try std.testing.expectEqual(@as(types.ObjectId, 999), sched.spec_queues[0].steal(true).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false, &sched.spec_mask.v).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 999), sched.spec_queues[0].steal(true, &sched.spec_mask.v).?.task.force_thunk);
 }
 
 test "spec ring: push evict wraps correctly at ring capacity" {
@@ -1841,12 +1880,12 @@ test "spec ring: push evict wraps correctly at ring capacity" {
     var q = &sched.spec_queues[0];
     var i: types.ObjectId = 0;
     while (i < spec_queue_capacity) : (i += 1)
-        try std.testing.expectEqual(SpecQueue.PushResult.pushed, q.push(.{ .task = .{ .force_thunk = i } }, true));
+        try std.testing.expectEqual(SpecQueue.PushResult.pushed, q.push(.{ .task = .{ .force_thunk = i } }, true, &sched.spec_mask.v));
     // Full: non-evicting push rejects, evicting push overwrites the oldest.
-    try std.testing.expectEqual(SpecQueue.PushResult.full, q.push(.{ .task = .{ .force_thunk = 7777 } }, false));
-    try std.testing.expectEqual(SpecQueue.PushResult.pushed_evicted, q.push(.{ .task = .{ .force_thunk = 8888 } }, true));
-    try std.testing.expectEqual(@as(types.ObjectId, 1), q.steal(false).?.task.force_thunk);
-    try std.testing.expectEqual(@as(types.ObjectId, 8888), q.steal(true).?.task.force_thunk);
+    try std.testing.expectEqual(SpecQueue.PushResult.full, q.push(.{ .task = .{ .force_thunk = 7777 } }, false, &sched.spec_mask.v));
+    try std.testing.expectEqual(SpecQueue.PushResult.pushed_evicted, q.push(.{ .task = .{ .force_thunk = 8888 } }, true, &sched.spec_mask.v));
+    try std.testing.expectEqual(@as(types.ObjectId, 1), q.steal(false, &sched.spec_mask.v).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 8888), q.steal(true, &sched.spec_mask.v).?.task.force_thunk);
 }
 
 test "stealForWorker: each worker excludes its own queue" {
