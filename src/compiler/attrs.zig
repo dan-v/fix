@@ -770,6 +770,14 @@ pub fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
 }
 
 pub fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
+    // Fast path: an unquoted identifier segment is a verbatim slice of
+    // source. `intern` copies the bytes into its own table, so the
+    // dupe+free that `attrSegmentNameAlloc` performs for this case is
+    // pure churn — intern the source span directly. Produces the exact
+    // same InternId, so the emitted bytecode is byte-identical.
+    if (string_syntax.kindAt(self.source, atom.offset) == null) {
+        return self.intern.intern(self.source[atom.offset .. atom.offset + atom.len]);
+    }
     const name = try attrSegmentNameAlloc(self, atom);
     defer self.allocator.free(name);
     return self.intern.intern(name);
