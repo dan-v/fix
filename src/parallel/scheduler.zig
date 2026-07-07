@@ -629,6 +629,23 @@ pub const Scheduler = struct {
     /// reads to decide whether to keep spinning for stealable continuation
     /// work, without per-queue CAS probes (same design as `pending_tasks`).
     cont_pending: containers.Isolated(u32),
+    /// Per-lane stealable-work summaries (scan-census-driven, see the
+    /// w=32 idle-churn fix): net tasks currently sitting in each queue
+    /// class across all workers. `pending_tasks` says work EXISTS but not
+    /// in WHICH lane — so every idle drain pass paid an O(N) per-peer
+    /// probe walk over all five classes even when a class was provably
+    /// empty (at w=32 the novel + cont walks alone were ~48% of all scan
+    /// cycles with a 0% hit rate). One read-mostly load per class now
+    /// short-circuits the walk. Increments happen AFTER the queue push
+    /// and decrements AFTER the take (same lag discipline as
+    /// `pending_tasks`), so a zero is only ever transiently stale — the
+    /// spin/wake protocol re-runs the scan within the same pass window.
+    /// Purely advisory: a stale zero skips one scan pass, never a park
+    /// decision (`pending_tasks` still gates those).
+    ready_pending: containers.Isolated(u32),
+    urgent_pending: containers.Isolated(u32),
+    novel_pending: containers.Isolated(u32),
+    spec_pending: containers.Isolated(u32),
     /// Per-worker activity counters. Each worker writes ONLY its own
     /// slot — single-writer, plain non-atomic adds. This kills the
     /// cross-core cache-line contention that shared-atomic counters
@@ -871,6 +888,10 @@ pub const Scheduler = struct {
             .pending_tasks = .init(0),
             .spinners = .init(0),
             .cont_pending = .init(0),
+            .ready_pending = .init(0),
+            .urgent_pending = .init(0),
+            .novel_pending = .init(0),
+            .spec_pending = .init(0),
             .worker_counters = worker_counters,
             .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
@@ -1014,6 +1035,7 @@ pub const Scheduler = struct {
             return;
         }
         self.ready_queues[target_worker_id].push(node);
+        _ = self.ready_pending.v.fetchAdd(1, .release);
         self.wakeWorker(target_worker_id);
     }
 
@@ -1022,6 +1044,7 @@ pub const Scheduler = struct {
         const t0 = rdtscScan();
         const n = self.ready_queues[worker_id].pop();
         scanEnd("ready_pop", t0, n != null);
+        if (n != null) _ = self.ready_pending.v.fetchSub(1, .monotonic);
         return n;
     }
 
@@ -1030,6 +1053,9 @@ pub const Scheduler = struct {
     /// woken on a busy worker still gets resumed promptly.
     pub fn stealReady(self: *Scheduler, my_worker_id: u8) ?*ReadyNode {
         if (self.worker_count < 2) return null;
+        // Stealable-work summary: no woken fiber is sitting anywhere —
+        // skip the O(N) per-peer queue walk (see `ready_pending`).
+        if (self.ready_pending.v.load(.monotonic) == 0) return null;
         const t0 = rdtscScan();
         const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
@@ -1037,6 +1063,7 @@ pub const Scheduler = struct {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == my_worker_id) continue;
             if (self.ready_queues[idx].pop()) |n| {
+                _ = self.ready_pending.v.fetchSub(1, .monotonic);
                 scanEnd("ready_steal", t0, true);
                 return n;
             }
@@ -1189,6 +1216,11 @@ pub const Scheduler = struct {
     /// caller's own. Null if none available.
     pub fn stealCont(self: *Scheduler, worker_id: u8) ?Continuation {
         if (self.worker_count < 2) return null;
+        // Stealable-work summary: `cont_pending` (already maintained for
+        // the pre-park spin) now also short-circuits the scan itself —
+        // with `work_first` off it is permanently zero, yet the walk was
+        // ~8% of all idle-scan cycles at w=32.
+        if (self.cont_pending.v.load(.monotonic) == 0) return null;
         const t0 = rdtscScan();
         const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
         var i: u8 = 0;
@@ -1252,7 +1284,10 @@ pub const Scheduler = struct {
                 self.bump(submitter_id, "spec_rej");
                 return false;
             },
-            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
+            .pushed => blk: {
+                _ = self.spec_pending.v.fetchAdd(1, .release);
+                break :blk self.pending_tasks.v.fetchAdd(1, .release);
+            },
             // Ring overwrite inside our own queue: one task dropped, one
             // added — pending count is unchanged.
             .pushed_evicted => blk: {
@@ -1286,7 +1321,10 @@ pub const Scheduler = struct {
             true,
         )) {
             .full => unreachable, // evicting push never reports full
-            .pushed => self.pending_tasks.v.fetchAdd(1, .release),
+            .pushed => blk: {
+                _ = self.novel_pending.v.fetchAdd(1, .release);
+                break :blk self.pending_tasks.v.fetchAdd(1, .release);
+            },
             .pushed_evicted => blk: {
                 self.bump(submitter_id, "evicts");
                 break :blk self.pending_tasks.v.load(.monotonic);
@@ -1312,6 +1350,7 @@ pub const Scheduler = struct {
     fn evictOldestSpec(self: *Scheduler, submitter_id: u8) bool {
         if (!self.spec_evict) return false;
         if (self.spec_queues[submitter_id].evictOldest()) {
+            _ = self.spec_pending.v.fetchSub(1, .monotonic);
             _ = self.pending_tasks.v.fetchSub(1, .monotonic);
             self.bump(submitter_id, "evicts");
             return true;
@@ -1322,6 +1361,7 @@ pub const Scheduler = struct {
             const idx = (start_idx + i) % self.worker_count;
             if (idx == submitter_id) continue;
             if (self.spec_queues[idx].evictOldest()) {
+                _ = self.spec_pending.v.fetchSub(1, .monotonic);
                 _ = self.pending_tasks.v.fetchSub(1, .monotonic);
                 self.bump(submitter_id, "evicts");
                 return true;
@@ -1356,6 +1396,7 @@ pub const Scheduler = struct {
         // submitter's open span and the arrow binds cleanly.
         const push_ts: u64 = if (self.trace_flows) monotonicNs() else 0;
         if (!queues[submitter_id].push(.{ .task = task, .push_ts = push_ts })) return false;
+        _ = self.urgent_pending.v.fetchAdd(1, .release);
         // Ramp worker wakeups at the start of a burst. A single submit
         // only needs one wake, but fanout submits dozens or thousands of
         // tasks back-to-back; waking only on 0 -> 1 leaves the burst at
@@ -1387,13 +1428,31 @@ pub const Scheduler = struct {
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
         const t0 = rdtscScan();
-        const traced = self.urgent_queues[worker_id].pop() orelse
-            self.novel_queues[worker_id].popNewest() orelse
-            self.spec_queues[worker_id].popNewest() orelse
-            {
-                scanEnd("pop_own", t0, false);
-                return null;
-            };
+        const traced: TracedTask = blk: {
+            if (self.urgent_queues[worker_id].pop()) |t| {
+                _ = self.urgent_pending.v.fetchSub(1, .monotonic);
+                break :blk t;
+            }
+            // Lane summaries also spare the OWN-pop mutex locks: the novel
+            // ring is empty for almost the entire eval (and permanently at
+            // w>16, where the lane is gated off), and stealers hammering
+            // an owner's ring line made even an empty-own-ring lock a
+            // cache miss.
+            if (self.novel_pending.v.load(.monotonic) != 0) {
+                if (self.novel_queues[worker_id].popNewest()) |t| {
+                    _ = self.novel_pending.v.fetchSub(1, .monotonic);
+                    break :blk t;
+                }
+            }
+            if (self.spec_pending.v.load(.monotonic) != 0) {
+                if (self.spec_queues[worker_id].popNewest()) |t| {
+                    _ = self.spec_pending.v.fetchSub(1, .monotonic);
+                    break :blk t;
+                }
+            }
+            scanEnd("pop_own", t0, false);
+            return null;
+        };
         scanEnd("pop_own", t0, true);
         _ = self.pending_tasks.v.fetchSub(1, .monotonic);
         self.bump(worker_id, "pops");
@@ -1423,23 +1482,38 @@ pub const Scheduler = struct {
 
     fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         if (self.worker_count < 2) return null;
-        const t0 = rdtscScan();
-        if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| {
-            scanEnd("urgent_steal", t0, true);
-            return t;
+        // Per-lane stealable-work summaries: one load per class replaces
+        // the O(N) per-peer probe walk when the class has nothing queued
+        // (the dominant case for every class but spec — see scan census).
+        if (self.urgent_pending.v.load(.monotonic) != 0) {
+            const t0 = rdtscScan();
+            if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| {
+                _ = self.urgent_pending.v.fetchSub(1, .monotonic);
+                scanEnd("urgent_steal", t0, true);
+                return t;
+            }
+            scanEnd("urgent_steal", t0, false);
         }
-        scanEnd("urgent_steal", t0, false);
         // Novel lane before the bulk backlog; always newest-first.
-        const t1 = rdtscScan();
-        if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| {
-            scanEnd("novel_steal", t1, true);
-            return t;
+        if (self.novel_pending.v.load(.monotonic) != 0) {
+            const t1 = rdtscScan();
+            if (self.stealSpecExcluding(self.novel_queues, worker_id, true, victim, push_ts)) |t| {
+                _ = self.novel_pending.v.fetchSub(1, .monotonic);
+                scanEnd("novel_steal", t1, true);
+                return t;
+            }
+            scanEnd("novel_steal", t1, false);
         }
-        scanEnd("novel_steal", t1, false);
-        const t2 = rdtscScan();
-        const r = self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts);
-        scanEnd("spec_steal", t2, r != null);
-        return r;
+        if (self.spec_pending.v.load(.monotonic) != 0) {
+            const t2 = rdtscScan();
+            if (self.stealSpecExcluding(self.spec_queues, worker_id, self.spec_lifo, victim, push_ts)) |t| {
+                _ = self.spec_pending.v.fetchSub(1, .monotonic);
+                scanEnd("spec_steal", t2, true);
+                return t;
+            }
+            scanEnd("spec_steal", t2, false);
+        }
+        return null;
     }
 
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
@@ -1633,7 +1707,8 @@ pub const Scheduler = struct {
         // no pair shares one, and no other (read-mostly or cold) field
         // lands inside one. Layout is otherwise the compiler's business,
         // so this is what keeps a future field-shuffle honest.
-        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending" };
+        @setEvalBranchQuota(8000);
+        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending", "ready_pending", "urgent_pending", "novel_pending", "spec_pending" };
         const blk = std.atomic.cache_line;
         for (@typeInfo(Scheduler).@"struct".fields) |f| {
             if (@sizeOf(f.type) == 0) continue;
@@ -1655,9 +1730,11 @@ test "scheduler push/pop/steal work for a single worker" {
 
     const t1: TracedTask = .{ .task = .{ .force_thunk = 7 } };
     const t2: TracedTask = .{ .task = .{ .force_thunk = 13 } };
-    // Push directly to worker 1's urgent queue.
+    // Push directly to worker 1's urgent queue. Direct pushes bypass
+    // `pushOwn`, so mirror its lane-summary bookkeeping by hand.
     try std.testing.expect(sched.urgent_queues[1].push(t1));
     try std.testing.expect(sched.urgent_queues[1].push(t2));
+    sched.urgent_pending.v.store(2, .release);
 
     // LIFO from owner.
     const popped = sched.pop(1).?;
@@ -1778,9 +1855,11 @@ test "stealForWorker: each worker excludes its own queue" {
     try std.testing.expectEqual(@as(u8, 3), sched.worker_count);
 
     // Put one task in each of worker 1 and worker 2's urgent queues.
+    // (Direct pushes — mirror `pushOwn`'s lane-summary bookkeeping.)
     try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 100 } }));
     try std.testing.expect(sched.urgent_queues[2].push(.{ .task = .{ .force_thunk = 200 } }));
     sched.pending_tasks.v.store(2, .release);
+    sched.urgent_pending.v.store(2, .release);
 
     // Worker 1 must not steal from its own queue.
     const stolen_by_w1 = sched.stealForWorker(1).?;
@@ -1797,6 +1876,7 @@ test "stealForWorker: each worker excludes its own queue" {
     // from any other.
     try std.testing.expect(sched.urgent_queues[1].push(.{ .task = .{ .force_thunk = 7 } }));
     sched.pending_tasks.v.store(1, .release);
+    sched.urgent_pending.v.store(1, .release);
     const stolen_by_main = sched.stealForWorker(0).?;
     try std.testing.expectEqual(@as(types.ObjectId, 7), stolen_by_main.force_thunk);
 }
