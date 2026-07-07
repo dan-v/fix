@@ -55,6 +55,6 @@ pub fn groupIndex(groups: anytype, name: InternId) ?usize {
 pub fn isSpeculatableUserFunc(self: anytype, func: Value) bool {
     if (!func.isClosure()) return false;
     const closure = self.heap.getClosure(func.asObjectId()) catch return false;
-    const ch = self.registry.get(closure.chunk_id) orelse return false;
-    return ch.scheduling.body_is_substantial;
+    const slot = self.registry.slot(closure.chunk_id) orelse return false;
+    return slot.body_is_substantial;
 }

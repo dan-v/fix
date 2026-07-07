@@ -302,7 +302,6 @@ fn recordThunkCaptures(vm: *VM, rec: *Recorder, chunk_id: u32, code: []const u8,
         // `get_upvalue N; ret` → forcing yields capture N's value, pushed
         // unforced exactly as the interpreter's short-circuit does.
         .identity_upvalue => |idx| try pushCaptureRef(rec, descriptors, idx),
-        .constant => |ci| try rec.pushConst(ch.constants[ci]),
         .literal => |v| try rec.pushConst(v),
         .builtins => try rec.pushConst(vm.builtins),
         // A real (non-trivial) thunk: emit `alloc_thunk` capturing the same

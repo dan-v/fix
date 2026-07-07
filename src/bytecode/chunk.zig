@@ -123,9 +123,6 @@ pub const TrivialBody = union(enum) {
     /// At thunk_captures we know upvalue N's value from the descriptor,
     /// so we push that value directly instead of allocating a thunk.
     identity_upvalue: u16,
-    /// Body is `constant_ret #idx` (or `constant #idx; ret`).
-    /// The value is in `chunk.constants[idx]`. We push it directly.
-    constant: ConstIdx,
     /// Body is `closure CL, 0; ret; halt` (or `closure_long`). The
     /// chunk wraps a zero-upvalue closure. At thunk_captures we
     /// allocate the closure directly, skipping the thunk wrapper.
@@ -147,11 +144,11 @@ pub const TrivialBody = union(enum) {
     /// `let lib = import ...; in ...` patterns where lib transitively
     /// embeds `builtins`.
     builtins,
-    /// Body is one of `push_null|push_true|push_false; ret; halt` — a
-    /// 3-byte literal-return chunk that the compiler emits for thunk
-    /// bindings of `null`/`true`/`false`. The chunk has no constant
-    /// pool entry to point at, so we cache the literal `Value`
-    /// directly. Saves one heap alloc + one thunk force per binding.
+    /// Body returns a compile-time-known `Value` — `constant_ret #idx`
+    /// (the constant is copied out of the pool at classify time, so the
+    /// short-circuit never touches the Chunk) or one of
+    /// `push_null|push_true|push_false; ret; halt`. Saves one heap
+    /// alloc + one thunk force per binding.
     literal: Value,
     /// Body is `get_upvalue_attr U N; ret; halt` (7 bytes) — the
     /// pervasive `someUpvalue.attr` thunk (`config.foo`, `lib.bar`,
@@ -391,7 +388,7 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (@as(OpCode, @enumFromInt(code[3])) != .halt) return .none;
             const idx = readU16Inline(code, 1);
             if (idx >= constants.len) return .none;
-            return .{ .constant = idx };
+            return .{ .literal = constants[idx] };
         },
         // `get_upvalue_attr U N; ret; halt` — 1 + 2 + 2 + 1 + 1 = 7 bytes.
         .get_upvalue_attr => {
@@ -542,7 +539,22 @@ pub const WellKnownChunks = struct {
 ///   - `get(id)` is lock-free.
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
-    const Store = stable.StableSegments(*Chunk, .{ .first_segment_size = 64 });
+    /// Dense per-chunk slot: the Chunk pointer plus a copy of the hot
+    /// scheduling metadata. The thunk-creation path (`thunk_captures`,
+    /// ~6M executions per NixOS toplevel) and the speculation gates only
+    /// need `trivial`/`body_is_substantial`; reading them through `ptr`
+    /// is a cache-missing deref into a heap-scattered Chunk, while the
+    /// slot array is dense and hot chunk ids repeat. `ptr` is only
+    /// dereferenced by paths that need the code/constants themselves.
+    pub const ChunkSlot = struct {
+        ptr: *Chunk,
+        trivial: TrivialBody,
+        body_is_substantial: bool,
+        strict_param: bool,
+        strict_via_upvalue: ?u16,
+    };
+
+    const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 });
     const jit = @import("../jit/native.zig");
     const jit_linear = @import("../jit/linear.zig");
     const JitCodeBuffer = if (jit.code_enabled) jit.CodeBuffer else void;
@@ -649,7 +661,7 @@ pub const ChunkRegistry = struct {
         var id: u32 = 0;
         const total = self.chunks.count();
         while (id < total) : (id += 1) {
-            const chunk = self.chunks.get(id).*;
+            const chunk = self.chunks.get(id).ptr;
             chunk.deinit(self.allocator);
             self.allocator.destroy(chunk);
         }
@@ -689,12 +701,24 @@ pub const ChunkRegistry = struct {
         // Lock-free registration: many workers compile (deferred bodies +
         // speculative imports) concurrently; the writer-mutex append serialized
         // them per-chunk. `appendAtomic` CAS-bumps the cursor instead.
-        return try self.chunks.appendAtomic(self.allocator, stored);
+        return try self.chunks.appendAtomic(self.allocator, .{
+            .ptr = stored,
+            .trivial = stored.scheduling.trivial,
+            .body_is_substantial = stored.scheduling.body_is_substantial,
+            .strict_param = stored.scheduling.strict_param,
+            .strict_via_upvalue = stored.scheduling.strict_via_upvalue,
+        });
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
         if (id >= self.chunks.count()) return null;
-        return self.chunks.get(id).*;
+        return self.chunks.get(id).ptr;
+    }
+
+    /// Dense-slot accessor for the hot metadata paths (see `ChunkSlot`).
+    pub fn slot(self: *const ChunkRegistry, id: ChunkId) ?*const ChunkSlot {
+        if (id >= self.chunks.count()) return null;
+        return self.chunks.get(id);
     }
 
     pub fn count(self: *const ChunkRegistry) u32 {
@@ -744,7 +768,7 @@ pub const ChunkRegistry = struct {
         };
         var id: u32 = 0;
         while (id < result.chunks) : (id += 1) {
-            const ch = self.chunks.get(id).*;
+            const ch = self.chunks.get(id).ptr;
             const len: u32 = @intCast(ch.code.len);
             result.code_bytes += len;
             result.const_count += ch.constants.len;
@@ -875,7 +899,7 @@ test "classifyTrivialBody recognizes a constant_ret-only thunk body" {
     defer chunk.deinit(allocator);
 
     switch (chunk.scheduling.trivial) {
-        .constant => |idx| try std.testing.expectEqual(@as(ConstIdx, 0), idx),
+        .literal => |v| try std.testing.expectEqual(@as(i64, 5), v.asInt()),
         else => return error.TestUnexpectedResult,
     }
 }

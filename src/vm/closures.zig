@@ -112,9 +112,10 @@ pub fn makeDeferredThunkFromCaptures(self: *VM, deferred_id: u32, descriptors: [
 pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
     const t = prof.start(.make_bytecode_thunk);
     defer prof.end(.make_bytecode_thunk, t);
-    // Pre-fetch the chunk so we can read `body_is_substantial` once
-    // instead of a second `registry.get` from `shouldSpeculate`.
-    const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
+    // Read the trivial classification + `body_is_substantial` from the
+    // registry's dense slot — the Chunk itself is only dereferenced by
+    // the one arm that needs its code (`closure_captures`).
+    const slot = self.registry.slot(chunk_id) orelse return error.InvalidChunk;
 
     // Trivial-body short-circuit: if the chunk's whole body is
     // `get_upvalue_ret upvalue[N]; halt` or `constant_ret #idx; halt`,
@@ -125,18 +126,15 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // alloc, a markDemanded, a frame push/pop, and several dispatches
     // per occurrence — the dominant pattern that drives the
     // `thunk_captures` op count (~15% of all ops on NixOS toplevel).
-    switch (ch.scheduling.trivial) {
+    switch (slot.trivial) {
         .identity_upvalue => |idx| {
             return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
-        },
-        .constant => |const_idx| {
-            return stack.push(self, ch.constants[const_idx]);
         },
         .closure_zero => |cl_id| {
             return makeClosure(self, cl_id, 0);
         },
         .closure_captures => |info| {
-            const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
+            const inner = slot.ptr.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
             return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
         },
         .builtins => {
@@ -153,7 +151,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (ch.scheduling.body_is_substantial) {
+    if (slot.body_is_substantial) {
         _ = self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
@@ -167,18 +165,18 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 pub fn calleeForcesArg(self: *VM, callee: Value) bool {
     if (!callee.isClosure()) return false;
     const cl = self.heap.getClosure(callee.asObjectId()) catch return false;
-    const ch = self.registry.get(cl.chunk_id) orelse return false;
-    if (ch.scheduling.strict_param) return true;
+    const slot = self.registry.slot(cl.chunk_id) orelse return false;
+    if (slot.strict_param) return true;
     // Forwarding `x: f x`: forces x iff the captured `f` (an upvalue we
     // hold here) forces its own argument. One level — enough to catch
     // wrappers around directly-strict functions.
-    if (ch.scheduling.strict_via_upvalue) |idx| {
+    if (slot.strict_via_upvalue) |idx| {
         if (idx < cl.upvalues.len) {
             const f = cl.upvalues[idx];
             if (f.isClosure()) {
                 const fcl = self.heap.getClosure(f.asObjectId()) catch return false;
-                const fch = self.registry.get(fcl.chunk_id) orelse return false;
-                return fch.scheduling.strict_param;
+                const fslot = self.registry.slot(fcl.chunk_id) orelse return false;
+                return fslot.strict_param;
             }
         }
     }
@@ -307,19 +305,16 @@ inline fn shortCircuitClosureCaptures(
 /// helper finishes its current force, then any consumer that forces
 /// this thunk gets normal demand-driven handling.
 pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !void {
-    const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
-    switch (ch.scheduling.trivial) {
+    const slot = self.registry.slot(chunk_id) orelse return error.InvalidChunk;
+    switch (slot.trivial) {
         .identity_upvalue => |idx| {
             return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
-        },
-        .constant => |const_idx| {
-            return stack.push(self, ch.constants[const_idx]);
         },
         .closure_zero => |cl_id| {
             return makeClosure(self, cl_id, 0);
         },
         .closure_captures => |info| {
-            const inner = ch.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
+            const inner = slot.ptr.code[info.inner_descriptors_offset..][0..info.inner_descriptors_len];
             return shortCircuitClosureCaptures(self, info.closure_chunk_id, inner, descriptors, frame);
         },
         .builtins => {

@@ -1149,10 +1149,11 @@ inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
 
 fn isSpeculatableClosureChunk(self: *VM, closure: Value) bool {
     // The eligibility bit is pre-computed at chunk registration time
-    // (see Chunk.speculatable).
+    // (see Chunk.speculatable); read it from the registry's dense slot
+    // rather than dereferencing the heap-scattered Chunk.
     const c = self.heap.getClosure(closure.asObjectId()) catch return false;
-    const ch = self.registry.get(c.chunk_id) orelse return false;
-    return ch.scheduling.body_is_substantial;
+    const slot = self.registry.slot(c.chunk_id) orelse return false;
+    return slot.body_is_substantial;
 }
 
 fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
