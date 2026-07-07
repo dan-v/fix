@@ -392,6 +392,20 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             return &seg_ptr[loc.offset];
         }
 
+        /// `get`, tolerating id space whose segment was never allocated —
+        /// with `-Dgc` the low nursery segments stay null until arming, so
+        /// a linear id walk (diagnostics/stats) crosses a hole. Returns
+        /// null there and sets `next_id.*` to the first id of the next
+        /// segment so walkers skip the hole in O(1).
+        pub fn getIfAllocated(self: *const Self, id: u32, next_id: *u32) ?*const T {
+            const loc = locationOf(id);
+            const seg_ptr = self.segments[loc.segment].load(.acquire) orelse {
+                next_id.* = segmentStart(loc.segment) + segmentCapacity(loc.segment);
+                return null;
+            };
+            return &seg_ptr[loc.offset];
+        }
+
         pub fn getMut(self: *Self, id: u32) *T {
             const loc = locationOf(id);
             const seg_ptr = self.segments[loc.segment].load(.acquire).?;

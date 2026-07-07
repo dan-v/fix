@@ -681,13 +681,21 @@ pub const ObjectHeap = struct {
         // attrset values live in `attrs`. These two cover every place an
         // int Value can be heap-resident — the VM stack contains transient
         // ints during execution but is empty by the time stats() runs.
+        // `getIfAllocated`: with `-Dgc` the low nursery segments stay
+        // null until arming, so the linear id walk crosses a hole of
+        // never-allocated id space — skip whole segments there.
         var vid: u32 = 0;
         scan_val: while (vid < result.values) : (vid += 1) {
             if (val_skip.skipPast(vid)) |next| {
                 vid = next - 1;
                 continue :scan_val;
             }
-            bucketInt(&result.int_buckets, self.values.get(vid).*);
+            var next_vid: u32 = undefined;
+            const v = self.values.getIfAllocated(vid, &next_vid) orelse {
+                vid = next_vid - 1;
+                continue :scan_val;
+            };
+            bucketInt(&result.int_buckets, v.*);
         }
         var aid: u32 = 0;
         scan_attr: while (aid < result.attrs) : (aid += 1) {
@@ -695,7 +703,12 @@ pub const ObjectHeap = struct {
                 aid = next - 1;
                 continue :scan_attr;
             }
-            bucketInt(&result.int_buckets, self.attrs.get(aid).value);
+            var next_aid: u32 = undefined;
+            const a = self.attrs.getIfAllocated(aid, &next_aid) orelse {
+                aid = next_aid - 1;
+                continue :scan_attr;
+            };
+            bucketInt(&result.int_buckets, a.value);
         }
         return result;
     }
