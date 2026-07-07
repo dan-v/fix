@@ -609,25 +609,35 @@ pub const Worker = struct {
     /// one shared counter is much cheaper.
     fn parkAndAccount(self: *Worker) void {
         const SPIN_ITERATIONS: u32 = 1024;
-        var i: u32 = 0;
-        while (i < SPIN_ITERATIONS) : (i += 1) {
-            // When background work is suppressed (result ready, draining the
-            // tail), the queued backlog won't be pulled — don't treat it as
-            // available work and busy-spin on it.
-            if (!self.scheduler.backgroundSuppressed() and
-                (self.scheduler.pending_tasks.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
-            // Un-scanned scavengeable ring backlog counts as available
-            // work for a scavenging helper (see scavengeStep's cap).
-            if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
-                !self.scheduler.backgroundSuppressed() and self.fibers.items.len > 0)
-            {
-                const head = self.fibers.items[0].vm.heap.worker_locals[0].scav_head.load(.monotonic);
-                if (head > self.scheduler.scav_margin and
-                    (self.scav_pos < head - self.scheduler.scav_margin or head >= self.scav_lap_head + 8192)) return;
+        // Cap the concurrent idle spinners: at high worker counts the
+        // spin-and-rescan churn from every idle helper (O(N) queue
+        // probes per rescan) burns the SMT siblings of busy workers.
+        // Helpers past the quota park immediately; submit-side wakes
+        // re-engage them when work arrives. Worker 0 always spins —
+        // it's the demand thread and its wake latency is critical.
+        const spin_allowed = self.worker_id == 0 or self.scheduler.tryBeginSpin();
+        if (spin_allowed) {
+            defer if (self.worker_id != 0) self.scheduler.endSpin();
+            var i: u32 = 0;
+            while (i < SPIN_ITERATIONS) : (i += 1) {
+                // When background work is suppressed (result ready, draining the
+                // tail), the queued backlog won't be pulled — don't treat it as
+                // available work and busy-spin on it.
+                if (!self.scheduler.backgroundSuppressed() and
+                    (self.scheduler.pending_tasks.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
+                // Un-scanned scavengeable ring backlog counts as available
+                // work for a scavenging helper (see scavengeStep's cap).
+                if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
+                    !self.scheduler.backgroundSuppressed() and self.fibers.items.len > 0)
+                {
+                    const head = self.fibers.items[0].vm.heap.worker_locals[0].scav_head.load(.monotonic);
+                    if (head > self.scheduler.scav_margin and
+                        (self.scav_pos < head - self.scheduler.scav_margin or head >= self.scav_lap_head + 8192)) return;
+                }
+                if (self.shouldStop()) return;
+                if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
+                std.atomic.spinLoopHint();
             }
-            if (self.shouldStop()) return;
-            if (comptime gc.enabled) if (self.scheduler.gcStopRequested()) return; // park in GC barrier via run loop
-            std.atomic.spinLoopHint();
         }
 
         self.flushTimingToScheduler();

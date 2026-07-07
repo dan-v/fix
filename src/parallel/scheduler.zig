@@ -209,6 +209,14 @@ pub fn setSpecBacklog(n: u32) void {
 }
 const burst_wake_budget: u32 = 4;
 
+/// Cap on helpers concurrently in the idle spin-rescan loop (see
+/// `Scheduler.spinners`). Never binds at w<=8 (7 helpers all spin, the
+/// measured-optimal behavior there); past that, only a core's worth of
+/// helpers keep scanning while the rest park until a submit wake.
+inline fn maxSpinners(worker_count: u8) u32 {
+    return @max(7, @as(u32, worker_count) / 4);
+}
+
 /// GC parallel-mark hook (`-Dgc`): the Evaluator installs this so a parked
 /// peer can help drain the mark graph. Type-erased to keep `parallel` free of
 /// an `eval`/`runtime.gc` import (mirrors the heap's `GcHook`).
@@ -330,6 +338,14 @@ pub const Scheduler = struct {
     /// and (b) skip futex_wake syscalls when at least one helper has
     /// work to do and is therefore not parked.
     pending_tasks: std.atomic.Value(u32),
+    /// Number of helpers currently in the idle spin-rescan loop
+    /// (parkAndAccount's pre-park spin + immediate rescan). Capped at
+    /// `max_spinners` so at high worker counts the idle scan churn
+    /// (O(N) queue probes per rescan, from every idle worker, burning
+    /// the SMT siblings of busy workers) stays bounded: workers past
+    /// the cap park on their futex immediately and are re-engaged by
+    /// submit-side wakes. Worker 0 is exempt (it's the demand thread).
+    spinners: std.atomic.Value(u32),
     /// Net work-first continuations currently sitting on all `cont_queues`
     /// (pushed − popped/stolen). A single shared counter the pre-park spin
     /// reads to decide whether to keep spinning for stealable continuation
@@ -491,6 +507,7 @@ pub const Scheduler = struct {
             .next_fiber_id = .init(0),
             .started = .init(false),
             .pending_tasks = .init(0),
+            .spinners = .init(0),
             .cont_pending = .init(0),
             .worker_counters = worker_counters,
             .n_max_fiber_stack = .init(0),
@@ -800,6 +817,24 @@ pub const Scheduler = struct {
         return self.cont_pending.load(.monotonic);
     }
 
+    /// Try to become one of the `max_spinners` idle spinners. Returns
+    /// false when the quota is taken — the caller should park directly
+    /// instead of spin-rescanning.
+    pub fn tryBeginSpin(self: *Scheduler) bool {
+        const cap = maxSpinners(self.worker_count);
+        var cur = self.spinners.load(.monotonic);
+        while (cur < cap) {
+            if (self.spinners.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic)) |actual| {
+                cur = actual;
+            } else return true;
+        }
+        return false;
+    }
+
+    pub fn endSpin(self: *Scheduler) void {
+        _ = self.spinners.fetchSub(1, .release);
+    }
+
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;
@@ -852,7 +887,14 @@ pub const Scheduler = struct {
         // are between the pre-park spin and the futex call.
         const prev = self.pending_tasks.fetchAdd(1, .release);
         const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
-        if (prev < wake_budget) {
+        // Burst ramp (prev < budget) plus a periodic re-wake under steady
+        // backlog: once prev >= budget the ramp alone never wakes anyone,
+        // so a helper whose pre-park spin expired during a lull would stay
+        // parked for the rest of the eval no matter how much stealable
+        // work piles up (measured: helper utilization FALLS as workers
+        // rise). Every 64th submit into a standing backlog re-nudges one
+        // worker — bounded futex traffic, keeps parked helpers engaged.
+        if (prev < wake_budget or (prev & 63) == 0) {
             const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
             const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
             self.wakeWorker(target);
@@ -1048,7 +1090,11 @@ pub const Scheduler = struct {
 
     fn wakeWorker(self: *Scheduler, worker_id: u8) void {
         const word = &self.wake_words[worker_id];
-        word.store(1, .release);
+        // Already signalled → a prior waker's futex_wake is still in
+        // flight for this word; skip the redundant syscall. (If the
+        // sleeper consumed the old signal it also cleared the word, so
+        // this swap would see 0 and we fall through to the wake.)
+        if (word.swap(1, .release) == 1) return;
         switch (builtin.os.tag) {
             .linux => {
                 _ = std.os.linux.futex_3arg(
