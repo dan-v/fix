@@ -141,6 +141,11 @@ pub const WorkerFiber = struct {
     /// (spec/novel/urgent force_thunk, scavenge, range, sweep, cont).
     /// Set alongside the task assignment; read by the fiber entry.
     census_class: if (census_on) prof.TaskClass else void = if (census_on) .spec_thunk else {},
+    /// Which queue `current_task` came from. Set alongside the task
+    /// assignment; the fiber entry uses it to arm the spec-lane creation
+    /// budget (`FIX_SPEC_CREATE_BUDGET`) — urgent tasks are never
+    /// budgeted.
+    current_lane: scheduler_mod.Lane = .spec,
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*WorkerFiber,
     /// Ready-queue node (scheduler-owned linked list). Set by
@@ -393,6 +398,7 @@ pub const Worker = struct {
             const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = task;
+            f.current_lane = lane;
             if (comptime census_on) f.census_class = switch (task) {
                 .force_thunk => switch (lane) {
                     .urgent => .urgent_thunk,
@@ -506,6 +512,7 @@ pub const Worker = struct {
             const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
             const f = try self.acquireFreeFiber();
             f.current_task = .{ .force_thunk = id };
+            f.current_lane = .spec;
             if (comptime census_on) f.census_class = .scav_thunk;
             f.flow_in_id = 0;
             f.inner.reset(slotEntry, @ptrCast(f));
@@ -968,6 +975,19 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
 fn runTask(f: *WorkerFiber, task: Task) void {
     switch (task) {
         .force_thunk => |thunk_id| {
+            // Bounded spec-lane cascade (`FIX_SPEC_CREATE_BUDGET`): arm the
+            // sweep-task creation budget for speculative/novel force_thunk
+            // tasks too, so one wrong creation-time guess can't evaluate an
+            // unbounded never-demanded subgraph (the w=32 junk-volume
+            // pathology). Bail is a transient thunk reset; resolved
+            // sub-thunks are kept — same semantics the sibling sweeps have
+            // shipped with. Urgent (demand-adjacent) tasks stay unbounded.
+            const budget = f.vm.scheduler.spec_task_create_budget;
+            if (budget != 0 and f.current_lane != .urgent) {
+                f.vm.spec_create_limit = f.vm.heap.currentLocal().thunks_created + budget;
+                f.vm.spec_create_worker = worker_id_mod.current;
+            }
+            defer f.vm.spec_create_limit = vm_mod.NO_SPEC_BUDGET;
             const v = Value.thunk(thunk_id);
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
         },

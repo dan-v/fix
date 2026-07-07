@@ -773,6 +773,16 @@ pub const Scheduler = struct {
     /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
     /// member body locations, heap-growth delta). Debug-only.
     sibling_log: bool = false,
+    /// `FIX_SPEC_CREATE_BUDGET`: per-task thunk-CREATION budget for
+    /// spec-lane `force_thunk` tasks (creation-time speculation + the
+    /// novel lane), reusing the sweep-task bounded-speculation machinery
+    /// (`VM.spec_create_limit`; bail = transient reset, resolved
+    /// sub-thunks kept). 0 = unbounded (historical behavior). Motivation:
+    /// at w=32, spec-created thunks reach 10-13M/eval with ~49% never
+    /// demanded — junk VOLUME, not discovery, is the residual w=32
+    /// regression; a creation budget caps each wrong guess's cascade.
+    /// Urgent-lane tasks are never budgeted (they're demand-adjacent).
+    spec_task_create_budget: u64 = 0,
     /// `FIX_SPEC_EVICT`: ring semantics for the speculation backlog. When
     /// the global backlog cap (or the submitter's own ring) is full, DROP
     /// THE OLDEST queued spec task and admit the fresh submission, instead

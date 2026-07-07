@@ -617,6 +617,23 @@ pub const Evaluator = struct {
         if (self.env_map) |em| if (em.get("FIX_NO_EAGER")) |s| {
             @import("vm/closures.zig").eager_submit_enabled = std.mem.eql(u8, s, "0");
         };
+        // FIX_SPEC_CREATE_BUDGET: per-task thunk-creation budget for
+        // spec-lane force_thunk tasks (0 = unbounded; e.g. 4096). On the
+        // pre-scan-summary scheduler a 4096 budget past 16 workers cut
+        // w=32 median max-RSS 4.1GB -> 2.5GB at wall-neutral (spec junk
+        // reaches 10-13M thunks/eval there, ~49% never demanded). On the
+        // scan-summary scheduler (413fc60/556af1a) the RSS win still
+        // reproduces (median 2.95GB -> 2.47GB, spikes to 3.7GB gone) but
+        // now costs ~+10% w=32 wall (interleaved n=8; budgets 16K/64K
+        // don't recover it — the cheaper steal path converts those
+        // cascades into demand hits), so the DEFAULT IS OFF at every
+        // worker count. See Scheduler.spec_task_create_budget.
+        self.scheduler.spec_task_create_budget = 0;
+        if (self.env_map) |em| if (em.get("FIX_SPEC_CREATE_BUDGET")) |s| {
+            if (std.fmt.parseInt(u64, s, 10)) |v| {
+                self.scheduler.spec_task_create_budget = v;
+            } else |_| {}
+        };
         // FIX_FANOUT_BATCH: items per force_list_range/force_attrs_range
         // task (default 16) — batch-size sweep knob.
         if (self.env_map) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
