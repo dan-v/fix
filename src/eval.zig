@@ -568,6 +568,17 @@ pub const Evaluator = struct {
         if (self.env_map) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
             if (std.fmt.parseInt(u32, s, 10)) |n| @import("parallel").scheduler.setSpecBacklog(n) else |_| {}
         };
+        // FIX_SPEC_EVICT: ring semantics for the speculation backlog — at the
+        // cap, drop the oldest queued spec task instead of rejecting the
+        // newest submission (see scheduler.spec_evict).
+        if (self.env_map) |em| if (em.get("FIX_SPEC_EVICT")) |s| {
+            self.scheduler.spec_evict = !std.mem.eql(u8, s, "0");
+        };
+        // FIX_SPEC_LIFO: helpers steal the newest speculative task instead of
+        // the oldest (see scheduler.spec_lifo).
+        if (self.env_map) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
+            self.scheduler.spec_lifo = !std.mem.eql(u8, s, "0");
+        };
         // FIX_WORK_FIRST: route strict collection-force acceleration through the
         // work-first split-and-steal primitive instead of the eager fan-out.
         if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);

@@ -166,6 +166,89 @@ pub const TracedTask = struct {
 
 const TaskQueue = containers.Deque(TracedTask);
 
+/// Mutex-protected bounded ring of speculative tasks. Replaces the Chase-Lev
+/// deque for the SPEC lane only (urgent stays lock-free): speculation is
+/// low-volume (~20-50K submissions per NixOS eval, vs millions of forces), so
+/// a SpinMutex ring is affordable, and it buys the two behaviors Chase-Lev
+/// cannot express:
+///   - ring overwrite (`FIX_SPEC_EVICT`): when full, drop the OLDEST queued
+///     task to admit the fresh one (freshest ≈ nearest the demand head);
+///   - newest-first stealing (`FIX_SPEC_LIFO`): stealers take the newest
+///     task instead of Chase-Lev's oldest-first FIFO, so a just-submitted
+///     seed is picked up in microseconds even under a saturated backlog.
+/// With both knobs off it reproduces the old semantics exactly: owner pops
+/// newest, stealers take oldest, full push rejects.
+///
+/// `head` is one past the newest slot; `tail` is the oldest. Both wrap; the
+/// occupancy is `head -% tail`. All mutation is under `mu`; the GC mark walk
+/// (`specQueueGcMark`) runs at the STW safepoint where no mutator is live.
+const SpecQueue = struct {
+    mu: stable.SpinMutex,
+    items: []TracedTask,
+    mask: u32,
+    head: u32,
+    tail: u32,
+
+    const PushResult = enum { pushed, pushed_evicted, full };
+
+    fn init(allocator: std.mem.Allocator, capacity: u32) !SpecQueue {
+        std.debug.assert(std.math.isPowerOfTwo(capacity));
+        const items = try allocator.alloc(TracedTask, capacity);
+        return .{ .mu = .{}, .items = items, .mask = capacity - 1, .head = 0, .tail = 0 };
+    }
+
+    fn deinit(self: *SpecQueue, allocator: std.mem.Allocator) void {
+        allocator.free(self.items);
+    }
+
+    /// Append at the newest end. On a full ring: drop the oldest when
+    /// `evict`, else reject.
+    fn push(self: *SpecQueue, t: TracedTask, evict: bool) PushResult {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var evicted = false;
+        if (self.head -% self.tail > self.mask) {
+            if (!evict) return .full;
+            self.tail +%= 1;
+            evicted = true;
+        }
+        self.items[self.head & self.mask] = t;
+        self.head +%= 1;
+        return if (evicted) .pushed_evicted else .pushed;
+    }
+
+    /// Owner pop — newest first (matches the old deque's owner LIFO).
+    fn popNewest(self: *SpecQueue) ?TracedTask {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.head == self.tail) return null;
+        self.head -%= 1;
+        return self.items[self.head & self.mask];
+    }
+
+    /// Stealer take: newest-first when `lifo` (demand-head-adjacent bets),
+    /// oldest-first otherwise (historical FIFO).
+    fn steal(self: *SpecQueue, lifo: bool) ?TracedTask {
+        if (lifo) return self.popNewest();
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.head == self.tail) return null;
+        const t = self.items[self.tail & self.mask];
+        self.tail +%= 1;
+        return t;
+    }
+
+    /// Drop the oldest queued task without running it (backlog-cap ring
+    /// overwrite). Returns false when empty.
+    fn evictOldest(self: *SpecQueue) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.head == self.tail) return false;
+        self.tail +%= 1;
+        return true;
+    }
+};
+
 /// Per-worker deque of work-first split-and-steal continuations (see
 /// `Continuation`). Same Chase-Lev engine as `TaskQueue`, distinct payload.
 const ContQueue = containers.Deque(Continuation);
@@ -180,6 +263,19 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
     var i = t;
     while (i != b) : (i +%= 1) {
         switch (q.items[@intCast(i & q.mask)].task) {
+            .force_thunk => |id| tr.markObject(heap, id),
+            .force_list_range => |r| tr.markObject(heap, r.list_id),
+            .force_attrs_sweep => |id| tr.markObject(heap, id),
+        }
+    }
+}
+
+/// GC (`-Dgc`): same, for the mutexed spec ring. STW-only — no mutator holds
+/// `mu`, so a plain `tail..head` walk is stable.
+fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+    var i = q.tail;
+    while (i != q.head) : (i +%= 1) {
+        switch (q.items[i & q.mask].task) {
             .force_thunk => |id| tr.markObject(heap, id),
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
@@ -253,7 +349,8 @@ pub const Scheduler = struct {
         parks: u64 = 0,
         scavenges: u64 = 0,
         sweeps: u64 = 0,
-        _pad: [128 - 11 * @sizeOf(u64)]u8 = undefined,
+        evicts: u64 = 0,
+        _pad: [128 - 12 * @sizeOf(u64)]u8 = undefined,
     };
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
@@ -281,6 +378,9 @@ pub const Scheduler = struct {
         scavenges: u64 = 0,
         /// Attrset sibling sweeps submitted (FIX_SIBLING).
         sweeps: u64 = 0,
+        /// Oldest-first spec-backlog evictions (FIX_SPEC_EVICT): queued
+        /// speculative tasks dropped unrun to admit a fresher submission.
+        evicts: u64 = 0,
         /// Deepest fiber native stack high-water seen across all workers
         /// since startup. Use to size `Fiber.min_stack_bytes` against a
         /// representative workload.
@@ -318,8 +418,11 @@ pub const Scheduler = struct {
     /// Per-worker queue of *speculative* tasks — submitted via
     /// `submit` when `makeThunk`'s heuristic suggests the body is
     /// substantial enough to pre-run. Drained only when there's no
-    /// ready fiber or urgent task to handle.
-    spec_queues: []TaskQueue,
+    /// ready fiber or urgent task to handle. A mutexed ring (see
+    /// `SpecQueue`) rather than Chase-Lev, so the backlog can ring-
+    /// overwrite (`FIX_SPEC_EVICT`) and stealers can take newest-first
+    /// (`FIX_SPEC_LIFO`).
+    spec_queues: []SpecQueue,
     /// Per-worker deque of work-first split-and-steal continuations. Owner
     /// pushes/pops LIFO on the unstolen fast path; idle workers take FIFO.
     /// Separate from the eager task queues so the work-first pop-back never
@@ -440,6 +543,26 @@ pub const Scheduler = struct {
     /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
     /// member body locations, heap-growth delta). Debug-only.
     sibling_log: bool = false,
+    /// `FIX_SPEC_EVICT`: ring semantics for the speculation backlog. When
+    /// the global backlog cap (or the submitter's own ring) is full, DROP
+    /// THE OLDEST queued spec task and admit the fresh submission, instead
+    /// of rejecting the newest. The newest submission was created nearest
+    /// the demand head; the oldest queued task is the stalest bet. Measured
+    /// motivation: the /etc per-file chain's seed thunk is submitted ONCE
+    /// (creation-time speculation) ~40ms into a NixOS toplevel eval — when
+    /// the cap-rejection lottery drops it, the whole ~300ms serial chain
+    /// starts ~250ms later and w=8 wall goes 0.95 → 1.05-1.12s. Eviction
+    /// is semantics-safe: a dropped spec task leaves its thunk unresolved
+    /// for demand to force later (same as a rejected submit).
+    spec_evict: bool = false,
+    /// `FIX_SPEC_LIFO`: stealers take the NEWEST speculative task instead
+    /// of the oldest. The owner already pops its own spec queue newest-
+    /// first; oldest-first stealing handed helpers the STALEST bets — the
+    /// exact inverse of demand-head adjacency. With this on, a fresh seed
+    /// submission is picked up almost immediately even under a saturated
+    /// backlog, instead of waiting behind (or being evicted with) hundreds
+    /// of stale speculations.
+    spec_lifo: bool = false,
     /// `FIX_TOUCH_LOG=<file substring>`: diagnosis probe — log every thunk
     /// CLAIM whose source file basename matches, with timestamp, worker,
     /// and spec/demand context (see `vm/force.zig logTouch`). Debug-only;
@@ -508,12 +631,12 @@ pub const Scheduler = struct {
             urgent_init += 1;
         }
 
-        const spec_queues = try allocator.alloc(TaskQueue, safe_worker_count);
+        const spec_queues = try allocator.alloc(SpecQueue, safe_worker_count);
         errdefer allocator.free(spec_queues);
         var spec_init: usize = 0;
         errdefer for (spec_queues[0..spec_init]) |*q| q.deinit(allocator);
         for (spec_queues) |*q| {
-            q.* = try TaskQueue.init(allocator, spec_queue_capacity);
+            q.* = try SpecQueue.init(allocator, spec_queue_capacity);
             spec_init += 1;
         }
 
@@ -615,6 +738,7 @@ pub const Scheduler = struct {
             c.parks += w.parks;
             c.scavenges += w.scavenges;
             c.sweeps += w.sweeps;
+            c.evicts += w.evicts;
         }
         return .{
             .speculative_submitted = c.spec_ok,
@@ -628,6 +752,7 @@ pub const Scheduler = struct {
             .parks = c.parks,
             .scavenges = c.scavenges,
             .sweeps = c.sweeps,
+            .evicts = c.evicts,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),
@@ -665,7 +790,7 @@ pub const Scheduler = struct {
     pub fn gcMarkPendingTasks(self: *const Scheduler, tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
         if (comptime !gc.enabled) return;
         for (self.urgent_queues) |*q| taskQueueGcMark(q, tr, heap);
-        for (self.spec_queues) |*q| taskQueueGcMark(q, tr, heap);
+        for (self.spec_queues) |*q| specQueueGcMark(q, tr, heap);
         // Work-first continuations reference a live collection each; mark it
         // (the range's items are reachable through the list/attrs). STW-only.
         for (self.cont_queues) |*q| {
@@ -907,16 +1032,70 @@ pub const Scheduler = struct {
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;
+        if (submitter_id >= self.worker_count) return false;
         const cap: u32 = @as(u32, self.worker_count - 1) * spec_backlog_per_helper;
         if (self.pending_tasks.load(.monotonic) >= cap) {
-            self.bump(submitter_id, "spec_rej");
-            return false;
+            // At the cap: with `FIX_SPEC_EVICT`, make room by dropping the
+            // oldest queued spec task (ring semantics — see `spec_evict`);
+            // otherwise reject the fresh submission (historical behavior).
+            if (!self.evictOldestSpec(submitter_id)) {
+                self.bump(submitter_id, "spec_rej");
+                return false;
+            }
         }
-        if (self.pushOwn(self.spec_queues, task, submitter_id)) {
-            self.bump(submitter_id, "spec_ok");
+        const push_ts: u64 = if (self.trace_flows) monotonicNs() else 0;
+        const prev: u32 = switch (self.spec_queues[submitter_id].push(
+            .{ .task = task, .push_ts = push_ts },
+            self.spec_evict,
+        )) {
+            .full => {
+                self.bump(submitter_id, "spec_rej");
+                return false;
+            },
+            .pushed => self.pending_tasks.fetchAdd(1, .release),
+            // Ring overwrite inside our own queue: one task dropped, one
+            // added — pending count is unchanged.
+            .pushed_evicted => blk: {
+                self.bump(submitter_id, "evicts");
+                break :blk self.pending_tasks.load(.monotonic);
+            },
+        };
+        // Same burst-ramp + periodic re-wake as `pushOwn` (see there).
+        const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
+        if (prev < wake_budget or (prev & 63) == 0) {
+            const wake_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+            const target = if (wake_idx == submitter_id) (wake_idx + 1) % self.worker_count else wake_idx;
+            self.wakeWorker(target);
+        }
+        self.bump(submitter_id, "spec_ok");
+        return true;
+    }
+
+    /// Ring-overwrite the speculation backlog (`FIX_SPEC_EVICT`): drop the
+    /// OLDEST queued spec task — the submitter's own queue first (usually
+    /// where its backlog lives, and the cheapest probe), then any peer's —
+    /// so a fresh submission can take its place. Returns false when
+    /// eviction is off or every spec queue is empty (the standing
+    /// `pending_tasks` are all urgent — never evict demand work for
+    /// speculation).
+    fn evictOldestSpec(self: *Scheduler, submitter_id: u8) bool {
+        if (!self.spec_evict) return false;
+        if (self.spec_queues[submitter_id].evictOldest()) {
+            _ = self.pending_tasks.fetchSub(1, .monotonic);
+            self.bump(submitter_id, "evicts");
             return true;
         }
-        self.bump(submitter_id, "spec_rej");
+        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        var i: u8 = 0;
+        while (i < self.worker_count) : (i += 1) {
+            const idx = (start_idx + i) % self.worker_count;
+            if (idx == submitter_id) continue;
+            if (self.spec_queues[idx].evictOldest()) {
+                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                self.bump(submitter_id, "evicts");
+                return true;
+            }
+        }
         return false;
     }
 
@@ -977,7 +1156,7 @@ pub const Scheduler = struct {
     pub fn pop(self: *Scheduler, worker_id: u8) ?Task {
         if (worker_id >= self.worker_count) return null;
         const traced = self.urgent_queues[worker_id].pop() orelse
-            self.spec_queues[worker_id].pop() orelse
+            self.spec_queues[worker_id].popNewest() orelse
             return null;
         _ = self.pending_tasks.fetchSub(1, .monotonic);
         self.bump(worker_id, "pops");
@@ -1008,7 +1187,26 @@ pub const Scheduler = struct {
     fn stealAnyVictimOpt(self: *Scheduler, worker_id: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
         if (self.worker_count < 2) return null;
         if (self.stealExcluding(self.urgent_queues, worker_id, victim, push_ts)) |t| return t;
-        return self.stealExcluding(self.spec_queues, worker_id, victim, push_ts);
+        return self.stealSpecExcluding(worker_id, victim, push_ts);
+    }
+
+    /// Spec-lane steal: newest-first under `FIX_SPEC_LIFO` (demand-head-
+    /// adjacent bets), oldest-first otherwise.
+    fn stealSpecExcluding(self: *Scheduler, exclude: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
+        const start_idx: u8 = @intCast(self.next_victim.fetchAdd(1, .monotonic) % self.worker_count);
+        var i: u8 = 0;
+        while (i < self.worker_count) : (i += 1) {
+            const idx = (start_idx + i) % self.worker_count;
+            if (idx == exclude) continue;
+            if (self.spec_queues[idx].steal(self.spec_lifo)) |traced| {
+                _ = self.pending_tasks.fetchSub(1, .monotonic);
+                self.bump(exclude, "steals");
+                if (victim) |v| v.* = idx;
+                if (push_ts) |p| p.* = traced.push_ts;
+                return traced.task;
+            }
+        }
+        return null;
     }
 
     fn stealExcluding(self: *Scheduler, queues: []TaskQueue, exclude: u8, victim: ?*u8, push_ts: ?*u64) ?Task {
@@ -1213,7 +1411,7 @@ test "scheduler.submit round-robins across workers" {
     var total: u32 = 0;
     for (sched.spec_queues) |*q| {
         var count: u32 = 0;
-        while (q.steal()) |_| count += 1;
+        while (q.steal(false)) |_| count += 1;
         total += count;
     }
     try std.testing.expectEqual(@as(u32, 6), total);
@@ -1237,7 +1435,7 @@ test "submitUrgent bypasses the speculation backlog cap" {
 
     var drained: u32 = 0;
     for (sched.urgent_queues) |*q| while (q.steal()) |_| { drained += 1; };
-    for (sched.spec_queues) |*q| while (q.steal()) |_| { drained += 1; };
+    for (sched.spec_queues) |*q| while (q.steal(false)) |_| { drained += 1; };
     // spec_backlog_per_helper (128) speculative tasks + 2 urgent tasks
     // that bypassed the cap. This was 66 (64 + 2) back when the cap was
     // helper_count * 64; when the cap was raised to 128 (commit
@@ -1245,6 +1443,60 @@ test "submitUrgent bypasses the speculation backlog cap" {
     // updated to the new `spec_backlog_per_helper` constant but this
     // expected total was left stale at the old value.
     try std.testing.expectEqual(spec_backlog_per_helper + 2, drained);
+}
+
+test "spec ring: LIFO owner pop, FIFO steal, reject when full (knobs off)" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    try std.testing.expect(sched.submit(.{ .force_thunk = 1 }, 0));
+    try std.testing.expect(sched.submit(.{ .force_thunk = 2 }, 0));
+    try std.testing.expect(sched.submit(.{ .force_thunk = 3 }, 0));
+
+    // Owner pops newest.
+    try std.testing.expectEqual(@as(types.ObjectId, 3), sched.pop(0).?.force_thunk);
+    // Default steal takes oldest.
+    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false).?.task.force_thunk);
+    // LIFO steal takes newest.
+    try std.testing.expectEqual(@as(types.ObjectId, 2), sched.spec_queues[0].steal(true).?.task.force_thunk);
+    try std.testing.expectEqual(@as(?TracedTask, null), sched.spec_queues[0].steal(false));
+}
+
+test "spec ring: FIX_SPEC_EVICT admits at the cap by dropping the oldest" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+    sched.spec_evict = true;
+
+    // Fill to the backlog cap.
+    var i: types.ObjectId = 0;
+    while (i < spec_backlog_per_helper) : (i += 1)
+        try std.testing.expect(sched.submit(.{ .force_thunk = i }, 0));
+
+    // At the cap the submit must still succeed (ring semantics), dropping
+    // the oldest (id 0) and keeping the count at the cap.
+    try std.testing.expect(sched.submit(.{ .force_thunk = 999 }, 0));
+    try std.testing.expectEqual(spec_backlog_per_helper, sched.pending_tasks.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), sched.stats().evicts);
+
+    // The oldest remaining is now id 1; the newest is the fresh 999.
+    try std.testing.expectEqual(@as(types.ObjectId, 1), sched.spec_queues[0].steal(false).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 999), sched.spec_queues[0].steal(true).?.task.force_thunk);
+}
+
+test "spec ring: push evict wraps correctly at ring capacity" {
+    var sched = try Scheduler.init(std.testing.allocator, 2);
+    defer sched.deinit();
+
+    // Drive the RING (not the cap) to full and overwrite: push directly.
+    var q = &sched.spec_queues[0];
+    var i: types.ObjectId = 0;
+    while (i < spec_queue_capacity) : (i += 1)
+        try std.testing.expectEqual(SpecQueue.PushResult.pushed, q.push(.{ .task = .{ .force_thunk = i } }, true));
+    // Full: non-evicting push rejects, evicting push overwrites the oldest.
+    try std.testing.expectEqual(SpecQueue.PushResult.full, q.push(.{ .task = .{ .force_thunk = 7777 } }, false));
+    try std.testing.expectEqual(SpecQueue.PushResult.pushed_evicted, q.push(.{ .task = .{ .force_thunk = 8888 } }, true));
+    try std.testing.expectEqual(@as(types.ObjectId, 1), q.steal(false).?.task.force_thunk);
+    try std.testing.expectEqual(@as(types.ObjectId, 8888), q.steal(true).?.task.force_thunk);
 }
 
 test "stealForWorker: each worker excludes its own queue" {
