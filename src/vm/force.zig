@@ -869,9 +869,20 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 };
                 if (memo_key) |k| {
                     const s = &thunk_memo[k.idx];
+                    // Memo census: 14.8% hit rate over 2.07M probes (w=1
+                    // NixOS toplevel) — hits save ~306K body runs, well
+                    // over the probe's TLS-miss cost. A 4x smaller table
+                    // (L2-resident) held 14.2% but was wall-neutral;
+                    // don't shrink blindly.
+                    if (comptime prof.enabled) {
+                        if (self.workerId() == 0) prof.memo_probes += 1;
+                    }
                     if (s.token == self.heap.token and s.chunk == k.chunk and
                         s.count == k.count and s.up0 == k.up0 and s.up1 == k.up1)
                     {
+                        if (comptime prof.enabled) {
+                            if (self.workerId() == 0) prof.memo_hits += 1;
+                        }
                         thunk.resolve(s.value);
                         self.heap.gcRecordEdge(thunk_id, s.value); // old→young barrier
                         recordResolve(self, thunk_id, s.value);

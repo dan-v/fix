@@ -129,6 +129,11 @@ pub var disc: Disc = .{};
 pub var attr_cache_hits: u64 = 0;
 pub var attr_cache_misses: u64 = 0;
 
+/// Thunk-result-memo census (piggybacks on `-Dprof-main`). Sizes whether
+/// the per-claimed-force TLS probe still pays for its cache misses.
+pub var memo_probes: u64 = 0;
+pub var memo_hits: u64 = 0;
+
 /// Age-at-force probe (piggybacks on `-Dprof-main`). For every thunk
 /// main CLAIMS on its demand path, buckets the thunk's age (force TSC
 /// minus creation TSC — how long the thunk sat forcible before main
@@ -470,6 +475,13 @@ pub fn report(registry: anytype, intern: anytype) void {
                 .{ total, attr_cache_hits, pct(attr_cache_hits, total), attr_cache_misses },
             );
         }
+    }
+    // Thunk-result-memo census.
+    if (memo_probes != 0) {
+        std.debug.print(
+            "prof thunk-memo: probes={d} hits={d} ({d:.1}%)\n",
+            .{ memo_probes, memo_hits, pct(memo_hits, memo_probes) },
+        );
     }
     // Discovery-serialization breakdown of main's demand forces.
     {
