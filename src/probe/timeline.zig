@@ -713,6 +713,10 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
     try w.writeAll("  \"tool\":\"fix\",\n");
     try w.print("  \"workers\":{d},\n", .{n_workers});
     try w.print("  \"unix-time\":{d},\n", .{unixTimeSec()});
+    // Absolute CLOCK_MONOTONIC ns of ts=0, so external profilers recorded
+    // with the same clock (`perf record -k CLOCK_MONOTONIC`) can be
+    // window-filtered against this trace's relative timestamps.
+    try w.print("  \"start-monotonic-ns\":{d},\n", .{start_ns});
     try w.writeAll("  \"source\":");
     try writeJsonString(w, meta_source);
     try w.writeAll("\n}\n}\n");
