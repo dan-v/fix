@@ -418,7 +418,8 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
 }
 
 /// The per-set deferral snapshot: lexical bindings followed by
-/// `with_count` with-subject captures (innermost-first).
+/// `with_count` with-subject captures (innermost-first). `caps` is
+/// table-owned (`adoptScope`) and shared by every deferred leaf of the set.
 const DeferScope = struct {
     caps: []const Capture,
     with_count: u16,
@@ -458,7 +459,7 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
         if (try buildEnclosingSnapshot(self, &snapshot)) {
             const lexical_len = snapshot.items.len;
             if (try appendWithSnapshot(self, &snapshot)) defer_scope = .{
-                .caps = snapshot.items,
+                .caps = try rootCompiler(self).deferred_table.?.adoptScope(snapshot.items),
                 .with_count = @intCast(snapshot.items.len - lexical_len),
             };
         }
@@ -667,29 +668,29 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
         groups_list.deinit(self.allocator);
     };
 
+    // Per-entry interned name ids, computed once here and reused by the
+    // second (leaf/tail fill) pass — recomputing them per entry doubled the
+    // decode+intern work on huge generated sets.
+    const name_ids = try self.allocator.alloc(InternId, entries.len);
+    errdefer self.allocator.free(name_ids);
+
     var total_leaves: usize = 0;
     var total_tails: usize = 0;
-    for (entries) |entry| {
+    for (entries, name_ids) |entry, *entry_name_id| {
         if (entry.path.len == 0) return error.InvalidAttributePath;
 
-        var name: ?[]u8 = try attrSegmentNameAlloc(self, entry.path[0]);
-        errdefer if (name) |owned| self.allocator.free(owned);
-        const name_id = try self.intern.intern(name.?);
-        const index = group_index.get(name_id) orelse blk: {
-            const new_index = groups_list.items.len;
-            try group_index.put(self.allocator, name_id, new_index);
+        const name_id = try attrSegmentNameId(self, entry.path[0]);
+        entry_name_id.* = name_id;
+        const gop = try group_index.getOrPut(self.allocator, name_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = groups_list.items.len;
             try groups_list.append(self.allocator, .{
                 .first = entry.path[0],
-                .name = name.?,
+                .name = try attrSegmentNameAlloc(self, entry.path[0]),
                 .name_id = name_id,
             });
-            name = null;
-            break :blk new_index;
-        };
-        if (name) |owned| {
-            self.allocator.free(owned);
-            name = null;
         }
+        const index = gop.value_ptr.*;
 
         const group = &groups_list.items[index];
         if (entry.path.len == 1) {
@@ -735,8 +736,7 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
         tail_start = tail_end;
     }
 
-    for (entries) |entry| {
-        const name_id = try attrSegmentNameId(self, entry.path[0]);
+    for (entries, name_ids) |entry, name_id| {
         const index = group_index.get(name_id).?;
         const group = &groups[index];
         if (entry.path.len == 1) {
@@ -752,6 +752,7 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
         group.tail_count += 1;
     }
 
+    self.allocator.free(name_ids);
     return .{ .groups = groups, .leaves = leaves, .tails = tails };
 }
 
@@ -803,6 +804,18 @@ pub fn attrSegmentSpan(self: *const Compiler, atom: Node.Atom) []const u8 {
     return span;
 }
 
+/// A double-quoted name whose body has no escapes or interpolation
+/// decodes to exactly its inner bytes — the common shape of generated
+/// package sets (`"pkg-name" = ...`). Returns that inner slice, or null
+/// when the segment needs the full `parseLiteral` decode.
+fn simpleQuotedInner(self: *const Compiler, atom: Node.Atom) ?[]const u8 {
+    const span = self.source[atom.offset .. atom.offset + atom.len];
+    if (span.len < 2 or span[0] != '"' or span[span.len - 1] != '"') return null;
+    const inner = span[1 .. span.len - 1];
+    if (std.mem.indexOfAny(u8, inner, "\\$\"") != null) return null;
+    return inner;
+}
+
 pub fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
     // Fast path: an unquoted identifier segment is a verbatim slice of
     // source. `intern` copies the bytes into its own table, so the
@@ -811,6 +824,11 @@ pub fn attrSegmentNameId(self: *Compiler, atom: Node.Atom) !InternId {
     // same InternId, so the emitted bytecode is byte-identical.
     if (string_syntax.kindAt(self.source, atom.offset) == null) {
         return self.intern.intern(self.source[atom.offset .. atom.offset + atom.len]);
+    }
+    // Same idea for simple quoted names: decode is the identity on the
+    // inner bytes, so intern them without the parseLiteral round-trip.
+    if (simpleQuotedInner(self, atom)) |inner| {
+        return self.intern.intern(inner);
     }
     const name = try attrSegmentNameAlloc(self, atom);
     defer self.allocator.free(name);
@@ -821,6 +839,9 @@ pub fn attrSegmentNameAlloc(self: *Compiler, atom: Node.Atom) ![]u8 {
     const span = self.source[atom.offset .. atom.offset + atom.len];
     if (string_syntax.kindAt(self.source, atom.offset) == null) {
         return self.allocator.dupe(u8, span);
+    }
+    if (simpleQuotedInner(self, atom)) |inner| {
+        return self.allocator.dupe(u8, inner);
     }
 
     const parsed = try string_syntax.parseLiteral(self.allocator, self.source, .{

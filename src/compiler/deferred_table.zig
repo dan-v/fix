@@ -68,6 +68,11 @@ pub const Entry = struct {
     /// re-establishes them as with-scopes on the synthetic parent so the
     /// body's name resolution (lexical-first, then withs innermost-first)
     /// matches the eager compile exactly.
+    ///
+    /// Table-owned and SHARED: every entry of one attrset registers the
+    /// same snapshot, so it is adopted into the table once (`adoptScope`)
+    /// and referenced by all of them (a 19k-entry generated set would
+    /// otherwise dupe 19k copies).
     scope: []const Capture,
     /// How many trailing `scope` entries are `with`-subject captures.
     with_count: u16 = 0,
@@ -97,6 +102,12 @@ pub const Table = struct {
     /// of each rebuilding it over the whole (16MB+) source.
     line_indexes: std.AutoHashMapUnmanaged(usize, *diagnostic.LineIndex) = .{},
     line_index_mu: stable.SpinMutex = .{},
+    /// Adopted scope snapshots (see `Entry.scope`), freed at deinit.
+    scopes: std.ArrayListUnmanaged([]const Capture) = .empty,
+    /// Owned base/source path strings, deduped by content: all entries of
+    /// one file share the same two paths, so dupe each once, not per entry.
+    paths: std.StringHashMapUnmanaged(void) = .empty,
+    shared_mu: stable.SpinMutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) Table {
         return .{ .allocator = allocator, .entries = .empty };
@@ -106,14 +117,17 @@ pub const Table = struct {
         var id: u32 = 0;
         const total = self.entries.count();
         while (id < total) : (id += 1) {
-            const e = self.entries.get(id).*;
-            for (e.scope) |cap| self.allocator.free(cap.name);
-            self.allocator.free(e.scope);
-            if (e.base_path) |p| self.allocator.free(p);
-            if (e.source_path) |p| self.allocator.free(p);
-            self.allocator.destroy(e);
+            self.allocator.destroy(self.entries.get(id).*);
         }
         self.entries.deinit(self.allocator);
+        for (self.scopes.items) |caps| {
+            for (caps) |cap| self.allocator.free(cap.name);
+            self.allocator.free(caps);
+        }
+        self.scopes.deinit(self.allocator);
+        var path_it = self.paths.keyIterator();
+        while (path_it.next()) |p| self.allocator.free(p.*);
+        self.paths.deinit(self.allocator);
         var it = self.line_indexes.valueIterator();
         while (it.next()) |idx| {
             idx.*.deinit(self.allocator);
@@ -136,19 +150,13 @@ pub const Table = struct {
         return idx;
     }
 
-    /// Register a deferred body and return its id (the operand the
-    /// `defer_attr_value` op carries). `entry.scope` (and each `Capture`'s
-    /// `name` bytes) is duped into the table's allocator; the caller may
-    /// pass a temporary slice. The names must be owned here, not borrowed
-    /// from `source`: some come from `attrSegmentNameAlloc` (a fresh
-    /// allocation in the originating compile's scratch arena, e.g. parsed
-    /// `"a b" = ...` keys or `rec` attr names), which is freed when that
-    /// compile unit finishes. The force-time compile needs them later.
-    pub fn register(self: *Table, entry: Entry) !u32 {
-        const stored = try self.allocator.create(Entry);
-        errdefer self.allocator.destroy(stored);
-        stored.* = entry;
-        const scope_copy = try self.allocator.dupe(Capture, entry.scope);
+    /// Adopt a scope snapshot: dupe `caps` (and each `Capture`'s `name`
+    /// bytes — often borrowed from a compile unit's scratch arena, freed
+    /// when that unit finishes) into the table's allocator. The returned
+    /// slice is table-owned and lives until `deinit`; the caller shares it
+    /// across every `register` of one attrset instead of duping per entry.
+    pub fn adoptScope(self: *Table, caps: []const Capture) ![]const Capture {
+        const scope_copy = try self.allocator.dupe(Capture, caps);
         errdefer self.allocator.free(scope_copy);
         var named: usize = 0;
         errdefer for (scope_copy[0..named]) |cap| self.allocator.free(cap.name);
@@ -156,13 +164,37 @@ pub const Table = struct {
             cap.name = try self.allocator.dupe(u8, cap.name);
             named += 1;
         }
-        stored.scope = scope_copy;
-        // base_path / source_path are transient (freed with the import's
-        // stable_path) — dupe so the force-time compile can use them.
-        stored.base_path = if (entry.base_path) |p| try self.allocator.dupe(u8, p) else null;
-        errdefer if (stored.base_path) |p| self.allocator.free(p);
-        stored.source_path = if (entry.source_path) |p| try self.allocator.dupe(u8, p) else null;
-        errdefer if (stored.source_path) |p| self.allocator.free(p);
+        self.shared_mu.lock();
+        defer self.shared_mu.unlock();
+        try self.scopes.append(self.allocator, scope_copy);
+        return scope_copy;
+    }
+
+    /// Content-dedupe an owned copy of a path string (base/source paths
+    /// are transient — freed with the import's `stable_path` — but the
+    /// force-time compile needs them later). All registrations from one
+    /// file pass the same two paths; dupe each once.
+    fn internPath(self: *Table, path: []const u8) ![]const u8 {
+        self.shared_mu.lock();
+        defer self.shared_mu.unlock();
+        const gop = try self.paths.getOrPut(self.allocator, path);
+        if (!gop.found_existing) {
+            errdefer _ = self.paths.remove(path);
+            gop.key_ptr.* = try self.allocator.dupe(u8, path);
+        }
+        return gop.key_ptr.*;
+    }
+
+    /// Register a deferred body and return its id (the operand the
+    /// `defer_attr_value` op carries). `entry.scope` must be table-owned
+    /// (from `adoptScope`); the path strings may be temporary — they are
+    /// interned here.
+    pub fn register(self: *Table, entry: Entry) !u32 {
+        const stored = try self.allocator.create(Entry);
+        errdefer self.allocator.destroy(stored);
+        stored.* = entry;
+        stored.base_path = if (entry.base_path) |p| try self.internPath(p) else null;
+        stored.source_path = if (entry.source_path) |p| try self.internPath(p) else null;
         return self.entries.append(self.allocator, stored);
     }
 
@@ -204,7 +236,7 @@ test "register stores an entry retrievable by its returned id" {
     try std.testing.expectEqual(@as(usize, 0), entry.scope.len);
 }
 
-test "register dupes scope capture names so the caller's buffer can be freed" {
+test "adoptScope dupes capture names so the caller's buffer can be freed" {
     var table = Table.init(std.testing.allocator);
     defer table.deinit();
 
@@ -212,7 +244,7 @@ test "register dupes scope capture names so the caller's buffer can be freed" {
     const caps = [_]Capture{.{ .name = &name_buf, .name_id = 7, .kind = .local, .index = 0 }};
     const id = try table.register(.{
         .node = &test_node,
-        .scope = &caps,
+        .scope = try table.adoptScope(&caps),
         .source = "irrelevant",
         .base_path = null,
         .source_path = null,
