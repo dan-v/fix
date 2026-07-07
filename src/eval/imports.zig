@@ -173,6 +173,18 @@ pub fn forceEntry(ev: anytype, path: []const u8, entry: *ImportEntry, parent_dep
 /// fall back to `Future.reset` (transient), so the next caller
 /// retries.
 fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
+    // Resource-pressure failures may not repeat on a later force —
+    // NEVER cache them as the import's deterministic result (a
+    // speculative prefetch fiber hitting fiber-stack/memory limits
+    // must not poison the path for the real demand). Reset so the
+    // next caller retries; mirrors `isTransientThunkError`.
+    switch (err) {
+        error.OutOfMemory, error.StackOverflow => {
+            entry.future.reset();
+            return;
+        },
+        else => {},
+    }
     const info = ev.allocator.create(thunk_mod.ErrorInfo) catch {
         entry.future.reset();
         return;

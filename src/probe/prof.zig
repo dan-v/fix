@@ -274,6 +274,8 @@ pub const TaskClass = enum(u8) {
     attrs_range,
     /// Stolen work-first continuation (FIX_WORK_FIRST).
     cont,
+    /// Speculative import prefetch (FIX_IMPORT_PREFETCH; spec lane).
+    import_prefetch,
 };
 pub const TASK_CLASS_COUNT = @typeInfo(TaskClass).@"enum".fields.len;
 pub const TC_CY_BUCKETS = 26; // bucket i = task cycles in [2^i, 2^(i+1))

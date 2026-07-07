@@ -680,6 +680,21 @@ pub const ChunkRegistry = struct {
         }
     }
 
+    /// Optional import-prefetch discovery sink (`FIX_IMPORT_PREFETCH`): when
+    /// set (by the Evaluator, before workers start), `register` reports each
+    /// freshly compiled chunk's `.path` constants so `.nix` file references
+    /// can be speculatively parsed+compiled+evaluated on idle helpers ahead
+    /// of the demand fiber. A module-level hook (not a registry field) so
+    /// the deferred force-time compiles — which build Compilers from bare
+    /// registry/intern/heap refs — feed it without extra plumbing. Read-only
+    /// after start; called concurrently from every compiling worker (the
+    /// callee handles its own synchronization/dedup).
+    pub const PathConstSink = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, path_id: types.InternId) void,
+    };
+    pub var path_const_sink: ?PathConstSink = null;
+
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
         const stored = try self.allocator.create(Chunk);
         errdefer {
@@ -687,6 +702,11 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
+        if (path_const_sink) |sink| {
+            for (stored.constants) |c| {
+                if (c.isPath()) sink.call(sink.ctx, c.asInternId());
+            }
+        }
         if (jit.enabled) {
             // Best-effort: failure to JIT just leaves the interpreter
             // to handle it. Don't propagate. The peephole matcher runs

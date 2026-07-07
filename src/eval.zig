@@ -49,6 +49,7 @@ const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const struct_census = @import("runtime").struct_census;
 const gc = @import("runtime").gc;
 const thunk_mod = @import("runtime").thunk;
+const worker_id_mod = @import("runtime").worker_id;
 const trace_probe = @import("probe/trace_probe.zig");
 const drv_probe = @import("probe/drv_probe.zig");
 const ngram_probe = @import("probe/ngram_probe.zig");
@@ -141,6 +142,15 @@ pub const Evaluator = struct {
     /// `eval/gc.zig:memoryBudget`. Set by the CLI before evaluation;
     /// ignored by non-`-Dgc` builds.
     max_memory_bytes: ?u64 = null,
+    /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
+    /// constants discovered by `ChunkRegistry.register` and already
+    /// submitted as `import_prefetch` tasks — dedup so each path is
+    /// prefetched at most once per eval. Guarded by `prefetch_mu`
+    /// (compiles run on every worker). Remaining submission budget in
+    /// `prefetch_budget` bounds the junk volume.
+    prefetch_seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
+    prefetch_mu: SpinMutex = .{},
+    prefetch_budget: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -284,6 +294,12 @@ pub const Evaluator = struct {
 
     pub fn deinit(self: *Evaluator) void {
         self.memReport();
+        // Detach the import-prefetch sink before teardown (module-level
+        // global; only clear it if it still points at THIS evaluator).
+        if (ChunkRegistry.path_const_sink) |sink| {
+            if (sink.ctx == @as(*anyopaque, @ptrCast(self))) ChunkRegistry.path_const_sink = null;
+        }
+        self.prefetch_seen.deinit(self.allocator);
         if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
         trace_probe.report();
         struct_census.report();
@@ -706,6 +722,33 @@ pub const Evaluator = struct {
             }
             self.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
         }
+        // Speculative import prefetch: `.nix` path constants of freshly
+        // compiled chunks are parse+compile+evaluated ahead of demand on
+        // the spec lane (the braid-window perf decomposition measured
+        // ~25-50ms of import parse+compile sitting ON the critical chain
+        // at w=8 while every helper parked). The import registry dedups
+        // and coordinates, so a prefetch is exactly the import the demand
+        // fiber would have run — started earlier. Default ON at 2..16
+        // workers (same gate as the novel lane: at w=32 extra spec-lane
+        // volume chases junk); FIX_IMPORT_PREFETCH=0/1 overrides,
+        // FIX_IMPORT_PREFETCH_MAX bounds submissions per eval.
+        {
+            var on = self.worker_count >= 2 and self.worker_count <= 16;
+            var max: u32 = 8192;
+            if (self.env_map) |em| {
+                if (em.get("FIX_IMPORT_PREFETCH")) |s| on = !std.mem.eql(u8, s, "0");
+                if (em.get("FIX_IMPORT_PREFETCH_MAX")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |n| max = n else |_| {}
+                }
+            }
+            if (on and self.worker_count > 1) {
+                self.prefetch_budget = max;
+                ChunkRegistry.path_const_sink = .{ .ctx = self, .call = prefetchPathConst };
+            } else {
+                self.prefetch_budget = 0;
+                ChunkRegistry.path_const_sink = null;
+            }
+        }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
@@ -975,6 +1018,28 @@ pub const Evaluator = struct {
     fn importValue(context: *anyopaque, path: []const u8, parent_depth: u32) anyerror!Value {
         const self: *Evaluator = @ptrCast(@alignCast(context));
         return imports_mod.importPath(self, path, parent_depth);
+    }
+
+    /// `ChunkRegistry.path_const_sink` target (`FIX_IMPORT_PREFETCH`):
+    /// called for every `.path` constant of every freshly compiled chunk,
+    /// from whichever worker ran the compile. Filters to `.nix` files
+    /// (directory references — the bulk of e.g. all-packages.nix's ~1.7K
+    /// path constants — are mostly never imported in a given eval and
+    /// would be junk), dedups per intern id, spends the submission
+    /// budget, and hands the path to the spec lane.
+    fn prefetchPathConst(context: *anyopaque, path_id: types.InternId) void {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        const text = self.intern.get(path_id);
+        if (!std.mem.endsWith(u8, text, ".nix")) return;
+        {
+            self.prefetch_mu.lock();
+            defer self.prefetch_mu.unlock();
+            if (self.prefetch_budget == 0) return;
+            const gop = self.prefetch_seen.getOrPut(self.allocator, path_id) catch return;
+            if (gop.found_existing) return;
+            self.prefetch_budget -= 1;
+        }
+        _ = self.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
     }
 
     fn scopedImportValue(context: *anyopaque, scope: Value, path: []const u8, parent_depth: u32) anyerror!Value {

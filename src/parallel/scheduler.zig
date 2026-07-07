@@ -153,6 +153,14 @@ pub const Task = union(enum) {
     /// costs the submitter one queue push per ~16 entries instead of
     /// one per thunk.
     force_attrs_range: ForceAttrsRange,
+    /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): resolve +
+    /// parse + compile + top-level-eval the `.nix` file named by this
+    /// interned absolute path, populating the import registry ahead of
+    /// the demand fiber. Discovered from `.path` constants of freshly
+    /// compiled chunks (see `ChunkRegistry.register`); deduplicated
+    /// per path by the Evaluator before submission. Holds no heap
+    /// ObjectId — nothing to GC-mark.
+    import_prefetch: types.InternId,
 };
 
 /// Which queue a popped/stolen task came from. Purely informational —
@@ -444,6 +452,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
             .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
+            .import_prefetch => {},
         }
     }
 }
@@ -458,6 +467,7 @@ fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
             .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
+            .import_prefetch => {},
         }
     }
 }
@@ -1991,7 +2001,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
-                    .force_list_range, .force_attrs_sweep, .force_attrs_range => 0,
+                    .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch => 0,
                 }, .acq_rel);
             }
         }
