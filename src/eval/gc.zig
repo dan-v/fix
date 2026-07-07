@@ -170,6 +170,7 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
             if (f.current_task) |task| switch (task) {
                 .force_thunk => |id| tr.markObject(&ev.heap, id),
                 .force_list_range => |r| tr.markObject(&ev.heap, r.list_id),
+                .force_attrs_sweep => |id| tr.markObject(&ev.heap, id),
             };
         }
     }
