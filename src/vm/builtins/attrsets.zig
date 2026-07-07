@@ -254,19 +254,60 @@ pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Va
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
-    // gc: re-fetch — range may move across stringListContainsIntern's force
+    // Names are forced at most once each, into a growing prefix cache,
+    // in exactly the order the per-entry rescan used to force them —
+    // same evaluation set and stopping points (an entry that matches an
+    // early name never forces the later ones), so laziness-observable
+    // behavior is unchanged. What goes away is the O(entries × names)
+    // re-force/re-fetch of already-resolved list items.
+    var resolved: std.ArrayListUnmanaged(InternId) = .empty;
+    defer resolved.deinit(self.allocator);
+
+    // gc: re-fetch — ranges may move across the name forces
     const attrs_id = attrs.asObjectId();
+    const names_id = names.asObjectId();
+    const names_len = try self.heap.getListLen(names_id);
     const n = (try self.heap.getAttrs(attrs_id)).len;
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    outer: while (i < n) : (i += 1) {
         const entry = (try self.heap.getAttrs(attrs_id))[i];
-        if (!try stringListContainsIntern(self, names.asObjectId(), entry.name)) {
-            try entries.append(self.allocator, entry);
+        for (resolved.items) |name_id| {
+            if (name_id == entry.name) continue :outer;
         }
+        while (resolved.items.len < names_len) {
+            const item = try self.heap.getListItem(names_id, resolved.items.len);
+            const value = try vm_force.forceValue(self, item);
+            if (!isPlainString(value)) return error.TypeError;
+            const name_id = try stringTextInternId(self, value);
+            try resolved.append(self.allocator, name_id);
+            if (name_id == entry.name) continue :outer;
+        }
+        try entries.append(self.allocator, entry);
     }
 
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
+
+/// Binary search a sorted attr-entry slice by name (heap invariant:
+/// entries are sorted by InternId, no duplicates).
+fn sortedEntryIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const n = entries[mid].name;
+        if (n == name) return mid;
+        if (n < name) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+/// Size ratio beyond which `intersectAttrs` walks the smaller operand and
+/// binary-searches the larger, instead of merge-walking both. callPackage's
+/// `intersectAttrs (functionArgs f) pkgs` intersects ~10 formal args with a
+/// tens-of-thousands-entry package set; the O(left+right) merge walk paid
+/// ~12K cycles per call scanning entries the small side can never match.
+const INTERSECT_SKEW = 8;
 
 pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !Value {
     const left = try vm_force.forceValue(self, left_arg);
@@ -279,40 +320,41 @@ pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !
     var entries = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, @min(left_entries.len, right_entries.len));
     defer entries.deinit(self.allocator);
 
-    var left_i: usize = 0;
-    var right_i: usize = 0;
-    while (left_i < left_entries.len and right_i < right_entries.len) {
-        const left_entry = left_entries[left_i];
-        const right_entry = right_entries[right_i];
-        if (left_entry.name < right_entry.name) {
-            left_i += 1;
-        } else if (left_entry.name > right_entry.name) {
-            right_i += 1;
-        } else {
-            entries.appendAssumeCapacity(right_entry);
-            left_i += 1;
-            right_i += 1;
+    // All three paths emit the same set — the RIGHT entry for every name
+    // present in both — walking names in ascending order, so the output
+    // is identical regardless of which strategy runs.
+    if (left_entries.len / INTERSECT_SKEW > right_entries.len) {
+        for (right_entries) |re| {
+            if (sortedEntryIndex(left_entries, re.name) != null) entries.appendAssumeCapacity(re);
+        }
+    } else if (right_entries.len / INTERSECT_SKEW > left_entries.len) {
+        for (left_entries) |le| {
+            if (sortedEntryIndex(right_entries, le.name)) |ri| entries.appendAssumeCapacity(right_entries[ri]);
+        }
+    } else {
+        var left_i: usize = 0;
+        var right_i: usize = 0;
+        while (left_i < left_entries.len and right_i < right_entries.len) {
+            const left_entry = left_entries[left_i];
+            const right_entry = right_entries[right_i];
+            if (left_entry.name < right_entry.name) {
+                left_i += 1;
+            } else if (left_entry.name > right_entry.name) {
+                right_i += 1;
+            } else {
+                entries.appendAssumeCapacity(right_entry);
+                left_i += 1;
+                right_i += 1;
+            }
         }
     }
 
     // `left_entries` and `right_entries` are sorted by name (heap
-    // invariant); the merge-walk preserves order and adds no
+    // invariant); each strategy preserves order and adds no
     // duplicates, so `entries.items` is sorted+unique by construction.
     return Value.attrs(try self.heap.addAttrsSorted(entries.items));
 }
 
-pub fn stringListContainsIntern(self: anytype, list_id: ObjectId, needle: InternId) !bool {
-    // gc: re-fetch — range may move across the force
-    const n = try self.heap.getListLen(list_id);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const item = try self.heap.getListItem(list_id, i);
-        const value = try vm_force.forceValue(self, item);
-        if (!isPlainString(value)) return error.TypeError;
-        if (try stringTextInternId(self, value) == needle) return true;
-    }
-    return false;
-}
 
 const std_testing = std.testing;
 const renderForTest = @import("../../eval/test_helpers.zig").renderForTest;
