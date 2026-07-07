@@ -416,11 +416,19 @@ pub const Scheduler = struct {
     /// nixpkgs). `FIX_SIBLING_MIN`/`FIX_SIBLING_MAX` override.
     sibling_min: u32 = 16,
     sibling_max: u32 = 64,
-    /// Per-member claimed-force budget for sweep tasks (see
-    /// `VM.spec_budget`): a wrongly-predicted member's cascade is
-    /// abandoned after this many claimed forces. `FIX_SIBLING_BUDGET`
-    /// overrides.
+    /// Per-member CREATION budget for sweep tasks (see
+    /// `VM.spec_create_limit`): a wrongly-predicted member's cascade is
+    /// abandoned once it has created this many new thunks.
+    /// `FIX_SIBLING_BUDGET` overrides.
     sibling_budget: u64 = 4096,
+    /// Per-member CLAIMED-force budget, split from the creation budget
+    /// (see `VM.spec_budget`; `FIX_SIBLING_CLAIMS` overrides). Claims
+    /// re-force existing thunks (convergent chains — the etc/service
+    /// tails need thousands of claims but few creations); creations are
+    /// where junk cascades blow up (derivation bodies). A high claim
+    /// budget with the default creation budget lets convergent chains
+    /// finish without re-opening the junk-by-cost dragon.
+    sibling_claim_budget: u64 = 4096,
     /// Submit sweeps to the urgent queue (drained before the speculative
     /// backlog) instead of the spec queue. Default ON — measured strictly
     /// better on the NixOS toplevel (w=8 median 1.24s→1.03s vs ~1.3s at

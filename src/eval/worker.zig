@@ -884,7 +884,7 @@ fn slotEntry(arg: *anyopaque) void {
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
                 if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
-                f.vm.spec_budget = f.vm.scheduler.sibling_budget;
+                f.vm.spec_budget = f.vm.scheduler.sibling_claim_budget;
                 f.vm.spec_create_limit = f.vm.heap.currentLocal().thunks_created + f.vm.scheduler.sibling_budget;
                 f.vm.spec_create_worker = worker_id_mod.current;
                 if (log) {

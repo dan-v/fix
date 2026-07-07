@@ -620,7 +620,13 @@ pub const Evaluator = struct {
                     if (std.fmt.parseInt(u32, s, 10)) |n| sib_max = n else |_| {}
                 }
                 if (em.get("FIX_SIBLING_BUDGET")) |s| {
-                    if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_budget = n else |_| {}
+                    if (std.fmt.parseInt(u64, s, 10)) |n| {
+                        self.scheduler.sibling_budget = n;
+                        self.scheduler.sibling_claim_budget = n;
+                    } else |_| {}
+                }
+                if (em.get("FIX_SIBLING_CLAIMS")) |s| {
+                    if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_claim_budget = n else |_| {}
                 }
                 if (em.get("FIX_SIBLING_URGENT")) |s| {
                     self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
