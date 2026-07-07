@@ -598,28 +598,36 @@ pub const Evaluator = struct {
             self.scheduler.setScavenge(scav_on, scav_margin);
             self.heap.scav_record = scav_on;
         }
-        // FIX_SIBLING: demand-sibling prefetch — a demand fiber's first touch
-        // of an unresolved member of a mid-sized attrset submits a speculative
-        // whole-set sweep. FIX_SIBLING_MIN/MAX tune the entry-count gate
-        // (defaults 16/64, from the -Dprof-main sibling census).
-        if (self.env_map) |em| {
-            const sib_on = em.get("FIX_SIBLING") != null;
+        // Demand-sibling prefetch is ON by default when helpers exist
+        // (~15% wall win on the NixOS toplevel; junk bounded by the
+        // entry-count gate + per-member force/creation budgets, RSS
+        // neutral-to-lower). At --workers=1 there is nobody to run the
+        // sweeps — worker 0 would drain them itself as pure overhead —
+        // so it defaults off there. FIX_SIBLING=0 disables (=1 forces on,
+        // including at w=1, for debugging); FIX_SIBLING_MIN/MAX tune the
+        // entry-count gate (defaults 16/64, from the -Dprof-main sibling
+        // census).
+        {
+            var sib_on = self.worker_count > 1;
             var sib_min: u32 = 16;
             var sib_max: u32 = 64;
-            if (em.get("FIX_SIBLING_MIN")) |s| {
-                if (std.fmt.parseInt(u32, s, 10)) |n| sib_min = n else |_| {}
-            }
-            if (em.get("FIX_SIBLING_MAX")) |s| {
-                if (std.fmt.parseInt(u32, s, 10)) |n| sib_max = n else |_| {}
-            }
-            if (em.get("FIX_SIBLING_BUDGET")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_budget = n else |_| {}
+            if (self.env_map) |em| {
+                if (em.get("FIX_SIBLING")) |s| sib_on = !std.mem.eql(u8, s, "0");
+                if (em.get("FIX_SIBLING_MIN")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |n| sib_min = n else |_| {}
+                }
+                if (em.get("FIX_SIBLING_MAX")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |n| sib_max = n else |_| {}
+                }
+                if (em.get("FIX_SIBLING_BUDGET")) |s| {
+                    if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_budget = n else |_| {}
+                }
+                if (em.get("FIX_SIBLING_URGENT")) |s| {
+                    self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
+                }
+                self.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
             }
             self.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
-            if (em.get("FIX_SIBLING_URGENT")) |s| {
-                self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
-            }
-            self.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
         }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();

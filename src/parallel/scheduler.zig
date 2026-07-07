@@ -402,12 +402,13 @@ pub const Scheduler = struct {
     /// Highest worker id allowed to scavenge. `FIX_SCAV_WORKERS` overrides.
     scav_workers: u8 = 7,
 
-    /// `FIX_SIBLING`: demand-sibling prefetch. On a demand fiber's
-    /// inline-cache MISS landing on a still-unresolved thunk member of a
-    /// plain attrset with entry count in `[sibling_min, sibling_max)`,
-    /// submit ONE speculative `force_attrs_sweep` task for the whole set
-    /// (deduped by `AttrsObject.sibling_swept`). Set once before helpers
-    /// start, read-only during eval.
+    /// Demand-sibling prefetch. On a demand fiber's inline-cache MISS
+    /// landing on a still-unresolved thunk member of a plain attrset
+    /// with entry count in `[sibling_min, sibling_max)`, submit ONE
+    /// speculative `force_attrs_sweep` task for the whole set (deduped
+    /// by `AttrsObject.sibling_swept`). ON by default when helpers exist
+    /// (the evaluator sets it before `start`); `FIX_SIBLING=0` disables.
+    /// Read-only during eval.
     sibling_prefetch: bool = false,
     /// Attrset entry-count gate. Defaults from the `-Dprof-main` sibling
     /// census: 16-63 entries = 17-29% junk; >=64 grows to 51%, >=256 is
