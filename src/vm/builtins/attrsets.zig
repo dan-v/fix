@@ -187,7 +187,10 @@ pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
                 .value = try makeBuiltinThunk(self, .mapAttrValue, &.{ fn_arg, Value.string(entry.name), entry.value }),
             };
         }
-        return Value.attrs(try self.heap.addAttrs(out));
+        // `out` preserves the input's order (names copied 1:1 from the
+        // already sorted+deduped source attrs), so it is sorted+unique by
+        // construction — skip the redundant sort+dedup in `addAttrs`.
+        return Value.attrs(try self.heap.addAttrsSorted(out));
     }
 
     const apply_chunk_id = self.registry.well_known.mapattrs_apply;
@@ -197,7 +200,8 @@ pub fn builtinMapAttrs(self: anytype, fn_arg: Value, attrs_arg: Value) !Value {
         if (speculatable) _ = self.scheduler.submit(.{ .force_thunk = tid }, self.workerId());
         mapped.* = .{ .name = entry.name, .value = Value.thunk(tid) };
     }
-    return Value.attrs(try self.heap.addAttrs(out));
+    // Sorted+unique by construction (see the thunk-path note above).
+    return Value.attrs(try self.heap.addAttrsSorted(out));
 }
 
 pub fn builtinMapAttrValue(self: anytype, func_arg: Value, name_arg: Value, value_arg: Value) !Value {
