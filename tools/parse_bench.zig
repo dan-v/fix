@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
         defer a.free(src);
         const iters: usize = @max(30, 20_000_000 / (src.len + 1));
         var best: u64 = std.math.maxInt(u64);
+        var best_elide: u64 = std.math.maxInt(u64);
         var best_scan: u64 = std.math.maxInt(u64);
         var best_toks: u64 = std.math.maxInt(u64);
         var ntok_total: usize = 0;
@@ -69,17 +70,32 @@ pub fn main(init: std.process.Init) !void {
                 std.mem.doNotOptimizeAway(toks.items.len);
                 if (dt < best_toks) best_toks = dt;
             }
-            var arena = syntax.ast.AstArena.init(a);
-            defer arena.deinit();
-            var p = syntax.Parser.init(a, &arena, src);
-            defer p.deinit();
-            const t0 = rdtsc();
-            const node = p.parse() catch continue;
-            const dt = rdtsc() - t0;
-            std.mem.doNotOptimizeAway(node);
-            if (dt < best) best = dt;
+            {
+                var arena = syntax.ast.AstArena.init(a);
+                defer arena.deinit();
+                var p = syntax.Parser.init(a, &arena, src);
+                defer p.deinit();
+                const t0 = rdtsc();
+                const node = p.parse() catch continue;
+                const dt = rdtsc() - t0;
+                std.mem.doNotOptimizeAway(node);
+                if (dt < best) best = dt;
+            }
+            {
+                // Body-span elision on (the file-compile configuration).
+                var arena = syntax.ast.AstArena.init(a);
+                defer arena.deinit();
+                var p = syntax.Parser.init(a, &arena, src);
+                defer p.deinit();
+                p.elide_bodies = true;
+                const t0 = rdtsc();
+                const node = p.parse() catch continue;
+                const dt = rdtsc() - t0;
+                std.mem.doNotOptimizeAway(node);
+                if (dt < best_elide) best_elide = dt;
+            }
         }
         const b: f64 = @floatFromInt(src.len);
-        std.debug.print("{s: <30} {d: >7}B {d: >7} toks  full {d:5.2}  scan {d:5.2}  toks {d:5.2}  cyc/byte\n", .{ std.fs.path.basename(path), src.len, ntok_total, @as(f64, @floatFromInt(best)) / b, @as(f64, @floatFromInt(best_scan)) / b, @as(f64, @floatFromInt(best_toks)) / b });
+        std.debug.print("{s: <30} {d: >7}B {d: >7} toks  full {d:5.2}  elide {d:5.2}  scan {d:5.2}  toks {d:5.2}  cyc/byte\n", .{ std.fs.path.basename(path), src.len, ntok_total, @as(f64, @floatFromInt(best)) / b, @as(f64, @floatFromInt(best_elide)) / b, @as(f64, @floatFromInt(best_scan)) / b, @as(f64, @floatFromInt(best_toks)) / b });
     }
 }
