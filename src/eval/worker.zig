@@ -63,8 +63,10 @@ const DerivationStore = @import("derivation").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker patches
-/// the VM's claimer_id to match the fiber id.
-pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32) anyerror!VM;
+/// the VM's claimer_id to match the fiber id. `scratch` is the fiber's
+/// per-fiber arena — the VM's run-path allocations land there and are
+/// swept wholesale when the fiber is recycled (see `recycleScratch`).
+pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32, scratch: std.mem.Allocator) anyerror!VM;
 
 /// Number of fibers pre-allocated at Worker.init time. Keeps the
 /// common-case task pickup off the malloc path; the free list still
@@ -101,6 +103,14 @@ pub const WorkerFiber = struct {
     fiber_id: u32,
     inner: InnerFiber,
     vm: VM,
+    /// Per-fiber scratch arena backing `vm`'s run-path allocations
+    /// (builtin temp buffers, drv hashing, equality scratch — ~490 MB of
+    /// transient traffic per NixOS eval). Arena semantics are load-bearing:
+    /// run paths free best-effort and error/suspend paths abandon
+    /// allocations. Reset (bounded retention) each time the fiber is
+    /// recycled onto the free list — a never-reset arena retained ~240 MB
+    /// (w=1) / ~380 MB (w=8) of dead interleaved pages.
+    scratch: std.heap.ArenaAllocator,
     state: FiberState,
     /// Set to 1 while some worker is inside `inner.resume_()` on this
     /// fiber. The owning worker's `deinit` spin-waits on this to drop
@@ -164,6 +174,16 @@ pub const WorkerFiber = struct {
     fn wakeImpl(w: *thunk_mod.Waiter) void {
         const self: *WorkerFiber = @fieldParentPtr("waiter", w);
         self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
+    }
+
+    /// Sweep the per-fiber scratch arena when the fiber goes back on the
+    /// free list. Safe exactly here: the fiber is `.finished` (its stack
+    /// unwound — no pending defers reference scratch) and its VM is idle
+    /// at depth 0. Retains one page-sized chunk so the next task's small
+    /// scratch doesn't immediately re-alloc.
+    fn recycleScratch(self: *WorkerFiber) void {
+        self.vm.onScratchReset();
+        _ = self.scratch.reset(.{ .retain_with_limit = 64 * 1024 });
     }
 };
 
@@ -271,6 +291,7 @@ pub const Worker = struct {
             if (f.vm.sp_high_water > max_vm_sp) max_vm_sp = f.vm.sp_high_water;
             f.inner.deinit(self.allocator);
             f.vm.deinit();
+            f.scratch.deinit();
             f.local_trace.deinit();
             self.allocator.destroy(f);
         }
@@ -672,6 +693,7 @@ pub const Worker = struct {
                     prof.fiberLiveDec();
                 }
                 f.state = .free;
+                f.recycleScratch();
                 f.worker.pushFree(f);
                 if (f.worker != self) f.worker.nudge();
             },
@@ -805,17 +827,12 @@ pub const Worker = struct {
         const f = try self.allocator.create(WorkerFiber);
         errdefer self.allocator.destroy(f);
 
-        var vm = try self.init_vm_fn(self.init_vm_ctx, self.worker_id, fiber_id);
-        errdefer vm.deinit();
-
-        var inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
-        errdefer inner.deinit(self.allocator);
-
         f.* = .{
             .worker = self,
             .fiber_id = fiber_id,
-            .inner = inner,
-            .vm = vm,
+            .inner = undefined,
+            .vm = undefined,
+            .scratch = std.heap.ArenaAllocator.init(self.allocator),
             .state = .free,
             .in_runfiber = .init(0),
             .run_mu = .{},
@@ -826,6 +843,17 @@ pub const Worker = struct {
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
+        errdefer f.scratch.deinit();
+        errdefer f.local_trace.deinit();
+
+        // The VM allocates through the fiber's arena, so the arena must
+        // sit at its final address (`f.scratch`) before the VM captures it.
+        f.vm = try self.init_vm_fn(self.init_vm_ctx, self.worker_id, fiber_id, f.scratch.allocator());
+        errdefer f.vm.deinit();
+
+        f.inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
+        errdefer f.inner.deinit(self.allocator);
+
         f.vm.claimer_id = thunk_mod.makeClaimer(fiber_id);
         // Speculative work captures only the throw message for sticky
         // caching; skip frame-stack allocation on the hot path.
@@ -1233,10 +1261,11 @@ test "Worker basic init/deinit" {
         arena: std.heap.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
-        fn initVm(ctx: *anyopaque, _: u8, _: u32) anyerror!VM {
+        fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return VM.init(
-                self.arena.allocator(),
+                scratch,
+                null,
                 &self.registry,
                 &self.intern,
                 &self.heap,

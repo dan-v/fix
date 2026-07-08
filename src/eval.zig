@@ -76,10 +76,11 @@ pub const Evaluator = struct {
     regexes: regex_mod.PatternCache,
     imports: imports_mod.Registry,
     search_paths: search_path_mod.Paths,
-    /// One arena per worker. Each VM allocates its stack, frames, and
-    /// per-opcode scratch through its worker's arena so workers never share
-    /// a non-thread-safe allocator.
-    worker_arenas: []std.heap.ArenaAllocator,
+    /// Shared pool of VM stack/frames buffers (see vm.zig BufferPool):
+    /// nested import VMs churn ~2.6K times per NixOS eval; reuse bounds
+    /// their RSS at the concurrent-VM high-water instead of leaking a
+    /// dirty half-MB into the worker arena per import.
+    vm_buffers: vm_mod.BufferPool,
     builtins_value: ?Value,
     /// Whether the final render observes lazy shells (only lazy-XML).
     /// Propagated to every VM via `initVm`; gates `make_lazy_shell`.
@@ -170,9 +171,6 @@ pub const Evaluator = struct {
         var registry = try ChunkRegistry.init(allocator);
         errdefer registry.deinit();
 
-        const arenas = try allocator.alloc(std.heap.ArenaAllocator, worker_count);
-        errdefer allocator.free(arenas);
-        for (arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(allocator);
 
         const gc_workers = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
@@ -193,7 +191,7 @@ pub const Evaluator = struct {
             .regexes = regex_mod.PatternCache.init(allocator),
             .imports = .{},
             .search_paths = .{},
-            .worker_arenas = arenas,
+            .vm_buffers = vm_mod.BufferPool.init(allocator),
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
@@ -351,14 +349,16 @@ pub const Evaluator = struct {
         if (comptime tjit_hot.enabled) self.reportHotAnchors();
         if (comptime tjit_exec.enabled) tjit_exec.report();
         if (comptime tjit_record.enabled) tjit_record.report();
-        // Helpers hold VMs whose allocations live in `worker_arenas`. Shut
-        // them down (which joins on `defer vm.deinit()` inside helperLoop)
-        // before freeing the arenas they borrow from.
+        // Shut helpers down (which joins on `defer vm.deinit()` inside
+        // helperLoop) before tearing down state their VMs borrow.
         self.scheduler.deinit();
         // Now that helpers are guaranteed quiescent, tear down the main
         // worker. Doing this before scheduler shutdown could race with
         // a helper still resuming a stolen main fiber.
         if (self.main_worker) |w| w.deinit();
+        // Every VM (helper fibers, main worker, imports) is dead now —
+        // all pooled stack/frames buffers are back on the free list.
+        self.vm_buffers.deinit();
         // GC bookkeeping is freed only AFTER the workers above are joined:
         // a helper can still be finishing a speculative import when the
         // main thread enters deinit, and its `evaluateSource` appends the
@@ -382,8 +382,6 @@ pub const Evaluator = struct {
         self.regexes.deinit();
         self.files.deinit();
         self.heap.deinit();
-        for (self.worker_arenas) |*arena| arena.deinit();
-        self.allocator.free(self.worker_arenas);
         // Free deferred-compile state after the heap (whose thunks
         // referenced entries) and workers (no force-compile can be in
         // flight) are gone. The retained arenas own the AST nodes the
@@ -863,7 +861,12 @@ pub const Evaluator = struct {
         if (scope == null and source_path == null) {
             return self.runChunkOnMainWorker(chunk_id);
         }
-        var vm = try self.initVm(0);
+        // Per-import scratch arena: the nested VM's run-path allocations
+        // (drv hashing, builtin temp buffers) are freed wholesale when the
+        // import returns instead of accreting for the evaluator's lifetime.
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        var vm = try self.initVm(0, scratch.allocator());
         defer vm.deinit();
         // Depth-transparent import: the fresh nested VM inherits the caller's
         // depth minus 1 (dropping the `import` builtin's own +1), so a
@@ -897,14 +900,22 @@ pub const Evaluator = struct {
         return self.runWithVm(VM.eval, .{chunk_id});
     }
 
-    fn initVm(self: *Evaluator, worker_id: u8) !VM {
-        // RSS attribution: the VM's value stack + frames come from the
-        // worker arena and live for the evaluator's lifetime (one set per
-        // fiber ever allocated) — give them their own bucket.
+    /// `scratch` is the VM's allocation arena — per-fiber (reset when the
+    /// fiber is recycled) or per-import (freed when the import returns).
+    /// It MUST be an arena: VM run paths lean on arena semantics — frees
+    /// are best-effort, error/suspend paths may abandon allocations, and
+    /// the sweep happens wholesale at reset/deinit. It must NOT live for
+    /// the whole evaluator: that retained ~240 MB (w=1) / ~380 MB (w=8)
+    /// of dead interleaved scratch pages on a NixOS eval (~490 MB of
+    /// transient traffic per run never reclaimed by a never-reset arena).
+    fn initVm(self: *Evaluator, worker_id: u8, scratch: std.mem.Allocator) !VM {
+        // RSS attribution: the VM's own allocations (gc lists; the
+        // stack/frames go through the shared pool) get the worker bucket.
         const prev_tag = vma_mod.setAllocTag(.worker_arena);
         defer _ = vma_mod.setAllocTag(prev_tag);
         var vm = try VM.init(
-            self.worker_arenas[worker_id].allocator(),
+            scratch,
+            &self.vm_buffers,
             &self.registry,
             &self.intern,
             &self.heap,
@@ -985,7 +996,9 @@ pub const Evaluator = struct {
     /// inferred from its return signature; void payloads work too.
     fn runWithVm(self: *Evaluator, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
         if (fiber_mod.currentFiber() != null) {
-            var vm = try self.initVm(0);
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            var vm = try self.initVm(0, scratch.allocator());
             defer vm.deinit();
             if (comptime gc.enabled) eval_gc.registerVm(self, &vm);
             defer if (comptime gc.enabled) eval_gc.unregisterVm(self, &vm);
@@ -1001,7 +1014,9 @@ pub const Evaluator = struct {
 
             fn entry(arg: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(arg));
-                var vm = ctx.ev.initVm(0) catch |e| {
+                var scratch = std.heap.ArenaAllocator.init(ctx.ev.allocator);
+                defer scratch.deinit();
+                var vm = ctx.ev.initVm(0, scratch.allocator()) catch |e| {
                     ctx.err = e;
                     return;
                 };
@@ -1243,9 +1258,9 @@ fn helperLoop(worker_id: u8, sched: *Scheduler, ev: *Evaluator) void {
     worker.deinit();
 }
 
-fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32) anyerror!VM {
+fn initVmForWorkerSlot(ctx: *anyopaque, worker_id: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
     const ev: *Evaluator = @ptrCast(@alignCast(ctx));
-    return ev.initVm(worker_id);
+    return ev.initVm(worker_id, scratch);
 }
 
 fn ReturnPayload(comptime F: type) type {

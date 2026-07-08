@@ -37,6 +37,9 @@ const equality = @import("equality.zig");
 /// those pointers.
 const Harness = struct {
     ev: *Evaluator,
+    /// VM scratch arena. Heap-allocated for the same address-stability
+    /// reason as `ev`: the VM's allocator captures its address.
+    scratch: *std.heap.ArenaAllocator,
     vm: VM,
 
     fn init() !Harness {
@@ -46,8 +49,14 @@ const Harness = struct {
         errdefer ev.deinit();
         _ = try ev.evaluate("null");
 
+        const scratch = try testing.allocator.create(std.heap.ArenaAllocator);
+        errdefer testing.allocator.destroy(scratch);
+        scratch.* = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer scratch.deinit();
+
         const vm = try VM.init(
-            ev.worker_arenas[0].allocator(),
+            scratch.allocator(),
+            null,
             &ev.registry,
             &ev.intern,
             &ev.heap,
@@ -63,11 +72,13 @@ const Harness = struct {
             ev.builtins_value.?,
             if (vm_mod.opcode_profile_enabled) unreachable else {},
         );
-        return .{ .ev = ev, .vm = vm };
+        return .{ .ev = ev, .scratch = scratch, .vm = vm };
     }
 
     fn deinit(self: *Harness) void {
         self.vm.deinit();
+        self.scratch.deinit();
+        testing.allocator.destroy(self.scratch);
         self.ev.deinit();
         testing.allocator.destroy(self.ev);
     }

@@ -55,6 +55,69 @@ pub const thunks_log_enabled = build_options.thunks_log;
 pub const OpcodeCounts = [opcode.count]u64;
 const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
 const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
+const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const vma = @import("runtime").vma;
+
+/// Reusable VM buffers — the value stack + frame stack, the two large
+/// per-VM allocations (~0.5 MB together). Pooled by the evaluator:
+/// nested import VMs are created ~2.6K times per NixOS eval, and each
+/// used to bump-allocate a fresh stack out of the worker arena that was
+/// then "freed" into the void (arena free is a no-op) — ~245 MB of
+/// once-touched, never-reused pages at w=1. Reuse keeps the working set
+/// at the max-concurrent-VM high-water instead, and stops the re-fault
+/// churn. Buffers come back dirty; that's fine — every consumer is
+/// bounded by `sp`/`frames_len`, including the GC's stack scan
+/// (eval/gc.zig marks `stack[0..sp]`).
+pub const BufferPool = struct {
+    allocator: std.mem.Allocator,
+    mu: SpinMutex = .{},
+    list: std.ArrayListUnmanaged(Buffers) = .empty,
+
+    pub const Buffers = struct { stack: []Value, frames: []Frame };
+
+    pub fn init(allocator: std.mem.Allocator) BufferPool {
+        return .{ .allocator = allocator };
+    }
+
+    /// All VMs must be dead (buffers released or freed) before this.
+    pub fn deinit(self: *BufferPool) void {
+        for (self.list.items) |bufs| {
+            self.allocator.free(bufs.stack);
+            self.allocator.free(bufs.frames);
+        }
+        self.list.deinit(self.allocator);
+    }
+
+    pub fn acquire(self: *BufferPool) !Buffers {
+        self.mu.lock();
+        if (self.list.pop()) |bufs| {
+            self.mu.unlock();
+            return bufs;
+        }
+        self.mu.unlock();
+        // RSS attribution (runtime/vma.zig): VM buffers get their own
+        // bucket so the report separates them from transient blocks.
+        const prev_tag = vma.setAllocTag(.worker_arena);
+        defer _ = vma.setAllocTag(prev_tag);
+        const value_stack = try self.allocator.alloc(Value, types.VM_STACK_CAP);
+        errdefer self.allocator.free(value_stack);
+        const frames = try self.allocator.alloc(Frame, types.MAX_FRAMES);
+        return .{ .stack = value_stack, .frames = frames };
+    }
+
+    pub fn release(self: *BufferPool, bufs: Buffers) void {
+        self.mu.lock();
+        const appended = blk: {
+            self.list.append(self.allocator, bufs) catch break :blk false;
+            break :blk true;
+        };
+        self.mu.unlock();
+        if (!appended) {
+            self.allocator.free(bufs.stack);
+            self.allocator.free(bufs.frames);
+        }
+    }
+};
 
 /// A single call frame.
 pub const Frame = struct {
@@ -153,6 +216,9 @@ pub const VM = struct {
     /// caller's depth (see `Evaluator.evaluateSource`).
     native_depth: u32 = 0,
 
+    /// Where `stack`/`frames` came from and where `deinit` returns them:
+    /// the evaluator's shared pool, or (null — tests, tools) `allocator`.
+    buffer_pool: ?*BufferPool,
     /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
     /// logical length.
     stack: []Value,
@@ -244,6 +310,7 @@ pub const VM = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        buffer_pool: ?*BufferPool,
         registry: *ChunkRegistry,
         intern: *InternTable,
         heap: *ObjectHeap,
@@ -259,11 +326,14 @@ pub const VM = struct {
         builtins_value: Value,
         opcode_profile_sink: OpcodeProfileSink,
     ) !VM {
-        const value_stack = try allocator.alloc(Value, types.VM_STACK_CAP);
-        errdefer allocator.free(value_stack);
-
-        const frames = try allocator.alloc(Frame, types.MAX_FRAMES);
-        errdefer allocator.free(frames);
+        const bufs: BufferPool.Buffers = if (buffer_pool) |bp| try bp.acquire() else blk: {
+            const value_stack = try allocator.alloc(Value, types.VM_STACK_CAP);
+            errdefer allocator.free(value_stack);
+            const frames = try allocator.alloc(Frame, types.MAX_FRAMES);
+            break :blk .{ .stack = value_stack, .frames = frames };
+        };
+        const value_stack = bufs.stack;
+        const frames = bufs.frames;
 
         return .{
             .allocator = allocator,
@@ -283,6 +353,7 @@ pub const VM = struct {
             // Placeholder; overwritten by Worker.allocateFiber with the
             // fiber's globally-allocated id before the VM runs anything.
             .claimer_id = thunk_mod.INVALID_CLAIMER,
+            .buffer_pool = buffer_pool,
             .stack = value_stack,
             .sp = 0,
             .sp_high_water = 0,
@@ -307,13 +378,30 @@ pub const VM = struct {
         return worker_id_mod.current;
     }
 
+    /// The owner is about to reset the arena backing `allocator` (fiber
+    /// recycle — see WorkerFiber.recycleScratch): drop any capacity this
+    /// VM retains there. The lists are logically empty between tasks
+    /// (roots/chains are scoped to a force); only their capacity lives on.
+    pub fn onScratchReset(self: *VM) void {
+        if (comptime build_options.gc) {
+            std.debug.assert(self.gc_force_chain.items.len == 0);
+            std.debug.assert(self.gc_temp_roots.items.len == 0);
+            self.gc_force_chain = .empty;
+            self.gc_temp_roots = .empty;
+        }
+    }
+
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
         if (comptime tjit_record.enabled) tjit_record.cleanup(self);
         if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);
         if (comptime build_options.gc) self.gc_temp_roots.deinit(self.allocator);
-        self.allocator.free(self.stack);
-        self.allocator.free(self.frames);
+        if (self.buffer_pool) |bp| {
+            bp.release(.{ .stack = self.stack, .frames = self.frames });
+        } else {
+            self.allocator.free(self.stack);
+            self.allocator.free(self.frames);
+        }
     }
 
     /// Evaluate a chunk and return its result.
