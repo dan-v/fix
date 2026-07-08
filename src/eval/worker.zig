@@ -74,6 +74,11 @@ pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32, s
 /// flight than the prewarm count.
 pub const prewarm_fiber_count: u8 = 4;
 
+/// Overflow-fiber stack release flavor: true = MADV_FREE (default),
+/// false = MADV_DONTNEED. Process-wide; set from `FIX_FIBER_MADV`
+/// before workers spawn (eval.zig `evaluate`).
+pub var stack_release_lazy: bool = true;
+
 /// Fiber cost/benefit census (piggybacks on `-Dprof-main`; see
 /// `prof.FiberLocal`). Comptime-gated so the default build's structs
 /// and hot paths are untouched.
@@ -158,6 +163,10 @@ pub const WorkerFiber = struct {
     current_lane: scheduler_mod.Lane = .spec,
     /// Free-list link. Only the owning worker manipulates this.
     next_free: ?*WorkerFiber,
+    /// Stack pages were madvised away while parked on the free list
+    /// (see Worker.sweepFreeStacks). Cleared on reuse. Guarded by the
+    /// owning worker's `free_mu`.
+    stack_released: bool = false,
     /// Ready-queue node (scheduler-owned linked list). Set by
     /// `wakeImpl`; cleared by the ready-queue pop.
     ready_node: scheduler_mod.ReadyNode,
@@ -205,6 +214,13 @@ pub const Worker = struct {
     /// finishes routes its completion back to the owning worker's free
     /// list). Consumer: this worker only.
     free_head: ?*WorkerFiber,
+    /// Depth of the `free_head` list. Drives the stack-release policy:
+    /// fibers parked deeper than the prewarm count are spike overflow
+    /// (a burst of blocking work grew the pool) and give their stack
+    /// pages back to the OS — 8 MiB dirty reservations otherwise stay
+    /// resident forever, and 99.9% of tasks are served by the first
+    /// (still-warm) `prewarm_fiber_count` fibers.
+    free_count: u32,
     free_mu: stable.SpinMutex,
 
     shutdown_requested: std.atomic.Value(u8),
@@ -246,6 +262,7 @@ pub const Worker = struct {
             .init_vm_fn = init_vm_fn,
             .fibers = .empty,
             .free_head = null,
+            .free_count = 0,
             .free_mu = .{},
             .shutdown_requested = .init(0),
             .idle_ns = 0,
@@ -768,6 +785,10 @@ pub const Worker = struct {
         }
 
         self.flushTimingToScheduler();
+        // About to sleep: idle time is free — give parked overflow fibers'
+        // dirty stacks back to the OS (never on the task-completion path;
+        // measured ~107K madvise calls/eval there, ~2µs each).
+        self.sweepFreeStacks();
         const t0 = nanoMonotonic();
         const pt = prof.start(.park_main_worker);
         timeline.begin(.park, "", 0);
@@ -776,6 +797,36 @@ pub const Worker = struct {
         prof.end(.park_main_worker, pt);
         const t1 = nanoMonotonic();
         if (t1 > t0) self.idle_ns += t1 - t0;
+    }
+
+    /// Release the stacks of free-list fibers beyond the prewarm depth
+    /// (spike overflow, parked with dirty 8 MiB reservations — spikes
+    /// reach ~196 live fibers, so up to ~1.5 GB of once-touched pages).
+    /// Runs only when this worker is about to park. Candidates are
+    /// collected under `free_mu` but madvised outside it — safe because
+    /// the free list's consumer is THIS worker only (see `free_head`),
+    /// and it is here, not popping; concurrent `pushFree` from other
+    /// workers only prepends. The `stack_released` flag (cleared on
+    /// reuse) makes each park-cycle release a fiber at most once.
+    fn sweepFreeStacks(self: *Worker) void {
+        var batch: [64]*WorkerFiber = undefined;
+        var n: usize = 0;
+        self.free_mu.lock();
+        var cursor = self.free_head;
+        var depth: u32 = 0;
+        while (cursor) |f| : (cursor = f.next_free) {
+            depth += 1;
+            if (depth <= prewarm_fiber_count) continue; // keep the hot head warm
+            if (f.stack_released) continue;
+            f.stack_released = true;
+            batch[n] = f;
+            n += 1;
+            if (n == batch.len) break;
+        }
+        self.free_mu.unlock();
+        for (batch[0..n]) |f| {
+            f.inner.releaseStackPages(retained_stack_bytes, stack_release_lazy);
+        }
     }
 
     /// Pick a task from own queues (not stolen → `victim` stays null) or steal
@@ -812,7 +863,11 @@ pub const Worker = struct {
         self.free_mu.lock();
         if (self.free_head) |head| {
             self.free_head = head.next_free;
+            self.free_count -= 1;
             head.next_free = null;
+            // Reused: its stack will re-dirty; a later idle sweep may
+            // release it again.
+            head.stack_released = false;
             self.free_mu.unlock();
             if (comptime census_on) self.census.free_hits += 1;
             return head;
@@ -863,11 +918,17 @@ pub const Worker = struct {
         return f;
     }
 
+    /// How much of a released fiber's stack stays resident: covers the
+    /// dispatch machinery + a shallow task so a re-used overflow fiber
+    /// rarely faults at all.
+    const retained_stack_bytes: usize = 64 * 1024;
+
     fn pushFree(self: *Worker, f: *WorkerFiber) void {
         self.free_mu.lock();
         defer self.free_mu.unlock();
         f.next_free = self.free_head;
         self.free_head = f;
+        self.free_count += 1;
     }
 
     /// Pop a fiber from this worker's ready queue, or steal one from

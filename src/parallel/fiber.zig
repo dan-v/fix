@@ -224,6 +224,31 @@ pub const Fiber = struct {
         self.* = undefined;
     }
 
+    /// Give the stack's dirty pages back to the OS (advisory), keeping
+    /// `retain_top` bytes at the top — the hot end; stacks grow down.
+    /// Call only on a `.finished`/`.ready` fiber: its frames are dead,
+    /// so page contents are garbage by definition and a later re-fault
+    /// reading zeros is indistinguishable from a fresh stack (`reset`
+    /// rewrites the trampoline slot, and running code always writes a
+    /// frame before reading it).
+    ///
+    /// `lazy` picks MADV_FREE (pages reclaimed only under memory
+    /// pressure — free to call, RSS drops only when it matters) over
+    /// MADV_DONTNEED (immediate reclaim, visible RSS drop, guaranteed
+    /// re-fault on reuse).
+    pub fn releaseStackPages(self: *Fiber, retain_top: usize, lazy: bool) void {
+        if (comptime builtin.os.tag != .linux) return;
+        // The stack-probe watermark scan reads the whole stack; reclaimed
+        // pages would zero the sentinel pattern and skew it.
+        if (comptime stack_probe_enabled) return;
+        const page = std.heap.pageSize();
+        const keep = std.mem.alignForward(usize, retain_top, page);
+        if (self.stack.len <= keep) return;
+        const len = self.stack.len - keep; // stack.len is page-aligned (mmap)
+        const advice: u32 = if (lazy) std.os.linux.MADV.FREE else std.os.linux.MADV.DONTNEED;
+        _ = std.os.linux.madvise(@alignCast(self.stack.ptr), len, advice);
+    }
+
     /// Rewind the fiber so the next `resume_` starts a fresh invocation
     /// of `entry(arg)` on the same stack buffer. Used by Worker to
     /// recycle a `.finished` fiber for a new task without allocating a
@@ -554,6 +579,53 @@ test "reset recycles a finished fiber's stack for a fresh entry" {
     fiber.resume_();
     try testing.expect(ctx_b.ran);
     try testing.expectEqual(State.finished, fiber.state);
+}
+
+test "releaseStackPages: reused post-madvise fiber runs a deep-recursion task correctly" {
+    // Worker recycles fibers through the free list and (beyond the
+    // prewarm count) gives their stack pages back to the OS. A re-faulted
+    // zero page must be indistinguishable from a fresh stack: run a deep
+    // recursion, madvise the stack away, reset, and run another deep
+    // recursion that checksums its frames.
+    const Ctx = struct {
+        result: u64 = 0,
+        fn entry(arg: *anyopaque) void {
+            const ctx: *@This() = @ptrCast(@alignCast(arg));
+            ctx.result = deep(4000, 1);
+        }
+        // Enough frames to reach megabytes of stack; accumulates through
+        // the unwind so a corrupted frame corrupts the checksum.
+        fn deep(n: u64, acc: u64) u64 {
+            var pad: [256]u8 = undefined; // force real frame depth
+            pad[0] = @truncate(n);
+            std.mem.doNotOptimizeAway(&pad);
+            if (n == 0) return acc;
+            return deep(n - 1, acc +% n *% pad[0]);
+        }
+    };
+    var ctx: Ctx = .{};
+    var fiber = try Fiber.init(testing.allocator, Fiber.min_stack_bytes, Ctx.entry, &ctx);
+    defer fiber.deinit(testing.allocator);
+
+    fiber.resume_();
+    try testing.expectEqual(State.finished, fiber.state);
+    const first = ctx.result;
+    try testing.expect(first != 0);
+
+    // Both advice flavors, interleaved with reuse.
+    fiber.releaseStackPages(64 * 1024, true); // MADV_FREE
+    ctx.result = 0;
+    fiber.reset(Ctx.entry, &ctx);
+    fiber.resume_();
+    try testing.expectEqual(State.finished, fiber.state);
+    try testing.expectEqual(first, ctx.result);
+
+    fiber.releaseStackPages(64 * 1024, false); // MADV_DONTNEED
+    ctx.result = 0;
+    fiber.reset(Ctx.entry, &ctx);
+    fiber.resume_();
+    try testing.expectEqual(State.finished, fiber.state);
+    try testing.expectEqual(first, ctx.result);
 }
 
 test "reset is valid from the .ready state (never-resumed fiber)" {

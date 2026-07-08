@@ -681,6 +681,11 @@ pub const Evaluator = struct {
         // FIX_WORK_FIRST: route strict collection-force acceleration through the
         // work-first split-and-steal primitive instead of the eager fan-out.
         if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
+        // FIX_FIBER_MADV=dontneed: eager (visible-RSS) comparator for the
+        // overflow-fiber stack release; default is MADV_FREE (lazy reclaim).
+        if (self.env_map) |em| if (em.get("FIX_FIBER_MADV")) |s| {
+            worker_mod.stack_release_lazy = !std.mem.eql(u8, s, "dontneed");
+        };
         // FIX_NO_EAGER: disable the strictness-driven eager thunk submit
         // (see closures.zig makeBytecodeThunkFromCapturesEager) — A/B knob.
         if (self.env_map) |em| if (em.get("FIX_NO_EAGER")) |s| {
