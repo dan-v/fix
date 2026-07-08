@@ -210,10 +210,11 @@ pub const Object = union(enum) {
 /// This keeps the hot path off the global mutex on workloads that
 /// allocate many small ranges (lists, attrsets, closure upvalues).
 ///
-/// We only TLAB the range-typed stores (values, attrs, attr_positions).
-/// The `objects` store is still global so that `objects.count()` reflects
-/// the next ObjectId assigned — `buildAttrSet` predicts that id to
-/// construct the `builtins.builtins` self-reference.
+/// All four stores TLAB their allocation: a worker reserves a chunk under the
+/// store mutex, then hands out slots lock-free. The `objects` store also
+/// supports reserving a slot up front (`reserveObjectSlot`/`fillObjectSlot`) so
+/// a value can learn its own ObjectId before the object exists — how
+/// `buildAttrSet` builds the `builtins.builtins` self-reference.
 const OBJECT_CHUNK_SIZE: u32 = 256;
 const VALUE_CHUNK_SIZE: u32 = 1024;
 const ATTR_CHUNK_SIZE: u32 = 512;

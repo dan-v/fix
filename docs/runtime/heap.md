@@ -2,17 +2,17 @@
 
 *The object store and memory model: flat mmap slots, append-only stable segments, per-worker TLABs, and the layered `//` node.*
 
-Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`ObjectId`**, never by host pointer. `ObjectHeap` owns four append-only backing stores and hands out ids that stay valid for the store's lifetime. The union tag of an object slot is fixed at creation and never mutates — once a reader has a published ObjectId it can pattern-match without synchronization.
+Every non-immediate [`Value`](values.md) refers to a boxed runtime object by **`ObjectId`**, never by host pointer. `ObjectHeap` owns four backing stores and hands out ids that name an object for as long as it stays reachable. The heap is **non-moving** — an object's bytes never relocate — so a published `ObjectId` is a stable handle, and its union tag (fixed when the object is created) can be pattern-matched without synchronization.
 
 ## Mental model
 
-- **Ids are forever.** Object and [Intern](interning.md) ids are never reused or relocated; any pointer derived from one is valid until the store is torn down. (GC frees *slots* off a free list but does not move objects or invalidate ids — see [gc.md](../gc.md).)
+- **Non-moving, but slots recycle.** The heap never *moves* an object, so an `ObjectId` held by reachable state is never relocated or invalidated, and [Intern](interning.md) ids last the whole run. Object ids, though, are **reused**: when the [GC](../gc.md) collects it frees dead object slots to per-worker free lists, and a later allocation is handed the same id for a different object. (Under `-Dgc=false`, or while the collector stays dormant, the stores are strictly append-only and no id is ever reused.) Collection is stop-the-world and recycles only *unreachable* slots, so no reader sees a live slot change under it; a cache that stashes a bare `ObjectId` across a safepoint guards against reuse by keeping the referent rooted or pairing the id with a heap token.
 - **Readers lock-free, writers serialized.** Backing arrays never move, so reads are a single atomic segment-pointer load (or a bare load for the object store). Writers serialize per-store on a `SpinMutex` whose critical section is at most one allocator call.
 - **Values are position-independent.** Copying a `Value` copies 8 bytes; the referent lives in the shared heap.
 
 ## The object store: `FlatStore`
 
-The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `OBJECT_MAX_SLOTS = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory (a real eval produces ~millions of objects against that reservation for free). The base pointer is immutable after init, so `get(id)` collapses to one load — `base[id]` — with no segment decode and no per-access atomic. This access happens tens of millions of times on the NixOS toplevel, which is why the object store forgoes the segment machinery the range stores use. The object store stays global (not TLAB'd) so `objects.count()` predicts the next ObjectId (needed for the `builtins` self-reference).
+The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometric segments. `OBJECT_MAX_SLOTS = 2^30` slots are reserved virtually with `MAP_NORESERVE`; only touched pages cost physical memory (a real eval produces ~millions of objects against that reservation for free). The base pointer is immutable after init, so `get(id)` collapses to one load — `base[id]` — with no segment decode and no per-access atomic. This access happens tens of millions of times on the NixOS toplevel, which is why the object store forgoes the segment machinery the range stores use. Allocation is still per-worker TLAB'd (workers reserve chunks of the flat region and fill them lock-free); the flat single-region layout is only about the `get` path, not about how slots are handed out. The `builtins.builtins` self-reference reserves its slot up front (`reserveObjectSlot` → `fillObjectSlot`) so it can embed its own id before the object is filled.
 
 ## The range stores: `StableSegments`
 
