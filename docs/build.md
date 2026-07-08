@@ -6,27 +6,33 @@
 
 ## Model: clean-cut modules vs the coupled core
 
-Zig's `@import("<name>")` reaches a module only through its facade; the compiler then enforces that outside code cannot touch the module's internal files. `fix` uses this to carve out the subsystems that are genuinely tree-shaped from the engine that isn't. See [architecture.md](architecture.md) for the boundary rationale and [plans/cleanup-plan.md](plans/cleanup-plan.md) for the migration history.
+Zig's `@import("<name>")` reaches a module only through its facade; the compiler then enforces that outside code cannot touch the module's internal files. `fix` uses this to carve out the subsystems that are genuinely tree-shaped from the engine that isn't. See [architecture.md](architecture.md) for the boundary rationale.
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `syntax` | `src/syntax.zig` | — | lexer + parser + AST; no engine deps |
-| `runtime` | `src/runtime.zig` | `build_options` | values, heap, interning, thunk representation |
-| `parallel` | `src/parallel.zig` | `build_options`, `runtime` | fibers, scheduler, workers; adds arch asm `src/parallel/fiber/swap_x86_64.S` |
+| `containers` | `src/containers.zig` | — | lock-free work-stealing deques + cache-line isolation; bottom of the graph, depends only on `std` |
+| `syntax` | `src/syntax.zig` | `parser_tables` | lexer + parser + AST; no engine deps |
+| `runtime` | `src/runtime.zig` | `build_options`, `containers` | values, heap, interning, thunk representation, GC tracer |
+| `parallel` | `src/parallel.zig` | `build_options`, `runtime`, `containers` | fibers, scheduler, workers; adds arch asm `src/parallel/fiber/swap_x86_64.S` |
 | `derivation` | `src/derivation.zig` | `runtime` | derivation model, hashing, context |
-| `fix` (core) | `src/root.zig` | all of the above + `build_options` | bytecode, compiler, vm, eval/worker, support/trace, eval/progress, probe |
+| `fix` (core) | `src/root.zig` | all of the above + `build_options` | bytecode, compiler, vm, eval/worker, eval/progress, eval/gc, probe |
+| `cli` | `src/cli.zig` | `fix` + the shared set | command surface, arg parsing, subcommands, rendering, progress |
 
-The core stays monolithic because its cycles are real: chunk↔jit, force↔compiler, worker↔vm. Splitting them would need forward-declared interfaces that buy nothing. Everything else is a named module; reaching into one by relative path is a lint error (below).
+`containers`, `syntax`, `runtime`, `parallel`, `derivation`, and `cli` are the six clean-cut modules the linter guards. The core stays one module because its cycles are real: `vm/force ↔ compiler/deferred` (forcing a thunk can trigger compilation of its deferred body) and `eval/worker ↔ vm/force` (the worker drives the VM, whose force path re-enters the worker to schedule/steal). Splitting them would need forward-declared interfaces that buy nothing. Reaching into any named module by relative path is a lint error (below).
 
-The `exe` module (`src/main.zig`) and both root test artifacts pull in `fix` plus the same shared imports via `addSharedImports`.
+`cli` is its own module rather than part of the core: it imports `fix` by name, so the command tools reach the engine through its public facade instead of poking at engine internals. The `exe` module (`src/main.zig`) imports both `fix` and `cli`; it and every test artifact receive the same shared module set via `addSharedImports`.
+
+## Parser-table codegen
+
+The LALR parser tables are expensive to construct at comptime, so a standalone codegen tool builds them once and emits a plain `.zig` of literal arrays. `src/syntax/gen_parser_tables.zig` is compiled into the `gen-parser-tables` host executable, run as a build step whose single output file is fed to the `syntax` module as the anonymous import `parser_tables`. The build system caches the run and only re-executes it when the grammar or generator changes, keeping the table-construction cost off every ordinary rebuild. `zig build gen-parser-tables` runs it explicitly. Because the parser imports the generated `parser_tables`, `zig test src/syntax/parser.zig` cannot resolve it standalone — use `zig build test-syntax` for fast lexer/parser/AST iteration.
 
 ## Shared `build_options`
 
-Every `-D` flag is folded into one `build_options` module created **once** and injected into `runtime`, `parallel`, `derivation`, `fix`, and `exe`. This is load-bearing: importing the generated options file into two *different* module instances makes Zig treat them as two distinct types, so a single shared instance is the only way every subsystem sees the same flag set (and the same `bool` type for each flag).
+Every `-D` flag is folded into one `build_options` module created **once** and injected into `runtime`, `parallel`, `derivation`, `fix`, `cli`, and `exe`. This is load-bearing: importing the generated options file into two *different* module instances makes Zig treat them as two distinct types, so a single shared instance is the only way every subsystem sees the same flag set (and the same `bool` type for each flag).
 
 ### `-D` flag surface
 
-All are `bool`, off unless noted. Probe flags gate `-Dprof-main`-style instrumentation compiled into the core — see [perf/probes.md](perf/probes.md) for what each measures and the workers=1 caveats.
+All are `bool` and off unless noted. These are exactly the flags `build.zig` defines; there are no others. Profiling probes gate instrumentation compiled into the core — see [perf/probes.md](perf/probes.md) for what each measures and the workers=1 caveats.
 
 | Group | Flag | Effect |
 |---|---|---|
@@ -35,21 +41,15 @@ All are `bool`, off unless noted. Probe flags gate `-Dprof-main`-style instrumen
 | | `vm-trace` | enable VM execution tracing (surfaced by `--vm-trace`) → [cli.md](cli.md) |
 | | `thunks-log` | per-thunk lifecycle event log (surfaced by `--thunks-log`) → [cli.md](cli.md) |
 | | `fiber-stack-probe` | sentinel-fill fiber stacks for `maxStackUsedBytes`; forces full RSS commit |
-| JIT | `jit` | experimental native-code JIT, x86_64 Linux only → [jit.md](jit.md) |
-| | `tjit` | experimental tracing/inlining JIT (record→inline→sink→native + deopt) → [jit.md](jit.md) |
-| probes | `prof-main` | rdtsc-time the main thread's hot serial paths → [perf/probes.md](perf/probes.md) |
-| | `prof-path` | record the force-call tree + critical path (workers=1) → [perf/probes.md](perf/probes.md) |
-| | `trace-probe` | tracing-JIT headroom: per-thunk read-count + body-size histograms → [perf/probes.md](perf/probes.md) |
-| | `struct-census` | deforestation headroom: per-list/attrset consume-count histogram → [perf/probes.md](perf/probes.md) |
-| | `drv-probe` | derivation-build demand: resolved-ahead vs forced-inline, fanout, DAG depth → [perf/probes.md](perf/probes.md) |
-| | `opcode-ngram` | hottest adjacent opcode pairs for superinstruction fusion → [perf/probes.md](perf/probes.md) |
+| profiling | `prof-main` | rdtsc-time the main thread's hot serial paths; reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
+| | `prof-path` | record the force-call tree + critical path (workers=1); reported via `--print-sched-stats` → [perf/probes.md](perf/probes.md) |
 | | `timeline` | wall-clock per-worker event timeline; Perfetto JSON via `--timeline` → [perf/probes.md](perf/probes.md) |
-| | `gc` | GC Phase 0: sample live set, report peak-live vs total-allocated → [gc.md](gc.md), [perf/probes.md](perf/probes.md) |
+| memory | `gc` | include the generational collector (`--max-memory`-budgeted; dormant below half-budget, ~2% rooting tax). **Defaults on**; `-Dgc=false` builds the collector-free evaluator → [gc.md](gc.md) |
 | compilation | `profile` | keep symbols + frame pointers (sets `strip=false`, `omit_frame_pointer=false`) |
 
 Standard `zig build` options apply too: `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` and `-Dtarget=…`. Perf numbers assume `ReleaseFast` (or `ReleaseSafe`); `-Dprofile` only flips symbol/frame-pointer stripping, it does not change the optimize mode.
 
-The `--vm-trace` / `--thunks-log` / `--timeline` runtime flags are inert unless the matching `-D` flag compiled the machinery in (`--timeline` on a non-`-Dtimeline` build prints a warning and is ignored). Probe flags have no runtime toggle — they are build-time only, so exercising a probe means a rebuild.
+The `--vm-trace` / `--thunks-log` runtime flags are inert unless the matching `-D` flag compiled the machinery in. `--timeline` is a special case: the timeline probe is always compiled in and runtime-gated, so `--timeline[=path]` arms it with no rebuild. The `-Dprof-*` reports have no runtime toggle — they are build-time only, so exercising one means a rebuild, and its output surfaces through `--print-sched-stats`.
 
 ## Why LLVM is forced (`use_llvm = true`)
 
@@ -57,13 +57,15 @@ The threaded VM dispatcher (`src/vm/run.zig`) chains handlers with `@call(.alway
 
 ## Per-module test wiring
 
-`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `fix`, `exe_tests` over `exe`) therefore collect **only** core-module tests; `runtime`, `syntax`, `parallel`, and `derivation` are pulled into `fix` by module *name*, so their unit tests are invisible to the root artifacts. Each clean-cut module needs its own `addTest` step, run explicitly:
+`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `fix`, `exe_tests` over `exe`) therefore collect **only** core-module tests; a clean-cut module is pulled into `fix` by module *name*, so its unit tests are invisible to the root artifacts. Each clean-cut module needs its own `addTest` step, run explicitly:
 
 ```
-test → lint, mod_tests, exe_tests, runtime_tests, syntax_tests, parallel_tests, derivation_tests
+test → lint, mod_tests, exe_tests,
+       runtime_tests, syntax_tests, parallel_tests,
+       derivation_tests, containers_tests, cli_tests
 ```
 
-This wiring is easy to get wrong: a gap once silently skipped the `syntax`, `parallel`, and `derivation` unit tests entirely (they compiled, were just never *run*). When adding a clean-cut module, add its test step to `test_step` or its tests never execute.
+This wiring is easy to get wrong: a clean-cut module whose test step is missing from `test_step` still compiles but is never *run*. When adding a clean-cut module, add its test step to `test_step` or its tests never execute. `zig build test-syntax` runs the `syntax` tests alone for fast lexer/parser/AST iteration; `zig build bench -- <file.nix>` runs the parse microbenchmark against the `syntax` module.
 
 Integration tests live in the core graph (`src/root/tests`, `src/eval/tests`) so the root artifacts pick them up; `test/*.nix` holds pathology and spec fixtures driven through eval.
 
@@ -73,6 +75,6 @@ Integration tests live in the core graph (`src/root/tests`, `src/eval/tests`) so
 
 ## The correctness gate
 
-The oracle for every change is a **byte-identical `.drv`**: the emitted derivation must match Nix C++ exactly, and the interpreter is canonical (the JITs must reproduce it bit-for-bit). Any build option, module split, or optimization that perturbs `.drv` output is wrong regardless of speed. See [invariants.md](invariants.md).
+The oracle for every change is a **byte-identical `.drv`**: the emitted derivation must match Nix C++ exactly, and the interpreter is canonical. Any build option, module split, or optimization that perturbs `.drv` output is wrong regardless of speed — including `-Dgc`, whose collection must leave output bit-for-bit identical. See [invariants.md](invariants.md).
 
 Code: `build.zig` / `tools/lint_imports.zig`

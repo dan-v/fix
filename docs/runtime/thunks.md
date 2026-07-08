@@ -39,7 +39,7 @@ Thunk (~24B core + 24B payload)
 | `closure` | Call a `Value` (user closure → run its chunk; builtin/builtin-closure → apply) | The general case. |
 | `bytecode` | Run `chunk_id` with captured upvalues | Up to `INLINE_CAP` = 2 upvalues live **inline** in the thunk (one alloc, one cache line on the force path); wider captures spill to a slice in the [heap's `values` store](heap.md). `upvalue_count` *is* the discriminant — no tag word, struct stays 24B. |
 | `pass_through` | Force a wrapped `Value`, memoize its result | How the compiler models recursive let cells; also `deepSeq`-style memo. |
-| `attr_access` | `getAttrValue(base, name)` directly | **Frameless, O(1)**: no frame push, no bytecode dispatch. Replaces the `get_upvalue_attr; ret` thunk shape (`config.foo`, `lib.bar`, attrset-pattern params) — `run_isolated_frame` is the biggest machinery bucket on the serial critical path, so short-circuiting it matters. |
+| `attr_access` | `getAttrValue(base, name)` directly | **Frameless, O(1)**: no frame push, no bytecode dispatch. Serves the overwhelmingly common `someUpvalue.attr` shape (`config.foo`, `lib.bar`, attrset-pattern params) directly; a `bytecode` thunk over a tiny `get_upvalue_attr; ret` chunk would instead run a whole isolated frame, and `run_isolated_frame` is the biggest machinery bucket on the serial critical path. |
 | `deferred` | Compile an AST node on first force, then run like `bytecode` | Lazy per-attr compilation of huge generated attrsets (e.g. nixpkgs hackage-packages). The compiled `ChunkId` is cached on the shared `DeferredTable` entry; see [lazy-compile](../compiler/lazy-compile.md). |
 
 Inline-vs-spill storage is mirrored in `deferred` so that arm doesn't widen the union either.
@@ -94,7 +94,7 @@ The result store *happens-before* the state release-store; a reader that acquire
 
 `forceThunkImpl`: hit the [GC](../gc.md) safepoint (collections only fire at `native_depth == 0` — never mid-builtin), `tryClaim`, then on `.claimed` check the [memo](#thread-local-thunk-result-memo) and `evalThunkTarget`:
 
-- `bytecode` / `deferred` → `runBytecodeChunk` (tracing-[JIT](../jit.md) → native JIT → interpreter via `run_isolated_frame`)
+- `bytecode` / `deferred` → `runBytecodeChunk`, which runs the chunk on a fresh interpreter frame (`run_isolated_frame` — the interpreter is the sole execution engine)
 - `closure` → force+call (user chunk, or `applyBuiltin`)
 - `attr_access` → frameless `getAttrValue`
 - `pass_through` → recurse `forceValue` on the wrapped value
@@ -123,11 +123,11 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 
 ## Invariants & gotchas
 
-- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). **It is NOT a safe general retry:** re-running a body after `StackOverflow` historically produced a *different* value (surfaced by a VM stack shrink). Deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
+- **`reset()` is transient-only.** It drops to `.unresolved` and wakes waiters to retry — used *only* for `error.OutOfMemory`, `error.StackOverflow`, `error.SpeculativeBail` (the target arm is untouched; a transient failure never wrote a result). **It is NOT a safe general retry:** re-running a body after `StackOverflow` can yield a *different* value (a shrunk VM stack changes what the body computes). Deterministic failures instead go **sticky** via `.errored`, replaying the cached `ErrorInfo` on every later force.
 - **Terminal states never revert** — except the binding-cell's deliberate `.evaluating → .unresolved` publish.
 - **Claim is per-fiber**, not per-worker. Never key blackhole/claim decisions on the OS thread.
 - **Thunks are GC-rooted through the in-flight force chain** (`vm.gc_force_chain` roots the `.evaluating` thunk's target closure / upvalues / attr-access base). See [gc](../gc.md).
 - **Speculative forcing** (`forceValueSpeculative`) resolves without setting `demanded` and raises `in_speculation`, which (a) stops new thunks from cascading further speculation and (b) lets big builtin loops `error.SpeculativeBail` (a transient reset) once the demanded result is already in hand — bounding one wrong guess. See [speculation](../parallel/speculation.md).
-- **Single-owner ranges.** Every `ValueRange` / `AttrRange` a thunk's upvalues spill into is single-owner (struct-census invariant), so the GC marks objects not ranges.
+- **Single-owner ranges.** Every `ValueRange` / `AttrRange` a thunk's upvalues spill into is single-owner (a structural invariant), so the GC marks objects not ranges.
 
 Code: `src/runtime/thunk.zig`, `src/vm/force.zig`

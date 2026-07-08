@@ -34,7 +34,7 @@ Some Nix files are enormous machine-generated attrsets (e.g. `hackage-packages.n
 At compile time, for a deferring set:
 
 1. **Snapshot the enclosing scope** — capture the ancestor bindings visible to the value bodies, each resolved to a `.local` slot or `.upvalue` index, then the subject values of the active `with` scopes (innermost-first, via `collectWithScopes` — the same capture plumbing a with-lookup uses), all capped at `MAX_SCOPE`. The entry records how many trailing snapshot slots are with-subjects (`with_count`).
-2. **Register an `Entry` per leaf** — the value's AST node + that scope snapshot, into the deferred table (keyed by a table id). The evaluator **retains the file's source text and AST arena** so the node stays live.
+2. **Register an `Entry` per leaf** — the value's AST node + that scope snapshot, into the deferred table (keyed by a table id). The snapshot is **adopted once** (`adoptScope`) and shared by every entry of the set, and the base/source paths are content-deduped (`internPath`), so a 19k-entry generated set does not dupe 19k copies. The evaluator **retains the file's source text and AST arena** so the node stays live.
 3. **Emit `defer_attr_value`** — carrying the table id + an environment descriptor array (the snapshot, as [capture descriptors](scopes.md)). The attrset is built with these as deferred thunks.
 
 At **force time** (`deferred.compile`), on first demand:
@@ -52,7 +52,8 @@ force time:     synthetic parent(locals = snapshot) → compile child (captures 
 ### Correctness
 
 - **Byte-identical to eager.** The synthetic-parent trick guarantees the produced bytecode is equivalent to what an eager compile emitted — the only difference is *when* it is compiled, and internal upvalue numbering (never observable in output).
-- **Concurrency-safe.** Each forcer builds its own chunk on a per-body scratch arena; `register` is internally serialized; the CAS on the cached `ChunkId` ensures a single winner. Runs on any worker.
+- **Concurrency-safe.** Each forcer builds its own chunk on a per-body scratch arena; `register` is internally serialized; the CAS on the cached `compiled` word (`ChunkId + 1`, `0` = uncompiled) ensures a single winner (the loser's chunk is orphaned but correct). Runs on any worker.
+- **Elision-aware.** A deferred leaf's body may itself be an `.elided` span that the parser never parsed; `deferred.compile` sub-parses it at first force (into a throwaway arena, never mutating the shared AST), so a syntax error inside an elided body surfaces at force time rather than parse time.
 - **One funnel.** Deferred and eager compilation share `finishCompiledChild`, so strictness stamping / trivial classification / registration are identical.
 
 ---

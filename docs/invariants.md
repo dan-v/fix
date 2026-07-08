@@ -7,7 +7,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## Correctness oracle
 
 - **Byte-identical `.drv`.** Evaluation must produce the exact store paths `nix-instantiate` does. It's the ground-truth test for every change — a perf win that alters a store path is a bug. What must match exactly (ATerm ordering & escaping, `hashModuloInputs`, nixBase32, fixed-output `r:` logic) is enumerated in [derivation/hashing](derivation/hashing.md).
-- **The interpreter is canonical.** The [JIT](jit.md), [GC](gc.md), and [probes](perf/probes.md) are opt-in (`-D…`), off by default, and must never change output or behavior — only speed, memory, or measurement. Keep the interpreter path fully working; don't let an experimental path become load-bearing.
+- **The interpreter is the sole engine and is canonical.** The [GC](gc.md) (`-Dgc`) and the [probes](perf/probes.md) (`-D…`) must never change output or behavior — only speed, memory, or measurement. Output is byte-identical whether the collector is dormant, collecting, or absent; a diagnostic path must never become load-bearing.
 - **Determinism.** Everything that feeds a hash is canonically sorted (attrset entries, drv outputs/inputs/srcs/env, path refs). [String context](derivation/context.md) must propagate through every string op, or a derivation loses inputs.
 
 ## Values & memory
@@ -41,5 +41,5 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## Build & structure
 
 - **LLVM is forced** (`use_llvm=true`) because the threaded dispatcher relies on `@call(.always_tail)`; other backends would unbounded-recurse. → [build](build.md), [vm/dispatch](vm/dispatch.md)
-- **Module-boundary hygiene.** Import a clean-cut module (`syntax`/`runtime`/`parallel`/`derivation`) by name through its facade — never a relative path into its internals (that silently duplicate-compiles). `zig build lint` enforces it, and those modules' unit tests need explicit test steps. → [build](build.md)
-- **Chunks are immutable after registration** (JIT code is attached at register time, not later). Per-thread inline caches/memos are guarded by `heap_token`. → [vm/dispatch](vm/dispatch.md)
+- **Module-boundary hygiene.** Import a clean-cut module (`containers`/`syntax`/`runtime`/`parallel`/`derivation`/`cli`) by name through its facade — never a relative path into its internals (that silently duplicate-compiles into an incompatible second type). `zig build lint` enforces it, and those modules' unit tests need explicit test steps. → [build](build.md)
+- **Chunks are immutable after registration**, and their constants are permanent GC roots (never swept). Per-thread inline caches/memos are guarded by `heap_token`. → [vm/dispatch](vm/dispatch.md)

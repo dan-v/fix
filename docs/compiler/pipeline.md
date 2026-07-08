@@ -4,62 +4,78 @@
 
 ## Mental model
 
-The compiler is a **recursive tree-walk that emits [bytecode](../vm/dispatch.md) as it descends** — no separate IR, no optimization pass over a built graph. `Compiler.compile()` dispatches on the [AST `Node.tag`](../syntax/parsing.md) and hands each node to the module that owns its shape. Emission is *stack-oriented*: every node lowers to a sequence that leaves exactly one value on the VM operand stack. Sub-expressions are compiled left-to-right; the parent emits its own op after its children.
+The compiler is a **recursive tree-walk that emits [bytecode](../vm/dispatch.md) as it descends** — no separate IR, no optimization pass over a built graph. `Compiler.compileNode()` dispatches on the [AST `Node.tag`](../syntax/parsing.md) and hands each node to the module that owns its shape. Emission is *stack-oriented*: every node lowers to a sequence that leaves exactly one value on the VM operand stack. Sub-expressions are compiled left-to-right; the parent emits its own op after its children.
 
-A `Compiler` instance compiles **one chunk** (one function body / thunk body / file body). Nested bodies (thunks, lambdas, deferred attrs) spawn a **child Compiler** linked by `parent` — the chain drives [name resolution and capture](scopes.md). Scratch state (locals, captures, diagnostics) lives on an arena and dies with the unit; only bytecode, constants, and the source map are duped onto the persistent allocator.
+A `Compiler` instance compiles **one chunk** (one function body / thunk body / file body). Nested bodies (thunks, lambdas, deferred attrs) spawn a **child Compiler** linked by `parent` — the chain drives [name resolution and capture](scopes.md). Scratch state (locals, captures, diagnostics, strictness maps) lives on a per-unit arena and dies with the unit; only bytecode, constants, and the source map are duped onto the persistent allocator at `finish`.
 
 ## Dispatch → domain modules
 
+`compileNodeImpl` is the dispatch switch. The high-level node compilers live in cohesive sibling modules; `ops.zig` is a thin facade re-exporting the entry points for `fold`, `lambda`, and `let`, so callers dispatch through `ops.X`.
+
 | Node family | Module | Lowers |
 | --- | --- | --- |
-| int / float / string / path / identifier | `literals` | immediates, interpolation, path resolution, `id → local`/`upvalue`/`with` |
-| binary / unary / apply / lambda / let | `ops` | operators, calls, closures, `let` bindings; constant-folds; `call_n` flattening |
+| int / float / string / path / search-path / identifier | `literals` | immediates, interpolation (`concat_strings`), path resolution, `id → local`/`upvalue`/`with` |
+| bool / null | (inline) | a single `push_true`/`push_false`/`push_null` op |
+| binary / unary | `fold` (via `ops`) | operators; compile-time constant folding |
+| apply / lambda / lambda_attrs | `lambda` (via `ops`) | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`tail_call_n` spine flattening |
+| let | `let` (via `ops`) | `let` binding classification, cell elision, eager elision |
 | if / assert / with | `control` | branch/join, assertion guard, dynamic-scope push |
-| attrset (static/dynamic/rec/inherit) | `attrs` | attr construction, merge, deferred-set gating |
-| attr access / `?` has-attr | `access` | static/dynamic/mixed attr paths, `or`-defaults |
+| attrset (static/dynamic/rec/inherit) | `attrs` | attr construction, merge, `inherit`, deferred-set gating |
+| attr access / `?` has-attr / list | `access` | static/dynamic/mixed attr paths, `or`-defaults, list building |
+| free-variable collection | `refs` | conservative name-set walk shared by `let`/`lambda` classification |
+| name resolution & capture | `scope` | local slots, upvalue threading, `with`-scope collection |
+| must-force analysis + stamp | `strictness` | strictness masks, per-param must-force, body span |
 | low-level byte emission + fusion | `emit` | opcode + LE operand writes, super-op fusion, jump patching |
 
-`ops.zig` is the high-level node→ops layer; `emit.zig` is the low-level layer. Domain modules call `emit` to write bytes; `emit` never walks the AST.
+Domain modules call `emit` to write bytes; `emit` sees only opcodes/operands and never walks the AST.
 
 ## ChunkBuilder → Chunk
 
 `ChunkBuilder` accumulates, during the walk:
 
 - **code** — opcode bytes + little-endian operands.
-- **constants** — a pool of [`Value`s](../runtime/values.md); ops reference by index. Duplicate literals may be pooled.
-- **function_args** — attrset-pattern parameter names, retained for `builtins.functionArgs`.
-- **source_map** — `bytecode byte-range → SourceSpan` entries, emitted at `compileNode` exit; runtime stack traces bind a program counter back to file/line/col.
-- **fusion_savings** — bytes elided by `_ret` rewrites (see below).
+- **constants** — a pool of [`Value`s](../runtime/values.md); ops reference by index.
+- **function_args** — attrset-pattern parameter names + a has-default flag, retained for `builtins.functionArgs`.
+- **source_map** — sparse `bytecode byte-range → SourceSpan` entries, added at `compileNode` exit; runtime stack traces bind a program counter back to file/line/col.
+- **body_span** — a single representative span for the whole body, stamped even when `source_map` is empty (it is sparse). Labels a thunk quantum / demand wait in the timeline.
+- **fusion_savings** — bytes elided by fusion rewrites (see below).
+- **strictness / strict_param / strict_via_upvalue / arity / strict_params** — scheduling metadata written by the `strictness` stamp and `compileLambda` before `finish`.
 
-At **finish** (`ChunkBuilder.finish`), in one pass:
+The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body compilation**, before `finish`: it computes the [must-force upvalue masks](strictness.md) and records `body_span`.
 
-1. **Strictness stamp** — [must-force upvalue masks](strictness.md) computed and written into `SchedulingHints`.
-2. **Trivial-body classify** — the finished body is matched against ~8 shapes once (see [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
-3. **Register** — `ChunkRegistry.register` assigns a sequential immutable `ChunkId` and (if `-Djit`) installs a native entry point.
+At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
 
-The frozen **Chunk** carries: `code`, `constants`, `arity`, `local_count`, per-param strictness, `SchedulingHints` (strictness masks + `body_is_substantial` + `trivial` + `strict_param`), `function_args`, `source_map`, and JIT slots.
+1. **body_is_substantial** — `code.len + fusion_savings ≥ SPECULATION_MIN_CODE_BYTES` (256), gating [speculation](../parallel/speculation.md).
+2. **Trivial-body classify** — the finished body is matched against ~8 shapes once (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
+3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
+
+The caller then registers the frozen Chunk: `ChunkRegistry.register` assigns a **sequential, immutable `ChunkId`** and caches the hot scheduling metadata (`trivial`, `body_is_substantial`) in a dense per-chunk slot so the thunk-creation path reads it without chasing the Chunk pointer.
+
+The frozen **Chunk** carries: `code`, `constants`, `local_count`, `arity`, `strict_params` (per-param must-force bitmask for uncurried chunks), `SchedulingHints` (`strictness` masks + `body_is_substantial` + `trivial` + `strict_param` + `strict_via_upvalue`), `function_args`, `source_map`, and `body_span`.
 
 ```
 ChunkBuilder (mutable, arena)                 Chunk (immutable, persistent)
-  code[] constants[] function_args[]   finish   code arity local_count
-  source_map[] fusion_savings          ──────▶  strict-params SchedulingHints
-  + strictness stamp + trivial classify         source_map jit-slots  → ChunkId
+  code[] constants[] function_args[]  stamp   code arity local_count
+  source_map[] fusion_savings         ─────▶   strict_params SchedulingHints
+  + strictness masks + body_span      finish    source_map body_span  → ChunkId
 ```
 
 ## Constant folding & call_n flattening
 
-- **Constant folding** — arithmetic/comparison over literal operands is evaluated at compile time in `ops`, emitting a single `constant` instead of the op sequence.
-- **`call_n` flattening** — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). When the callee is an **arity-matched uncurried (merged) lambda**, the spine is flattened to a single `call_n K`: K args pushed, body run in **one frame**. Each spine argument compiles as a plain lazy thunk; the saturated `call_n` path then eagerly forces the argument positions the callee's per-param strictness marks must-force. Non-matching applications keep the nested `call` form.
+- **Constant folding** (`fold.zig`) — arithmetic/comparison over literal operands is evaluated at compile time, emitting a single `constant` instead of the op sequence.
+- **`call_n` flattening** (`lambda.zig`) — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). For `K ≥ 2` the spine is flattened to a single `call_n K`: the callee is compiled, then K args pushed, then `call_n K`. When the callee is an **arity-matched uncurried (merged) lambda** the body runs in **one frame** with no intermediate closure/PAP allocation; a non-matching callee folds one arg at a time (same result). Each spine argument compiles as an immediate container value or a plain lazy thunk (not the runtime-adaptive `apply_arg`, whose callee probe is only valid for the first arg); the saturated `call_n` path then eagerly forces the argument positions the callee's `strict_params` mark must-force. `K == 1` keeps the single-arg path (eager-strict-arg + tail-call frame reuse).
 
 ## Super-op fusion (in `emit`)
 
 Fusion rewrites the *last emitted op in place* when the next emission completes a known pattern — no peephole pass. It is byte-for-byte behavior-preserving; the fused op is a single [dispatch](../vm/dispatch.md) instead of two.
 
-- `<op> + ret` → `<op>_ret` (`constant_ret`, `get_upvalue_ret`, `get_local_ret`) — the value-producing op returns directly, skipping a standalone `ret`.
-- `get_upvalue + get_attr` → `get_upvalue_attr`; `get_local + get_attr` → `get_local_attr` — fuses only when the attr name is a static InternId (not dynamic/interpolated).
-- `thunk_captures + set_local` → `*_store_local` / `*_store_cell_local` — fused thunk-create-and-store, for 1-byte (narrow) slots only.
+- `<op> + ret` → `<op>_ret` (`constant_ret`, `get_upvalue_ret`, `get_local_ret`, `get_local_ret_long`) — the value-producing op returns directly, skipping a standalone `ret`.
+- `get_upvalue + get_attr` → `get_upvalue_attr`; `get_local + get_attr` → `get_local_attr` / `get_local_attr_long` — fuses only when the attr name is a static InternId that fits in `u16`.
+- `thunk_captures(_eager) + set_local` → `*_store_local` / `*_store_cell_local` — fused thunk-create-and-store, for 1-byte (narrow) slots and short chunk ids only.
 
-Every rewrite that shrinks the code adds the saved bytes to **`fusion_savings`**, which is added back to `code.len` when deciding `body_is_substantial` — so the [speculation](../parallel/speculation.md) size threshold stays calibrated after `_ret` collapses a body.
+A branch fixup (`patchJump`) that lands at the current write position drops the `last_op_offset` fusion hint, so a multi-predecessor join never fuses across control flow.
+
+Every rewrite that shrinks the code adds the saved bytes to **`fusion_savings`**, which is added back to `code.len` when deciding `body_is_substantial` — so the [speculation](../parallel/speculation.md) size threshold stays calibrated after fusion collapses a body.
 
 ## Tail-position lowering
 
@@ -75,13 +91,13 @@ Lambda and thunk bodies are compiled via `compileTailExpression`, so a body endi
 
 ## Lowering notes by family
 
-**attrs** — static keys build the attrset directly; dynamic/interpolated keys emit `get_attr_dynamic`-family construction; `rec` sets self-reference via cells so bindings see each other; `inherit` (plain and `inherit (e)`) copies named attrs from the current scope or a source expression. Large file-scope generated sets may defer per-attr compilation — see [lazy-compile.md](lazy-compile.md).
+**attrs** — static keys build the attrset directly (`build_attrs` / `build_attrs_with_pos`, `_sorted` variants when the entries were emitted in ascending interned-name order so the runtime skips a sort + dedup); dynamic/interpolated keys emit dynamic construction; `rec` sets self-reference via cells so bindings see each other; `inherit` (plain and `inherit (e)`) copies named attrs from the current scope or a source expression. Large file-scope generated sets may defer per-attr compilation — see [lazy-compile.md](lazy-compile.md).
 
-**access** — a static dotted path `a.b.c` lowers to one `get_attr_path` super-op over a packed segment operand; a path containing interpolation lowers to `get_attr_path_mixed`; a single dynamic key lowers to `get_attr_dynamic`. `or`-defaults get `*_or` variants carrying the fallback as a thunk. `?` has-attr mirrors the static/dynamic/mixed split.
+**access** — a static dotted path `a.b.c` compiles the root then emits one `get_attr` per segment (the first fusing into `get_local_attr` / `get_upvalue_attr`); an interpolated segment emits `get_attr_dynamic`. `or`-defaults use packed segment super-ops carrying the fallback as a thunk: `get_attr_path_or` (all-static path), `get_attr_path_mixed_or` (interpolated), `get_attr_dynamic_or` / `get_attr_path_dynamic_or` (dynamic key). `?` has-attr mirrors the split with `has_attr_path` / `has_attr_path_mixed` over a packed segment operand. Lists build via `build_list`.
 
-**control** — `if` emits jump-if-false + forward jumps patched at join; `assert` emits a guard that raises on false then falls through to the body; `with` pushes the scope expr as a cell onto the dynamic-scope chain, compiles the body, then pops.
+**control** — `if` emits `jump_if_false` + a forward `jump` patched at join; `assert` emits a guard that raises on false then falls through to the body; `with` pushes the scope expr as a cell onto the dynamic-scope chain, compiles the body, then pops.
 
-**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates; path literals resolve against the compiler's `base_path` at compile time (absolute/relative), preserving trailing-slash semantics; an identifier resolves in order **local slot → upvalue capture → `with` dynamic lookup**, emitting `get_local` / `capture_upvalue` / `lookup_with` respectively (see [scopes.md](scopes.md)).
+**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates via `concat_strings`; path literals resolve against the compiler's `base_path` at compile time (absolute/relative), preserving trailing-slash semantics; `__curPos` lowers to the current source position. An identifier resolves in order **local slot → upvalue capture → `builtins` / ambient builtin → `with` dynamic lookup**, emitting `get_local` / `get_upvalue` / `push_builtins` / `lookup_with` respectively; an unresolved name is a compile error (see [scopes.md](scopes.md)).
 
 ## Diagnostics
 
@@ -91,10 +107,12 @@ Lambda and thunk bodies are compiled via `compileTailExpression`, so a body endi
 
 - **Single value per node.** Every lowered node nets exactly one value on the operand stack.
 - **Emit never re-reads the AST.** `emit` sees only opcodes/operands; all tree knowledge is in the domain modules.
-- **Classify/stamp run once, at finish**, over the frozen body.
-- **Persistent vs scratch.** Bytecode/constants/source-map are duped and outlive the unit; locals/captures/diagnostics die with the arena.
+- **Stamp before finish; classify at finish**, both over the frozen straight-line body.
+- **Persistent vs scratch.** Bytecode/constants/source-map are duped and outlive the unit; locals/captures/diagnostics/strictness maps die with the arena.
 - **ChunkIds are sequential and immutable.** Registration order is stable; a registered Chunk is never mutated.
 
 Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 
 Code: `src/compiler/`
+</content>
+</invoke>

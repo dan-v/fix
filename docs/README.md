@@ -11,7 +11,7 @@
 **Overview** — [architecture](architecture.md) · [invariants](invariants.md)
 
 **Front end** — [`syntax/`](syntax/)
-- [parsing](syntax/parsing.md) — scanner + Pratt parser + arena AST
+- [parsing](syntax/parsing.md) — scanner + LALR(1) table-driven parser + arena AST
 - [nix-syntax](syntax/nix-syntax.md) — strings, paths, `inherit`, patterns, operators
 
 **Compiler** — [`compiler/`](compiler/)
@@ -48,9 +48,8 @@
 - [model](perf/model.md) — **cost model, critical-path floor, measured dead-ends**
 - [probes](perf/probes.md) — the `-D` headroom-measurement suite
 
-**Experimental** — opt-in; the interpreter stays canonical
-- [jit](jit.md) — tracing/inlining JIT (measured-dead on nixpkgs)
-- [gc](gc.md) — non-moving mark-sweep (works at `w=1`, `w>1` WIP)
+**Memory** — the interpreter stays canonical
+- [gc](gc.md) — optional `-Dgc` non-moving generational collector that bounds RSS; never changes output
 
 **Operating**
 - [build](build.md) — module layout, `-D` flags, lint, tests
@@ -59,5 +58,5 @@
 ## Conventions
 
 - Docs describe **the system** — mechanisms, data flow, invariants, and the *why* — not the text of specific `.zig` files. Each doc ends with a `Code:` pointer to its area.
-- The **interpreter is canonical**; JIT/GC/probes are opt-in and never change output. Byte-identical `.drv` is the ground truth for correctness.
+- The **interpreter is the sole engine and is canonical**; the `-Dgc` collector and the `-D` probes never change output. Byte-identical `.drv` is the ground truth for correctness.
 - Historical plans and the living A/B performance log are in [`plans/`](plans/) — design intent and status, kept separate from these system docs.

@@ -4,12 +4,13 @@
 
 ## Mental model
 
-An identifier reference resolves against a **chain of Compilers** (one per enclosing body, linked by `parent`). Resolution tries, in order:
+An identifier reference resolves against a **chain of Compilers** (one per enclosing body, linked by `parent`). Resolution tries, in order (`literals.compileIdent`):
 
-1. **Local** — a binding declared in *this* chunk (`let` name, lambda param, `rec`-attr cell). Read directly by frame-base slot.
-2. **Upvalue** — a binding in an *enclosing* chunk. Captured through every intervening body as a chunk-relative upvalue index.
-3. **`with` scope** — no static binding found; falls back to a runtime lookup over the dynamic-scope chain.
-4. **Unbound** → compile error (`UndefinedVariable`).
+1. **Local** — a binding declared in *this* chunk (`let` name, lambda param, `rec`-attr cell). Emits `get_local`, read directly by frame-base slot.
+2. **Upvalue** — a binding in an *enclosing* chunk. Captured through every intervening body as a chunk-relative upvalue index; emits `get_upvalue` (forces on read — the reference is a value being consumed).
+3. **`builtins` / ambient builtin** — the bare name `builtins`, or a name the evaluator injects ambiently, lowers to `push_builtins` / the matching builtin.
+4. **`with` scope** — no static binding found; falls back to a runtime `lookup_with` over the dynamic-scope chain.
+5. **Unbound** → compile error (`UndefinedVariable`).
 
 Locals and captures live on the arena and vanish at unit end; only the **capture descriptors** baked into thunk/closure ops persist.
 
@@ -20,7 +21,7 @@ A `Local` is `{ name, name_id, depth, slot }`:
 - **slot** — a monotonic frame-base offset from `declareLocal` (linear bump of `slot_count`; the final `slot_count` becomes the Chunk's `local_count`).
 - **depth** — the `scope_depth` at declaration.
 
-`beginScope` / `endScope` bump/restore `scope_depth`; `endScope` pops every local whose `depth` exceeds the new depth (a `while`-pop off the tail). Slots are **not** reused within a chunk.
+`beginScope` / `endScope` bump/restore `scope_depth`; `endScope` pops every local whose `depth` exceeds the restored `scope_depth` (a `while`-pop off the tail). Slots are **not** reused within a chunk.
 
 **Resolution** (`resolveLocal` / `resolveLocalId`) scans locals **top-down** (innermost declaration wins → shadowing is free). Id-based resolution compares interned `name_id`s up the chain rather than re-comparing source bytes at every level — the hot path for non-local references.
 
@@ -51,7 +52,7 @@ Two ways to read an upvalue at runtime, with different force semantics:
 | `capture_upvalue` | copies the upvalue **as-is** (thunk stays a thunk) | building a captured environment; laziness preserved |
 | `get_upvalue` | **forces on read** — the upvalue is a thunk that gets evaluated | reading a value the op is about to consume |
 
-> **Historical bug.** `mapattrs_apply` / `genlist_apply` built their user-function argument environments with `get_upvalue`, **eagerly forcing** entries meant to stay lazy — which blackholed on recursive attrset patterns (a binding forced before its cell was published). Fixed by switching those sites to `capture_upvalue`. Rule of thumb: **environment construction must use `capture_upvalue`**; `get_upvalue` is only for a value being consumed now.
+Rule of thumb: **environment construction must use `capture_upvalue`**, so entries meant to stay lazy are not forced before their cell is published (forcing a binding early blackholes recursive attrset patterns); `get_upvalue` is only for a value being consumed now — which is why a bare identifier reference (section above) emits `get_upvalue`.
 
 ## `with`: dynamic scope
 

@@ -14,9 +14,9 @@ Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by na
 | `get_attr_dynamic` | `[attrs, name]` | name is a runtime string; force it to an `InternId`, then as `get_attr`. |
 | `get_attr_dynamic_or` | `[attrs, name, default]` | dynamic select with a lazy default if missing / non-attrs. |
 | `get_attr_path_or` (`_long`) | `[attrs, default]`, N static ids | walk N segments; any missing segment ⇒ force+return the default. |
-| `get_attr_path_dynamic_or` | `[attrs, name, default]` | static prefix + one trailing runtime-string segment. |
+| `get_attr_path_dynamic_or` (`_long`) | `[attrs, name, default]` | static prefix + one trailing runtime-string segment. |
 | `get_attr_path_mixed_or` | `[attrs, dyn…, default]` | mixed static/runtime path; a per-segment tag byte says static (inline id) or dynamic (next stack value). |
-| `has_attr_path` / `has_attr_dynamic` / `has_attr_path_mixed` | `[attrs, …]` | existence test **without forcing** the final value. |
+| `has_attr_path` (`_long`) / `has_attr_path_mixed` | `[attrs, …]` | existence test (`?`) **without forcing** the final value; a single-segment `has_attr_path` covers the plain `attrs ? name` case. |
 | `validate_attrs` (`_long`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
 | `lookup_with` (`_long`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
 
@@ -24,7 +24,9 @@ All path walks keep each intermediate node rooted across the next level's force 
 
 ### Attr inline cache
 
-`cachedAttrLookup` fronts every lookup with a thread-local IC: `(heap_token, obj_id, name_id) → raw Value` (pre-force). A hit returns the raw attr value and skips the binary search; the caller forces it if it needs WHNF. The index mixes `obj_id` and `name_id` so `x.a` and `x.b` on the same object land in different slots. `heap_token`-guarded — the cache is per-worker and object ids are not stable across evaluators, so a token mismatch invalidates the slot. STW GC walks each registered worker's live (token-matching) slots as roots.
+`cachedAttrLookup` fronts every lookup with a thread-local IC (8192 slots): `(heap_token, obj_id, name_id) → raw Value` (pre-force). A hit returns the raw attr value and skips the binary search; the caller forces it if it needs WHNF. The index mixes `obj_id` and `name_id` so `x.a` and `x.b` on the same object land in different slots. `heap_token`-guarded — the cache is per-worker and object ids are not stable across evaluators, so a token mismatch invalidates the slot. STW GC walks each registered worker's live (token-matching) slots as roots.
+
+A cache **miss** is also the trigger point for the **demand-sibling prefetch** (`maybeSiblingSweep`): the first touch of a member on a demand fiber, when that member is still an unresolved thunk, can submit one speculative whole-set sweep task that forces the set's *other* members ahead of demand (size-gated and deduped once per set). The sweep forces speculatively, so it stays demand-invisible. See [parallel/speculation.md](../parallel/speculation.md).
 
 ## Fused super-ops
 
@@ -38,13 +40,10 @@ The compiler collapses pervasive read chains into single opcodes, saving a dispa
 
 ## The `//` update operator
 
-`merge_attrs` and `merge_attrs_strict` (`[left, right] → [merged]`) execute a **reserve-then-flush sorted merge**. Both operands stay on the operand stack across the merge (it forces and allocates — a GC safepoint) and are dropped only after:
+Both ops take `[left, right] → [merged]` and keep both operands on the operand stack across the merge (it forces and allocates — a GC safepoint), dropping them only after. They use **different strategies** for two different sources of `//`:
 
-1. Force both attrsets.
-2. Allocate the merged output sized to hold the union.
-3. Walk both sorted entry arrays in lockstep (O(n+m)), writing entries in place: left-only and right-only entries copy through; on a name collision the **right (RHS) key wins** (`//` semantics).
-
-`merge_attrs` (attrset-literal / runtime `//`) overrides on duplicate. `merge_attrs_strict` is for merging parts of a *single* attrset literal and **errors on a duplicate leaf**. The heap-side merge structure — layered `base // overlay` nodes, k-way flatten, and the depth cap that keeps the NixOS fixpoint's thousands of `//`s from degenerating — is a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
+- **`merge_attrs`** — runtime `//` (`a // b` where either side is dynamic). It does *not* eagerly merge: it builds a **lazy layered node** (`heap.mergeAttrsLayered`), a `base // overlay` structure whose lookups consult the overlay first, so **RHS wins**. Deferring the merge is what keeps the NixOS fixpoint's thousands of stacked `//`s cheap; the layered-node representation, its k-way flatten, and the depth cap that stops the stack from degenerating are a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
+- **`merge_attrs_strict`** — merging the sorted sub-groups of a *single* attrset literal (e.g. `{ a.b = 1; a.c = 2; }`). It performs an eager **reserve-then-flush sorted merge** (`mergeAttrLiteralObjects`): reserve the worst-case union directly in heap attr storage, then walk both sorted, deduped entry arrays in lockstep (O(n+m)), writing entries in place. Because both inputs are sorted+unique, the output is too, by construction. A name present on only one side copies through; on a **name collision** the two values are **recursively merged** iff both are attrsets — otherwise it raises `DuplicateAttribute` (a duplicate leaf in one literal is a static error, unlike runtime `//`'s override).
 
 ## List concatenation
 
@@ -61,7 +60,7 @@ The compiler collapses pervasive read chains into single opcodes, saving a dispa
 - **Derivation shortcut**: two attrsets that both have `type == "derivation"` are equal iff their `.outPath` strings are equal — Nix's derivation identity, avoiding a full deep walk of the derivation attrs. (See [derivation/model.md](../derivation/model.md).)
 - Closures/builtins/PAPs compare by identity (`ObjectId` / builtin id).
 
-`compareValues` (`<`, `<=`, `>`, `>=`) is the ordered sibling: numeric with int/float coercion, and lexicographic `std.mem.order` over string-like text; other kinds are a `TypeError`.
+`compareValues` (`<`, `<=`, `>`, `>=`) is the ordered sibling: numeric with int/float coercion, and lexicographic `std.mem.order` over string-like text — but ordering, unlike equality, does **not** coerce across string-like kinds (comparing a `string` to a `path` is a `TypeError`). Any other kind (lists, attrsets, bools) is a `TypeError`.
 
 ## String operations
 
@@ -71,7 +70,7 @@ Operand **coercion to a string** (`coerceLanguageStringValue`): `string`/`string
 
 ## Invariants
 
-- **Operands stay on the operand stack across the operation** (merge / concat / attr select force + allocate — GC safepoints); dropped or replaced in place only after. Never `forceValue(pop())`.
+- **Operands stay on the operand stack across the operation** (merge / concat / attr select force + allocate — GC safepoints); dropped or overwritten in place only after. Never `forceValue(pop())`.
 - **Attrs are sorted by interned name**; lookup is binary search over integer ids.
 - **Existence tests don't force** the final value; selection does.
 - **Attr IC is per-thread and `heap_token`-guarded**; entries are GC roots while the token matches.

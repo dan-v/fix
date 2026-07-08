@@ -1,6 +1,6 @@
 # Builtins
 
-*How the ~120 primops are structured, dispatched, and made GC- and parallel-safe.*
+*How the ~110 primops are structured, dispatched, and made GC- and parallel-safe.*
 
 ## Mental model
 
@@ -14,8 +14,9 @@ A builtin is a native Zig function reachable from Nix as a `BuiltinId`-tagged va
    - `args.len < arity` → return a **builtin closure** capturing the partial args (undersupply; see [partial application](calls.md)).
    - `args.len > arity` → `error.TooManyArguments` (oversupply is a hard error — Nix rejects it).
    - exact → dispatch.
-2. **GC rooting** of every argument for the call's duration (below).
-3. **`switch (id)`** — one arm per `BuiltinId`, each forwarding to a group module's implementation. The switch is exhaustive; unknown ids are a compile error.
+2. **`switch (id)`** — one arm per `BuiltinId`, each forwarding to a group module's implementation. The switch is exhaustive; unknown ids are a compile error.
+
+The one-hop wrapper `access.applyBuiltin` fronts this: it raises the per-thread native depth for the builtin's duration (the GC gate, below) before calling the switch.
 
 Applying a saturated closure (`applyBuiltinClosure`) copies the captured args, appends the final arg, and re-enters `applyBuiltin` at full arity. Curried calls therefore round-trip through the same dispatch; a builtin needing *n* args produces *n−1* intermediate closure values.
 
@@ -34,28 +35,28 @@ Two constructors in `shared.zig`, both keyed off a `BuiltinId` + captured args:
 
 Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, so a force mid-body could otherwise sweep them (and their reachable graph). Two overlapping guards make builtins correct-by-default under [`-Dgc`](../gc.md):
 
-- **Native-depth gate**: entering any builtin raises the per-thread native depth; collections only fire at depth 0, so no builtin's Zig-local heap refs are observable mid-call. (`import`/`scopedImport` drop back to caller depth for the nested eval.)
-- **Per-arg rooting**: `rootsBegin`/`rootKeep`/`rootsEnd` root every argument uniformly, so individual builtins only manage their own freshly-produced intermediates.
+- **Native-depth gate**: `access.applyBuiltin` raises the per-thread native depth for the whole call; collections only fire at depth 0, so no builtin's Zig-local heap refs are observable mid-call. (`import`/`scopedImport` drop back to the caller's depth for the nested eval so it can still collect.) This is why the switch arms need no rooting of their own.
+- **Caller-side arg rooting**: the calling convention already roots the arguments before entry — `doCall`/`doTailCall`/`callValue` `rootKeep` their arg, `doCallN` leaves the args on the operand stack, and an in-flight `builtin_closure` force keeps them on the force chain. So a builtin's arguments survive any force it performs, and the arm only has to manage the intermediates *it* freshly produces.
 
-Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON`, `derivationStrict`, `zipAttrsWith`) open their own `rootsBegin`/`rootsEnd` scope around the intermediates. All of this compiles away without `-Dgc`.
+Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON`, `derivationStrict`, `zipAttrsWith`, the `fetch*` family) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates. All of this compiles away without `-Dgc`.
 
 ## File-group split (`src/vm/builtins/`)
 
 | Group | Holds |
 |---|---|
-| `shared` | closure/thunk value construction (`makeBuiltinClosure`, `makeBuiltinThunk`) |
+| `shared` | builtin closure/thunk value construction (`makeBuiltinClosure`, `makeBuiltinThunk`), the JSON cycle guard, and the adaptive `NameIndex` used by accumulate-by-name builtins |
 | `strings` | `toString`, `stringLength`, `substring`, `concatStringsSep`, `replaceStrings`; coercion & interning |
-| `collections` | attrset ops (`hasAttr`, `getAttr`, `attrNames`, `mapAttrs`, `zipAttrsWith`) + functional list ops (`map`, `filter`, `foldl'`, `any`, `all`, `sort`, `partition`) |
-| `lists` | list structure: `length`, `head`, `tail`, `elemAt`, `concatLists`, `listToAttrs` |
+| `attrsets` | attrset ops: `hasAttr`, `getAttr`, `attrNames`, `attrValues`, `mapAttrs`, `zipAttrsWith`, `catAttrs`, `intersectAttrs`, `removeAttrs`, `functionArgs`, plus the internal per-key thunk bodies `mapAttrValue`/`zipAttrsValue` |
+| `lists` | list structure (`length`, `head`, `tail`, `elemAt`, `concatLists`, `listToAttrs`, `elem`, `seq`, `deepSeq`) and the functional list ops (`map`, `filter`, `foldl'`, `any`, `all`, `sort`, `partition`, `groupBy`, `genList`, `concatMap`, `genericClosure`) |
 | `paths` | `baseNameOf`, `dirOf`, `path`, `storePath`, `placeholder` |
 | `hash` | `hashString`, `hashFile` |
-| `io` | `readFile`, `readDir`, `readFileType`, `pathExists`, `import`/`scopedImport`, path/`filterSource` source materialization |
-| `fetch` | `fetchGit`, `fetchurl`, `fetchTarball`, `getEnv`, `toPath`, `toFile` |
+| `io` | `readFile`, `readDir`, `readFileType`, `pathExists`, `import`/`scopedImport` |
+| `fetch` | `fetchGit`, `fetchurl`, `fetchTarball`, `fetchTree`, `fetchMercurial`, `getFlake`, `filterSource`, `getEnv`, `toPath`, `toFile` |
 | `arithmetic` | `add`, `sub`, `mul`, `div`, `lessThan`, bitwise ops, `floor`, `ceil` |
 | `predicates` | `typeOf`, `isString`/`isInt`/`isBool`/`isList`/`isAttrs`/`isNull`/`isFloat`/`isPath`/`isFunction` |
-| `serial` | `toJSON`/`fromJSON`, `toXML`, `fromTOML`, `parseFlakeRef`, `compareVersions`, `split`, `match` |
+| `serial` | `toJSON`/`fromJSON`, `toXML`, `fromTOML`, `compareVersions`, `splitVersion`, `parseDrvName`, `split`, `match` |
 | `errors` | `throw`, `abort`, `tryEval`, `trace`, `traceVerbose`, `addErrorContext` |
-| `string_context` | context tracking (`getContext`, `appendContext`, `unsafeDiscardStringContext`, …) — see [derivation/context.md](../derivation/context.md) |
+| `string_context` | context tracking (`getContext`, `hasContext`, `appendContext`, `unsafeDiscardStringContext`, …) — see [derivation/context.md](../derivation/context.md) |
 | `derivation` | `derivation`/`derivationStrict`, `derivationLazyAttr` — see [derivation/model.md](../derivation/model.md) |
 
 ## Concurrency stance

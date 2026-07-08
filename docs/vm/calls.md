@@ -10,7 +10,7 @@ A call applies a **callee** value to arguments. Five callee kinds:
 
 | kind | apply behavior |
 |---|---|
-| **closure** | `ObjectId → { chunk_id, upvalues }` (see [runtime/heap.md](../runtime/heap.md)). Runs the chunk body in a frame. May carry `jit_lambda_code`. |
+| **closure** | `ObjectId → { chunk_id, upvalues }` (see [runtime/heap.md](../runtime/heap.md)). Runs the chunk body in a frame. |
 | **PartialApp** | an under-applied uncurried closure: `{ func, accumulated_args }`. Extended or saturated by the next arg. |
 | **builtin** | a primop id; `applyBuiltin(id, args)` (see [builtins.md](builtins.md)). |
 | **builtin_closure** | a primop pre-bound to some leading args (`{ builtin_id, args }`); appends the new arg and applies. |
@@ -28,7 +28,7 @@ Application against an uncurried chunk has three cases:
 - **Under-applied** (`< arity`): build a `PartialApp { func, args }` value and return it. It stays callable; the next application folds one more arg in, saturating when the count reaches `arity`.
 - **Over-applied** / **non-closure callee** / **curried (arity 1)**: fall back to applying **one argument at a time** (a normal frame per arg, or the PAP fold).
 
-`arity == 1` (curried lambdas, attrset-pattern lambdas, and all thunk bodies) is the overwhelmingly common path and stays branch-cheap; only `jit_lambda_code`-carrying chunks are arity-1.
+`arity == 1` (curried lambdas, attrset-pattern lambdas, and all thunk bodies) is the overwhelmingly common path; `doCall` short-circuits it directly and stays branch-cheap, treating `arity != 1` as the rare uncurried/PAP case.
 
 ## The call opcodes
 
@@ -44,7 +44,7 @@ Application against an uncurried chunk has three cases:
 Two application "flavors" back these:
 
 - **Control-transfer** (`doCall`/`doTailCall`/`doCallN`/`doTailCallN`): pushes/reuses a VM frame, result lands on the caller's stack. Used by the `call*` opcodes.
-- **Run-to-completion** (`callValue`/`callValuePartial`): runs the body via `run_isolated_frame` ([dispatch.md](dispatch.md)) and *returns* a Value. Used by builtins and by the `call_n` fold, which need a value in hand mid-operation.
+- **Run-to-completion** (`callValue`/`callValuePartial`): runs the body via `runIsolatedFrame` ([dispatch.md](dispatch.md)) and *returns* a Value. Used by builtins and by the `call_n` fold, which need a value in hand mid-operation.
 
 ## Per-parameter strictness at the call boundary
 
@@ -62,10 +62,10 @@ Applying an attrset dispatches through `__functor`: read `attrs.__functor`, appl
 
 ## Inline caches
 
-Two thread-local, `heap_token`-guarded caches (256 slots each). `chunk_id`s are not unique across evaluator instances and the caches are per-thread, so a mismatched `heap_token` invalidates the slot when the evaluator changes.
+Two thread-local, `heap_token`-guarded caches. `chunk_id`s and `obj_id`s are not unique across evaluator instances and the caches are per-thread, so a mismatched `heap_token` invalidates the slot when the evaluator changes.
 
-- **Call IC** — keyed by `(caller_chunk_id, caller_ip, callee_chunk_id) → *const Chunk`. On hit, skips the registry hashtable lookup at every `call`/`tail_call` site. Its contents double as **JIT feedback**: at codegen the JIT reads a site's slot to classify it monomorphic / polymorphic / megamorphic.
-- **Attr IC** — keyed by `(heap_token, obj_id, name_id) → Value` (pre-force). Backs attribute reads; detailed in [access.md](access.md).
+- **Call IC** (256 slots) — keyed by the caller's `(chunk_id, ip)`, storing the `(callee_chunk_id → *const Chunk)` it last resolved. On hit, `closureChunkViaIC` skips the registry index lookup at every `call`/`tail_call`/`call_n` site; on miss it records the observed callee. The slot index mixes `chunk_id` and `ip` so distinct call sites collide rarely.
+- **Attr IC** (8192 slots) — keyed by `(heap_token, obj_id, name_id) → Value` (pre-force). Backs attribute reads; detailed in [access.md](access.md).
 
 ## Invariants
 

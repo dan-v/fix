@@ -20,7 +20,7 @@ The `objects` store is a `FlatStore` — a single `mmap` region, **not** geometr
 - **Reads** resolve `(segment, offset)` via a single atomic segment-pointer load plus CLZ-based index math (`locationOf`); readers may cache segment pointers safely.
 - **Writers** serialize on the store's `SpinMutex`.
 
-API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-only `rollback` (used to unwind a failed multi-step allocation). A `Range` must fit within a single segment.
+API: `append(v) → id`, `reserve(len) → Range`, `slice`/`sliceMut`, and tail-only `rollback` (for unwinding a failed multi-step allocation). A `Range` must fit within a single segment.
 
 ## Per-worker TLABs (`HeapLocal`)
 
@@ -40,7 +40,7 @@ boxed_int     i64                       // out-of-i48 escape; see values.md
 partial_app   { func: Value, args: ValueRange }
 ```
 
-Source positions were folded into `attrs` (rather than a per-object `meta` field) because the thunk variant sizes the union anyway — a ~20% shrink across all objects, most of which carry no positions. `positions.len == 0` means "none" and is never sliced.
+Source positions live inside the `attrs` variant rather than in a field on every object: the thunk variant already sizes the union, so hanging positions off attrsets alone costs nothing on the objects that carry none — a ~20% saving across all objects, most of which carry no positions. `positions.len == 0` means "none" and is never sliced.
 
 ## Attrsets: sorted, binary-searched, dup-rejecting
 
@@ -57,7 +57,7 @@ The NixOS module/overlay fixpoints `//` a massive accumulator thousands of times
 
 ## Constants
 
-`VM_STACK_CAP = 65536`, `MAX_FRAMES = 512`, `MAX_UNCURRY_ARITY = 4`.
+The evaluator-wide limits live in `runtime/types.zig`: `VM_STACK_CAP = 65536`, `MAX_FRAMES = 512`, `MAX_UNCURRY_ARITY = 4`.
 
 Out of scope: the `//` opcode's execution and inline cache → [vm/access.md](../vm/access.md); thunk internals/state machine → [thunks.md](thunks.md); the collection algorithm → [gc.md](../gc.md).
 

@@ -22,10 +22,12 @@ Everything below is a matter of **which `ty`** and **which `inner_digest`** feed
 `computePaths(drv, resolver)` runs the stages in order:
 
 1. **Fixed-output paths** — for the (single) output with a set `hash_algo`.
-2. **Input-addressed output paths** — one hash-modulo for all outputs, then a path per output.
+2. **Input-addressed output paths** — one *masked* hash-modulo (`mask_outputs=true`) for all outputs, then a path per output.
 3. **Back-patch** each output's `env` entry to its computed path.
-4. **`.drv` text path** — serialize the *actual* (unmasked) `Drv` and text-hash it.
-5. **Dependency hash-modulo** — recorded for consumers to resolve against.
+4. **`.drv` text path** — serialize the *actual* (unmasked, inputs-unresolved) `Drv` and text-hash it.
+5. **Dependency hash-modulo** — an *unmasked* hash-modulo (`mask_outputs=false`) recorded in the [`DerivationStore`](./model.md) for consumers to resolve against.
+
+The input-set resolution (`hashModuloInputs` — one resolver lookup + hash-dup + merge per input drv) is a pure function of `input_drvs` and the resolver, so `computePaths` runs it **once** and feeds the same resolved inputs to both the masked (step 2) and unmasked (step 5) hashes.
 
 ### 1. ATerm serialization
 
@@ -42,7 +44,7 @@ Derive([outputs],[inputs],[srcs],system,builder,[args],[env])
 Invariants baked in:
 
 - **Canonical sort** of *everything* with a defined order — outputs by name, inputs by drv path, input output-name lists, srcs, and env by name — all lexicographic (byte-wise).
-- **String escaping** inside quoted fields: `"` `\` `\n` `\r` `\t` are backslash-escaped. `builder`, `args`, and `env` name/value are quoted+escaped; output/input path fields and src/output-name lists are quoted but **not** escaped (they are known store-path shaped).
+- **String escaping** is applied to only four fields: `builder`, each `args` element, and each `env` entry's name and value are quoted **and** escaped (`"` `\` `\n` `\r` `\t` → backslash escapes). Everything else — the output tuple fields (`name`, `path`, `hash_algo`, `hash`), input drv paths, src and output-name lists, and `system` — is quoted but **not** escaped, since those are known store-path / identifier shaped. Matching Nix's exact escaped-field set is load-bearing.
 
 **Pre-sized-buffer + escape-free bulk-copy optimization** (measurably transfers to high worker counts): the output buffer is pre-sized from the dominant content (env value + input-path lengths) to avoid grow-and-copy reallocs; and quoted-string emission **bulk-copies maximal escape-free runs** (`appendSlice`) instead of appending byte-by-byte. Env values (build scripts, dependency lists) are large and almost entirely escape-free, so this is ~one copy per value. Because ATerm building runs on the serial drv-hashing chain, this is a real high-worker win, not just a w=1 micro-opt.
 
@@ -58,15 +60,15 @@ sha256_hex( "fixed:out:{hash_algo}:{hash}:{output_path}" )
 
 Returned as a per-output hash (`.outputs`).
 
-**Input-addressed** derivation: resolve every input drv to *its* hash-modulo, substitute those resolved hashes for the input drv paths (the **mask**), serialize the masked ATerm, sha256 it:
+**Input-addressed** derivation: resolve every input drv to *its* hash-modulo, substitute those resolved hashes for the input drv paths, serialize the ATerm (masked or not, per the caller), sha256 it:
 
 - `hashModuloInputs` walks `input_drvs`; for each, `resolver.resolvePath(input.path)` returns the input's recorded hash-modulo (built earlier and stored in the [`DerivationStore`](./model.md)).
   - Resolved to a single **drv** hash → that hash stands in for the path; the input's requested output-names are carried through, **merged by path** (union of output-name sets if the same path appears twice).
   - Resolved to **per-output** hashes → each requested output name is mapped to its output's hash, keyed under output name `"out"`, then merged by path as above.
-- The resulting substituted input list feeds `toATerm(mask_outputs=true, actual_inputs=...)`: output `path` fields blank, output-named `env` values blank, input paths replaced by resolved hashes. `sha256_hex` of that ATerm is the derivation's hash (`.drv`).
+- The resulting substituted input list feeds `toATerm(mask_outputs, actual_inputs=...)` with input paths replaced by resolved hashes (and, under `mask_outputs=true`, output `path` fields and output-named `env` values blanked). `sha256_hex` of that ATerm is the modulo digest — a `HashModulo` with the `.drv` union tag (as opposed to the per-output `.outputs` tag of the fixed-output case).
 - Missing input → `error.UnknownInputDerivation`; missing requested output → `error.UnknownDerivationOutput`.
 
-`computePaths` calls this once with `mask_outputs=true` to derive output paths; the resulting hash is **cached per drv path** (via the store record) so consumers resolve it without recomputation.
+`computePaths` renders two hashes from the one resolved input set: the `mask_outputs=true` hash derives this derivation's own output paths (its output paths aren't known yet, so they must be masked out), and the `mask_outputs=false` hash is **recorded per drv path** in the store as this derivation's dependency hash — the value a *consumer's* `hashModuloInputs` gets back when it resolves this drv as an input. This mirrors Nix: output paths come from the masked modulo, but inputs substitute the **unmasked** modulo of their dependencies.
 
 ### 3. Input-addressed output path
 
@@ -103,7 +105,15 @@ textPath(name=".drv name", text, refs):
   storePathFromInnerDigest(ty, digest, name)               // name = "{drv_name}.drv"
 ```
 
-So the **two serializations differ**: the hash-modulo masks output paths and substitutes resolved input hashes; the drv-text hash uses concrete paths and folds the dependency set into the `ty` tag. A third **dependency-hash** variant (`hashModulo(mask_outputs=false)`) keeps output paths but blanks the `env` values named after outputs — recorded in the store for consumers.
+So a `Drv` is rendered to ATerm in **three ways**, differing along two independent axes — whether outputs are *masked* (output `path` fields and output-named `env` values blanked) and whether input drv paths are *resolved* (replaced by their recorded hash-modulo) or left concrete:
+
+| Serialization | Masked outputs | Inputs | Used for |
+|---|---|---|---|
+| Output hash-modulo | yes | resolved | deriving this drv's output paths |
+| Dependency hash-modulo | no | resolved | recorded in the store; what consumers substitute for this drv |
+| `.drv` text | no | concrete paths | the `.drv` store path (refs folded into `ty`) |
+
+Masking blanks output env values *only* under `mask_outputs=true`; the dependency hash-modulo (`mask_outputs=false`) keeps real output paths and real env values. The dependency and text serializations therefore differ purely in whether inputs are resolved hashes or raw drv paths.
 
 ### nixBase32 encoding
 
@@ -133,12 +143,12 @@ User-supplied fixed-output hashes arrive in many encodings; `hashToBase16(expect
 
 Any drift here silently produces the wrong store path. The oracle enforces exact equality with Nix C++ on:
 
-- **ATerm ordering** — lexicographic sort of outputs, inputs, input output-name lists, srcs, and env; the exact `Derive(...)` field layout.
-- **String escaping** — only `"` `\` `\n` `\r` `\t`, only in the quoted (escaped) fields; store-path-shaped fields quoted-but-unescaped.
+- **ATerm ordering** — lexicographic sort of outputs, inputs, input output-name lists, srcs, and env (`args` keep source order); the exact `Derive(...)` field layout.
+- **String escaping** — only `"` `\` `\n` `\r` `\t`, and only in `builder` / `args` / `env` name+value; every other field (including `system` and the output tuple fields) quoted-but-unescaped.
 - **nixBase32** — the exact 32-char alphabet, the 32→20 XOR fold, and the bit-swapped LSB→MSB emission.
-- **hashModuloInputs** — resolve each input to its recorded hash, substitute for the path (the mask), **merge duplicate input paths by union of output names**; keep `"out"` keying for per-output resolution.
+- **hashModuloInputs** — resolve each input to its recorded (unmasked) hash, substitute for the path, **merge duplicate input paths by union of output names**; keep `"out"` keying for per-output resolution.
 - **Fixed-output logic** — `r:` → NAR/`source`; flat → `fixed:out:{algo}:{hash}:` fingerprint; the single-output requirement.
-- **The two distinct serializations** — masked-inputs hash-modulo vs unmasked drv-text path (refs folded into `ty`), plus the dependency-hash variant that blanks output-named env values.
+- **The three serializations** — masked-outputs modulo (drives output paths), unmasked modulo (recorded dependency hash), and unmasked drv-text path with concrete input paths and refs folded into `ty`.
 - **Sorted refs** before the text-path `ty` is built.
 
 For value-shape and interned string handling see [runtime values](../runtime/values.md).

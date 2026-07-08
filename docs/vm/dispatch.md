@@ -2,7 +2,7 @@
 
 *The direct-threaded bytecode interpreter and the chunk format it runs.*
 
-The interpreter is the canonical evaluator. The [JIT](../jit.md) is an optional, opt-in accelerator layered on top; the bytecode loop is what every correctness claim rests on (byte-identical `.drv`).
+The interpreter is the canonical evaluator: the bytecode loop is what every correctness claim rests on (byte-identical `.drv`).
 
 ## Mental model
 
@@ -52,7 +52,7 @@ An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. 
 | field | meaning |
 |---|---|
 | `chunk_ptr` | the running `*const Chunk` |
-| `chunk_id` | its registry id (for trace/JIT anchoring) |
+| `chunk_id` | its registry id (for trace/error anchoring) |
 | `ip` | byte offset into `code` (written back before any op that can re-enter or fault) |
 | `frame_base` | index in `vm.stack` where this frame's locals begin |
 | `local_count` | slots reserved for locals |
@@ -70,7 +70,7 @@ Local access is force-vs-capture split, matching the recursive-`let` cell discip
 2. if `frames_len == stop_depth`, **returns** (leaving the chain) — `runUntil` pops `result` and returns it to its caller;
 3. otherwise dispatches into the resumed caller frame (`ret_frame.ip` already points past the call site).
 
-This is what makes the interpreter **re-entrant**. `run_isolated_frame(ch, chunk_id, arg_count, upvalues)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the universal "run this body and give me the value" primitive — used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)), by `callValue`/PAP saturation ([calls.md](calls.md)), and by JIT side-exit reconstruction ([jit.md](../jit.md)).
+This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_id, arg_count, upvalues)` records `stop_depth = frames_len`, pushes one frame over the pre-staged args, then `runUntil(stop_depth)`; the nested chain runs until exactly that frame rets, yielding its single value. On error it unwinds `frames_len`/`sp` back to the mark and captures a trace. Isolated frames are the universal "run this body and give me the value" primitive — used by thunk forcing ([runtime/thunks.md](../runtime/thunks.md)) and by `callValue`/PAP saturation ([calls.md](calls.md)).
 
 `halt` (chunk sentinel) and running off the end of `code` both terminate the chain, ensuring at least one value is on the stack for the caller.
 
@@ -92,12 +92,12 @@ A `Chunk` is **immutable after construction**. Key fields (compiler-stamped; see
 | `strict_params` | per-param must-force bitmask for uncurried chunks |
 | `scheduling` | `SchedulingHints`: `body_is_substantial` (≥ `SPECULATION_MIN_CODE_BYTES` = 256 → worth speculative forcing, see [parallel/speculation.md](../parallel/speculation.md)), `strictness` bitmasks, `trivial` body classification (trivial thunk bodies skip thunk allocation — see [runtime/thunks.md](../runtime/thunks.md)), `strict_param`, `strict_via_upvalue` |
 | `function_args`, `source_map` | `builtins.functionArgs` metadata; cold-path error spans |
-| `jit_code` / `jit_lambda_code` | optional native entry points, attached at register time; mutually exclusive by `local_count` |
+| `body_span` | representative source span of the whole body node — labels a thunk quantum / demand wait in the timeline (`null` for chunks that skip it) |
 
-`ChunkRegistry` is the "program": chunks are stored once and referenced by `ChunkId` across threads.
+`ChunkRegistry` is the "program": chunks are stored once and referenced by `ChunkId` across threads. Chunks accumulate at runtime, not just at load — the deferred-attr force path compiles fresh bodies on demand, and speculative-import helpers compile `.nix` files ahead of the demand fiber, so many worker threads register concurrently.
 
 - `get(id)` is **lock-free** (bounds-checked index into stable segments).
-- `register(chunk)` **serializes** on the segment writer. It is the *only* mutation point, and it is where the JIT compiles the chunk (best-effort — a failed compile just leaves the interpreter path). Once registered, a chunk never changes, so cross-thread `*const Chunk` sharing needs no further synchronization.
+- `register(chunk)` is **lock-free** too: it heap-allocates the immutable `Chunk`, then `appendAtomic`-CAS-bumps the segment cursor to publish a `ChunkSlot`. Alongside the `*Chunk` pointer, the slot inlines a copy of the hot scheduling metadata (`trivial`, `body_is_substantial`, `strict_param`, `strict_via_upvalue`) so the thunk-creation and speculation-gate paths read them from a dense, cache-friendly array instead of chasing the heap-scattered `Chunk`. Once registered, a chunk never changes, so cross-thread `*const Chunk` sharing needs no further synchronization.
 
 A handful of **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registered eagerly at init so builtins can materialize lazy elements by reusing a shared 1-arg-application body instead of allocating a per-element closure (see [access.md](access.md)).
 
@@ -105,7 +105,7 @@ A handful of **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are 
 
 - **Operand stack is a precise GC root.** Values are forced *in place* on the stack, never after popping into a local — forcing is a GC safepoint, and a popped-then-forced value could be swept. Binary ops read via `binTop`, force in place, and `dropBin` only after. (See [gc.md](../gc.md).)
 - **Single reused machine frame.** The `always_tail` chain never grows the native stack; growth is bounded by `MAX_FRAMES` VM frames, not by opcode count.
-- **Registered chunks are immutable**; JIT code is attached at register time, before any thread can observe the chunk.
+- **Registered chunks are immutable**; a chunk is fully built before its `ChunkSlot` is published, so any thread that resolves the id observes a complete, unchanging `Chunk`.
 - **`frame.ip` is written back** before any op that can fault, re-enter the interpreter, or push a frame, so error traces and resumed callers see a consistent ip.
 
 Code: `src/vm/`, `src/bytecode/`

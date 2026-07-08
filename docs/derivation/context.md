@@ -36,15 +36,18 @@ Every string operation that produces a new string must **carry the union of its 
 
 - **Concatenation** (`++` on strings, `builtins.concatStringsSep`, interpolation): the result's context is the union of all operands' contexts. If no operand had context the result is a plain string; otherwise a context string.
 - **`substring` / `replaceStrings` / other transforms**: propagate the source string's context wholesale (context tracks *the whole string's* dependencies, not per-character — a substring keeps them all).
-- **path ++ string**: result carries the path's `{path=true}` entry plus the string's context; concatenating a store-path-context string onto a *path* is rejected (`InvalidPathConcatenation`).
+- **path ++ string** (`concatPathLike`): the result is **path-typed** (the concatenated, absolute-resolved path), carrying the right operand's context; a bare path is treated as its implicit `{path=true}` when the result's context is later queried. Appending a string that carries **store-path** context onto a path is rejected (`InvalidPathConcatenation`) — a filesystem path cannot be turned into a store dependency this way.
 
-**Merge algorithm.** When two contexts are unioned, entries are combined by store path via a **sorted attr merge** (both context attrsets are kept sorted by interned key, so it is a linear two-pointer merge). For a path present in both:
+**Merge algorithm.** Unioning happens at two levels.
 
-- Descriptors are merged key-by-key (also a sorted merge). Most keys take the right value.
-- The **`outputs` list is special-cased**: the two lists are **unioned, appending only names not already present** (order-preserving dedup), so `outputs=["out"]` merged with `outputs=["bin"]` → `["out","bin"]`.
-- `path` / `allOutputs` booleans just merge as ordinary keys.
+*Across store paths* (`appendStringContext` → `appendContextEntry`): the union is accumulated into a plain list. Each incoming entry is added by a **linear scan** of the accumulated entries for a matching store-path key — found → merge the two descriptors; not found → append. The result list is handed to `addContextString`, which **sorts it by interned key and rejects duplicate keys**, so every stored context string is sorted even though the merge itself is scan-and-append. An empty merge result collapses back to a plain `Value.string`.
 
-Building a context string always goes through `addContextString(text, entries)` with the merged, sorted entries; an empty merge result collapses back to a plain `Value.string`.
+*Within a store path's descriptor* (`mergeContextValues` → `mergeContextAttrs`): if both descriptors are attrsets, they are combined by a **two-pointer sorted merge** over their keys (descriptor attrsets are themselves stored sorted). Per key:
+
+- Most keys (`path`, `allOutputs`) take the **right** value.
+- The **`outputs` list is special-cased** (`mergeContextOutputs`): the two lists are **unioned, appending only names not already present** (order-preserving dedup), so `outputs=["out"]` merged with `outputs=["bin"]` → `["out","bin"]`.
+
+If either descriptor is not an attrset, the merge just takes the right value.
 
 ## The context builtins
 

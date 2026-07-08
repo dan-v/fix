@@ -32,8 +32,8 @@ The normalized build recipe, hashed to produce paths. All string-typed:
 
 `derivation`'s argument is an ordinary attrset; normalization projects it onto `Drv`:
 
-- `name`, `system`, `builder` are required strings; `args` is a required-shaped list.
-- Every other attr (minus the synthetic names and `args`/`__ignoreNulls`/`outputs`) becomes an `env` entry, its value **string-coerced** (lists space-joined, `true`→`"1"`, `false`/`null`→`""`, etc.). `__ignoreNulls = true` drops null-valued attrs instead of emitting `""`.
+- `name`, `system`, `builder` are required strings (a missing one is an error); `args` is optional and defaults to an empty list, but must be a list when present, each element string-coerced.
+- Every other attr — excluding `args`, `__ignoreNulls`, `outputs` (handled specially below), and any attr named after an output — becomes an `env` entry, its value **string-coerced** (lists space-joined, `true`→`"1"`, `false`/`null`→`""`, etc.). `__ignoreNulls = true` drops null-valued attrs instead of emitting `""`. When `outputs` is given explicitly, the space-joined output names become the `outputs` env entry.
 - Each output name is seeded as an empty `env` entry (`out = ""`), later overwritten with the computed output path (below).
 - `__structuredAttrs = true` switches the env model: instead of per-attr string coercion, the whole attrset is serialized to JSON under a single `__json` env var.
 - Fixed-output attrs (`outputHash*`) populate `outputs[0].hash_algo`/`hash`; `outputHashMode = "recursive"` prefixes the algo with `r:` (NAR hashing, see [hashing](./hashing.md)).

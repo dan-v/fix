@@ -1,28 +1,48 @@
 # Performance probes
 
-*The headroom-measurement suite — quantify a lever's ceiling before building the optimizer.*
+*The instrumentation suite — quantify a lever's ceiling before building the optimizer.*
 
-Each probe is a compile-time `-D` flag (see [build](../build.md)), **zero-cost when off** (dead code, no runtime branch). Run at `--workers=1` so instrumentation uses plain counters — no atomics, deterministic, no scheduler interference. Each answers exactly **one** headroom question by instrumenting eval; results print via `--print-sched-stats` (see [cli](../cli.md)) or a written file.
+Every probe is a compile-time `-D` flag (see [build](../build.md)) and is **zero-cost when off**: each is a `build_options` boolean the compiler folds away, so the disabled build has no counters, no branches, no footprint. Run probes at `--workers=1` so instrumentation uses plain counters — no atomics, deterministic, no scheduler interference. Results surface either through `--print-sched-stats` (see [cli](../cli.md)) or a written file.
 
-The governing philosophy: **measure headroom before building.** Every dead-end in the [performance model](./model.md) was probed first — the probe told us the ceiling, and the ceiling told us not to build. The two live levers (deforestation, GC) are likewise the output of a probe.
+The governing philosophy: **measure headroom before building.** Every dead-end in the [performance model](./model.md) was probed first — the probe told us the ceiling, and the ceiling told us not to build. The two live levers (deforestation, GC) are likewise the output of measurement.
 
 ## The suite
 
-| flag | question it answers | output | finding it produced |
-| --- | --- | --- | --- |
-| `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `apply_builtin`), and **does main ever wait**? | rdtsc excl-cycle breakdown via `--print-sched-stats` | DECISIVE: at w=32 main parks ~3× / waits ~2× — it runs the whole serial chain end-to-end; machinery ~7% of wall. See [model](./model.md) |
-| `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what's the `w=∞` floor? | force-call tree + per-chunk self-time | Prof-path floor ~0.43s vs ~1.7s wall = the gap is discovery-serialization, not throughput; top self-time bodies are module-system drivers (irreducible) |
-| `-Dtrace-probe` | Per-thunk **read-count** (single-use vs shared) + body-size distribution → tracing-[JIT](../jit.md) sink ceiling | read-count histogram + body-size dist | ~66.8% of thunks single-use BUT completed traces expose only ~15 sinkable allocs/eval (~362 escape — SHARED thunk graph). JIT sink dead |
-| `-Dstruct-census` | Per-list/attrset **consume-count** + producer→consumer pairs → deforestation ceiling | consume histogram + producer/consumer pairs | LIVE lever: ~83.5% lists / ~66.8% attrsets single-use intermediates (~2.4M structures). Ceiling by **count**, opposite the thunk sink ceiling. See [model](./model.md) |
-| `-Ddrv-probe` | Derivation-build **demand shape**: attr resolved-ahead vs forced-inline, fanout ok/rejected, input-DAG depth/fan-in | per-attr resolution counters + DAG stats | drv frontier ~92% already resolved-ahead at w=32, 0 fanout rejections → deep consumer fanout dead; dedup off-path. See [derivation/model](../derivation/model.md) |
-| `-Dopcode-ngram` | Hottest **adjacent fall-through opcode pairs** → superinstruction candidates | top opcode-pair frequency table | Calibration proved dispatch is ~1.5% of wall (+10 instr/op ≈ +1.5–1.8%); fusion sub-noise → superinstructions dead. See [vm/dispatch](../vm/dispatch.md) |
-| `-Dtimeline` | Per-worker **wall-clock timeline** — phases, fiber quanta, idle parks | Perfetto JSON via `--timeline[=path]` | Visualizes the ~86% helper idle + main's uninterrupted chain walk; corroborates the prof-main floor. See [cli](../cli.md) |
-| `-Dgc` (Phase-0) | **Reclaimable-RSS headroom**: mark-only live-set sampling, peak-live vs total-allocated | peak-live vs total-allocated report | ~81% reclaimable on nixos_toplevel (w=1: ~1208MB allocated vs ~228MB peak-live); live set plateaus while total grows linearly → GC justified for RSS. See [gc](../gc.md) |
+| flag | question it answers | output |
+| --- | --- | --- |
+| `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--print-sched-stats` |
+| `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--print-sched-stats` |
+| `-Dtimeline` | Per-worker **wall-clock timeline** — parse/compile/import phases, fiber-run quanta, idle parks, GC pauses | Perfetto JSON, written via `--timeline[=path]` |
+| `-Dvm-opcode-profile` | Which **VM opcodes** execute most (raw dispatch counts) | per-opcode execution-count table, printed at VM teardown |
+| `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/blackhole), written via `--thunks-log[=path]`; queried with `fix thunks dump` / `fix thunks diff` |
+| `-Dfiber-stack-probe` | **Peak fiber stack depth** — how much of each fiber's reserved stack is actually touched | sentinel-fills every fiber stack so `maxStackUsedBytes` can scan for the high-water mark |
+
+### `-Dprof-main` and its piggyback censuses
+
+`-Dprof-main` is the workhorse. Its core is a per-thread rdtsc stack profiler that charges each instrumented C++-level scope its **exclusive** cycles (inclusive delta minus time already attributed to nested instrumented scopes), so the printed number for a routine is time spent *inside it but not inside any inner instrumented routine* — the right shape for finding a bottleneck. Only worker 0 (main) updates counters; helpers pay one thread-local load + branch.
+
+This is the probe that settled the floor question. At `--workers=32` main parks ~3× and waits ~2× while `force_value` drops from ~23M (w=1) to ~68K — it runs the whole serial chain end-to-end, and machinery is ~7% of the wall (see [model](./model.md)). A set of small counters ride the same flag, written only from worker 0:
+
+- **Demand classification** — for each thunk main forces, was it *resolved-ahead* by a helper (win), *claimed by main* (main out-ran the helpers), or a *busy-wait* on a helper mid-compute; at a busy-wait, whether the awaited thunk was still speculative (a demand→spec promotion would pull it up).
+- **Age-at-force** — the age of each thunk main claims, sizing the look-ahead ceiling of speculation.
+- **Task-class census** — per scheduled work-item class: item counts, no-op rate, useful-cycle distribution.
+- **Fiber cost/benefit** — dispatch + swap cycles per task vs. how many tasks suspend and the peak concurrent live-fiber count.
+- **Attr-cache / thunk-memo / string** — inline-cache hit rates, thunk-result-memo hit and ineligibility breakdown, and string-machinery (`concat`) counts and bytes.
+
+### `-Dprof-path`: the critical-path floor
+
+`-Dprof-main` tells you which routines burn cycles, but not which *Nix source* the eval spends its time in, and nothing about the **critical path** — the longest chain of dependent thunk forces, the floor no worker count can beat. `-Dprof-path` runs at `--workers=1`, where forcing is cleanly nested (one fiber, LIFO on the C stack): every `forceThunkImpl` is a span containing exactly the spans of the thunks it forced, keyed by body chunk (≈ a Nix source location). Per span it computes `total` (subtree wall cycles), `self = total − Σ child totals`, and `span = self + max(child span)`. Using `max` (not `sum`) over children models the multi-worker floor — independent siblings would run in parallel — so the root `span` estimates what `w=∞` cannot beat. That floor lands ~0.43s vs. the ~1.7s w=32 wall: the gap is discovery-serialization, not throughput, and the top self-time bodies are module-system drivers (irreducible).
+
+Attribution caveat: spans nest on thunk *forces* only, not on direct closure calls (`do_call`/`tail_call` keep running in the same dispatch loop). Work in a directly-called closure that forces no thunk is charged to the *forcing* chunk's self-time. Read the flat profile as "which forcing site drives the most call work", and use `-Dprof-main` for operation-level truth.
+
+## `--print-sched-stats`
+
+`--print-sched-stats` works in any build (it does not need a probe flag) and dumps the scheduler/registry/deferred counters plus worker utilisation and the speculation-precision census (of all resolved thunks, the undemanded fraction = speculative waste by count). When `-Dprof-main` or `-Dprof-path` is compiled in, this is also where their reports print.
 
 ## How a probe result becomes a decision
 
-- **Ceiling low → don't build.** `trace-probe` (~15 sinkable) and `opcode-ngram` (~1.5% dispatch) each killed a JIT direction before a line of optimizer was written.
-- **Ceiling high by wall → build (with A/B).** `prof-main` at w=32 pointed the whole program at on-chain work-elimination (the layered-`//` and ATerm wins).
-- **Ceiling high by count, not wall → live but caveated.** `struct-census` (deforestation) and `gc` Phase-0 (RSS) are large by structure count / allocated bytes but need an optimizer with reach (or off-clock mark) to convert into wall/RSS.
+- **Ceiling low → don't build.** `-Dvm-opcode-profile` + dispatch calibration showed dispatch is ~1.5% of the wall (+10 instr/op ≈ +1.5–1.8%), killing superinstructions/fusion before any optimizer was written.
+- **Ceiling high by wall → build (with A/B).** `-Dprof-main` at w=32 pointed the whole program at on-chain work-elimination (the layered-`//` and ATerm wins in [model](./model.md)).
+- **Ceiling high by count/bytes, not wall → live but caveated.** Deforestation (single-use intermediates) and the GC RSS bound (see [gc](../gc.md)) are large by structure count / allocated bytes but need an optimizer with reach (or off-clock mark) to convert into wall/RSS.
 
-See the [performance model](./model.md) for the full live/dead ledger, and [`docs/plans/perf-notes.md`](../plans/perf-notes.md) for the running A/B log each probe fed.
+See the [performance model](./model.md) for the full live/dead ledger.

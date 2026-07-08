@@ -4,60 +4,66 @@
 
 ## Worker model
 
-`--workers N` spawns **N total** threads: **N−1 helpers** plus **main, running on the calling thread**. Workers are **symmetric** — post-redesign there is *no behavioral main/helper split*; main is worker 0 and steals, parks, and drains exactly like a helper. (Historically main had privileged roles; that is gone.)
+`--workers N` spawns **N total** threads: **N−1 helpers** plus **main, running on the calling thread**. Workers are **symmetric** — there is no behavioral main/helper split. Main is worker 0 and steals, parks, and drains exactly like a helper; the only structural difference is that worker 0 runs on the thread that launched the eval (and delivers the result), so the scheduler spawns only `N−1` helper threads.
 
 Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 
-- `urgent_queues[i]`, `spec_queues[i]`, `ready_queues[i]`, `wake_words[i]`
+- its lane of the scheduler queues — `ready_queues[i]`, `urgent_queues[i]`, `novel_queues[i]`, `spec_queues[i]`, `cont_queues[i]`, and `wake_words[i]`
 - a **fiber free-list** of recyclable [fiber](fibers.md) slots.
 
 ### The fiber free-list
 
-Fibers are expensive to create (8 MiB mmap) and cheap to [`reset`](fibers.md) — so workers pool them:
+Fibers are expensive to create (8 MiB mmap + a VM) and cheap to [`reset`](fibers.md) — so workers pool them:
 
-- **Prewarm** `prewarm_fiber_count = 4` fibers per worker at startup; **grow on demand** when more work is in flight than the pool holds.
-- A finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg installed) rather than freed and re-allocated.
-- **Ownership returns home.** A fiber stolen and run by another worker is, once `.finished`, returned to its **allocator-worker's** free-list — not the thief's. This keeps free-lists balanced and bounds each worker's fiber count. The `run_mu` SpinMutex and `in_runfiber` atomic on each slot (below) coordinate the hand-back safely.
+- **Prewarm** `prewarm_fiber_count = 4` fibers per worker at `Worker.init`; **grow on demand** when more blocking work is in flight than the pool holds. There is no fixed pool size.
+- `acquireFreeFiber` pops the free-list LIFO (hottest cache) or allocates a fresh slot; a finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg installed) rather than freed and re-allocated, so the per-task cost is a memcpy of the trampoline address.
+- **Ownership returns home.** A fiber stolen and run by another worker is, once `.finished`, pushed back onto its **allocator-worker's** free-list — not the thief's — and that owner is nudged in case it is parked waiting on this very fiber. This keeps free-lists balanced and bounds each worker's fiber count. The per-slot `run_mu` SpinMutex and `in_runfiber` atomic coordinate the hand-back safely (below).
+- **Overflow stacks are trimmed.** When a worker is about to park it calls `sweepFreeStacks`: free-list fibers deeper than the prewarm count are spike overflow (a burst of blocking work grew the pool) and give their dirty 8 MiB stacks back to the OS via [`releaseStackPages`](fibers.md), keeping a 64 KiB warm top. A `stack_released` flag (cleared on reuse) makes each park-cycle release a fiber at most once. This runs only at park time — never on the task-completion path, where `madvise` volume would dominate.
+
+Each fiber also owns a **scratch arena** backing its VM's run-path allocations (builtin temp buffers, drv hashing, equality scratch). Arena semantics are load-bearing: run paths free best-effort and error/suspend paths abandon allocations wholesale. `recycleScratch` resets the arena (retaining one 64 KiB chunk) each time the fiber returns to the free-list, so a never-reset arena's dead interleaved pages don't accumulate.
 
 ### The drain loop
 
-Every worker (helpers and main-while-parked) runs the same loop:
+Every worker (helpers via `run`, main-while-draining via `runTopLevel`) runs the same `drainStep`, in strict priority order:
 
 ```
 while not shutdown:
     gcSafepoint()                 # park here if a GC stop is requested
     if drainStep():               # did one unit of work?
         continue
-    parkWorker(wake_word)         # nothing to do → spin then futex WAIT
+    parkAndAccount()              # spin-then-futex WAIT
 
 drainStep():                      # returns true if it did work
-    pop own ready fiber          → resume it        # highest priority
-    else pop own urgent task     → wrap in a fiber, resume
-    else steal a task (ready/urgent/spec, others)   → resume
+    pick a ready fiber   (own queue, else steal)   → resume it
+    else pick a task     (own queues, else steal)  → wrap in a fiber, resume
+    else steal a cont    (work-first, others only) → wrap in a fiber, resume
+    else scavengeStep    (idle-only pre-forcing)
     else return false             # caller parks
 ```
 
-Priority within `drainStep` mirrors the scheduler's discipline: **own ready fibers → own demand tasks → steal**, and demand (urgent) always before speculation. A dequeued task is run by resuming a free-list fiber whose entry is the task; a dequeued ready fiber is resumed directly. `run_fiber` takes the slot's `run_mu` around the resume (serializing a stealer that pops the same ready node against the current owner) and flips `in_runfiber` 1→0 across the run so teardown can tell when the fiber is truly idle.
+Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers → demand/speculation tasks → work-first continuations → scavenge**, and within the task pick, own queues before stealing and urgent before novel before spec. A dequeued task runs by resetting a free-list fiber to `slotEntry` (which reads the task off the slot and forces it); a dequeued ready fiber is resumed directly. A worker steals *other* workers' continuations only — its own are reclaimed inline by the work-first walk's pop-back, never through the drain loop.
 
-**`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the (opt-in) collector reaches a stop-the-world barrier without preempting mid-op.
+`runFiber` takes the slot's `run_mu` around the resume (serializing a stealer that pops the same ready node against the current owner) and flips `in_runfiber` 1→0 across the run so teardown can tell when the fiber is truly idle. It also refreshes the heap's per-thread speculation-context flag from the fiber's VM state on every resume, buckets the elapsed wall into `busy_ns`, and recycles or accounts the fiber based on whether it finished or yielded.
+
+**`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the (opt-in) collector reaches a stop-the-world barrier without preempting mid-op. **`scavengeStep`** is the lowest-priority idle work (`FIX_SCAVENGE`, off by default): a helper pre-forces aged still-unresolved thunks from main's creation ring whose body chunk has proven expensive on the demand path.
 
 ## The Evaluator
 
 The **`Evaluator`** (the `eval.zig` facade) holds the state shared across all workers and fibers:
 
 - **chunk registry** (compiled [bytecode](../compiler/pipeline.md)), **[intern](../runtime/interning.md) table**, **[heap](../runtime/heap.md)**, **scheduler**, **file/[import](imports.md) caches**, [derivation](../derivation/model.md) caches.
-- **per-worker arenas** — each worker allocates from its own non-thread-safe arena, so the hot allocation path takes no lock. Cross-worker sharing goes through the heap / interned tables, which *are* concurrency-safe.
+- Cross-worker sharing goes through the heap and interned tables, which *are* concurrency-safe; the hot per-fiber allocation path takes no lock because it lands in the fiber's private scratch arena.
 
-`scheduler.start(workerFn)` is idempotent (safe to call once per eval). Per-eval mutable state — diagnostics, the trace arena — is mutex-protected because concurrent helper [imports](imports.md) touch it.
+`scheduler.start(workerFn)` is idempotent (safe to call once per eval). Per-eval mutable state — diagnostics, the trace arena, retained AST arenas — is mutex-protected because concurrent helper [imports](imports.md) touch it.
 
 ## Top-level evaluation
 
-Root evaluation does **not** run on the bare main thread. Instead:
+Root evaluation does **not** run on the bare main thread. Instead `runTopLevel`:
 
-1. Main creates a **top-level fiber** (a custom entry) that evaluates the root expression.
+1. Main resets `suppress_background` to false (each top-level entry begins able to start background work), acquires a free fiber, marks it the **demand** fiber, and resumes it to evaluate the root expression.
 2. When that fiber forces a busy [thunk](../runtime/thunks.md) — one another worker already claimed — it **parks on the [`Future`](../runtime/thunks.md)** (yields), exactly like any other blocked fiber.
-3. **While the top-level fiber is parked, main runs the drain loop** — draining its own ready fibers and stealing tasks. So main **participates in stealing and never idle-waits**: the calling thread is a full worker, not a supervisor blocked on a condition variable.
-4. When the top-level entry retires, main keeps draining until **every fiber is back on a free-list** — i.e. all stolen/in-flight work has quiesced.
+3. **While the top-level fiber is parked, main runs `drainStep`** — draining its own ready fibers and stealing tasks. So main **participates in stealing and never idle-waits**: the calling thread is a full worker, not a supervisor blocked on a condition variable.
+4. Once the demanded result is ready (the top-level fiber is back on the free-list), main sets `suppress_background` so no *new* speculative/fan-out work starts; it then keeps draining until **every fiber on this worker is back on a free-list** — i.e. all in-flight suspended fibers have quiesced. In-flight fibers still finish (a suspended fiber only waits on an already-claimed thunk, never on a queued task), so only un-started backlog is skipped.
 
 This is why main is "just worker 0": the root computation is a fiber like any other, and the thread that launched the eval spends its time as a peer worker.
 
@@ -65,23 +71,23 @@ This is why main is "just worker 0": the root computation is a fiber like any ot
 
 Tearing down workers while a stolen fiber is still running (on another thread, or mid-resume) would free a stack out from under live execution — a wake-after-free. Two mechanisms prevent it:
 
-- **`in_runfiber`** (per fiber slot, atomic): set while a fiber is actually being resumed. Teardown of a slot **spins until `in_runfiber` is 0**, so a fiber that a thief is still inside is never reclaimed.
-- **`awaitHelpersQuiescent`**: a barrier main crosses **before** it tears down the worker threads, ensuring no helper is still spinning in a drain loop that could wake into freed memory.
+- **`in_runfiber`** (per fiber slot, atomic): set while a fiber is actually being resumed. `Worker.deinit` **spins until `in_runfiber` is 0** for each slot, so a fiber that a thief is still inside is never reclaimed.
+- **`awaitHelpersQuiescent`**: a barrier each helper crosses **after** its drain loop exits and **before** it destroys its fibers, so all forcing has stopped before any fiber is freed. Otherwise a helper could free a still-enrolled speculative fiber while another helper, finishing its last quantum, resolves that fiber's thunk and wakes the freed memory.
 
-Together: no fiber is reclaimed while owned, and no worker is torn down while another might wake it.
+Together: no fiber is reclaimed while owned, and no worker is torn down while another might wake it. On `deinit` each worker also reports its fiber/VM-stack high-water and its `idle_ns`/`busy_ns` to the scheduler for `fix inspect`.
 
 ## Race invariants (summary)
 
 The parallel path rests on a small set of invariants proven load-bearing by real corruption bugs; see [invariants](../invariants.md) and [thunks](../runtime/thunks.md) for the full history.
 
-- **Cell-thunk binding:** cells are born `.evaluating` (claimed) so a helper can't resolve a binding to a placeholder `null` before the real value is published.
+- **Cell-thunk binding:** binding cells are born `.evaluating` (claimed) so a helper can't resolve a binding to a placeholder before the real value is published.
 - **Fiber resume:** `ReadyNode.queued` CAS + per-slot `run_mu` — a [fiber](fibers.md) is enqueued once and resumed by one thread at a time.
-- **Waiter wake:** a waiter re-checks thunk state under `waiters_mu` before parking (the [Future](../runtime/thunks.md) claim/wait protocol).
+- **Waiter wake:** a waiter re-checks thunk state under the [`Future`](../runtime/thunks.md) claim/wait protocol before parking.
 - **Fiber ownership returns home** to the allocator-worker's free-list.
-- **Speculation is strictly one layer** (`in_speculation`): a spec fiber does not itself spawn further speculation — the [speculation](speculation.md) brake that bounds fan-out.
+- **Speculation is one layer deep** (`in_speculation`): a spec fiber does not itself spawn further speculation — the [speculation](speculation.md) brake that bounds fan-out.
 
-For *why* all this parallelism buys a bounded speedup — the serial critical-path floor where helpers sit ~87% idle — see [perf/model](../perf/model.md).
+For *why* all this parallelism buys a bounded speedup — the serial critical-path floor where helpers sit mostly idle — see [perf/model](../perf/model.md).
 
 ---
 
-Code: `src/parallel/`, `src/eval/`
+Code: `src/eval/worker.zig`, `src/parallel/`
