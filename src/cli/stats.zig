@@ -6,9 +6,10 @@
 //! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
-const Evaluator = @import("../eval.zig").Evaluator;
-const prof = @import("../probe/prof.zig");
-const prof_path = @import("../probe/prof_path.zig");
+const fix = @import("fix");
+const Evaluator = fix.Evaluator;
+const prof = fix.probe.prof;
+const prof_path = fix.probe.prof_path;
 const scheduler = @import("parallel").scheduler;
 
 pub fn report(ev: *Evaluator) void {

@@ -5,8 +5,9 @@
 //! Use `--no-eval` to inspect what compilation alone produces.
 
 const std = @import("std");
-const eval = @import("../eval.zig");
-const bytecode = @import("../bytecode.zig");
+const fix = @import("fix");
+const eval = fix.eval;
+const bytecode = fix.bytecode;
 const intern_mod = @import("runtime").intern;
 const builtin = @import("builtin");
 

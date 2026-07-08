@@ -3,7 +3,7 @@
 const std = @import("std");
 const cli = @import("../cli.zig");
 const diagnostic = @import("syntax").diagnostic;
-const eval = @import("../eval.zig");
+const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 

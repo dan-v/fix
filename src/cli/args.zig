@@ -3,7 +3,7 @@
 const std = @import("std");
 const cli = @import("../cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval_gc = @import("../eval/gc.zig");
+const eval_gc = @import("fix").eval_gc;
 
 pub const usage =
     \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)

@@ -1,8 +1,9 @@
 //! `fix disasm` — pretty-print compiled bytecode for an expression.
 
 const std = @import("std");
-const eval = @import("../eval.zig");
-const bytecode = @import("../bytecode.zig");
+const fix = @import("fix");
+const eval = fix.eval;
+const bytecode = fix.bytecode;
 const cli = @import("../cli.zig");
 const builtin = @import("builtin");
 

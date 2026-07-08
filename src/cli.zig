@@ -4,8 +4,21 @@
 //! formatting primitives. Evaluation progress itself is backed by `std.Progress`.
 
 const std = @import("std");
-const eval_progress = @import("eval/progress.zig");
+const eval_progress = @import("fix").eval_progress;
 const gc = @import("runtime").gc;
+
+// Command modules, re-exported so `main.zig` reaches them through the `cli`
+// module by name instead of importing `src/cli/*.zig` by relative path.
+pub const args = @import("cli/args.zig");
+pub const run = @import("cli/run.zig");
+pub const repl = @import("cli/repl.zig");
+pub const disasm = @import("cli/disasm.zig");
+pub const inspect = @import("cli/inspect.zig");
+pub const trace = @import("cli/trace.zig");
+pub const thunks = @import("cli/thunks.zig");
+pub const stats = @import("cli/stats.zig");
+pub const trace_setup = @import("cli/trace_setup.zig");
+pub const render = @import("cli/render.zig");
 
 pub const When = enum {
     auto,
@@ -297,7 +310,7 @@ pub const EvalProgress = struct {
     /// main thread after it's joined, in `stopProgressSampler`) — the sole owner
     /// of `self.waiting`, so lazy create/end here is race-free.
     fn updateWaiting(self: *EvalProgress, m: eval_progress.Metrics) void {
-        const run = self.run_node orelse return;
+        const run_node = self.run_node orelse return;
         const w = m.wait();
         if (w.len == 0) {
             if (self.waiting) |n| {
@@ -311,7 +324,7 @@ pub const EvalProgress = struct {
         if (self.waiting) |n| {
             n.setName(name);
         } else {
-            self.waiting = run.start(name, 0);
+            self.waiting = run_node.start(name, 0);
         }
     }
 

@@ -125,6 +125,16 @@ pub fn build(b: *std.Build) void {
     };
     addSharedImports(mod, shared_imports);
 
+    const cli_mod = b.addModule("cli", .{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    cli_mod.addImport("fix", mod);
+    addSharedImports(cli_mod, shared_imports);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -133,6 +143,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
         .imports = &.{
             .{ .name = "fix", .module = mod },
+            .{ .name = "cli", .module = cli_mod },
         },
     });
     addSharedImports(exe_mod, shared_imports);
@@ -206,6 +217,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_derivation_tests = b.addRunArtifact(derivation_tests);
 
+    const cli_tests = b.addTest(.{
+        .root_module = cli_mod,
+        .use_llvm = true,
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
     // Module-boundary import lint (tools/lint_imports.zig). Catches relative
     // imports that reach into a clean-cut module's files instead of going
     // through `@import("<module>")` — those silently duplicate-compile.
@@ -230,6 +247,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parallel_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
     test_step.dependOn(&run_containers_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);

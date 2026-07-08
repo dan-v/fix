@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const cli = @import("../cli.zig");
 const run = @import("run.zig");
 const Options = @import("args.zig").Options;
-const Evaluator = @import("../eval.zig").Evaluator;
+const Evaluator = @import("fix").Evaluator;
 
 pub const History = struct {
     allocator: std.mem.Allocator,
