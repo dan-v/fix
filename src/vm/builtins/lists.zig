@@ -15,7 +15,6 @@ const vm_closures = @import("../closures.zig");
 const isCallable = strings.isCallable;
 const isPlainString = strings.isPlainString;
 const stringTextInternId = strings.stringTextInternId;
-const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 
 pub fn builtinLength(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);

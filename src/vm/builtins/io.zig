@@ -2,6 +2,7 @@ const std = @import("std");
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;
 const path_ops = @import("runtime").paths;
+const FileCache = @import("runtime").file_cache.FileCache;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
@@ -85,7 +86,7 @@ const readdir_prefetch_batch = 32;
 fn maybePrefetchChildDirs(
     self: anytype,
     dir_path: []const u8,
-    dir_entries: []const @import("runtime").file_cache.FileCache.DirEntry,
+    dir_entries: []const FileCache.DirEntry,
 ) void {
     const min = self.scheduler.readdir_prefetch_min;
     if (min == 0) return; // off (w=1 / FIX_READDIR_PREFETCH=0)

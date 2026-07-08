@@ -1449,10 +1449,6 @@ pub const ObjectHeap = struct {
         return self.gc_mark_slot.fetchAdd(1, .acq_rel);
     }
 
-    /// Detector: after evacuation every reachable object's owned ranges must be
-    /// tenured (the nursery is about to be reset). A live object still pointing
-    /// at a young range would dangle. Panics with the offending id/kind so a
-    /// missed-evacuation bug is caught at its source, not downstream.
     /// Sweep: free every filled object that `mark_bits` left unmarked —
     /// return its owned ranges to the free lists and its slot to the
     /// object free list. `mark_bits` is the marker's live-bitmap (same

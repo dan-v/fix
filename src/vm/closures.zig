@@ -22,6 +22,7 @@ const force = @import("force.zig");
 const jit_mod = @import("../jit/native.zig");
 const trace_log = @import("trace_log.zig");
 const prof = @import("../probe/prof.zig");
+const run_mod = @import("run.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -804,7 +805,6 @@ pub const TraceFrame = struct {
 /// parent (resuming at the parent's call-return ip), … until the anchor `ret`
 /// yields the trace result. Mirrors `runIsolatedFrame`'s teardown on error.
 pub fn resumeTraceMulti(self: *VM, frames: []const TraceFrame) anyerror!Value {
-    const run_mod = @import("run.zig");
     const stop_depth = self.frames_len;
     const base0 = self.sp;
     for (frames) |fr| {
@@ -838,7 +838,6 @@ pub fn resumeTraceMulti(self: *VM, frames: []const TraceFrame) anyerror!Value {
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {
     const t = prof.start(.run_isolated_frame);
     defer prof.end(.run_isolated_frame, t);
-    const run_mod = @import("run.zig");
     const stop_depth = self.frames_len;
     const base_sp = self.sp - arg_count;
     stack.pushFrame(self, ch, chunk_id, arg_count, upvalues) catch |err| {

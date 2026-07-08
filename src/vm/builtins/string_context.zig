@@ -6,10 +6,6 @@ const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
-const vm_strings = @import("../strings.zig");
-const vm_equality = @import("../equality.zig");
-const vm_closures = @import("../closures.zig");
-const vm_trace = @import("../trace.zig");
 
 pub fn builtinGetContext(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);

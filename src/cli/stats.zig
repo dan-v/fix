@@ -12,6 +12,7 @@ const prof = @import("../probe/prof.zig");
 const prof_path = @import("../probe/prof_path.zig");
 const thunk_census = @import("../probe/thunk_census.zig");
 const arc_census = @import("runtime").heap.heap_arc;
+const scheduler = @import("parallel").scheduler;
 
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
@@ -59,7 +60,7 @@ pub fn report(ev: *Evaluator) void {
     if (comptime jit.enabled) jit.report();
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
-        @import("parallel").scheduler.reportScanCensus();
+        scheduler.reportScanCensus();
         // Demand-prediction de-risk censuses (see heap.zig): junk ratios
         // for demand-descendant scavenging and sibling prefetch.
         ev.heap.profCreationCensus();

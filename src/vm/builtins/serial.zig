@@ -14,10 +14,6 @@ const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
-const vm_strings = @import("../strings.zig");
-const vm_equality = @import("../equality.zig");
-const vm_closures = @import("../closures.zig");
-const vm_trace = @import("../trace.zig");
 
 const appendContextEntry = string_context.appendContextEntry;
 const coerceAttrsToStringValue = strings.coerceAttrsToStringValue;

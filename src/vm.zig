@@ -57,6 +57,7 @@ const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
 const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const vma = @import("runtime").vma;
+const PatternCache = @import("runtime").regex.PatternCache;
 
 /// Reusable VM buffers — the value stack + frame stack, the two large
 /// per-VM allocations (~0.5 MB together). Pooled by the evaluator:
@@ -166,7 +167,7 @@ pub const VM = struct {
     /// (see `runtime.regex.PatternCache`). Set post-init by
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
-    regexes: ?*@import("runtime").regex.PatternCache = null,
+    regexes: ?*PatternCache = null,
     /// Shared "what is the demand path blocked on" record for the progress
     /// indicator. Non-null only on worker 0's VMs when progress is being
     /// drawn; the demand fiber writes its blocking source loc here at a busy

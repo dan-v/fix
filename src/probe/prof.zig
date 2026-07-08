@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const worker_id = @import("runtime").worker_id;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
+const prof_path_mod = @import("prof_path.zig");
 
 /// Compile-time switch. False when `-Dprof-main` wasn't passed.
 /// `rdtsc` is x86_64-only, so we additionally gate on arch.
@@ -900,7 +901,6 @@ pub fn report(registry: anytype, intern: anytype) void {
                 },
             );
             // Top bodies holding the offloadable cycles.
-            const prof_path_mod = @import("prof_path.zig");
             const TOP = 24;
             var top: [TOP]OldAgg = @splat(.{});
             for (old_agg) |agg| {

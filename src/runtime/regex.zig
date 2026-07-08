@@ -1,6 +1,7 @@
 //! Small POSIX-ERE-style matcher for Nix regex builtins.
 
 const std = @import("std");
+const SpinMutex = @import("stable_segments.zig").SpinMutex;
 
 pub const Match = struct {
     start: usize,
@@ -524,7 +525,7 @@ fn matchesPosixClass(class: PosixClass, c: u8) bool {
 /// (matching uses per-call scratch), so concurrent workers share them.
 pub const PatternCache = struct {
     allocator: std.mem.Allocator,
-    mu: @import("stable_segments.zig").SpinMutex = .{},
+    mu: SpinMutex = .{},
     map: std.AutoHashMapUnmanaged(u32, *Pattern) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) PatternCache {

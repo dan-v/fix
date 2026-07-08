@@ -13,6 +13,9 @@ const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
 const prof = @import("../probe/prof.zig");
+const gc = @import("runtime").gc;
+const sched_mod = @import("parallel").scheduler;
+const heap_mod = @import("runtime").heap;
 
 const VM = vm_mod.VM;
 const readU32 = vm_mod.readU32;
@@ -129,7 +132,7 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return;
     const sched = self.scheduler;
     if (!self.heap.trySiblingSweep(obj_id, sched.sibling_min, sched.sibling_max)) return;
-    const task: @import("parallel").scheduler.Task = .{ .force_attrs_sweep = obj_id };
+    const task: sched_mod.Task = .{ .force_attrs_sweep = obj_id };
     const ok = if (sched.sibling_urgent)
         sched.submitUrgent(task, self.workerId())
     else
@@ -174,13 +177,13 @@ var attr_cache_registry: [GC_MAX_WORKERS]?*[attr_cache_size]AttrCacheSlot = @spl
 
 /// Called by each worker (on its own thread) before it can allocate.
 pub fn gcRegisterAttrCache(worker_id: u8) void {
-    if (comptime !@import("runtime").gc.enabled) return;
+    if (comptime !gc.enabled) return;
     attr_cache_registry[worker_id] = &attr_cache;
 }
 
 /// Mark every registered worker's live attr-cache entries. STW-only.
-pub fn gcMarkAttrCache(tr: *@import("runtime").gc.Tracer, heap: *const @import("runtime").heap.ObjectHeap) void {
-    if (comptime !@import("runtime").gc.enabled) return;
+pub fn gcMarkAttrCache(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+    if (comptime !gc.enabled) return;
     for (attr_cache_registry) |maybe| {
         const cache = maybe orelse continue;
         for (cache) |*slot| {

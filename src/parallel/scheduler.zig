@@ -1238,13 +1238,6 @@ pub const Scheduler = struct {
         for (self.threads) |t| t.join();
     }
 
-    /// Submit a *speculative* task. With Chase-Lev work-stealing the
-    /// submitter pushes onto its own queue: lock-free SPMC `push` is
-    /// the hot path. Idle helpers will steal when their own queue is
-    /// empty. The previous "push to a peer" model required a MPMC
-    /// mutex on the hot path; this trades that for a steal
-    /// round-trip on the cold path, which has been hidden by spin-
-    /// before-park (project-tier1-perf-session).
     /// Enable push-time stamping for the work-stealing flow arrows. Called
     /// once at startup when `--timeline` is active.
     pub fn setTraceFlows(self: *Scheduler, on: bool) void {
@@ -1383,6 +1376,13 @@ pub const Scheduler = struct {
         _ = self.spinners.v.fetchSub(1, .release);
     }
 
+    /// Submit a *speculative* task. With Chase-Lev work-stealing the
+    /// submitter pushes onto its own queue: lock-free SPMC `push` is
+    /// the hot path. Idle helpers will steal when their own queue is
+    /// empty. The previous "push to a peer" model required a MPMC
+    /// mutex on the hot path; this trades that for a steal
+    /// round-trip on the cold path, which has been hidden by spin-
+    /// before-park (project-tier1-perf-session).
     pub fn submit(self: *Scheduler, task: Task, submitter_id: u8) bool {
         if (self.worker_count <= 1) return false;
         if (self.disable_speculation) return false;

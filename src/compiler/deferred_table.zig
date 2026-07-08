@@ -20,6 +20,7 @@ const types = @import("runtime").types;
 const Capture = @import("types.zig").Capture;
 const stable = @import("runtime").stable_segments;
 const diagnostic = @import("syntax").diagnostic;
+const Parser = @import("syntax").parser.Parser;
 
 const InternId = types.InternId;
 
@@ -46,7 +47,6 @@ pub const MIN_BODY_BYTES: usize = 100;
 // body is only profitable if it would have been deferred anyway); keep
 // them in lock-step.
 comptime {
-    const Parser = @import("syntax").parser.Parser;
     std.debug.assert(Parser.elide_min_body_bytes == MIN_BODY_BYTES);
     std.debug.assert(Parser.elide_min_prior_clauses == MIN_ENTRIES);
 }

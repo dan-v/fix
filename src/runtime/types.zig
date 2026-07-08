@@ -43,12 +43,3 @@ pub const ConstIdx = u16;
 pub const ObjectId = u32;
 pub const OBJECT_ID_NONE: ObjectId = std.math.maxInt(ObjectId);
 
-/// The result of attempting to force a thunk.
-pub const ForceResult = enum(u8) {
-    /// The thunk was already resolved, value is ready.
-    already_resolved,
-    /// This thread claimed the thunk and must now compute it.
-    claimed,
-    /// Another thread is computing it; spin or yield.
-    busy,
-};

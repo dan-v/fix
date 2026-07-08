@@ -101,21 +101,21 @@ var thunk_memo_registry: [GC_MAX_WORKERS]?*[MEMO_SIZE]MemoSlot = @splat(null);
 /// Called by each worker (on its own thread) before it can allocate, so the
 /// collector can mark this worker's memo entries.
 pub fn gcRegisterThunkMemo(worker_id: u8) void {
-    if (comptime !@import("runtime").gc.enabled) return;
+    if (comptime !gc.enabled) return;
     thunk_memo_registry[worker_id] = &thunk_memo;
 }
 
 /// Register this worker's thread-local GC caches (thunk memo + attr cache)
 /// so the collector can mark them. Called once per worker before it runs.
 pub fn gcRegisterWorkerCaches(worker_id: u8) void {
-    if (comptime !@import("runtime").gc.enabled) return;
+    if (comptime !gc.enabled) return;
     gcRegisterThunkMemo(worker_id);
     access.gcRegisterAttrCache(worker_id);
 }
 
 /// Mark every registered worker's live memo entries. STW-only (peers parked).
-pub fn gcMarkThunkMemo(tr: *@import("runtime").gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
-    if (comptime !@import("runtime").gc.enabled) return;
+pub fn gcMarkThunkMemo(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
+    if (comptime !gc.enabled) return;
     for (thunk_memo_registry) |maybe| {
         const memo = maybe orelse continue;
         for (memo) |*slot| {

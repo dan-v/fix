@@ -14,10 +14,7 @@ const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
-const vm_strings = @import("../strings.zig");
-const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
-const vm_trace = @import("../trace.zig");
 
 const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 const coerceStringContextValue = strings.coerceStringContextValue;
@@ -689,8 +686,4 @@ pub fn filterSourceAccepts(self: anytype, pred: Value, path: []const u8, kind: f
     const result = try vm_force.forceValue(self, try vm_closures.callValue(self, partial, kind_value));
     if (!result.isBool()) return error.TypeError;
     return result.asBool();
-}
-
-fn dirEntryNameLessThan(_: void, left: file_cache.FileCache.DirEntry, right: file_cache.FileCache.DirEntry) bool {
-    return std.mem.lessThan(u8, left.name, right.name);
 }

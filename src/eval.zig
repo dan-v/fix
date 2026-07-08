@@ -840,7 +840,7 @@ pub const Evaluator = struct {
         // task (default 16) — batch-size sweep knob.
         if (self.env_map) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
             if (std.fmt.parseInt(u8, s, 10)) |v| {
-                if (v > 0) @import("vm/force.zig").fan_out_batch_items = v;
+                if (v > 0) vm_force.fan_out_batch_items = v;
             } else |_| {}
         };
         // FIX_SCAVENGE: idle helpers pre-force old unresolved thunks from the
