@@ -151,15 +151,20 @@ pub const Evaluator = struct {
     /// `eval/gc.zig:memoryBudget`. Set by the CLI before evaluation;
     /// ignored by non-`-Dgc` builds.
     max_memory_bytes: ?u64 = null,
+    /// Speculative import prefetch state (`FIX_IMPORT_PREFETCH`).
+    prefetch: Prefetch = .{},
+
     /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
-    /// constants discovered by `ChunkRegistry.register` and already
-    /// submitted as `import_prefetch` tasks — dedup so each path is
-    /// prefetched at most once per eval. Guarded by `prefetch_mu`
-    /// (compiles run on every worker). Remaining submission budget in
-    /// `prefetch_budget` bounds the junk volume.
-    prefetch_seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
-    prefetch_mu: SpinMutex = .{},
-    prefetch_budget: u32 = 0,
+    /// constants discovered by `ChunkRegistry.register` are submitted as
+    /// `import_prefetch` tasks ahead of demand.
+    pub const Prefetch = struct {
+        /// Dedup so each path is prefetched at most once per eval. Guarded
+        /// by `mu` (compiles run on every worker).
+        seen: std.AutoHashMapUnmanaged(types.InternId, void) = .empty,
+        mu: SpinMutex = .{},
+        /// Remaining submission budget — bounds the junk volume.
+        budget: u32 = 0,
+    };
 
     pub fn init(allocator: std.mem.Allocator, requested_worker_count: u8) !Evaluator {
         // Always run at least one worker — the main evaluator thread itself
@@ -223,7 +228,7 @@ pub const Evaluator = struct {
         if (ChunkRegistry.path_const_sink) |sink| {
             if (sink.ctx == @as(*anyopaque, @ptrCast(self))) ChunkRegistry.path_const_sink = null;
         }
-        self.prefetch_seen.deinit(self.allocator);
+        self.prefetch.seen.deinit(self.allocator);
         if (comptime vm_mod.opcode_profile_enabled) eval_diagnostics.printVmOpcodeProfile(&self.vm_opcode_counts);
         if (comptime gc.enabled) {
             gc.recordFinalTotal(self.heap.totalReservedBytes());
@@ -552,10 +557,10 @@ pub const Evaluator = struct {
                 }
             }
             if (on and self.worker_count > 1) {
-                self.prefetch_budget = max;
+                self.prefetch.budget = max;
                 ChunkRegistry.path_const_sink = .{ .ctx = self, .call = prefetchPathConst };
             } else {
-                self.prefetch_budget = 0;
+                self.prefetch.budget = 0;
                 ChunkRegistry.path_const_sink = null;
             }
         }
@@ -896,12 +901,12 @@ pub const Evaluator = struct {
         const text = self.intern.get(path_id);
         if (!std.mem.endsWith(u8, text, ".nix")) return;
         {
-            self.prefetch_mu.lock();
-            defer self.prefetch_mu.unlock();
-            if (self.prefetch_budget == 0) return;
-            const gop = self.prefetch_seen.getOrPut(self.allocator, path_id) catch return;
+            self.prefetch.mu.lock();
+            defer self.prefetch.mu.unlock();
+            if (self.prefetch.budget == 0) return;
+            const gop = self.prefetch.seen.getOrPut(self.allocator, path_id) catch return;
             if (gop.found_existing) return;
-            self.prefetch_budget -= 1;
+            self.prefetch.budget -= 1;
         }
         _ = self.scheduler.submit(.{ .import_prefetch = path_id }, worker_id_mod.current);
     }
