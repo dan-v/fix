@@ -26,11 +26,21 @@ const Alignment = std.mem.Alignment;
 const SpinMutex = @import("stable_segments.zig").SpinMutex;
 const vma = @import("vma.zig");
 
-const MIN_LOG2: u6 = 16; // 64 KB — SmpAllocator's direct-map threshold
+const MIN_LOG2: u6 = 16; // 64 KB — the smallest block class
 const CLASS_COUNT: usize = 11; // 64 KB .. 64 MB
 /// Per-class retained-block caps (index = class); bigger classes keep fewer.
 const class_caps: [CLASS_COUNT]u8 = .{ 8, 8, 8, 8, 8, 8, 8, 4, 2, 1, 1 };
 const MAX_PER_CLASS = 8;
+
+/// Anything ABOVE this is direct-mapped by the backing SmpAllocator
+/// (its slab size classes stop at 32 KB; a 33 KB request rounds to the
+/// 64 KB power-of-two class, which is past its slab range and goes
+/// straight to PageAllocator). That's the cacheable-range floor: a
+/// (32 KB, 64 KB] request gets a 64 KB class block here — the unused
+/// tail pages are never touched, so they cost nothing — instead of a
+/// fresh mmap/munmap per use (measured ~4.6K such cycles per NixOS
+/// eval at w=1, one ~36-60 KB parse-scratch block per file).
+const DIRECT_MAP_OVER: usize = 32 * 1024;
 
 fn classSize(class: usize) usize {
     return @as(usize, 1) << (MIN_LOG2 + @as(u6, @intCast(class)));
@@ -38,9 +48,9 @@ fn classSize(class: usize) usize {
 
 /// Class index for `len`, or null when `len` is outside the cacheable range.
 fn classOf(len: usize) ?usize {
-    if (len < (@as(usize, 1) << MIN_LOG2)) return null;
-    const log = std.math.log2_int_ceil(usize, len);
-    if (log < MIN_LOG2 or log >= MIN_LOG2 + CLASS_COUNT) return null;
+    if (len <= DIRECT_MAP_OVER) return null;
+    const log = @max(std.math.log2_int_ceil(usize, len), MIN_LOG2);
+    if (log >= MIN_LOG2 + CLASS_COUNT) return null;
     return log - MIN_LOG2;
 }
 
@@ -89,11 +99,11 @@ pub const BlockCacheAllocator = struct {
         .free = free,
     };
 
-    /// SmpAllocator's direct-map threshold: at or above this, a backing
-    /// allocation is its own mmap and worth tracking for RSS attribution
-    /// (see runtime/vma.zig); below it rides a shared slab.
+    /// Past SmpAllocator's direct-map threshold, a backing allocation is
+    /// its own mmap and worth tracking for RSS attribution (see
+    /// runtime/vma.zig); below it rides a shared slab.
     fn trackable(len: usize) bool {
-        return len >= (@as(usize, 1) << MIN_LOG2);
+        return len > DIRECT_MAP_OVER;
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
