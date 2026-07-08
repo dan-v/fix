@@ -171,10 +171,20 @@ pub const FileCache = struct {
     }
 
     pub fn readDir(self: *FileCache, path: []const u8) ![]const DirEntry {
+        return self.readDirCold(path, null);
+    }
+
+    /// `readDir` that also reports whether THIS call did the I/O (a cold
+    /// miss) vs returning the cached listing. Exactly one caller observes
+    /// `cold = true` per path — concurrent readers of the same path
+    /// serialise on the entry mutex and see the populated cache. Used by
+    /// the readDir-children prefetch hook to fire once per directory.
+    pub fn readDirCold(self: *FileCache, path: []const u8, cold: ?*bool) ![]const DirEntry {
         const entry = try self.entryFor(path);
         entry.mu.lock();
         defer entry.mu.unlock();
         if (entry.dir_entries) |entries| return entries;
+        if (cold) |c| c.* = true;
 
         const io = self.io orelse return error.FileIoUnavailable;
         var dir = try std.Io.Dir.cwd().openDir(io, entry.path, .{ .iterate = true });

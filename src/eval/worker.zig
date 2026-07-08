@@ -409,6 +409,7 @@ pub const Worker = struct {
                 .force_attrs_sweep => .attrs_sweep,
                 .force_attrs_range => .attrs_range,
                 .import_prefetch => .import_prefetch,
+                .readdir_prefetch => .readdir_prefetch,
             };
             // Timeline: a stolen task's run draws a victim→stealer arrow. Anchor
             // the producer end to `push_ts` — the moment the victim *pushed* this
@@ -560,6 +561,7 @@ pub const Worker = struct {
                 .force_attrs_sweep => |id| timeline.beginArgs(.run, "sweep-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d}", .{id}) catch ""),
                 .force_attrs_range => |r| timeline.beginArgs(.run, "force-attrs", f.fiber_id, std.fmt.bufPrint(&buf, "\"attrs\":{d},\"off\":{d},\"len\":{d}", .{ r.attrs_id, r.offset, r.len }) catch ""),
                 .import_prefetch => |path_id| timeline.beginArgs(.run, "import-prefetch", f.fiber_id, std.fmt.bufPrint(&buf, "\"path\":{d}", .{path_id}) catch ""),
+                .readdir_prefetch => |r| timeline.beginArgs(.run, "readdir-prefetch", f.fiber_id, std.fmt.bufPrint(&buf, "\"dir\":{d},\"off\":{d},\"len\":{d}", .{ r.dir, r.offset, r.len }) catch ""),
             }
             // Consumer end of the work-stealing arrow — inside this quantum so
             // the arrow lands on it. No-op unless this task was stolen (id != 0).
@@ -581,7 +583,7 @@ pub const Worker = struct {
             // fn / …); empty when unresolvable or already resolved → the quantum
             // keeps its generic "force-thunk" name.
             .force_thunk => |id| vm_force.thunkLabel(&f.vm, id, buf),
-            .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch => .{},
+            .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => .{},
         };
     }
 
@@ -969,8 +971,9 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
                 if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
             }
         },
-        // Import registry state isn't scanned here — count the task itself.
-        .import_prefetch => total.* = 1,
+        // Import registry / FileCache state isn't scanned here — count the
+        // task itself.
+        .import_prefetch, .readdir_prefetch => total.* = 1,
     }
 }
 
@@ -1122,6 +1125,34 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             const host = f.vm.import_host orelse return;
             const path = f.vm.intern.get(path_id);
             _ = host.import_value(host.context, path, 1) catch {};
+        },
+        .readdir_prefetch => |r| {
+            // Speculative readDir-children prefetch (FIX_READDIR_PREFETCH):
+            // warm the FileCache with the directory-kind children in
+            // [offset, offset+len) of the parent's listing. The parent
+            // read is a warm cache hit (the submitter just populated it);
+            // each child read is exactly the getdents the demand fiber
+            // would do — errors are swallowed and NOT cached, so a real
+            // demand read replays them identically.
+            const files = f.vm.files;
+            const parent = f.vm.intern.get(r.dir);
+            const entries = files.readDir(parent) catch return;
+            const end = @min(entries.len, @as(usize, r.offset) + r.len);
+            if (r.offset >= end) return;
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            for (entries[r.offset..end]) |ent| {
+                if (ent.kind != .directory) continue;
+                const child = std.fmt.bufPrint(&buf, "{s}/{s}", .{ parent, ent.name }) catch continue;
+                const listing = files.readDir(child) catch continue;
+                // Pre-intern the child's entry names: the demand-side
+                // builtins.readDir interns every name it returns (~21K
+                // for pkgs/by-name — measured as the residual chain cost
+                // once the getdents itself is prefetched). Warm inserts
+                // here turn those into read-mostly lookups. The intern
+                // table is append-only and global, so this is invisible
+                // beyond timing.
+                for (listing) |le| _ = f.vm.intern.intern(le.name) catch break;
+            }
         },
     }
 }

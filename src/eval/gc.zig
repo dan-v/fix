@@ -283,7 +283,7 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
                 .force_list_range => |r| tr.markObject(&ev.heap, r.list_id),
                 .force_attrs_sweep => |id| tr.markObject(&ev.heap, id),
                 .force_attrs_range => |r| tr.markObject(&ev.heap, r.attrs_id),
-                .import_prefetch => {},
+                .import_prefetch, .readdir_prefetch => {},
             };
         }
     }

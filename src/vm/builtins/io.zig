@@ -39,7 +39,17 @@ pub fn builtinScopedImport(self: anytype, scope_arg: Value, path_arg: Value) !Va
 }
 
 pub fn builtinReadDir(self: anytype, arg: Value) !Value {
-    const dir_entries = try self.files.readDir(try pathArg(self, arg));
+    const dir_path = try pathArg(self, arg);
+    var cold = false;
+    const dir_entries = try self.files.readDirCold(dir_path, &cold);
+    // Speculative readDir-children prefetch (FIX_READDIR_PREFETCH): a
+    // cold listing that is a directory-of-directories (pkgs/by-name:
+    // 756 shard dirs) strongly predicts the demand fiber readDirs each
+    // child next — serially, on the critical chain (~19ms measured in
+    // the w=8 braid). Fan the child index space out to helpers, who
+    // warm the FileCache ahead of that walk. Cache-only, error-
+    // swallowing, deduped by coldness — demand-invisible.
+    if (cold) maybePrefetchChildDirs(self, dir_path, dir_entries);
     var attrs: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer attrs.deinit(self.allocator);
     try attrs.ensureTotalCapacity(self.allocator, dir_entries.len);
@@ -66,6 +76,56 @@ pub fn builtinReadDir(self: anytype, arg: Value) !Value {
 }
 
 const FileKindCount = @typeInfo(@import("runtime").file_cache.FileCache.FileKind).@"enum".fields.len;
+
+/// Children per `readdir_prefetch` task: coarse enough to amortise the
+/// queue+wake cost (a child listing is ~20-30µs of getdents), fine
+/// enough that 756 by-name shards split across every idle helper.
+const readdir_prefetch_batch = 32;
+
+fn maybePrefetchChildDirs(
+    self: anytype,
+    dir_path: []const u8,
+    dir_entries: []const @import("runtime").file_cache.FileCache.DirEntry,
+) void {
+    const min = self.scheduler.readdir_prefetch_min;
+    if (min == 0) return; // off (w=1 / FIX_READDIR_PREFETCH=0)
+    var ndirs: u32 = 0;
+    for (dir_entries) |e| {
+        if (e.kind == .directory) ndirs += 1;
+    }
+    if (ndirs < min) return;
+    const granted = self.scheduler.readDirPrefetchTake(ndirs);
+    if (granted == 0) return;
+    // The task carries (parent intern id, child index range); the helper
+    // re-reads the parent listing — a warm FileCache hit — and joins the
+    // names itself, so the submitter pays one intern lookup, not one
+    // allocation per child. Ranges cover the raw index space (non-dirs
+    // are skipped helper-side): the mapping stays trivially stable.
+    const dir_id = self.intern.intern(dir_path) catch return;
+    var covered: u32 = 0; // directory-kind children covered so far
+    var offset: u32 = 0;
+    while (offset < dir_entries.len and covered < granted) {
+        const len: u16 = @intCast(@min(dir_entries.len - offset, readdir_prefetch_batch));
+        var dirs_in_batch: u32 = 0;
+        for (dir_entries[offset..][0..len]) |e| {
+            if (e.kind == .directory) dirs_in_batch += 1;
+        }
+        if (dirs_in_batch != 0) {
+            // Urgent lane: this is demand-adjacent fan-out (the walk
+            // starts within the same quantum), not a long-odds bet —
+            // and the spec lane is typically deep in import-prefetch
+            // backlog exactly when this fires. Rejection = queue full;
+            // just stop, demand pays the old serial cost.
+            if (!self.scheduler.submitUrgent(.{ .readdir_prefetch = .{
+                .dir = dir_id,
+                .offset = offset,
+                .len = len,
+            } }, self.workerId())) break;
+            covered += dirs_in_batch;
+        }
+        offset += len;
+    }
+}
 
 pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !Value {
     const search_path = try vm_force.forceValue(self, search_path_arg);

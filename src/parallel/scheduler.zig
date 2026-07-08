@@ -161,6 +161,26 @@ pub const Task = union(enum) {
     /// per path by the Evaluator before submission. Holds no heap
     /// ObjectId — nothing to GC-mark.
     import_prefetch: types.InternId,
+    /// Speculative readDir-children prefetch (`FIX_READDIR_PREFETCH`):
+    /// when a COLD `builtins.readDir` returns a directory-of-directories
+    /// (pkgs/by-name: 756 shard dirs, ~21K entries), the demand fiber is
+    /// about to readDir each child sequentially on the critical chain.
+    /// The submitter fans the child index space out as these range tasks;
+    /// a helper re-reads the parent listing (warm FileCache hit) and
+    /// readDirs the directory-kind children in `[offset, offset+len)`,
+    /// warming the FileCache the demand fiber is about to walk. Pure
+    /// cache population — no heap objects, no eval side effects, errors
+    /// swallowed (failures are NOT cached, so demand replays them
+    /// identically). Holds no heap ObjectId — nothing to GC-mark.
+    readdir_prefetch: ReadDirPrefetch,
+};
+
+pub const ReadDirPrefetch = struct {
+    /// Interned parent directory path (any spelling — the FileCache
+    /// canonicalises, so helper and demand land on the same entry).
+    dir: types.InternId,
+    offset: u32,
+    len: u16,
 };
 
 /// Which queue a popped/stolen task came from. Purely informational —
@@ -452,7 +472,7 @@ fn taskQueueGcMark(q: *const TaskQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
             .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
-            .import_prefetch => {},
+            .import_prefetch, .readdir_prefetch => {},
         }
     }
 }
@@ -467,7 +487,7 @@ fn specQueueGcMark(q: *const SpecQueue, tr: *gc.Tracer, heap: *const heap_mod.Ob
             .force_list_range => |r| tr.markObject(heap, r.list_id),
             .force_attrs_sweep => |id| tr.markObject(heap, id),
             .force_attrs_range => |r| tr.markObject(heap, r.attrs_id),
-            .import_prefetch => {},
+            .import_prefetch, .readdir_prefetch => {},
         }
     }
 }
@@ -783,6 +803,19 @@ pub const Scheduler = struct {
     /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
     /// member body locations, heap-growth delta). Debug-only.
     sibling_log: bool = false,
+    /// Speculative readDir-children prefetch (`FIX_READDIR_PREFETCH`):
+    /// a COLD `builtins.readDir` whose listing contains at least this
+    /// many DIRECTORY children fans the children out as
+    /// `readdir_prefetch` range tasks (helpers warm the FileCache the
+    /// demand fiber is about to walk serially — pkgs/by-name is 756
+    /// shard dirs read back-to-back on the chain). 0 = off (the w=1 and
+    /// disabled default). Read-only during eval.
+    readdir_prefetch_min: u32 = 0,
+    /// Remaining child-listing budget (`FIX_READDIR_PREFETCH_MAX`);
+    /// decremented per SUBMITTED child range so a pathological readDir
+    /// fan-out can't flood the queues. Atomic — any worker's readDir
+    /// may submit.
+    readdir_prefetch_budget: containers.Isolated(u32) = .init(0),
     /// `FIX_SPEC_CREATE_BUDGET`: per-task thunk-CREATION budget for
     /// spec-lane `force_thunk` tasks (creation-time speculation + the
     /// novel lane), reusing the sweep-task bounded-speculation machinery
@@ -1249,6 +1282,25 @@ pub const Scheduler = struct {
     }
     pub inline fn bumpSweeps(self: *Scheduler, id: u8) void {
         self.bump(id, "sweeps");
+    }
+
+    /// Enable/configure readDir-children prefetch. Set once before helpers
+    /// start (from `FIX_READDIR_PREFETCH` / `_MIN` / `_MAX`). min = 0
+    /// disables.
+    pub fn setReadDirPrefetch(self: *Scheduler, min: u32, budget: u32) void {
+        self.readdir_prefetch_min = min;
+        self.readdir_prefetch_budget.v.store(budget, .monotonic);
+    }
+
+    /// Claim up to `want` child listings from the readDir-prefetch budget.
+    /// Returns the granted count (0 when exhausted or disabled).
+    pub fn readDirPrefetchTake(self: *Scheduler, want: u32) u32 {
+        var cur = self.readdir_prefetch_budget.v.load(.monotonic);
+        while (true) {
+            if (cur == 0) return 0;
+            const grant = @min(cur, want);
+            cur = self.readdir_prefetch_budget.v.cmpxchgWeak(cur, cur - grant, .monotonic, .monotonic) orelse return grant;
+        }
     }
 
     /// Push a work-first continuation onto `worker_id`'s own continuation deque
@@ -2001,7 +2053,7 @@ test "scheduler helpers run their loop and shut down cleanly" {
                 };
                 _ = c.observed[worker_id].fetchAdd(switch (task) {
                     .force_thunk => |id| @as(u32, @intCast(id)),
-                    .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch => 0,
+                    .force_list_range, .force_attrs_sweep, .force_attrs_range, .import_prefetch, .readdir_prefetch => 0,
                 }, .acq_rel);
             }
         }

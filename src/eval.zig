@@ -765,6 +765,33 @@ pub const Evaluator = struct {
                 ChunkRegistry.path_const_sink = null;
             }
         }
+        // Speculative readDir-children prefetch: a cold builtins.readDir
+        // whose listing is a directory-of-directories fans the children out
+        // to helpers, who warm the FileCache ahead of the demand fiber's
+        // serial child-readDir walk (pkgs/by-name: 756 shard listings
+        // back-to-back on the critical chain, ~19ms at w=8). Same default
+        // gate as import prefetch (ON at 2..16 workers);
+        // FIX_READDIR_PREFETCH=0/1 overrides, FIX_READDIR_PREFETCH_MIN
+        // tunes the directory-children threshold,
+        // FIX_READDIR_PREFETCH_MAX bounds total child listings per eval.
+        {
+            var on = self.worker_count >= 2 and self.worker_count <= 16;
+            var min: u32 = 32;
+            var max: u32 = 16384;
+            if (self.env_map) |em| {
+                if (em.get("FIX_READDIR_PREFETCH")) |s| on = !std.mem.eql(u8, s, "0");
+                if (em.get("FIX_READDIR_PREFETCH_MIN")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |n| min = n else |_| {}
+                }
+                if (em.get("FIX_READDIR_PREFETCH_MAX")) |s| {
+                    if (std.fmt.parseInt(u32, s, 10)) |n| max = n else |_| {}
+                }
+            }
+            if (on and self.worker_count > 1)
+                self.scheduler.setReadDirPrefetch(min, max)
+            else
+                self.scheduler.setReadDirPrefetch(0, 0);
+        }
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
