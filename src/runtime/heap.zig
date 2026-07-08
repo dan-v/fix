@@ -1651,6 +1651,25 @@ pub const ObjectHeap = struct {
     /// the flattened object).
     fn kwayMergeLeaves(self: *ObjectHeap, leaves: []const ObjectId) !ObjectId {
         if (leaves.len == 1) return leaves[0];
+        if (leaves.len > @bitSizeOf(usize)) {
+            // Leaf sets wider than the cursor bitmask (pkgs/by-name's
+            // mergeAttrsList: 756 shard leaves, ~21K entries) reduce in
+            // chunks of <=64 through the fast path below, then k-way the
+            // intermediates (recursing until they fit). Chunks are
+            // contiguous in precedence order and the outer merge is
+            // right-biased across chunks, so the result is identical to
+            // the flat one-pass merge. Cost is O(N·k/64 + N·chunks)
+            // instead of the per-name O(N·k) wide walk that measured
+            // ~13ms on the critical chain for by-name alone.
+            var reduced: std.ArrayListUnmanaged(ObjectId) = .empty;
+            defer reduced.deinit(self.allocator);
+            var start: usize = 0;
+            while (start < leaves.len) : (start += @bitSizeOf(usize)) {
+                const end = @min(leaves.len, start + @bitSizeOf(usize));
+                try reduced.append(self.allocator, try self.kwayMergeLeaves(leaves[start..end]));
+            }
+            return self.kwayMergeLeaves(reduced.items);
+        }
         const n = leaves.len;
         const slices = try self.allocator.alloc([]const AttrEntry, n);
         defer self.allocator.free(slices);
@@ -1667,12 +1686,7 @@ pub const ObjectHeap = struct {
         const reserved = try self.reserveAttrsLocal(cap);
         const dst = self.attrs.sliceMut(reserved);
         var out: usize = 0;
-        if (n > @bitSizeOf(usize)) {
-            // Leaf sets wider than the cursor bitmask (only reachable via
-            // deeply-nested overlay-of-overlay chains) take the simple
-            // per-name walk.
-            out = kwayMergeWide(slices, cursors, dst);
-        } else while (true) {
+        while (true) {
             // One scan: the smallest name across all cursors, the set of
             // leaves sitting on it (bitmask — depth is bounded, so k is
             // small), and the smallest name any OTHER leaf is at (`next`).
@@ -1735,39 +1749,6 @@ pub const ObjectHeap = struct {
 
         const range: AttrRange = .{ .segment = reserved.segment, .offset = reserved.offset, .len = @intCast(out) };
         return self.add(.{ .attrs = .{ .range = range } });
-    }
-
-    /// Per-name k-way merge for leaf counts too wide for the bitmask fast
-    /// path in `kwayMergeLeaves`. Identical output: at each smallest
-    /// remaining name the highest-indexed (newest) leaf wins; every cursor
-    /// at that name advances. Returns the number of entries written.
-    fn kwayMergeWide(slices: []const []const AttrEntry, cursors: []usize, dst: []AttrEntry) usize {
-        const n = slices.len;
-        var out: usize = 0;
-        while (true) {
-            var min_name: ?InternId = null;
-            for (slices, cursors) |s, c| {
-                if (c < s.len) {
-                    const nm = s[c].name;
-                    if (min_name == null or nm < min_name.?) min_name = nm;
-                }
-            }
-            const name = min_name orelse break;
-            var winner: usize = 0;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                if (cursors[i] < slices[i].len and slices[i][cursors[i]].name == name) {
-                    winner = i;
-                }
-            }
-            dst[out] = slices[winner][cursors[winner]];
-            out += 1;
-            i = 0;
-            while (i < n) : (i += 1) {
-                if (cursors[i] < slices[i].len and slices[i][cursors[i]].name == name) cursors[i] += 1;
-            }
-        }
-        return out;
     }
 
     pub fn getClosure(self: *const ObjectHeap, id: ObjectId) !Closure {
