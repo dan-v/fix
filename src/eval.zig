@@ -466,7 +466,10 @@ pub const Evaluator = struct {
         struct_census.report();
         if (comptime gc.enabled) {
             gc.recordFinalTotal(self.heap.totalReservedBytes());
-            gc.report();
+            // Off by default: the report is a diagnostic, not something every
+            // `-Dgc` run should dump to stderr. Gate it like `FIX_MEM_REPORT`.
+            const gc_report_on = if (self.env_map) |em| em.get("FIX_GC_REPORT") != null else false;
+            if (gc_report_on) gc.report();
         }
         drv_probe.report();
         ngram_probe.report();
