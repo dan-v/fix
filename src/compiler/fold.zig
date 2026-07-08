@@ -1,3 +1,9 @@
+//! Lowers unary and binary operators, with compile-time constant folding
+//! of pure literal-on-literal arithmetic/comparison/logic.
+//! Folding is strictly conservative: it never folds operations that could
+//! trap (`/`, `%`, i64 overflow), since `{ x = 1/0; }` is valid Nix and
+//! only forcing `.x` may throw.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

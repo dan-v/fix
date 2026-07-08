@@ -1,3 +1,6 @@
+//! Error-trace capture: walk the VM frame stack turning each frame's source span
+//! into a "while evaluating" diagnostic note, plus the span-resolution helpers
+//! (frame / chunk-entry / tightest-span-for-ip) shared with the timeline.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const chunk = @import("../bytecode.zig").chunk;

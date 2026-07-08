@@ -1,3 +1,9 @@
+//! Compile-time diagnostic reporting: emit errors/notes, absorb child and
+//! parser diagnostics, and resolve source offsets to line/column via a
+//! memoized (root-owned, parent-chain-shared) line index.
+//! Also the operand-size guards (`requireU16At`/`requireU8At`) and chunk
+//! source-span construction.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

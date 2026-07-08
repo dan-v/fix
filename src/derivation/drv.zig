@@ -1,3 +1,7 @@
+//! The Drv struct: the in-memory derivation model and its hashing pipeline —
+//! computes output store paths, the .drv store path, and the input-addressed
+//! hash-modulo digest (resolving each input drv to its own hash).
+
 const std = @import("std");
 const aterm = @import("aterm.zig");
 const paths = @import("paths.zig");

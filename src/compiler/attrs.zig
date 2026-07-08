@@ -1,3 +1,11 @@
+//! Lowers attribute-set construction — plain, recursive (`rec`), and
+//! dynamic/mixed sets — grouping entries by interned name for dedup and
+//! sorted `build_attrs`.
+//! Also drives lazy per-attr compilation: substantial single-leaf value
+//! bodies are registered in the root's deferred table (with an enclosing-
+//! scope + with-chain snapshot) and compiled at first force, concurrently
+//! over the shared retained AST.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

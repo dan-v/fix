@@ -1,3 +1,7 @@
+//! Nix fetcher and flake builtins: fetchGit/fetchurl/fetchTarball/
+//! fetchMercurial/fetchTree, getFlake and flake-ref parsing/serialization,
+//! plus the impure getEnv/toPath/toFile/filterSource builtins.
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

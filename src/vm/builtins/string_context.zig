@@ -1,3 +1,7 @@
+//! Nix string-context builtins: getContext, hasContext, appendContext, and
+//! the unsafeDiscard*/addDrvOutputDependencies context manipulators, plus the
+//! context-entry helpers those and other builtin families share.
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

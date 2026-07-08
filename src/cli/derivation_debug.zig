@@ -1,3 +1,7 @@
+//! CLI renderer for captured derivation debug records: the `--derivation-debug`
+//! summary/full report, with name/drv-path/substring filtering and colorized,
+//! sorted per-record output of paths, hashes, inputs, env, and ATerm text.
+
 const std = @import("std");
 const cli = @import("../cli.zig");
 const derivation = @import("derivation");

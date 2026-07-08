@@ -1,3 +1,6 @@
+//! The VM operand-stack and call-frame machinery: push/pop, frame reservation
+//! and teardown, and the GC-precise in-place binary-operand peek (`binTop`/`dropBin`).
+//! Frame entry also bumps the tracing-JIT hot-anchor counter.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;

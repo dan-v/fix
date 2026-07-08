@@ -1,3 +1,7 @@
+//! Shared data types for the derivation model: outputs, inputs, env vars,
+//! hash-modulo (owned + borrowed views), computed paths, debug records, the
+//! resolver interface, and the Spec used to build the runtime derivation Value.
+
 const std = @import("std");
 const heap_mod = @import("runtime").heap;
 const InternId = @import("runtime").types.InternId;

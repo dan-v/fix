@@ -1,3 +1,10 @@
+//! Compiles a sub-expression into its own thunk chunk and chooses the
+//! emission mode: plain lazy `thunk_captures`, eager-spawn (strictness says
+//! it will be forced), or runtime-adaptive `apply_arg` (callee decides),
+//! with trivial-bodied args falling back to a plain thunk.
+//! `finishCompiledChild` is the shared funnel so the force-time deferred
+//! compile reuses the exact eager child-body path.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

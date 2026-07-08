@@ -1,3 +1,6 @@
+//! Nix type-inspection builtins: typeOf and the is* predicates (isString,
+//! isBool, isFunction, and the generic isInt/isFloat/isList/... family).
+
 const Value = @import("runtime").value.Value;
 const ValueType = @import("runtime").value.ValueType;
 const vm_force = @import("../force.zig");

@@ -1,3 +1,10 @@
+//! Lowers lambdas and function application into chunks: value-lambda
+//! uncurrying (`a: b: …` → one multi-param chunk), attrset-pattern lambdas
+//! (formal validation, defaults, mutually-recursive binding cells), and
+//! call-spine flattening into `call_n`/`tail_call_n`.
+//! Emits per-chunk strictness metadata (`strict_param`/`strict_params`/
+//! forwarding upvalue) that drives eager-vs-lazy argument passing.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

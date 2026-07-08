@@ -1,3 +1,8 @@
+//! Attribute-set and list access: getAttr / getAttrPath / hasAttrPath, functor
+//! (`__functor`) calls, and `with`-scope lookup, fronted by a thread-local inline
+//! attr cache. Also the demand-sibling-sweep trigger — a cache miss speculatively
+//! prefetches the set's other members.
+//! Concurrency: the attr cache is per-worker thread-local, registered so the STW collector marks its live entries.
 const std = @import("std");
 const build_options = @import("build_options");
 const vm_mod = @import("../vm.zig");

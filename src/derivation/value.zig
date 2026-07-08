@@ -1,3 +1,7 @@
+//! Builds the runtime attrset Value that `derivation` returns: the derivation
+//! attrs (type, drvPath, outputName, outPath, per-output sub-attrs, `all`) with
+//! string context wiring drvPath/outPath back to the .drv and its outputs.
+
 const std = @import("std");
 const heap_mod = @import("runtime").heap;
 const InternTable = @import("runtime").intern.InternTable;

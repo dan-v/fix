@@ -1,3 +1,9 @@
+//! Nix list builtins: length/head/tail, map/filter/concatMap/genList,
+//! sort/partition/groupBy, foldl', elem/elemAt, seq/deepSeq, and
+//! genericClosure.
+//! map/genList/filter fan per-element apply-thunks out to worker fibers for
+//! parallel evaluation (speculative and demand-safe).
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

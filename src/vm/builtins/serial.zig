@@ -1,3 +1,7 @@
+//! Grab-bag of Nix serialization and parsing builtins: toJSON/toXML,
+//! fromJSON/fromTOML, compareVersions/splitVersion, the regex match/split
+//! builtins, and parseDrvName.
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

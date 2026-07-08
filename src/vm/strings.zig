@@ -1,3 +1,6 @@
+//! String and path machinery for the language: coercion to language strings
+//! (`__toString` / outPath), `+` and `concat_strings` concatenation, and
+//! string-context (store-path dependency set) accumulation and merging.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;

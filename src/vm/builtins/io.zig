@@ -1,3 +1,8 @@
+//! Nix filesystem and import builtins: pathExists, readFile, readFileType,
+//! readDir, findFile, import, and scopedImport.
+//! readDir speculatively fans child-directory listings out to helper fibers
+//! to warm the FileCache ahead of the demand walk (cache-only, demand-invisible).
+
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;

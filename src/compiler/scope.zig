@@ -1,3 +1,7 @@
+//! Compile-time scope management: local-slot declaration and pop, lexical
+//! name resolution (by interned id), upvalue capture threading up the
+//! parent-compiler chain, and `with`-scope collection + lookup emission.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const types = @import("runtime").types;

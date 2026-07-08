@@ -1,3 +1,9 @@
+//! DerivationStore: the evaluation-wide registry mapping each .drv path to its
+//! hash-modulo and output names (the resolver for input-addressed hashing),
+//! plus the lazy-derivation Value cache and optional debug-record capture.
+//! Read-mostly but written from any worker thread: `mu` guards the record maps
+//! and a separate `lazy_drv_mu` spinlock guards the lazy value cache.
+
 const std = @import("std");
 const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");

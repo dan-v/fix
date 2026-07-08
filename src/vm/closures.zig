@@ -1,3 +1,8 @@
+//! Closure creation and upvalue capture, bytecode/deferred thunk materialisation
+//! from capture descriptors (with trivial-body short-circuits), function calls
+//! (doCall / callValue / doCallN, tail calls, partial applications), and
+//! tracing-JIT trace resume, fronted by a per-call-site inline cache.
+//! Concurrency: the call IC is per-worker thread-local, heap-token-gated across evaluator instances.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;

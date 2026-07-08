@@ -1,3 +1,9 @@
+//! Lowers `let … in`: classifies each binding root
+//! (unreferenced/literal/uncaptured/needs_cell) to skip binding cells and
+//! dead bindings, then drives strictness-based eager elision (a
+//! first-demanded, forward-ref-free binding is evaluated straight into its
+//! slot with no thunk).
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const types = @import("runtime").types;

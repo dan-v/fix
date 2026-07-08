@@ -1,3 +1,7 @@
+//! Serializes a Drv to Nix's ATerm text form (the `Derive(...)` string) that
+//! is SHA-256'd to produce store paths and hash-modulo digests. Emits fields
+//! in canonical sorted order, escapes strings, and can mask output paths.
+
 const std = @import("std");
 const sort = @import("sort.zig");
 const types = @import("types.zig");

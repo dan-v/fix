@@ -1,3 +1,7 @@
+//! Helpers shared across the builtin families: builtin-thunk/closure
+//! construction, the recursive-JSON cycle guard (SeenJsonObject), and the
+//! adaptive name->index lookup (NameIndex) for accumulate-by-name builtins.
+
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const BuiltinId = @import("runtime").builtins.BuiltinId;

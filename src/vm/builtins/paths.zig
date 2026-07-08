@@ -1,3 +1,6 @@
+//! Nix path builtins: baseNameOf, dirOf, placeholder, storePath, and the
+//! `path` copy-to-store builtin.
+
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const file_cache = @import("runtime").file_cache;

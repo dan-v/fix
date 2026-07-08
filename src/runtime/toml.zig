@@ -1,3 +1,7 @@
+//! Minimal arena-backed TOML parser backing `builtins.fromTOML`: parses tables,
+//! array-of-tables, inline tables/arrays, and scalar values into a tree owned
+//! by the returned `Parsed` arena.
+
 const std = @import("std");
 
 pub const Entry = struct {

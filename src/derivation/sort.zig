@@ -1,3 +1,6 @@
+//! Canonical-ordering helpers (outputs/inputs/env/strings) that return sorted
+//! copies, so ATerm serialization is deterministic and its hash is stable.
+
 const std = @import("std");
 const types = @import("types.zig");
 

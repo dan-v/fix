@@ -1,3 +1,8 @@
+//! Lock-free Chase-Lev work-stealing deques (fixed `Deque` + growable
+//! `GrowableDeque`) plus the `Isolated` cache-line-padded atomic wrapper.
+//! Single-owner LIFO push/pop, multi-consumer FIFO steal; the `top`/`bottom`
+//! counters, seq_cst last-element CAS, and x86_64 `mfence`s are load-bearing.
+
 const std = @import("std");
 
 /// A `std.atomic.Value(T)` alone in one full destructive-interference

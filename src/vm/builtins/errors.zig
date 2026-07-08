@@ -1,3 +1,6 @@
+//! Nix error and tracing builtins: throw, abort, tryEval, addErrorContext,
+//! and trace/traceVerbose.
+
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;

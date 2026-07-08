@@ -1,3 +1,7 @@
+//! Lowers control-flow expressions — `if`/`else`, `assert`, and `with`
+//! (subject thunk + with-scope setup) — with matching tail-position
+//! variants for the tail-call compiler.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

@@ -1,3 +1,5 @@
+//! Error reporting onto the VM's trace object: set/push error messages, the
+//! type-error and not-callable constructors, and human-readable value type names.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const Value = @import("runtime").value.Value;

@@ -1,3 +1,7 @@
+//! Bounds checks that narrow a `usize` count to a u16 bytecode operand,
+//! erroring when it would overflow (capture counts, generic operand
+//! counts).
+
 const std = @import("std");
 
 pub fn captureCount(count: usize) !u16 {

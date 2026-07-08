@@ -1,3 +1,8 @@
+//! Bytecode emission helpers: low-level op/operand writers plus the
+//! short/long and capture-carrying encodings for closures, thunks, and
+//! attr-set/attr-path ops. Also the peephole super-op fusion (`*_ret`,
+//! `get_*_attr`, store-to-slot) and jump patching.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

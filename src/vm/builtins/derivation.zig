@@ -1,3 +1,10 @@
+//! The `derivation`/`derivationStrict` builtins: normalize the input attrs
+//! into a Drv, compute its store paths, and build the lazy or strict
+//! derivation value (including structured-attrs JSON and input drv/src
+//! collection).
+//! Fans per-attr forcing out to helper fibers and caches lazy-derivation
+//! values keyed by attrs id + heap GC token (guards against id reuse).
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

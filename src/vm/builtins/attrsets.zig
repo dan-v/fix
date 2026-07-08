@@ -1,3 +1,6 @@
+//! Nix attribute-set builtins: attrNames/attrValues, hasAttr/getAttr,
+//! mapAttrs, removeAttrs, intersectAttrs, catAttrs, and zipAttrsWith.
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

@@ -1,3 +1,7 @@
+//! Lowers attribute-access forms — static paths (`a.b.c`), dynamic
+//! `.${…}`, `or`-defaults, and `?` has-attr — plus list and
+//! immediate-container-value emission (the literal-vs-thunk dispatch).
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

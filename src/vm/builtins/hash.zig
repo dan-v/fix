@@ -1,3 +1,5 @@
+//! Nix hashing builtins: hashString and hashFile.
+
 const Value = @import("runtime").value.Value;
 const nix_hash = @import("runtime").hash;
 const strings = @import("strings.zig");

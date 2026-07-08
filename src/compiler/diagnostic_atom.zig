@@ -1,3 +1,7 @@
+//! Selects the representative source atom (offset/len) to anchor a compile
+//! diagnostic for each AST construct — attr entries, groups, paths, and
+//! has-attr forms — falling back to the head span when a list is empty.
+
 const ast = @import("syntax").ast;
 const compiler_types = @import("types.zig");
 

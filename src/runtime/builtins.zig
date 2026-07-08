@@ -13,6 +13,12 @@ pub const NixPathEntry = struct {
     path: []const u8,
 };
 
+/// Identifies every builtin the evaluator can invoke. Most variants are
+/// user-facing: they appear in `builtin_bindings` and are reachable as
+/// `builtins.<name>` from Nix. A handful are compiler-internal only —
+/// continuations/thunks with no name binding, never nameable from Nix:
+/// `mapAttrValue`, `zipAttrsValue`, `derivationLazyAttr`, `mapValue`,
+/// and `constantValue`.
 pub const BuiltinId = enum(u16) {
     toString = 0,
     isAttrs = 1,

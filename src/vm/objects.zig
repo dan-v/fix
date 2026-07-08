@@ -1,3 +1,6 @@
+//! Data-structure builders: attrset and list literal construction from stack
+//! operands, the `//` update merge (lazy layered + strict recursive), and list
+//! concatenation, with struct-census producer tagging.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;

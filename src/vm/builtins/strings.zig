@@ -1,3 +1,8 @@
+//! Nix string builtins: stringLength, substring, concatStringsSep,
+//! replaceStrings, and toString, plus the string-coercion and string-argument
+//! helpers (stringArg/pathArg/isPlainString/coerce*) shared across builtin
+//! families.
+
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;

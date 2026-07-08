@@ -1,3 +1,10 @@
+//! Walks an AST subtree collecting the free identifier names it references
+//! (including identifier-shaped words inside `${…}` interpolation), either
+//! into a set or streamed to a marker callback.
+//! Deliberately conservative — a superset is fine, since callers
+//! (let-binding cell/eagerness classification) only ever keep extra
+//! bindings alive, never drop a live one.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 

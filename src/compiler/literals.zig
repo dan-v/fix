@@ -1,3 +1,8 @@
+//! Lowers leaf and near-leaf expressions: integer/float/string/path
+//! literals (with `${…}` interpolation and `concat_strings` assembly),
+//! search paths, identifier resolution (locals/upvalues/`with`/ambient
+//! builtins/`__curPos`), and materialization of parser-elided bodies.
+
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 const ast = @import("syntax").ast;

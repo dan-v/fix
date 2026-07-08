@@ -1,3 +1,7 @@
+//! Shared compiler-internal data types: tracked locals, captures/upvalues,
+//! `with`-scopes, the attr-entry views/groups used by attr-set lowering,
+//! and container-value options.
+
 const std = @import("std");
 const ast = @import("syntax").ast;
 const base_types = @import("runtime").types;
@@ -34,6 +38,15 @@ pub const AttrEntryView = struct {
     inherit_outer: bool = false,
 };
 
+/// All entries sharing one attr-name root, bucketed into direct `leaves`
+/// (path.len == 1) and nested `tails` (path.len > 1).
+///
+/// FOOTGUN: `leaf_count`/`tail_count` are dual-purpose across the two
+/// passes of `attrEntryGroups`. Pass 1 uses them as running *counts* to
+/// size the `leaves`/`tails` slices; they are then reset to 0 and reused
+/// as fill *cursors* in pass 2. So they equal the true bucket size only
+/// before the carve and again after the fill completes — never trust them
+/// mid-build; read `leaves.len`/`tails.len` once the slices are populated.
 pub const AttrEntryGroup = struct {
     first: Node.Atom,
     name: []const u8,

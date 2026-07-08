@@ -160,6 +160,9 @@ pub const FileCache = struct {
         return kind;
     }
 
+    /// Trap: deliberately UNcached. Unlike `readFile`/`fileType`/`readDir`,
+    /// this does not take the per-entry mutex or memoize on the `Entry`; it
+    /// stats the file fresh on every call.
     pub fn isExecutable(self: *FileCache, path: []const u8) !bool {
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;
@@ -167,6 +170,10 @@ pub const FileCache = struct {
         return @TypeOf(stat.permissions).has_executable_bit and stat.permissions.toMode() & 0o111 != 0;
     }
 
+    /// Trap: deliberately UNcached. Unlike `readFile`/`fileType`/`readDir`,
+    /// this does not take the per-entry mutex or memoize on the `Entry`; it
+    /// re-reads the symlink target fresh on every call and returns a newly
+    /// allocated copy the caller owns.
     pub fn readLink(self: *FileCache, path: []const u8) ![]u8 {
         const entry = try self.entryFor(path);
         const io = self.io orelse return error.FileIoUnavailable;

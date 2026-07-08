@@ -1,3 +1,6 @@
+//! Value equality (`==`) and ordering (`<`): recursive structural comparison over
+//! lists and attrsets with cycle-pair tracking, the derivation `outPath` fast
+//! path, and the numeric/string coercion rules.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;

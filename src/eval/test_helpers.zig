@@ -1,3 +1,7 @@
+//! Test-only helpers that spin up an Evaluator, evaluate a source string, and
+//! render the result to text (strict, XML, pipe-operator, and base-path
+//! variants) for eval unit tests.
+
 const std = @import("std");
 const eval_mod = @import("../eval.zig");
 const Evaluator = eval_mod.Evaluator;

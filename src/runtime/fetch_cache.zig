@@ -8,6 +8,11 @@ const std = @import("std");
 const nix_hash = @import("hash.zig");
 const FileCache = @import("file_cache.zig").FileCache;
 
+/// Trap: this does NOT memoize within a process run. There is no
+/// in-memory cache — the only cache is the on-disk `.zig-cache/fix-fetch`
+/// store, and it merely skips re-writing/re-extracting already-present
+/// paths. Each `fetchUrl`/`fetchTarball` call still re-downloads and
+/// re-hashes the bytes on every invocation.
 pub const FetchCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,

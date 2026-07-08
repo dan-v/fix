@@ -1,3 +1,6 @@
+//! Nix arithmetic and numeric-comparison builtins: add/sub/mul/div, the
+//! bitwise ops, floor/ceil, and lessThan.
+
 const Value = @import("runtime").value.Value;
 const numeric = @import("runtime").numeric;
 const vm_force = @import("../force.zig");

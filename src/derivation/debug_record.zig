@@ -1,3 +1,7 @@
+//! Builds a self-owned DebugRecord snapshot of a Drv for the derivation-debug
+//! CLI: deep-clones every field and precomputes the ATerm, text hash,
+//! references, and both (masked/unmasked) hash-modulo steps.
+
 const std = @import("std");
 const drv_mod = @import("drv.zig");
 const codec = @import("hash_codec.zig");

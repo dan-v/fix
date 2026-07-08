@@ -1,3 +1,7 @@
+//! Nix store-path computation: builds the `<type>:sha256:<digest>:<store>:<name>`
+//! fingerprint and hashes it into a store path, for input-addressed, fixed-output,
+//! source, and text (.drv) outputs.
+
 const std = @import("std");
 const sort = @import("sort.zig");
 const codec = @import("hash_codec.zig");

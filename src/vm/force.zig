@@ -1,3 +1,9 @@
+//! The thunk force protocol: the claim/busy/resolved/errored state machine that
+//! drives lazy evaluation, plus speculative (demand-invisible) forcing, work-first
+//! collection fan-out, and the GC safepoints — the VM's hot serial path.
+//! Concurrency: a demander CAS-claims a thunk and spins then enrolls as a waiter
+//! on a peer-owned `.busy` one; the per-worker thunk-result memo, scavenge cost
+//! tables, and cache registries are thread-local, published for the STW collector to mark.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
