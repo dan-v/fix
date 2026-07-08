@@ -2,17 +2,17 @@
 //! as a plain `.zig` of literal arrays. Wired into `build.zig` as a run step
 //! whose single argument is the output path.
 //!
-//! The point is caching: `lr.Generate` is expensive at comptime, so paying it
-//! here — in a standalone artifact the build system caches and only rebuilds
-//! when the grammar or generator changes — keeps it off the hot path of every
-//! ordinary `syntax`-module rebuild. The emitted file compiles instantly.
+//! The point is caching AND avoiding comptime: `lr.generate` builds the tables
+//! with ordinary native loops when this tool runs during the build, then emits
+//! them as static array literals. The build system caches the artifact and only
+//! reruns it when the grammar or generator changes, keeping the cost off every
+//! ordinary `syntax`-module rebuild. The emitted file compiles instantly, and
+//! the shipped `fix` binary contains only these baked-in static arrays — it does
+//! no table construction at eval time.
 
 const std = @import("std");
 const lr = @import("lr.zig");
 const grammar = @import("grammar.zig");
-
-// The one expensive comptime evaluation, isolated to this tool.
-const Tab = lr.Generate(grammar.desc);
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -20,6 +20,11 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next(); // program name
     const out_path = args.next() orelse return error.MissingOutputPath;
+
+    // Build the tables natively into an arena (freed on exit).
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const tab = try lr.generate(arena.allocator(), grammar.desc);
 
     const file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
     defer file.close(io);
@@ -33,16 +38,16 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\
     );
-    try w.print("pub const num_states: u32 = {d};\n", .{Tab.num_states});
-    try w.print("pub const num_terminals: u32 = {d};\n", .{Tab.num_terminals});
-    try w.print("pub const num_nonterminals: u32 = {d};\n", .{Tab.num_nonterminals});
-    try w.print("pub const num_productions: u32 = {d};\n", .{Tab.num_productions});
-    try w.print("pub const start_state: u32 = {d};\n", .{Tab.start_state});
-    try w.print("pub const eof: u32 = {d};\n\n", .{Tab.eof});
-    try emit(w, lr.Cell, "action", Tab.action);
-    try emit(w, i16, "goto_table", Tab.goto_table);
-    try emit(w, u32, "prod_lhs", Tab.prod_lhs);
-    try emit(w, u32, "prod_rhs_len", Tab.prod_rhs_len);
+    try w.print("pub const num_states: u32 = {d};\n", .{tab.num_states});
+    try w.print("pub const num_terminals: u32 = {d};\n", .{tab.num_terminals});
+    try w.print("pub const num_nonterminals: u32 = {d};\n", .{tab.num_nonterminals});
+    try w.print("pub const num_productions: u32 = {d};\n", .{tab.num_productions});
+    try w.print("pub const start_state: u32 = {d};\n", .{tab.start_state});
+    try w.print("pub const eof: u32 = {d};\n\n", .{tab.eof});
+    try emit(w, lr.Cell, "action", tab.action);
+    try emit(w, i16, "goto_table", tab.goto_table);
+    try emit(w, u32, "prod_lhs", tab.prod_lhs);
+    try emit(w, u32, "prod_rhs_len", tab.prod_rhs_len);
     try w.flush();
 }
 

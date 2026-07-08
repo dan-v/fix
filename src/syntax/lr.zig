@@ -1,21 +1,29 @@
-//! Generic, comptime LALR(1) parser-table generator.
+//! Generic LALR(1) parser-table generator.
 //!
 //! Given a context-free grammar in integer form (`GrammarDesc`), this produces
-//! flat ACTION/GOTO tables *at compile time*. The runtime driver (see
-//! `parser.zig`) is a tight shift/reduce loop over those tables — no per-token
-//! function-pointer dispatch, one array lookup per action.
+//! flat ACTION/GOTO tables. The runtime driver (see `parser.zig`) is a tight
+//! shift/reduce loop over those tables — no per-token function-pointer dispatch,
+//! one array lookup per action.
+//!
+//! Construction runs as ORDINARY runtime code (native loops + an arena
+//! allocator), invoked once by the `gen-parser-tables` build tool, which emits
+//! the resulting arrays as static literals into `parser_tables.zig`. The shipped
+//! `fix` binary therefore contains only baked-in tables and does no construction
+//! at eval time. (This was previously a `comptime` evaluation, which cost ~70s
+//! of compiler time per table regen; running it natively is orders of magnitude
+//! faster and produces byte-identical tables.)
 //!
 //! Algorithm: the canonical LR(0) automaton plus LALR(1) lookaheads computed by
 //! the DeRemer/Pennello-style "spontaneous generation + propagation" method
 //! (Aho/Sethi/Ullman, Dragon book §4.7). State count therefore equals the LR(0)
-//! state count, keeping comptime work bounded.
+//! state count.
 //!
 //! Symbols are integers:
 //!   terminals    : `0 .. num_terminals`            (includes the EOF marker)
 //!   nonterminals : `num_terminals .. num_terminals+num_nonterminals`
 //!   augmented S' : `num_terminals+num_nonterminals` (added internally)
 //!
-//! Productions are given without the augmented start rule; `Generate` prepends
+//! Productions are given without the augmented start rule; `generate` prepends
 //! `S' -> start` as production index 0. The runtime driver switches on the
 //! production index to run the matching semantic action, so the *order* of
 //! `productions` is part of the grammar's contract.
@@ -58,7 +66,7 @@ pub const GrammarDesc = struct {
 /// A `u16` cell keeps the whole ACTION table half the size it would be as
 /// `u32` — the driver does one dependent table load per input token, so
 /// the table living in L1 is worth real cycles. 14 bits of arg bound the
-/// grammar at 16384 states/productions (asserted in `Generate`; the Nix
+/// grammar at 16384 states/productions (asserted in `generate`; the Nix
 /// grammar has ~253/205).
 pub const ACT_ERROR: u32 = 0;
 pub const ACT_SHIFT: u32 = 1;
@@ -79,89 +87,233 @@ pub inline fn cellArg(c: Cell) u32 {
     return @as(u32, c) & cell_arg_mask;
 }
 
-const Item = struct {
-    prod: u32,
-    dot: u32,
-};
+/// Upper bound on the lookahead-set width `W = num_terminals + 1`. Each LR(1)
+/// closure item carries a fixed-size lookahead bitset of this width; only the
+/// first `W` slots are ever read, so the cap just has to exceed the grammar's
+/// terminal count. The Nix grammar has 55 terminals; 1024 leaves ample room.
+const max_terminals = 1024;
 
-/// Build the LALR(1) tables for `g`. Returns a type exposing flat comptime
-/// arrays the runtime driver indexes with the current state and lookahead.
-pub fn Generate(comptime g: GrammarDesc) type {
-    @setEvalBranchQuota(200_000_000);
-    const built = comptime buildAll(g);
-    comptime std.debug.assert(built.num_states <= cell_arg_mask + 1);
-    comptime std.debug.assert(built.num_productions <= cell_arg_mask + 1);
-    comptime std.debug.assert(built.num_states <= std.math.maxInt(i16));
-    return struct {
-        pub const num_states: u32 = built.num_states;
-        pub const num_terminals: u32 = g.num_terminals;
-        /// Includes the augmented start nonterminal S'.
-        pub const num_nonterminals: u32 = g.num_nonterminals + 1;
-        pub const num_productions: u32 = built.num_productions;
-        pub const eof: u32 = g.eof;
-        pub const start_state: u32 = 0;
+const Item = struct { prod: u32, dot: u32 };
 
-        /// `action[state * num_terminals + term]` — a packed cell.
-        pub const action: []const Cell = built.action;
-        /// `goto_table[state * num_nonterminals + nt]` — target state, or -1.
-        pub const goto_table: []const i16 = built.goto_table;
-        /// Per-production left-hand-side nonterminal index (0-based).
-        pub const prod_lhs: []const u32 = built.prod_lhs;
-        /// Per-production right-hand-side length (symbols popped on reduce).
-        pub const prod_rhs_len: []const u32 = built.prod_rhs_len;
-    };
-}
+/// An LR(1) closure item: an LR(0) item plus a lookahead bitset. Only
+/// `la[0..W]` is meaningful; the trailing slots are unused padding (never read),
+/// which lets the item be a fixed-size value type instead of carrying a slice.
+const LItem = struct { prod: u32, dot: u32, la: [max_terminals]bool };
 
-const Built = struct {
+/// The constructed tables. Slices are owned by the allocator passed to
+/// `generate` (in practice an arena that outlives the emit).
+pub const Built = struct {
     num_states: u32,
+    num_terminals: u32,
+    /// Includes the augmented start nonterminal S'.
+    num_nonterminals: u32,
     num_productions: u32,
+    eof: u32,
+    start_state: u32,
+    /// `action[state * num_terminals + term]` — a packed cell.
     action: []const Cell,
+    /// `goto_table[state * num_nonterminals + nt]` — target state, or -1.
     goto_table: []const i16,
+    /// Per-production left-hand-side nonterminal index (0-based).
     prod_lhs: []const u32,
+    /// Per-production right-hand-side length (symbols popped on reduce).
     prod_rhs_len: []const u32,
 };
 
-fn buildAll(comptime g: GrammarDesc) Built {
-    @setEvalBranchQuota(200_000_000);
+pub const GenError = error{ OutOfMemory, LRConflict };
 
+const List = std.ArrayListUnmanaged;
+
+// FNV-1a over a kernel's (prod, dot) pairs, used to bucket kernels for O(1)
+// average dedup.
+fn kernelHash(k: []const Item) u64 {
+    var h: u64 = 1469598103934665603;
+    for (k) |it| {
+        h = (h ^ @as(u64, it.prod)) *% 1099511628211;
+        h = (h ^ @as(u64, it.dot)) *% 1099511628211;
+    }
+    return h;
+}
+
+fn kernelEqual(a: []const Item, b: []const Item) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.prod != y.prod or x.dot != y.dot) return false;
+    }
+    return true;
+}
+
+fn itemLess(a: Item, b: Item) bool {
+    if (a.prod != b.prod) return a.prod < b.prod;
+    return a.dot < b.dot;
+}
+
+// Sort an item list into canonical (prod, dot) order so equal kernels hash and
+// compare equal regardless of discovery order. Returns a freshly-allocated,
+// persistent slice (the state's kernel).
+fn sortKernel(arena: std.mem.Allocator, list: []const Item) ![]const Item {
+    const arr = try arena.dupe(Item, list);
+    var i: usize = 1;
+    while (i < arr.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and itemLess(arr[j], arr[j - 1])) : (j -= 1) {
+            const tmp = arr[j];
+            arr[j] = arr[j - 1];
+            arr[j - 1] = tmp;
+        }
+    }
+    return arr;
+}
+
+// index of kernel item (prod,dot) within a state's kernel
+fn kidxFind(kernel: []const Item, prod: u32, dot: u32) u32 {
+    for (kernel, 0..) |it, j| {
+        if (it.prod == prod and it.dot == dot) return @intCast(j);
+    }
+    unreachable;
+}
+
+fn precOfTerm(g: GrammarDesc, a: u32) RawPrec {
+    for (g.precedence) |pr| {
+        if (pr.term == a) return pr;
+    }
+    return .{ .term = a, .level = 0, .assoc = .none };
+}
+
+fn precOfProd(g: GrammarDesc, prods: []const RawProd, p: u32) u16 {
+    if (prods[p].prec) |pt| return precOfTerm(g, pt).level;
+    var i: usize = prods[p].rhs.len;
+    while (i > 0) {
+        i -= 1;
+        const sym = prods[p].rhs[i];
+        if (sym < g.num_terminals) return precOfTerm(g, sym).level;
+    }
+    return 0;
+}
+
+// Shared grammar data + the two closure helpers that read it. Groups what the
+// old comptime nested-struct methods captured from their enclosing scope.
+const Ctx = struct {
+    NT: u32,
+    W: u32,
+    num_nt_total: u32,
+    prods: []const RawProd,
+    prods_of: []const []const u32,
+    first: []const bool, // [num_nt_total][NT], flattened as [b*NT + a]
+    nullable: []const bool,
+
+    // FIRST of the sequence `seq` followed by lookahead set `la` (width W),
+    // written into `out[0..W]`.
+    fn firstSeq(self: *const Ctx, out: []bool, seq: []const u32, la: []const bool) void {
+        const NT = self.NT;
+        const W = self.W;
+        for (0..W) |k| out[k] = false;
+        var all_null = true;
+        for (seq) |sym| {
+            if (sym < NT) {
+                out[sym] = true;
+                all_null = false;
+                break;
+            } else {
+                const b = sym - NT;
+                for (0..NT) |a| {
+                    if (self.first[b * NT + a]) out[a] = true;
+                }
+                if (!self.nullable[b]) {
+                    all_null = false;
+                    break;
+                }
+            }
+        }
+        if (all_null) {
+            for (0..W) |a| {
+                if (la[a]) out[a] = true;
+            }
+        }
+    }
+
+    // LR(1) closure of `seeds` into `buf`; returns its length. `pos` is caller
+    // scratch of length `prods.len` (reset internally). Closure only adds dot-0
+    // items, so "find existing" is O(1) via `pos[p]` and the rule lookup uses
+    // the by-LHS index.
+    fn clo1(self: *const Ctx, seeds: []const LItem, buf: []LItem, pos: []i32) usize {
+        const NT = self.NT;
+        const W = self.W;
+        var n: usize = 0;
+        @memset(pos, -1);
+        for (seeds) |it| {
+            buf[n] = it;
+            if (it.dot == 0) pos[it.prod] = @intCast(n);
+            n += 1;
+        }
+        var fs: [max_terminals]bool = undefined;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const it = buf[i];
+                const rhs = self.prods[it.prod].rhs;
+                if (it.dot >= rhs.len) continue;
+                const sym = rhs[it.dot];
+                if (sym < NT) continue;
+                const beta = rhs[it.dot + 1 ..];
+                self.firstSeq(fs[0..W], beta, it.la[0..W]);
+                for (self.prods_of[sym - NT]) |p| {
+                    if (pos[p] < 0) {
+                        buf[n] = .{ .prod = p, .dot = 0, .la = undefined };
+                        @memcpy(buf[n].la[0..W], fs[0..W]);
+                        pos[p] = @intCast(n);
+                        n += 1;
+                        changed = true;
+                    } else {
+                        const qi: usize = @intCast(pos[p]);
+                        for (0..W) |a| {
+                            if (fs[a] and !buf[qi].la[a]) {
+                                buf[qi].la[a] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return n;
+    }
+};
+
+/// Build the LALR(1) tables for `g`. Runs as ordinary native code; all working
+/// state and the returned arrays are allocated from `arena`.
+pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
     const NT = g.num_terminals;
     const NN = g.num_nonterminals;
     const start_sym: u32 = NT + g.start;
     const num_nt_total = NN + 1; // includes S'
     const W = NT + 1; // lookahead-set width: real terminals + the '#' marker
     const HASH = NT; // bit index of the '#' propagation marker
+    std.debug.assert(W <= max_terminals);
 
     // Productions with the augmented rule S' -> start prepended at index 0.
-    const prods = [_]RawProd{.{ .lhs = NN, .rhs = &[_]u32{start_sym} }} ++ g.productions;
+    const prods = try arena.alloc(RawProd, g.productions.len + 1);
+    prods[0] = .{ .lhs = NN, .rhs = try arena.dupe(u32, &[_]u32{start_sym}) };
+    for (g.productions, 0..) |p, i| prods[i + 1] = p;
     const P = prods.len;
 
-    // Productions grouped by left-hand-side nonterminal, so closure steps
-    // iterate only the relevant rules instead of scanning all P every time.
-    const prods_of = blk: {
-        var lists = [_][]const u32{&[_]u32{}} ** num_nt_total;
-        for (prods, 0..) |p, i| lists[p.lhs] = lists[p.lhs] ++ &[_]u32{@intCast(i)};
-        break :blk lists;
-    };
-
-    // ---- helpers over the integer symbol space ----
-    const H = struct {
-        fn isTerm(s: u32) bool {
-            return s < NT;
-        }
-        fn ntIndexOf(s: u32) u32 {
-            return s - NT; // s is a nonterminal symbol id
-        }
-        fn rhsOf(p: u32) []const u32 {
-            return prods[p].rhs;
-        }
-    };
+    // Productions grouped by left-hand-side nonterminal.
+    const prods_of = try arena.alloc([]const u32, num_nt_total);
+    {
+        const lists = try arena.alloc(List(u32), num_nt_total);
+        for (lists) |*l| l.* = .empty;
+        for (prods, 0..) |p, i| try lists[p.lhs].append(arena, @intCast(i));
+        for (0..num_nt_total) |k| prods_of[k] = lists[k].items;
+    }
 
     // ---- FIRST sets and nullability (indexed by nonterminal index 0..NN) ----
-    // Computed into consts so the nested closure helpers below can reference
-    // them (nested struct methods may read outer consts, not outer vars).
-    const fn_sets = blk: {
-        var nullable = [_]bool{false} ** num_nt_total;
-        var first = [_][NT]bool{[_]bool{false} ** NT} ** num_nt_total;
+    const nullable = try arena.alloc(bool, num_nt_total);
+    @memset(nullable, false);
+    const first = try arena.alloc(bool, num_nt_total * NT);
+    @memset(first, false);
+    {
         var changed = true;
         while (changed) {
             changed = false;
@@ -169,19 +321,18 @@ fn buildAll(comptime g: GrammarDesc) Built {
                 const lhs = p.lhs;
                 var all_null = true;
                 for (p.rhs) |sym| {
-                    if (H.isTerm(sym)) {
-                        if (!first[lhs][sym]) {
-                            first[lhs][sym] = true;
+                    if (sym < NT) {
+                        if (!first[lhs * NT + sym]) {
+                            first[lhs * NT + sym] = true;
                             changed = true;
                         }
                         all_null = false;
                         break;
                     } else {
-                        const b = H.ntIndexOf(sym);
-                        var a: u32 = 0;
-                        while (a < NT) : (a += 1) {
-                            if (first[b][a] and !first[lhs][a]) {
-                                first[lhs][a] = true;
+                        const b = sym - NT;
+                        for (0..NT) |a| {
+                            if (first[b * NT + a] and !first[lhs * NT + a]) {
+                                first[lhs * NT + a] = true;
                                 changed = true;
                             }
                         }
@@ -197,296 +348,150 @@ fn buildAll(comptime g: GrammarDesc) Built {
                 }
             }
         }
-        break :blk .{ .first = first, .nullable = nullable };
-    };
-    const first = fn_sets.first;
-    const nullable = fn_sets.nullable;
+    }
 
-    // FIRST of the sequence `seq` followed by lookahead set `la` (width W).
-    const FIRST = struct {
-        fn seq(comptime_first: *const [num_nt_total][NT]bool, comptime_nullable: *const [num_nt_total]bool, s: []const u32, la: [W]bool) [W]bool {
-            var res = [_]bool{false} ** W;
-            var all_null = true;
-            for (s) |sym| {
-                if (sym < NT) {
-                    res[sym] = true;
-                    all_null = false;
-                    break;
-                } else {
-                    const b = sym - NT;
-                    var a: u32 = 0;
-                    while (a < NT) : (a += 1) {
-                        if (comptime_first[b][a]) res[a] = true;
-                    }
-                    if (!comptime_nullable[b]) {
-                        all_null = false;
-                        break;
-                    }
-                }
-            }
-            if (all_null) {
-                var a: u32 = 0;
-                while (a < W) : (a += 1) {
-                    if (la[a]) res[a] = true;
-                }
-            }
-            return res;
-        }
-    };
-
-    // ---- LR(0) closure over a kernel item list ----
-    const Clo0 = struct {
-        fn run(kernel: []const Item) []const Item {
-            // Worklist over a fixed buffer; `seen[p]` tracks whether the closure
-            // item (p, 0) is already present (closure only ever adds dot-0
-            // items), so both the "already there?" check and the rule lookup are
-            // O(1) instead of scanning every item / every production.
-            var buf: [2 * P + 64]Item = undefined;
-            var n: usize = 0;
-            var seen = [_]bool{false} ** P;
-            for (kernel) |it| {
-                buf[n] = it;
-                n += 1;
-                if (it.dot == 0) seen[it.prod] = true;
-            }
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                const it = buf[i];
-                const rhs = prods[it.prod].rhs;
-                if (it.dot >= rhs.len) continue;
-                const sym = rhs[it.dot];
-                if (sym < NT) continue; // terminal
-                for (prods_of[sym - NT]) |p| {
-                    if (!seen[p]) {
-                        seen[p] = true;
-                        buf[n] = .{ .prod = p, .dot = 0 };
-                        n += 1;
-                    }
-                }
-            }
-            var out: [n]Item = undefined;
-            for (buf[0..n], 0..) |it, k| out[k] = it;
-            const frozen = out;
-            return &frozen;
-        }
-    };
-
-    // Sort an item list into canonical (prod, dot) order so equal kernels hash
-    // and compare equal regardless of discovery order.
-    const sortKernel = struct {
-        fn run(list: []const Item) []const Item {
-            var arr: [list.len]Item = undefined;
-            for (list, 0..) |v, ix| arr[ix] = v;
-            var i: usize = 1;
-            while (i < arr.len) : (i += 1) {
-                var j = i;
-                while (j > 0 and less(arr[j], arr[j - 1])) : (j -= 1) {
-                    const tmp = arr[j];
-                    arr[j] = arr[j - 1];
-                    arr[j - 1] = tmp;
-                }
-            }
-            const final = arr;
-            return &final;
-        }
-        fn less(a: Item, b: Item) bool {
-            if (a.prod != b.prod) return a.prod < b.prod;
-            return a.dot < b.dot;
-        }
-    }.run;
-
-    const kernelEq = struct {
-        fn eq(a: []const Item, b: []const Item) bool {
-            if (a.len != b.len) return false;
-            for (a, b) |x, y| {
-                if (x.prod != y.prod or x.dot != y.dot) return false;
-            }
-            return true;
-        }
-        fn hash(k: []const Item) u64 {
-            var h: u64 = 1469598103934665603; // FNV-1a
-            for (k) |it| {
-                h = (h ^ it.prod) *% 1099511628211;
-                h = (h ^ it.dot) *% 1099511628211;
-            }
-            return h;
-        }
+    const ctx = Ctx{
+        .NT = NT,
+        .W = W,
+        .num_nt_total = num_nt_total,
+        .prods = prods,
+        .prods_of = prods_of,
+        .first = first,
+        .nullable = nullable,
     };
 
     // ---- build the canonical LR(0) collection ----
-    // Kernels are deduplicated through a hash table (`buckets` maps a kernel's
-    // FNV hash to the state indices in that bucket), so finding whether a GOTO
-    // target already exists is O(1) average rather than a scan of every state.
-    const NB = 8192;
     const NSYM = NT + NN;
-    const start_kernel = &[_]Item{.{ .prod = 0, .dot = 0 }};
-    var kernels: []const []const Item = &[_][]const Item{start_kernel};
+    const NB = 8192;
+    const start_kernel = try arena.dupe(Item, &[_]Item{.{ .prod = 0, .dot = 0 }});
+    var kernels: List([]const Item) = .empty;
+    try kernels.append(arena, start_kernel);
     const Trans = struct { from: u32, sym: u32, to: u32 };
-    var trans: []const Trans = &[_]Trans{};
-    var buckets = [_][]const u32{&[_]u32{}} ** NB;
-    buckets[kernelEq.hash(start_kernel) & (NB - 1)] = &[_]u32{0};
+    var trans: List(Trans) = .empty;
+    // buckets maps a kernel's FNV hash (masked) to the state indices in it.
+    const buckets = try arena.alloc(List(u32), NB);
+    for (buckets) |*bk| bk.* = .empty;
+    try buckets[kernelHash(start_kernel) & (NB - 1)].append(arena, 0);
+
+    // scratch reused across states
+    const clo0_buf = try arena.alloc(Item, 2 * P + 64);
+    const seen = try arena.alloc(bool, P);
+    const g_items = try arena.alloc(List(Item), NSYM);
+    for (g_items) |*gi| gi.* = .empty;
 
     {
         var s: usize = 0;
-        while (s < kernels.len) : (s += 1) {
-            const clos = Clo0.run(kernels[s]);
-            // One pass over the closure: bucket each advanced item by its next
-            // symbol (closure items are distinct, so advanced items are too — no
-            // dedup needed). Replaces NSYM full re-scans of the closure.
-            var g_items = [_][]const Item{&[_]Item{}} ** NSYM;
-            for (clos) |it| {
+        while (s < kernels.items.len) : (s += 1) {
+            // LR(0) closure over the kernel: worklist with an O(1) "seen"
+            // (closure only ever adds dot-0 items).
+            var nclo: usize = 0;
+            @memset(seen, false);
+            for (kernels.items[s]) |it| {
+                clo0_buf[nclo] = it;
+                nclo += 1;
+                if (it.dot == 0) seen[it.prod] = true;
+            }
+            var i: usize = 0;
+            while (i < nclo) : (i += 1) {
+                const it = clo0_buf[i];
                 const rhs = prods[it.prod].rhs;
                 if (it.dot >= rhs.len) continue;
                 const sym = rhs[it.dot];
-                g_items[sym] = g_items[sym] ++ &[_]Item{.{ .prod = it.prod, .dot = it.dot + 1 }};
+                if (sym < NT) continue;
+                for (prods_of[sym - NT]) |p| {
+                    if (!seen[p]) {
+                        seen[p] = true;
+                        clo0_buf[nclo] = .{ .prod = p, .dot = 0 };
+                        nclo += 1;
+                    }
+                }
             }
-            var x: u32 = 0;
+            // Bucket each advanced closure item by its next symbol.
+            for (0..NSYM) |x| g_items[x].clearRetainingCapacity();
+            for (clo0_buf[0..nclo]) |it| {
+                const rhs = prods[it.prod].rhs;
+                if (it.dot >= rhs.len) continue;
+                const sym = rhs[it.dot];
+                try g_items[sym].append(arena, .{ .prod = it.prod, .dot = it.dot + 1 });
+            }
+            var x: usize = 0;
             while (x < NSYM) : (x += 1) { // never GOTO on S'
-                if (g_items[x].len == 0) continue;
-                const gk = sortKernel(g_items[x]);
-                const h = kernelEq.hash(gk);
+                if (g_items[x].items.len == 0) continue;
+                const gk = try sortKernel(arena, g_items[x].items);
+                const h = kernelHash(gk);
                 const b = h & (NB - 1);
                 var target: i64 = -1;
-                for (buckets[b]) |ki| {
-                    if (kernelEq.eq(kernels[ki], gk)) {
+                for (buckets[b].items) |ki| {
+                    if (kernelEqual(kernels.items[ki], gk)) {
                         target = @intCast(ki);
                         break;
                     }
                 }
                 if (target < 0) {
-                    const ni: u32 = @intCast(kernels.len);
-                    kernels = kernels ++ &[_][]const Item{gk};
-                    buckets[b] = buckets[b] ++ &[_]u32{ni};
+                    const ni: u32 = @intCast(kernels.items.len);
+                    try kernels.append(arena, gk);
+                    try buckets[b].append(arena, ni);
                     target = ni;
                 }
-                trans = trans ++ &[_]Trans{.{ .from = @intCast(s), .sym = x, .to = @intCast(target) }};
+                try trans.append(arena, .{ .from = @intCast(s), .sym = @intCast(x), .to = @intCast(target) });
             }
         }
     }
 
-    const num_states = kernels.len;
+    const num_states = kernels.items.len;
 
-    // Dense transition table (state,sym) -> target state or -1, for O(1) lookup.
-    const trans_dense = blk: {
-        var td = [_]i32{-1} ** (num_states * NSYM);
-        for (trans) |e| td[e.from * NSYM + e.sym] = @intCast(e.to);
-        break :blk td;
-    };
-    const Tr = struct {
-        fn find(from: u32, sym: u32) i64 {
-            return trans_dense[from * NSYM + sym];
-        }
-    };
+    // Dense transition table (state,sym) -> target state or -1.
+    const trans_dense = try arena.alloc(i32, num_states * NSYM);
+    @memset(trans_dense, -1);
+    for (trans.items) |e| trans_dense[e.from * NSYM + e.sym] = @intCast(e.to);
 
     // ---- global ids for kernel items: offset[s] + j ----
-    var offset = [_]u32{0} ** (num_states + 1);
-    {
-        var s: usize = 0;
-        while (s < num_states) : (s += 1) offset[s + 1] = offset[s] + @as(u32, @intCast(kernels[s].len));
-    }
+    const offset = try arena.alloc(u32, num_states + 1);
+    offset[0] = 0;
+    for (0..num_states) |s| offset[s + 1] = offset[s] + @as(u32, @intCast(kernels.items[s].len));
     const K = offset[num_states];
 
-    // ---- LR(1)-carrying closure (width-W lookaheads), used for both the
-    //      propagation pass and final table construction ----
-    const LItem = struct { prod: u32, dot: u32, la: [W]bool };
-    const Clo1 = struct {
-        // Fills `buf` with the LR(1) closure of `seeds` and returns its length.
-        // The caller owns/reuses `buf`, so there is no per-call result copy.
-        // `pos[p]` = buffer index of the closure item (p, 0), or -1. Closure only
-        // adds dot-0 items, so "find existing" is O(1) and the rule lookup uses
-        // the by-LHS index — both were O(P·n) linear scans.
-        fn run(seeds: []const LItem, buf: *[2 * P + 64]LItem) usize {
-            var n: usize = 0;
-            var pos = [_]i32{-1} ** P;
-            for (seeds) |it| {
-                buf[n] = it;
-                if (it.dot == 0) pos[it.prod] = @intCast(n);
-                n += 1;
-            }
-            var changed = true;
-            while (changed) {
-                changed = false;
-                var i: usize = 0;
-                while (i < n) : (i += 1) {
-                    const it = buf[i];
-                    const rhs = prods[it.prod].rhs;
-                    if (it.dot >= rhs.len) continue;
-                    const sym = rhs[it.dot];
-                    if (sym < NT) continue;
-                    const beta = rhs[it.dot + 1 ..];
-                    const fs = FIRST.seq(&first, &nullable, beta, it.la);
-                    for (prods_of[sym - NT]) |p| {
-                        if (pos[p] < 0) {
-                            buf[n] = .{ .prod = p, .dot = 0, .la = fs };
-                            pos[p] = @intCast(n);
-                            n += 1;
-                            changed = true;
-                        } else {
-                            const qi: usize = @intCast(pos[p]);
-                            var a: u32 = 0;
-                            while (a < W) : (a += 1) {
-                                if (fs[a] and !buf[qi].la[a]) {
-                                    buf[qi].la[a] = true;
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return n;
-        }
-    };
-
-    // index of kernel item (prod,dot) within a state's kernel
-    const kidx = struct {
-        fn find(kernel: []const Item, prod: u32, dot: u32) u32 {
-            for (kernel, 0..) |it, j| {
-                if (it.prod == prod and it.dot == dot) return @intCast(j);
-            }
-            unreachable;
-        }
-    };
-
     // ---- spontaneous lookaheads + propagation links ----
-    // `prop[src]` = the kernel-item ids that `src` propagates lookaheads to
-    // (per-source lists, so building them is O(links) not O(links²) via `++`).
-    var la_sets = [_][NT]bool{[_]bool{false} ** NT} ** K;
-    var prop = [_][]const u32{&[_]u32{}} ** K;
+    const la_sets = try arena.alloc(bool, K * NT); // [K][NT], flattened
+    @memset(la_sets, false);
+    const prop = try arena.alloc(List(u32), K); // prop[src] -> dst kernel-item ids
+    for (prop) |*pl| pl.* = .empty;
+
+    const cbuf = try arena.alloc(LItem, 2 * P + 64);
+    const pos = try arena.alloc(i32, P);
 
     {
-        var cbuf: [2 * P + 64]LItem = undefined;
         var s: usize = 0;
         while (s < num_states) : (s += 1) {
             var j: usize = 0;
-            while (j < kernels[s].len) : (j += 1) {
-                const kit = kernels[s][j];
-                var seed_la = [_]bool{false} ** W;
-                seed_la[HASH] = true;
-                const seeds = [_]LItem{.{ .prod = kit.prod, .dot = kit.dot, .la = seed_la }};
-                const nc = Clo1.run(&seeds, &cbuf);
+            while (j < kernels.items[s].len) : (j += 1) {
+                const kit = kernels.items[s][j];
+                var seed: LItem = .{ .prod = kit.prod, .dot = kit.dot, .la = undefined };
+                for (0..W) |a| seed.la[a] = false;
+                seed.la[HASH] = true;
+                const seeds = [_]LItem{seed};
+                const nc = ctx.clo1(&seeds, cbuf, pos);
                 const src_id = offset[s] + @as(u32, @intCast(j));
                 for (cbuf[0..nc]) |ci| {
                     const rhs = prods[ci.prod].rhs;
                     if (ci.dot >= rhs.len) continue;
-                    const x = rhs[ci.dot];
-                    const t = Tr.find(@intCast(s), x);
+                    const xsym = rhs[ci.dot];
+                    const t = trans_dense[s * NSYM + xsym];
                     if (t < 0) continue;
-                    const ts: u32 = @intCast(t);
-                    const dst_j = kidx.find(kernels[ts], ci.prod, ci.dot + 1);
+                    const ts: usize = @intCast(t);
+                    const dst_j = kidxFind(kernels.items[ts], ci.prod, ci.dot + 1);
                     const dst_id = offset[ts] + dst_j;
-                    var a: u32 = 0;
-                    while (a < NT) : (a += 1) {
-                        if (ci.la[a]) la_sets[dst_id][a] = true;
+                    for (0..NT) |a| {
+                        if (ci.la[a]) la_sets[dst_id * NT + a] = true;
                     }
-                    if (ci.la[HASH]) prop[src_id] = prop[src_id] ++ &[_]u32{dst_id};
+                    if (ci.la[HASH]) try prop[src_id].append(arena, dst_id);
                 }
             }
         }
     }
 
     // start item S'->.S in state 0 has lookahead {eof}
-    la_sets[offset[0] + kidx.find(kernels[0], 0, 0)][g.eof] = true;
+    la_sets[(offset[0] + kidxFind(kernels.items[0], 0, 0)) * NT + g.eof] = true;
 
     // propagate to fixpoint
     {
@@ -495,11 +500,10 @@ fn buildAll(comptime g: GrammarDesc) Built {
             changed = false;
             var src: usize = 0;
             while (src < K) : (src += 1) {
-                for (prop[src]) |dst| {
-                    var a: u32 = 0;
-                    while (a < NT) : (a += 1) {
-                        if (la_sets[src][a] and !la_sets[dst][a]) {
-                            la_sets[dst][a] = true;
+                for (prop[src].items) |dst| {
+                    for (0..NT) |a| {
+                        if (la_sets[src * NT + a] and !la_sets[dst * NT + a]) {
+                            la_sets[dst * NT + a] = true;
                             changed = true;
                         }
                     }
@@ -508,72 +512,52 @@ fn buildAll(comptime g: GrammarDesc) Built {
         }
     }
 
-    // ---- precedence helpers ----
-    const Prec = struct {
-        fn ofTerm(a: u32) RawPrec {
-            for (g.precedence) |pr| {
-                if (pr.term == a) return pr;
-            }
-            return .{ .term = a, .level = 0, .assoc = .none };
-        }
-        fn ofProd(p: u32) u16 {
-            if (prods[p].prec) |pt| return ofTerm(pt).level;
-            var i: usize = prods[p].rhs.len;
-            while (i > 0) {
-                i -= 1;
-                const sym = prods[p].rhs[i];
-                if (sym < NT) return ofTerm(sym).level;
-            }
-            return 0;
-        }
-    };
-
     // ---- build ACTION / GOTO ----
-    var action = [_]Cell{cell(ACT_ERROR, 0)} ** (num_states * NT);
-    var goto_table = [_]i16{-1} ** (num_states * num_nt_total);
+    const action = try arena.alloc(Cell, num_states * NT);
+    @memset(action, cell(ACT_ERROR, 0));
+    const goto_table = try arena.alloc(i16, num_states * num_nt_total);
+    @memset(goto_table, -1);
+
+    var max_kernel: usize = 0;
+    for (0..num_states) |s| max_kernel = @max(max_kernel, kernels.items[s].len);
+    const seeds_buf = try arena.alloc(LItem, max_kernel);
 
     {
-        var cbuf: [2 * P + 64]LItem = undefined;
         var s: usize = 0;
         while (s < num_states) : (s += 1) {
             // seed LR(1) closure with kernel items + their propagated lookaheads
-            var seeds: [256]LItem = undefined;
             var ns: usize = 0;
             var j: usize = 0;
-            while (j < kernels[s].len) : (j += 1) {
-                var la = [_]bool{false} ** W;
+            while (j < kernels.items[s].len) : (j += 1) {
+                var seed: LItem = .{ .prod = kernels.items[s][j].prod, .dot = kernels.items[s][j].dot, .la = undefined };
+                for (0..W) |a| seed.la[a] = false;
                 const gid = offset[s] + @as(u32, @intCast(j));
-                var a: u32 = 0;
-                while (a < NT) : (a += 1) la[a] = la_sets[gid][a];
-                seeds[ns] = .{ .prod = kernels[s][j].prod, .dot = kernels[s][j].dot, .la = la };
+                for (0..NT) |a| seed.la[a] = la_sets[gid * NT + a];
+                seeds_buf[ns] = seed;
                 ns += 1;
             }
-            const nc = Clo1.run(seeds[0..ns], &cbuf);
-            const clos = cbuf[0..nc];
-
-            for (clos) |ci| {
+            const nc = ctx.clo1(seeds_buf[0..ns], cbuf, pos);
+            for (cbuf[0..nc]) |ci| {
                 const rhs = prods[ci.prod].rhs;
                 if (ci.dot < rhs.len) {
-                    const x = rhs[ci.dot];
-                    const t = Tr.find(@intCast(s), x);
+                    const xsym = rhs[ci.dot];
+                    const t = trans_dense[s * NSYM + xsym];
                     if (t < 0) continue;
-                    if (x < NT) {
-                        setAction(&action, s * NT + x, cell(ACT_SHIFT, @intCast(t)), x, g, Prec.ofProd, Prec.ofTerm, s);
+                    if (xsym < NT) {
+                        try setAction(g, prods, action, s * NT + xsym, cell(ACT_SHIFT, @intCast(t)), xsym, s);
                     } else {
-                        goto_table[s * num_nt_total + (x - NT)] = @intCast(t);
+                        goto_table[s * num_nt_total + (xsym - NT)] = @intCast(t);
                     }
                 } else {
                     if (ci.prod == 0) {
                         // S' -> start .  : accept on its lookahead (eof)
-                        var a: u32 = 0;
-                        while (a < NT) : (a += 1) {
+                        for (0..NT) |a| {
                             if (ci.la[a]) action[s * NT + a] = cell(ACT_ACCEPT, 0);
                         }
                     } else {
-                        var a: u32 = 0;
-                        while (a < NT) : (a += 1) {
+                        for (0..NT) |a| {
                             if (ci.la[a]) {
-                                setAction(&action, s * NT + a, cell(ACT_REDUCE, ci.prod), a, g, Prec.ofProd, Prec.ofTerm, s);
+                                try setAction(g, prods, action, s * NT + a, cell(ACT_REDUCE, ci.prod), @intCast(a), s);
                             }
                         }
                     }
@@ -582,45 +566,43 @@ fn buildAll(comptime g: GrammarDesc) Built {
         }
     }
 
-    // materialize into static const slices
-    const num_prods = P;
-    var prod_lhs = [_]u32{0} ** num_prods;
-    var prod_rhs_len = [_]u32{0} ** num_prods;
-    {
-        var p: usize = 0;
-        while (p < num_prods) : (p += 1) {
-            prod_lhs[p] = prods[p].lhs;
-            prod_rhs_len[p] = @intCast(prods[p].rhs.len);
-        }
+    const prod_lhs = try arena.alloc(u32, P);
+    const prod_rhs_len = try arena.alloc(u32, P);
+    for (0..P) |p| {
+        prod_lhs[p] = prods[p].lhs;
+        prod_rhs_len[p] = @intCast(prods[p].rhs.len);
     }
 
-    const action_final = action;
-    const goto_final = goto_table;
-    const lhs_final = prod_lhs;
-    const rlen_final = prod_rhs_len;
+    std.debug.assert(num_states <= cell_arg_mask + 1);
+    std.debug.assert(P <= cell_arg_mask + 1);
+    std.debug.assert(num_states <= std.math.maxInt(i16));
+
     return .{
         .num_states = @intCast(num_states),
-        .num_productions = @intCast(num_prods),
-        .action = &action_final,
-        .goto_table = &goto_final,
-        .prod_lhs = &lhs_final,
-        .prod_rhs_len = &rlen_final,
+        .num_terminals = NT,
+        .num_nonterminals = num_nt_total,
+        .num_productions = @intCast(P),
+        .eof = g.eof,
+        .start_state = 0,
+        .action = action,
+        .goto_table = goto_table,
+        .prod_lhs = prod_lhs,
+        .prod_rhs_len = prod_rhs_len,
     };
 }
 
 /// Install `new_cell` at `action[idx]`, resolving shift/reduce conflicts with
-/// precedence. Unresolved conflicts are a compile error — a stratified grammar
-/// should be conflict-free, so a conflict means the grammar is wrong.
+/// precedence. Unresolved conflicts return `error.LRConflict` — a stratified
+/// grammar should be conflict-free, so a conflict means the grammar is wrong.
 fn setAction(
-    action: anytype,
+    g: GrammarDesc,
+    prods: []const RawProd,
+    action: []Cell,
     idx: usize,
     new_cell: Cell,
     term: u32,
-    comptime g: GrammarDesc,
-    comptime prodPrec: anytype,
-    comptime termPrec: anytype,
     state: usize,
-) void {
+) GenError!void {
     const cur = action[idx];
     if (cellKind(cur) == ACT_ERROR) {
         action[idx] = new_cell;
@@ -640,8 +622,8 @@ fn setAction(
     if (new_kind == ACT_REDUCE) reduce_prod = cellArg(new_cell);
 
     if (shift_target != null and reduce_prod != null) {
-        const rlevel = prodPrec(reduce_prod.?);
-        const tp = termPrec(term);
+        const rlevel = precOfProd(g, prods, reduce_prod.?);
+        const tp = precOfTerm(g, term);
         if (rlevel > 0 and tp.level > 0) {
             if (rlevel > tp.level) {
                 action[idx] = cell(ACT_REDUCE, reduce_prod.?);
@@ -654,24 +636,24 @@ fn setAction(
                     .left => action[idx] = cell(ACT_REDUCE, reduce_prod.?),
                     .right => action[idx] = cell(ACT_SHIFT, shift_target.?),
                     .nonassoc => action[idx] = cell(ACT_ERROR, 0),
-                    .none => conflictError(g, state, term, cur, new_cell),
+                    .none => return conflictError(state, term, cur, new_cell),
                 }
                 return;
             }
         }
-        conflictError(g, state, term, cur, new_cell);
+        return conflictError(state, term, cur, new_cell);
     }
 
     // reduce/reduce or anything else unresolved
-    conflictError(g, state, term, cur, new_cell);
+    return conflictError(state, term, cur, new_cell);
 }
 
-fn conflictError(comptime g: GrammarDesc, state: usize, term: u32, cur: u32, new_cell: u32) void {
-    _ = g;
-    @compileError(std.fmt.comptimePrint(
-        "LR conflict in state {d} on terminal {d}: existing cell kind={d} arg={d} vs new kind={d} arg={d}. Fix the grammar (add precedence or restructure).",
+fn conflictError(state: usize, term: u32, cur: Cell, new_cell: Cell) GenError {
+    std.debug.print(
+        "LR conflict in state {d} on terminal {d}: existing cell kind={d} arg={d} vs new kind={d} arg={d}. Fix the grammar (add precedence or restructure).\n",
         .{ state, term, cellKind(cur), cellArg(cur), cellKind(new_cell), cellArg(new_cell) },
-    ));
+    );
+    return error.LRConflict;
 }
 
 // ---------------------------------------------------------------------------
@@ -681,16 +663,16 @@ fn conflictError(comptime g: GrammarDesc, state: usize, term: u32, cur: u32, new
 
 const testing = std.testing;
 
-/// A minimal runtime driver used only by the tests here to validate the tables.
-fn driveAccepts(comptime Tab: type, terms: []const u32) bool {
+/// A minimal driver used only by the tests here to validate the tables.
+fn driveAccepts(tab: Built, terms: []const u32) bool {
     var stack: [256]u32 = undefined; // state stack
     var sp: usize = 0;
-    stack[sp] = Tab.start_state;
+    stack[sp] = tab.start_state;
     var ip: usize = 0;
     while (true) {
         const state = stack[sp];
         const la = terms[ip];
-        const c = Tab.action[state * Tab.num_terminals + la];
+        const c = tab.action[state * tab.num_terminals + la];
         switch (cellKind(c)) {
             ACT_SHIFT => {
                 sp += 1;
@@ -699,13 +681,13 @@ fn driveAccepts(comptime Tab: type, terms: []const u32) bool {
             },
             ACT_REDUCE => {
                 const p = cellArg(c);
-                const n = Tab.prod_rhs_len[p];
+                const n = tab.prod_rhs_len[p];
                 sp -= n;
-                const lhs = Tab.prod_lhs[p];
-                const g = Tab.goto_table[stack[sp] * Tab.num_nonterminals + lhs];
-                if (g < 0) return false;
+                const lhs = tab.prod_lhs[p];
+                const gt = tab.goto_table[stack[sp] * tab.num_nonterminals + lhs];
+                if (gt < 0) return false;
                 sp += 1;
-                stack[sp] = @intCast(g);
+                stack[sp] = @intCast(gt);
             },
             ACT_ACCEPT => return true,
             else => return false,
@@ -730,13 +712,15 @@ test "LALR(1) grammar that is not SLR(1)" {
             .{ .lhs = 2, .rhs = &[_]u32{4 + 1} }, // R -> L
         },
     };
-    const Tab = Generate(g);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tab = try generate(arena.allocator(), g);
 
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 2, 3 })); // id
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 2, 0, 2, 3 })); // id = id
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 1, 2, 0, 2, 3 })); // * id = id
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 1, 1, 2, 3 })); // * * id
-    try testing.expect(!driveAccepts(Tab, &[_]u32{ 2, 0, 3 })); // id =  (incomplete)
+    try testing.expect(driveAccepts(tab, &[_]u32{ 2, 3 })); // id
+    try testing.expect(driveAccepts(tab, &[_]u32{ 2, 0, 2, 3 })); // id = id
+    try testing.expect(driveAccepts(tab, &[_]u32{ 1, 2, 0, 2, 3 })); // * id = id
+    try testing.expect(driveAccepts(tab, &[_]u32{ 1, 1, 2, 3 })); // * * id
+    try testing.expect(!driveAccepts(tab, &[_]u32{ 2, 0, 3 })); // id =  (incomplete)
 }
 
 test "left/right recursive operator grammar" {
@@ -758,10 +742,12 @@ test "left/right recursive operator grammar" {
             .{ .lhs = 2, .rhs = &[_]u32{2} }, // F -> id
         },
     };
-    const Tab = Generate(g);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tab = try generate(arena.allocator(), g);
 
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 2, 3 })); // id
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 2, 0, 2, 0, 2, 3 })); // id + id + id
-    try testing.expect(driveAccepts(Tab, &[_]u32{ 2, 1, 2, 1, 2, 3 })); // id ^ id ^ id
-    try testing.expect(!driveAccepts(Tab, &[_]u32{ 2, 0, 3 })); // id +
+    try testing.expect(driveAccepts(tab, &[_]u32{ 2, 3 })); // id
+    try testing.expect(driveAccepts(tab, &[_]u32{ 2, 0, 2, 0, 2, 3 })); // id + id + id
+    try testing.expect(driveAccepts(tab, &[_]u32{ 2, 1, 2, 1, 2, 3 })); // id ^ id ^ id
+    try testing.expect(!driveAccepts(tab, &[_]u32{ 2, 0, 3 })); // id +
 }
