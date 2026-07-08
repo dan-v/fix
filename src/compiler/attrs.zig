@@ -335,6 +335,11 @@ fn appendWithSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)) !b
 /// i.e. iff it would otherwise go through `compileThunkEager`. Deferring
 /// exactly replaces that thunk, so output stays byte-identical. (The
 /// immediate set mirrors `access.compileImmediateContainerValue`.)
+///
+/// `.elided` bodies (never parsed) intentionally land in the `else => true`
+/// branch: the parser's elision shape gate (`scanElidableBody`) already
+/// excluded every immediate shape at token level, so an elided body is
+/// deferral-shaped by construction.
 fn isDeferrableBody(node: *const Node) bool {
     return switch (ast.unwrapParens(node).tag) {
         .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null, .list, .attr_set, .lambda, .lambda_attrs => false,
@@ -509,9 +514,16 @@ fn compilePlainAttrGroup(
     }
 
     if (group.leaf_count > 1 or group.tails.len > 0) {
-        const duplicate = duplicateExtendedLeaf(group, leaf.?);
+        // Elided leaves must be materialized first: whether an extended
+        // group merges (leaf is an attrset literal) or is a duplicate
+        // error depends on the leaf's true shape.
+        for (group.leaves) |*lv| {
+            if (lv.expr.tag == .elided) lv.expr = try literals.materializeElided(self, lv.expr);
+        }
+        const lead = group.leaves[0];
+        const duplicate = duplicateExtendedLeaf(group, lead);
         if (duplicate) |entry| {
-            try reportDuplicateAttribute(self, entry.path[0], leaf.?.path[0]);
+            try reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
             return error.DuplicateAttribute;
         }
         try emitAttrNameId(self, group.name_id);
@@ -522,7 +534,10 @@ fn compilePlainAttrGroup(
 
     // Lazy per-attr compilation: a clean single-leaf body (path.len == 1,
     // not an inherit) whose shape is substantial defers its compile to
-    // first force instead of emitting bytecode now.
+    // first force instead of emitting bytecode now. An `.elided` body
+    // qualifies without inspection: the parser's elision gates guarantee
+    // it is deferral-shaped and over MIN_BODY_BYTES (`isDeferrableBody`
+    // returns true for `.elided` via its else branch).
     if (defer_scope) |dscope| {
         if (leafDeferrable(leaf.?)) {
             try emitAttrNameId(self, group.name_id);
@@ -532,8 +547,13 @@ fn compilePlainAttrGroup(
         }
     }
 
+    // Eager path: materialize an elided body before the shape-sensitive
+    // immediate-vs-thunk decision so the emitted bytecode is exactly what
+    // the eager parse would have produced.
+    var body = leaf.?.expr;
+    if (body.tag == .elided) body = try literals.materializeElided(self, body);
     try emitAttrNameId(self, group.name_id);
-    try access.compileContainerValue(self, leaf.?.expr, .{ .raw_identifier = true });
+    try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
 }
 

@@ -36,6 +36,10 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
     switch (node.tag) {
         .integer, .float_val, .bool_true, .bool_false, .null, .search_path => {},
         .string, .path => walkIdentifiersInSpan(self, node.data.atom, ctx),
+        // Never parsed: conservatively mark every identifier-shaped word in
+        // the span (a superset of the real references — false positives
+        // only keep cells alive, matching this walker's contract).
+        .elided => markIdentWords(self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len], ctx),
         .identifier => {
             const ident = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
             ctx.mark(ident);
@@ -122,6 +126,10 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
 fn walkIdentifiersInSpan(self: *Compiler, atom: Node.Atom, ctx: anytype) void {
     const text = self.source[atom.offset .. atom.offset + atom.len];
     if (std.mem.indexOf(u8, text, "${") == null) return;
+    markIdentWords(text, ctx);
+}
+
+fn markIdentWords(text: []const u8, ctx: anytype) void {
     var i: usize = 0;
     while (i < text.len) {
         if (isIdentStart(text[i])) {

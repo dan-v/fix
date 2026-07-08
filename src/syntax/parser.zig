@@ -114,6 +114,27 @@ pub const Parser = struct {
     /// The earliest pipe operator token seen, for a precise "disabled"
     /// diagnostic.
     first_pipe_token: ?Token,
+    /// Body-span elision (lazy parsing): when enabled, a bind body inside a
+    /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
+    /// earlier clauses in the same brace, (b) spans at least
+    /// `elide_min_body_bytes`, and (c) is deferral-shaped (see
+    /// `scanElidableBody`'s shape gate) is NOT parsed. Its tokens are
+    /// skipped by a balanced span scan and a single `.elided` node holding
+    /// the span is spliced onto the parse stack; the compiler sub-parses it
+    /// on demand. Default off — `Evaluator.parseAndCompile` enables it for
+    /// file compiles, mirroring the lazy per-attr compilation gate
+    /// (`compiler/attrs.zig shouldDeferSet`). Note this makes parse errors
+    /// inside such bodies surface at first *force* instead of at parse time
+    /// — the same deal deferred compilation already makes for compile
+    /// errors (an unforced body's errors are never reported).
+    elide_bodies: bool = false,
+
+    /// Gate tunables for body-span elision. Mirror the lazy per-attr
+    /// compilation gates (`compiler/deferred_table.zig` MIN_BODY_BYTES /
+    /// MIN_ENTRIES — cross-checked there at comptime): an elided body is
+    /// only profitable if the compiler would have deferred it anyway.
+    pub const elide_min_body_bytes: u32 = 100;
+    pub const elide_min_prior_clauses: u32 = 64;
 
     pub fn init(allocator: std.mem.Allocator, arena: *ast.AstArena, source: []const u8) Parser {
         return .{
@@ -199,6 +220,17 @@ pub const Parser = struct {
         }
     }
 
+    /// Binding-context tracking for body-span elision: the kind of the
+    /// innermost open construct that could own a `=` bind. Only a plain
+    /// (non-`rec`) brace is elidable — `rec { }` / `let ... in` bindings
+    /// never defer, and `${ ... }` only nests an expression.
+    const BindCtx = struct {
+        kind: enum(u8) { brace, other_brace, let_block },
+        /// Clauses terminated so far in this brace (approximate: counts
+        /// `;` shifts, which is exact for generated package sets).
+        clauses: u32 = 0,
+    };
+
     fn drive(self: *Parser, scanner: *Scanner) !?*Node {
         const gpa = self.allocator;
         // Tokens stream straight from the scanner — no token array. The
@@ -216,6 +248,12 @@ pub const Parser = struct {
         vals[sp] = .{ .nil = {} };
         sp += 1;
 
+        // Body-span elision bookkeeping (only maintained when enabled —
+        // one predictable branch per shift otherwise).
+        var ctx_stack: std.ArrayListUnmanaged(BindCtx) = .empty;
+        defer ctx_stack.deinit(gpa);
+        var last_shifted: TokenType = .eof;
+
         var tok = self.nextToken(scanner);
         var error_count: usize = 0;
         const max_errors = 32;
@@ -231,14 +269,70 @@ pub const Parser = struct {
             const c = Tab.action[state * Tab.num_terminals + la];
             switch (lr.cellKind(c)) {
                 lr.ACT_SHIFT => {
-                    if (sp == cap) {
+                    if (sp + 2 > cap) {
                         cap *= 2;
                         states = try gpa.realloc(states, cap);
                         vals = try gpa.realloc(vals, cap);
                     }
+                    if (self.elide_bodies) elide: {
+                        // Grammar-wide, `=` appears only in the two bind
+                        // productions (`attrpath = expr ;` / let-`bind`), so
+                        // every `=` shift starts a bind body. Elide it when
+                        // the innermost binding context is a plain brace
+                        // that has already accumulated enough clauses.
+                        if (tok.type != .equal or self.had_error) break :elide;
+                        const top = if (ctx_stack.items.len > 0) ctx_stack.items[ctx_stack.items.len - 1] else break :elide;
+                        if (top.kind != .brace or top.clauses < elide_min_prior_clauses) break :elide;
+                        const eq_state = lr.cellArg(c);
+                        const g = Tab.goto_table[eq_state * Tab.num_nonterminals + @intFromEnum(grammar.NT.expr)];
+                        if (g < 0) break :elide;
+                        const res = self.scanElidableBody(scanner) orelse break :elide;
+                        // Shift the `=`, then splice the elided body onto the
+                        // stack as an already-reduced Expr (goto on the Expr
+                        // nonterminal with a synthetic value); the pending
+                        // lookahead becomes the terminating `;`.
+                        states[sp] = eq_state;
+                        vals[sp] = .{ .tok = tok };
+                        sp += 1;
+                        const node = try self.arena.createNode(.elided, .{ .atom = res.span });
+                        states[sp] = @intCast(g);
+                        vals[sp] = .{ .node = node };
+                        sp += 1;
+                        scanner.* = res.scanner;
+                        tok = res.semi;
+                        last_shifted = .equal;
+                        continue;
+                    }
                     states[sp] = lr.cellArg(c);
                     vals[sp] = .{ .tok = tok };
                     sp += 1;
+                    if (self.elide_bodies) {
+                        switch (tok.type) {
+                            .left_brace => try ctx_stack.append(gpa, .{
+                                .kind = if (last_shifted == .kw_rec) .other_brace else .brace,
+                            }),
+                            .dollar_curly => try ctx_stack.append(gpa, .{ .kind = .other_brace }),
+                            .kw_let => try ctx_stack.append(gpa, .{ .kind = .let_block }),
+                            .kw_in => {
+                                if (ctx_stack.items.len > 0 and ctx_stack.items[ctx_stack.items.len - 1].kind == .let_block) {
+                                    _ = ctx_stack.pop();
+                                }
+                            },
+                            .right_brace => {
+                                if (ctx_stack.items.len > 0 and ctx_stack.items[ctx_stack.items.len - 1].kind != .let_block) {
+                                    _ = ctx_stack.pop();
+                                }
+                            },
+                            .semicolon => {
+                                if (ctx_stack.items.len > 0) {
+                                    const top = &ctx_stack.items[ctx_stack.items.len - 1];
+                                    if (top.kind == .brace) top.clauses += 1;
+                                }
+                            },
+                            else => {},
+                        }
+                        last_shifted = tok.type;
+                    }
                     tok = self.nextToken(scanner);
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
@@ -296,6 +390,124 @@ pub const Parser = struct {
             const la = @intFromEnum(tok.type);
             if (lr.cellKind(Tab.action[top_state * NT + la]) != lr.ACT_ERROR) return true;
         }
+    }
+
+    // ---- body-span elision ----
+
+    const ElideResult = struct {
+        /// The body's exact source span: first body token's start to the
+        /// terminating `;` (exclusive; may include trailing layout/comments,
+        /// which the sub-parse skips identically).
+        span: Node.Atom,
+        /// The terminating `;`, handed back as the pending lookahead.
+        semi: Token,
+        /// Scanner state just past the `;`.
+        scanner: Scanner,
+    };
+
+    /// Scan (without parsing) from just after a bind's `=` to its
+    /// terminating `;`, and decide whether the body may be elided. Works on
+    /// a COPY of the scanner, so a bail leaves the parse untouched.
+    ///
+    /// Finding the right `;` is a token-level balance scan — the scanner
+    /// already lexes strings (with nested interpolation), paths, and
+    /// comments as opaque units, so only real structure needs tracking:
+    ///   - bracket depth: `(`/`[`/`{`/`${` vs `)`/`]`/`}` (bail if the body
+    ///     would close an enclosing group — malformed or `}`-terminated);
+    ///   - `let ... in` at depth 0: every `;` before the matching `in`
+    ///     belongs to the let's bindings;
+    ///   - `assert`/`with` at depth 0 (outside open lets): each owns one
+    ///     following `;`.
+    ///
+    /// Shape gate (mirrors `compiler/attrs.zig isDeferrableBody`): bodies
+    /// the compiler would compile as immediate values — single-token atoms,
+    /// lambdas (`x:`/`x@`/`{..}:`/`{..}@`), whole-body `{..}`/`[..]`
+    /// literals, `rec`-rooted sets, and whole-body parens (opaque without
+    /// unwrapping) — are NOT elided, so an elided body is always
+    /// deferral-shaped and the compiler may defer it without inspecting it.
+    ///
+    /// Returns null to fall back to normal parsing (also on any token-level
+    /// anomaly: error tokens, EOF, unbalanced closers, undersized bodies).
+    fn scanElidableBody(self: *Parser, scanner: *const Scanner) ?ElideResult {
+        var sc = scanner.*;
+        const first = sc.next();
+        switch (first.type) {
+            // Not a body / immediate-shaped roots (see shape gate above).
+            .semicolon, .eof, .error_token, .kw_rec, .left_paren => return null,
+            else => {},
+        }
+        const first_opens_group = first.type == .left_brace or first.type == .left_bracket;
+
+        var depth: u32 = 0;
+        var lets: u32 = 0;
+        var pending_semis: u32 = 0;
+        var i: u32 = 0; // token ordinal within the body (0 == `first`)
+        var second_type: TokenType = .eof;
+        var first_group_close: ?u32 = null; // ordinal of the token closing the first-token group
+        var after_first_group: TokenType = .eof; // the token right after that close
+        var tk = first;
+        const semi = while (true) {
+            if (i == 1) second_type = tk.type;
+            if (first_group_close) |gc| {
+                if (i == gc + 1) after_first_group = tk.type;
+            }
+            switch (tk.type) {
+                .eof, .error_token => return null,
+                // Record pipe usage for the compile-time feature gate —
+                // these tokens are otherwise never seen by the driver.
+                .pipe_forward, .pipe_backward => self.notePipe(tk),
+                .left_paren, .left_bracket, .left_brace, .dollar_curly => depth += 1,
+                .right_paren, .right_bracket, .right_brace => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                    if (depth == 0 and first_opens_group and first_group_close == null) first_group_close = i;
+                },
+                .kw_let => {
+                    if (depth == 0) lets += 1;
+                },
+                .kw_in => {
+                    if (depth == 0) {
+                        if (lets == 0) return null;
+                        lets -= 1;
+                    }
+                },
+                .kw_assert, .kw_with => {
+                    if (depth == 0 and lets == 0) pending_semis += 1;
+                },
+                .semicolon => {
+                    if (depth == 0) {
+                        if (lets > 0) {
+                            // a `let` binding separator — not ours
+                        } else if (pending_semis > 0) {
+                            pending_semis -= 1;
+                        } else {
+                            break tk; // the bind's terminator
+                        }
+                    }
+                },
+                else => {},
+            }
+            i += 1;
+            tk = sc.next();
+        };
+
+        // Shape gate (see doc comment).
+        if (i == 1) return null; // single-token body: always an immediate atom
+        if (first.type == .identifier and (second_type == .colon or second_type == .at)) return null; // lambda
+        if (first_opens_group) {
+            if (after_first_group == .colon or after_first_group == .at) return null; // lambda pattern
+            if (first_group_close.? == i - 1) return null; // body is exactly `{..}` / `[..]`
+        }
+
+        // Size gate: mirrors the deferral gate's MIN_BODY_BYTES.
+        const len = semi.offset - first.offset;
+        if (len < elide_min_body_bytes) return null;
+
+        return .{
+            .span = .{ .offset = first.offset, .len = len },
+            .semi = semi,
+            .scanner = sc,
+        };
     }
 
     fn reportUnexpected(self: *Parser, state: u32, tok: Token) void {
@@ -442,9 +654,13 @@ pub const Parser = struct {
             .string => return self.atom(.string, rhs[0].tok),
             .path => return self.atom(.path, rhs[0].tok),
             .search_path => return self.atom(.search_path, rhs[0].tok),
-            .bool_true => return .{ .node = try self.arena.createNode(.bool_true, .{ .atom = .{ .offset = 0, .len = 0 } }) },
-            .bool_false => return .{ .node = try self.arena.createNode(.bool_false, .{ .atom = .{ .offset = 0, .len = 0 } }) },
-            .null_lit => return .{ .node = try self.arena.createNode(.null, .{ .atom = .{ .offset = 0, .len = 0 } }) },
+            // Real token atoms (not {0,0} placeholders): a zero offset would
+            // poison every ancestor's combined span back to file offset 0 —
+            // and make an elided body's sub-parse (whose offsets are
+            // corrected) disagree with the eager parse.
+            .bool_true => return self.atom(.bool_true, rhs[0].tok),
+            .bool_false => return self.atom(.bool_false, rhs[0].tok),
+            .null_lit => return self.atom(.null, rhs[0].tok),
             .parens => return .{ .node = try self.arena.createNode(.parens, .{ .parens = rhs[1].node }) },
             .attrset_from_brace => return self.buildAttrSet(rhs[0].brace),
             .rec_attr_set => {

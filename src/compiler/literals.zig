@@ -146,6 +146,43 @@ pub fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !voi
     have_value.* = true;
 }
 
+/// Materialize an `.elided` body (body-span elision, see
+/// `syntax/parser.zig scanElidableBody`): sub-parse its recorded source
+/// span into the root compiler's AST arena and return the parsed body,
+/// offset-corrected so every node span matches what an eager parse of the
+/// whole file would have produced. Parse diagnostics are absorbed with the
+/// same offset correction (the `compileInterpolatedExpr` precedent).
+///
+/// During the original file compile (`elide_mutable`), the shared elided
+/// node is overwritten in place, so all later consumers — duplicate-merge
+/// checks, the parent chunk's strictness stamp — see the real shape.
+/// Force-time deferred compiles run CONCURRENTLY over the shared retained
+/// AST: they parse into their per-compile throwaway arena and leave the
+/// shared node untouched (racers each materialize their own copy).
+pub fn materializeElided(self: *Compiler, node: *const Node) anyerror!*Node {
+    std.debug.assert(node.tag == .elided);
+    var root: *Compiler = self;
+    while (root.parent) |p| root = p;
+    const arena = root.ast_arena orelse return error.ElidedBodyWithoutArena;
+
+    const atom = node.data.atom;
+    const body_source = self.source[atom.offset .. atom.offset + atom.len];
+    var parser = parser_mod.Parser.init(self.allocator, arena, body_source);
+    defer parser.deinit();
+    const expr = parser.parse() catch |err| {
+        try diagnostics.absorbParserDiagnostics(self, parser.diagnostics.items, atom.offset);
+        return err;
+    };
+    offsetNode(expr, atom.offset);
+
+    if (root.elide_mutable) {
+        const shared = @constCast(node);
+        shared.* = expr.*;
+        return shared;
+    }
+    return expr;
+}
+
 pub fn compileInterpolatedExpr(self: *Compiler, expr_source: []const u8, source_offset: u32) !void {
     var arena = ast.AstArena.init(self.allocator);
     defer arena.deinit();

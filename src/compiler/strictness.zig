@@ -173,6 +173,13 @@ const Analyzer = struct {
             .lambda_attrs,
             => {},
 
+            // An elided (never-parsed) body is opaque: contribute nothing.
+            // Sound in both directions its sets are used — must-force is an
+            // under-approximation by definition, and the may-force sets only
+            // drive speculative pre-submission (missing names just mean
+            // fewer speculative forces).
+            .elided => {},
+
             .identifier => {
                 const name_id = try self.identifierNameId(node);
                 if (self.findBound(name_id)) |idx| {
@@ -327,6 +334,9 @@ const Analyzer = struct {
             .lambda,
             .lambda_attrs,
             => {},
+
+            // Opaque, contributes nothing (see `analyzeInto`).
+            .elided => {},
 
             .identifier => {
                 const name_id = try self.identifierNameId(node);

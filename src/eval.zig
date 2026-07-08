@@ -458,6 +458,11 @@ pub const Evaluator = struct {
 
         var parser = parser_mod.Parser.init(self.allocator, &arena, source);
         defer parser.deinit();
+        // Body-span elision: skip PARSING large attrset value bodies that
+        // lazy per-attr compilation would defer anyway; the compiler
+        // sub-parses them on demand (`literals.materializeElided`). File
+        // compiles only, mirroring the deferral gate (`shouldDeferSet`).
+        parser.elide_bodies = source_path != null;
 
         const ast_node = blk: {
             self.progressBegin(.parse, subject);
@@ -518,6 +523,12 @@ pub const Evaluator = struct {
         compiler.base_path = base_path;
         compiler.source_path = source_path;
         compiler.deferred_table = &self.deferred_table;
+        // Elided bodies materialize into the file's AST arena (retained
+        // below alongside deferred bodies); this compile is single-threaded,
+        // so in-place node replacement is safe and keeps every later
+        // consumer's view identical to an eager parse.
+        compiler.ast_arena = &arena;
+        compiler.elide_mutable = true;
         defer compiler.deinit();
 
         {

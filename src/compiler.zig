@@ -108,6 +108,20 @@ pub const Compiler = struct {
     /// chunk; recycling the buffers avoids paying the builder's initial
     /// code/constants capacity allocation ~once per chunk.
     builder_pool: std.ArrayListUnmanaged(ChunkBuilder) = .empty,
+    /// Arena that `.elided` bodies are sub-parsed into (body-span elision;
+    /// see `literals.materializeElided`). Set on the ROOT compiler:
+    /// `parseAndCompile` points it at the file's (possibly retained) AST
+    /// arena; `deferred.compile` at a per-compile throwaway arena. Null in
+    /// roots that can never see elided nodes (elision is only enabled for
+    /// file parses).
+    ast_arena: ?*ast.AstArena = null,
+    /// Whether `materializeElided` may overwrite the shared `.elided` node
+    /// in place with its parsed body. True only for the single-threaded
+    /// original file compile (where in-place replacement makes every later
+    /// consumer — merge checks, strictness stamps — see exactly the tree an
+    /// eager parse would have built). Force-time deferred compiles run
+    /// concurrently over the shared retained AST and must never write to it.
+    elide_mutable: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -283,6 +297,16 @@ pub const Compiler = struct {
             .has_attr_mixed => try access.compileHasAttrMixed(self, node),
             .list => try access.compileList(self, node),
             .parens => try self.compileNode(node.data.parens),
+            // A body whose parse was elided: sub-parse the span now and
+            // compile the result. Recurses through `compileNodeImpl` (not
+            // `compileNode`) so exactly ONE source-map entry is added — by
+            // the enclosing `compileNode`, which reads the materialized
+            // span in the in-place (mutable) case — matching the eager
+            // compile byte for byte.
+            .elided => {
+                const body = try literals.materializeElided(self, node);
+                try self.compileNodeImpl(body);
+            },
         }
     }
 };

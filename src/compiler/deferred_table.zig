@@ -42,6 +42,15 @@ pub const MIN_ENTRIES: usize = 64;
 /// `callPackage ../path {}` bodies (mostly forced). Tunable by measurement.
 pub const MIN_BODY_BYTES: usize = 100;
 
+// The parser's body-span elision gates mirror these tunables (an elided
+// body is only profitable if it would have been deferred anyway); keep
+// them in lock-step.
+comptime {
+    const Parser = @import("syntax").parser.Parser;
+    std.debug.assert(Parser.elide_min_body_bytes == MIN_BODY_BYTES);
+    std.debug.assert(Parser.elide_min_prior_clauses == MIN_ENTRIES);
+}
+
 /// `MAX_SCOPE`: cap on the enclosing-scope snapshot size (lexical
 /// bindings + active `with` scopes). Keeps the env gather cheap and
 /// bounds the runtime stack buffer. hackage-packages.nix needs 4;

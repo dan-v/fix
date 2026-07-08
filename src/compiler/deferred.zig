@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
+const ast = @import("syntax").ast;
+const literals = @import("literals.zig");
 const Compiler = compiler_mod.Compiler;
 const bytecode = @import("../bytecode.zig");
 const ChunkBuilder = bytecode.chunk.ChunkBuilder;
@@ -66,6 +68,16 @@ pub fn compile(
     var local_line_index = line_index.*;
     parent.external_line_index = &local_line_index;
     defer parent.deinit();
+    // Body-span elision: the registered body (or a node nested inside it)
+    // may be an `.elided` span that was never parsed. Sub-parses land in
+    // this per-compile throwaway arena — deferred compiles run concurrently
+    // over the shared retained AST, so `elide_mutable` stays false and the
+    // shared nodes are never written (racers each materialize their own
+    // copy; the chunk cache converges on one winner as usual). Nothing
+    // outlives the compile except the registered chunk.
+    var body_arena = ast.AstArena.init(sa);
+    defer body_arena.deinit();
+    parent.ast_arena = &body_arena;
     for (entry.scope) |cap| {
         _ = try scope.declareLocal(&parent, cap.name, cap.name_id);
     }
@@ -102,10 +114,17 @@ pub fn compile(
     }
 
     // A body that compiled fine eagerly compiles fine here; only resource
-    // errors (OOM) realistically reach this. There is no parent compiler
-    // to absorb diagnostics into, so just propagate.
-    try child.compileNode(entry.node);
-    return thunks.finishCompiledChild(&child, &child_builder, entry.node);
+    // errors (OOM) realistically reach this — except an ELIDED body, whose
+    // parse was skipped entirely: a syntax error inside it surfaces here,
+    // at first force, the same deal deferred compilation already makes for
+    // compile errors. There is no parent compiler to absorb diagnostics
+    // into, so just propagate.
+    const body = if (entry.node.tag == .elided)
+        try literals.materializeElided(&child, entry.node)
+    else
+        entry.node;
+    try child.compileNode(body);
+    return thunks.finishCompiledChild(&child, &child_builder, body);
 }
 
 const fix = @import("../root.zig");
@@ -215,4 +234,157 @@ test "deferred bodies under enclosing with scopes resolve names like the eager c
 
     const result = try ev.evaluate(source);
     try std.testing.expectEqual(@as(i64, 65), result.asInt());
+}
+
+// ---- body-span elision e2e ----------------------------------------------
+
+/// Write `contents` into a tmp dir and return an absolute path to it
+/// (owned by `allocator`). Shared by the elision tests below.
+fn writeTmpNix(tmp: *std.testing.TmpDir, allocator: std.mem.Allocator, name: []const u8, contents: []const u8) ![]u8 {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = contents });
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{
+        cwd, ".zig-cache", "tmp", &tmp.sub_path, name,
+    });
+}
+
+/// 64 filler entries to clear the parser's elision clause gate, so the
+/// entries appended after this prefix parse as `.elided` spans.
+fn appendElisionPrefix(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
+    try list.appendSlice(allocator, "{\n");
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try list.print(allocator, "  pre{d} = 0;\n", .{i});
+    }
+}
+
+const elision_pad = "+ 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0";
+
+test "an elided attr body is deferred and compiles correctly at first force" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try contents.appendSlice(std.testing.allocator, "let shared = 3; in ");
+    try appendElisionPrefix(&contents, std.testing.allocator);
+    try contents.print(std.testing.allocator, "  target = shared + 39 {s};\n}}\n", .{elision_pad});
+
+    const file_path = try writeTmpNix(&tmp, std.testing.allocator, "elided.nix", contents.items);
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).target", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
+test "a syntax error inside an elided body surfaces at force time, not parse time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try appendElisionPrefix(&contents, std.testing.allocator);
+    // Token-balanced but malformed (`if` with no `else`): an eager parse
+    // rejects the file; the elided parse defers the error to first force —
+    // the same deal deferred compilation makes for compile errors.
+    try contents.print(std.testing.allocator, "  bad = if true then 1 {s};\n  good = 7 {s};\n}}\n", .{ elision_pad, elision_pad });
+
+    const file_path = try writeTmpNix(&tmp, std.testing.allocator, "badbody.nix", contents.items);
+    defer std.testing.allocator.free(file_path);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    // Forcing a healthy attr proves the file parsed (i.e. `bad` was elided).
+    const good_src = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).good", .{file_path});
+    defer std.testing.allocator.free(good_src);
+    const good = try ev.evaluate(good_src);
+    try std.testing.expectEqual(@as(i64, 7), good.asInt());
+
+    // Forcing the malformed one reports the (deferred) parse error.
+    const bad_src = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).bad", .{file_path});
+    defer std.testing.allocator.free(bad_src);
+    try std.testing.expectError(error.ParseError, ev.evaluate(bad_src));
+}
+
+test "an elided leaf in an extended group materializes for the duplicate check" {
+    // `dup = <elided>; dup.extra = 2;` — whether this merges or errors
+    // depends on the leaf's true shape, so the compiler must materialize
+    // the elided body before deciding. Here the body is an application,
+    // so it must be a duplicate-attribute error (at compile/import time).
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try contents.appendSlice(std.testing.allocator, "let f = x: { }; in ");
+    try appendElisionPrefix(&contents, std.testing.allocator);
+    try contents.print(std.testing.allocator, "  dup = f 1 {s};\n  dup.extra = 2;\n}}\n", .{elision_pad});
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    try std.testing.expectError(
+        error.DuplicateAttribute,
+        ev.compileSource(contents.items, "/elision-dup-test.nix"),
+    );
+}
+
+test "elided bodies fall back to eager materialization when the set cannot defer" {
+    // 33 enclosing let bindings exceed MAX_SCOPE (32), so the snapshot
+    // bails and the set compiles eagerly — elided bodies must be sub-parsed
+    // at compile time and produce the same values.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try contents.appendSlice(std.testing.allocator, "let\n");
+    var i: usize = 0;
+    while (i < 33) : (i += 1) {
+        try contents.print(std.testing.allocator, "v{d} = {d};\n", .{ i, i });
+    }
+    try contents.appendSlice(std.testing.allocator, "in ");
+    try appendElisionPrefix(&contents, std.testing.allocator);
+    try contents.print(std.testing.allocator, "  target = v32 + 10 {s};\n}}\n", .{elision_pad});
+
+    const file_path = try writeTmpNix(&tmp, std.testing.allocator, "eagerback.nix", contents.items);
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).target", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
+test "an elided body under a dynamic attribute name compiles via the thunk path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(std.testing.allocator);
+    try contents.appendSlice(std.testing.allocator, "let suffix = \"X\"; base = 40; in ");
+    try appendElisionPrefix(&contents, std.testing.allocator);
+    try contents.print(std.testing.allocator, "  \"dyn${{suffix}}\" = base + 2 {s};\n}}\n", .{elision_pad});
+
+    const file_path = try writeTmpNix(&tmp, std.testing.allocator, "dynelide.nix", contents.items);
+    defer std.testing.allocator.free(file_path);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "(import {s}).dynX", .{file_path});
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const result = try ev.evaluate(source);
+    try std.testing.expectEqual(@as(i64, 42), result.asInt());
 }

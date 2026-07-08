@@ -36,6 +36,16 @@ pub const NodeTag = enum(u8) {
     has_attr_mixed, // foo ? bar.${expr}
     list,
     parens, // parenthesized subexpression
+
+    // ---- lazy parsing ----
+    /// An attrset value body whose PARSING was skipped (body-span elision):
+    /// the parser recorded the body's source span (`data.atom`) instead of
+    /// LR-driving it, because the body was going to be lazily compiled
+    /// (deferred) anyway. The compiler sub-parses the span on demand — at
+    /// force time for deferred bodies, or immediately ("materialize") when
+    /// an eager compile needs the real shape. See `Parser.scanElidableBody`
+    /// and `compiler/literals.zig materializeElided`.
+    elided,
 };
 
 pub const BinaryOp = enum(u8) {
@@ -278,6 +288,7 @@ fn nodeSourceSpan(tag: NodeTag, data: Node.Data) ?Node.Atom {
         .bool_true,
         .bool_false,
         .null,
+        .elided,
         => data.atom,
 
         .unary_op => data.unary.expr.span,
@@ -384,6 +395,7 @@ pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
         .bool_true,
         .bool_false,
         .null,
+        .elided,
         => arena.createNode(node.tag, .{ .atom = node.data.atom }),
 
         .unary_op => arena.createNode(.unary_op, .{ .unary = .{
@@ -551,7 +563,7 @@ pub fn nodeMayEvaluateToFloat(node: *const Node) bool {
 pub fn offsetNode(node: *Node, offset: u32) void {
     if (node.span) |*span| span.offset += offset;
     switch (node.tag) {
-        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null => {
+        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null, .elided => {
             node.data.atom.offset += offset;
         },
         .unary_op => offsetNode(node.data.unary.expr, offset),
