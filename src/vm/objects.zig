@@ -33,6 +33,18 @@ pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mo
     try stack.push(self, Value.attrs(id));
 }
 
+/// `build_attrs_sorted(_with_pos)`: pairs are compile-time sorted by
+/// interned name and duplicate-free — skip the construction sort.
+pub fn buildAttrsSorted(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+    const csp = struct_census.setProducer(struct_census.TAG_ATTRS_LIT);
+    defer struct_census.restoreProducer(csp);
+    const value_count: u32 = @as(u32, count) * 2;
+    const start = self.sp - value_count;
+    const id = try self.heap.addAttrsFromStackPairsSorted(self.stack[start..self.sp], positions);
+    self.sp = start;
+    try stack.push(self, Value.attrs(id));
+}
+
 pub fn buildList(self: *VM, count: u16) !void {
     const csp = struct_census.setProducer(struct_census.TAG_LIST_LIT);
     defer struct_census.restoreProducer(csp);

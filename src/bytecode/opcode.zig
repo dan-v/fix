@@ -85,6 +85,15 @@ pub const OpCode = enum(u8) {
     /// Operand: 2-byte count, 2-byte source-position count, then repeated
     /// 4-byte name InternId, 4-byte file InternId, 4-byte line, 4-byte column.
     build_attrs_with_pos,
+    /// `build_attrs`, but the compiler guarantees the pairs are already on
+    /// the stack in ascending interned-name order with no duplicates —
+    /// static attrset literals are grouped (duplicates rejected at compile
+    /// time) and emitted name-sorted, so the runtime skips the
+    /// per-construction sort + duplicate scan. Operand: 2-byte count.
+    build_attrs_sorted,
+    /// `build_attrs_with_pos` with the same compile-time sorted+unique
+    /// guarantee as `build_attrs_sorted`. Operands as `build_attrs_with_pos`.
+    build_attrs_with_pos_sorted,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     build_list,

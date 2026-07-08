@@ -454,6 +454,16 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
     var grouped = try attrEntryGroups(self, entries);
     defer grouped.deinit(self.allocator);
 
+    // Emit groups in ascending interned-name order (groups are unique by
+    // name_id, duplicates rejected below) so `build_attrs_sorted` can skip
+    // the runtime sort + duplicate scan on every construction. Value code
+    // in a plain attr literal is non-strict (thunks/constants/captures),
+    // so emission order is not observable. Sorts a compact index array —
+    // sorting the fat `AttrEntryGroup` structs by value swaps ~150 bytes
+    // per element and measured ~2% of w=1 wall.
+    const order = try sortedGroupOrder(self, grouped.groups);
+    defer self.allocator.free(order);
+
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
@@ -478,12 +488,25 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
         }
     }
 
-    for (grouped.groups) |group| {
-        try compilePlainAttrGroup(self, &positions, group, defer_scope);
+    for (order) |group_idx| {
+        try compilePlainAttrGroup(self, &positions, grouped.groups[group_idx], defer_scope);
     }
 
     const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
-    try emit.emitBuildAttrs(self, count, positions.items);
+    try emit.emitBuildAttrsSorted(self, count, positions.items);
+}
+
+/// Index permutation of `groups` in ascending `name_id` order. Groups are
+/// unique by name_id (hashmap-grouped), so the order is total.
+fn sortedGroupOrder(self: *Compiler, groups: []const AttrEntryGroup) ![]u32 {
+    const order = try self.allocator.alloc(u32, groups.len);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, groups, groupIndexLessThan);
+    return order;
+}
+
+fn groupIndexLessThan(groups: []const AttrEntryGroup, lhs: u32, rhs: u32) bool {
+    return groups[lhs].name_id < groups[rhs].name_id;
 }
 
 fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) anyerror!void {
@@ -597,7 +620,15 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
-    for (groups) |group| {
+    // Emit the (name, capture_local) pairs in ascending interned-name
+    // order for `build_attrs_sorted` — the cells were already declared
+    // and filled in source order above; this loop only reads locals, so
+    // its order is not observable.
+    const order = try sortedGroupOrder(self, groups);
+    defer self.allocator.free(order);
+
+    for (order) |group_idx| {
+        const group = groups[group_idx];
         try emitAttrNameId(self, group.name_id);
 
         const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
@@ -606,7 +637,7 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
     }
 
     const count = try diagnostics.requireU16At(self, groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
-    try emit.emitBuildAttrs(self, count, positions.items);
+    try emit.emitBuildAttrsSorted(self, count, positions.items);
 }
 
 pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {

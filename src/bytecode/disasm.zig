@@ -211,12 +211,12 @@ fn writeOperands(
             try writer.print("+{d}  // -> {x:0>4}", .{ off, ip + off });
         },
 
-        .build_attrs => {
+        .build_attrs, .build_attrs_sorted => {
             const n = readU16(code, ip);
             ip += 2;
             try writer.print("{d} entries", .{n});
         },
-        .build_attrs_with_pos => {
+        .build_attrs_with_pos, .build_attrs_with_pos_sorted => {
             const n = readU16(code, ip);
             ip += 2;
             const pos_count = readU16(code, ip);

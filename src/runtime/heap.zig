@@ -1947,13 +1947,35 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addAttrsFromStackPairs(self: *ObjectHeap, pairs: []const Value) !ObjectId {
-        return self.addAttrsFromStackPairsWithPositions(pairs, &.{});
+        return self.addAttrsFromStackPairsImpl(pairs, &.{}, false);
     }
 
     pub fn addAttrsFromStackPairsWithPositions(
         self: *ObjectHeap,
         pairs: []const Value,
         positions: []const AttrPosEntry,
+    ) !ObjectId {
+        return self.addAttrsFromStackPairsImpl(pairs, positions, false);
+    }
+
+    /// `build_attrs_sorted` fast path: the compiler guarantees the pairs
+    /// are already in ascending interned-name order with no duplicates
+    /// (static attrset literals are grouped — duplicates rejected — and
+    /// emitted name-sorted at compile time), so the per-construction
+    /// sort + duplicate scan is skipped. Debug builds re-verify.
+    pub fn addAttrsFromStackPairsSorted(
+        self: *ObjectHeap,
+        pairs: []const Value,
+        positions: []const AttrPosEntry,
+    ) !ObjectId {
+        return self.addAttrsFromStackPairsImpl(pairs, positions, true);
+    }
+
+    fn addAttrsFromStackPairsImpl(
+        self: *ObjectHeap,
+        pairs: []const Value,
+        positions: []const AttrPosEntry,
+        comptime presorted: bool,
     ) !ObjectId {
         std.debug.assert(pairs.len % 2 == 0);
 
@@ -1981,8 +2003,12 @@ pub const ObjectHeap = struct {
             entry_i += 1;
         }
 
-        self.sortAttrs(range);
-        try self.rejectDuplicateAttrs(range);
+        if (comptime presorted) {
+            std.debug.assert(attrEntriesSortedUnique(entries));
+        } else {
+            self.sortAttrs(range);
+            try self.rejectDuplicateAttrs(range);
+        }
 
         if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
 
@@ -1993,6 +2019,14 @@ pub const ObjectHeap = struct {
         const pos_range = try self.appendAttrPositions(positions);
         errdefer self.attr_positions.rollback(pos_range);
         return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+    }
+
+    fn attrEntriesSortedUnique(entries: []const AttrEntry) bool {
+        if (entries.len < 2) return true;
+        for (entries[1..], 1..) |entry, i| {
+            if (entry.name <= entries[i - 1].name) return false;
+        }
+        return true;
     }
 
     fn positionsSortedByName(positions: []const AttrPosEntry) bool {

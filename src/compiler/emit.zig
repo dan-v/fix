@@ -32,8 +32,20 @@ pub fn emitOpU32(self: *Compiler, op: OpCode, val: u32) !void {
 }
 
 pub fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+    return emitBuildAttrsImpl(self, count, positions, false);
+}
+
+/// `emitBuildAttrs` for call sites that emitted their entry pairs in
+/// ascending interned-name order with compile-time duplicate rejection —
+/// emits the `_sorted` opcode variants so the runtime skips the
+/// per-construction sort + duplicate scan.
+pub fn emitBuildAttrsSorted(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
+    return emitBuildAttrsImpl(self, count, positions, true);
+}
+
+fn emitBuildAttrsImpl(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry, comptime presorted: bool) !void {
     if (positions.len == 0) {
-        try emitOpU16(self, .build_attrs, count);
+        try emitOpU16(self, if (presorted) .build_attrs_sorted else .build_attrs, count);
         return;
     }
 
@@ -42,11 +54,19 @@ pub fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.A
     // build time, so a name-sorted position block stays consistent —
     // and the runtime `build_attrs_with_pos` op can then skip a sort it
     // would otherwise pay on every execution (≈1.6% of all opcodes).
-    const sorted = try self.allocator.dupe(heap_mod.AttrPosEntry, positions);
-    defer self.allocator.free(sorted);
-    std.mem.sort(heap_mod.AttrPosEntry, sorted, {}, posNameLessThan);
+    // Presorted call sites appended their positions in emit order, which
+    // IS name order — no dupe+sort needed.
+    const sorted = if (presorted) blk: {
+        std.debug.assert(std.sort.isSorted(heap_mod.AttrPosEntry, positions, {}, posNameLessThan));
+        break :blk positions;
+    } else blk: {
+        const dup = try self.allocator.dupe(heap_mod.AttrPosEntry, positions);
+        std.mem.sort(heap_mod.AttrPosEntry, dup, {}, posNameLessThan);
+        break :blk dup;
+    };
+    defer if (!presorted) self.allocator.free(@constCast(sorted));
 
-    try emitOpU16(self, .build_attrs_with_pos, count);
+    try emitOpU16(self, if (presorted) .build_attrs_with_pos_sorted else .build_attrs_with_pos, count);
     try self.builder.writeU16(self.allocator, try u16Count(sorted.len));
     for (sorted) |position| {
         try self.builder.writeU32(self.allocator, position.name);

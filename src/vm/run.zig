@@ -470,6 +470,21 @@ fn opBuildAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
 }
 
 fn opBuildAttrsWithPos(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    return buildAttrsWithPosImpl(vm, frame, code, ip, stop_depth, false);
+}
+
+fn opBuildAttrsSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    try objects.buildAttrsSorted(vm, count, &.{});
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
+fn opBuildAttrsWithPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    return buildAttrsWithPosImpl(vm, frame, code, ip, stop_depth, true);
+}
+
+inline fn buildAttrsWithPosImpl(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize, comptime presorted: bool) anyerror!void {
     frame.ip = ip;
     const count = readU16(code, ip);
     var cur_ip = ip + 2;
@@ -494,7 +509,10 @@ fn opBuildAttrsWithPos(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop
         };
         cur_ip += 16;
     }
-    try objects.buildAttrsWithPositions(vm, count, positions);
+    if (comptime presorted)
+        try objects.buildAttrsSorted(vm, count, positions)
+    else
+        try objects.buildAttrsWithPositions(vm, count, positions);
     return dispatch(vm, frame, code, cur_ip, stop_depth);
 }
 
@@ -1243,6 +1261,8 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.fail_assertion)] = opFailAssertion;
     table[@intFromEnum(OpCode.build_attrs)] = opBuildAttrs;
     table[@intFromEnum(OpCode.build_attrs_with_pos)] = opBuildAttrsWithPos;
+    table[@intFromEnum(OpCode.build_attrs_sorted)] = opBuildAttrsSorted;
+    table[@intFromEnum(OpCode.build_attrs_with_pos_sorted)] = opBuildAttrsWithPosSorted;
     table[@intFromEnum(OpCode.build_list)] = opBuildList;
     table[@intFromEnum(OpCode.merge_attrs_strict)] = opMergeAttrsStrict;
     table[@intFromEnum(OpCode.merge_attrs)] = opMergeAttrs;
