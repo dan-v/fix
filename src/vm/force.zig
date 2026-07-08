@@ -1024,9 +1024,40 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // + the raw pointer remain), so the conservative scan can't
                 // see it — the per-VM force chain is load-bearing. The tracer
                 // follows an `.evaluating` thunk's target. See docs/plans/gc-plan.md.
-                if (comptime build_options.gc) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+                //
+                // DORMANT GATE (the GC-default rooting tax): skip this push/pop
+                // entirely while collection is DORMANT (`gc_collect_enabled ==
+                // false`). Soundness — a thunk claimed while dormant is provably
+                // OLD in every collection, so rooting it is a no-op:
+                //   • `armTracking` sets `gc_track_from = objects.count()` at the
+                //     budget/2 STW safepoint; arming is monotonic and only
+                //     becomes visible after an STW where this worker was parked.
+                //     If we read `false` here, no arming has completed-and-resumed
+                //     for us, so this already-allocated thunk's id predates any
+                //     future `gc_track_from` ⇒ `thunk_id < gc_track_from` ⇒ old
+                //     (`gcIsYoung` false).
+                //   • The production collector is ALWAYS a young-gated minor
+                //     (`collect` uses only resetMinor/resetParallelMinor; no
+                //     major). `markObject` short-circuits on old ids under the
+                //     minor gate (`minor_gate and !gcIsYoung → return`), so
+                //     `markObject(old thunk)` neither marks the thunk nor follows
+                //     its target — the chain entry would do NOTHING.
+                //   • Arming mid-body is safe: the thunk stays old (id predates
+                //     the new track_from), young values the body produces are
+                //     rooted by the operand stack / frames / temp-roots (markVm),
+                //     never solely behind this `.evaluating` thunk; the resolved
+                //     result is picked up by `gcRecordEdge` (old→young remset).
+                //   • w>1 safe: arming happens only inside STW (all peers parked);
+                //     a `false` read here means no peer has armed-and-resumed.
+                // Captured ONCE so push and pop agree even if a peer arms
+                // mid-body. Once armed (`--max-memory` small), this is true
+                // forever and the chain is maintained exactly as before.
+                const gc_root_chain: bool = if (comptime build_options.gc) self.heap.gc_collect_enabled else false;
+                if (comptime build_options.gc) {
+                    if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
+                }
                 defer if (comptime build_options.gc) {
-                    _ = self.gc_force_chain.pop();
+                    if (gc_root_chain) _ = self.gc_force_chain.pop();
                 };
                 // Scavenger cost-learning: time this force on main's
                 // demand path so repeat-expensive chunks become
