@@ -239,7 +239,10 @@ pub fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
         return std.fmt.bufPrint(&name_scratch, "<builtin {s}>", .{@tagName(@as(BuiltinId, @enumFromInt(id)))}) catch "<builtin>";
     }
     const ch = registry.get(key) orelse return "<unknown chunk>";
-    if (ch.source_map.len == 0) return "<no source map>";
+    if (ch.source_map.len == 0)
+        return std.fmt.bufPrint(&name_scratch, "<no source map: chunk={d} code_len={d} arity={d} locals={d}>", .{
+            key, ch.code.len, ch.arity, ch.local_count,
+        }) catch "<no source map>";
     // Smallest enclosing span at pc 0 — the body's defining location.
     var best: ?@TypeOf(ch.source_map[0]) = null;
     for (ch.source_map) |entry| {

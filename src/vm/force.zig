@@ -192,6 +192,14 @@ pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
     return forceThunkImpl(self, thunk_val, true);
 }
 
+/// Probe-only (`-Dprof-main`): is `v` a thunk that is ALREADY resolved?
+/// Used by the repeat-force census to size resolved-value writeback.
+pub inline fn profIsResolvedThunk(self: *VM, v: Value) bool {
+    if (!v.isThunk()) return false;
+    const thunk = self.heap.getThunkAssumeValid(v.asObjectId());
+    return thunk.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved);
+}
+
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
     const t = prof.start(.force_value);
     defer prof.end(.force_value, t);
@@ -234,7 +242,12 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
             self.heap.currentLocal().thunks_created > self.spec_create_limit)
             return error.SpeculativeBail;
     }
-    if (!value.isThunk()) return value;
+    if (!value.isThunk()) {
+        if (comptime prof.enabled) {
+            if (demand and self.workerId() == 0) prof.fv_plain += 1;
+        }
+        return value;
+    }
     if (comptime trace_probe.enabled) trace_probe.recordRead(value.asObjectId());
     // Inline the resolved-thunk fast path. The vast majority of forces
     // hit an already-resolved thunk in steady state (workers and
@@ -252,7 +265,10 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
             // Discovery probe: main is the first real demander of an
             // already-resolved thunk ⇒ a helper resolved it ahead of demand.
             if (comptime prof.enabled) {
-                if (self.workerId() == 0 and !thunk.isDemanded()) prof.disc.resolved_ahead += 1;
+                if (self.workerId() == 0) {
+                    prof.fv_resolved += 1;
+                    if (!thunk.isDemanded()) prof.disc.resolved_ahead += 1;
+                }
             }
             thunk.markDemanded();
         }
@@ -949,6 +965,17 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     .bytecode => memoKeyForBytecode(&thunk.payload.target.bytecode),
                     else => null,
                 };
+                if (comptime prof.enabled) {
+                    // Widening headroom: claimed bytecode thunks that miss
+                    // the ≤2-upvalue memo-key limit, by upvalue count.
+                    if (self.workerId() == 0 and memo_key == null and thunk.targetKind() == .bytecode) {
+                        switch (thunk.payload.target.bytecode.upvalues().len) {
+                            3 => prof.memo_inel_3 += 1,
+                            4 => prof.memo_inel_4 += 1,
+                            else => prof.memo_inel_ge5 += 1,
+                        }
+                    }
+                }
                 if (memo_key) |k| {
                     const s = &thunk_memo[k.idx];
                     // Memo census: 14.8% hit rate over 2.07M probes (w=1

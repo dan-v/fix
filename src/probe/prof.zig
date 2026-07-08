@@ -144,6 +144,34 @@ pub var attr_cache_misses: u64 = 0;
 /// the per-claimed-force TLS probe still pays for its cache misses.
 pub var memo_probes: u64 = 0;
 pub var memo_hits: u64 = 0;
+/// Memo eligibility histogram: forces of freshly-claimed bytecode thunks
+/// that were NOT memo-probed because their upvalue count exceeds the ≤2
+/// inline-key limit. Sizes the widening headroom.
+pub var memo_inel_3: u64 = 0;
+pub var memo_inel_4: u64 = 0;
+pub var memo_inel_ge5: u64 = 0;
+
+/// Repeat-force census (piggybacks on `-Dprof-main`): demand forces that
+/// hit an ALREADY-RESOLVED thunk, bucketed by access path. These are the
+/// forces a resolved-value writeback (thunk shortcutting) would turn into
+/// plain-value reads — each one currently touches the thunk's cache line.
+/// Worker-0-only writes.
+pub var fv_plain: u64 = 0; // forceValue on a non-thunk value
+pub var fv_resolved: u64 = 0; // forceValue resolved-thunk fast-path hit
+pub var rf_local: u64 = 0; // opGetLocal(/Long) re-read of resolved thunk in a stack slot
+pub var rf_upvalue: u64 = 0; // opGetUpvalue re-read of resolved thunk in a capture array
+pub var rf_attr_hit: u64 = 0; // attr-cache HIT returning an already-resolved thunk
+
+/// Attr-lookup size census (piggybacks on `-Dprof-main`): attr-cache
+/// MISSES (the compulsory binary-search population) bucketed by the
+/// looked-up set's entry count — log2 buckets [0]=1..2, [1]=3..4, ...
+/// Sizes the per-object hash-index headroom (binary-search probes are
+/// dependent cache misses on large sets). `al_merge` counts lookups that
+/// hit an unflattened merge_attrs chain (no single size).
+pub const AL_BUCKETS = 16;
+pub var al_size: [AL_BUCKETS]u64 = @splat(0);
+pub var al_probes: [AL_BUCKETS]u64 = @splat(0); // ~log2(n) per lookup, summed
+pub var al_merge: u64 = 0;
 
 /// String-machinery census (piggybacks on `-Dprof-main`). Sizes the
 /// byte-assembly cost of the interning value representation: every
@@ -703,9 +731,35 @@ pub fn report(registry: anytype, intern: anytype) void {
     // Thunk-result-memo census.
     if (memo_probes != 0) {
         std.debug.print(
-            "prof thunk-memo: probes={d} hits={d} ({d:.1}%)\n",
-            .{ memo_probes, memo_hits, pct(memo_hits, memo_probes) },
+            "prof thunk-memo: probes={d} hits={d} ({d:.1}%) inel_ups3={d} inel_ups4={d} inel_ups>=5={d}\n",
+            .{ memo_probes, memo_hits, pct(memo_hits, memo_probes), memo_inel_3, memo_inel_4, memo_inel_ge5 },
         );
+    }
+    // Repeat-force census.
+    {
+        const total = fv_plain + fv_resolved;
+        if (total != 0) {
+            std.debug.print(
+                "prof repeat-force: fv_plain={d} fv_resolved={d} rf_local={d} rf_upvalue={d} rf_attr_hit={d}\n",
+                .{ fv_plain, fv_resolved, rf_local, rf_upvalue, rf_attr_hit },
+            );
+        }
+    }
+    // Attr-lookup size census.
+    {
+        var total: u64 = 0;
+        for (al_size) |n| total += n;
+        if (total != 0) {
+            std.debug.print("prof attr-lookup sizes (cache misses; bucket=[2^k+1..2^(k+1)] entries):\n", .{});
+            for (al_size, 0..) |n, k| {
+                if (n == 0) continue;
+                std.debug.print(
+                    "  size<=2^{d}: lookups={d} ({d:.1}%) probes={d}\n",
+                    .{ k + 1, n, pct(n, total), al_probes[k] },
+                );
+            }
+            std.debug.print("  merge-chain lookups={d}\n", .{al_merge});
+        }
     }
     // Fiber cost/benefit census.
     {

@@ -152,6 +152,9 @@ fn opGetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     frame.ip = ip;
     const slot = code[ip];
     const raw = vm.stack[frame.frame_base + slot];
+    if (comptime prof.enabled) {
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof.rf_local += 1;
+    }
     const val = try force.forceValue(vm, raw);
     try stack.push(vm, val);
     return dispatch(vm, frame, code, ip + 1, stop_depth);
@@ -161,6 +164,9 @@ fn opGetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     frame.ip = ip;
     const slot = readU16(code, ip);
     const raw = vm.stack[frame.frame_base + slot];
+    if (comptime prof.enabled) {
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof.rf_local += 1;
+    }
     const val = try force.forceValue(vm, raw);
     try stack.push(vm, val);
     return dispatch(vm, frame, code, ip + 2, stop_depth);
@@ -237,6 +243,9 @@ fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     frame.ip = ip;
     const slot = readU16(code, ip);
     const upvalues = frame.upvalues orelse return error.MissingClosure;
+    if (comptime prof.enabled) {
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, upvalues[slot])) prof.rf_upvalue += 1;
+    }
     const val = try force.forceValue(vm, upvalues[slot]);
     try stack.push(vm, val);
     return dispatch(vm, frame, code, ip + 2, stop_depth);
