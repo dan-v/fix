@@ -36,6 +36,7 @@ const thunk_trace = @import("../probe/thunk_trace.zig");
 const ChunkId = types.ChunkId;
 const deferred_compile = @import("../compiler/deferred.zig");
 const force_label = @import("force_label.zig");
+const speculate = @import("force_speculate.zig");
 
 /// Timeline source labels for thunks live in `force_label.zig`; re-exported
 /// so `vm_force.thunkLabel` keeps resolving for worker.zig.
@@ -1179,105 +1180,17 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
-    if (shouldSpeculateClosure(self, closure)) {
+    if (speculate.shouldSpeculateClosure(self, closure)) {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.
-        const ok = if (self.scheduler.spec_novel and novelClosureChunk(self, closure))
+        const ok = if (self.scheduler.spec_novel and speculate.novelClosureChunk(self, closure))
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
         if (self.scheduler.touch_log != null) logSpawn(self, id, ok);
     }
     return Value.thunk(id);
-}
-
-/// `FIX_SPEC_NOVEL` selector for `makeThunk`: is this closure the first
-/// speculative instance of its chunk? (Test-and-set — call at most once
-/// per submission, only when the knob is on.)
-fn novelClosureChunk(self: *VM, closure: Value) bool {
-    if (!closure.isClosure()) return false;
-    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
-    return self.registry.markSpecSubmitted(c.chunk_id);
-}
-
-inline fn shouldSpeculateClosure(self: *VM, closure: Value) bool {
-    // Bound the cascade: if we got here because a helper is *itself*
-    // running speculative work, don't submit further speculation. The
-    // helper's result may or may not be observed; chaining more
-    // speculation off it would just multiply uncertain work.
-    if (self.in_speculation) return false;
-    return switch (closure.kind()) {
-        .closure => isSpeculatableClosureChunk(self, closure),
-        // map / mapAttrs / genList / zipAttrsWith all produce
-        // builtin_closure thunks that wrap a *user* function. Real
-        // evals create millions of these; if we wait for forceDeep to
-        // submit them urgently, main is already on the critical path.
-        // Speculate them now, gated on the inner function being
-        // substantial (and on `in_speculation` above, so a helper
-        // forcing one won't speculate the next one in the chain).
-        .builtin_closure => isSpeculatableBuiltinClosure(self, closure),
-        else => false,
-    };
-}
-
-fn isSpeculatableClosureChunk(self: *VM, closure: Value) bool {
-    // The eligibility bit is pre-computed at chunk registration time
-    // (see Chunk.speculatable); read it from the registry's dense slot
-    // rather than dereferencing the heap-scattered Chunk.
-    const c = self.heap.getClosure(closure.asObjectId()) catch return false;
-    const slot = self.registry.slot(c.chunk_id) orelse return false;
-    return slot.body_is_substantial;
-}
-
-fn isSpeculatableBuiltinClosure(self: *VM, closure: Value) bool {
-    const bc = self.heap.getBuiltinClosure(closure.asObjectId()) catch return false;
-    return switch (@as(BuiltinId, @enumFromInt(bc.builtin_id))) {
-        // Map-style fan-out: args[0] is the user function in each.
-        // Speculate when it's either a user closure with a substantial
-        // body (the chunk-size threshold filters trivial cases like
-        // `x: x + 1`) or a builtin known to be expensive enough to
-        // earn the scheduler hop — most importantly `import`, which
-        // is how the NixOS module system parallelises file
-        // resolution.
-        .mapValue, .mapAttrValue, .zipAttrsValue => bc.args.len > 0 and
-            isSpeculatableMapFunc(self, bc.args[0]),
-        // A single lazy derivation attr is not trivial, but forcing it can
-        // recursively evaluate arbitrary package inputs. Keep these
-        // demand-driven so speculation does not wander into unobserved
-        // package graphs (for example pandoc -> luaPackages on the NixOS
-        // toplevel).
-        .derivationLazyAttr => false,
-        else => false,
-    };
-}
-
-inline fn isSpeculatableMapFunc(self: *VM, func: Value) bool {
-    if (func.isClosure()) return isSpeculatableClosureChunk(self, func);
-    if (func.isBuiltin()) return isExpensiveBuiltin(@enumFromInt(func.asBuiltinId()));
-    return false;
-}
-
-/// Builtins whose body is heavy enough that submitting a speculative
-/// force task pays for itself: file I/O, network fetches, or full
-/// nested evaluation. Lightweight ones (head, length, isList, ...)
-/// stay off this list so `map builtins.head xs` doesn't burn helper
-/// fibers on trivially-cheap work.
-fn isExpensiveBuiltin(id: BuiltinId) bool {
-    return switch (id) {
-        .import,
-        .scopedImport,
-        .fetchurl,
-        .fetchTarball,
-        .fetchGit,
-        .fetchTree,
-        .readFile,
-        .readFileType,
-        .readDir,
-        .derivation,
-        => true,
-        else => false,
-    };
 }
 
 pub fn makeCell(self: *VM, val: Value) !Value {
