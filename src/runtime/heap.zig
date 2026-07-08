@@ -78,10 +78,10 @@ pub const AttrPosEntry = struct {
 /// (MAP_NORESERVE), so the headroom over the ~6M objects a real eval
 /// produces costs no physical memory.
 pub const OBJECT_MAX_SLOTS: u32 = 1 << 30;
-const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS });
-const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024 });
-const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512 });
-const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512 });
+const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .vma_tag = .objects });
+const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values });
+const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs });
+const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos });
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 

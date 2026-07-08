@@ -22,6 +22,7 @@ const heap_gc = @import("runtime").heap.heap_gc;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const regex_mod = @import("runtime").regex;
+const vma_mod = @import("runtime").vma;
 const DerivationStore = @import("derivation").DerivationStore;
 const derivation = @import("derivation");
 const Value = @import("runtime").value.Value;
@@ -263,10 +264,14 @@ pub const Evaluator = struct {
         }.f;
         const p = std.debug.print;
 
+        // `reservedSlots`, not `count`: with `-Dgc` the segmented stores'
+        // cursor starts past the (possibly never-armed) nursery gap, and
+        // `count()` would bill those phantom slots as used (~175 MB of
+        // pages that don't exist on a dormant-GC run).
         const obj_b = @as(u64, self.heap.objects.count()) * @sizeOf(heap_mod.Object);
-        const val_b = @as(u64, self.heap.values.count()) * @sizeOf(Value);
-        const attr_b = @as(u64, self.heap.attrs.count()) * @sizeOf(heap_mod.AttrEntry);
-        const apos_b = @as(u64, self.heap.attr_positions.count()) * @sizeOf(heap_mod.AttrPosEntry);
+        const val_b = @as(u64, self.heap.values.reservedSlots()) * @sizeOf(Value);
+        const attr_b = @as(u64, self.heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
+        const apos_b = @as(u64, self.heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
         const stores_b = obj_b + val_b + attr_b + apos_b;
 
         const is = self.intern.stats();
@@ -284,8 +289,8 @@ pub const Evaluator = struct {
 
         p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
         p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), self.heap.objects.count() });
-        p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), self.heap.values.count() });
-        p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), self.heap.attrs.count() });
+        p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), self.heap.values.reservedSlots() });
+        p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), self.heap.attrs.reservedSlots() });
         p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
         p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
         p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
@@ -294,6 +299,35 @@ pub const Evaluator = struct {
         p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
         p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
         if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
+
+        // Second table: kernel-truth attribution. Every big mapping the
+        // process creates is registered (runtime/vma.zig), so asking
+        // mincore for each region's resident pages decomposes the RSS the
+        // slot-count table above can't see: segment-capacity slack +
+        // pre-touch-ahead (store buckets minus their counted bytes), fiber
+        // stacks, block-cache blocks (parse/compile arenas, retained AST,
+        // builtin temps, intern data). The remainder vs current RSS is
+        // allocator small-slabs + thread stacks + binary. Point-in-time
+        // (now, at deinit) — compare against VmHWM above for drift.
+        const res = vma_mod.residency();
+        var tracked_total: u64 = 0;
+        for (res.rss_bytes) |b| tracked_total += b;
+        const cur_rss = gc.currentRssBytes();
+        const retained_blocks = @import("runtime").block_cache.retained_bytes.load(.monotonic);
+        p("  -- mapping residency (mincore; current RSS {d:.1} MB) --\n", .{mb(cur_rss)});
+        inline for (0..vma_mod.tag_count) |ti| {
+            const tag: vma_mod.Tag = @enumFromInt(ti);
+            p("  {s:<16}{d:>8.1} MB  ({d} regions, {d:.0} MB reserved)\n", .{
+                vma_mod.tagName(tag), mb(res.rss_bytes[ti]), res.regions[ti], mb(res.reserved_bytes[ti]),
+            });
+        }
+        p("  {s:<16}{d:>8.1} MB  (of fix:bigblock; parked on free stacks)\n", .{ "block-cache", mb(retained_blocks) });
+        if (cur_rss > tracked_total)
+            p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_rss - tracked_total) });
+        if (res.dropped > 0)
+            p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
+        const dump = if (self.env_map) |em| em.get("FIX_MEM_REPORT") else null;
+        if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
     }
 
     pub fn deinit(self: *Evaluator) void {
@@ -471,6 +505,11 @@ pub const Evaluator = struct {
             defer timeline.end(.parse);
             const pt = prof.start(.parse);
             defer prof.end(.parse, pt);
+            // RSS attribution: blocks the parse grows (AST arena chunks,
+            // parser scratch) belong to the "ast-arena" bucket — the
+            // retained ones live as long as the evaluator.
+            const prev_tag = vma_mod.setAllocTag(.ast_arena);
+            defer _ = vma_mod.setAllocTag(prev_tag);
             break :blk parser.parse() catch {
                 try self.copyDiagnostics(parser.diagnostics.items, source, source_path);
                 return error.ParseError;
@@ -859,6 +898,11 @@ pub const Evaluator = struct {
     }
 
     fn initVm(self: *Evaluator, worker_id: u8) !VM {
+        // RSS attribution: the VM's value stack + frames come from the
+        // worker arena and live for the evaluator's lifetime (one set per
+        // fiber ever allocated) — give them their own bucket.
+        const prev_tag = vma_mod.setAllocTag(.worker_arena);
+        defer _ = vma_mod.setAllocTag(prev_tag);
         var vm = try VM.init(
             self.worker_arenas[worker_id].allocator(),
             &self.registry,

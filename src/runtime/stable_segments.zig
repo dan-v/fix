@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const vma = @import("vma.zig");
 
 /// Spinlock built on `std.atomic.Mutex`. Short critical sections only —
 /// writers on the storage primitives below are O(allocator call) at most.
@@ -97,6 +98,13 @@ pub const Params = struct {
     /// Cap on the number of segments. Total addressable slots is
     /// `first_segment_size * (2^segment_count - 1)`.
     segment_count: u6 = 28,
+    /// RSS-attribution tag for this store's segments (see
+    /// runtime/vma.zig): a claimed segment is re-tagged from the
+    /// allocator's generic "bigblock" bucket to the store's own, so
+    /// `FIX_MEM_REPORT` can tell the stores apart. Only segments big
+    /// enough to be dedicated mappings (≥64 KB) are tagged; smaller
+    /// early segments ride allocator slabs and keep the slab's identity.
+    vma_tag: ?vma.Tag = null,
 };
 
 pub fn StableSegments(comptime T: type, comptime params: Params) type {
@@ -353,6 +361,19 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             const buf = try allocator.alloc(T, cap);
             if (self.segments[segment].cmpxchgStrong(null, buf.ptr, .acq_rel, .acquire) != null) {
                 allocator.free(buf);
+                return;
+            }
+            nameSegment(buf);
+        }
+
+        /// Re-tag a freshly-claimed segment's backing region for RSS
+        /// attribution (no-op unless `params.vma_tag` is set and the
+        /// segment is a dedicated mapping — see runtime/vma.zig).
+        fn nameSegment(buf: []T) void {
+            if (comptime params.vma_tag) |tag| {
+                const bytes = buf.len * @sizeOf(T);
+                if (bytes < (64 << 10)) return;
+                vma.retagRegion(buf.ptr, tag);
             }
         }
 
@@ -481,6 +502,7 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             const cap = segmentCapacity(segment);
             const buf = try allocator.alloc(T, cap);
             self.segments[segment].store(buf.ptr, .release);
+            nameSegment(buf);
         }
 
         fn packCursor(seg: u32, used: u32) u64 {
@@ -501,6 +523,9 @@ pub const FlatParams = struct {
     /// memory) and never relocated, so a slot's address is stable for the
     /// store's lifetime and reads need no synchronization on the base.
     max_slots: u32,
+    /// RSS-attribution tag for the reservation (see `Params.vma_tag`);
+    /// registered at init since the flat store owns its mmap directly.
+    vma_tag: ?vma.Tag = null,
 };
 
 /// Append-only flat storage backed by a single mmap-reserved contiguous
@@ -555,6 +580,7 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
                 -1,
                 0,
             ) catch return error.OutOfMemory;
+            if (comptime params.vma_tag) |tag| vma.registerRegion(mem.ptr, BYTES, tag);
             return .{
                 .base = @ptrCast(@alignCast(mem.ptr)),
                 .cursor = .init(0),
@@ -567,6 +593,7 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
         /// owns mmap memory, not allocator memory, so it's ignored.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             _ = allocator;
+            if (comptime params.vma_tag != null) vma.unregisterRegion(self.base);
             const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
             std.posix.munmap(bytes[0..BYTES]);
             self.cursor.store(0, .monotonic);

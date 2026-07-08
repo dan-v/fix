@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const stable = @import("stable_segments.zig");
+const vma = @import("vma.zig");
 
 pub const FileCache = struct {
     allocator: std.mem.Allocator,
@@ -118,6 +119,10 @@ pub const FileCache = struct {
         if (entry.contents) |contents| return contents;
 
         const io = self.io orelse return error.FileIoUnavailable;
+        // RSS attribution: cached source texts live for the evaluator's
+        // lifetime — big ones (≥64 KB) get their own bucket.
+        const prev_tag = vma.setAllocTag(.file_cache);
+        defer _ = vma.setAllocTag(prev_tag);
         const contents = try std.Io.Dir.cwd().readFileAlloc(
             io,
             entry.path,

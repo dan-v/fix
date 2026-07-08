@@ -32,6 +32,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const vma = @import("runtime").vma;
 
 comptime {
     if (builtin.cpu.arch != .x86_64) {
@@ -178,6 +179,10 @@ pub const Fiber = struct {
         ) catch return error.OutOfMemory;
         const stack: []u8 = stack_raw[0..aligned_len];
         errdefer std.posix.munmap(@alignCast(stack));
+        // RSS attribution (see runtime/vma.zig): fiber stacks are the
+        // process's most numerous big mappings; untracked they'd merge
+        // into anonymous blobs no report can attribute.
+        vma.registerRegion(stack.ptr, stack.len, .fiber_stack);
         if (comptime stack_probe_enabled) {
             // Probe mode: pay the eager-commit cost so the watermark
             // scan in `maxStackUsedBytes` can identify untouched pages.
@@ -214,6 +219,7 @@ pub const Fiber = struct {
         _ = allocator;
         // A live fiber whose stack is freed will crash on resume; the
         // caller must arrange shutdown semantics.
+        vma.unregisterRegion(self.stack.ptr);
         std.posix.munmap(@alignCast(self.stack));
         self.* = undefined;
     }
