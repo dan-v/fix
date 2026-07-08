@@ -10,8 +10,6 @@ const Evaluator = @import("../eval.zig").Evaluator;
 const jit = @import("../jit/native.zig");
 const prof = @import("../probe/prof.zig");
 const prof_path = @import("../probe/prof_path.zig");
-const thunk_census = @import("../probe/thunk_census.zig");
-const arc_census = @import("runtime").heap.heap_arc;
 const scheduler = @import("parallel").scheduler;
 
 pub fn report(ev: *Evaluator) void {
@@ -56,7 +54,6 @@ pub fn report(ev: *Evaluator) void {
             .{ created, tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
         );
     }
-    if (comptime thunk_census.enabled) thunk_census.report();
     if (comptime jit.enabled) jit.report();
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
@@ -67,8 +64,4 @@ pub fn report(ev: *Evaluator) void {
         ev.heap.profSiblingCensus();
     }
     if (comptime prof_path.enabled) prof_path.report(ev.chunkRegistry(), ev.internTable());
-    // ARC-feasibility census (`-Darc-census`): exit-time cycle-mass +
-    // RC-traffic analysis over the whole object heap. See
-    // src/runtime/heap/arc_census.zig.
-    if (comptime arc_census.enabled) arc_census.report(&ev.heap);
 }

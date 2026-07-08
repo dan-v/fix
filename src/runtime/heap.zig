@@ -35,10 +35,6 @@ const worker_id_mod = @import("worker_id.zig");
 /// Re-exported (`pub`) so out-of-module callers reach it as
 /// `@import("runtime").heap.heap_gc`.
 pub const heap_gc = @import("heap/gc.zig");
-/// ARC-feasibility census (`-Darc-census`): exit-time whole-heap cycle-mass
-/// + RC-traffic analysis. Print-only; compiles to nothing when off.
-pub const heap_arc = @import("heap/arc_census.zig");
-const struct_census = @import("struct_census.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
@@ -1112,15 +1108,6 @@ pub const ObjectHeap = struct {
     pub fn add(self: *ObjectHeap, object: Object) !ObjectId {
         const id = try self.reserveObjectSlot();
         self.fillObjectSlot(id, object);
-        if (comptime struct_census.enabled) {
-            switch (object) {
-                .list => |range| struct_census.recordAlloc(id, .list, range.len),
-                .attrs => |a| struct_census.recordAlloc(id, .attrs, a.range.len),
-                // Layer node is O(1); its structural cost is ~1 entry.
-                .merge_attrs => struct_census.recordAlloc(id, .attrs, 1),
-                else => {},
-            }
-        }
         // Scavenger ring (FIX_SCAVENGE): record thunk creations, in
         // order, for idle peers to pre-force. Three stores to this
         // worker's own cache lines; a single predictable branch when off.
@@ -1497,7 +1484,6 @@ pub const ObjectHeap = struct {
     }
 
     pub fn getList(self: *const ObjectHeap, id: ObjectId) ![]const Value {
-        if (comptime struct_census.enabled) struct_census.recordRead(id);
         return switch (self.getConst(id).*) {
             .list => |range| self.values.slice(range),
             else => error.InvalidObjectType,
@@ -1519,7 +1505,6 @@ pub const ObjectHeap = struct {
     /// callers (deep force, `==`, JSON/XML, `attrNames`) see a normal
     /// sorted entry slice. Non-const because flattening allocates.
     pub fn getAttrs(self: *ObjectHeap, id: ObjectId) ![]const AttrEntry {
-        if (comptime struct_census.enabled) struct_census.recordRead(id);
         return switch (self.getConst(id).*) {
             .attrs => |a| self.attrs.slice(a.range),
             .merge_attrs => self.attrs.slice(self.getConst(try self.flattenMerge(id)).attrs.range),
@@ -1536,7 +1521,6 @@ pub const ObjectHeap = struct {
     /// it stays const and feeds the hot inline cache). Once a node has
     /// been flattened it delegates to the flat object's binary search.
     pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
-        if (comptime struct_census.enabled) struct_census.recordRead(id);
         return switch (self.getConst(id).*) {
             .attrs => |a| binarySearchAttr(self.attrs.slice(a.range), name),
             .merge_attrs => |m| {

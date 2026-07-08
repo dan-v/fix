@@ -1,6 +1,6 @@
 //! Data-structure builders: attrset and list literal construction from stack
 //! operands, the `//` update merge (lazy layered + strict recursive), and list
-//! concatenation, with struct-census producer tagging.
+//! concatenation.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
@@ -10,15 +10,12 @@ const heap_mod = @import("runtime").heap;
 const force = @import("force.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
-const struct_census = @import("runtime").struct_census;
 
 const VM = vm_mod.VM;
 
 // ---- data structure builders ----
 
 pub fn buildAttrs(self: *VM, count: u16) !void {
-    const csp = struct_census.setProducer(struct_census.TAG_ATTRS_LIT);
-    defer struct_census.restoreProducer(csp);
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
     const id = try self.heap.addAttrsFromStackPairs(self.stack[start..self.sp]);
@@ -27,8 +24,6 @@ pub fn buildAttrs(self: *VM, count: u16) !void {
 }
 
 pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
-    const csp = struct_census.setProducer(struct_census.TAG_ATTRS_LIT);
-    defer struct_census.restoreProducer(csp);
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
     const id = try self.heap.addAttrsFromStackPairsWithPositions(self.stack[start..self.sp], positions);
@@ -39,8 +34,6 @@ pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mo
 /// `build_attrs_sorted(_with_pos)`: pairs are compile-time sorted by
 /// interned name and duplicate-free — skip the construction sort.
 pub fn buildAttrsSorted(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
-    const csp = struct_census.setProducer(struct_census.TAG_ATTRS_LIT);
-    defer struct_census.restoreProducer(csp);
     const value_count: u32 = @as(u32, count) * 2;
     const start = self.sp - value_count;
     const id = try self.heap.addAttrsFromStackPairsSorted(self.stack[start..self.sp], positions);
@@ -49,8 +42,6 @@ pub fn buildAttrsSorted(self: *VM, count: u16, positions: []const heap_mod.AttrP
 }
 
 pub fn buildList(self: *VM, count: u16) !void {
-    const csp = struct_census.setProducer(struct_census.TAG_LIST_LIT);
-    defer struct_census.restoreProducer(csp);
     const start = self.sp - count;
     const id = try self.heap.addList(self.stack[start..self.sp]);
     self.sp = start;
@@ -60,16 +51,12 @@ pub fn buildList(self: *VM, count: u16) !void {
 pub fn mergeAttrs(self: *VM, left: Value, right: Value) !Value {
     if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
     if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
-    const csp = struct_census.setProducer(struct_census.TAG_MERGE);
-    defer struct_census.restoreProducer(csp);
     return Value.attrs(try self.heap.mergeAttrsLayered(left.asObjectId(), right.asObjectId()));
 }
 
 pub fn mergeAttrsStrict(self: *VM, left: Value, right: Value) !Value {
     if (!left.isAttrs()) return trace.typeErrorExpected(self, "attrs", left);
     if (!right.isAttrs()) return trace.typeErrorExpected(self, "attrs", right);
-    const csp = struct_census.setProducer(struct_census.TAG_MERGE_STRICT);
-    defer struct_census.restoreProducer(csp);
     return Value.attrs(try mergeAttrLiteralObjects(self, left.asObjectId(), right.asObjectId()));
 }
 
@@ -154,7 +141,5 @@ pub fn mergeAttrLiteralValue(self: *VM, left: Value, right: Value) anyerror!Valu
 pub fn concatLists(self: *VM, left: Value, right: Value) !Value {
     if (!left.isList()) return trace.typeErrorExpected(self, "list", left);
     if (!right.isList()) return trace.typeErrorExpected(self, "list", right);
-    const csp = struct_census.setProducer(struct_census.TAG_CONCAT);
-    defer struct_census.restoreProducer(csp);
     return Value.list(try self.heap.addConcatenatedLists(left.asObjectId(), right.asObjectId()));
 }

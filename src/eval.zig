@@ -51,14 +51,9 @@ const compiler_mod = @import("compiler.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
-const struct_census = @import("runtime").struct_census;
 const gc = @import("runtime").gc;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
-const trace_probe = @import("probe/trace_probe.zig");
-const drv_probe = @import("probe/drv_probe.zig");
-const ngram_probe = @import("probe/ngram_probe.zig");
-const depth0_probe = @import("probe/depth0_probe.zig");
 const tjit_hot = @import("jit/hot.zig");
 const tjit_exec = @import("jit/exec.zig");
 const tjit_record = @import("jit/record_driver.zig");
@@ -233,8 +228,6 @@ pub const Evaluator = struct {
         }
         self.prefetch_seen.deinit(self.allocator);
         if (comptime vm_mod.opcode_profile_enabled) eval_diagnostics.printVmOpcodeProfile(&self.vm_opcode_counts);
-        trace_probe.report();
-        struct_census.report();
         if (comptime gc.enabled) {
             gc.recordFinalTotal(self.heap.totalReservedBytes());
             // Off by default: the report is a diagnostic, not something every
@@ -242,9 +235,6 @@ pub const Evaluator = struct {
             const gc_report_on = if (self.env_map) |em| em.get("FIX_GC_REPORT") != null else false;
             if (gc_report_on) gc.report();
         }
-        drv_probe.report();
-        ngram_probe.report();
-        depth0_probe.report();
         if (comptime tjit_hot.enabled) eval_diagnostics.reportHotAnchors(self);
         if (comptime tjit_exec.enabled) tjit_exec.report();
         if (comptime tjit_record.enabled) tjit_record.report();
@@ -542,8 +532,6 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
-        trace_probe.init(self.allocator);
-        struct_census.init(self.allocator);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -648,7 +636,7 @@ pub const Evaluator = struct {
         // top-level import evaluates at depth 0 (collects) while a nested one
         // stays gated at the enclosing builtin's depth. native_depth lives on
         // the VM (fiber-local), so no threadlocal dance is needed.
-        if (comptime gc.enabled or depth0_probe.enabled) vm.native_depth = parent_depth -| 1;
+        if (comptime gc.enabled) vm.native_depth = parent_depth -| 1;
         // This VM isn't in any worker's `fibers`, so the collector can't find
         // its roots on its own — register it for the duration of the import.
         // Concurrent imports at --workers>1 interleave, so guard the list and

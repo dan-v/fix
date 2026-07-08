@@ -215,7 +215,7 @@ pub const VM = struct {
     /// `ClaimerId` for thunk forces. Worker patches this when binding
     /// the VM to a fiber.
     claimer_id: thunk_mod.ClaimerId,
-    /// GC native-builtin call depth (`-Dgc`/`-Ddepth0-probe`): incremented
+    /// GC native-builtin call depth (`-Dgc`): incremented
     /// around each native builtin, so `native_depth == 0` marks a clean
     /// safepoint where no builtin holds un-rooted Zig locals. On the VM (not a
     /// threadlocal) so it's fiber-local — a yielded fiber resuming on another

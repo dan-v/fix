@@ -21,7 +21,6 @@ pub const toml = @import("runtime/toml.zig");
 pub const paths = @import("runtime/paths.zig");
 pub const worker_id = @import("runtime/worker_id.zig");
 pub const stable_segments = @import("runtime/stable_segments.zig");
-pub const struct_census = @import("runtime/struct_census.zig");
 pub const gc = @import("runtime/gc.zig");
 pub const builtins = @import("runtime/builtins.zig");
 pub const file_cache = @import("runtime/file_cache.zig");
@@ -51,7 +50,6 @@ test {
     _ = paths;
     _ = worker_id;
     _ = stable_segments;
-    _ = struct_census;
     _ = gc;
     _ = builtins;
     _ = file_cache;

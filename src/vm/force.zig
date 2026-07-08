@@ -29,8 +29,6 @@ const prof_census = @import("../probe/prof_census.zig");
 const timeline = @import("../probe/timeline.zig");
 const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe/prof_path.zig");
-const trace_probe = @import("../probe/trace_probe.zig");
-const depth0_probe = @import("../probe/depth0_probe.zig");
 const tjit_exec = @import("../jit/exec.zig");
 const tjit_record = @import("../jit/record_driver.zig");
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
@@ -255,7 +253,6 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
         }
         return value;
     }
-    if (comptime trace_probe.enabled) trace_probe.recordRead(value.asObjectId());
     // Inline the resolved-thunk fast path. The vast majority of forces
     // hit an already-resolved thunk in steady state (workers and
     // demand-driven fan-out tend to resolve hot thunks early); folding
@@ -940,10 +937,6 @@ pub noinline fn logSpawn(self: *VM, thunk_id: ObjectId, accepted: bool) void {
 }
 
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
-    // Concurrent-SATB feasibility probe (`-Ddepth0-probe`): tally this
-    // safepoint by native_depth + allocation cursor. Independent of -Dgc.
-    if (comptime build_options.depth0_probe)
-        depth0_probe.onForceThunk(self.native_depth, self.heap.totalReservedBytes());
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
     // may be off the VM stack (passed by value), so root it explicitly
@@ -1093,12 +1086,6 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     }
                 }
 
-                if (comptime trace_probe.enabled) {
-                    if (thunk.targetKind() == .bytecode) {
-                        if (self.registry.get(thunk.payload.target.bytecode.chunk_id)) |ch|
-                            trace_probe.recordComputeBody(ch.code.len);
-                    }
-                }
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
                 // Tracing-JIT force-inline hook: if we're recording and this is
