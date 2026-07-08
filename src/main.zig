@@ -14,7 +14,6 @@ const stats = @import("cli/stats.zig");
 const args = @import("cli/args.zig");
 const run = @import("cli/run.zig");
 const trace_setup = @import("cli/trace_setup.zig");
-const tjit_hot = @import("jit/hot.zig");
 const block_cache = @import("runtime").block_cache;
 const Evaluator = eval.Evaluator;
 
@@ -133,14 +132,6 @@ pub fn main(init: std.process.Init) !void {
     var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, options);
     defer thunks_setup.deinit(allocator);
     if (thunks_setup.trace) |t| ev.setThunkTrace(t);
-
-    // Tracing-JIT diagnostics (trace dumps, hot-anchor list, exec counters)
-    // print during/after eval only when stats are requested; otherwise a
-    // `-Dtjit` build stays quiet. Must be set before evaluation since traces
-    // are dumped as they're recorded.
-    if (comptime tjit_hot.enabled) {
-        tjit_hot.report_enabled = options.print_sched_stats;
-    }
 
     // Timeline is always compiled in and RUNTIME-gated: `--timeline[=path]`
     // calls `init()` which flips the runtime gate on; without it the probe

@@ -1,6 +1,5 @@
 //! The VM operand-stack and call-frame machinery: push/pop, frame reservation
 //! and teardown, and the GC-precise in-place binary-operand peek (`binTop`/`dropBin`).
-//! Frame entry also bumps the tracing-JIT hot-anchor counter.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
@@ -8,8 +7,6 @@ const Value = @import("runtime").value.Value;
 const chunk = @import("../bytecode.zig").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
-const hot_mod = @import("../jit/hot.zig");
-const record_mod = @import("../jit/record_driver.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -18,13 +15,6 @@ const ChunkId = types.ChunkId;
 // ---- frame management ----
 
 pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value) !void {
-    // Tracing-JIT hot-anchor detection: every chunk entry (lambda calls and
-    // thunk/closure forcing both route through here) bumps the chunk's hot
-    // counter. Comptime-gated to `-Dtjit` — zero cost in normal builds.
-    const tjit_armed = if (comptime hot_mod.enabled) blk: {
-        if (self.registry.hot) |h| break :blk h.onEntry(chunk_id);
-        break :blk false;
-    } else false;
     if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const frame_base = self.sp - arg_count;
@@ -48,15 +38,6 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
     };
     self.frames_len += 1;
     trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
-    // Begin recording this just-pushed frame if its chunk armed. `root_depth`
-    // is the post-push frame depth; ops at any other depth abort the trace.
-    if (comptime hot_mod.enabled) {
-        // Only arity-1 anchors (curried lambdas / thunks) for now; the
-        // recorder's frame model assumes a single trace argument.
-        if (tjit_armed and ch.arity == 1) {
-            record_mod.start(self, chunk_id, ch.local_count, ch.local_count >= 1, self.frames_len);
-        }
-    }
 }
 
 pub fn popFrame(self: *VM) Frame {

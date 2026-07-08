@@ -22,7 +22,6 @@ pub const fiber = @import("parallel").fiber;
 pub const worker = @import("eval/worker.zig");
 pub const file_cache = @import("runtime").file_cache;
 pub const vm = @import("vm.zig");
-pub const jit = @import("jit.zig");
 pub const probe = @import("probe.zig");
 pub const eval = @import("eval.zig");
 pub const builtins = @import("runtime").builtins;

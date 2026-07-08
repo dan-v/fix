@@ -5,9 +5,7 @@ test {
     _ = @import("tests/functions.zig");
     _ = @import("tests/builtins.zig");
     _ = @import("tests/parallel.zig");
-    // Whole jit/ and probe/ subsystems via their aggregator facades, so no
-    // submodule can silently drop out of the test run (native/exec/record/
-    // jit_helpers were previously missing from a hand-maintained list).
-    _ = @import("../jit.zig");
+    // Whole probe/ subsystem via its aggregator facade, so no submodule can
+    // silently drop out of the test run.
     _ = @import("../probe.zig");
 }

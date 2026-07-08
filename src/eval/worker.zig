@@ -44,7 +44,6 @@ const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
 const vm_force = @import("../vm/force.zig");
 const vm_errors = @import("../vm/errors.zig");
-const tjit_record = @import("../jit/record_driver.zig");
 const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
@@ -984,9 +983,6 @@ fn slotEntry(arg: *anyopaque) void {
     const f: *WorkerFiber = @ptrCast(@alignCast(arg));
     f.vm.sp = 0;
     f.vm.frames_len = 0;
-    // A tjit recording must not span task boundaries — an errored
-    // speculative force unwinds with it still live (see abortStale).
-    if (comptime tjit_record.enabled) tjit_record.abortStale(&f.vm);
     const task = f.current_task orelse return;
     f.current_task = null;
     // Speculative work must NOT touch the user-facing error trace. A
@@ -1255,7 +1251,6 @@ fn contEntry(arg: *anyopaque) void {
     const f: *WorkerFiber = @ptrCast(@alignCast(arg));
     f.vm.sp = 0;
     f.vm.frames_len = 0;
-    if (comptime tjit_record.enabled) tjit_record.abortStale(&f.vm);
     const cont = f.current_cont orelse return;
     f.current_cont = null;
     const saved_trace = f.vm.trace;

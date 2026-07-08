@@ -342,5 +342,4 @@ pub fn markVm(tr: *gc.Tracer, heap: *ObjectHeap, vm: anytype) void {
     for (vm.frames[0..vm.frames_len]) |frame| {
         if (frame.upvalues) |ups| for (ups) |v| tr.markValue(heap, v);
     }
-    for (vm.native_upvalues) |v| tr.markValue(heap, v);
 }

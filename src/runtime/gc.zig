@@ -632,7 +632,7 @@ pub fn currentRssBytes() u64 {
 pub fn report() void {
     if (comptime !enabled) return;
     // Diagnostic stderr during `zig build test --listen=-` corrupts the
-    // runner (the tjit work hit this). Stay silent under the test runner.
+    // runner. Stay silent under the test runner.
     if (builtin.is_test) return;
     std.debug.print("\n=== GC (-Dgc, stop-the-world mark-sweep; parallel mark at --workers>1) ===\n", .{});
     std.debug.print("memory budget (reserved-bytes ceiling): {d:.1} MB\n", .{mb(heap_mod.ObjectHeap.gc_budget_bytes)});

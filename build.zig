@@ -9,10 +9,8 @@ pub fn build(b: *std.Build) void {
     const vm_trace = b.option(bool, "vm-trace", "Enable VM execution tracing (--vm-trace)") orelse false;
     const thunks_log = b.option(bool, "thunks-log", "Enable per-thunk lifecycle event log (--thunks-log)") orelse false;
     const fiber_stack_probe = b.option(bool, "fiber-stack-probe", "Sentinel-fill fiber stacks to enable maxStackUsedBytes — forces full RSS commit") orelse false;
-    const jit = b.option(bool, "jit", "Enable the experimental native-code JIT (x86_64 Linux only)") orelse false;
     const prof_main = b.option(bool, "prof-main", "Time main thread's hot serial paths via rdtsc; print via --print-sched-stats") orelse false;
     const prof_path = b.option(bool, "prof-path", "Record the force-call tree (workers=1) and report the critical path + source-attributed profile; print via --print-sched-stats") orelse false;
-    const tjit = b.option(bool, "tjit", "Experimental tracing/inlining JIT (records hot force/call traces, inlines + sinks allocations, compiles to native with deopt guards). See docs/plans/tracing-jit.md. Off by default; interpreter stays canonical.") orelse false;
     const timeline = b.option(bool, "timeline", "Record a wall-clock event timeline (parse/compile/import phases, fiber-run quanta, idle parks) per worker; write Perfetto JSON via --timeline[=path].") orelse false;
     const gc = b.option(bool, "gc", "Include the generational collector (budget-gated via --max-memory, dormant below half-budget, ~2% rooting tax). ON by default; -Dgc=false builds the collector-free evaluator. See docs/gc.md.") orelse true;
     const strip: ?bool = if (profile) false else null;
@@ -25,10 +23,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "vm_trace", vm_trace);
     build_options.addOption(bool, "thunks_log", thunks_log);
     build_options.addOption(bool, "fiber_stack_probe", fiber_stack_probe);
-    build_options.addOption(bool, "jit", jit);
     build_options.addOption(bool, "prof_main", prof_main);
     build_options.addOption(bool, "prof_path", prof_path);
-    build_options.addOption(bool, "tjit", tjit);
     build_options.addOption(bool, "timeline", timeline);
     build_options.addOption(bool, "gc", gc);
     // One shared module instance — importing the same `build_options` into

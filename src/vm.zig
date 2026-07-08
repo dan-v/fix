@@ -33,7 +33,6 @@ const eval_progress = @import("eval/progress.zig");
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
-const tjit_record = @import("jit/record_driver.zig");
 const DeferredTable = @import("compiler/deferred_table.zig").Table;
 const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
 
@@ -174,16 +173,6 @@ pub const VM = struct {
     /// safepoint and the progress sampler reads it. Null (and thus free) in
     /// every non-interactive build path. Set post-init by `Evaluator.initVm`.
     progress_wait: ?*eval_progress.ProgressWait = null,
-    /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
-    /// recording. Typed `?*anyopaque` (cast in `jit/record.zig`) to avoid a
-    /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
-    /// are comptime-gated).
-    tjit_rec: ?*anyopaque = null,
-    /// Anchor upvalues of the currently-executing native trace, so a native
-    /// `side_exit` (which only gets the upvalues *pointer* via the ABI, not the
-    /// length) can reconstruct the anchor frame. Set/restored around each native
-    /// call in `jit/exec.zig`; only meaningful mid native-trace.
-    native_upvalues: []const Value = &.{},
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
@@ -409,7 +398,6 @@ pub const VM = struct {
 
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
-        if (comptime tjit_record.enabled) tjit_record.cleanup(self);
         if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);
         if (comptime build_options.gc) self.gc_temp_roots.deinit(self.allocator);
         if (self.buffer_pool) |bp| {

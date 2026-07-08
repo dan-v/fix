@@ -29,8 +29,6 @@ const prof_census = @import("../probe/prof_census.zig");
 const timeline = @import("../probe/timeline.zig");
 const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe/prof_path.zig");
-const tjit_exec = @import("../jit/exec.zig");
-const tjit_record = @import("../jit/record_driver.zig");
 const Chunk = @import("../bytecode.zig").chunk.Chunk;
 const heap_mod = @import("runtime").heap;
 const gc = @import("runtime").gc;
@@ -1088,13 +1086,6 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
 
                 const pp = if (comptime prof_path.enabled) prof_path.enter(pathKey(self, &thunk.payload.target, thunk.targetKind())) else @as(usize, 0);
                 defer prof_path.exit(pp);
-                // Tracing-JIT force-inline hook: if we're recording and this is
-                // a thunk the trace built, inline its body (see record.zig).
-                if (comptime tjit_record.enabled) {
-                    if (self.tjit_rec != null and thunk.targetKind() == .bytecode) {
-                        tjit_record.onForceInline(self, thunk.payload.target.bytecode.chunk_id);
-                    }
-                }
                 trace_log.forceEnter(self.vm_trace, self.workerId(), thunk_id);
                 // Root this in-flight thunk (and thus its target closure /
                 // upvalues / attr-access base) for the duration of its body:
@@ -1321,27 +1312,10 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
     };
 }
 
-/// Execute a compiled chunk body with `upvalues`, honoring the tracing
-/// JIT and native JIT fast paths. Shared by the `.bytecode` and
-/// `.deferred` thunk arms (a deferred thunk is a bytecode thunk whose
+/// Execute a compiled chunk body with `upvalues`. Shared by the `.bytecode`
+/// and `.deferred` thunk arms (a deferred thunk is a bytecode thunk whose
 /// ChunkId is computed lazily).
 fn runBytecodeChunk(self: *VM, ch: *const Chunk, chunk_id: ChunkId, upvalues: []const Value) anyerror!Value {
-    // Tracing-JIT: run an installed trace for this thunk body instead
-    // of interpreting it. A guard side-exit returns null → fall through.
-    if (comptime tjit_exec.enabled) {
-        if (try tjit_exec.tryRun(self, chunk_id, upvalues, Value.null_val)) |result| return result;
-    }
-    // JIT fast path: if the registry produced a native-code entry for
-    // this chunk, call it instead of pushing a frame and dispatching.
-    // Null jit_code (the universal case, including any build without
-    // `-Djit`) falls through to the interpreter.
-    if (ch.jit_code) |jit_fn| {
-        const result = jit_fn(@ptrCast(self), upvalues.ptr, upvalues.len);
-        if (result.error_code != 0) {
-            return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
-        }
-        return result.value;
-    }
     return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues);
 }
 

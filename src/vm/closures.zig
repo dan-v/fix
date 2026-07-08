@@ -1,13 +1,12 @@
 //! Closure creation and upvalue capture, bytecode/deferred thunk materialisation
-//! from capture descriptors (with trivial-body short-circuits), function calls
-//! (doCall / callValue / doCallN, tail calls, partial applications), and
-//! tracing-JIT trace resume, fronted by a per-call-site inline cache.
+//! from capture descriptors (with trivial-body short-circuits), and function calls
+//! (doCall / callValue / doCallN, tail calls, partial applications), fronted by a
+//! per-call-site inline cache.
 //! Concurrency: the call IC is per-worker thread-local, heap-token-gated across evaluator instances.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const tjit_exec = @import("../jit/exec.zig");
 const ChunkId = types.ChunkId;
 const ObjectId = types.ObjectId;
 const chunk = @import("../bytecode.zig").chunk;
@@ -24,7 +23,6 @@ const errors = @import("errors.zig");
 const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
-const jit_mod = @import("../jit/native.zig");
 const trace_log = @import("trace_log.zig");
 const prof = @import("../probe/prof.zig");
 const run_mod = @import("run.zig");
@@ -366,10 +364,7 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 
 /// Per-call-site inline cache. Caches the (chunk_id → Chunk*) lookup
 /// at every `call`/`tail_call` site keyed by the caller's
-/// (chunk_id, ip). On hit the registry hashtable lookup is skipped,
-/// and the cache contents are first-class JIT feedback: at code-gen
-/// time the JIT reads the IC to discover whether a site is
-/// monomorphic, polymorphic, or megamorphic.
+/// (chunk_id, ip). On hit the registry hashtable lookup is skipped.
 ///
 /// Heap-token gated: chunk_ids aren't unique across Evaluator
 /// instances (each registry starts at 0), and the IC is threadlocal,
@@ -456,26 +451,9 @@ pub fn doCall(self: *VM, callee: Value, arg: Value) !void {
         if (ch.arity != 1) {
             // Uncurried closure, one arg supplied → under-applied PAP.
             // (arity == 1 is the overwhelmingly common path and stays
-            // branch-cheap below; jit_lambda_code is only attached to
-            // arity-1 chunks.)
+            // branch-cheap below.)
             const id = try self.heap.addPartialApp(callee, &.{arg});
             return stack.push(self, Value.partialApp(id));
-        }
-        if (comptime jit_mod.enabled) {
-            if (ch.jit_lambda_code) |jit_fn| {
-                const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
-                if (result.error_code != 0) {
-                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
-                }
-                return stack.push(self, result.value);
-            }
-        }
-        // Tracing-JIT: run an installed trace for this lambda body instead of
-        // pushing a frame. A guard side-exit returns null → fall through.
-        if (comptime tjit_exec.enabled) {
-            if (try tjit_exec.tryRun(self, closure.chunk_id, closure.upvalues, arg)) |result| {
-                return stack.push(self, result);
-            }
         }
         try stack.push(self, arg); // arg is first local
         try stack.pushFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
@@ -540,19 +518,6 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                     // tail-call case below).
                     const id = try self.heap.addPartialApp(current, &.{arg});
                     return stack.push(self, Value.partialApp(id));
-                }
-                if (comptime jit_mod.enabled) {
-                    if (ch.jit_lambda_code) |jit_fn| {
-                        const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
-                        if (result.error_code != 0) {
-                            return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
-                        }
-                        // Mirror the builtin tail-call case: push the
-                        // result on the current frame's stack. The
-                        // surrounding op (`opTailCall`) then resumes
-                        // dispatch on the next op, which is `ret`.
-                        return stack.push(self, result.value);
-                    }
                 }
                 try replaceCurrentFrame(self, ch, closure.chunk_id, arg, closure.upvalues);
                 return;
@@ -740,15 +705,6 @@ pub fn callValue(self: *VM, callee: Value, arg: Value) !Value {
             const id = try self.heap.addPartialApp(callee, &.{arg});
             return Value.partialApp(id);
         }
-        if (comptime jit_mod.enabled) {
-            if (ch.jit_lambda_code) |jit_fn| {
-                const result = jit_fn(@ptrCast(self), closure.upvalues.ptr, arg);
-                if (result.error_code != 0) {
-                    return @errorFromInt(@as(std.meta.Int(.unsigned, @bitSizeOf(anyerror)), @intCast(result.error_code)));
-                }
-                return result.value;
-            }
-        }
         try stack.push(self, arg);
         return runIsolatedFrame(self, ch, closure.chunk_id, 1, closure.upvalues);
     }
@@ -787,57 +743,6 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
     for (buf[0..total]) |a| try stack.push(self, a);
     try forceStrictArgs(self, ch, args_base, ch.arity);
     return runIsolatedFrame(self, ch, closure.chunk_id, ch.arity, closure.upvalues);
-}
-
-/// A live local to restore when resuming a truncated trace.
-pub const TraceLocal = struct { slot: u16, value: Value };
-
-/// One reconstructed VM frame for a tracing-JIT side-exit.
-pub const TraceFrame = struct {
-    chunk: *const Chunk,
-    chunk_id: types.ChunkId,
-    upvalues: ?[]const Value,
-    resume_ip: u32,
-    locals: []const TraceLocal,
-    operands: []const Value,
-};
-
-/// Resume interpretation of a tracing-JIT trace mid-body (`-Dtjit` side-exit),
-/// reconstructing the WHOLE inlined call stack. `frames` are ordered anchor →
-/// deepest; each becomes a real VM frame (locals written into their slots,
-/// operands pushed above, ip set to its resume point). The interpreter then
-/// unwinds naturally: the deepest frame runs, its `ret` pushes its result to the
-/// parent (resuming at the parent's call-return ip), … until the anchor `ret`
-/// yields the trace result. Mirrors `runIsolatedFrame`'s teardown on error.
-pub fn resumeTraceMulti(self: *VM, frames: []const TraceFrame) anyerror!Value {
-    const stop_depth = self.frames_len;
-    const base0 = self.sp;
-    for (frames) |fr| {
-        const fb = self.sp; // pushFrame(arg_count=0) sets frame_base = sp = fb
-        stack.pushFrame(self, fr.chunk, fr.chunk_id, 0, fr.upvalues) catch |err| {
-            self.frames_len = stop_depth;
-            self.sp = base0;
-            return err;
-        };
-        for (fr.locals) |l| self.stack[fb + l.slot] = l.value;
-        if (self.sp + fr.operands.len > types.VM_STACK_CAP) {
-            self.frames_len = stop_depth;
-            self.sp = base0;
-            return error.StackOverflow;
-        }
-        for (fr.operands) |v| {
-            self.stack[self.sp] = v;
-            self.sp += 1;
-        }
-        self.frames[self.frames_len - 1].ip = fr.resume_ip;
-    }
-    if (self.sp > self.sp_high_water) self.sp_high_water = self.sp;
-    return run_mod.runUntil(self, stop_depth) catch |err| {
-        errors.captureErrorTrace(self, err) catch {};
-        self.frames_len = stop_depth;
-        self.sp = base0;
-        return err;
-    };
 }
 
 pub fn runIsolatedFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg_count: u32, upvalues: ?[]const Value) anyerror!Value {

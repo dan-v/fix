@@ -10,9 +10,6 @@ const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("runtime").value.Value;
 const AttrEntry = @import("runtime").heap.AttrEntry;
 const stable = @import("runtime").stable_segments;
-const hot_mod = @import("../jit/hot.zig");
-const HotTable = hot_mod.HotTable;
-const jit_mod = @import("../jit/native.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -71,19 +68,6 @@ pub const Chunk = struct {
     /// constructs). Used by the timeline to label a thunk quantum / demand
     /// wait. Set at `stampOnBuilder`; null for chunks that skip it.
     body_span: ?SourceSpan = null,
-    /// Optional native-code entry point produced by the JIT. Null
-    /// means "interpret the bytecode normally" — the canonical path
-    /// and the only one available without `-Djit`. See `src/jit.zig`.
-    jit_code: ?jit_mod.CompiledFn = null,
-    /// Native-code entry point for *lambda bodies* (chunks called via
-    /// `doCall`/`doTailCall`/`callValue`). Distinct ABI from
-    /// `jit_code` because the caller passes the argument as a Value
-    /// register, not via the VM stack — JIT'd lambdas skip the
-    /// frame push and bytecode dispatch entirely. Mutually exclusive
-    /// with `jit_code` at most: thunk bodies have `local_count == 0`
-    /// and lambda bodies have `local_count >= 1`, so a chunk is
-    /// classified one way or the other (never both).
-    jit_lambda_code: ?jit_mod.LambdaCompiledFn = null,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
@@ -562,45 +546,18 @@ pub const ChunkRegistry = struct {
     };
 
     const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 });
-    const jit = @import("../jit/native.zig");
-    const jit_linear = @import("../jit/linear.zig");
-    const JitCodeBuffer = if (jit.code_enabled) jit.CodeBuffer else void;
 
     allocator: std.mem.Allocator,
     chunks: Store,
     well_known: WellKnownChunks,
-    /// JIT'd native-code buffer, one per registry. `void` when the
-    /// JIT is disabled at build time — has zero footprint and the
-    /// interpreter handles everything.
-    jit_buffer: JitCodeBuffer,
-    /// Tracing-JIT hot-anchor table (`-Dtjit`). Heap-allocated so workers can
-    /// mutate it through the VM's `*const ChunkRegistry`. Null when tjit is off.
-    hot: ?*HotTable = null,
-
-    /// Fixed capacity for the hot table — comfortably over the toplevel's
-    /// chunk count; ids beyond it are untracked (never go hot).
-    const HOT_CAPACITY: usize = 1 << 21;
-    const HOT_THRESHOLD: u32 = 64;
-    const HOT_MAX_ABORTS: u8 = 3;
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
             .allocator = allocator,
             .chunks = .empty,
             .well_known = .{ .genlist_apply = 0, .mapattrs_apply = 0 },
-            // 16 MiB — NixOS toplevel registers ~700K chunks at
-            // ~20 bytes per stub when many shapes match, comfortably
-            // under capacity. Reservation is virtual until populated
-            // so the over-provision is free for callers who don't
-            // hit the upper bound.
-            .jit_buffer = if (jit.code_enabled) try jit.CodeBuffer.init(16 << 20) else {},
         };
         errdefer self.deinit();
-        if (hot_mod.enabled) {
-            const h = try allocator.create(HotTable);
-            h.* = try HotTable.init(allocator, HOT_CAPACITY, HOT_THRESHOLD, HOT_MAX_ABORTS);
-            self.hot = h;
-        }
         self.well_known.genlist_apply = try self.registerGenListApplyChunk();
         self.well_known.mapattrs_apply = try self.registerMapAttrsApplyChunk();
         return self;
@@ -673,11 +630,6 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
-        if (jit.code_enabled) self.jit_buffer.deinit();
-        if (self.hot) |h| {
-            h.deinit(self.allocator);
-            self.allocator.destroy(h);
-        }
     }
 
     /// Optional import-prefetch discovery sink (`FIX_IMPORT_PREFETCH`): when
@@ -705,24 +657,6 @@ pub const ChunkRegistry = struct {
         if (path_const_sink) |sink| {
             for (stored.constants) |c| {
                 if (c.isPath()) sink.call(sink.ctx, c.asInternId());
-            }
-        }
-        if (jit.enabled) {
-            // Best-effort: failure to JIT just leaves the interpreter
-            // to handle it. Don't propagate. The peephole matcher runs
-            // first (its hand-tuned tail-call stubs are optimal for the
-            // tiny fixed shapes); the linear compiler catches the
-            // larger straight-line bodies the peephole can't.
-            if (stored.local_count == 0) {
-                stored.jit_code = jit.compile(&self.jit_buffer, stored);
-                if (stored.jit_code == null) {
-                    stored.jit_code = @ptrCast(jit_linear.compileLinear(&self.jit_buffer, stored, false));
-                }
-            } else {
-                stored.jit_lambda_code = jit.compileLambda(&self.jit_buffer, stored);
-                if (stored.jit_lambda_code == null) {
-                    stored.jit_lambda_code = @ptrCast(jit_linear.compileLinear(&self.jit_buffer, stored, true));
-                }
             }
         }
         // Lock-free registration: many workers compile (deferred bodies +

@@ -54,9 +54,6 @@ const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const gc = @import("runtime").gc;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
-const tjit_hot = @import("jit/hot.zig");
-const tjit_exec = @import("jit/exec.zig");
-const tjit_record = @import("jit/record_driver.zig");
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
@@ -235,9 +232,6 @@ pub const Evaluator = struct {
             const gc_report_on = if (self.env_map) |em| em.get("FIX_GC_REPORT") != null else false;
             if (gc_report_on) gc.report();
         }
-        if (comptime tjit_hot.enabled) eval_diagnostics.reportHotAnchors(self);
-        if (comptime tjit_exec.enabled) tjit_exec.report();
-        if (comptime tjit_record.enabled) tjit_record.report();
         // Shut helpers down (which joins on `defer vm.deinit()` inside
         // helperLoop) before tearing down state their VMs borrow.
         self.scheduler.deinit();

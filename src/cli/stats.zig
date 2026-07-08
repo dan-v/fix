@@ -1,13 +1,12 @@
 //! `--print-sched-stats` diagnostics dump.
 //!
-//! Scheduler/registry/deferred counters, plus the comptime-gated `-Djit`,
-//! `-Dprof-main`, and `-Dprof-path` reports. Kept out of `main` so the entry
+//! Scheduler/registry/deferred counters, plus the comptime-gated
+//! `-Dprof-main` and `-Dprof-path` reports. Kept out of `main` so the entry
 //! point stays a thin composition; the build-flag-gated subsystem internals
 //! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
 const Evaluator = @import("../eval.zig").Evaluator;
-const jit = @import("../jit/native.zig");
 const prof = @import("../probe/prof.zig");
 const prof_path = @import("../probe/prof_path.zig");
 const scheduler = @import("parallel").scheduler;
@@ -54,7 +53,6 @@ pub fn report(ev: *Evaluator) void {
             .{ created, tot, dem, undem, if (tot == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(undem)) / @as(f64, @floatFromInt(tot)) },
         );
     }
-    if (comptime jit.enabled) jit.report();
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
         scheduler.reportScanCensus();
