@@ -25,6 +25,7 @@ const closures = @import("closures.zig");
 const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("../probe/prof.zig");
+const prof_census = @import("../probe/prof_census.zig");
 const timeline = @import("../probe/timeline.zig");
 const vm_errors = @import("errors.zig");
 const prof_path = @import("../probe/prof_path.zig");
@@ -250,7 +251,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     }
     if (!value.isThunk()) {
         if (comptime prof.enabled) {
-            if (demand and self.workerId() == 0) prof.fv_plain += 1;
+            if (demand and self.workerId() == 0) prof_census.fv_plain += 1;
         }
         return value;
     }
@@ -272,8 +273,8 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
             // already-resolved thunk ⇒ a helper resolved it ahead of demand.
             if (comptime prof.enabled) {
                 if (self.workerId() == 0) {
-                    prof.fv_resolved += 1;
-                    if (!thunk.isDemanded()) prof.disc.resolved_ahead += 1;
+                    prof_census.fv_resolved += 1;
+                    if (!thunk.isDemanded()) prof_census.disc.resolved_ahead += 1;
                 }
             }
             thunk.markDemanded();
@@ -1016,7 +1017,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 var age_t: u64 = std.math.maxInt(u64);
                 if (comptime prof.enabled) {
                     if (demand and self.workerId() == 0) {
-                        prof.disc.claimed_by_main += 1;
+                        prof_census.disc.claimed_by_main += 1;
                         age_t = prof.ageForceBegin(
                             thunk.future.created_tsc,
                             @intFromEnum(thunk.targetKind()),
@@ -1062,9 +1063,9 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     // the ≤2-upvalue memo-key limit, by upvalue count.
                     if (self.workerId() == 0 and memo_key == null and thunk.targetKind() == .bytecode) {
                         switch (thunk.payload.target.bytecode.upvalues().len) {
-                            3 => prof.memo_inel_3 += 1,
-                            4 => prof.memo_inel_4 += 1,
-                            else => prof.memo_inel_ge5 += 1,
+                            3 => prof_census.memo_inel_3 += 1,
+                            4 => prof_census.memo_inel_4 += 1,
+                            else => prof_census.memo_inel_ge5 += 1,
                         }
                     }
                 }
@@ -1076,13 +1077,13 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     // (L2-resident) held 14.2% but was wall-neutral;
                     // don't shrink blindly.
                     if (comptime prof.enabled) {
-                        if (self.workerId() == 0) prof.memo_probes += 1;
+                        if (self.workerId() == 0) prof_census.memo_probes += 1;
                     }
                     if (s.token == self.heap.token and s.chunk == k.chunk and
                         s.count == k.count and s.up0 == k.up0 and s.up1 == k.up1)
                     {
                         if (comptime prof.enabled) {
-                            if (self.workerId() == 0) prof.memo_hits += 1;
+                            if (self.workerId() == 0) prof_census.memo_hits += 1;
                         }
                         thunk.resolve(s.value);
                         self.heap.gcRecordEdge(thunk_id, s.value); // old→young barrier
@@ -1207,8 +1208,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         } else false;
                         if (is_dem) {
                             disc_spec = !thunk.isDemanded();
-                            prof.disc.busy_wait += 1;
-                            if (disc_spec) prof.disc.busy_spec_owned += 1;
+                            prof_census.disc.busy_wait += 1;
+                            if (disc_spec) prof_census.disc.busy_spec_owned += 1;
                             disc_start = prof.tscMainOnly();
                         }
                     }
@@ -1220,8 +1221,8 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     const end_tsc = prof.tscMainOnly();
                     if (disc_start != 0 and end_tsc > disc_start) {
                         const dt = end_tsc - disc_start;
-                        prof.disc.busy_cycles += dt;
-                        if (disc_spec) prof.disc.busy_spec_cycles += dt;
+                        prof_census.disc.busy_cycles += dt;
+                        if (disc_spec) prof_census.disc.busy_spec_cycles += dt;
                     }
                 };
                 // Spin-before-enroll: a helper that is nearly done publishes

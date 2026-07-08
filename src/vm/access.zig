@@ -18,6 +18,7 @@ const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const vm_builtins = @import("builtins.zig");
 const prof = @import("../probe/prof.zig");
+const prof_census = @import("../probe/prof_census.zig");
 const gc = @import("runtime").gc;
 const sched_mod = @import("parallel").scheduler;
 const heap_mod = @import("runtime").heap;
@@ -83,25 +84,25 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
     if (slot.heap_token == token and slot.obj_id == obj_id and slot.name_id == name_id) {
         if (comptime prof.enabled) {
             if (self.workerId() == 0) {
-                prof.attr_cache_hits += 1;
-                if (force.profIsResolvedThunk(self, slot.value)) prof.rf_attr_hit += 1;
+                prof_census.attr_cache_hits += 1;
+                if (force.profIsResolvedThunk(self, slot.value)) prof_census.rf_attr_hit += 1;
             }
         }
         return slot.value;
     }
     if (comptime prof.enabled) {
         if (self.workerId() == 0) {
-            prof.attr_cache_misses += 1;
+            prof_census.attr_cache_misses += 1;
             // Attr-lookup size census: bucket this compulsory binary
             // search by the set's entry count.
             switch (self.heap.getConst(obj_id).*) {
                 .attrs => |a| {
                     const n: u64 = a.range.len;
-                    const k: usize = @min(prof.AL_BUCKETS - 1, std.math.log2_int(u64, @max(2, n) - 1));
-                    prof.al_size[k] += 1;
-                    prof.al_probes[k] += if (n <= 1) 1 else std.math.log2_int(u64, n) + 1;
+                    const k: usize = @min(prof_census.AL_BUCKETS - 1, std.math.log2_int(u64, @max(2, n) - 1));
+                    prof_census.al_size[k] += 1;
+                    prof_census.al_probes[k] += if (n <= 1) 1 else std.math.log2_int(u64, n) + 1;
                 },
-                else => prof.al_merge += 1,
+                else => prof_census.al_merge += 1,
             }
         }
     }

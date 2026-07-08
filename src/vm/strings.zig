@@ -14,6 +14,7 @@ const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
 const prof = @import("../probe/prof.zig");
+const prof_census = @import("../probe/prof_census.zig");
 
 const VM = vm_mod.VM;
 
@@ -30,12 +31,12 @@ pub fn concatInternedString(self: *VM, a: InternId, b: InternId) !InternId {
     const pre_entries = if (prof.enabled) self.intern.entries.count() else 0;
     const id = try self.intern.intern(buf);
     if (prof.enabled and t_start != 0) {
-        prof.str.concat_calls += 1;
-        prof.str.concat_cycles += prof.tscMainOnly() - t_start;
-        prof.str.concat_bytes += buf.len;
+        prof_census.str.concat_calls += 1;
+        prof_census.str.concat_cycles += prof.tscMainOnly() - t_start;
+        prof_census.str.concat_bytes += buf.len;
         if (self.intern.entries.count() != pre_entries) {
-            prof.str.concat_new += 1;
-            prof.str.concat_new_bytes += buf.len;
+            prof_census.str.concat_new += 1;
+            prof_census.str.concat_new_bytes += buf.len;
         }
     }
     return id;

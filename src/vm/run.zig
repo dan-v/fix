@@ -29,6 +29,7 @@ const OpCode = opcode.OpCode;
 const heap_mod = @import("runtime").heap;
 const numeric = @import("runtime").numeric;
 const prof = @import("../probe/prof.zig");
+const prof_census = @import("../probe/prof_census.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
@@ -153,7 +154,7 @@ fn opGetLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: u
     const slot = code[ip];
     const raw = vm.stack[frame.frame_base + slot];
     if (comptime prof.enabled) {
-        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof.rf_local += 1;
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
     }
     const val = try force.forceValue(vm, raw);
     try stack.push(vm, val);
@@ -165,7 +166,7 @@ fn opGetLocalLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dept
     const slot = readU16(code, ip);
     const raw = vm.stack[frame.frame_base + slot];
     if (comptime prof.enabled) {
-        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof.rf_local += 1;
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, raw)) prof_census.rf_local += 1;
     }
     const val = try force.forceValue(vm, raw);
     try stack.push(vm, val);
@@ -244,7 +245,7 @@ fn opGetUpvalue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     const slot = readU16(code, ip);
     const upvalues = frame.upvalues orelse return error.MissingClosure;
     if (comptime prof.enabled) {
-        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, upvalues[slot])) prof.rf_upvalue += 1;
+        if (vm.workerId() == 0 and force.profIsResolvedThunk(vm, upvalues[slot])) prof_census.rf_upvalue += 1;
     }
     const val = try force.forceValue(vm, upvalues[slot]);
     try stack.push(vm, val);
