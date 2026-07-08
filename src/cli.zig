@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const eval_progress = @import("eval/progress.zig");
+const gc = @import("runtime").gc;
 
 pub const When = enum {
     auto,
@@ -145,17 +146,67 @@ pub const EvalProgress = struct {
     /// is blocked and the stage tree would otherwise be empty. Owned by the
     /// main thread (stage-event thread); the sampler only reads it as a parent.
     run_node: ?std.Progress.Node = null,
-    /// Live counter lines, created lazily and refreshed via `setName`. These
-    /// are owned exclusively by the sampler thread while a session runs (the
-    /// sampler is joined before `session_end`/`deinit` touch them), so there's
-    /// no cross-thread mutation of the same node.
-    stats_node: ?std.Progress.Node = null,
-    spec_node: ?std.Progress.Node = null,
-    gc_node: ?std.Progress.Node = null,
+    /// The persistent "stats" subtree: a `stats` umbrella holding a section per
+    /// subsystem (heap / scheduler / gc), each with per-metric child lines the
+    /// sampler refreshes in place. Hangs off `run_node` as its first child (so
+    /// the run is a single tree, stats above the eval spans). Built on the main
+    /// thread in `sessionBegin`, then mutated only by the sampler thread — which
+    /// is joined before `session_end`/`deinit` tear it down, so there's no
+    /// cross-thread mutation of the same node.
+    stats: ?Stats = null,
+    /// What the demand path is currently blocked on, shown as a `waiting <loc>`
+    /// node under the run node during the windows where the stage tree is empty
+    /// (demand parked while helpers churn). Created and torn down lazily by the
+    /// sampler thread as the block comes and goes, so it vanishes the moment
+    /// work resumes. Sampler-owned, same as `stats`.
+    waiting: ?std.Progress.Node = null,
 
     const Active = struct {
         stage: eval_progress.Stage,
         node: std.Progress.Node,
+    };
+
+    /// Live-counter node scaffold: a `stats` umbrella with one row per
+    /// subsystem, each row carrying that section's whole compact readout. Every
+    /// node is created up front in `Stats.build` and lives for the session; the
+    /// sampler only mutates names. The gc row only exists under `-Dgc` (its type
+    /// collapses to `void` otherwise), since a non-collecting build has no
+    /// collector to report on. Future work will add sibling sections for the
+    /// eval phases (eval / force / render / builds).
+    const Stats = struct {
+        node: std.Progress.Node, // "stats" umbrella
+        heap: std.Progress.Node,
+        sched: std.Progress.Node,
+        gc: if (gc.enabled) std.Progress.Node else void,
+
+        fn build(parent: std.Progress.Node) Stats {
+            var buf: [std.Progress.Node.max_name_len]u8 = undefined;
+            const m: eval_progress.Metrics = .{}; // zero seed until the first sample
+            const node = parent.start("stats", 0);
+            return .{
+                .node = node,
+                .heap = node.start(fmtHeap(&buf, m), 0),
+                .sched = node.start(fmtSched(&buf, m), 0),
+                // Last child, so it sorts below the always-present sections.
+                .gc = if (comptime gc.enabled) node.start(fmtGc(&buf, m), 0) else {},
+            };
+        }
+
+        /// Refresh every section row in place from one snapshot.
+        fn update(self: *Stats, m: eval_progress.Metrics) void {
+            var buf: [std.Progress.Node.max_name_len]u8 = undefined;
+            self.heap.setName(fmtHeap(&buf, m));
+            self.sched.setName(fmtSched(&buf, m));
+            if (comptime gc.enabled) self.gc.setName(fmtGc(&buf, m));
+        }
+
+        /// End the rows before their `stats` parent (mirror of `build` order).
+        fn deinit(self: *Stats) void {
+            self.heap.end();
+            self.sched.end();
+            if (comptime gc.enabled) self.gc.end();
+            self.node.end();
+        }
     };
 
     pub fn init(io: std.Io, enabled: bool) EvalProgress {
@@ -185,9 +236,8 @@ pub const EvalProgress = struct {
             self.active_len -= 1;
             self.active[self.active_len].node.end();
         }
-        if (self.gc_node) |n| { n.end(); self.gc_node = null; }
-        if (self.spec_node) |n| { n.end(); self.spec_node = null; }
-        if (self.stats_node) |n| { n.end(); self.stats_node = null; }
+        if (self.waiting) |n| { n.end(); self.waiting = null; }
+        if (self.stats) |*s| { s.deinit(); self.stats = null; }
         if (self.run_node) |n| { n.end(); self.run_node = null; }
     }
 
@@ -226,23 +276,43 @@ pub const EvalProgress = struct {
         var buf: [std.Progress.Node.max_name_len]u8 = undefined;
         const name = std.fmt.bufPrint(&buf, "evaluating {s}", .{label}) catch "evaluating";
         self.run_node = self.root.start(name, 0);
+        // Stats hangs off the run node as its first child (before any eval span,
+        // which the demand path adds later), so the whole run is a single tree
+        // rooted at "evaluating <label>". Built on the main thread before the
+        // sampler is spawned, so the sampler only ever mutates these nodes.
+        self.stats = Stats.build(self.run_node.?);
     }
 
-    /// Refresh the live counter lines: a heap/wait readout, a speculation line,
-    /// and (once the collector has run) a GC line whose item count is the
-    /// collection tally. Runs on the sampler thread; these nodes are its alone.
+    /// Refresh the stats subtree from a snapshot. Runs on the sampler thread;
+    /// the nodes were created up front in `sessionBegin`, so this only mutates
+    /// their names — the tree scaffold is the sampler's alone once the session
+    /// is live. No-op before `sessionBegin` builds the tree.
     fn updateMetrics(self: *EvalProgress, m: eval_progress.Metrics) void {
+        if (self.stats) |*s| s.update(m);
+        self.updateWaiting(m);
+    }
+
+    /// Show/refresh/hide the `waiting <loc>` node under the run node to match
+    /// the current block state. Runs on the sampler thread (and once on the
+    /// main thread after it's joined, in `stopProgressSampler`) — the sole owner
+    /// of `self.waiting`, so lazy create/end here is race-free.
+    fn updateWaiting(self: *EvalProgress, m: eval_progress.Metrics) void {
+        const run = self.run_node orelse return;
+        const w = m.wait();
+        if (w.len == 0) {
+            if (self.waiting) |n| {
+                n.end();
+                self.waiting = null;
+            }
+            return;
+        }
         var buf: [std.Progress.Node.max_name_len]u8 = undefined;
-        if (self.stats_node == null) self.stats_node = self.root.start("", 0);
-        self.stats_node.?.setName(formatStats(&buf, m));
-
-        if (self.spec_node == null) self.spec_node = self.root.start("", 0);
-        self.spec_node.?.setName(formatSpec(&buf, m));
-
-        if (m.gc_collections == 0) return;
-        if (self.gc_node == null) self.gc_node = self.root.start("gc", 0);
-        self.gc_node.?.setName(formatGc(&buf, m));
-        self.gc_node.?.setCompletedItems(m.gc_collections);
+        const name = std.fmt.bufPrint(&buf, "waiting {s}", .{w}) catch "waiting";
+        if (self.waiting) |n| {
+            n.setName(name);
+        } else {
+            self.waiting = run.start(name, 0);
+        }
     }
 
     fn beginStep(self: *EvalProgress, step: eval_progress.Step) void {
@@ -282,39 +352,33 @@ pub const EvalProgress = struct {
     }
 };
 
-/// The heap readout line (see `EvalProgress.updateMetrics`). When the demand
-/// path is blocked, appends what it's waiting on — so the stage-tree-empty
-/// windows still say something. Pure so it's unit-testable; `buf` must hold
-/// `max_name_len` bytes.
-fn formatStats(buf: []u8, m: eval_progress.Metrics) []const u8 {
+// Per-section row formatters for the stats subtree (see `Stats`). Each writes
+// one section's whole compact readout into `buf` (which must hold
+// `max_name_len` bytes), prefixed by the section label. Pure so they're
+// unit-testable; scratch buffers are 16 bytes — wide enough for any `count`/`mb`
+// output.
+
+fn fmtHeap(buf: []u8, m: eval_progress.Metrics) []const u8 {
     var objs: [16]u8 = undefined;
-    var frcd: [16]u8 = undefined;
-    var heap: [16]u8 = undefined;
+    var res: [16]u8 = undefined;
     var rss: [16]u8 = undefined;
-    const w = m.wait();
-    if (w.len == 0) {
-        return std.fmt.bufPrint(buf, "{s} objs · heap {s} · rss {s} · {s} forced", .{
-            count(&objs, m.objects),
-            mb(&heap, m.reserved_bytes),
-            mb(&rss, m.rss_bytes),
-            count(&frcd, m.forced),
-        }) catch "";
-    }
-    return std.fmt.bufPrint(buf, "{s} objs · heap {s} · rss {s} · {s} forced · waiting {s}", .{
+    var frcd: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "heap · {s} objs · {s} reserved · {s} rss · {s} forced", .{
         count(&objs, m.objects),
-        mb(&heap, m.reserved_bytes),
+        mb(&res, m.reserved_bytes),
         mb(&rss, m.rss_bytes),
         count(&frcd, m.forced),
-        w,
     }) catch "";
 }
 
-/// The speculation-activity line: backlog + cumulative spec/steal counters.
-fn formatSpec(buf: []u8, m: eval_progress.Metrics) []const u8 {
+/// The scheduler row. (What the demand path is blocked on lives on its own
+/// `waiting` node under the run node — see `EvalProgress.updateMetrics` — since
+/// it's eval status, not a scheduler counter.)
+fn fmtSched(buf: []u8, m: eval_progress.Metrics) []const u8 {
     var sub: [16]u8 = undefined;
     var rej: [16]u8 = undefined;
     var stl: [16]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{d} pending · {s} spec · {s} rejected · {s} steals", .{
+    return std.fmt.bufPrint(buf, "scheduler · {d} pending · {s} spec · {s} rejected · {s} steals", .{
         m.pending,
         count(&sub, m.spec_submitted),
         count(&rej, m.spec_rejected),
@@ -322,11 +386,11 @@ fn formatSpec(buf: []u8, m: eval_progress.Metrics) []const u8 {
     }) catch "";
 }
 
-/// The collector line (shown once `gc_collections > 0`).
-fn formatGc(buf: []u8, m: eval_progress.Metrics) []const u8 {
+/// The gc row (`-Dgc` only).
+fn fmtGc(buf: []u8, m: eval_progress.Metrics) []const u8 {
     var live: [16]u8 = undefined;
     var freed: [16]u8 = undefined;
-    return std.fmt.bufPrint(buf, "gc ×{d} · {s} live · {s} freed", .{
+    return std.fmt.bufPrint(buf, "gc · {d} collections · {s} live · {s} freed", .{
         m.gc_collections,
         mb(&live, m.gc_live_bytes),
         count(&freed, m.gc_freed_objects),
@@ -374,7 +438,7 @@ test "progress count formatter: bare / K / M / B thresholds" {
     try std.testing.expectEqualStrings("2.5B", count(&b, 2_500_000_000));
 }
 
-test "progress stats/spec/gc lines render as expected" {
+test "progress stats subtree lines render as expected" {
     // Numbers from a real `--max-memory=1200` NixOS eval (1 collection).
     var m: eval_progress.Metrics = .{
         .objects = 2_487_505,
@@ -391,23 +455,24 @@ test "progress stats/spec/gc lines render as expected" {
     };
     var buf: [std.Progress.Node.max_name_len]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "2.5M objs · heap 1215MB · rss 1760MB · 12.3M forced",
-        formatStats(&buf, m),
+        "heap · 2.5M objs · 1215MB reserved · 1760MB rss · 12.3M forced",
+        fmtHeap(&buf, m),
     );
-    // Blocked on a source loc → the waiting clause appears.
+    try std.testing.expectEqualStrings(
+        "scheduler · 8 pending · 1.2M spec · 34.0K rejected · 41.0K steals",
+        fmtSched(&buf, m),
+    );
+    try std.testing.expectEqualStrings(
+        "gc · 1 collections · 225MB live · 4.3M freed",
+        fmtGc(&buf, m),
+    );
+    // The wait subject is not part of the scheduler row — it drives a separate
+    // `waiting` node under the run node, so setting it changes nothing here.
     const w = "modules.nix:545";
     @memcpy(m.wait_buf[0..w.len], w);
     m.wait_len = w.len;
     try std.testing.expectEqualStrings(
-        "2.5M objs · heap 1215MB · rss 1760MB · 12.3M forced · waiting modules.nix:545",
-        formatStats(&buf, m),
-    );
-    try std.testing.expectEqualStrings(
-        "8 pending · 1.2M spec · 34.0K rejected · 41.0K steals",
-        formatSpec(&buf, m),
-    );
-    try std.testing.expectEqualStrings(
-        "gc ×1 · 225MB live · 4.3M freed",
-        formatGc(&buf, m),
+        "scheduler · 8 pending · 1.2M spec · 34.0K rejected · 41.0K steals",
+        fmtSched(&buf, m),
     );
 }
