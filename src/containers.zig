@@ -9,11 +9,13 @@
 //! worklist (a dropped element is a swept live object).
 
 pub const deque = @import("containers/deque.zig");
+pub const cache_line = @import("containers/cache_line.zig");
 
 pub const Deque = deque.Deque;
 pub const GrowableDeque = deque.GrowableDeque;
-pub const Isolated = deque.Isolated;
+pub const Isolated = cache_line.Isolated;
 
 test {
     _ = deque;
+    _ = cache_line;
 }
