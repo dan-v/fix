@@ -326,6 +326,122 @@ pub const Evaluator = struct {
             p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
         const dump = if (self.env_map) |em| em.get("FIX_MEM_REPORT") else null;
         if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
+
+        // Decompose the "untracked" bucket above via /proc/self/smaps:
+        // split current RSS into file-backed (binary + shared libs), the
+        // main thread stack, brk heap, and anonymous. The anonymous total
+        // minus the registry-tracked big mappings is the real SmpAllocator
+        // small-slab + worker-thread-stack + misc-anon footprint — showing
+        // the previously-opaque line is ~entirely small-object slabs, not
+        // binary/stacks.
+        smapsDecompose(tracked_total);
+    }
+
+    fn smapsDecompose(tracked_anon: u64) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const p = std.debug.print;
+        const linux = std.os.linux;
+        const fd_raw = linux.open("/proc/self/smaps", .{ .ACCMODE = .RDONLY }, 0);
+        const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+        if (fd < 0) return;
+        defer _ = linux.close(fd);
+
+        var file_rss: u64 = 0;
+        var stack_rss: u64 = 0;
+        var anon_rss: u64 = 0;
+        var heap_rss: u64 = 0;
+        // Track whether the current mapping is file-backed / [stack] /
+        // [heap] / anonymous by its header line, then attribute each
+        // "Rss:" line to that category. Read in chunks, reassembling lines
+        // across chunk boundaries in a small carry buffer.
+        var current: enum { file, stack, heap, anon } = .anon;
+        var chunk: [64 * 1024]u8 = undefined;
+        var carry: [512]u8 = undefined;
+        var carry_len: usize = 0;
+        while (true) {
+            const n = linux.read(fd, &chunk, chunk.len);
+            const rd: isize = @bitCast(n);
+            if (rd <= 0) break;
+            var data = chunk[0..@intCast(rd)];
+            while (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
+                var line = data[0..nl];
+                if (carry_len > 0) {
+                    // Prepend carried partial line.
+                    const take = @min(line.len, carry.len - carry_len);
+                    @memcpy(carry[carry_len..][0..take], line[0..take]);
+                    line = carry[0 .. carry_len + take];
+                    carry_len = 0;
+                }
+                classifySmapsLine(line, &current, &file_rss, &stack_rss, &heap_rss, &anon_rss);
+                data = data[nl + 1 ..];
+            }
+            // Stash any trailing partial line.
+            if (data.len > 0 and data.len <= carry.len) {
+                @memcpy(carry[0..data.len], data);
+                carry_len = data.len;
+            }
+        }
+        const mb = struct {
+            fn f(kb: u64) f64 {
+                return @as(f64, @floatFromInt(kb)) / 1024.0;
+            }
+        }.f;
+        p("  -- smaps decomposition (RSS by mapping kind) --\n", .{});
+        p("  file-backed     {d:>8.1} MB  (binary + shared libs)\n", .{mb(file_rss)});
+        p("  main [stack]    {d:>8.1} MB\n", .{mb(stack_rss)});
+        p("  [heap] brk      {d:>8.1} MB\n", .{mb(heap_rss)});
+        p("  anon total      {d:>8.1} MB\n", .{mb(anon_rss)});
+        const tracked_mb = @as(f64, @floatFromInt(tracked_anon)) / (1024.0 * 1024.0);
+        p("  anon tracked    {d:>8.1} MB  (registered big regions)\n", .{tracked_mb});
+        p("  anon UNTRACKED  {d:>8.1} MB  (SmpAllocator small slabs + worker stacks + misc)\n", .{mb(anon_rss) - tracked_mb});
+    }
+
+    fn classifySmapsLine(
+        line: []const u8,
+        current: anytype,
+        file_rss: *u64,
+        stack_rss: *u64,
+        heap_rss: *u64,
+        anon_rss: *u64,
+    ) void {
+        const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        const tok0 = line[0..first_space];
+        const is_header = std.mem.indexOfScalar(u8, tok0, '-') != null and tok0.len > 0 and isHexDash(tok0);
+        if (is_header) {
+            if (std.mem.indexOf(u8, line, "[stack]") != null) {
+                current.* = .stack;
+            } else if (std.mem.indexOf(u8, line, "[heap]") != null) {
+                current.* = .heap;
+            } else {
+                current.* = if (std.mem.lastIndexOfScalar(u8, line, '/') != null) .file else .anon;
+            }
+            return;
+        }
+        if (std.mem.startsWith(u8, line, "Rss:")) {
+            const kb = parseKb(line);
+            switch (current.*) {
+                .file => file_rss.* += kb,
+                .stack => stack_rss.* += kb,
+                .heap => heap_rss.* += kb,
+                .anon => anon_rss.* += kb,
+            }
+        }
+    }
+
+    fn isHexDash(tok: []const u8) bool {
+        for (tok) |c| {
+            const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+            if (!hex and c != '-') return false;
+        }
+        return true;
+    }
+
+    fn parseKb(line: []const u8) u64 {
+        // "Rss:               1234 kB"
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        _ = it.next(); // "Rss:"
+        const num = it.next() orelse return 0;
+        return std.fmt.parseInt(u64, num, 10) catch 0;
     }
 
     pub fn deinit(self: *Evaluator) void {
