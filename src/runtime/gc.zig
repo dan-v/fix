@@ -571,6 +571,24 @@ pub fn recordCollection(objects_freed: u64, live_bytes: u64, total_after: u64) v
     if (total_after > peak_total_bytes) peak_total_bytes = total_after;
 }
 
+/// Live collector counters for the progress indicator: how many collections
+/// have run, the surviving live bytes after the last one, and the cumulative
+/// objects freed. Cheap (plain global loads); all zero in a build that never
+/// collects. See `eval/progress.zig`.
+pub const LiveReport = struct {
+    collections: u64,
+    live_bytes: u64,
+    freed_objects: u64,
+};
+
+pub fn liveReport() LiveReport {
+    return .{
+        .collections = collections,
+        .live_bytes = last_live_bytes,
+        .freed_objects = objects_freed_total,
+    };
+}
+
 pub fn recordFinalTotal(total: u64) void {
     if (comptime !enabled) return;
     final_total_bytes = total;

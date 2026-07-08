@@ -101,7 +101,10 @@ pub fn main(init: std.process.Init) !void {
         var progress = cli.EvalProgress.init(init.io, show_progress);
         var repl_ok = false;
         defer progress.deinit(repl_ok);
-        ev.setProgressSink(progress.sink());
+        // Only wire the sink when we'll actually draw: it drives a per-quantum
+        // counter sampler (a /proc RSS read + scheduler tally), so a null sink
+        // keeps that fully out of the hot path when progress is off.
+        if (show_progress) ev.setProgressSink(progress.sink());
         try repl.run_loop(allocator, init.io, options, use_color, &ev);
         repl_ok = true;
         return;
@@ -119,7 +122,9 @@ pub fn main(init: std.process.Init) !void {
 
     var progress = cli.EvalProgress.init(init.io, show_progress);
     errdefer progress.deinit(false);
-    ev.setProgressSink(progress.sink());
+    // Only wire the sink when we'll actually draw (see the REPL path above):
+    // keeps the per-quantum counter sampler out of the hot path when off.
+    if (show_progress) ev.setProgressSink(progress.sink());
 
     var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
     defer vm_trace.deinit(allocator);
@@ -152,7 +157,11 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text);
+    const eval_label = switch (source_arg) {
+        .file => |p| std.fs.path.basename(p),
+        .expr => "expression",
+    };
+    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text, eval_label);
     progress.deinit(ok);
 
     if (timeline_path) |p| timeline.dump(init.io, p, worker_count);

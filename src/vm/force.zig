@@ -290,6 +290,45 @@ pub const SeenDeepObject = struct {
     id: ObjectId,
 };
 
+/// Like `forceDeep`, but reports `[i/N]` over the TOP-LEVEL members (a list's
+/// elements / an attrset's entries) on the active render node. Used only by the
+/// strict top-level render (`Evaluator.forceDeep`) — plain `forceDeep` stays
+/// count-free so builtin deep-forces (seq/deepSeq) don't hijack the counter.
+/// The count is on the outermost fan-out only; nested forces recurse via the
+/// uncounted `forceDeepInner`.
+pub fn forceDeepCounted(self: *VM, value: Value) !void {
+    var seen: std.ArrayListUnmanaged(SeenDeepObject) = .empty;
+    defer seen.deinit(self.allocator);
+    const forced = try forceValue(self, value);
+    switch (forced.kind()) {
+        .list, .attrs => {},
+        else => return, // scalar result: nothing to fan out / count
+    }
+    const gc_roots = rootsBegin(self);
+    defer rootsEnd(self, gc_roots);
+    rootKeep(self, forced);
+    const id = forced.asObjectId();
+    if (forced.kind() == .list) {
+        if (!try enterDeep(self, .list, id, &seen)) return;
+        const items = try self.heap.getList(id);
+        forceListAccelerate(self, id, items);
+        self.progressCount(0, items.len);
+        for (items, 0..) |item, i| {
+            try forceDeepInner(self, item, &seen);
+            self.progressCount(i + 1, items.len);
+        }
+    } else {
+        if (!try enterDeep(self, .attrs, id, &seen)) return;
+        const entries = try self.heap.getAttrs(id);
+        forceAttrsAccelerate(self, id, entries);
+        self.progressCount(0, entries.len);
+        for (entries, 0..) |entry, i| {
+            try forceDeepInner(self, entry.value, &seen);
+            self.progressCount(i + 1, entries.len);
+        }
+    }
+}
+
 pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(SeenDeepObject)) anyerror!void {
     const forced = try forceValue(self, value);
     switch (forced.kind()) {
@@ -594,6 +633,25 @@ pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
     return critTargetLabel(self, th, buf, true);
 }
 
+/// "basename:line" for the demand fiber's CURRENT frame — a stable read (the
+/// fiber's own frames), used for the progress "waiting on" line. Deliberately
+/// NOT the target thunk's def-site: decoding that touches the thunk's payload
+/// union, which a concurrent resolver can clobber mid-read. Returns "" when
+/// there's no frame / no source map. The result is copied immediately by the
+/// caller (into `ProgressWait`), so borrowing `buf` is safe.
+fn demandFrameText(self: *VM, buf: []u8) []const u8 {
+    if (self.frames_len == 0) return "";
+    const frame = self.frames[self.frames_len - 1];
+    // Prefer the exact ip's span; fall back to the chunk's body span (set for
+    // every chunk) since source maps are sparse and the current ip is usually
+    // uncovered. Both read the immutable chunk — never the thunk union.
+    const span = vm_errors.sourceSpanForFrame(frame) orelse
+        vm_errors.chunkEntrySpan(frame.chunk_ptr) orelse return "";
+    const file_id = span.file orelse return "";
+    const base = std.fs.path.basename(self.intern.get(file_id));
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ base, span.line }) catch base;
+}
+
 fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
     const label = thunkLabel(self, thunk_id, buf);
     if (!label.isEmpty()) return label;
@@ -605,22 +663,40 @@ fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
     return timeline.Subject.lit(@tagName(th.targetKind()));
 }
 
+/// True while the thunk's `payload` is still its `.target` arm — i.e. NOT yet
+/// resolved/errored, which overwrite that arm with the result. Monotonic (once
+/// false, stays false). Read it AFTER a `rawArm` snapshot to validate the
+/// snapshot: if the thunk is still evaluating at the recheck, the bytes were
+/// live when read (state can't go terminal → evaluating), so the ids in them
+/// are real; otherwise discard them unused.
+inline fn stillEvaluating(th: *const thunk_mod.Thunk) bool {
+    return th.future.state.load(.acquire) <= @intFromEnum(thunk_mod.FutureState.evaluating);
+}
+
+/// Snapshot the target arm's bytes as concrete type `T` through a RAW pointer —
+/// never a `.payload.target.<arm>` union access. Both `Payload` and
+/// `ThunkTarget` are bare unions that carry a hidden safety tag in safe builds,
+/// so the field-access form panics ("access of union field 'target' while
+/// 'result' is active") the instant a concurrent resolver flips `payload` to
+/// `.result`. The arm sits at offset 0 of `payload`; casting to the arm struct
+/// reads the same bytes with no tag check. A resolved thunk yields garbage,
+/// gated by a `stillEvaluating` recheck before any id is dereferenced.
+inline fn rawArm(th: *const thunk_mod.Thunk, comptime T: type) T {
+    return @as(*const T, @ptrCast(@alignCast(&th.payload))).*;
+}
+
 fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) timeline.Subject {
     return switch (th.targetKind()) {
         .bytecode => blk: {
-            const b = &th.payload.target.bytecode;
+            const b = rawArm(th, thunk_mod.BytecodeThunk);
+            if (!stillEvaluating(th)) break :blk .{}; // resolved mid-read → b is garbage
             const loc = critChunkLoc(self, b.chunk_id);
             if (!loc.isEmpty()) break :blk loc;
             // Source-less chunk — a compiler-generated apply-glue. The
             // well-known map/genList/mapAttrs stubs are the common ones; name
             // the operation and, where the applied function (upvalue 0) is
-            // INLINE-safe to read, its location.
-            //
-            // Only the inline slot is read (upvalue_count <= INLINE_CAP) and via
-            // a raw ptrCast (not the union field): a busy thunk can resolve
-            // mid-read and clobber the union — an inline read then yields a
-            // garbage Value (handled by critClosureLabel's bounds-checked
-            // accessors), whereas the spilled slice would deref a garbage ptr.
+            // INLINE-safe to read, its location. `b` is a validated snapshot,
+            // so its inline slot is safe to read.
             if (b.chunk_id == self.registry.well_known.mapattrs_apply) break :blk timeline.Subject.lit("mapAttrs"); // 3 ups → spilled
             if (b.upvalue_count >= 1 and b.upvalue_count <= thunk_mod.BytecodeThunk.INLINE_CAP) {
                 const fn_val: Value = @as(*const Value, @ptrCast(@alignCast(&b.storage))).*;
@@ -632,25 +708,35 @@ fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool) tim
             if (b.chunk_id == self.registry.well_known.genlist_apply) break :blk timeline.Subject.lit("map/genList");
             break :blk .{};
         },
-        .closure => critClosureLabel(self, th.payload.target.closure, buf),
-        .attr_access => timeline.Subject.lit(std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(th.payload.target.attr_access.name)}) catch ""),
+        .closure => blk: {
+            const cv = rawArm(th, Value);
+            if (!stillEvaluating(th)) break :blk .{};
+            break :blk critClosureLabel(self, cv, buf);
+        },
+        .attr_access => blk: {
+            const aa = rawArm(th, thunk_mod.AttrAccess);
+            if (!stillEvaluating(th)) break :blk .{};
+            break :blk timeline.Subject.lit(std.fmt.bufPrint(buf, ".{s}", .{self.intern.get(aa.name)}) catch "");
+        },
         .pass_through => blk: {
             // A cell forwards to another value; label what it points at (one
-            // level, no further pass_through recursion). Guard the inner read:
-            // it may already be resolved (target arm dead).
+            // level, no further pass_through recursion).
             if (!follow) break :blk .{};
-            const pv = th.payload.target.pass_through;
+            const pv = rawArm(th, Value);
+            if (!stillEvaluating(th)) break :blk .{}; // resolved mid-read → pv is garbage
             if (!pv.isThunk()) break :blk .{};
             const inner = self.heap.getThunkAssumeValid(pv.asObjectId());
-            if (inner.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) break :blk .{};
+            if (!stillEvaluating(inner)) break :blk .{};
             break :blk critTargetLabel(self, inner, buf, false);
         },
         // A lazy-compiled attr body — file id + line from its AST node via the
         // table's cached per-source line index (built once; `lineForOffset` is
         // cache-free so it's safe even while the compiler shares the index).
         .deferred => blk: {
+            const d = rawArm(th, thunk_mod.DeferredThunk);
+            if (!stillEvaluating(th)) break :blk .{};
             const table = self.deferred_table orelse break :blk timeline.Subject.lit("deferred");
-            const entry = table.get(th.payload.target.deferred.deferred_id);
+            const entry = table.get(d.deferred_id);
             const fid = entry.source_file_id orelse break :blk timeline.Subject.lit("deferred");
             const off = if (entry.node.span) |s| s.offset else break :blk timeline.Subject.src(fid, 0);
             const idx = table.lineIndexFor(entry.source) catch break :blk timeline.Subject.src(fid, 0);
@@ -1169,16 +1255,28 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     // the crit track (the "main stalls on a giant file" signal).
                     // Resolve the label NOW (the busy thunk is still evaluating,
                     // so its target arm is live); after the yield it may be
-                    // resolved and the union clobbered. `lbuf` lives on the
-                    // fiber stack, preserved across the yield.
+                    // resolved and the union clobbered. `lbuf` lives on the fiber
+                    // stack, preserved across the yield.
                     const crit_start = if (worker_fiber.is_demand) timeline.critWaitBegin() else 0;
                     var lbuf: [128]u8 = undefined;
                     const crit_label: timeline.Subject = if (crit_start != 0) critWaitLabel(self, thunk_id, &lbuf) else .{};
+                    // Progress "waiting on" line: publish only on the demand path
+                    // and only when drawn (free otherwise). Labelled from THIS
+                    // fiber's own current frame span — a stable read — NOT the
+                    // target thunk's union, which a concurrent resolver can flip
+                    // `.target → .result` mid-decode (a union-field panic in a
+                    // safe build; `critWaitLabel` above tolerates it only because
+                    // `--timeline` rarely runs, whereas progress blocks here often).
+                    if (worker_fiber.is_demand) if (self.progress_wait) |pw| {
+                        var sbuf: [64]u8 = undefined;
+                        pw.set(demandFrameText(self, &sbuf));
+                    };
                     const ty = prof.start(.wait_busy_thunk);
                     fiber_mod.Fiber.yield();
                     prof.end(.wait_busy_thunk, ty);
                     worker_fiber.state = .running;
                     if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
+                    if (worker_fiber.is_demand) if (self.progress_wait) |pw| pw.clear();
                 }
                 continue;
             },

@@ -22,6 +22,7 @@ const heap_gc = @import("runtime").heap.heap_gc;
 const thunk_mod = @import("runtime").thunk;
 const vm_force = @import("../vm/force.zig");
 const vm_access = @import("../vm/access.zig");
+const timeline = @import("../probe/timeline.zig");
 
 /// Cap on the number of participants in a single collection's mark+evac.
 /// The eval still runs `worker_count`-wide; only the STW mark/evac is
@@ -86,6 +87,11 @@ pub fn collect(ev: anytype, collector_id: u8) void {
         heap_gc.armLazy(&ev.heap);
         return;
     }
+    // Timeline (`--timeline`): a `.gc` span on the collector's track so a pause
+    // is visible in the trace, correlatable with the RSS/backlog counters. A
+    // no-op single branch when tracing is off; nests inside the running quantum.
+    timeline.begin(.gc, "minor", 0);
+    defer timeline.end(.gc);
     // Copying minor collection (STW). The young-gated mark runs from roots +
     // the old→young remembered set. At --workers>1 the parked peers HELP the
     // mark (parallel young-gated drain); at --workers=1 it's serial.

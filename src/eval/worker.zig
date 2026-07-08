@@ -636,7 +636,8 @@ pub const Worker = struct {
     /// Timeline: sample heap cursors, RSS, and scheduler state as counter tracks
     /// (time-series graphs in Perfetto) so memory growth, the speculation flood,
     /// and steal activity are visible over the eval and correlatable with GC
-    /// pauses. Throttled to ~1ms; RSS is a /proc read.
+    /// pauses. Throttled to ~1ms; RSS is a /proc read. The progress indicator
+    /// surfaces the same numbers via its own sampler (`Evaluator.readMetrics`).
     fn sampleTimelineCounters(f: *WorkerFiber) void {
         if (!timeline.shouldSample(1_000_000)) return;
         const heap = f.vm.heap;

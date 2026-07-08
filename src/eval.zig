@@ -94,6 +94,15 @@ pub const Evaluator = struct {
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
+    /// Progress sampler state (active only while `progress != null`). A thread
+    /// pushes a counter snapshot to the sink every ~100ms — decoupled from
+    /// fiber quanta so `--workers=1` (which can run the whole eval in one
+    /// non-yielding quantum) still updates. `progress_wait` is the shared
+    /// demand-block subject the sampler surfaces. All three are inert (unset)
+    /// in non-interactive runs, so they add nothing to the hot path.
+    progress_wait: eval_progress.ProgressWait = .{},
+    progress_thread: ?std.Thread = null,
+    progress_stop: std.atomic.Value(bool) = .init(false),
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
     worker_count: u8,
@@ -1076,6 +1085,10 @@ pub const Evaluator = struct {
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
+        // Only worker-0 VMs (the demand path) publish their block subject, and
+        // only when progress is drawn — keeps the busy-safepoint write out of
+        // helper and non-interactive paths entirely.
+        if (worker_id == 0 and self.progress != null) vm.progress_wait = &self.progress_wait;
         return vm;
     }
 
@@ -1105,7 +1118,7 @@ pub const Evaluator = struct {
         defer self.progressEnd(.render, "strict result");
         timeline.instant(.render, "strict result");
         self.run.trace.clear();
-        return self.runWithVm(vm_force.forceDeep, .{value});
+        return self.runWithVm(vm_force.forceDeepCounted, .{value});
     }
 
     /// Run `body(vm, args...)` on this Evaluator's main worker. If we're
@@ -1314,18 +1327,20 @@ pub const Evaluator = struct {
 
     /// Progress is a single-threaded UI concern that must be driven only by
     /// the demand path. Imports/compiles triggered off a speculative or
-    /// fan-out force run on arbitrary worker fibers and reentrantly
-    /// interleave begin/end pairs into the one std `Progress` tree, which
-    /// deadlocks inside `Io.Threaded.cancel` (`Progress.Node.end`). Every
-    /// task fiber forces via `forceValueSpeculative` (so `vm.in_speculation`
-    /// is set); only the top demand fiber has it clear and is never
-    /// concurrent with itself, so it alone may emit. begin and end share
-    /// this gate (the fiber's flag is stable across a single force), so
+    /// fan-out force — OR off a background `import_prefetch` task — run on
+    /// arbitrary worker fibers and would reentrantly interleave begin/end
+    /// pairs into the one std `Progress` tree (whose `active[]` stack is not
+    /// thread-safe) → the `Progress.Node.init` "slot reuse" assert / a torn
+    /// stack. Gate on the fiber's `is_demand` flag: exactly one fiber carries
+    /// it (the top-level entry), it emits sequentially even across a steal, so
+    /// it alone may emit. NB: `!in_speculation` is NOT sufficient — a prefetch
+    /// task fiber has `in_speculation == false` yet must stay silent. begin
+    /// and end share this gate (the flag is stable across a fiber's life), so
     /// pairs stay balanced. No current fiber = early single-threaded setup.
     fn progressEligible() bool {
         const inner = fiber_mod.currentFiber() orelse return true;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-        return !wf.vm.in_speculation;
+        return wf.is_demand;
     }
 
     pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
@@ -1341,6 +1356,92 @@ pub const Evaluator = struct {
     pub fn progressInstant(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
         if (!progressEligible()) return;
         if (self.progress) |progress| progress.instant(stage, subject);
+    }
+
+    /// Build a live counter snapshot for the progress indicator. Cheap — a
+    /// handful of plain/atomic loads plus one /proc RSS read. Runs on the
+    /// sampler thread; every read here is advisory, so no locking.
+    fn readMetrics(self: *Evaluator) eval_progress.Metrics {
+        const st = self.scheduler.stats();
+        const g = gc.liveReport();
+        var m: eval_progress.Metrics = .{
+            .objects = self.heap.objects.count(),
+            .values = self.heap.values.count(),
+            .attrs = self.heap.attrs.count(),
+            .reserved_bytes = self.heap.totalReservedBytes(),
+            .rss_bytes = gc.currentRssBytes(),
+            .pending = self.scheduler.pending_tasks.v.load(.monotonic),
+            .forced = st.pops,
+            .steals = st.steals,
+            .spec_submitted = st.speculative_submitted,
+            .spec_rejected = st.speculative_rejected,
+            .gc_collections = g.collections,
+            .gc_live_bytes = g.live_bytes,
+            .gc_freed_objects = g.freed_objects,
+        };
+        m.wait_len = @intCast(self.progress_wait.read(&m.wait_buf));
+        return m;
+    }
+
+    fn progressSample(self: *Evaluator) void {
+        if (self.progress) |sink| sink.metrics(self.readMetrics());
+    }
+
+    /// Sampler thread body: push a snapshot, then sleep ~100ms (waking every
+    /// 20ms to observe the stop flag). Decoupled from fiber quanta so the
+    /// display advances even during a single long `--workers=1` quantum.
+    fn progressSampleLoop(self: *Evaluator) void {
+        while (!self.progress_stop.load(.acquire)) {
+            self.progressSample();
+            var slept: u32 = 0;
+            while (slept < 100 and !self.progress_stop.load(.acquire)) : (slept += 20) {
+                var req: std.os.linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&req, null);
+            }
+        }
+    }
+
+    /// Start the background progress sampler. No-op unless progress is drawn,
+    /// so it never spins up in benchmark / piped runs.
+    pub fn startProgressSampler(self: *Evaluator) void {
+        if (self.progress == null) return;
+        self.progress_stop.store(false, .release);
+        self.progress_thread = std.Thread.spawn(.{}, progressSampleLoop, .{self}) catch null;
+    }
+
+    /// Stop and join the sampler, then push one final snapshot so the last
+    /// numbers (final heap / GC tally) land before the bar is torn down.
+    pub fn stopProgressSampler(self: *Evaluator) void {
+        if (self.progress_thread) |t| {
+            self.progress_stop.store(true, .release);
+            t.join();
+            self.progress_thread = null;
+        }
+        self.progressSample();
+    }
+
+    /// Writer-side `[i/N]` item count. `progressCountBegin` sets the render
+    /// node's total (once, per top-level collection) and returns whether
+    /// counting is live; `progressStep` advances it per element (cheap — no
+    /// per-element eligibility recheck). Demand path only.
+    pub fn progressCountBegin(self: *Evaluator, total: usize) bool {
+        if (!progressEligible()) return false;
+        const sink = self.progress orelse return false;
+        sink.count(0, total);
+        return true;
+    }
+
+    pub fn progressStep(self: *Evaluator, completed: usize, total: usize) void {
+        if (self.progress) |sink| sink.count(completed, total);
+    }
+
+    pub fn progressSessionBegin(self: *Evaluator, label: []const u8) void {
+        if (self.progress) |sink| sink.sessionBegin(label);
+    }
+
+    pub fn progressSessionEnd(self: *Evaluator) void {
+        self.progress_wait.clear();
+        if (self.progress) |sink| sink.sessionEnd();
     }
 };
 

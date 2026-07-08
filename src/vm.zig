@@ -167,6 +167,12 @@ pub const VM = struct {
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*@import("runtime").regex.PatternCache = null,
+    /// Shared "what is the demand path blocked on" record for the progress
+    /// indicator. Non-null only on worker 0's VMs when progress is being
+    /// drawn; the demand fiber writes its blocking source loc here at a busy
+    /// safepoint and the progress sampler reads it. Null (and thus free) in
+    /// every non-interactive build path. Set post-init by `Evaluator.initVm`.
+    progress_wait: ?*eval_progress.ProgressWait = null,
     /// Tracing-JIT (`-Dtjit`) per-VM recording state, or null when not
     /// recording. Typed `?*anyopaque` (cast in `jit/record.zig`) to avoid a
     /// vm↔tjit import cycle. Untouched in non-tjit builds (hot-path accesses
@@ -389,6 +395,15 @@ pub const VM = struct {
             self.gc_force_chain = .empty;
             self.gc_temp_roots = .empty;
         }
+    }
+
+    /// Report `[completed/total]` on the current render/stage node. Demand path
+    /// only (speculative walks stay invisible), and free unless progress is
+    /// drawn (`progress == null`). Cheap: a field check + one atomic store in
+    /// the sink → node. See `vm/force.zig` `forceDeepCounted`.
+    pub fn progressCount(self: *VM, completed: usize, total: usize) void {
+        if (self.in_speculation) return;
+        if (self.progress) |sink| sink.count(completed, total);
     }
 
     pub fn deinit(self: *VM) void {

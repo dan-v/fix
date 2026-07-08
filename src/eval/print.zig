@@ -38,6 +38,10 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         ev: EvaluatorPtr,
         writer: *std.Io.Writer,
         seen: std.ArrayListUnmanaged(SeenObject),
+        /// Recursion depth, so top-level (`depth == 0`) list/attrs walks can
+        /// report `[i/N]` item progress on the render node without every nested
+        /// container fighting over the same counter.
+        depth: u32 = 0,
 
         const SeenKind = enum { list, attrs, thunk };
 
@@ -83,10 +87,15 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 return;
             }
 
+            const count_on = self.depth == 0 and self.ev.progressCountBegin(items.len);
+            self.depth += 1;
+            defer self.depth -= 1;
+
             try self.writer.writeAll("[ ");
             for (items, 0..) |item, i| {
                 if (i > 0) try self.writer.writeByte(' ');
                 try self.write(item);
+                if (count_on) self.ev.progressStep(i + 1, items.len);
             }
             try self.writer.writeAll(" ]");
         }
@@ -109,12 +118,17 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 return;
             }
 
+            const count_on = self.depth == 0 and self.ev.progressCountBegin(entries.len);
+            self.depth += 1;
+            defer self.depth -= 1;
+
             try self.writer.writeAll("{ ");
-            for (entries) |entry| {
+            for (entries, 0..) |entry, i| {
                 try self.writeAttrName(self.ev.intern.get(entry.name));
                 try self.writer.writeAll(" = ");
                 try self.write(entry.value);
                 try self.writer.writeAll("; ");
+                if (count_on) self.ev.progressStep(i + 1, entries.len);
             }
             try self.writer.writeByte('}');
         }
