@@ -37,13 +37,13 @@ derivation │
 cli        ┘
 
 fix (core) ── bytecode · compiler · vm · eval · probe
-              real dependency cycles (vm/force ↔ compiler/deferred,
-              eval/worker ↔ vm/force) → stays one module
+              real dependency cycles (eval/worker ↔ vm/force,
+              vm/force → compiler/deferred → eval) → stays one module
 ```
 
 Six modules are genuinely tree-shaped and become real Zig modules: `containers` (lock-free deques shared by the GC and scheduler), `syntax`, `runtime`, `parallel`, `derivation`, and `cli`. Each exposes a single facade file; reaching into its internals is a lint error (it also silently duplicate-compiles into a second, incompatible type). `cli` sits on top and imports the `fix` core by name; the other five never import the core.
 
-The core stays one module because it has genuine cycles that a module boundary would have to break with forward-declared interfaces buying nothing: the VM's `forceThunk` triggers on-demand compilation of deferred thunk bodies (`vm/force ↔ compiler/deferred`), and the parallel eval worker drives the VM while the VM's force path re-enters the worker to schedule and steal (`eval/worker ↔ vm/force`). So the engine lives together and is organised by directory instead. See [build](build.md).
+The core stays one module because it has genuine cycles that a module boundary could only break with forward-declared interfaces buying nothing: the VM's `forceThunk` reaches into `compiler/deferred` to compile deferred thunk bodies on demand, and that compile path in turn needs the `Evaluator` (`vm/force → compiler/deferred → eval`); the parallel eval worker drives the VM while the VM's force path re-enters the worker to schedule and steal (`eval/worker ↔ vm/force`, a direct two-file cycle). So the engine lives together and is organised by directory instead. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 
@@ -52,7 +52,7 @@ The spine of the system is the [thunk / `Future`](runtime/thunks.md). A thunk is
 ## The concurrency model
 
 - **[Fibers](parallel/fibers.md)** — stackful user-space coroutines with x86-64 stack-switching. A yielded fiber is fully-captured, movable state, so it can be stolen and resumed on any worker. This is why the engine uses fibers, not OS threads: "steal the work while it waits."
-- **[Scheduler](parallel/scheduler.md)** — per-worker Chase-Lev deques with two priorities: *urgent* (demand-driven fan-out, uncapped) and *speculative* (capped). Idle workers steal; parked workers spin then futex-sleep.
+- **[Scheduler](parallel/scheduler.md)** — per-worker work-stealing queues, classed by submission lane: an *urgent* lane (demand-driven fan-out, a lock-free Chase-Lev deque, uncapped) and capped, best-effort *speculative* lanes (a mutex-protected bounded ring). Idle workers steal; parked workers spin then futex-sleep.
 - **[Workers](parallel/workers.md)** — N symmetric workers; the main thread runs a top-level fiber and, whenever it parks, joins the others in stealing. It never idle-waits.
 - **[Speculation & fan-out](parallel/speculation.md)** — the evaluator forces likely-needed thunks ahead of demand (speculation) and forks a collection's element thunks in parallel (fan-out), gated by [strictness](compiler/strictness.md) and bounded by a bail-on-demand brake so a wrong guess can't extend wall time.
 

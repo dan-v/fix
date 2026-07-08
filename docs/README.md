@@ -2,7 +2,7 @@
 
 *A parallel evaluator for the Nix expression language, in Zig. These docs describe the system you're about to modify.*
 
-`fix` parses and evaluates Nix expressions to values and derivations, aiming for **byte-identical `.drv` output** to `nix-instantiate` while evaluating **in parallel** — idle cores force lazy thunks ahead of demand without changing any result. ~50k lines of Zig.
+`fix` parses and evaluates Nix expressions to values and derivations, aiming for **byte-identical `.drv` output** to `nix-instantiate` while evaluating **in parallel** — idle cores force lazy thunks ahead of demand without changing any result. ~56k lines of Zig.
 
 **Start with [architecture](architecture.md)** for the whole system in one pass and the recommended reading order, then [invariants](invariants.md) for the cross-cutting rules every change must respect.
 

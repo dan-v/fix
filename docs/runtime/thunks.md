@@ -92,22 +92,24 @@ The result store *happens-before* the state release-store; a reader that acquire
 2. **thunk, `resolved`** → mark demanded, return `payload.result` (the steady-state case — workers/fan-out tend to resolve hot thunks early).
 3. **anything else** → cold `forceThunkImpl`.
 
-`forceThunkImpl`: hit the [GC](../gc.md) safepoint (collections only fire at `native_depth == 0` — never mid-builtin), `tryClaim`, then on `.claimed` check the [memo](#thread-local-thunk-result-memo) and `evalThunkTarget`:
+`forceThunkImpl`: hit the [GC](../gc.md) safepoint, `tryClaim`, then on `.claimed` check the [memo](#thread-local-thunk-result-memo) and `evalThunkTarget`:
 
-- `bytecode` / `deferred` → `runBytecodeChunk`, which runs the chunk on a fresh interpreter frame (`run_isolated_frame` — the interpreter is the sole execution engine)
-- `closure` → force+call (user chunk, or `applyBuiltin`)
+- `bytecode` / `deferred` → `runBytecodeChunk`, which runs the chunk on a fresh interpreter frame (`runIsolatedFrame` — the interpreter is the sole execution engine)
+- `closure` → `evalThunkClosure`: run a user closure's chunk on a fresh frame, or `applyBuiltin` for a builtin/builtin-closure
 - `attr_access` → frameless `getAttrValue`
-- `pass_through` → recurse `forceValue` on the wrapped value
+- `pass_through` → recurse `forceValueImpl` on the wrapped value
 
-On `.busy`, enroll + yield, then retry the loop on resume. On `.blackhole` → `error.RecursiveThunk`; on `.errored` → replay the cached error.
+The safepoint sits at this force boundary, never mid-allocation. A requested collection fires at **any** native builtin depth (`native_depth` does not gate it — it is the RSS lever); soundness rests on the precise-root discipline (operand stack, call/arg rooting, the in-flight force chain, container temp-roots), not on depth. (The `--workers>1` peer stop-the-world response *is* gated to `native_depth == 0`, but that collector is dormant; reclaim runs only at `--workers=1`.)
+
+On `.busy`, spin a bounded `BUSY_SPIN_BEFORE_ENROLL` (1024) times in case the owner is about to publish, then enroll + yield, and retry the loop on resume. On `.blackhole` → `error.RecursiveThunk`; on `.errored` → replay the cached error.
 
 **In-place forcing.** Ops force operands with `forceAt(depth)` / `forceTop` — the value is forced *while it stays in its stack slot* and written back, never popped first. This keeps the operand stack a precise GC root across the (possibly collecting) force. The in-flight thunk itself is rooted by pushing its id onto `vm.gc_force_chain` for the duration of its body (it's `.evaluating` and off the stack). See [gc](../gc.md).
 
 ## Thread-local thunk-result memo
 
-nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`, `lib.mkXxx`, …) with identical arguments across thousands of modules — distinct thunk objects computing identical values, which per-object memoization can't share. ~10.8% of bytecode-thunk forces on the NixOS toplevel are such duplicates.
+nixpkgs re-evaluates the same pure `lib` helpers (`lib.types.*`, `lib.mkXxx`, …) with identical arguments across thousands of modules — distinct thunk objects computing identical values, which per-object memoization can't share. ~10.8% of bytecode-thunk computations on the NixOS toplevel are such duplicates.
 
-The memo is a bounded **per-worker, zero-contention** table (16K slots) keyed by `(heap_token, chunk_id, ≤2 upvalue bits) → Value`:
+The memo is a bounded **per-worker, zero-contention** table (`MEMO_SIZE = 1 << 14` = 16384 slots) keyed by `(heap_token, chunk_id, upvalue count, ≤2 upvalue Value-bits) → Value`:
 
 - Only `bytecode` thunks with ≤2 upvalues (the inline-storage majority) — the key compares exactly with no allocation.
 - **Sound because bytecode thunks are pure** — same chunk + same upvalues ⇒ same value.
@@ -118,7 +120,7 @@ Checked on the freshly-claimed path before running the body; a hit resolves the 
 
 ## Special thunks
 
-- **Lazy shell** (`initLazyShell`): born **`.resolved`** with `demanded = 0` and `result` already live. Forces in O(1) (resolved fast path). Used when the compiler has an eager-buildable shape (list/attrset/lambda) sitting in an observably-lazy position — it wraps the already-built shell instead of registering a chunk and dispatching bytecode. Lazy renderers (XML lazy mode) see *resolved but undemanded* and print `<unevaluated/>` until a real consumer marks it demanded — this is how speculation stays invisible.
+- **Lazy shell** (`initLazyShell`): born **`.resolved`** with `demanded = 0` and `result` already live. Forces in O(1) (resolved fast path). Used when the compiler has an eager-buildable shape (list/attrset/lambda) sitting in an observably-lazy position — it wraps the already-built shell instead of registering a chunk and dispatching bytecode. Lazy renderers (XML lazy mode) see *resolved but undemanded* and print `<unevaluated />` until a real consumer marks it demanded — this is how speculation stays invisible.
 - **Binding cell** (`initBindingCell`): created for recursive `let` bindings *before* the RHS is computed, born **`.evaluating` claimed** by the creating fiber. A concurrent force therefore sees `.busy` and parks, rather than CAS-claiming a placeholder. The creator later calls `publishCellBinding(val)`, which writes `target = pass_through(val)` and transitions back to **`.unresolved`** (keeping laziness — the cell forces `val` only when actually forced). Without the born-claimed guard, a racing fiber could claim the cell while it still wrapped the placeholder null and freeze the binding to null before the creator published — a real race that this fixes.
 
 ## Invariants & gotchas

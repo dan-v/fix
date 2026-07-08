@@ -4,13 +4,13 @@
 
 ## Mental model
 
-An identifier reference resolves against a **chain of Compilers** (one per enclosing body, linked by `parent`). Resolution tries, in order (`literals.compileIdent`):
+An identifier reference resolves against a **chain of Compilers** (one per enclosing body, linked by `parent`), driven by `literals.compileIdent`. The bare word `__curPos` is intercepted first: it lowers to a `{ file; line; column; }` attrset (`compileCurPos`), or `push_null` when the compiler has no source path. Otherwise resolution tries, in order:
 
-1. **Local** — a binding declared in *this* chunk (`let` name, lambda param, `rec`-attr cell). Emits `get_local`, read directly by frame-base slot.
-2. **Upvalue** — a binding in an *enclosing* chunk. Captured through every intervening body as a chunk-relative upvalue index; emits `get_upvalue` (forces on read — the reference is a value being consumed).
-3. **`builtins` / ambient builtin** — the bare name `builtins`, or a name the evaluator injects ambiently, lowers to `push_builtins` / the matching builtin.
+1. **Local** — a binding declared in *this* chunk (`let` name, lambda param, `rec`-attr cell). Emits `get_local` (`get_local_long` when the slot exceeds 255), which reads the value at `frame_base + slot` **and forces it**.
+2. **Upvalue** — a binding in an *enclosing* chunk. Captured through every intervening body as a chunk-relative upvalue index; emits `get_upvalue`, which reads the closure upvalue **and forces it**. Both reads force because a bare identifier is a value being consumed now — the non-forcing `capture_*` reads (below) exist only for building environments.
+3. **`builtins` / ambient builtin** — the bare name `builtins` emits `push_builtins`; an ambient builtin name (`emitAmbientBuiltin`) emits either a builtin-value constant (`builtins.ambientIdForName`) or `push_builtins` + `get_attr` (`builtins.hasConstant`).
 4. **`with` scope** — no static binding found; falls back to a runtime `lookup_with` over the dynamic-scope chain.
-5. **Unbound** → compile error (`UndefinedVariable`).
+5. **Unbound** → compile error (`error.UndefinedVariable`).
 
 Locals and captures live on the arena and vanish at unit end; only the **capture descriptors** baked into thunk/closure ops persist.
 
@@ -25,7 +25,7 @@ A `Local` is `{ name, name_id, depth, slot }`:
 
 **Resolution** (`resolveLocal` / `resolveLocalId`) scans locals **top-down** (innermost declaration wins → shadowing is free). Id-based resolution compares interned `name_id`s up the chain rather than re-comparing source bytes at every level — the hot path for non-local references.
 
-**Pattern skip slot.** Attrset-pattern parameters (`{ a, b } @ args: …`) reserve a slot that must not shadow the fields it binds during their own compilation. `skip_local_slot` names that slot; `resolveLocal*` skips it, so a field default referencing a sibling resolves to the sibling, not the pattern binder.
+**Inherit skip slot.** A plain `inherit name;` in a `let` or `rec` attrset binds `name` to the value of `name` from the *enclosing* scope, but `name` is simultaneously being declared as a local cell in this chunk. While compiling that binding's RHS (the reference to the outer `name`), `skip_local_slot` holds the slot being written; `resolveLocal` / `resolveLocalId` skip it, so the reference resolves to the enclosing binding (parent local / upvalue / `with`) rather than to the self-referential cell it is being stored into. Set only for `inherit_outer` bindings — `inherit name;` with no source — because `inherit (e) name;` compiles as `e.name` and needs no skip (`let.zig`, `attrs.zig`).
 
 ## Upvalue capture chain
 
@@ -36,7 +36,7 @@ When a name isn't local, `resolveCapture[Id]` walks the parent chain:
 
 `addCapture[Id]` **dedups** by `(kind, index, name_id)`: a name referenced twice reuses one upvalue index. The returned index is **chunk-relative** (`0..K-1` for a K-capture body).
 
-At a capturing site the compiler emits a **descriptor** per upvalue: `(kind:1 bit, index)`. The runtime reads descriptors to build the closure/thunk environment — slot `index` from the parent frame (`.local`) or upvalue `index` from the parent's environment (`.upvalue`). Descriptor arrays are emitted at:
+At a capturing site the compiler emits a **descriptor** per upvalue: a 3-byte `(1-byte kind {0=local, 1=upvalue}, 2-byte index)`. The runtime reads descriptors to build the closure/thunk environment — slot `index` from the parent frame (`.local`) or upvalue `index` from the parent's environment (`.upvalue`). Descriptor arrays are emitted at:
 
 - **`thunk_captures`** — a lazy thunk's captured environment.
 - **`closure_captures`** — a lambda closure's captured environment.

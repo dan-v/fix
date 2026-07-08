@@ -20,7 +20,7 @@ Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by na
 | `validate_attrs` (`_long`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
 | `lookup_with` (`_long`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
 
-All path walks keep each intermediate node rooted across the next level's force (path nodes are reached via `getAttrValue`, not held on the operand stack), which matters under [-Dgc](../gc.md).
+Each path walk keeps the root attrs value (and the default) on the operand stack for the whole helper (`getAttrPathOrValue` and siblings); intermediate path nodes are not separately rooted — they are transitively reachable from that on-stack root (attr thunks memoise in place), which is what keeps the walk correct under [-Dgc](../gc.md). The walk itself goes through `cachedAttrLookup`, not the forcing `getAttrValue` wrapper: it forces each intermediate node explicitly between segments.
 
 ### Attr inline cache
 
@@ -32,26 +32,26 @@ A cache **miss** is also the trigger point for the **demand-sibling prefetch** (
 
 The compiler collapses pervasive read chains into single opcodes, saving a dispatch and the intermediate push/pop (fusion is chosen at emit time; see [compiler/pipeline.md](../compiler/pipeline.md)):
 
-- **`get_upvalue_attr`** (upvalue idx + name): force upvalue, select attr, push. The `lib.foo` / `config.bar` chain — `get_upvalue` alone is a large fraction of all ops, much of it feeding a `get_attr`.
+- **`get_upvalue_attr`** (upvalue idx + name): force upvalue, select attr, push. Profiling puts `get_upvalue` at 10% of all executed ops and `get_attr` at 3%, much of the latter being the same upvalue→attr chain (`lib.foo`, `config.bar`).
 - **`get_local_attr`** / **`get_local_attr_long`**: same for a local slot (narrow / wide).
 - **Value-returning `_ret` fusions** — `constant_ret`, `get_local_ret` (`_long`), `get_upvalue_ret`: load-and-return in one op, collapsing the two dispatches that dominate per-thunk overhead. These also drive the trivial-body thunk short-circuit (see [runtime/thunks.md](../runtime/thunks.md)).
 
-**Well-known stub chunks** are the same idea at the builtin level: `genlist_apply` (`[func, index]` → `func index`) and `mapattrs_apply` (`[func, name, value]` → `(func name) value`) are shared 1-/2-arg-application bodies reused by `genList`/`map`/`mapAttrs` instead of allocating a per-element closure object. They pass their captured arg **unforced** so the user function decides laziness — forcing eagerly here would blackhole when the lambda captures the surrounding recursive attrset (the typical module pattern).
+**Well-known stub chunks** are the same idea at the builtin level: `genlist_apply` (`[func, index]` → `func index`) and `mapattrs_apply` (`[func, name, value]` → `(func name) value`) are shared 1-/2-arg-application bodies reused by `genList`/`map`/`mapAttrs` instead of allocating a per-element closure object. They call the user function on their captured element value **unforced** so the function decides laziness — forcing eagerly here would blackhole when the lambda captures the surrounding recursive attrset (the typical module pattern). `mapAttrs` uses `mapattrs_apply` only when its function argument is already callable; when the function is itself still a thunk it falls back to a per-key `mapAttrValue` builtin thunk (see [builtins.md](builtins.md)).
 
 ## The `//` update operator
 
-Both ops take `[left, right] → [merged]` and keep both operands on the operand stack across the merge (it forces and allocates — a GC safepoint), dropping them only after. They use **different strategies** for two different sources of `//`:
+Both ops take `[left, right] → [merged]`. The operands arrive in WHNF (whatever produced them forced them; the helpers only `isAttrs`-check, they do not re-force) and stay on the operand stack across the call because the merge **allocates** a heap object — a GC safepoint — with both operands dropped only after. They use **different strategies** for two different sources of `//`:
 
 - **`merge_attrs`** — runtime `//` (`a // b` where either side is dynamic). It does *not* eagerly merge: it builds a **lazy layered node** (`heap.mergeAttrsLayered`), a `base // overlay` structure whose lookups consult the overlay first, so **RHS wins**. Deferring the merge is what keeps the NixOS fixpoint's thousands of stacked `//`s cheap; the layered-node representation, its k-way flatten, and the depth cap that stops the stack from degenerating are a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
-- **`merge_attrs_strict`** — merging the sorted sub-groups of a *single* attrset literal (e.g. `{ a.b = 1; a.c = 2; }`). It performs an eager **reserve-then-flush sorted merge** (`mergeAttrLiteralObjects`): reserve the worst-case union directly in heap attr storage, then walk both sorted, deduped entry arrays in lockstep (O(n+m)), writing entries in place. Because both inputs are sorted+unique, the output is too, by construction. A name present on only one side copies through; on a **name collision** the two values are **recursively merged** iff both are attrsets — otherwise it raises `DuplicateAttribute` (a duplicate leaf in one literal is a static error, unlike runtime `//`'s override).
+- **`merge_attrs_strict`** — merging the sorted sub-groups of a *single* attrset literal (e.g. `{ a.b = 1; a.c = 2; }`). It performs an eager **reserve-then-flush sorted merge** (`mergeAttrLiteralObjects`): reserve the worst-case union directly in heap attr storage, then walk both sorted, deduped entry arrays in lockstep (O(n+m)), writing entries in place. Because both inputs are sorted+unique, the output is too, by construction. A name present on only one side copies through; on a **name collision** the two values are **recursively merged** iff both are attrsets (`mergeAttrLiteralValue`) — otherwise it raises `DuplicateAttribute`. A leaf collision inside a single literal is rejected, unlike runtime `//`'s silent override.
 
 ## List concatenation
 
-`concat_lists` (`[left, right] → [result]`, from `++`) forces both operands (kept on the stack as roots) and produces the concatenated list. Elements are carried across unforced — `++` does not force list contents.
+`concat_lists` (`[left, right] → [result]`, from `++`) type-checks both operands as lists (they arrive forced) and allocates the concatenation (`heap.addConcatenatedLists`), keeping both on the stack as roots across the allocation. Elements are carried across unforced — `++` does not force list contents.
 
 ## Deep equality
 
-`==`/`!=` (`eq`, `neq`, plus the monomorphic `eq_null`/`neq_null` specializations the compiler emits when one side is literal `null`) run a recursive, **cycle-tracking** structural comparison (`valuesEqual`):
+`==`/`!=` compile to `eq`/`neq`, which run a recursive, **cycle-tracking** structural comparison (`valuesEqual`). When exactly one side is a literal `null` the compiler instead emits the monomorphic `eq_null`/`neq_null`, which force the single operand and test `kind() == .null` directly — bypassing `valuesEqual` entirely. The structural comparison:
 
 - **Numeric coercion**: two ints compare as ints; any int/float mix compares as floats (`int ↔ float`).
 - **String-like coercion**: `string`, `path`, and `string_context` are mutually comparable **by their text** (interned id), ignoring context.
@@ -70,7 +70,7 @@ Operand **coercion to a string** (`coerceLanguageStringValue`): `string`/`string
 
 ## Invariants
 
-- **Operands stay on the operand stack across the operation** (merge / concat / attr select force + allocate — GC safepoints); dropped or overwritten in place only after. Never `forceValue(pop())`.
+- **Operands stay on the operand stack across the operation**: attr select and equality **force** (deeply), merge and concat **allocate** — both are GC safepoints. Dropped or overwritten in place only after. Never `forceValue(pop())`.
 - **Attrs are sorted by interned name**; lookup is binary search over integer ids.
 - **Existence tests don't force** the final value; selection does.
 - **Attr IC is per-thread and `heap_token`-guarded**; entries are GC roots while the token matches.

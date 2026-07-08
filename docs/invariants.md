@@ -14,7 +14,7 @@ These span subsystems, so they're collected here. Violating one usually shows up
 
 - **Canonical-NaN scrub.** Every `f64` entering a `Value` goes through `float()`, which scrubs any NaN to one canonical positive NaN. Never hand-construct a NaN into a `Value`, and never assume an arbitrary NaN bit pattern is a float — a stray sign=1 NaN aliases the tagged-value prefix. → [runtime/values](runtime/values.md)
 - **Boxed integers.** i64 outside i48 range lives in a heap `boxed_int`. Use `isAnyInt`/`int.get`, never branch on `isInt` alone where a big integer is possible. → [runtime/values](runtime/values.md)
-- **IDs never move or invalidate.** `ObjectId` and `InternId` index append-only/flat stores; a value copied by bits stays valid for the store's lifetime. The [GC](gc.md) is non-moving *because* suspended fibers hold ObjectIds that can't be rewritten. → [runtime/heap](runtime/heap.md)
+- **IDs never move; a *reachable* object's ID stays valid.** `ObjectId` and `InternId` index segmented stores whose backing pages are never relocated, so a value copied by bits keeps addressing the same slot — the [GC](gc.md) is non-moving *because* suspended fibers hold `ObjectId`s that can't be rewritten. `InternId`s are append-only and never reclaimed. But under `-Dgc` a swept object's slot is reclaimed onto a free list and reused for a later allocation, so a stale (unrooted) `ObjectId` can silently alias a *different* object — which is exactly why rooting (below) is load-bearing. → [runtime/heap](runtime/heap.md)
 - **Attrsets are sorted by `InternId`.** Construction sorts and rejects duplicates; lookup binary-searches. Don't build an attrset object out of order. → [runtime/heap](runtime/heap.md)
 
 ## Thunks & the `Future` protocol

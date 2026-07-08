@@ -1,6 +1,6 @@
 # Builtins
 
-*How the ~110 primops are structured, dispatched, and made GC- and parallel-safe.*
+*How the primops — 106 named builtins plus 5 compiler-internal ids (111 `BuiltinId` variants) — are structured, dispatched, and made GC- and parallel-safe.*
 
 ## Mental model
 
@@ -14,7 +14,7 @@ A builtin is a native Zig function reachable from Nix as a `BuiltinId`-tagged va
    - `args.len < arity` → return a **builtin closure** capturing the partial args (undersupply; see [partial application](calls.md)).
    - `args.len > arity` → `error.TooManyArguments` (oversupply is a hard error — Nix rejects it).
    - exact → dispatch.
-2. **`switch (id)`** — one arm per `BuiltinId`, each forwarding to a group module's implementation. The switch is exhaustive; unknown ids are a compile error.
+2. **`switch (id)`** — one arm per `BuiltinId`, almost all forwarding to a group-module implementation (`.constantValue` returns `args[0]` inline; `.break_` just forces `args[0]`). The switch has no `else` arm, so it is exhaustive over `BuiltinId` — adding a variant without an arm is a compile error.
 
 The one-hop wrapper `access.applyBuiltin` fronts this: it raises the per-thread native depth for the builtin's duration (the GC gate, below) before calling the switch.
 
@@ -29,7 +29,7 @@ Two constructors in `shared.zig`, both keyed off a `BuiltinId` + captured args:
 | `makeBuiltinClosure` | a **builtin-closure** object (callable) | partial application; a builtin awaiting more args |
 | `makeBuiltinThunk` | a **thunk** wrapping that closure | deferring a builtin's *result* (lazy attrs, per-element maps) |
 
-`makeBuiltinThunk` is how lazy machinery re-enters builtins later: `mapAttrs`/`zipAttrsWith` build per-key thunks (`mapAttrValue`, `zipAttrsValue`), and `derivation` seeds a `derivationLazyAttr` thunk per output/`drvPath`/`outPath`. Forcing such a thunk runs the internal builtin id on its captured args — invisible to Nix as a distinct primop.
+`makeBuiltinThunk` is how lazy machinery re-enters builtins later: `zipAttrsWith` builds a per-group `zipAttrsValue` thunk; `mapAttrs` builds a per-key `mapAttrValue` thunk only on its thunk-function fallback path (when the mapped function is already callable it instead uses the `mapattrs_apply` bytecode-stub chunk — one object per key rather than two; see [access.md](access.md)); and `derivation` seeds a `derivationLazyAttr` thunk for `drvPath`, `outPath`, each declared output, and `all`. Forcing such a thunk runs the internal builtin id on its captured args — invisible to Nix as a distinct primop.
 
 ## GC safety
 
@@ -38,7 +38,7 @@ Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, s
 - **Native-depth gate**: `access.applyBuiltin` raises the per-thread native depth for the whole call; collections only fire at depth 0, so no builtin's Zig-local heap refs are observable mid-call. (`import`/`scopedImport` drop back to the caller's depth for the nested eval so it can still collect.) This is why the switch arms need no rooting of their own.
 - **Caller-side arg rooting**: the calling convention already roots the arguments before entry — `doCall`/`doTailCall`/`callValue` `rootKeep` their arg, `doCallN` leaves the args on the operand stack, and an in-flight `builtin_closure` force keeps them on the force chain. So a builtin's arguments survive any force it performs, and the arm only has to manage the intermediates *it* freshly produces.
 
-Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON`, `derivationStrict`, `zipAttrsWith`, the `fetch*` family) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates. All of this compiles away without `-Dgc`.
+Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON` in `serial`, `derivationStrict` in `derivation`, the `fetch*` family, string ops in `strings`/`string_context`) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates. All of this compiles away without `-Dgc`.
 
 ## File-group split (`src/vm/builtins/`)
 
@@ -61,7 +61,7 @@ Builtins that merge [string context](../derivation/context.md) or build large in
 
 ## Concurrency stance
 
-Builtins are **logically sequential**. The evaluator is bytecode-threaded, not data-parallel: a builtin runs to completion on one fiber, and nothing inside a builtin fans work out to other threads. Parallelism lives one level up, at [thunk-force granularity](../parallel/speculation.md) — [helper workers](../parallel/workers.md) force *independent* thunks while main drives the serial critical path. A builtin that produces per-element thunks (`mapAttrs`, `genList`) is thus a parallelism *source*: it hands the scheduler independent work without itself becoming concurrent.
+Builtins are **logically sequential**: a builtin's own logic runs to completion on one fiber and never blocks on, nor forks its computation across, other threads. It may, however, *submit* independent per-element thunks to the [scheduler](../parallel/scheduler.md) — `map`, `genList`, and `mapAttrs` speculatively enqueue `force_thunk` tasks for their elements when the per-element function is substantial enough to speculate on (`isSpeculatableUserFunc`) — so [helper workers](../parallel/workers.md) force those thunks ahead of demand while main drives the serial critical path. Such a builtin is thus a parallelism *source*: it hands the scheduler independent work without itself becoming concurrent.
 
 Some builtins do internal I/O within their one frame — `readFile`/`readDir`, the `fetch*` family, `import`. Import results are cached and deduplicated so concurrent importers of the same path converge (see [imports.md](../parallel/imports.md)); other I/O runs inline in the calling fiber.
 
@@ -69,7 +69,8 @@ Some builtins do internal I/O within their one frame — `readFile`/`readDir`, t
 
 - **`derivationLazyAttr`** — computes `drvPath`/`outPath` via input-modulo sha256 [hashing](../derivation/hashing.md); memoized through the derivations store, so repeated attr access is a lookup. A w=32 serial-critical-path lever.
 - **`mapAttrs`/`mapAttrValue`** — recurse the module/option trees; inherent work, no speculative waste (results are consumed).
-- **`length`/`any`/`all`** — short-circuit; `any`/`all` stop at the first decisive element.
+- **`length`** — O(1): returns the list's stored length without touching elements.
+- **`any`/`all`** — short-circuit: they force predicates left-to-right and stop at the first decisive element (`any` at the first `true`, `all` at the first `false`).
 - **`toString`** — coercion + string-context propagation on a very hot path.
 
 ## Invariants
@@ -77,7 +78,7 @@ Some builtins do internal I/O within their one frame — `readFile`/`readDir`, t
 - Dispatch is exhaustive over `BuiltinId`; a builtin is reachable *only* by id, never by name lookup at call time.
 - Undersupply ⇒ closure; oversupply ⇒ error. Never silently drop or ignore extra args.
 - Every argument is GC-rooted for the whole call; a builtin may force args and allocate freely without losing them to a sweep.
-- A builtin never forks work to another thread; concurrency is expressed by *returning thunks*, not by internal parallelism.
+- A builtin's own logic never runs across threads; parallelism is expressed by producing independent per-element thunks (and optionally submitting them to the scheduler for speculative forcing), not by the builtin computing concurrently.
 - Result parity is byte-identical `.drv`; the interpreter path is canonical.
 
 Code: `src/vm/builtins/`

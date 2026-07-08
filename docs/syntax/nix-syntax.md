@@ -13,7 +13,7 @@ String literal extent-finding lives in `string_syntax`; the [scanner](parsing.md
 
 `text` parts carry an `owned` flag. When the source bytes are already the final text (no escapes to resolve) the part points directly into `source` with `owned = false`. When escapes had to be decoded, the resolved bytes are heap-allocated and `owned = true`. A `ParsedLiteral` is a rope of literal chunks and holes; the compiler compiles the holes as sub-expressions and concatenates.
 
-**Double-quoted** `"..."` (`scanDoubleQuoted` / `parseDoubleQuoted`): escapes `\n \r \t \" \\`; any other `\x` passes the following byte through literally. `${` opens an interpolation; the extent scanner tracks nested `{`/`}` depth (and skips over nested strings and comments inside the hole) so `${ f { x = 1; } }` is one hole. Interpolation triggers only on an **odd** run of `$` immediately before `{`: a `$` not followed by `{`, or an even `$$…` run, is plain text — so a `\$` escaped dollar is a literal `$`.
+**Double-quoted** `"..."` (`scanDoubleQuoted` / `parseDoubleQuoted`): escapes `\n \r \t \" \\`; any other `\x` passes the following byte through literally. `${` opens an interpolation; the extent scanner (`findInterpolationEnd`) tracks nested `{`/`}` depth (and skips over nested strings and comments inside the hole) so `${ f { x = 1; } }` is one hole. Interpolation triggers only on an **odd**-length run of `$` immediately before `{`: a `$` not followed by `{`, or an even-length `$$…` run before `{`, is plain text. A backslash escape `\$` is a literal `$` (the `\` consumes the following `$`, which the interpolation scan then never examines).
 
 **Indented** `''...''` strings (`scanIndented` / `parseIndented`): same interpolation machinery, plus two extra transforms.
 - **Dedentation**: the minimum leading indentation across all non-blank lines is computed (`minIndent`) and stripped from every line, so the literal's text is relative to its least-indented line — the standard Nix indented-string behavior. A leading newline right after the opening `''` is dropped.
@@ -23,7 +23,7 @@ String literal extent-finding lives in `string_syntax`; the [scanner](parsing.md
 
 Three path forms, all emitted as single tokens:
 
-- **Literal path** — `./foo`, `/abs/path`, `../x`. The scanner extends the token with `isPathContinue` over the allowed path characters (identifier bytes, digits, `/ . - _ +`); a path must contain a `/`.
+- **Literal path** — `./foo`, `/abs/path`, `../x`. The scanner extends the token with `isPathContinue` over the allowed path bytes — ASCII letters, digits, and `/ . - _ +`; every path literal contains a `/` (the scanner only starts one at `./`, `../`, or a leading `/`).
 - **Interpolated path** — `./${v}/f`. Despite the embedded `${...}`, this is *one* `path` token: `findInterpolationEnd` skips over the interpolation while continuing the path scan, so the whole thing is a single literal with holes (like a string).
 - **Search path** — `<nixpkgs>`, `<nixpkgs/lib>`. Emitted as a distinct `search_path` token/atom; resolution against the search path happens later. `<` with no closing `>` is not a search path — the scanner backtracks to the bare `less` operator (see [parsing](parsing.md)).
 

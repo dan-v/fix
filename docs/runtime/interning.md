@@ -2,12 +2,12 @@
 
 *String and symbol interning: the sharded global table behind every `InternId`.*
 
-Strings and attr names are interned to dense `u32` `InternId`s so that comparison is an integer compare and [`Value`](values.md) can carry a `string`/`path` as a 48-bit payload. The `InternTable` is a process-global, thread-safe store: interning is sharded for concurrency, and `get(id)` is lock-free once an id exists.
+Strings and attr names are interned to dense `u32` `InternId`s so that comparison is an integer compare and [`Value`](values.md) can carry a `string`/`path` as a 48-bit payload. An `InternTable` is owned by the `Evaluator` (one per evaluation) and is thread-safe: interning is sharded for concurrency, and `get(id)` is lock-free once an id exists.
 
 ## Mental model
 
 - **Intern once, compare by id.** Equal bytes ⇒ equal `InternId` (`eql` is `a == b`); attr-name lookup and symbol comparison never touch bytes on the hot path.
-- **Ids are dense and permanent.** Assigned sequentially from a shared counter; never reused or relocated (the backing stores are [`StableSegments`](heap.md)). A slice returned by `get(id)` is valid for the table's lifetime.
+- **Ids are dense and permanent.** An id is the slot index `entries.append` returns, so ids are handed out sequentially and are never reused or relocated within a table's lifetime (the backing stores are [`StableSegments`](heap.md)). A slice returned by `get(id)` stays valid for the table's lifetime.
 - **Empty string is `id 0`** — a reserved "no string" sentinel that `get` resolves without touching the segments.
 
 ## Storage
@@ -23,11 +23,11 @@ Two `StableSegments` hold the data globally (so ids stay dense and `get` needn't
 `intern(s)` is thread-safe and concurrency-friendly:
 
 1. `h = Wyhash(s)`.
-2. Shard = `h & (SHARD_COUNT-1)`; there are **64 shards**, each a `HashMap(InternId → void)` guarded by its own `SpinMutex`. Interns of strings hashing to different shards proceed fully in parallel.
+2. Shard = `h & (SHARD_COUNT-1)`; there are **64 shards** (`SHARD_COUNT = 64`), each a `std.HashMapUnmanaged(InternId, void)` open-addressing set guarded by its own `SpinMutex`. Interns of strings hashing to different shards proceed fully in parallel.
 3. Under the shard lock, `getOrPutContextAdapted` looks up by the caller's `[]const u8` (a `StringAdapter` compares input bytes against `table.get(id)`) while storing `InternId` keys. The precomputed `h` is threaded in so the map doesn't re-Wyhash the same bytes.
 4. Miss → append bytes to `data` (with `rollback` on mid-allocation failure), append the `Entry`, publish the new id.
 
-**Hash collisions coexist.** The map keys on `InternId` and compares bytes on lookup, so two distinct strings sharing a Wyhash output live as separate entries in the same shard — no tombstones, no probing pathology.
+**Hash collisions coexist.** The map keys on `InternId` and compares bytes on lookup, so two distinct strings sharing a Wyhash output live as separate entries in the same shard. Interning is insert-only (nothing ever calls `remove`), so the open-addressing set never accumulates tombstones, and it rehashes on crossing `std.hash_map.default_max_load_percentage`; those two together keep probe sequences short — there is no tombstone-driven probe-length blowup.
 
 ## Per-thread cache
 

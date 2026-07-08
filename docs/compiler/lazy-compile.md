@@ -25,7 +25,7 @@ Some Nix files are enormous machine-generated attrsets (e.g. `hackage-packages.n
 | --- | --- | --- |
 | file / import scope | `source_path != null` | need retained source + AST arena to recompile later |
 | ≥ 64 entries | `MIN_ENTRIES = 64` | coarse pre-filter; skip the snapshot machinery for small sets |
-| body ≥ ~100 bytes | `MIN_BODY_BYTES = 100` | **the real lever** — defer only when the compile cost beats the deferral bookkeeping |
+| body span ≥ 100 bytes | `MIN_BODY_BYTES = 100` | **the real lever** — defer only when the compile cost beats the deferral bookkeeping |
 | ≤ 32 snapshot entries | `MAX_SCOPE = 32` | snapshot must stay small (lexical bindings + active `with` subjects; perl-packages.nix needs ~16) |
 | deferrable leaves | — | value bodies must be recompilable in isolation |
 
@@ -52,7 +52,7 @@ force time:     synthetic parent(locals = snapshot) → compile child (captures 
 ### Correctness
 
 - **Byte-identical to eager.** The synthetic-parent trick guarantees the produced bytecode is equivalent to what an eager compile emitted — the only difference is *when* it is compiled, and internal upvalue numbering (never observable in output).
-- **Concurrency-safe.** Each forcer builds its own chunk on a per-body scratch arena; `register` is internally serialized; the CAS on the cached `compiled` word (`ChunkId + 1`, `0` = uncompiled) ensures a single winner (the loser's chunk is orphaned but correct). Runs on any worker.
+- **Concurrency-safe.** Each forcer builds its own chunk on a per-body scratch arena; `ChunkRegistry.register` bumps a lock-free atomic cursor (`StableSegments.appendAtomic`), so racers get distinct `ChunkId`s; the CAS on the entry's cached `compiled` word (`ChunkId + 1`, `0` = uncompiled) then ensures a single winner (the loser's chunk is orphaned but correct). Runs on any worker.
 - **Elision-aware.** A deferred leaf's body may itself be an `.elided` span that the parser never parsed; `deferred.compile` sub-parses it at first force (into a throwaway arena, never mutating the shared AST), so a syntax error inside an elided body surfaces at force time rather than parse time.
 - **One funnel.** Deferred and eager compilation share `finishCompiledChild`, so strictness stamping / trivial classification / registration are identical.
 
@@ -62,11 +62,11 @@ force time:     synthetic parent(locals = snapshot) → compile child (captures 
 
 ### Problem
 
-A large fraction of thunks wrap a body that does essentially nothing — return an upvalue, a constant, `null`, or a single attr access. Allocating a heap thunk, submitting it, forcing it, and pushing/popping a frame is pure overhead when the body reduces to one value. (~15% of executed ops on `nixos_toplevel` are such bodies.)
+Many thunks wrap a body that does essentially nothing — return an upvalue, a constant, `null`, or a single attr access. Allocating a heap thunk, submitting it, forcing it, and pushing/popping a frame is pure overhead when the body reduces to one value (the short-circuit cuts a heap alloc, a future force, a frame push/pop, and two dispatches per occurrence).
 
 ### Classification (`classifyTrivialBody`, at chunk finish)
 
-The finished body is matched **once** against ~8 shapes (safe because thunk bodies have [`local_count == 0`](scopes.md), which pins the possible instruction shapes). The result is stored as `SchedulingHints.trivial : TrivialBody`:
+The finished body is classified **once** into one of the `TrivialBody` variants below, else `none` (safe because thunk bodies have [`local_count == 0`](scopes.md), which pins the possible instruction shapes). The result is stored as `SchedulingHints.trivial : TrivialBody` (`constant_ret` and the `push_null|push_true|push_false` bodies both classify as `literal`):
 
 | Shape | Body bytecode | Yields |
 | --- | --- | --- |
@@ -85,7 +85,7 @@ When such a body would be wrapped at a `thunk_captures` site, the compiler inste
 
 ### Keeping the speculation threshold calibrated
 
-`_ret` fusion (see [pipeline.md](pipeline.md)) shrinks a body's byte length, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. **`ChunkBuilder.fusion_savings`** records the bytes elided by every `_ret` rewrite and is added back to `code.len` when computing `body_is_substantial` — so `SPECULATION_MIN_CODE_BYTES` still measures the *pre-fusion* body size, and fusion never silently changes which bodies are deemed substantial enough to speculate.
+Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's encoding, which would make it look *smaller* than it is to the [speculation](../parallel/speculation.md) size gate. The `get_*_attr` and `thunk_captures_*_store_local` rewrites each add their saved byte to **`ChunkBuilder.fusion_savings`** (string-interpolation lowering adjusts it too); `fusion_savings` is added back to `code.len` when computing `body_is_substantial`, so `SPECULATION_MIN_CODE_BYTES` measures the *pre-fusion* body size and fusion never silently changes which bodies are deemed substantial enough to speculate. The `<op>_ret` rewrite that produces the trivial shapes above is not recorded — those bodies are a handful of bytes and never approach the 256-byte threshold anyway.
 
 ---
 
@@ -94,7 +94,7 @@ When such a body would be wrapped at a `thunk_captures` site, the compiler inste
 - **Deferral changes only *when*.** Deferred bytecode ≡ eager bytecode (modulo internal upvalue numbering); output is byte-identical.
 - **Classify runs once, over the frozen body**, guarded by `local_count == 0` — the shape set is exhaustive for thunk bodies.
 - **Short-circuit ≡ force.** Pushing the trivial value directly yields exactly what forcing the thunk would have.
-- **Fusion is size-neutral to the scheduler.** `fusion_savings` restores the pre-`_ret` byte count for the `body_is_substantial` decision.
+- **Fusion is size-neutral to the scheduler.** `fusion_savings` (fed by the `get_*_attr` and store-fusion rewrites) restores the pre-fusion byte count for the `body_is_substantial` decision.
 
 Out of scope: thunk states / how `thunk_captures` and force behave → [runtime/thunks.md](../runtime/thunks.md); how substantial bodies get speculated → [parallel/speculation.md](../parallel/speculation.md); emission & fusion → [pipeline.md](pipeline.md).
 

@@ -38,7 +38,7 @@ loop:
       .blackhole        → return error.ImportCycle        # same-claimer recursion
       .errored          → return entry.error_info.err     # deterministic replay
       .busy:                                              # another fiber owns it
-          enroll on future.waiter_list
+          enrollWaiter(&wf.waiter)                         # onto future.waiters_head
           fiber.state = suspended; yield()                # park, don't spin
           fiber.state = running;   continue               # re-try on wake
       .claimed:                                           # WE own it
@@ -50,7 +50,7 @@ loop:
 ```
 
 - **First claimer** runs `compileImportPath` **inline**: read file → `evaluateSource` (parse + compile + eval) → value. No task handoff; the claimer *is* the evaluator for that file.
-- **Concurrent fibers** enroll on `future.waiter_list` and park (the [import fiber-park](workers.md), symmetric with thunk waiting). On `publish()`, woken fibers are enqueued on their **home-worker** ready [queue](scheduler.md).
+- **Concurrent fibers** enroll on the future's waiter list via `enrollWaiter` (linked through `Future.waiters_head`, guarded by `waiters_mu`) and park (the [import fiber-park](workers.md), symmetric with thunk waiting). On `publish()`, woken fibers are enqueued on their **home-worker** ready [queue](scheduler.md).
 - **Cycles** come for free: a `ClaimerId` is stable across [fiber migration](fibers.md), so `A imports B imports A` reaches a slot the *same claimer* already owns → `Future` returns `.blackhole` → `error.ImportCycle`.
 
 ### Failure caching
@@ -60,7 +60,7 @@ A failed compile publishes an `ErrorInfo` sidecar via `publishErrored`, so the s
 `import <dir>` redirects to `<dir>/default.nix`. `<nix/fetchurl.nix>` resolves to a hard-coded synthetic source (`corepkgsSource`), so no corepkgs store path is needed on disk. Both flow back through the same registry.
 
 ### Speculative import prefetch
-An opt-in lane (`FIX_IMPORT_PREFETCH`, off by default) submits `import_prefetch` [tasks](scheduler.md) that resolve + parse + compile + top-level-eval a `.nix` file ahead of demand — discovered from the `.path` constants of freshly compiled chunks and deduplicated per path before submission. It populates the *same* registry, so the demand fiber later hits `.already_resolved` (or joins the in-flight `Future`) instead of paying parse+compile on the critical chain. Errors are swallowed on the prefetch path; deterministic failures still cache on the entry and replay identically on real demand. It defaults off because helpers are not free during discovery (see the floor below).
+A spec-lane prefetch (`FIX_IMPORT_PREFETCH`) submits `import_prefetch` [tasks](scheduler.md) that resolve + parse + compile + top-level-eval a `.nix` file ahead of demand — discovered from the `.path` constants of freshly compiled chunks (via `ChunkRegistry.path_const_sink`) and deduplicated per path before submission, capped at `FIX_IMPORT_PREFETCH_MAX` = **8192** submissions per eval. It populates the *same* registry, so the demand fiber later hits `.already_resolved` (or joins the in-flight `Future`) instead of paying parse+compile on the critical chain. Errors are swallowed on the prefetch path; deterministic failures still cache on the entry and replay identically on real demand. It is **on by default at `2..16` workers** (the same gate as the [novel lane](speculation.md)): at `--workers=1` nothing drains it, and past 16 workers the extra spec-lane volume chases junk rather than shortening the chain. `FIX_IMPORT_PREFETCH=0`/`1` overrides.
 
 ---
 
@@ -73,7 +73,7 @@ Cycle detection therefore cannot rely on the Future. Instead each in-progress sc
 - `pushScopedFrame` links a frame and returns the prior top (restored on scope exit);
 - `checkScopedCycle` walks the chain for the path before evaluating → `error.ImportCycle`.
 
-Per-fiber, no locking — the frame stack lives only on the evaluating fiber's stack.
+Thread-local, no locking: `scoped_stack_top` is a `threadlocal` pointer and each `ScopedFrame` is a local on the evaluating call stack (a scoped import is compiled inline by its claimer, so the chain never leaves that native stack).
 
 ---
 
@@ -85,7 +85,7 @@ The registry parallelizes *duplicate* imports (many fibers, one eval) and lets i
 - collecting them means **parsing and compiling** the file — largely single-threaded work;
 - that parse+compile must finish before the module's contents can be forced N-ways.
 
-So the critical path is a **serial chain of parse+compile through the import graph**, and it is the high-worker-count floor. Adding cores speeds up the *forcing* of already-discovered work; it does not speed up discovering it. This is why the speculative `import_prefetch` lane above is off by default — helpers are not free during discovery. See [perf/model.md](../perf/model.md).
+So the critical path is a **serial chain of parse+compile through the import graph**, and it is the high-worker-count floor. Adding cores speeds up the *forcing* of already-discovered work; it does not speed up discovering it. The `import_prefetch` lane above attacks exactly this chain by running a file's parse+compile ahead of demand, which is why it is gated to `2..16` workers — past that the helpers spend their scan budget on speculative volume that never shortens the chain. See [perf/model.md](../perf/model.md).
 
 ---
 

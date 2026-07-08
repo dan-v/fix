@@ -7,16 +7,17 @@ Every runtime value is an 8-byte `extern struct { bits: u64 }`. Scalars and obje
 ## Bit layout
 
 ```
-bits[63:51] != 0xFFF8 (sign=1, exp=0x7FF, qNaN=1)  →  regular IEEE double
-otherwise (tagged):
+bits[63:51] == 0x1FFF (sign=1, exp=0x7FF, quiet=1)  →  tagged
+otherwise                                           →  regular IEEE double
+tagged:
   bits[50:48]  primary tag   (3 bits, 8 variants)
   bits[47:0]   payload       (48 bits: InternId / ObjectId / inline int / value)
-misc primary tag (7) is refined:
+primary tag misc (7) is refined:
   bits[47:44]  sub-tag       (4 bits)
   bits[43:0]   sub-payload   (44 bits)
 ```
 
-The tagged prefix is `sign=1 & quiet-NaN` (`QNAN_PREFIX = 0xFFF8…`). Discrimination is a single load + AND + CMP: `(bits & 0xFFFF_0000_0000_0000) == QNAN_PREFIX | (tag<<48)`. `isFloat` is simply "not tagged".
+The tagged prefix is sign=1 with the full exponent and the quiet-NaN bit set (`QNAN_PREFIX = 0xFFF8_0000_0000_0000`). `isTagged` splits on it with a single load + AND + CMP against `QNAN_PREFIX_MASK` (== `QNAN_PREFIX`, the top 13 bits): `(bits & QNAN_PREFIX_MASK) == QNAN_PREFIX`. `isFloat` is its negation. Each per-kind predicate (`isInt`, `isString`, …) is the same shape one field wider — mask the top 16 bits (`HIGH16_MASK = 0xFFFF_0000_0000_0000`), compare against `QNAN_PREFIX | (tag << 48)`; the misc sub-tag predicates additionally match bits 47:44.
 
 **Primary tags** (bits 50:48): `int=0`, `string=1`, `path=2`, `list=3`, `attrs=4`, `thunk=5`, `closure=6`, `misc=7`.
 
@@ -46,8 +47,8 @@ Arithmetic can produce NaNs whose bit pattern lands anywhere in qNaN space — i
 ## Constructors / discriminators / accessors
 
 - Construct: `int` / `float` / `string` / `path` / `list` / `attrs` / `closure` / `thunk` / `boolVal` / `null_val` / `builtin` / `builtinClosure` / `contextString` / `boxedInt` / `partialApp`.
-- Discriminate: `kind()` (full `ValueType`); fast predicates `isInt`/`isFloat`/`isString`/`isList`/`isAttrs`/`isThunk`/`isClosure`/`isBuiltin`/`isBoxedInt`/`isPartialApp`/`isNull`/`isBool`.
-- Access: `asInt` / `asFloat` / `asInternId` / `asObjectId` / `asBuiltinId` / `asBool`. Accessors assert their kind (debug).
+- Discriminate: `kind()` (full `ValueType`); fast predicates `isInt`/`isFloat`/`isString`/`isPath`/`isList`/`isAttrs`/`isThunk`/`isClosure`/`isBuiltin`/`isBuiltinClosure`/`isContextString`/`isBoxedInt`/`isPartialApp`/`isNull`/`isBool`.
+- Access: `asInt` / `asFloat` / `asInternId` / `asObjectId` / `asBuiltinId` / `asBool`. `asInt` and `asFloat` assert their kind in debug; `asInternId`/`asObjectId`/`asBuiltinId`/`asBool` only mask the payload with no kind check, so the caller must have already discriminated.
 
 ## Identity: `idEq` / `idHash`
 
@@ -60,7 +61,7 @@ Arithmetic lives in `numeric.zig` and matches the C++ evaluator exactly (the [co
 - **Checked integer overflow.** `add`/`sub`/`mul` use Zig's `*WithOverflow` and raise `error.IntegerOverflow` on wrap — never silent two's-complement. `negate` routes through `checkedSub(0, v)` so `-i64_min` raises.
 - **Int/float promotion.** If both operands are any-int → checked integer path (result boxed if needed). If either is float → both promote to `f64` (`toFloat`) and the op is IEEE. `toFloat` accepts int/boxed_int/float; anything else is `error.TypeError`.
 - **Division.** Integer `/0` raises `error.DivisionByZero`. The `i64_min / -1` overflow (mathematically `2^63`) raises `error.IntegerOverflow` instead of hitting Zig UB. Float `/0` **also raises** `error.DivisionByZero` — Nix does *not* yield IEEE ±Inf.
-- **`floatToI64Safely`** (backs `floor`/`ceil` on floats): NaN/±Inf → `error.NumericConversion`; magnitude `≥ 2^63` (or `< -2^63`) **saturates to `i64_min`**, mirroring x86 `cvttsd2si`'s indefinite-integer result that Nix inherits; otherwise truncates. Bounds are exact hex-float compares (`0x1.0p63`): upper is strictly `<`, lower is `≥`. `floor`/`ceil` on an int/boxed_int are identity.
+- **`floatToI64Safely`** (backs `floor`/`ceil` on floats): NaN/±Inf → `error.NumericConversion`; a float `≥ 2^63` or `< -2^63` **saturates to `i64_min`**, mirroring x86 `cvttsd2si`'s indefinite-integer result that Nix inherits; otherwise truncates via `@intFromFloat`. Bounds are exact hex-float compares (`0x1.0p63`): upper is strictly `<`, lower is `≥` (so exactly `-2^63` truncates normally to `i64_min`). `floor`/`ceil` on an int/boxed_int are identity.
 - **Bitwise** (`bitAnd`/`bitOr`/`bitXor`): integers only (`error.TypeError` otherwise); operands read via `int.get`, result boxed if it exceeds i48.
 
 Out of scope: object layouts → [heap.md](heap.md); thunk states → [thunks.md](thunks.md); string context → [derivation/context.md](../derivation/context.md).

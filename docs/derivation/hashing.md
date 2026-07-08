@@ -4,7 +4,7 @@
 
 ## Why this is the hot path
 
-Store-path computation is **the** correctness oracle for this evaluator: every `.drv` and every output path must be **byte-identical** to what `nix-instantiate` produces. It is also a top serial [critical-path cost](../perf/model.md) — evaluating the NixOS toplevel hashes ~477 distinct derivations, each requiring 3 ATerm serializations, and `main` does most of that work itself on the serial chain. Constant-factor wins in ATerm string-building therefore transfer straight to high-worker wall time (below).
+Store-path computation is **the** correctness oracle for this evaluator: every `.drv` and every output path must be **byte-identical** to what `nix-instantiate` produces. It is also a serial [critical-path cost](../perf/model.md): every input-addressed derivation is serialized to ATerm three times (masked hash-modulo, unmasked hash-modulo, `.drv` text — see the three-serialization table in step 5), and that serialization runs on the drv-hashing chain. Constant-factor wins in ATerm string-building therefore transfer to high-worker wall time (below).
 
 ## The pipeline
 
@@ -46,7 +46,7 @@ Invariants baked in:
 - **Canonical sort** of *everything* with a defined order — outputs by name, inputs by drv path, input output-name lists, srcs, and env by name — all lexicographic (byte-wise).
 - **String escaping** is applied to only four fields: `builder`, each `args` element, and each `env` entry's name and value are quoted **and** escaped (`"` `\` `\n` `\r` `\t` → backslash escapes). Everything else — the output tuple fields (`name`, `path`, `hash_algo`, `hash`), input drv paths, src and output-name lists, and `system` — is quoted but **not** escaped, since those are known store-path / identifier shaped. Matching Nix's exact escaped-field set is load-bearing.
 
-**Pre-sized-buffer + escape-free bulk-copy optimization** (measurably transfers to high worker counts): the output buffer is pre-sized from the dominant content (env value + input-path lengths) to avoid grow-and-copy reallocs; and quoted-string emission **bulk-copies maximal escape-free runs** (`appendSlice`) instead of appending byte-by-byte. Env values (build scripts, dependency lists) are large and almost entirely escape-free, so this is ~one copy per value. Because ATerm building runs on the serial drv-hashing chain, this is a real high-worker win, not just a w=1 micro-opt.
+**Pre-sized buffer + escape-free bulk copy.** The output buffer is pre-sized from the dominant content (a 256-byte base, plus each env entry's name+value+8 and each input path+16) to avoid grow-and-copy reallocs; and quoted-string emission (`appendString`) bulk-copies each maximal escape-free run with one `appendSlice` rather than appending byte-by-byte. Env values (build scripts, dependency lists) are large and almost entirely escape-free, so the common case is one copy per value. Because ATerm building runs on the serial drv-hashing chain, this transfers to high-worker wall time.
 
 ### 2. hashModulo / hashModuloInputs (input-addressed hashing)
 
@@ -122,7 +122,7 @@ Store-path hashes are 32-character nixBase32, **not** standard base32:
 - **Compress**: XOR-fold the 32-byte sha256 into 20 bytes (`compressed[i % 20] ^= digest[i]`).
 - **Encode**: 5-bit radix over the alphabet `"0123456789abcdfghijklmnpqrsvwxyz"` (note: no `e`, `o`, `t`, `u` — Nix's set), emitting **bit-swapped**, i.e. output char *n* reads bits low-to-high and is placed at `len - 1 - n` (LSB→MSB). 20 bytes → 32 chars.
 
-The Nix-base32 encoder is separate from the flat-hex encoder used for `sha256_hex` (lowercase hex). The base32 encoder is also used directly by `hashBytesNixBase32` for hash builtins.
+This store-path encoder (`hash_codec.zig`) is distinct from the flat lowercase-hex encoder used for `sha256_hex`. It is also a separate function from the base-32 encoder behind the hash builtins (`hashBytesNixBase32` in `src/runtime/hash.zig`): that one shares the same 32-char alphabet and bit-swapped emission but encodes the **full** digest (`(len*8+4)/5` chars, for md5/sha1/sha256/sha512) with no 32→20 XOR fold — the fold is specific to store-path hashes, which always compress to 20 bytes → 32 chars.
 
 ### NAR hashing
 
@@ -130,7 +130,7 @@ Used for `r:` fixed-output (recursive) and for **source paths** (a plain path re
 
 - `"nix-archive-1"` magic, then per node: `type` = `regular` (+ `executable` marker) | `directory` | `symlink`, with `contents` / recursive `entry (name, node)` (dir entries **sorted by name**) / `target`.
 - Every token is length-prefixed (little-endian u64) and **8-byte zero-padded**.
-- sha256 of the NAR bytes → hex. A source path becomes `sourcePath(name, nar_hex)` = `storePathFromInnerDigest("source", nar_hex, name)`. An optional filter (`filterSource`) can drop entries during the walk.
+- sha256 of the NAR bytes → hex. A source path becomes `sourcePath(name, nar_hex)` = `storePathFromInnerDigest("source", nar_hex, name)`. `hashPath` walks unfiltered; `hashPathFiltered` takes an optional `Filter` whose `accept` callback drops directory entries during the walk.
 
 ### Hash-format normalization
 

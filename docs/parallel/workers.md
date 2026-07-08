@@ -13,7 +13,7 @@ Each worker `i` owns (see [scheduler](scheduler.md) for the queue internals):
 
 ### The fiber free-list
 
-Fibers are expensive to create (8 MiB mmap + a VM) and cheap to [`reset`](fibers.md) — so workers pool them:
+Creating a fiber costs an 8 MiB `mmap` plus a VM; [`reset`](fibers.md)ting one is a single trampoline-slot store — so workers pool them:
 
 - **Prewarm** `prewarm_fiber_count = 4` fibers per worker at `Worker.init`; **grow on demand** when more blocking work is in flight than the pool holds. There is no fixed pool size.
 - `acquireFreeFiber` pops the free-list LIFO (hottest cache) or allocates a fresh slot; a finished fiber is **`reset` in place** (stack pointer rewound, new entry/arg installed) rather than freed and re-allocated, so the per-task cost is a memcpy of the trampoline address.
@@ -43,18 +43,18 @@ drainStep():                      # returns true if it did work
 
 Priority within `drainStep` mirrors the scheduler's discipline: **ready fibers → demand/speculation tasks → work-first continuations → scavenge**, and within the task pick, own queues before stealing and urgent before novel before spec. A dequeued task runs by resetting a free-list fiber to `slotEntry` (which reads the task off the slot and forces it); a dequeued ready fiber is resumed directly. A worker steals *other* workers' continuations only — its own are reclaimed inline by the work-first walk's pop-back, never through the drain loop.
 
-`runFiber` takes the slot's `run_mu` around the resume (serializing a stealer that pops the same ready node against the current owner) and flips `in_runfiber` 1→0 across the run so teardown can tell when the fiber is truly idle. It also refreshes the heap's per-thread speculation-context flag from the fiber's VM state on every resume, buckets the elapsed wall into `busy_ns`, and recycles or accounts the fiber based on whether it finished or yielded.
+`runFiber` takes the slot's `run_mu` around the resume (serializing a stealer that pops the same ready node against the current owner) and holds `in_runfiber` at 1 across the resume, clearing it to 0 after, so teardown can tell when the fiber is truly idle. It also refreshes the heap's per-thread speculation-context flag from the fiber's VM state on every resume, buckets the elapsed wall into `busy_ns`, and recycles or accounts the fiber based on whether it finished or yielded.
 
 **`gcSafepoint`** is a per-loop-iteration poll: if a [GC](../gc.md) stop is requested the worker parks at the safepoint until released. This is how the (opt-in) collector reaches a stop-the-world barrier without preempting mid-op. **`scavengeStep`** is the lowest-priority idle work (`FIX_SCAVENGE`, off by default): a helper pre-forces aged still-unresolved thunks from main's creation ring whose body chunk has proven expensive on the demand path.
 
 ## The Evaluator
 
-The **`Evaluator`** (the `eval.zig` facade) holds the state shared across all workers and fibers:
+The **`Evaluator`** (defined in `eval.zig`) holds the state shared across all workers and fibers:
 
 - **chunk registry** (compiled [bytecode](../compiler/pipeline.md)), **[intern](../runtime/interning.md) table**, **[heap](../runtime/heap.md)**, **scheduler**, **file/[import](imports.md) caches**, [derivation](../derivation/model.md) caches.
 - Cross-worker sharing goes through the heap and interned tables, which *are* concurrency-safe; the hot per-fiber allocation path takes no lock because it lands in the fiber's private scratch arena.
 
-`scheduler.start(workerFn)` is idempotent (safe to call once per eval). Per-eval mutable state — diagnostics, the trace arena, retained AST arenas — is mutex-protected because concurrent helper [imports](imports.md) touch it.
+`scheduler.start(helperLoop, evaluator)` spawns the `N−1` helper threads (thread ids `1..N−1`); a `started` compare-and-swap makes a second call a no-op. Per-eval mutable state — diagnostics, the trace arena, retained AST arenas — is mutex-protected because concurrent helper [imports](imports.md) touch it.
 
 ## Top-level evaluation
 
@@ -78,7 +78,7 @@ Together: no fiber is reclaimed while owned, and no worker is torn down while an
 
 ## Race invariants (summary)
 
-The parallel path rests on a small set of invariants proven load-bearing by real corruption bugs; see [invariants](../invariants.md) and [thunks](../runtime/thunks.md) for the full history.
+The parallel path rests on a small set of invariants proven load-bearing by real corruption bugs; see [invariants](../invariants.md) and [thunks](../runtime/thunks.md) for the full analysis.
 
 - **Cell-thunk binding:** binding cells are born `.evaluating` (claimed) so a helper can't resolve a binding to a placeholder before the real value is published.
 - **Fiber resume:** `ReadyNode.queued` CAS + per-slot `run_mu` — a [fiber](fibers.md) is enqueued once and resumed by one thread at a time.

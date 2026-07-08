@@ -46,10 +46,10 @@ The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body com
 At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
 
 1. **body_is_substantial** — `code.len + fusion_savings ≥ SPECULATION_MIN_CODE_BYTES` (256), gating [speculation](../parallel/speculation.md).
-2. **Trivial-body classify** — the finished body is matched against ~8 shapes once (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
+2. **Trivial-body classify** — the finished body is classified once into a `TrivialBody` variant, else `none` (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
 3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
 
-The caller then registers the frozen Chunk: `ChunkRegistry.register` assigns a **sequential, immutable `ChunkId`** and caches the hot scheduling metadata (`trivial`, `body_is_substantial`) in a dense per-chunk slot so the thunk-creation path reads it without chasing the Chunk pointer.
+The caller then registers the frozen Chunk: `ChunkRegistry.register` assigns a **sequential, immutable `ChunkId`** (a lock-free `appendAtomic` cursor bump) and caches the hot scheduling metadata (`trivial`, `body_is_substantial`, `strict_param`, `strict_via_upvalue`) in a dense per-chunk `ChunkSlot` so the thunk-creation path reads it without chasing the Chunk pointer.
 
 The frozen **Chunk** carries: `code`, `constants`, `local_count`, `arity`, `strict_params` (per-param must-force bitmask for uncurried chunks), `SchedulingHints` (`strictness` masks + `body_is_substantial` + `trivial` + `strict_param` + `strict_via_upvalue`), `function_args`, `source_map`, and `body_span`.
 
@@ -62,7 +62,7 @@ ChunkBuilder (mutable, arena)                 Chunk (immutable, persistent)
 
 ## Constant folding & call_n flattening
 
-- **Constant folding** (`fold.zig`) — arithmetic/comparison over literal operands is evaluated at compile time, emitting a single `constant` instead of the op sequence.
+- **Constant folding** (`fold.zig`) — arithmetic, comparison, and unary (`!`, negation) operators over fully-literal operands are evaluated at compile time, emitting a single `constant` instead of the op sequence; nested `&&`/`||`/`->` fold too when both sides are literal, but a top-level `&&`/`||`/`->` compiles to short-circuit branch code. Division and any i64-overflowing arithmetic are never folded: `{ x = 1/0; }` is valid Nix and must throw only when `.x` is forced, so folding stays conservative.
 - **`call_n` flattening** (`lambda.zig`) — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). For `K ≥ 2` the spine is flattened to a single `call_n K`: the callee is compiled, then K args pushed, then `call_n K`. When the callee is an **arity-matched uncurried (merged) lambda** the body runs in **one frame** with no intermediate closure/PAP allocation; a non-matching callee folds one arg at a time (same result). Each spine argument compiles as an immediate container value or a plain lazy thunk (not the runtime-adaptive `apply_arg`, whose callee probe is only valid for the first arg); the saturated `call_n` path then eagerly forces the argument positions the callee's `strict_params` mark must-force. `K == 1` keeps the single-arg path (eager-strict-arg + tail-call frame reuse).
 
 ## Super-op fusion (in `emit`)
@@ -75,7 +75,7 @@ Fusion rewrites the *last emitted op in place* when the next emission completes 
 
 A branch fixup (`patchJump`) that lands at the current write position drops the `last_op_offset` fusion hint, so a multi-predecessor join never fuses across control flow.
 
-Every rewrite that shrinks the code adds the saved bytes to **`fusion_savings`**, which is added back to `code.len` when deciding `body_is_substantial` — so the [speculation](../parallel/speculation.md) size threshold stays calibrated after fusion collapses a body.
+The `get_*_attr` and `*_store_local` rewrites each add their one saved byte to **`fusion_savings`** (the `<op>_ret` rewrite does not); `fusion_savings` is added back to `code.len` when deciding `body_is_substantial`, so the [speculation](../parallel/speculation.md) size threshold measures the pre-fusion body size. String-interpolation lowering (`literals.zig`) also adjusts `fusion_savings` so a `concat_strings` body keeps the scheduling weight of its unfused encoding.
 
 ## Tail-position lowering
 
@@ -87,7 +87,7 @@ Every rewrite that shrinks the code adds the saved bytes to **`fusion_savings`**
 - `assert` → `compileAssertTail` (body tail, guard unchanged).
 - `with` → `compileWithTail` (body tail after scope push).
 
-Lambda and thunk bodies are compiled via `compileTailExpression`, so a body ending in a call becomes a tail call.
+Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpression`, so a lambda body ending in a call becomes a tail call and tail position then propagates through the forms above. Thunk bodies and the file body compile through `compileNode` (not tail position), so a trailing call there is a plain `call`.
 
 ## Lowering notes by family
 
@@ -95,9 +95,9 @@ Lambda and thunk bodies are compiled via `compileTailExpression`, so a body endi
 
 **access** — a static dotted path `a.b.c` compiles the root then emits one `get_attr` per segment (the first fusing into `get_local_attr` / `get_upvalue_attr`); an interpolated segment emits `get_attr_dynamic`. `or`-defaults use packed segment super-ops carrying the fallback as a thunk: `get_attr_path_or` (all-static path), `get_attr_path_mixed_or` (interpolated), `get_attr_dynamic_or` / `get_attr_path_dynamic_or` (dynamic key). `?` has-attr mirrors the split with `has_attr_path` / `has_attr_path_mixed` over a packed segment operand. Lists build via `build_list`.
 
-**control** — `if` emits `jump_if_false` + a forward `jump` patched at join; `assert` emits a guard that raises on false then falls through to the body; `with` pushes the scope expr as a cell onto the dynamic-scope chain, compiles the body, then pops.
+**control** — `if` emits `jump_if_false` + a forward `jump` patched at join; `assert` compiles the condition then `jump_if_false` over the body to a `fail_assertion` tail, falling through to the body when the condition holds; `with` compiles the scope subject as a thunk bound to an anonymous frame-local slot, registers that slot on the `with_scopes` chain, compiles the body, then pops the scope.
 
-**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates via `concat_strings`; path literals resolve against the compiler's `base_path` at compile time (absolute/relative), preserving trailing-slash semantics; `__curPos` lowers to the current source position. An identifier resolves in order **local slot → upvalue capture → `builtins` / ambient builtin → `with` dynamic lookup**, emitting `get_local` / `get_upvalue` / `push_builtins` / `lookup_with` respectively; an unresolved name is a compile error (see [scopes.md](scopes.md)).
+**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates via `concat_strings`; path literals resolve against the compiler's `base_path` at compile time (absolute paths via `std.fs.path.resolve`, relative paths joined onto `base_path`); `__curPos` lowers to a `{ file; line; column; }` attrset built at the current source position (or `push_null` when the unit has no `source_path`). An identifier resolves in order **local slot → upvalue capture → the literal `builtins` → ambient builtin → `with` lookup**, emitting `get_local` / `get_upvalue` / `push_builtins` / (a `builtin` constant or `push_builtins` + `get_attr`) / `lookup_with`; an unresolved name is a compile error (see [scopes.md](scopes.md)).
 
 ## Diagnostics
 

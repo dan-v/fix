@@ -1,6 +1,6 @@
 # VM Dispatch
 
-*The direct-threaded bytecode interpreter and the chunk format it runs.*
+*The threaded bytecode interpreter and the chunk format it runs.*
 
 The interpreter is the canonical evaluator: the bytecode loop is what every correctness claim rests on (byte-identical `.drv`).
 
@@ -8,7 +8,7 @@ The interpreter is the canonical evaluator: the bytecode loop is what every corr
 
 A chunk is a compiled function or thunk body: a flat byte stream of opcodes plus a constant pool. The VM holds one **operand stack** and a stack of **call frames**. Executing a chunk = pushing a frame over its locals and running its opcodes; each op mutates the operand stack, and control ops (`call`, `ret`) push/pop frames. There is no expression tree at runtime — only bytes, a stack, and frames.
 
-Dispatch is **direct-threaded**: each opcode is its own small handler function, and each handler ends by tail-jumping directly to the next handler. There is no central `switch`, no per-op `call`/`return`. The whole run of a chunk is one long chain of `jmp`s sharing a single machine stack frame.
+Dispatch is **threaded**: each opcode is its own small handler function, and each handler ends by tail-jumping to the next. A dispatch step reads the next opcode byte and indexes a static `handlers` table (opcode byte → handler pointer, `handlers[op]`), then `@call(.always_tail)`s it. There is no central `switch`, no per-op `call`/`return`. The whole run of a chunk is one long chain of `jmp`s sharing a single machine stack frame.
 
 ## The dispatch chain
 
@@ -21,7 +21,7 @@ fn (vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anye
 A handler reads its inline operands from `code[ip..]`, does its work, **pushes any result onto `vm.stack`** (it does not *return* the value), then tail-calls `dispatch`, which reads the next opcode and tail-calls its handler:
 
 ```
-dispatch(vm, frame, code, ip):
+dispatch(vm, frame, code, ip, stop_depth):
     if ip >= code.len: return endOfCode(vm)     # ran off the end → ensure ≥1 stack value
     op = code[ip]
     @call(.always_tail, handlers[op], {vm, frame, code, ip + 1, stop_depth})
@@ -41,11 +41,11 @@ Handlers return `anyerror!void`. `anyerror!Value` is 24 bytes on x86-64 SysV, wh
 
 ### Why many small handlers, not one switch
 
-An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. At that size LLVM's register allocator abandons aggressive stack-slot coloring, so every arm spills conservatively and adding a single case grows the frame for *all* arms. Splitting each opcode into a standalone function restores local, per-handler register allocation, removes the shared-spill tax, and makes adding an opcode genuinely free at the codegen level. The static `handlers` table (indexed by opcode byte) is the only thing tying them together.
+An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. At that size LLVM's register allocator abandons aggressive stack-slot coloring, so every arm spills conservatively and adding a single case grew the frame by 16 bytes for *every* arm. Splitting each opcode into a standalone function restores local, per-handler register allocation, removes the shared-spill tax, and makes adding an opcode genuinely free at the codegen level. The static `handlers` table (indexed by opcode byte) is the only thing tying them together.
 
 ## Value stack and frames
 
-**Operand stack** — `vm.stack[0..sp)`, capacity `VM_STACK_CAP` (65 536). `push`/`pop` bounds-check against the cap and raise `error.StackOverflow`. `sp_high_water` tracks the peak for diagnostics.
+**Operand stack** — `vm.stack[0..sp)`, capacity `VM_STACK_CAP` (65 536). `push`/`pushFrame` bounds-check against the cap and raise `error.StackOverflow`; `pop` is unchecked (it only decrements `sp`). `sp_high_water` tracks the peak for diagnostics.
 
 **Frames** — `vm.frames[0..frames_len)`, capacity `MAX_FRAMES` (512). A `Frame` is:
 
@@ -99,7 +99,7 @@ A `Chunk` is **immutable after construction**. Key fields (compiler-stamped; see
 - `get(id)` is **lock-free** (bounds-checked index into stable segments).
 - `register(chunk)` is **lock-free** too: it heap-allocates the immutable `Chunk`, then `appendAtomic`-CAS-bumps the segment cursor to publish a `ChunkSlot`. Alongside the `*Chunk` pointer, the slot inlines a copy of the hot scheduling metadata (`trivial`, `body_is_substantial`, `strict_param`, `strict_via_upvalue`) so the thunk-creation and speculation-gate paths read them from a dense, cache-friendly array instead of chasing the heap-scattered `Chunk`. Once registered, a chunk never changes, so cross-thread `*const Chunk` sharing needs no further synchronization.
 
-A handful of **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registered eagerly at init so builtins can materialize lazy elements by reusing a shared 1-arg-application body instead of allocating a per-element closure (see [access.md](access.md)).
+Two **well-known stub chunks** (`genlist_apply`, `mapattrs_apply`) are registered eagerly at `ChunkRegistry.init` so builtins can materialize lazy elements by reusing a shared stub-chunk body instead of allocating a per-element `builtin_closure` object (see [access.md](access.md)).
 
 ## Invariants
 

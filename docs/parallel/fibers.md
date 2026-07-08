@@ -15,7 +15,7 @@ When a thunk force blocks on an in-flight [`Future`](../runtime/thunks.md), the 
 - **OS threads / blocking:** parking on a futex burns a whole OS thread per blocked force; at realistic fan-out that is thousands of threads. A yielded fiber's incremental switch state is a 56-byte `Context`; its stack stays mapped but demand-paged (committed RSS tracks only the depth touched), and overflow fibers hand their pages back to the OS.
 - **Steal-while-waiting** (a worker, while blocked, dives into the scheduler to run unrelated work on the *same* stack): this pins the resumption to the waiting thread and grows the stack unboundedly with nested unrelated frames. Fibers instead *yield the frame away* — the waiter becomes a stealable object and its thread returns to the drain loop clean.
 
-Payoff and cost profile: at high `--workers` counts helpers are mostly idle (see the [critical-path floor](../perf/model.md)); the wall is dependency-chain depth, not throughput. So the machinery that matters is *cheap, affinity-free resumption of blocked work*, exactly what a yielded fiber gives. Fiber creation is amortized by recycling (below), so parking/resuming is close to a `swap` + a queue push.
+Payoff and cost profile: at high `--workers` counts helpers are mostly idle (see the [critical-path floor](../perf/model.md)); the wall is dependency-chain depth, not throughput. So the machinery that matters is *low-overhead, affinity-free resumption of blocked work*, exactly what a yielded fiber gives. Fiber creation is amortized by recycling (below), so parking/resuming is close to a `swap` + a queue push.
 
 ## The swap primitive
 
@@ -42,7 +42,7 @@ The trampoline can't receive arguments through the ABI (naked switching bypasses
 
 ## Stacks
 
-Each fiber reserves an **8 MiB** anonymous mapping (`MAP_ANONYMOUS | MAP_PRIVATE`, demand-paged — effectively `NORESERVE`). The kernel commits pages only as the fiber recurses, so **RSS tracks actual depth, not the reservation**. 8 MiB buys thousands of frames of headroom on any realistic Nix eval while costing ~0 physical memory for shallow fibers. The mapping is registered with the [RSS attributor](../runtime/heap.md) (`vma`) so the process's most numerous large mappings don't merge into an unattributable anonymous blob.
+Each fiber reserves an **8 MiB** anonymous mapping (`mmap` with `PROT_READ|PROT_WRITE`, `MAP_ANONYMOUS|MAP_PRIVATE`, demand-paged). The kernel commits pages only as the fiber recurses, so **RSS tracks actual depth, not the reservation**. 8 MiB buys thousands of frames of headroom on any realistic Nix eval while costing ~0 physical memory for shallow fibers. The mapping is registered with the [RSS attributor](../runtime/heap.md) (`vma`) so the process's most numerous large mappings don't merge into an unattributable anonymous blob.
 
 `releaseStackPages(retain_top, lazy)` gives a dead fiber's stack pages back to the OS — `MADV_FREE` (reclaimed only under pressure) or `MADV_DONTNEED` (immediate). It is only ever called on a `.finished`/`.ready` fiber, whose frames are garbage by definition: a later re-fault reading zeros is indistinguishable from a fresh stack (`reset` rewrites the trampoline slot, and running code always writes a frame before reading it). The [worker](workers.md) uses this to trim spike-overflow fibers when it parks.
 
@@ -69,7 +69,7 @@ Sentinel-fill high-water tracking (`maxStackUsedBytes`) exists under `-Dfiber-st
 
 ## Cross-thread resume safety (load-bearing invariants)
 
-Fibers migrate — a fiber allocated on worker A may be stolen and resumed on worker B. Three invariants make concurrent/serial resumption from arbitrary threads correct. They are not optimizations; each closes a race that produced real corruption (see the resume-race and waiter-race history in [invariants](../invariants.md)).
+Fibers migrate — a fiber allocated on worker A may be stolen and resumed on worker B. Three invariants make concurrent/serial resumption from arbitrary threads correct. They are not optimizations; each closes a race that produces real corruption (see the resume-race and waiter-race analysis in [invariants](../invariants.md)).
 
 1. **Fresh `caller_ctx` per resume.** `caller_ctx` — where the fiber swaps *back* to on yield/finish — points into the *resumer's* current stack frame. `resume_` sets it fresh on every call and clears it on return. So the "return path" is always the current resumer's, never a stale pointer into a thread that has since moved on. A resume from a different thread than the previous one is therefore safe by construction.
 

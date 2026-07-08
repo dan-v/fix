@@ -20,7 +20,7 @@ Zig's `@import("<name>")` reaches a module only through its facade; the compiler
 
 `containers`, `syntax`, `runtime`, `parallel`, `derivation`, and `cli` are the six clean-cut modules the linter guards. The core stays one module because its cycles are real: `vm/force ↔ compiler/deferred` (forcing a thunk can trigger compilation of its deferred body) and `eval/worker ↔ vm/force` (the worker drives the VM, whose force path re-enters the worker to schedule/steal). Splitting them would need forward-declared interfaces that buy nothing. Reaching into any named module by relative path is a lint error (below).
 
-`cli` is its own module rather than part of the core: it imports `fix` by name, so the command tools reach the engine through its public facade instead of poking at engine internals. The `exe` module (`src/main.zig`) imports both `fix` and `cli`; it and every test artifact receive the same shared module set via `addSharedImports`.
+`cli` is its own module rather than part of the core: it imports `fix` by name, so the command tools reach the engine through its public facade instead of poking at engine internals. The `exe` module (`src/main.zig`) imports both `fix` and `cli`; `addSharedImports` gives `fix`, `cli`, and `exe` the identical shared set — `build_options`, `syntax`, `runtime`, `parallel`, `derivation`, `containers` — and the `mod` (over `fix`) and `exe` test artifacts reuse those same modules.
 
 ## Parser-table codegen
 

@@ -9,7 +9,7 @@ The scheduler owns, **per worker `i`**, a set of queues plus a wake word. Every 
 | Structure | Contents | Discipline |
 |---|---|---|
 | `ready_queues[i]` | woken/blocked [fibers](fibers.md) ready to resume | drained **first**; stealable; deduped |
-| `urgent_queues[i]` | demand tasks (fan-out of a strict consumer; the critical path) | drained next, **uncapped** |
+| `urgent_queues[i]` | demand tasks (fan-out of a strict consumer; the critical path) | drained next; not spec-rationed (fixed 4096-slot deque, full push → force inline) |
 | `novel_queues[i]` | first-ever [speculative](speculation.md) force of each code region | drained before the bulk backlog; cap-exempt |
 | `spec_queues[i]` | bulk [speculative](speculation.md) tasks (bets on future demand) | drained last of the eager lanes; **capped** |
 | `cont_queues[i]` | work-first split-and-steal continuations (`FIX_WORK_FIRST`) | owner-inline; idle peers steal |
@@ -53,10 +53,10 @@ Woken fibers land on `ready_queues[i]` — a **`SpinMutex`-guarded intrusive FIF
 
 Demand is unbounded; speculation is *rationed* so a burst of bad bets can't bury the real work or exhaust memory.
 
-- **Urgent: uncapped.** Demand fan-out is on the critical path; refusing it would serialize the very work parallelism exists to spread. (Backing arrays are large — `urgent_queue_capacity = 4096` per worker.)
-- **Spec: capped** at `spec_backlog_per_helper × (N−1)` = **128 × (N−1)** ≈ **4096 in-flight at N=32**, gated by a shared `pending_tasks` counter. `FIX_SPEC_BACKLOG` sweeps the per-helper figure — it is the primary peak-RSS↔wall knob.
+- **Urgent: not spec-rationed.** Demand fan-out is on the critical path; refusing it would serialize the very work parallelism exists to spread, so it never consults the `pending_tasks` cap. It is not *unbounded*, though: the lane is a fixed 4096-slot Chase-Lev deque (`urgent_queue_capacity = 4096` per worker), and a full push returns `false`, whereupon the submitter forces the work inline — demand is at worst run serially, never dropped.
+- **Spec: capped** at `spec_backlog_per_helper × (N−1)` = **128 × (N−1)** = **3968 in-flight at N=32**, gated by a shared `pending_tasks` counter. `FIX_SPEC_BACKLOG` sweeps the per-helper figure — it is the primary peak-RSS↔wall knob.
 - **Over-cap spec submit** either **evicts the oldest queued spec task** (`FIX_SPEC_EVICT`) or **returns `false`** → the caller **falls back to running the work serially, inline**. Speculation is best-effort; the fallback is what makes an over-cap submit harmless rather than lost work.
-- **Novel: cap-exempt.** Its total volume is bounded structurally at one task per chunk, so it bypasses `pending_tasks`.
+- **Novel: cap-exempt.** `submitNovel` does not test the backlog cap — its total volume is bounded structurally at one task per chunk. (A novel task still increments `pending_tasks` for pop/wake bookkeeping; it just is not *gated* by it.)
 
 This asymmetry encodes the cost model: at high worker counts cores are mostly idle, so speculative CPU is nearly free — but its real cost is *scheduling* (a spec task runs to completion once started) and *allocation pressure*, so it must be *rationed*, never allowed to displace demand.
 
@@ -74,7 +74,7 @@ enqueueReady(fiber):
         wake target
 ```
 
-**Burst wake + periodic re-wake.** Fan-out arrives in waves (one strict consumer spawns many children at once). Waking one worker per submit would trickle; waking *all* would thundering-herd. So the ramp at the *start* of a burst wakes **up to `burst_wake_budget` = 4** parked workers, and thereafter — under a standing backlog — **every 64th submit** re-nudges one worker. The periodic re-wake matters: without it a helper whose pre-park spin expired during a lull would stay parked for the rest of the eval no matter how much stealable work piles up. `pending_tasks` also lets a submitter *skip* the `futex_wake` syscall when a helper is already known to have work.
+**Burst wake + periodic re-wake.** Fan-out arrives in waves (one strict consumer spawns many children at once). Waking one worker per submit would trickle; waking *all* would thundering-herd. So the ramp at the *start* of a burst wakes **up to `burst_wake_budget` = 4** parked workers, and thereafter — under a standing backlog — **every 64th submit** re-nudges one worker. The periodic re-wake matters: without it a helper whose pre-park spin expired during a lull would stay parked for the rest of the eval no matter how much stealable work piles up. Both decisions read the pre-increment `pending_tasks` value (`prev`): the wake fires only when `prev < wake_budget` (the ramp) or `(prev & 63) == 0` (the re-wake), so a standing backlog issues no `futex_wake` per submit. `wakeWorker` then elides even that syscall when the target's wake word is already `1` (a prior wake is still in flight).
 
 ## Parking
 

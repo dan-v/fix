@@ -21,7 +21,7 @@ One number decides when the collector runs: a heap-reserved-bytes budget, defend
 
 ## Generational structure
 
-Collections are **minor** and young-gated: each cycle's new objects form a contiguous young generation `[gc_young_slot_start, count)`, and only that set is examined — the work is O(young), not O(total).
+Collections are **minor** and young-gated: each minor examines only the objects allocated since the last collection — recorded per-worker in `HeapLocal.gc_young_slots` (appended on allocation once tracking is armed, cleared after each minor) — so the work is O(young), not O(total).
 
 - **Young/old.** Objects allocated after arming are young; a minor promotes marked survivors to old (in place) and reclaims the dead.
 - **Remembered set.** An old→young write barrier records old objects that come to reference young ones, so the young-gated mark can seed from roots *plus* the remembered set and stop at old boundaries without missing live young children.
@@ -61,7 +61,7 @@ Root set (all must be enumerated — precise):
 ## Sweep (reclaim)
 
 - Processing each young object: **marked ⇒ survivor**, promoted in place (`gcSetOld`, id unchanged, ranges stay put); **unmarked ⇒ dead**, its store ranges returned to the free lists in place and its slot id recycled.
-- **Per-worker** exact-fit free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_*`); freed slots and store ranges are **reused lock-free** by subsequent allocation on the owning worker. No shared alloc mutex.
+- **Per-worker** free lists in the [heap](runtime/heap.md) (`HeapLocal.gc_free_objects` for slot ids; `gc_free_values` / `gc_free_attrs` / `gc_free_attr_pos` are exact-fit range lists keyed by length). A dead object's slot id and ranges are pushed into the free shard of whichever worker evacuated its young-slot list, then **reused lock-free** by that worker's subsequent allocations (exact-length range match; slot ids LIFO). No shared alloc mutex.
 - Non-moving: no compaction pass; scattered death leaves fragmentation (measured real, not recoverable by page-return — see status).
 
 ## Safepoints

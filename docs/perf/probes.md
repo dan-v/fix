@@ -2,7 +2,7 @@
 
 *The instrumentation suite — quantify a lever's ceiling before building the optimizer.*
 
-Every probe is a compile-time `-D` flag (see [build](../build.md)) and is **zero-cost when off**: each is a `build_options` boolean the compiler folds away, so the disabled build has no counters, no branches, no footprint. Run probes at `--workers=1` so instrumentation uses plain counters — no atomics, deterministic, no scheduler interference. Results surface either through `--print-sched-stats` (see [cli](../cli.md)) or a written file.
+Every probe is a compile-time `-D` flag (see [build](../build.md)) and is **zero-cost when off**: each is a `build_options` boolean the compiler folds away, so the disabled build has no counters, no branches, no footprint. The cycle profilers keep their counters plain (no atomics): `-Dprof-main` writes only from worker 0, so it stays lock-free at any worker count — run it at `--workers=32` for the wait question and at `--workers=1` for the pathlength floor; `-Dprof-path` requires `--workers=1`, since its span nesting assumes a single fiber forcing LIFO. Results surface either through `--print-sched-stats` (see [cli](../cli.md)) or a written file.
 
 The governing philosophy: **measure headroom before building.** Every dead-end in the [performance model](./model.md) was probed first — the probe told us the ceiling, and the ceiling told us not to build. The two live levers (deforestation, GC) are likewise the output of measurement.
 
@@ -13,8 +13,8 @@ The governing philosophy: **measure headroom before building.** Every dead-end i
 | `-Dprof-main` | Where does main spend cycles, per C++-level op (e.g. `merge_attrs`, `force_value`, `do_call`), and **does main ever wait**? | rdtsc exclusive-cycle breakdown + piggyback censuses (below), via `--print-sched-stats` |
 | `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--print-sched-stats` |
 | `-Dtimeline` | Per-worker **wall-clock timeline** — parse/compile/import phases, fiber-run quanta, idle parks, GC pauses | Perfetto JSON, written via `--timeline[=path]` |
-| `-Dvm-opcode-profile` | Which **VM opcodes** execute most (raw dispatch counts) | per-opcode execution-count table, printed at VM teardown |
-| `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/blackhole), written via `--thunks-log[=path]`; queried with `fix thunks dump` / `fix thunks diff` |
+| `-Dvm-opcode-profile` | Which **VM opcodes** execute most (raw dispatch counts) | per-opcode count table, sorted with each opcode's % of total, printed after evaluation |
+| `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/errored/blackhole), written via `--thunks-log[=path]`; two logs are compared with `fix thunks diff`, which reports the creator source locations whose resolve/errored/reset outcome multisets differ (keyed by creator location, which is stable across runs) |
 | `-Dfiber-stack-probe` | **Peak fiber stack depth** — how much of each fiber's reserved stack is actually touched | sentinel-fills every fiber stack so `maxStackUsedBytes` can scan for the high-water mark |
 
 ### `-Dprof-main` and its piggyback censuses

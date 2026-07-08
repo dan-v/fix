@@ -26,7 +26,7 @@ Strings come in three [value](../runtime/values.md) forms:
 
 - **plain string** — `Value.string(InternId)`, no context.
 - **path** — `Value.path(InternId)`; treated as carrying the implicit context `{ <path> = { path = true; }; }` when its context is queried (coercing a path into a store path is what materializes that entry).
-- **context string** — `Value.contextString(ObjectId)` → heap `ContextString{ text: InternId, context: []AttrEntry }`: interned text plus the explicit sorted context entries.
+- **context string** — `Value.contextString(ObjectId)` → heap `ContextString{ text: InternId, context: []const AttrEntry }`: interned text plus the explicit sorted context entries.
 
 `contextEntriesForValue(value)` unifies them: `[]` for a plain string, the synthesized `{path=true}` entry for a path, the stored slice for a context string, `TypeError` otherwise.
 
@@ -58,7 +58,7 @@ If either descriptor is not an attrset, the merge just takes the right value.
 | `appendContext s ctx` | attach/merge an explicit context attrset onto `s`'s text (each entry merged via the same union rules) |
 | `unsafeDiscardStringContext s` | return the bare text as a **plain string**, dropping all context |
 | `unsafeDiscardOutputDependency s` | keep entries but rewrite each descriptor to `{ path = true; }` (demote drv-output deps to plain path deps) |
-| `addDrvOutputDependencies s` | rewrite every `.drv`-path entry's descriptor to `{ allOutputs = true; }`; if `s` has no context but its text ends in `.drv`, add a `{ <text> = { allOutputs = true; }; }` entry. This is what `drv.drvPath` uses so that depending on a `.drv` string pulls in all its outputs. |
+| `addDrvOutputDependencies s` | rewrite every `.drv`-path entry's descriptor to `{ allOutputs = true; }`; if `s` has no context but its text ends in `.drv`, add a `{ <text> = { allOutputs = true; }; }` entry. It yields the same all-outputs descriptor that `drv.drvPath` already carries (built directly in `value.zig`, not via this builtin), letting Nix code turn a bare `.drv`-path string into an all-outputs dependency. |
 
 `appendContext` and `addDrvOutputDependencies` reject non-string-like arguments with `TypeError`; `appendContext` also rejects a non-attrs context. These are the [builtins](../vm/builtins.md) surface for context.
 
@@ -71,4 +71,4 @@ When [`derivation`](./model.md) normalizes its argument, each attribute value is
 
 The store-path strings a derivation *hands out* are themselves context strings that seed this: `drvPath` carries `{ <drv> = { allOutputs = true; }; }`, and each `outPath` carries `{ <drv> = { outputs = [ <thatOutput> ]; }; }`. So the moment one derivation's `outPath` flows into another's env, the consumer records the exact input-drv edge and output name. This closed loop — context in the produced strings, context read back at consumption — is what makes cross-derivation dependency tracking byte-correct.
 
-Code: `src/derivation/`, `src/vm/builtins/string_context.zig`
+Code: `src/runtime/heap.zig` (`ContextString`, `addContextString`), `src/vm/strings.zig` (concat / path-concat context union), `src/vm/builtins/string_context.zig` (context builtins), `src/vm/builtins/derivation.zig` (`normalizeDerivationString`: context → `.drv`/src deps)

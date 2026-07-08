@@ -13,7 +13,7 @@ The recipe is deterministic in its inputs, so the same attrset always yields the
 
 ## The `Drv` data model
 
-The normalized build recipe, hashed to produce paths. All string-typed:
+The normalized build recipe, hashed to produce paths. Every leaf is a byte string (`[]const u8`); `outputs`/`input_drvs`/`env` are slices of small structs whose fields are all byte strings:
 
 | Field | Meaning |
 |---|---|
@@ -65,7 +65,7 @@ Forcing any one of the thunked attrs triggers the full build (via the fast path 
 Each lazy derivation attr is a thunk over the `derivationLazyAttr(attrs_id, name)` builtin. Naively, forcing *N* of a derivation's attrs would rebuild the entire derivation *N* times — and the build (normalize + hash) is the bulk of the cost. The fast path deduplicates:
 
 - `derivationLazyAttr` builds the **full lazy value once** (`buildForcedDerivationValue(.lazy)`) and caches it in the `DerivationStore.lazy_drv_cache`, keyed by the input `attrs` [ObjectId](../runtime/heap.md).
-- Subsequent per-attr accesses (any of `drvPath`, `outPath`, `outputName`, named outputs, ...) hit the cache and just select the requested attr.
+- Subsequent per-attr accesses to the thunked attrs (`drvPath`, `outPath`, `all`, and each named output) hit the cache and just select the requested attr. `type`/`outputName`/`drvAttrs`/`outputs` are plain values in the lazy attrs, so reading them never routes through `derivationLazyAttr`.
 - The cache is **token-guarded**: the key is a raw ObjectId, and after a GC that id may be reused for a different attrs; a per-collection token bumps so a stale entry misses rather than returning another derivation's value. Caching is best-effort (an OOM on insert is ignored — correctness never depends on it).
 
 The fully-built lazy value produced here is the same shape as `derivation`'s eager form (below).

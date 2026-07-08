@@ -78,11 +78,11 @@ Cumulative session ~-5.5% w=32. The cheap and medium on-chain work-elimination w
 Both are large by **count / bytes**, not by wall — the opposite shape of an on-chain win — and both are caveated.
 
 - **Deforestation.** The module fixpoint builds single-use intermediate lists and attrsets by the million and consumes most exactly once. The ceiling is by **count, not wall**; realizing it needs an optimizer with reach (targeted fusion, or a trace deforester), and a naive lazy-materialization attempt already regressed (see dead-ends).
-- **GC for peak RSS.** The live set plateaus while total allocation grows linearly, so a collector bounds RSS (~-16% w=1; see [gc](../gc.md)). Mark is a wall tax, so the win is **RSS, not wall**.
+- **GC for peak RSS.** The live set plateaus (~228 MB on nixos_toplevel) while total allocation grows linearly (~1.2 GB), so a collector bounds peak reserved memory (measured: `--max-memory=512m` holds nixos_toplevel at ~850 MB reserved vs ~1.4 GB unbounded; see [gc](../gc.md)). Mark is a wall tax, so the win is **RSS, not wall**.
 
 ## Methodology
 
 1. **Measure headroom before building.** Every direction above was probed first — see [perf/probes](./probes.md). The philosophy is: quantify the ceiling of a lever before writing the optimizer.
 2. **A/B at both ends.** Controlled A/B at w=1 (ReleaseFast, throughput floor) and w=32 (critical-path floor), back-to-back, best+median. w=1-only wins that don't touch the chain do not transfer.
 3. **Byte-identical `.drv` gate, always.** Plus `zig build test`. A perf change that alters the store path is a bug, not a win.
-4. **Probes run at `--workers=1`** — plain counters, no atomics, deterministic.
+4. **`-Dprof-path` runs at `--workers=1`** (its span nesting assumes one fiber forcing LIFO); **`-Dprof-main` writes counters only from worker 0**, so they stay plain (no atomics) at any worker count — that is how it profiles main's serial pathlength at `--workers=32` (above) as well as at `--workers=1`.
