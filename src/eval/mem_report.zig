@@ -1,0 +1,212 @@
+//! `FIX_MEM_REPORT` peak-RSS attribution.
+//!
+//! Decomposes the process's memory across every subsystem (object stores,
+//! interned strings, bytecode, retained AST arenas) alongside a kernel-truth
+//! mincore/smaps breakdown, so it's visible where memory actually goes — the
+//! tracked object stores are only part of it. Printed at `Evaluator.deinit`,
+//! before any teardown frees state. Diagnostics only; off the hot path.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const heap_mod = @import("runtime").heap;
+const Value = @import("runtime").value.Value;
+const gc = @import("runtime").gc;
+const vma_mod = @import("runtime").vma;
+const block_cache = @import("runtime").block_cache;
+const bytecode = @import("../bytecode.zig");
+
+/// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
+/// where the memory actually goes (the tracked object stores are only part
+/// of it — interned strings, bytecode, and AST arenas are large and the GC
+/// never sees them). Printed at deinit, before any teardown frees state.
+pub fn report(ev: anytype) void {
+    const on = if (ev.env_map) |em| em.get("FIX_MEM_REPORT") != null else false;
+    if (!on) return;
+    const mb = struct {
+        fn f(bytes: u64) f64 {
+            return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+        }
+    }.f;
+    const p = std.debug.print;
+
+    // `reservedSlots`, not `count`: with `-Dgc` the segmented stores'
+    // cursor starts past the (possibly never-armed) nursery gap, and
+    // `count()` would bill those phantom slots as used (~175 MB of
+    // pages that don't exist on a dormant-GC run).
+    const obj_b = @as(u64, ev.heap.objects.count()) * @sizeOf(heap_mod.Object);
+    const val_b = @as(u64, ev.heap.values.reservedSlots()) * @sizeOf(Value);
+    const attr_b = @as(u64, ev.heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
+    const apos_b = @as(u64, ev.heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
+    const stores_b = obj_b + val_b + attr_b + apos_b;
+
+    const is = ev.intern.stats();
+    const intern_b = @as(u64, is.entries) * 12 + is.data_bytes; // Entry = 3×u32
+
+    const cs = ev.registry.stats();
+    const code_b = cs.code_bytes + cs.const_count * @sizeOf(Value) +
+        cs.source_map_entries * @sizeOf(bytecode.chunk.Chunk.SourceMapEntry);
+
+    var arena_b: u64 = 0;
+    for (ev.retained_arenas.items) |*a| arena_b += a.inner.queryCapacity();
+
+    const accounted = stores_b + intern_b + code_b + arena_b;
+    const rss = gc.peakRssBytes();
+
+    p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
+    p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), ev.heap.objects.count() });
+    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), ev.heap.values.reservedSlots() });
+    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), ev.heap.attrs.reservedSlots() });
+    p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
+    p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
+    p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
+    p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
+    p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), ev.retained_arenas.items.len });
+    p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
+    p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
+    if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
+
+    // Second table: kernel-truth attribution. Every big mapping the
+    // process creates is registered (runtime/vma.zig), so asking
+    // mincore for each region's resident pages decomposes the RSS the
+    // slot-count table above can't see: segment-capacity slack +
+    // pre-touch-ahead (store buckets minus their counted bytes), fiber
+    // stacks, block-cache blocks (parse/compile arenas, retained AST,
+    // builtin temps, intern data). The remainder vs current RSS is
+    // allocator small-slabs + thread stacks + binary. Point-in-time
+    // (now, at deinit) — compare against VmHWM above for drift.
+    const res = vma_mod.residency();
+    var tracked_total: u64 = 0;
+    for (res.rss_bytes) |b| tracked_total += b;
+    const cur_rss = gc.currentRssBytes();
+    const retained_blocks = block_cache.retained_bytes.load(.monotonic);
+    p("  -- mapping residency (mincore; current RSS {d:.1} MB) --\n", .{mb(cur_rss)});
+    inline for (0..vma_mod.tag_count) |ti| {
+        const tag: vma_mod.Tag = @enumFromInt(ti);
+        p("  {s:<16}{d:>8.1} MB  ({d} regions, {d:.0} MB reserved)\n", .{
+            vma_mod.tagName(tag), mb(res.rss_bytes[ti]), res.regions[ti], mb(res.reserved_bytes[ti]),
+        });
+    }
+    p("  {s:<16}{d:>8.1} MB  (of fix:bigblock; parked on free stacks)\n", .{ "block-cache", mb(retained_blocks) });
+    if (cur_rss > tracked_total)
+        p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_rss - tracked_total) });
+    if (res.dropped > 0)
+        p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
+    const dump = if (ev.env_map) |em| em.get("FIX_MEM_REPORT") else null;
+    if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
+
+    // Decompose the "untracked" bucket above via /proc/self/smaps:
+    // split current RSS into file-backed (binary + shared libs), the
+    // main thread stack, brk heap, and anonymous. The anonymous total
+    // minus the registry-tracked big mappings is the real SmpAllocator
+    // small-slab + worker-thread-stack + misc-anon footprint — showing
+    // the previously-opaque line is ~entirely small-object slabs, not
+    // binary/stacks.
+    smapsDecompose(tracked_total);
+}
+
+fn smapsDecompose(tracked_anon: u64) void {
+    if (comptime builtin.os.tag != .linux) return;
+    const p = std.debug.print;
+    const linux = std.os.linux;
+    const fd_raw = linux.open("/proc/self/smaps", .{ .ACCMODE = .RDONLY }, 0);
+    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+    if (fd < 0) return;
+    defer _ = linux.close(fd);
+
+    var file_rss: u64 = 0;
+    var stack_rss: u64 = 0;
+    var anon_rss: u64 = 0;
+    var heap_rss: u64 = 0;
+    // Track whether the current mapping is file-backed / [stack] /
+    // [heap] / anonymous by its header line, then attribute each
+    // "Rss:" line to that category. Read in chunks, reassembling lines
+    // across chunk boundaries in a small carry buffer.
+    var current: enum { file, stack, heap, anon } = .anon;
+    var chunk: [64 * 1024]u8 = undefined;
+    var carry: [512]u8 = undefined;
+    var carry_len: usize = 0;
+    while (true) {
+        const n = linux.read(fd, &chunk, chunk.len);
+        const rd: isize = @bitCast(n);
+        if (rd <= 0) break;
+        var data = chunk[0..@intCast(rd)];
+        while (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
+            var line = data[0..nl];
+            if (carry_len > 0) {
+                // Prepend carried partial line.
+                const take = @min(line.len, carry.len - carry_len);
+                @memcpy(carry[carry_len..][0..take], line[0..take]);
+                line = carry[0 .. carry_len + take];
+                carry_len = 0;
+            }
+            classifySmapsLine(line, &current, &file_rss, &stack_rss, &heap_rss, &anon_rss);
+            data = data[nl + 1 ..];
+        }
+        // Stash any trailing partial line.
+        if (data.len > 0 and data.len <= carry.len) {
+            @memcpy(carry[0..data.len], data);
+            carry_len = data.len;
+        }
+    }
+    const mb = struct {
+        fn f(kb: u64) f64 {
+            return @as(f64, @floatFromInt(kb)) / 1024.0;
+        }
+    }.f;
+    p("  -- smaps decomposition (RSS by mapping kind) --\n", .{});
+    p("  file-backed     {d:>8.1} MB  (binary + shared libs)\n", .{mb(file_rss)});
+    p("  main [stack]    {d:>8.1} MB\n", .{mb(stack_rss)});
+    p("  [heap] brk      {d:>8.1} MB\n", .{mb(heap_rss)});
+    p("  anon total      {d:>8.1} MB\n", .{mb(anon_rss)});
+    const tracked_mb = @as(f64, @floatFromInt(tracked_anon)) / (1024.0 * 1024.0);
+    p("  anon tracked    {d:>8.1} MB  (registered big regions)\n", .{tracked_mb});
+    p("  anon UNTRACKED  {d:>8.1} MB  (SmpAllocator small slabs + worker stacks + misc)\n", .{mb(anon_rss) - tracked_mb});
+}
+
+fn classifySmapsLine(
+    line: []const u8,
+    current: anytype,
+    file_rss: *u64,
+    stack_rss: *u64,
+    heap_rss: *u64,
+    anon_rss: *u64,
+) void {
+    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+    const tok0 = line[0..first_space];
+    const is_header = std.mem.indexOfScalar(u8, tok0, '-') != null and tok0.len > 0 and isHexDash(tok0);
+    if (is_header) {
+        if (std.mem.indexOf(u8, line, "[stack]") != null) {
+            current.* = .stack;
+        } else if (std.mem.indexOf(u8, line, "[heap]") != null) {
+            current.* = .heap;
+        } else {
+            current.* = if (std.mem.lastIndexOfScalar(u8, line, '/') != null) .file else .anon;
+        }
+        return;
+    }
+    if (std.mem.startsWith(u8, line, "Rss:")) {
+        const kb = parseKb(line);
+        switch (current.*) {
+            .file => file_rss.* += kb,
+            .stack => stack_rss.* += kb,
+            .heap => heap_rss.* += kb,
+            .anon => anon_rss.* += kb,
+        }
+    }
+}
+
+fn isHexDash(tok: []const u8) bool {
+    for (tok) |c| {
+        const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!hex and c != '-') return false;
+    }
+    return true;
+}
+
+fn parseKb(line: []const u8) u64 {
+    // "Rss:               1234 kB"
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    _ = it.next(); // "Rss:"
+    const num = it.next() orelse return 0;
+    return std.fmt.parseInt(u64, num, 10) catch 0;
+}

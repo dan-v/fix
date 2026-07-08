@@ -39,6 +39,9 @@ const path_ops = @import("runtime").paths;
 const eval_print = @import("eval/print.zig");
 const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
+const mem_report = @import("eval/mem_report.zig");
+const tuning = @import("eval/tuning.zig");
+const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("eval/worker.zig");
 const eval_gc = @import("eval/gc.zig");
@@ -221,247 +224,15 @@ pub const Evaluator = struct {
         };
     }
 
-    /// `-Dtjit` diagnostic: which chunks went hot enough to anchor a trace.
-    /// Resolves each armed/traced chunk to its source location so we can see
-    /// the recorder's targets on the real workload.
-    fn reportHotAnchors(self: *Evaluator) void {
-        if (!tjit_hot.report_enabled) return;
-        const h = self.registry.hot orelse return;
-        var armed: usize = 0;
-        var traced: usize = 0;
-        var shown: usize = 0;
-        const count = self.registry.count();
-        var id: u32 = 0;
-        while (id < count and id < h.entries.len) : (id += 1) {
-            const st = h.stateOf(id);
-            if (st == .cold or st == .blacklisted) continue;
-            if (st == .traced) traced += 1 else armed += 1;
-            if (shown >= 80) continue;
-            shown += 1;
-            const ch = self.registry.get(id) orelse continue;
-            var line: u32 = 0;
-            var file: ?types.InternId = null;
-            for (ch.source_map) |e| {
-                if (e.start == 0) {
-                    line = e.span.line;
-                    file = e.span.file;
-                    break;
-                }
-            }
-            const path = if (file) |f| std.fs.path.basename(self.intern.get(f)) else "<no-file>";
-            std.debug.print("HOT-ANCHOR chunk={d} {s}:{d} {s} entries={d} locals={d}\n", .{
-                id, path, line, @tagName(st), h.entries[id].count, ch.local_count,
-            });
-        }
-        std.debug.print("=== tjit hot anchors: {d} armed, {d} traced (threshold={d}, chunks={d}) ===\n", .{ armed, traced, h.hot_threshold, count });
-    }
-
-    /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
-    /// where the memory actually goes (the tracked object stores are only part
-    /// of it — interned strings, bytecode, and AST arenas are large and the GC
-    /// never sees them). Printed at deinit, before any teardown frees state.
-    fn memReport(self: *Evaluator) void {
-        const on = if (self.env_map) |em| em.get("FIX_MEM_REPORT") != null else false;
-        if (!on) return;
-        const heap_mod = @import("runtime").heap;
-        const mb = struct {
-            fn f(bytes: u64) f64 {
-                return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
-            }
-        }.f;
-        const p = std.debug.print;
-
-        // `reservedSlots`, not `count`: with `-Dgc` the segmented stores'
-        // cursor starts past the (possibly never-armed) nursery gap, and
-        // `count()` would bill those phantom slots as used (~175 MB of
-        // pages that don't exist on a dormant-GC run).
-        const obj_b = @as(u64, self.heap.objects.count()) * @sizeOf(heap_mod.Object);
-        const val_b = @as(u64, self.heap.values.reservedSlots()) * @sizeOf(Value);
-        const attr_b = @as(u64, self.heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
-        const apos_b = @as(u64, self.heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
-        const stores_b = obj_b + val_b + attr_b + apos_b;
-
-        const is = self.intern.stats();
-        const intern_b = @as(u64, is.entries) * 12 + is.data_bytes; // Entry = 3×u32
-
-        const cs = self.registry.stats();
-        const code_b = cs.code_bytes + cs.const_count * @sizeOf(Value) +
-            cs.source_map_entries * @sizeOf(bytecode.chunk.Chunk.SourceMapEntry);
-
-        var arena_b: u64 = 0;
-        for (self.retained_arenas.items) |*a| arena_b += a.inner.queryCapacity();
-
-        const accounted = stores_b + intern_b + code_b + arena_b;
-        const rss = gc.peakRssBytes();
-
-        p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
-        p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), self.heap.objects.count() });
-        p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), self.heap.values.reservedSlots() });
-        p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), self.heap.attrs.reservedSlots() });
-        p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
-        p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
-        p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
-        p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
-        p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), self.retained_arenas.items.len });
-        p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
-        p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
-        if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
-
-        // Second table: kernel-truth attribution. Every big mapping the
-        // process creates is registered (runtime/vma.zig), so asking
-        // mincore for each region's resident pages decomposes the RSS the
-        // slot-count table above can't see: segment-capacity slack +
-        // pre-touch-ahead (store buckets minus their counted bytes), fiber
-        // stacks, block-cache blocks (parse/compile arenas, retained AST,
-        // builtin temps, intern data). The remainder vs current RSS is
-        // allocator small-slabs + thread stacks + binary. Point-in-time
-        // (now, at deinit) — compare against VmHWM above for drift.
-        const res = vma_mod.residency();
-        var tracked_total: u64 = 0;
-        for (res.rss_bytes) |b| tracked_total += b;
-        const cur_rss = gc.currentRssBytes();
-        const retained_blocks = @import("runtime").block_cache.retained_bytes.load(.monotonic);
-        p("  -- mapping residency (mincore; current RSS {d:.1} MB) --\n", .{mb(cur_rss)});
-        inline for (0..vma_mod.tag_count) |ti| {
-            const tag: vma_mod.Tag = @enumFromInt(ti);
-            p("  {s:<16}{d:>8.1} MB  ({d} regions, {d:.0} MB reserved)\n", .{
-                vma_mod.tagName(tag), mb(res.rss_bytes[ti]), res.regions[ti], mb(res.reserved_bytes[ti]),
-            });
-        }
-        p("  {s:<16}{d:>8.1} MB  (of fix:bigblock; parked on free stacks)\n", .{ "block-cache", mb(retained_blocks) });
-        if (cur_rss > tracked_total)
-            p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_rss - tracked_total) });
-        if (res.dropped > 0)
-            p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
-        const dump = if (self.env_map) |em| em.get("FIX_MEM_REPORT") else null;
-        if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
-
-        // Decompose the "untracked" bucket above via /proc/self/smaps:
-        // split current RSS into file-backed (binary + shared libs), the
-        // main thread stack, brk heap, and anonymous. The anonymous total
-        // minus the registry-tracked big mappings is the real SmpAllocator
-        // small-slab + worker-thread-stack + misc-anon footprint — showing
-        // the previously-opaque line is ~entirely small-object slabs, not
-        // binary/stacks.
-        smapsDecompose(tracked_total);
-    }
-
-    fn smapsDecompose(tracked_anon: u64) void {
-        if (comptime builtin.os.tag != .linux) return;
-        const p = std.debug.print;
-        const linux = std.os.linux;
-        const fd_raw = linux.open("/proc/self/smaps", .{ .ACCMODE = .RDONLY }, 0);
-        const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
-        if (fd < 0) return;
-        defer _ = linux.close(fd);
-
-        var file_rss: u64 = 0;
-        var stack_rss: u64 = 0;
-        var anon_rss: u64 = 0;
-        var heap_rss: u64 = 0;
-        // Track whether the current mapping is file-backed / [stack] /
-        // [heap] / anonymous by its header line, then attribute each
-        // "Rss:" line to that category. Read in chunks, reassembling lines
-        // across chunk boundaries in a small carry buffer.
-        var current: enum { file, stack, heap, anon } = .anon;
-        var chunk: [64 * 1024]u8 = undefined;
-        var carry: [512]u8 = undefined;
-        var carry_len: usize = 0;
-        while (true) {
-            const n = linux.read(fd, &chunk, chunk.len);
-            const rd: isize = @bitCast(n);
-            if (rd <= 0) break;
-            var data = chunk[0..@intCast(rd)];
-            while (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
-                var line = data[0..nl];
-                if (carry_len > 0) {
-                    // Prepend carried partial line.
-                    const take = @min(line.len, carry.len - carry_len);
-                    @memcpy(carry[carry_len..][0..take], line[0..take]);
-                    line = carry[0 .. carry_len + take];
-                    carry_len = 0;
-                }
-                classifySmapsLine(line, &current, &file_rss, &stack_rss, &heap_rss, &anon_rss);
-                data = data[nl + 1 ..];
-            }
-            // Stash any trailing partial line.
-            if (data.len > 0 and data.len <= carry.len) {
-                @memcpy(carry[0..data.len], data);
-                carry_len = data.len;
-            }
-        }
-        const mb = struct {
-            fn f(kb: u64) f64 {
-                return @as(f64, @floatFromInt(kb)) / 1024.0;
-            }
-        }.f;
-        p("  -- smaps decomposition (RSS by mapping kind) --\n", .{});
-        p("  file-backed     {d:>8.1} MB  (binary + shared libs)\n", .{mb(file_rss)});
-        p("  main [stack]    {d:>8.1} MB\n", .{mb(stack_rss)});
-        p("  [heap] brk      {d:>8.1} MB\n", .{mb(heap_rss)});
-        p("  anon total      {d:>8.1} MB\n", .{mb(anon_rss)});
-        const tracked_mb = @as(f64, @floatFromInt(tracked_anon)) / (1024.0 * 1024.0);
-        p("  anon tracked    {d:>8.1} MB  (registered big regions)\n", .{tracked_mb});
-        p("  anon UNTRACKED  {d:>8.1} MB  (SmpAllocator small slabs + worker stacks + misc)\n", .{mb(anon_rss) - tracked_mb});
-    }
-
-    fn classifySmapsLine(
-        line: []const u8,
-        current: anytype,
-        file_rss: *u64,
-        stack_rss: *u64,
-        heap_rss: *u64,
-        anon_rss: *u64,
-    ) void {
-        const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
-        const tok0 = line[0..first_space];
-        const is_header = std.mem.indexOfScalar(u8, tok0, '-') != null and tok0.len > 0 and isHexDash(tok0);
-        if (is_header) {
-            if (std.mem.indexOf(u8, line, "[stack]") != null) {
-                current.* = .stack;
-            } else if (std.mem.indexOf(u8, line, "[heap]") != null) {
-                current.* = .heap;
-            } else {
-                current.* = if (std.mem.lastIndexOfScalar(u8, line, '/') != null) .file else .anon;
-            }
-            return;
-        }
-        if (std.mem.startsWith(u8, line, "Rss:")) {
-            const kb = parseKb(line);
-            switch (current.*) {
-                .file => file_rss.* += kb,
-                .stack => stack_rss.* += kb,
-                .heap => heap_rss.* += kb,
-                .anon => anon_rss.* += kb,
-            }
-        }
-    }
-
-    fn isHexDash(tok: []const u8) bool {
-        for (tok) |c| {
-            const hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
-            if (!hex and c != '-') return false;
-        }
-        return true;
-    }
-
-    fn parseKb(line: []const u8) u64 {
-        // "Rss:               1234 kB"
-        var it = std.mem.tokenizeAny(u8, line, " \t");
-        _ = it.next(); // "Rss:"
-        const num = it.next() orelse return 0;
-        return std.fmt.parseInt(u64, num, 10) catch 0;
-    }
-
     pub fn deinit(self: *Evaluator) void {
-        self.memReport();
+        mem_report.report(self);
         // Detach the import-prefetch sink before teardown (module-level
         // global; only clear it if it still points at THIS evaluator).
         if (ChunkRegistry.path_const_sink) |sink| {
             if (sink.ctx == @as(*anyopaque, @ptrCast(self))) ChunkRegistry.path_const_sink = null;
         }
         self.prefetch_seen.deinit(self.allocator);
-        if (comptime vm_mod.opcode_profile_enabled) printVmOpcodeProfile(&self.vm_opcode_counts);
+        if (comptime vm_mod.opcode_profile_enabled) eval_diagnostics.printVmOpcodeProfile(&self.vm_opcode_counts);
         trace_probe.report();
         struct_census.report();
         if (comptime gc.enabled) {
@@ -474,7 +245,7 @@ pub const Evaluator = struct {
         drv_probe.report();
         ngram_probe.report();
         depth0_probe.report();
-        if (comptime tjit_hot.enabled) self.reportHotAnchors();
+        if (comptime tjit_hot.enabled) eval_diagnostics.reportHotAnchors(self);
         if (comptime tjit_exec.enabled) tjit_exec.report();
         if (comptime tjit_record.enabled) tjit_record.report();
         // Shut helpers down (which joins on `defer vm.deinit()` inside
@@ -778,136 +549,7 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
-        // FIX_SPEC_BACKLOG: sweep the speculation backlog cap (peak-RSS↔wall knob).
-        if (self.env_map) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
-            if (std.fmt.parseInt(u32, s, 10)) |n| @import("parallel").scheduler.setSpecBacklog(n) else |_| {}
-        };
-        // FIX_SPEC_EVICT: ring semantics for the speculation backlog — at the
-        // cap, drop the oldest queued spec task instead of rejecting the
-        // newest submission (see scheduler.spec_evict).
-        if (self.env_map) |em| if (em.get("FIX_SPEC_EVICT")) |s| {
-            self.scheduler.spec_evict = !std.mem.eql(u8, s, "0");
-        };
-        // FIX_SPEC_LIFO: helpers steal the newest speculative task instead of
-        // the oldest (see scheduler.spec_lifo).
-        if (self.env_map) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
-            self.scheduler.spec_lifo = !std.mem.eql(u8, s, "0");
-        };
-        // Novel-chunk priority lane: first-ever speculation of each chunk
-        // goes to the high-priority novel lane (see scheduler.spec_novel).
-        // ON by default at 2-16 workers - it deterministically kills the
-        // tail-chain lottery (w=8 slow tail 7/26 -> 0/26 interleaved runs,
-        // RSS neutral-to-lower, w=16 within noise). At --workers=1 nothing
-        // drains speculation, so it stays off; past 16 workers it stays
-        // off too - the lane is exempt from the backlog cap, and 31 idle
-        // helpers chase every novel root deep (measured w=32: median 1.06
-        // -> 1.11, median RSS 2940 -> 3581MB). FIX_SPEC_NOVEL=0/1 overrides.
-        self.scheduler.spec_novel = self.worker_count > 1 and self.worker_count <= 16;
-        if (self.env_map) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
-            self.scheduler.spec_novel = !std.mem.eql(u8, s, "0");
-        };
-        // FIX_WORK_FIRST: route strict collection-force acceleration through the
-        // work-first split-and-steal primitive instead of the eager fan-out.
-        if (self.env_map) |em| self.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
-        // FIX_FIBER_MADV=dontneed: eager (visible-RSS) comparator for the
-        // overflow-fiber stack release; default is MADV_FREE (lazy reclaim).
-        if (self.env_map) |em| if (em.get("FIX_FIBER_MADV")) |s| {
-            worker_mod.stack_release_lazy = !std.mem.eql(u8, s, "dontneed");
-        };
-        // FIX_NO_EAGER: disable the strictness-driven eager thunk submit
-        // (see closures.zig makeBytecodeThunkFromCapturesEager) — A/B knob.
-        if (self.env_map) |em| if (em.get("FIX_NO_EAGER")) |s| {
-            @import("vm/closures.zig").eager_submit_enabled = std.mem.eql(u8, s, "0");
-        };
-        // FIX_SPEC_CREATE_BUDGET: per-task thunk-creation budget for
-        // spec-lane force_thunk tasks (0 = unbounded; e.g. 4096). On the
-        // pre-scan-summary scheduler a 4096 budget past 16 workers cut
-        // w=32 median max-RSS 4.1GB -> 2.5GB at wall-neutral (spec junk
-        // reaches 10-13M thunks/eval there, ~49% never demanded). On the
-        // scan-summary scheduler (413fc60/556af1a) the RSS win still
-        // reproduces (median 2.95GB -> 2.47GB, spikes to 3.7GB gone) but
-        // now costs ~+10% w=32 wall (interleaved n=8; budgets 16K/64K
-        // don't recover it — the cheaper steal path converts those
-        // cascades into demand hits), so the DEFAULT IS OFF at every
-        // worker count. See Scheduler.spec_task_create_budget.
-        self.scheduler.spec_task_create_budget = 0;
-        if (self.env_map) |em| if (em.get("FIX_SPEC_CREATE_BUDGET")) |s| {
-            if (std.fmt.parseInt(u64, s, 10)) |v| {
-                self.scheduler.spec_task_create_budget = v;
-            } else |_| {}
-        };
-        // FIX_FANOUT_BATCH: items per force_list_range/force_attrs_range
-        // task (default 16) — batch-size sweep knob.
-        if (self.env_map) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
-            if (std.fmt.parseInt(u8, s, 10)) |v| {
-                if (v > 0) vm_force.fan_out_batch_items = v;
-            } else |_| {}
-        };
-        // FIX_SCAVENGE: idle helpers pre-force old unresolved thunks from the
-        // per-worker creation rings. FIX_SCAV_MARGIN tunes how many of the
-        // newest entries stay reserved to their creator (default 4096).
-        if (self.env_map) |em| {
-            const scav_on = em.get("FIX_SCAVENGE") != null;
-            var scav_margin: u64 = 4096;
-            if (em.get("FIX_SCAV_MARGIN")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |n| scav_margin = n else |_| {}
-            }
-            if (em.get("FIX_SCAV_HOT")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |n| vm_force.scav_hot_threshold_cy = n else |_| {}
-            }
-            if (em.get("FIX_SCAV_WORKERS")) |s| {
-                if (std.fmt.parseInt(u8, s, 10)) |n| self.scheduler.scav_workers = n else |_| {}
-            }
-            if (em.get("FIX_SCAV_MULT")) |s| {
-                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_take_mult = n else |_| {}
-            }
-            if (em.get("FIX_SCAV_SLACK")) |s| {
-                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_take_slack = n else |_| {}
-            }
-            if (em.get("FIX_SCAV_MINDEM")) |s| {
-                if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_min_demand = n else |_| {}
-            }
-            self.scheduler.setScavenge(scav_on, scav_margin);
-            self.heap.scav_record = scav_on;
-        }
-        // Demand-sibling prefetch is ON by default when helpers exist
-        // (~15% wall win on the NixOS toplevel; junk bounded by the
-        // entry-count gate + per-member force/creation budgets, RSS
-        // neutral-to-lower). At --workers=1 there is nobody to run the
-        // sweeps — worker 0 would drain them itself as pure overhead —
-        // so it defaults off there. FIX_SIBLING=0 disables (=1 forces on,
-        // including at w=1, for debugging); FIX_SIBLING_MIN/MAX tune the
-        // entry-count gate (defaults 16/64, from the -Dprof-main sibling
-        // census).
-        {
-            var sib_on = self.worker_count > 1;
-            var sib_min: u32 = 16;
-            var sib_max: u32 = 64;
-            if (self.env_map) |em| {
-                if (em.get("FIX_SIBLING")) |s| sib_on = !std.mem.eql(u8, s, "0");
-                if (em.get("FIX_SIBLING_MIN")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |n| sib_min = n else |_| {}
-                }
-                if (em.get("FIX_SIBLING_MAX")) |s| {
-                    if (std.fmt.parseInt(u32, s, 10)) |n| sib_max = n else |_| {}
-                }
-                if (em.get("FIX_SIBLING_BUDGET")) |s| {
-                    if (std.fmt.parseInt(u64, s, 10)) |n| {
-                        self.scheduler.sibling_budget = n;
-                        self.scheduler.sibling_claim_budget = n;
-                    } else |_| {}
-                }
-                if (em.get("FIX_SIBLING_CLAIMS")) |s| {
-                    if (std.fmt.parseInt(u64, s, 10)) |n| self.scheduler.sibling_claim_budget = n else |_| {}
-                }
-                if (em.get("FIX_SIBLING_URGENT")) |s| {
-                    self.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
-                }
-                self.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
-                self.scheduler.touch_log = em.get("FIX_TOUCH_LOG");
-            }
-            self.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
-        }
+        tuning.apply(self);
         // Speculative import prefetch: `.nix` path constants of freshly
         // compiled chunks are parse+compile+evaluated ahead of demand on
         // the spec lane (the braid-window perf decomposition measured
@@ -1503,36 +1145,6 @@ fn ReturnPayload(comptime F: type) type {
 /// fresh VM here ourselves.
 fn writeValueBody(_: *VM, ev: *Evaluator, writer: *std.Io.Writer, value: Value) !void {
     return eval_print.writeValue(ev, writer, value);
-}
-
-const OpcodeCountEntry = struct {
-    op: opcode.OpCode,
-    count: u64,
-};
-
-fn printVmOpcodeProfile(counts: *const vm_mod.OpcodeCounts) void {
-    var total: u64 = 0;
-    var entries: [opcode.count]OpcodeCountEntry = undefined;
-    for (counts, &entries, 0..) |count, *entry, i| {
-        total += count;
-        entry.* = .{
-            .op = @enumFromInt(i),
-            .count = count,
-        };
-    }
-
-    std.mem.sort(OpcodeCountEntry, &entries, {}, opcodeCountGreaterThan);
-
-    std.debug.print("fix vm opcode profile: total={d}\n", .{total});
-    for (entries) |entry| {
-        if (entry.count == 0) break;
-        const pct = if (total == 0) 0.0 else (@as(f64, @floatFromInt(entry.count)) * 100.0) / @as(f64, @floatFromInt(total));
-        std.debug.print("  {s}: {d} ({d:.2}%)\n", .{ @tagName(entry.op), entry.count, pct });
-    }
-}
-
-fn opcodeCountGreaterThan(_: void, lhs: OpcodeCountEntry, rhs: OpcodeCountEntry) bool {
-    return lhs.count > rhs.count;
 }
 
 test {
