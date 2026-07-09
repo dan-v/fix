@@ -57,6 +57,18 @@ pub const FetchCache = struct {
         rev: ?[]const u8 = null,
     };
 
+    /// Byte-progress callback for a download (from the fetching thread). `total`
+    /// 0 = size not yet known. The vm/observ layer wraps a progress span in one
+    /// of these; runtime stays unaware of the progress types.
+    pub const Reporter = struct {
+        ctx: *anyopaque,
+        report: *const fn (ctx: *anyopaque, downloaded: u64, total: u64) void,
+
+        fn emit(self: ?Reporter, downloaded: u64, total: u64) void {
+            if (self) |r| r.report(r.ctx, downloaded, total);
+        }
+    };
+
     pub const UrlResult = struct {
         path: []u8,
         hash: []u8,
@@ -142,16 +154,16 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix" });
     }
 
-    pub fn fetchGit(self: *FetchCache, files: *FileCache, spec: GitSpec) !GitResult {
+    pub fn fetchGit(self: *FetchCache, files: *FileCache, spec: GitSpec, _: ?Reporter) !GitResult {
         if (localFetchPath(spec.url)) |path| {
             return self.localGit(files, path, spec);
         }
         return self.remoteGit(files, spec);
     }
 
-    pub fn fetchUrl(self: *FetchCache, files: *FileCache, spec: UrlSpec) !UrlResult {
+    pub fn fetchUrl(self: *FetchCache, files: *FileCache, spec: UrlSpec, reporter: ?Reporter) !UrlResult {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const body = try self.fetchUrlBytes(files, spec.url);
+        const body = try self.fetchUrlBytes(files, spec.url, reporter);
         defer self.allocator.free(body);
 
         const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
@@ -167,9 +179,9 @@ pub const FetchCache = struct {
         return .{ .path = path, .hash = hash };
     }
 
-    pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec) ![]u8 {
+    pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) ![]u8 {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name });
+        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name }, reporter);
         defer archive.deinit(self.allocator);
 
         const out_path = try self.tarballCachePath(io, spec.name, archive.hash);
@@ -181,27 +193,63 @@ pub const FetchCache = struct {
         return out_path;
     }
 
-    pub fn fetchMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec) !MercurialResult {
+    pub fn fetchMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec, _: ?Reporter) !MercurialResult {
         if (localFetchPath(spec.url)) |path| {
             return self.localMercurial(files, path, spec);
         }
         return self.remoteMercurial(files, spec);
     }
 
-    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8) ![]u8 {
+    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, reporter: ?Reporter) ![]u8 {
         if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
 
         const io = self.io orelse return error.FetchIoUnavailable;
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
+        // Stream (rather than one-shot `fetch`) so we can read `content_length`
+        // up front and report bytes as they arrive to the fetch progress span.
+        const uri = try std.Uri.parse(url);
+        var req = try client.request(.GET, uri, .{ .redirect_behavior = @enumFromInt(10) });
+        defer req.deinit();
+        try req.sendBodiless();
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buffer);
+        if (response.head.status.class() != .success) return error.FetchHttpStatus;
+        // Content-Length is the compressed wire size; we count decompressed
+        // bytes, so it's only a valid progress total when the body is identity.
+        const total: u64 = if (response.head.content_encoding == .identity)
+            (response.head.content_length orelse 0)
+        else
+            0;
+
+        // Decompress like std.http's one-shot fetch does, else we'd hash/store
+        // the raw gzip/deflate/zstd bytes instead of the real content.
+        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+            .identity => &.{},
+            .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
+            .deflate, .gzip => try self.allocator.alloc(u8, std.compress.flate.max_window_len),
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);
+
+        var transfer_buffer: [64 * 1024]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
         var body = std.Io.Writer.Allocating.init(self.allocator);
         defer body.deinit();
-        const result = try client.fetch(.{
-            .location = .{ .url = url },
-            .response_writer = &body.writer,
-        });
-        if (result.status.class() != .success) return error.FetchHttpStatus;
+        var chunk: [64 * 1024]u8 = undefined;
+        var downloaded: u64 = 0;
+        Reporter.emit(reporter, 0, total);
+        while (true) {
+            const n = reader.readSliceShort(&chunk) catch return error.FetchHttpStatus;
+            if (n == 0) break;
+            try body.writer.writeAll(chunk[0..n]);
+            downloaded += n;
+            Reporter.emit(reporter, downloaded, total);
+        }
         return body.toOwnedSlice();
     }
 

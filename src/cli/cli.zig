@@ -295,6 +295,7 @@ pub const EvalProgress = struct {
             .emit_fn = emit,
             .begin_span_fn = beginSpan,
             .end_span_fn = endSpan,
+            .update_span_fn = updateSpan,
         };
     }
 
@@ -334,6 +335,17 @@ pub const EvalProgress = struct {
         _ = context;
         const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(span.token))) };
         node.end();
+    }
+
+    /// Report download bytes on a fetch span. `std.Progress` renders the node as
+    /// `subject [downloaded/total]`; nodes are updated lock-free, so this is safe
+    /// from the off-demand fetch thread. `total` 0 means the size isn't known yet
+    /// (no Content-Length), leaving a bare downloaded count.
+    fn updateSpan(context: *anyopaque, span: eval_progress.Span, downloaded: u64, total: u64) void {
+        _ = context;
+        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(span.token))) };
+        if (total != 0) node.setEstimatedTotalItems(@intCast(@min(total, std.math.maxInt(usize))));
+        node.setCompletedItems(@intCast(@min(downloaded, std.math.maxInt(usize))));
     }
 
     fn emit(context: *anyopaque, event: eval_progress.Event) void {

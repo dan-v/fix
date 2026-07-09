@@ -141,6 +141,10 @@ pub const Sink = struct {
     /// them (then `beginSpan` returns null and `endSpan` is a no-op).
     begin_span_fn: ?*const fn (*anyopaque, SpanGroup, []const u8) Span = null,
     end_span_fn: ?*const fn (*anyopaque, Span) void = null,
+    /// Set byte progress (`downloaded`/`total`, `total` 0 = unknown) on an open
+    /// span — e.g. a fetch reporting download bytes. Thread-safe; called from
+    /// the off-demand fetch thread. Null when unsupported.
+    update_span_fn: ?*const fn (*anyopaque, Span, u64, u64) void = null,
 
     pub fn emit(self: Sink, event: Event) void {
         self.emit_fn(self.context, event);
@@ -157,6 +161,12 @@ pub const Sink = struct {
     /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.
     pub fn endSpan(self: Sink, span: Span) void {
         if (self.end_span_fn) |f| f(self.context, span);
+    }
+
+    /// Report byte progress on an open span (`total` 0 = size not yet known).
+    /// Safe to call from any thread; a no-op when unsupported.
+    pub fn updateSpan(self: Sink, span: Span, downloaded: u64, total: u64) void {
+        if (self.update_span_fn) |f| f(self.context, span, downloaded, total);
     }
 
     pub fn begin(self: Sink, stage: Stage, subject: []const u8) void {
