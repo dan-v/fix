@@ -497,6 +497,52 @@ test "evaluate getFlake builtin for local path ref" {
     try std.testing.expectEqualStrings(flake_dir, ev.intern.get(self_path.asInternId()));
 }
 
+test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)" {
+    // Three flakes: c (leaf), b (input c via a follows path), root (inputs b + c).
+    // Exercises transitive resolution, `follows` arrays, and diamond memoization
+    // (c is shared by root and b, fetched once).
+    var tc = std.testing.tmpDir(.{});
+    defer tc.cleanup();
+    var tb = std.testing.tmpDir(.{});
+    defer tb.cleanup();
+    var tr = std.testing.tmpDir(.{});
+    defer tr.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_c = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tc.sub_path });
+    defer std.testing.allocator.free(dir_c);
+    const dir_b = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tb.sub_path });
+    defer std.testing.allocator.free(dir_b);
+    const dir_r = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tr.sub_path });
+    defer std.testing.allocator.free(dir_r);
+
+    try tc.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { c = 3; }; }" });
+    try tb.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ inputs.c.url = \"path:/x\"; outputs = i: { b = 2; cVal = i.c.c; }; }" });
+    try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { bVal = i.b.b; bTransitiveC = i.b.cVal; cVal = i.c.c; }; }" });
+
+    const lock = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{ "nodes": {{
+        \\  "root": {{ "inputs": {{ "b": "b", "c": "c" }} }},
+        \\  "b": {{ "inputs": {{ "c": ["c"] }}, "locked": {{ "type": "path", "path": "{s}" }}, "original": {{ "type": "path", "path": "{s}" }} }},
+        \\  "c": {{ "locked": {{ "type": "path", "path": "{s}" }}, "original": {{ "type": "path", "path": "{s}" }} }}
+        \\}}, "root": "root", "version": 7 }}
+    , .{ dir_b, dir_b, dir_c, dir_c });
+    defer std.testing.allocator.free(lock);
+    try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.lock", .data = lock });
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.flakes_enabled = true;
+
+    inline for (.{ .{ "bVal", 2 }, .{ "bTransitiveC", 3 }, .{ "cVal", 3 } }) |q| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").{s}", .{ dir_r, q[0] });
+        defer std.testing.allocator.free(src);
+        try std.testing.expectEqual(@as(i64, q[1]), (try ev.evaluate(src)).asInt());
+    }
+}
+
 test "flake builtins are gated on the flakes experimental feature" {
     // getFlake / parseFlakeRef / flakeRefToString are hard-gated (uncatchable
     // by tryEval), like Nix. Without the feature they error before doing work.
