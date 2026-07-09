@@ -3,7 +3,7 @@
 //! (frame / chunk-entry / tightest-span-for-ip) shared with the timeline.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
-const chunk = @import("../bytecode.zig").chunk;
+const chunk = @import("bytecode").chunk;
 const diagnostic = @import("syntax").diagnostic;
 
 const VM = vm_mod.VM;

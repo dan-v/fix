@@ -52,7 +52,7 @@ const eval_trace = @import("observ").trace;
 const prof = @import("../probe/prof.zig");
 const timeline = @import("../probe/timeline.zig");
 // Used only by the test fixture below.
-const bytecode = @import("../bytecode.zig");
+const bytecode = @import("bytecode");
 const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;

@@ -13,7 +13,7 @@ const Value = @import("runtime").value.Value;
 const gc = @import("runtime").gc;
 const vma_mod = @import("runtime").vma;
 const block_cache = @import("runtime").block_cache;
-const bytecode = @import("../bytecode.zig");
+const bytecode = @import("bytecode");
 
 /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
 /// where the memory actually goes (the tracked object stores are only part

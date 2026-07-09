@@ -4,7 +4,7 @@ const std = @import("std");
 const vm_mod = @import("../vm.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const chunk = @import("../bytecode.zig").chunk;
+const chunk = @import("bytecode").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
 

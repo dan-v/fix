@@ -10,7 +10,7 @@ const types = @import("runtime").types;
 const thunk_mod = @import("runtime").thunk;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
-const bytecode_mod = @import("../bytecode.zig");
+const bytecode_mod = @import("bytecode");
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");

@@ -119,6 +119,18 @@ pub fn build(b: *std.Build) void {
     });
     observ_mod.addImport("syntax", syntax_mod);
 
+    // Bytecode IR: the instruction set, chunk encoding/registry, disassembler.
+    // A leaf of the eval engine — depends only on runtime types.
+    const bytecode_mod = b.addModule("bytecode", .{
+        .root_source_file = b.path("src/bytecode.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    bytecode_mod.addImport("build_options", build_options_mod);
+    bytecode_mod.addImport("runtime", runtime_mod);
+
     const mod = b.addModule("fix", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -136,6 +148,7 @@ pub fn build(b: *std.Build) void {
         .observ = observ_mod,
     };
     addSharedImports(mod, shared_imports);
+    mod.addImport("bytecode", bytecode_mod);
 
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),
@@ -235,6 +248,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const bytecode_tests = b.addTest(.{
+        .root_module = bytecode_mod,
+        .use_llvm = true,
+    });
+    const run_bytecode_tests = b.addRunArtifact(bytecode_tests);
+
     // Module-boundary import lint (tools/lint_imports.zig). Catches relative
     // imports that reach into a clean-cut module's files instead of going
     // through `@import("<module>")` — those silently duplicate-compile.
@@ -260,6 +279,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_derivation_tests.step);
     test_step.dependOn(&run_containers_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_bytecode_tests.step);
 
     const check_step = b.step("check", "Run unit tests");
     check_step.dependOn(test_step);
