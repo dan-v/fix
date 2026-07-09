@@ -26,23 +26,34 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 
 ## The module DAG
 
-The build (`build.zig`, see [build](build.md)) arranges the code as an acyclic graph of Zig modules. Each module exposes a single facade file; reaching into another module's internals by relative path is a lint error (`zig build lint`) — and would silently duplicate-compile those files into a second, incompatible copy of their types. Every dependency arrow points down:
+The source tree is three tiers, each answering "what am I looking at": `src/base/` (generic, reusable infrastructure with zero Nix coupling), `src/nix/` (the evaluator itself), and `src/cli/` + `src/main.zig` (the command-line app). Each subsystem is a Zig module reached by name through a single facade; reaching into another module's internals by relative path is a lint error (`zig build lint`), and would silently duplicate-compile those files into a second, incompatible copy of their types. The lint also enforces a **down-only** rule — every import points to a strictly lower layer — so the tree tells you what a file may safely reach.
 
 ```
-containers   syntax   runtime   parallel   derivation      (leaf subsystems)
-                 observ                    → syntax
-   bytecode                               → runtime
-   probe                                  → bytecode, runtime, parallel
-   compiler                               → bytecode, runtime, syntax, probe
-   vm                                     → bytecode, compiler, runtime, parallel,
-                                            derivation, observ, probe, syntax
-   fix  (src/root.zig)                    → all of the above
-   cli                                    → fix
+src/base/    one `base` module — generic infrastructure, nothing Nix-specific:
+             lock-free deque + cache-line isolation, the stackful fiber, spin/
+             blocking mutexes, segmented + flat stores, the mmap RSS tracker
+             Vma(Tag), the block-cache allocator, a regex engine, a TOML parser.
+
+src/nix/     the evaluator — one module per subsystem, layered:
+   syntax                    → (parser tables)
+   runtime                   → base        Nix value model, heap, thunk/Future,
+                                            interning, GC tracer, the MemTag taxonomy
+   observ                    → syntax       progress sink + error-trace collector
+   scheduler   derivation    → runtime, base
+   bytecode                  → runtime, base
+   probe                     → bytecode, runtime, base
+   compiler                  → bytecode, runtime, syntax, probe, base
+   vm                        → compiler, bytecode, scheduler, derivation,
+                                observ, probe, runtime, syntax, base
+   fix (src/nix/root.zig)    → all of nix + base   the Evaluator (composes the
+                                                    pipeline, owns shared state)
+
+src/cli/     the `cli` module + `src/main.zig`  → fix
 ```
 
-Eleven of these are lint-enforced modules: `containers` (lock-free deques shared by the GC and scheduler), `syntax`, `runtime`, `parallel`, `derivation`, `observ` (the progress/trace sinks the interpreter writes to), `bytecode` (the instruction set + chunk encoding), `probe` (opt-in diagnostics), `compiler`, `vm`, and `cli`. The `fix` module (`src/root.zig`) is the top layer — the `Evaluator` orchestration: it owns the shared state, composes the pipeline, and drives evaluation. `cli` and the executable import `fix` by name.
+`base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
 
-The layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution engine — the threaded dispatcher, thunk forcing, the fiber worker pool, and the builtins — and `fix` composes it all into the `Evaluator`. The VM's on-demand compilation of deferred thunk bodies calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* `vm` alongside the force path, so the force↔worker relationship is intra-module cohesion rather than a cycle. See [build](build.md).
+Within `nix` the layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution engine — the threaded dispatcher, thunk forcing, the fiber worker pool, the builtins; `fix` composes it into the `Evaluator`. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* `vm` next to the force path, so force↔worker is intra-module. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 
