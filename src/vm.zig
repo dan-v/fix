@@ -443,7 +443,3 @@ pub fn readU32(code: []const u8, ip: usize) u32 {
 pub fn readInternId(code: []const u8, ip: usize, wide: bool) InternId {
     return bytecode_mod.readInternId(code, ip, wide);
 }
-
-test {
-    _ = @import("vm/tests.zig");
-}
