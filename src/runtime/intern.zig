@@ -16,6 +16,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const stable = @import("stable_segments.zig");
+const mem_tag = @import("mem_tag.zig");
 const InternId = types.InternId;
 
 const Entry = struct {
@@ -24,8 +25,8 @@ const Entry = struct {
     len: u32,
 };
 
-const EntryStore = stable.StableSegments(Entry, .{ .first_segment_size = 256 });
-const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 });
+const EntryStore = stable.StableSegments(Entry, .{ .first_segment_size = 256 }, mem_tag.vma);
+const ByteStore = stable.StableSegments(u8, .{ .first_segment_size = 4096 }, mem_tag.vma);
 
 const SHARD_COUNT: u32 = 64;
 const SHARD_MASK: u64 = SHARD_COUNT - 1;

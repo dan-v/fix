@@ -24,7 +24,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const SpinMutex = @import("stable_segments.zig").SpinMutex;
-const vma = @import("vma.zig");
 
 const MIN_LOG2: u6 = 16; // 64 KB — the smallest block class
 const CLASS_COUNT: usize = 11; // 64 KB .. 64 MB
@@ -60,166 +59,175 @@ fn classOf(len: usize) ?usize {
 /// inside the `fix:bigblock` smaps bucket.
 pub var retained_bytes: std.atomic.Value(usize) = .init(0);
 
-pub const BlockCacheAllocator = struct {
-    backing: Allocator,
-    mu: SpinMutex = .{},
-    blocks: [CLASS_COUNT][MAX_PER_CLASS][*]u8 = undefined,
-    counts: [CLASS_COUNT]u8 = @splat(0),
+/// The reuse cache is generic over an instantiated `Vma` region-tracker
+/// (see runtime/vma.zig): it registers/retags/unregisters its backing
+/// mappings through `Vma.*` so `FIX_MEM_REPORT` can attribute them, but
+/// carries no knowledge of the app's tag taxonomy itself. Instantiate with
+/// the shared `mem_tag.vma`.
+pub fn BlockCacheAllocator(comptime Vma: type) type {
+    return struct {
+        const Self = @This();
 
-    pub fn init(backing: Allocator) BlockCacheAllocator {
-        return .{ .backing = backing };
-    }
+        backing: Allocator,
+        mu: SpinMutex = .{},
+        blocks: [CLASS_COUNT][MAX_PER_CLASS][*]u8 = undefined,
+        counts: [CLASS_COUNT]u8 = @splat(0),
 
-    /// Release every retained block back to the backing allocator.
-    pub fn deinit(self: *BlockCacheAllocator) void {
-        for (0..CLASS_COUNT) |class| {
-            const size = classSize(class);
-            for (self.blocks[class][0..self.counts[class]]) |ptr| {
-                vma.unregisterRegion(ptr);
-                self.backing.rawFree(ptr[0..size], block_alignment, @returnAddress());
-                _ = retained_bytes.fetchSub(size, .monotonic);
+        pub fn init(backing: Allocator) Self {
+            return .{ .backing = backing };
+        }
+
+        /// Release every retained block back to the backing allocator.
+        pub fn deinit(self: *Self) void {
+            for (0..CLASS_COUNT) |class| {
+                const size = classSize(class);
+                for (self.blocks[class][0..self.counts[class]]) |ptr| {
+                    Vma.unregisterRegion(ptr);
+                    self.backing.rawFree(ptr[0..size], block_alignment, @returnAddress());
+                    _ = retained_bytes.fetchSub(size, .monotonic);
+                }
+                self.counts[class] = 0;
             }
-            self.counts[class] = 0;
         }
-    }
 
-    pub fn allocator(self: *BlockCacheAllocator) Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    /// Class blocks come from the backing allocator's large path
-    /// (PageAllocator), which returns page-aligned memory; any request
-    /// with alignment above this passes through uncached.
-    const block_alignment: Alignment = .fromByteUnits(std.heap.page_size_min);
-
-    const vtable: Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    /// Past SmpAllocator's direct-map threshold, a backing allocation is
-    /// its own mmap and worth tracking for RSS attribution (see
-    /// runtime/vma.zig); below it rides a shared slab.
-    fn trackable(len: usize) bool {
-        return len > DIRECT_MAP_OVER;
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *BlockCacheAllocator = @ptrCast(@alignCast(ctx));
-        if (alignment.toByteUnits() > std.heap.page_size_min) {
-            const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
-            if (ptr != null and trackable(len)) vma.registerRegion(ptr.?, len, vma.alloc_tag);
-            return ptr;
+        pub fn allocator(self: *Self) Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
         }
-        const class = classOf(len) orelse {
-            const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
-            // Outside the class range; >64 MB is still a dedicated mapping.
-            if (ptr != null and trackable(len)) vma.registerRegion(ptr.?, len, vma.alloc_tag);
-            return ptr;
+
+        /// Class blocks come from the backing allocator's large path
+        /// (PageAllocator), which returns page-aligned memory; any request
+        /// with alignment above this passes through uncached.
+        const block_alignment: Alignment = .fromByteUnits(std.heap.page_size_min);
+
+        const vtable: Allocator.VTable = .{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
         };
-        self.mu.lock();
-        if (self.counts[class] > 0) {
-            self.counts[class] -= 1;
-            const ptr = self.blocks[class][self.counts[class]];
+
+        /// Past SmpAllocator's direct-map threshold, a backing allocation is
+        /// its own mmap and worth tracking for RSS attribution (see
+        /// runtime/vma.zig); below it rides a shared slab.
+        fn trackable(len: usize) bool {
+            return len > DIRECT_MAP_OVER;
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (alignment.toByteUnits() > std.heap.page_size_min) {
+                const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
+                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.alloc_tag);
+                return ptr;
+            }
+            const class = classOf(len) orelse {
+                const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
+                // Outside the class range; >64 MB is still a dedicated mapping.
+                if (ptr != null and trackable(len)) Vma.registerRegion(ptr.?, len, Vma.alloc_tag);
+                return ptr;
+            };
+            self.mu.lock();
+            if (self.counts[class] > 0) {
+                self.counts[class] -= 1;
+                const ptr = self.blocks[class][self.counts[class]];
+                self.mu.unlock();
+                _ = retained_bytes.fetchSub(classSize(class), .monotonic);
+                // Reused block: hand it the current owner's attribution tag.
+                if (Vma.alloc_tag != Vma.default_tag) Vma.retagRegion(ptr, Vma.alloc_tag);
+                return ptr;
+            }
             self.mu.unlock();
-            _ = retained_bytes.fetchSub(classSize(class), .monotonic);
-            // Reused block: hand it the current owner's attribution tag.
-            if (vma.alloc_tag != .bigblock) vma.retagRegion(ptr, vma.alloc_tag);
+            const ptr = self.backing.rawAlloc(classSize(class), block_alignment, ret_addr);
+            // Registered once per backing mmap (cache hits skip this): these
+            // blocks back the parse/compile arenas, retained AST arenas, and
+            // builtin temp buffers — one bucket for "large allocator blocks".
+            // Store segments re-tag themselves on claim (stable_segments.zig).
+            if (ptr != null) Vma.registerRegion(ptr.?, classSize(class), Vma.alloc_tag);
             return ptr;
         }
-        self.mu.unlock();
-        const ptr = self.backing.rawAlloc(classSize(class), block_alignment, ret_addr);
-        // Registered once per backing mmap (cache hits skip this): these
-        // blocks back the parse/compile arenas, retained AST arenas, and
-        // builtin temp buffers — one bucket for "large allocator blocks".
-        // Store segments re-tag themselves on claim (stable_segments.zig).
-        if (ptr != null) vma.registerRegion(ptr.?, classSize(class), vma.alloc_tag);
-        return ptr;
-    }
 
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *BlockCacheAllocator = @ptrCast(@alignCast(ctx));
-        if (alignment.toByteUnits() > std.heap.page_size_min) {
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (alignment.toByteUnits() > std.heap.page_size_min) {
+                return self.trackResize(self.backing.rawResize(memory, alignment, new_len, ret_addr), memory, new_len);
+            }
+            const old_class = classOf(memory.len);
+            const new_class = classOf(new_len);
+            if (old_class != null or new_class != null) {
+                // In place iff the block's class capacity already covers the new
+                // length. A backing-owned block (null old class) must never grow
+                // in place into the cacheable range — its capacity is unknown.
+                if (old_class == null or new_class == null) return false;
+                return old_class.? == new_class.?;
+            }
             return self.trackResize(self.backing.rawResize(memory, alignment, new_len, ret_addr), memory, new_len);
         }
-        const old_class = classOf(memory.len);
-        const new_class = classOf(new_len);
-        if (old_class != null or new_class != null) {
-            // In place iff the block's class capacity already covers the new
-            // length. A backing-owned block (null old class) must never grow
-            // in place into the cacheable range — its capacity is unknown.
-            if (old_class == null or new_class == null) return false;
-            return old_class.? == new_class.?;
-        }
-        return self.trackResize(self.backing.rawResize(memory, alignment, new_len, ret_addr), memory, new_len);
-    }
 
-    /// Keep the attribution registry in step with an in-place resize of a
-    /// backing-owned (pass-through) block whose registered length changed.
-    fn trackResize(self: *BlockCacheAllocator, ok: bool, memory: []u8, new_len: usize) bool {
-        _ = self;
-        if (ok and (trackable(memory.len) or trackable(new_len))) {
-            vma.unregisterRegion(memory.ptr);
-            if (trackable(new_len)) vma.registerRegion(memory.ptr, new_len, vma.alloc_tag);
+        /// Keep the attribution registry in step with an in-place resize of a
+        /// backing-owned (pass-through) block whose registered length changed.
+        fn trackResize(self: *Self, ok: bool, memory: []u8, new_len: usize) bool {
+            _ = self;
+            if (ok and (trackable(memory.len) or trackable(new_len))) {
+                Vma.unregisterRegion(memory.ptr);
+                if (trackable(new_len)) Vma.registerRegion(memory.ptr, new_len, Vma.alloc_tag);
+            }
+            return ok;
         }
-        return ok;
-    }
 
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *BlockCacheAllocator = @ptrCast(@alignCast(ctx));
-        if (alignment.toByteUnits() > std.heap.page_size_min) {
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (alignment.toByteUnits() > std.heap.page_size_min) {
+                return self.trackRemap(self.backing.rawRemap(memory, alignment, new_len, ret_addr), memory, new_len);
+            }
+            const old_class = classOf(memory.len);
+            const new_class = classOf(new_len);
+            if (old_class != null or new_class != null) {
+                if (old_class == null or new_class == null) return null;
+                return if (old_class.? == new_class.?) memory.ptr else null;
+            }
             return self.trackRemap(self.backing.rawRemap(memory, alignment, new_len, ret_addr), memory, new_len);
         }
-        const old_class = classOf(memory.len);
-        const new_class = classOf(new_len);
-        if (old_class != null or new_class != null) {
-            if (old_class == null or new_class == null) return null;
-            return if (old_class.? == new_class.?) memory.ptr else null;
-        }
-        return self.trackRemap(self.backing.rawRemap(memory, alignment, new_len, ret_addr), memory, new_len);
-    }
 
-    /// Registry bookkeeping for a pass-through remap (may move the block).
-    fn trackRemap(self: *BlockCacheAllocator, new_ptr: ?[*]u8, memory: []u8, new_len: usize) ?[*]u8 {
-        _ = self;
-        if (new_ptr != null and (trackable(memory.len) or trackable(new_len))) {
-            vma.unregisterRegion(memory.ptr);
-            if (trackable(new_len)) vma.registerRegion(new_ptr.?, new_len, vma.alloc_tag);
+        /// Registry bookkeeping for a pass-through remap (may move the block).
+        fn trackRemap(self: *Self, new_ptr: ?[*]u8, memory: []u8, new_len: usize) ?[*]u8 {
+            _ = self;
+            if (new_ptr != null and (trackable(memory.len) or trackable(new_len))) {
+                Vma.unregisterRegion(memory.ptr);
+                if (trackable(new_len)) Vma.registerRegion(new_ptr.?, new_len, Vma.alloc_tag);
+            }
+            return new_ptr;
         }
-        return new_ptr;
-    }
 
-    fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
-        const self: *BlockCacheAllocator = @ptrCast(@alignCast(ctx));
-        if (alignment.toByteUnits() > std.heap.page_size_min) {
-            if (trackable(memory.len)) vma.unregisterRegion(memory.ptr);
-            return self.backing.rawFree(memory, alignment, ret_addr);
-        }
-        const class = classOf(memory.len) orelse {
-            if (trackable(memory.len)) vma.unregisterRegion(memory.ptr);
-            return self.backing.rawFree(memory, alignment, ret_addr);
-        };
-        self.mu.lock();
-        if (self.counts[class] < class_caps[class]) {
-            self.blocks[class][self.counts[class]] = memory.ptr;
-            self.counts[class] += 1;
+        fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (alignment.toByteUnits() > std.heap.page_size_min) {
+                if (trackable(memory.len)) Vma.unregisterRegion(memory.ptr);
+                return self.backing.rawFree(memory, alignment, ret_addr);
+            }
+            const class = classOf(memory.len) orelse {
+                if (trackable(memory.len)) Vma.unregisterRegion(memory.ptr);
+                return self.backing.rawFree(memory, alignment, ret_addr);
+            };
+            self.mu.lock();
+            if (self.counts[class] < class_caps[class]) {
+                self.blocks[class][self.counts[class]] = memory.ptr;
+                self.counts[class] += 1;
+                self.mu.unlock();
+                _ = retained_bytes.fetchAdd(classSize(class), .monotonic);
+                // Parked, not returned to the OS: keep it registered, but
+                // drop any subsystem-specific tag it picked up while in use.
+                Vma.retagRegion(memory.ptr, Vma.default_tag);
+                return;
+            }
             self.mu.unlock();
-            _ = retained_bytes.fetchAdd(classSize(class), .monotonic);
-            // Parked, not returned to the OS: keep it registered, but
-            // drop any subsystem-specific tag it picked up while in use.
-            vma.retagRegion(memory.ptr, .bigblock);
-            return;
+            Vma.unregisterRegion(memory.ptr);
+            self.backing.rawFree(memory.ptr[0..classSize(class)], block_alignment, ret_addr);
         }
-        self.mu.unlock();
-        vma.unregisterRegion(memory.ptr);
-        self.backing.rawFree(memory.ptr[0..classSize(class)], block_alignment, ret_addr);
-    }
-};
+    };
+}
 
 test "block cache: round-trips and reuses a large block" {
-    var cache = BlockCacheAllocator.init(std.testing.allocator);
+    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 
@@ -236,7 +244,7 @@ test "block cache: round-trips and reuses a large block" {
 }
 
 test "block cache: small and huge allocations pass through" {
-    var cache = BlockCacheAllocator.init(std.testing.allocator);
+    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 
@@ -247,7 +255,7 @@ test "block cache: small and huge allocations pass through" {
 }
 
 test "block cache: in-place resize allowed only within one class" {
-    var cache = BlockCacheAllocator.init(std.testing.allocator);
+    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 

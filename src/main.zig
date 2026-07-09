@@ -15,6 +15,7 @@ const args = cli.args;
 const run = cli.run;
 const trace_setup = cli.trace_setup;
 const block_cache = @import("runtime").block_cache;
+const mem_tag = @import("runtime").mem_tag;
 const Evaluator = fix.Evaluator;
 
 const usage = args.usage;
@@ -44,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     // maps/unmaps every >=64KB allocation, and the eval's ~9K large
     // temporaries otherwise re-minor-fault ~2GB of pages per run (>20% of
     // w=1 wall in fault handling). See runtime/block_cache.zig.
-    var big_blocks = block_cache.BlockCacheAllocator.init(init.gpa);
+    var big_blocks = block_cache.BlockCacheAllocator(mem_tag.vma).init(init.gpa);
     defer big_blocks.deinit();
     const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();
 

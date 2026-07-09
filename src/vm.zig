@@ -57,7 +57,7 @@ pub const OpcodeCounts = [opcode.count]u64;
 const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
 const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
-const vma = @import("runtime").vma;
+const vma = @import("runtime").mem_tag.vma;
 const PatternCache = @import("runtime").regex.PatternCache;
 
 /// Reusable VM buffers — the value stack + frame stack, the two large

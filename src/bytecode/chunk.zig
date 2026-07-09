@@ -545,7 +545,7 @@ pub const ChunkRegistry = struct {
         spec_submitted: std.atomic.Value(u8) = .init(0),
     };
 
-    const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 });
+    const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     allocator: std.mem.Allocator,
     chunks: Store,

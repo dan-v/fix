@@ -102,7 +102,7 @@ pub const Entry = struct {
 };
 
 pub const Table = struct {
-    const Store = stable.StableSegments(*Entry, .{ .first_segment_size = 64 });
+    const Store = stable.StableSegments(*Entry, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
     allocator: std.mem.Allocator,
     entries: Store = .empty,

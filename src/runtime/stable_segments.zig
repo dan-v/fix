@@ -16,7 +16,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vma = @import("vma.zig");
 
 /// Spinlock built on `std.atomic.Mutex`. Short critical sections only —
 /// writers on the storage primitives below are O(allocator call) at most.
@@ -92,22 +91,38 @@ pub const BlockingMutex = struct {
     }
 };
 
-pub const Params = struct {
-    /// Size of segment 0 in slots. Must be a power of two ≥ 1.
-    first_segment_size: u32,
-    /// Cap on the number of segments. Total addressable slots is
-    /// `first_segment_size * (2^segment_count - 1)`.
-    segment_count: u6 = 28,
-    /// RSS-attribution tag for this store's segments (see
-    /// runtime/vma.zig): a claimed segment is re-tagged from the
-    /// allocator's generic "bigblock" bucket to the store's own, so
-    /// `FIX_MEM_REPORT` can tell the stores apart. Only segments big
-    /// enough to be dedicated mappings (≥64 KB) are tagged; smaller
-    /// early segments ride allocator slabs and keep the slab's identity.
-    vma_tag: ?vma.Tag = null,
-};
+/// `StableSegments` parameters, generic over the injected `Vma`
+/// instantiation so `vma_tag` can name the app's attribution enum without
+/// this generic store depending on the taxonomy (see runtime/vma.zig,
+/// runtime/mem_tag.zig).
+pub fn Params(comptime Vma: type) type {
+    return struct {
+        /// Size of segment 0 in slots. Must be a power of two ≥ 1.
+        first_segment_size: u32,
+        /// Cap on the number of segments. Total addressable slots is
+        /// `first_segment_size * (2^segment_count - 1)`.
+        segment_count: u6 = 28,
+        /// RSS-attribution tag for this store's segments (see
+        /// runtime/vma.zig): a claimed segment is re-tagged from the
+        /// allocator's generic "bigblock" bucket to the store's own, so
+        /// `FIX_MEM_REPORT` can tell the stores apart. Only segments big
+        /// enough to be dedicated mappings (≥64 KB) are tagged; smaller
+        /// early segments ride allocator slabs and keep the slab's identity.
+        vma_tag: ?Vma.Tag = null,
+    };
+}
 
-pub fn StableSegments(comptime T: type, comptime params: Params) type {
+pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vma: type) type {
+    // `params_in` is an anonymous struct literal whose `vma_tag` (if any) is an
+    // enum literal; copy it into a typed `Params(Vma)` so defaults apply and
+    // `vma_tag` is resolved against the injected `Vma.Tag`. A struct value can't
+    // coerce across the `anytype` boundary, so copy field-by-field.
+    const params: Params(Vma) = blk: {
+        var p: Params(Vma) = .{ .first_segment_size = params_in.first_segment_size };
+        if (@hasField(@TypeOf(params_in), "segment_count")) p.segment_count = params_in.segment_count;
+        if (@hasField(@TypeOf(params_in), "vma_tag")) p.vma_tag = params_in.vma_tag;
+        break :blk p;
+    };
     comptime {
         if (T == void) @compileError("StableSegments(void) is unsupported");
         if (params.first_segment_size == 0) @compileError("first_segment_size must be > 0");
@@ -373,7 +388,7 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
             if (comptime params.vma_tag) |tag| {
                 const bytes = buf.len * @sizeOf(T);
                 if (bytes < (64 << 10)) return;
-                vma.retagRegion(buf.ptr, tag);
+                Vma.retagRegion(buf.ptr, tag);
             }
         }
 
@@ -517,16 +532,18 @@ pub fn StableSegments(comptime T: type, comptime params: Params) type {
     };
 }
 
-pub const FlatParams = struct {
-    /// Virtual address space to reserve, in slots. The whole region is
-    /// mapped up front (MAP_NORESERVE — only touched pages cost physical
-    /// memory) and never relocated, so a slot's address is stable for the
-    /// store's lifetime and reads need no synchronization on the base.
-    max_slots: u32,
-    /// RSS-attribution tag for the reservation (see `Params.vma_tag`);
-    /// registered at init since the flat store owns its mmap directly.
-    vma_tag: ?vma.Tag = null,
-};
+pub fn FlatParams(comptime Vma: type) type {
+    return struct {
+        /// Virtual address space to reserve, in slots. The whole region is
+        /// mapped up front (MAP_NORESERVE — only touched pages cost physical
+        /// memory) and never relocated, so a slot's address is stable for the
+        /// store's lifetime and reads need no synchronization on the base.
+        max_slots: u32,
+        /// RSS-attribution tag for the reservation (see `Params.vma_tag`);
+        /// registered at init since the flat store owns its mmap directly.
+        vma_tag: ?Vma.Tag = null,
+    };
+}
 
 /// Append-only flat storage backed by a single mmap-reserved contiguous
 /// region. A drop-in replacement for `StableSegments` *for flat-id*
@@ -542,7 +559,14 @@ pub const FlatParams = struct {
 ///   - `reserve` bumps `cursor` under `write_mu`; concurrent readers only
 ///     ever touch ids already published through the value/state release
 ///     that made them reachable, which happens-after the slot was filled.
-pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
+pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: type) type {
+    // See `StableSegments`: copy the anonymous literal into a typed
+    // `FlatParams(Vma)` so `vma_tag` resolves against the injected `Vma.Tag`.
+    const params: FlatParams(Vma) = blk: {
+        var p: FlatParams(Vma) = .{ .max_slots = params_in.max_slots };
+        if (@hasField(@TypeOf(params_in), "vma_tag")) p.vma_tag = params_in.vma_tag;
+        break :blk p;
+    };
     comptime {
         if (T == void) @compileError("FlatStore(void) is unsupported");
         if (params.max_slots == 0) @compileError("max_slots must be > 0");
@@ -580,7 +604,7 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
                 -1,
                 0,
             ) catch return error.OutOfMemory;
-            if (comptime params.vma_tag) |tag| vma.registerRegion(mem.ptr, BYTES, tag);
+            if (comptime params.vma_tag) |tag| Vma.registerRegion(mem.ptr, BYTES, tag);
             return .{
                 .base = @ptrCast(@alignCast(mem.ptr)),
                 .cursor = .init(0),
@@ -593,7 +617,7 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
         /// owns mmap memory, not allocator memory, so it's ignored.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             _ = allocator;
-            if (comptime params.vma_tag != null) vma.unregisterRegion(self.base);
+            if (comptime params.vma_tag != null) Vma.unregisterRegion(self.base);
             const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
             std.posix.munmap(bytes[0..BYTES]);
             self.cursor.store(0, .monotonic);
@@ -660,9 +684,19 @@ pub fn FlatStore(comptime T: type, comptime params: FlatParams) type {
 
 const page_size_min = std.heap.page_size_min;
 
+/// A throwaway `Vma` instantiation for the tests below (none of which tag
+/// their stores, so the taxonomy is irrelevant — they just need a type to
+/// satisfy the `Vma` parameter).
+const TestTag = enum { none };
+const TestVma = @import("vma.zig").Vma(TestTag, .none, struct {
+    fn n(_: TestTag) [:0]const u8 {
+        return "none";
+    }
+}.n);
+
 test "stable segments: append and get" {
     const allocator = std.testing.allocator;
-    var seg = StableSegments(u32, .{ .first_segment_size = 4 }).empty;
+    var seg = StableSegments(u32, .{ .first_segment_size = 4 }, TestVma).empty;
     defer seg.deinit(allocator);
 
     var i: u32 = 0;
@@ -679,7 +713,7 @@ test "stable segments: append and get" {
 
 test "stable segments: reserve spans multiple segments" {
     const allocator = std.testing.allocator;
-    var seg = StableSegments(u8, .{ .first_segment_size = 4 }).empty;
+    var seg = StableSegments(u8, .{ .first_segment_size = 4 }, TestVma).empty;
     defer seg.deinit(allocator);
 
     const r1 = try seg.reserve(allocator, 3);
@@ -704,7 +738,7 @@ test "stable segments: reserve spans multiple segments" {
 
 test "stable segments: rollback within current segment" {
     const allocator = std.testing.allocator;
-    var seg = StableSegments(u32, .{ .first_segment_size = 8 }).empty;
+    var seg = StableSegments(u32, .{ .first_segment_size = 8 }, TestVma).empty;
     defer seg.deinit(allocator);
 
     _ = try seg.append(allocator, 1);
@@ -723,7 +757,7 @@ test "stable segments: rollback within current segment" {
 
 test "stable segments: rollback after segment-skip leaves earlier slots stranded" {
     const allocator = std.testing.allocator;
-    var seg = StableSegments(u32, .{ .first_segment_size = 4 }).empty;
+    var seg = StableSegments(u32, .{ .first_segment_size = 4 }, TestVma).empty;
     defer seg.deinit(allocator);
 
     _ = try seg.append(allocator, 1);
@@ -740,7 +774,7 @@ test "stable segments: rollback after segment-skip leaves earlier slots stranded
 }
 
 test "stable segments: locationOf round-trips" {
-    const Seg = StableSegments(u32, .{ .first_segment_size = 4 });
+    const Seg = StableSegments(u32, .{ .first_segment_size = 4 }, TestVma);
     var id: u32 = 0;
     while (id < 200) : (id += 1) {
         const loc = Seg.locationOf(id);
@@ -754,7 +788,7 @@ test "stable segments: locationOf round-trips" {
 }
 
 test "stable segments: concurrent appends are race-free" {
-    const Seg = StableSegments(u64, .{ .first_segment_size = 16 });
+    const Seg = StableSegments(u64, .{ .first_segment_size = 16 }, TestVma);
     const allocator = std.testing.allocator;
     var seg = Seg.empty;
     defer seg.deinit(allocator);
@@ -791,7 +825,7 @@ test "stable segments: concurrent appends are race-free" {
 }
 
 test "flat store: reserve, fill, get round-trip" {
-    var store = try FlatStore(u64, .{ .max_slots = 4096 }).init();
+    var store = try FlatStore(u64, .{ .max_slots = 4096 }, TestVma).init();
     defer store.deinit(std.testing.allocator);
 
     var i: u32 = 0;
@@ -809,7 +843,7 @@ test "flat store: reserve, fill, get round-trip" {
 }
 
 test "flat store: multi-slot reservation is contiguous" {
-    const Store = FlatStore(u32, .{ .max_slots = 256 });
+    const Store = FlatStore(u32, .{ .max_slots = 256 }, TestVma);
     var store = try Store.init();
     defer store.deinit(std.testing.allocator);
 
@@ -822,7 +856,7 @@ test "flat store: multi-slot reservation is contiguous" {
 }
 
 test "flat store: reserve past capacity errors without relocating" {
-    var store = try FlatStore(u32, .{ .max_slots = 8 }).init();
+    var store = try FlatStore(u32, .{ .max_slots = 8 }, TestVma).init();
     defer store.deinit(std.testing.allocator);
 
     const r = try store.reserve(std.testing.allocator, 8);
@@ -834,7 +868,7 @@ test "flat store: reserve past capacity errors without relocating" {
 }
 
 test "flat store: concurrent reserves are race-free" {
-    const Store = FlatStore(u64, .{ .max_slots = 4096 });
+    const Store = FlatStore(u64, .{ .max_slots = 4096 }, TestVma);
     var store = try Store.init();
     defer store.deinit(std.testing.allocator);
 

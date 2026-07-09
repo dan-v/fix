@@ -11,7 +11,8 @@ const builtin = @import("builtin");
 const heap_mod = @import("runtime").heap;
 const Value = @import("runtime").value.Value;
 const gc = @import("runtime").gc;
-const vma_mod = @import("runtime").vma;
+const mem_tag = @import("runtime").mem_tag;
+const vma_mod = mem_tag.vma;
 const block_cache = @import("runtime").block_cache;
 const bytecode = @import("bytecode");
 
@@ -83,7 +84,7 @@ pub fn report(ev: anytype) void {
     inline for (0..vma_mod.tag_count) |ti| {
         const tag: vma_mod.Tag = @enumFromInt(ti);
         p("  {s:<16}{d:>8.1} MB  ({d} regions, {d:.0} MB reserved)\n", .{
-            vma_mod.tagName(tag), mb(res.rss_bytes[ti]), res.regions[ti], mb(res.reserved_bytes[ti]),
+            mem_tag.tagName(tag), mb(res.rss_bytes[ti]), res.regions[ti], mb(res.reserved_bytes[ti]),
         });
     }
     p("  {s:<16}{d:>8.1} MB  (of fix:bigblock; parked on free stacks)\n", .{ "block-cache", mb(retained_blocks) });

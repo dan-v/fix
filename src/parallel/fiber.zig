@@ -32,7 +32,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const vma = @import("runtime").vma;
 
 comptime {
     if (builtin.cpu.arch != .x86_64) {
@@ -179,10 +178,10 @@ pub const Fiber = struct {
         ) catch return error.OutOfMemory;
         const stack: []u8 = stack_raw[0..aligned_len];
         errdefer std.posix.munmap(@alignCast(stack));
-        // RSS attribution (see runtime/vma.zig): fiber stacks are the
-        // process's most numerous big mappings; untracked they'd merge
-        // into anonymous blobs no report can attribute.
-        vma.registerRegion(stack.ptr, stack.len, .fiber_stack);
+        // RSS attribution for the stack (fiber stacks are the process's most
+        // numerous big mappings) is done by the *owner* that creates/destroys
+        // fibers — see src/vm/worker.zig — not here, so the fiber primitive
+        // stays free of the app's tag taxonomy.
         if (comptime stack_probe_enabled) {
             // Probe mode: pay the eager-commit cost so the watermark
             // scan in `maxStackUsedBytes` can identify untouched pages.
@@ -218,8 +217,8 @@ pub const Fiber = struct {
     pub fn deinit(self: *Fiber, allocator: std.mem.Allocator) void {
         _ = allocator;
         // A live fiber whose stack is freed will crash on resume; the
-        // caller must arrange shutdown semantics.
-        vma.unregisterRegion(self.stack.ptr);
+        // caller must arrange shutdown semantics. RSS un-registration of the
+        // stack is the owner's job (see src/vm/worker.zig).
         std.posix.munmap(@alignCast(self.stack));
         self.* = undefined;
     }

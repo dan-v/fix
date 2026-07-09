@@ -47,6 +47,7 @@ const vm_errors = @import("errors.zig");
 const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
+const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
 const eval_trace = @import("observ").trace;
 const prof = @import("probe").prof;
@@ -271,6 +272,7 @@ pub const Worker = struct {
         var prewarmed: u8 = 0;
         errdefer {
             for (self.fibers.items) |f| {
+                mem_tag.vma.unregisterRegion(f.inner.stack.ptr);
                 f.inner.deinit(allocator);
                 f.vm.deinit();
                 allocator.destroy(f);
@@ -301,6 +303,7 @@ pub const Worker = struct {
             const stack_used = f.inner.maxStackUsedBytes();
             if (stack_used > max_fiber_stack) max_fiber_stack = @intCast(stack_used);
             if (f.vm.sp_high_water > max_vm_sp) max_vm_sp = f.vm.sp_high_water;
+            mem_tag.vma.unregisterRegion(f.inner.stack.ptr);
             f.inner.deinit(self.allocator);
             f.vm.deinit();
             f.scratch.deinit();
@@ -903,7 +906,15 @@ pub const Worker = struct {
         errdefer f.vm.deinit();
 
         f.inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
-        errdefer f.inner.deinit(self.allocator);
+        // RSS attribution: the owner (this worker) registers the fiber stack —
+        // fiber.zig no longer does it, keeping the primitive free of the tag
+        // taxonomy. Registered when the stack is committed, unregistered when
+        // it is munmapped (both teardown paths + this errdefer).
+        mem_tag.vma.registerRegion(f.inner.stack.ptr, f.inner.stack.len, .fiber_stack);
+        errdefer {
+            mem_tag.vma.unregisterRegion(f.inner.stack.ptr);
+            f.inner.deinit(self.allocator);
+        }
 
         f.vm.claimer_id = thunk_mod.makeClaimer(fiber_id);
         // Speculative work captures only the throw message for sticky
