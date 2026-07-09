@@ -160,6 +160,26 @@ pub fn build(b: *std.Build) void {
     compiler_mod.addImport("bytecode", bytecode_mod);
     compiler_mod.addImport("probe", probe_mod);
 
+    // The tail-calling bytecode VM: the evaluation engine's execution core
+    // (dispatch, builtins, forcing, worker fibers). Depends on the compiler
+    // (deferred-attr compilation) and probe, plus the runtime/parallel leaves.
+    const vm_mod = b.addModule("vm", .{
+        .root_source_file = b.path("src/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    vm_mod.addImport("build_options", build_options_mod);
+    vm_mod.addImport("runtime", runtime_mod);
+    vm_mod.addImport("syntax", syntax_mod);
+    vm_mod.addImport("parallel", parallel_mod);
+    vm_mod.addImport("derivation", derivation_mod);
+    vm_mod.addImport("observ", observ_mod);
+    vm_mod.addImport("bytecode", bytecode_mod);
+    vm_mod.addImport("compiler", compiler_mod);
+    vm_mod.addImport("probe", probe_mod);
+
     const mod = b.addModule("fix", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -180,6 +200,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("bytecode", bytecode_mod);
     mod.addImport("probe", probe_mod);
     mod.addImport("compiler", compiler_mod);
+    mod.addImport("vm", vm_mod);
 
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli.zig"),

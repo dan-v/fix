@@ -24,7 +24,7 @@ const std = @import("std");
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
 const fiber_mod = @import("parallel").fiber;
-const worker_mod = @import("worker.zig");
+const worker_mod = @import("vm").worker;
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
 const timeline = @import("probe").timeline;
 

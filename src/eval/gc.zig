@@ -20,8 +20,8 @@ const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_gc = @import("runtime").heap.heap_gc;
 const thunk_mod = @import("runtime").thunk;
-const vm_force = @import("../vm/force.zig");
-const vm_access = @import("../vm/access.zig");
+const vm_force = @import("vm").force;
+const vm_access = @import("vm").access;
 const timeline = @import("probe").timeline;
 
 /// Cap on the number of participants in a single collection's mark+evac.

@@ -18,7 +18,7 @@ const fiber_mod = @import("parallel").fiber;
 const sched_mod = @import("parallel").scheduler;
 const ContKind = sched_mod.ContKind;
 const Continuation = sched_mod.Continuation;
-const worker_mod = @import("../eval/worker.zig");
+const worker_mod = @import("worker.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");

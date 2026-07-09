@@ -3,7 +3,7 @@
 //! after evaluation; off the hot path and compiled out of default builds.
 
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("vm");
 const opcode = @import("bytecode").opcode;
 
 const OpcodeCountEntry = struct {

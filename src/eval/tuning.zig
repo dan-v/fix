@@ -10,9 +10,9 @@
 
 const std = @import("std");
 const scheduler_mod = @import("parallel").scheduler;
-const worker_mod = @import("worker.zig");
-const vm_closures = @import("../vm/closures.zig");
-const vm_force = @import("../vm/force.zig");
+const worker_mod = @import("vm").worker;
+const vm_closures = @import("vm").closures;
+const vm_force = @import("vm").force;
 
 /// Resolve and apply the scheduler/speculation tuning knobs to `ev`.
 pub fn apply(ev: anytype) void {

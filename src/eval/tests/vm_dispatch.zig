@@ -13,7 +13,7 @@ const testing = std.testing;
 
 const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
-const vm_mod = @import("../../vm.zig");
+const vm_mod = @import("vm");
 const VM = vm_mod.VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -21,9 +21,9 @@ const heap_mod = @import("runtime").heap;
 const bytecode = @import("bytecode");
 const ChunkBuilder = bytecode.ChunkBuilder;
 const OpCode = bytecode.OpCode;
-const closures = @import("../../vm/closures.zig");
-const stack = @import("../../vm/stack.zig");
-const equality = @import("../../vm/equality.zig");
+const closures = @import("vm").closures;
+const stack = @import("vm").stack;
+const equality = @import("vm").equality;
 
 /// A live Evaluator plus a bare VM sharing its registry/heap/intern
 /// state. `evaluate("null")` on the Evaluator first drives the normal
@@ -243,7 +243,7 @@ test "build_list constructs a list value from stack items" {
 
 // ---- attrset/list merge opcodes (objects.zig) ----
 
-const objects_mod = @import("../../vm/objects.zig");
+const objects_mod = @import("vm").objects;
 
 test "merge_attrs lets the right-hand side override a colliding key" {
     var h = try Harness.init();
@@ -409,7 +409,7 @@ test "pushFrame surfaces StackOverflow when locals exceed remaining capacity" {
 
 // ---- strings.zig: real logic (interned-string concatenation) ----
 
-const strings_mod = @import("../../vm/strings.zig");
+const strings_mod = @import("vm").strings;
 
 test "concatInternedString interns the concatenation of two interned strings" {
     var h = try Harness.init();
