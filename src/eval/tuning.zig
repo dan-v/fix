@@ -9,7 +9,7 @@
 //! because it references evaluator-private callbacks.
 
 const std = @import("std");
-const scheduler_mod = @import("parallel").scheduler;
+const scheduler_mod = @import("scheduler");
 const worker_mod = @import("vm").worker;
 const vm_closures = @import("vm").closures;
 const vm_force = @import("vm").force;

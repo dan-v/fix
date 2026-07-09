@@ -82,22 +82,31 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("build_options", build_options_mod);
     runtime_mod.addImport("containers", containers_mod);
 
-    const parallel_mod = b.addModule("parallel", .{
-        .root_source_file = b.path("src/parallel.zig"),
+    const fiber_mod = b.addModule("fiber", .{
+        .root_source_file = b.path("src/fiber.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    parallel_mod.addImport("build_options", build_options_mod);
-    parallel_mod.addImport("runtime", runtime_mod);
-    parallel_mod.addImport("containers", containers_mod);
+    fiber_mod.addImport("build_options", build_options_mod);
     // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
-    // resolved target. Lives with the fiber code in the parallel module.
+    // resolved target. Lives with the fiber code.
     switch (target.result.cpu.arch) {
-        .x86_64 => parallel_mod.addAssemblyFile(b.path("src/parallel/fiber/swap_x86_64.S")),
+        .x86_64 => fiber_mod.addAssemblyFile(b.path("src/fiber/swap_x86_64.S")),
         else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
     }
+
+    const scheduler_mod = b.addModule("scheduler", .{
+        .root_source_file = b.path("src/scheduler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    scheduler_mod.addImport("build_options", build_options_mod);
+    scheduler_mod.addImport("runtime", runtime_mod);
+    scheduler_mod.addImport("containers", containers_mod);
 
     const derivation_mod = b.addModule("derivation", .{
         .root_source_file = b.path("src/derivation.zig"),
@@ -142,7 +151,8 @@ pub fn build(b: *std.Build) void {
     });
     probe_mod.addImport("build_options", build_options_mod);
     probe_mod.addImport("runtime", runtime_mod);
-    probe_mod.addImport("parallel", parallel_mod);
+    probe_mod.addImport("fiber", fiber_mod);
+    probe_mod.addImport("scheduler", scheduler_mod);
     probe_mod.addImport("bytecode", bytecode_mod);
 
     // AST → bytecode compiler. Consumes the syntax AST and emits into the
@@ -173,7 +183,8 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("build_options", build_options_mod);
     vm_mod.addImport("runtime", runtime_mod);
     vm_mod.addImport("syntax", syntax_mod);
-    vm_mod.addImport("parallel", parallel_mod);
+    vm_mod.addImport("fiber", fiber_mod);
+    vm_mod.addImport("scheduler", scheduler_mod);
     vm_mod.addImport("derivation", derivation_mod);
     vm_mod.addImport("observ", observ_mod);
     vm_mod.addImport("bytecode", bytecode_mod);
@@ -191,7 +202,8 @@ pub fn build(b: *std.Build) void {
         .build_options = build_options_mod,
         .syntax = syntax_mod,
         .runtime = runtime_mod,
-        .parallel = parallel_mod,
+        .fiber = fiber_mod,
+        .scheduler = scheduler_mod,
         .derivation = derivation_mod,
         .containers = containers_mod,
         .observ = observ_mod,
@@ -258,7 +270,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // `runtime`, `syntax`, `parallel`, `derivation`, and `containers` are each
+    // `runtime`, `syntax`, `fiber`, `scheduler`, `derivation`, and `containers` are each
     // separate modules (clean-cut subsystems, see the comment above
     // `syntax_mod`), so their unit tests aren't collected by the root-module
     // test artifacts above — Zig only walks a module's own `@import` graph,
@@ -282,11 +294,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_syntax_tests = b.addRunArtifact(syntax_tests);
 
-    const parallel_tests = b.addTest(.{
-        .root_module = parallel_mod,
+    const fiber_tests = b.addTest(.{
+        .root_module = fiber_mod,
         .use_llvm = true,
     });
-    const run_parallel_tests = b.addRunArtifact(parallel_tests);
+    const run_fiber_tests = b.addRunArtifact(fiber_tests);
+
+    const scheduler_tests = b.addTest(.{
+        .root_module = scheduler_mod,
+        .use_llvm = true,
+    });
+    const run_scheduler_tests = b.addRunArtifact(scheduler_tests);
 
     const derivation_tests = b.addTest(.{
         .root_module = derivation_mod,
@@ -339,7 +357,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
-    test_step.dependOn(&run_parallel_tests.step);
+    test_step.dependOn(&run_fiber_tests.step);
+    test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
     test_step.dependOn(&run_containers_tests.step);
     test_step.dependOn(&run_cli_tests.step);
@@ -374,7 +393,8 @@ const SharedImports = struct {
     build_options: *std.Build.Module,
     syntax: *std.Build.Module,
     runtime: *std.Build.Module,
-    parallel: *std.Build.Module,
+    fiber: *std.Build.Module,
+    scheduler: *std.Build.Module,
     derivation: *std.Build.Module,
     containers: *std.Build.Module,
     observ: *std.Build.Module,
@@ -384,7 +404,8 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("build_options", imports.build_options);
     module.addImport("syntax", imports.syntax);
     module.addImport("runtime", imports.runtime);
-    module.addImport("parallel", imports.parallel);
+    module.addImport("fiber", imports.fiber);
+    module.addImport("scheduler", imports.scheduler);
     module.addImport("derivation", imports.derivation);
     module.addImport("containers", imports.containers);
     module.addImport("observ", imports.observ);

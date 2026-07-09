@@ -20,7 +20,7 @@ const vm_builtins = @import("builtins.zig");
 const prof = @import("probe").prof;
 const prof_census = @import("probe").prof_census;
 const gc = @import("runtime").gc;
-const sched_mod = @import("parallel").scheduler;
+const sched_mod = @import("scheduler");
 const heap_mod = @import("runtime").heap;
 
 const VM = vm_mod.VM;

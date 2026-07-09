@@ -10,7 +10,7 @@ const fix = @import("fix");
 const Evaluator = fix.Evaluator;
 const prof = fix.probe.prof;
 const prof_path = fix.probe.prof_path;
-const scheduler = @import("parallel").scheduler;
+const scheduler = @import("scheduler");
 
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
