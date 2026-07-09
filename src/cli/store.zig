@@ -13,6 +13,7 @@ const usage =
     \\  info                 connect to the daemon and print protocol version + trust
     \\  is-valid PATH        print whether PATH is a valid store path
     \\  query-valid PATH...  print the subset of PATHs the daemon considers valid
+    \\  add-text NAME TEXT   add TEXT to the store as NAME; print the store path
     \\
     \\  -h, --help           show this help
     \\
@@ -31,6 +32,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     if (std.mem.eql(u8, sub, "info")) return runInfo(allocator, init);
     if (std.mem.eql(u8, sub, "is-valid")) return runIsValid(allocator, init, args_iter);
     if (std.mem.eql(u8, sub, "query-valid")) return runQueryValid(allocator, init, args_iter);
+    if (std.mem.eql(u8, sub, "add-text")) return runAddText(allocator, init, args_iter);
 
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });
     return 2;
@@ -95,6 +97,27 @@ fn runQueryValid(allocator: std.mem.Allocator, init: std.process.Init, args_iter
     var stdout_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     for (valid) |p| try w.interface.print("{s}\n", .{p});
+    try w.interface.flush();
+    return 0;
+}
+
+fn runAddText(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const name = args_iter.next() orelse {
+        std.debug.print("error: add-text needs NAME and TEXT\n\n{s}", .{usage});
+        return 2;
+    };
+    const text = args_iter.next() orelse {
+        std.debug.print("error: add-text needs TEXT\n\n{s}", .{usage});
+        return 2;
+    };
+    const daemon = try connect(allocator, init);
+    defer daemon.deinit();
+
+    const path = daemon.addTextToStore(allocator, name, text, &.{}) catch |err| return reportDaemonError(daemon, err);
+    defer allocator.free(path);
+    var stdout_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+    try w.interface.print("{s}\n", .{path});
     try w.interface.flush();
     return 0;
 }

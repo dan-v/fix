@@ -130,6 +130,45 @@ pub const DaemonStore = struct {
         return try wire.readStrings(allocator, self.r());
     }
 
+    /// Add `text` to the store as a text-addressed object named `name`
+    /// (`references` are full store paths it refers to). This is what a `.drv`
+    /// file and `builtins.toFile` need. Returns the resulting `/nix/store/...`
+    /// path (owned by `allocator`). Idempotent: an already-present object just
+    /// returns its path.
+    ///
+    /// Uses the modern `AddToStore` op with text ingestion rather than the
+    /// legacy `AddTextToStore` (op 8) — Lix rejects op 8 once the negotiated
+    /// protocol is >= 1.25, so op 8 is not portable across Lix/Nix. The content
+    /// is streamed raw through the framed sink; the daemon hashes it under the
+    /// `text:sha256` scheme (same addressing as `builtins.toFile`/`.drv`
+    /// paths).
+    pub fn addTextToStore(self: *DaemonStore, allocator: std.mem.Allocator, name: []const u8, text: []const u8, references: []const []const u8) ![]u8 {
+        try self.beginOp(.add_to_store);
+        try wire.writeString(self.w(), name);
+        try wire.writeString(self.w(), "text:sha256");
+        try wire.writeStrings(self.w(), references);
+        try wire.writeBool(self.w(), false); // repair
+        try self.writeFramed(text);
+        try self.flushAndDrain();
+        // The response is a ValidPathInfo whose first field is the path (a bare
+        // path in older daemons); reading one string yields the store path in
+        // both shapes. We use a fresh connection per op for now, so any trailing
+        // ValidPathInfo fields are left unread harmlessly. TODO: consume the
+        // full record once connections are reused across a forced eval.
+        return try wire.readString(allocator, self.r());
+    }
+
+    /// Stream `data` through the worker protocol's framed sink: one
+    /// `[u64 len][bytes]` frame followed by a zero-length terminator frame.
+    /// Frame payloads are raw (not 8-byte padded like protocol strings).
+    fn writeFramed(self: *DaemonStore, data: []const u8) !void {
+        if (data.len != 0) {
+            try wire.writeInt(self.w(), data.len);
+            try self.w().writeAll(data);
+        }
+        try wire.writeInt(self.w(), 0);
+    }
+
     // --- op plumbing ------------------------------------------------------
 
     fn beginOp(self: *DaemonStore, op: wire.Op) !void {
@@ -169,7 +208,9 @@ pub const DaemonStore = struct {
         _ = try wire.readInt(self.r()); // level
         try wire.skipString(self.r()); // name (ignored)
         const msg = try wire.readString(self.allocator, self.r());
-        errdefer self.allocator.free(msg);
+        // Deliberately no errdefer-free on `msg`: it becomes `last_error`, which
+        // we keep across the `error.DaemonError` return (an errdefer here would
+        // free the buffer we just stored and leave a dangling `last_error`).
         _ = try wire.readInt(self.r()); // havePos (0)
         const n_traces = try wire.readInt(self.r());
         if (n_traces > wire.max_wire_len) return error.WireListTooLong;
