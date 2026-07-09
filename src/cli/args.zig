@@ -244,6 +244,10 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
         } else if (std.mem.startsWith(u8, arg, "--timeline-flows=")) {
             const v = arg["--timeline-flows=".len..];
             options.timeline_flows = if (std.mem.eql(u8, v, "off")) 0 else if (std.mem.eql(u8, v, "all")) 1 else (std.fmt.parseInt(u32, v, 10) catch return error.UnknownOption);
+        } else if (std.mem.eql(u8, arg, "--")) {
+            // End of options: leave the rest in the iterator (e.g. `fix run`
+            // forwards them as program arguments).
+            break;
         } else {
             return error.UnknownOption;
         }

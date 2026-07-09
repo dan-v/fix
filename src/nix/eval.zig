@@ -832,12 +832,34 @@ pub const Evaluator = struct {
     fn derivationAttrPath(self: *Evaluator, value: Value, attr_name: []const u8) !?[]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
-        const name_id = try self.intern.intern(attr_name);
-        const attr = (try self.heap.getAttrValueOpt(forced.asObjectId(), name_id)) orelse return null;
-        const path_value = try self.forceValue(attr);
-        const text_id = switch (path_value.kind()) {
-            .string, .path => path_value.asInternId(),
-            .string_context => (try self.heap.getContextString(path_value.asObjectId())).text,
+        return self.forcedStringAttr(forced.asObjectId(), attr_name);
+    }
+
+    /// The name of the program `fix run` should exec from a derivation's output:
+    /// `meta.mainProgram`, else `pname`, else `name`. Borrowed from intern.
+    pub fn derivationProgram(self: *Evaluator, value: Value) !?[]const u8 {
+        const forced = try self.forceValue(value);
+        if (!forced.isAttrs()) return null;
+        const id = forced.asObjectId();
+        if (try self.heap.getAttrValueOpt(id, try self.intern.intern("meta"))) |meta| {
+            const meta_forced = try self.forceValue(meta);
+            if (meta_forced.isAttrs()) {
+                if (try self.forcedStringAttr(meta_forced.asObjectId(), "mainProgram")) |main| return main;
+            }
+        }
+        if (try self.forcedStringAttr(id, "pname")) |pname| return pname;
+        return self.forcedStringAttr(id, "name");
+    }
+
+    /// Force attribute `name` of `id` and return its text (string/path/context),
+    /// or null if absent or non-string. Borrowed from the intern table.
+    fn forcedStringAttr(self: *Evaluator, id: types.ObjectId, name: []const u8) !?[]const u8 {
+        const name_id = try self.intern.intern(name);
+        const attr = (try self.heap.getAttrValueOpt(id, name_id)) orelse return null;
+        const forced = try self.forceValue(attr);
+        const text_id = switch (forced.kind()) {
+            .string, .path => forced.asInternId(),
+            .string_context => (try self.heap.getContextString(forced.asObjectId())).text,
             else => return null,
         };
         return self.intern.get(text_id);
