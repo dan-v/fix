@@ -108,12 +108,36 @@ pub const Count = struct {
     total: usize,
 };
 
+/// Opaque handle to a *concurrent* (non-nested) progress span — one standalone
+/// progress node that may be opened on one thread/fiber and closed on another.
+/// Unlike the `begin`/`end` stage spans (which drive a single-writer LIFO stack
+/// owned by the demand fiber), a `Span` node is independent, so store-writes and
+/// other work that happens off the demand path can report progress safely. The
+/// CLI encodes its render node into `token`; the evaluator treats it as opaque.
+pub const Span = struct { token: usize };
+
 pub const Sink = struct {
     context: *anyopaque,
     emit_fn: *const fn (*anyopaque, Event) void,
+    /// Open/close a concurrent span. Both null when the sink doesn't support
+    /// them (then `beginSpan` returns null and `endSpan` is a no-op).
+    begin_span_fn: ?*const fn (*anyopaque, []const u8) Span = null,
+    end_span_fn: ?*const fn (*anyopaque, Span) void = null,
 
     pub fn emit(self: Sink, event: Event) void {
         self.emit_fn(self.context, event);
+    }
+
+    /// Open a concurrent (non-nested) span. Thread-safe: the returned handle can
+    /// be closed with `endSpan` from any thread. Returns null if unsupported.
+    pub fn beginSpan(self: Sink, subject: []const u8) ?Span {
+        const f = self.begin_span_fn orelse return null;
+        return f(self.context, subject);
+    }
+
+    /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.
+    pub fn endSpan(self: Sink, span: Span) void {
+        if (self.end_span_fn) |f| f(self.context, span);
     }
 
     pub fn begin(self: Sink, stage: Stage, subject: []const u8) void {

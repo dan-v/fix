@@ -17,6 +17,7 @@ const attrsets = @import("attrsets.zig");
 const serial = @import("serial.zig");
 const shared = @import("shared.zig");
 const strings = @import("strings.zig");
+const eval_progress = @import("observ").progress;
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
@@ -175,8 +176,14 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     const drv_name_id = try stringTextInternId(self, name_value);
     const drv_name = self.intern.get(drv_name_id);
 
-    if (self.progress) |progress| progress.begin(.derivation, drv_name);
-    defer if (self.progress) |progress| progress.end(.derivation, drv_name);
+    // The `.derivation` span drives the demand fiber's single-writer LIFO stage
+    // stack, so only emit it on the demand path (`is_demand`) — a speculative
+    // derivation force on a helper fiber interleaving pushes/pops here corrupts
+    // the stack (mis-paired `Node.end` → std.Progress render-future UAF). This
+    // matches `progressEligible()`, which gates parse/compile/evaluate the same.
+    const drv_progress = if (self.is_demand) self.progress else null;
+    if (drv_progress) |progress| progress.begin(.derivation, drv_name);
+    defer if (drv_progress) |progress| progress.end(.derivation, drv_name);
 
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
@@ -204,8 +211,18 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     // were forced (hence written) during `normalizeDerivation` above, so their
     // paths are already valid references — correct topological order for free.
     if (self.derivations.store_writes_enabled) {
-        if (self.progress) |progress| progress.begin(.store, drv_name);
-        defer if (self.progress) |progress| progress.end(.store, drv_name);
+        // A store write can happen off the demand fiber, so report it as an
+        // independent concurrent span (its own render node, safe to open/close
+        // from any thread) rather than on the demand-only stage stack.
+        var store_span: ?eval_progress.Span = null;
+        if (self.progress) |progress| {
+            var name_buf: [128]u8 = undefined;
+            const label = std.fmt.bufPrint(&name_buf, "writing {s}.drv", .{drv_name}) catch drv_name;
+            store_span = progress.beginSpan(label);
+        }
+        defer if (store_span) |sp| {
+            if (self.progress) |progress| progress.endSpan(sp);
+        };
 
         const aterm = try normalized.drv.toATerm(self.allocator, false, null);
         defer self.allocator.free(aterm);

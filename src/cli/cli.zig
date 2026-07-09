@@ -281,6 +281,8 @@ pub const EvalProgress = struct {
         return .{
             .context = self,
             .emit_fn = emit,
+            .begin_span_fn = beginSpan,
+            .end_span_fn = endSpan,
         };
     }
 
@@ -290,6 +292,25 @@ pub const EvalProgress = struct {
     pub fn childNode(self: *EvalProgress, name: []const u8) std.Progress.Node {
         const parent = self.run_node orelse self.root;
         return parent.start(name[0..@min(name.len, std.Progress.Node.max_name_len)], 0);
+    }
+
+    /// Concurrent-span support (see `eval_progress.Span`). A span is a single
+    /// standalone `std.Progress` node under the run node — allocated/freed via
+    /// the lock-free node freelist, so it is safe to open on one thread/fiber
+    /// and close on another (unlike the single-writer `active[]` stage stack).
+    /// A `std.Progress.Node` is just its `index`, so we round-trip it losslessly
+    /// through the opaque token with no allocation. Node-storage exhaustion
+    /// yields `Node.none`, whose `.end()` is a safe no-op.
+    fn beginSpan(context: *anyopaque, subject: []const u8) eval_progress.Span {
+        const self: *EvalProgress = @ptrCast(@alignCast(context));
+        const node = self.childNode(subject);
+        return .{ .token = @intFromEnum(node.index) };
+    }
+
+    fn endSpan(context: *anyopaque, span: eval_progress.Span) void {
+        _ = context;
+        const node: std.Progress.Node = .{ .index = @enumFromInt(@as(u8, @intCast(span.token))) };
+        node.end();
     }
 
     fn emit(context: *anyopaque, event: eval_progress.Event) void {
