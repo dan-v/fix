@@ -13,8 +13,8 @@ const source_paths = @import("derivation").source_path;
 const closures = @import("closures.zig");
 const force = @import("force.zig");
 const trace = @import("trace.zig");
-const prof = @import("../probe/prof.zig");
-const prof_census = @import("../probe/prof_census.zig");
+const prof = @import("probe").prof;
+const prof_census = @import("probe").prof_census;
 
 const VM = vm_mod.VM;
 

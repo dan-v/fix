@@ -24,7 +24,7 @@ const stack = @import("stack.zig");
 const trace = @import("trace.zig");
 const force = @import("force.zig");
 const trace_log = @import("trace_log.zig");
-const prof = @import("../probe/prof.zig");
+const prof = @import("probe").prof;
 const run_mod = @import("run.zig");
 
 const VM = vm_mod.VM;

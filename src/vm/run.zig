@@ -28,8 +28,8 @@ const opcode = bytecode_mod.opcode;
 const OpCode = opcode.OpCode;
 const heap_mod = @import("runtime").heap;
 const numeric = @import("runtime").numeric;
-const prof = @import("../probe/prof.zig");
-const prof_census = @import("../probe/prof_census.zig");
+const prof = @import("probe").prof;
+const prof_census = @import("probe").prof_census;
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");

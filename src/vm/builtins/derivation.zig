@@ -23,7 +23,7 @@ const vm_strings = @import("../strings.zig");
 const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
-const prof = @import("../../probe/prof.zig");
+const prof = @import("probe").prof;
 
 const allOutputsContextValue = string_context.allOutputsContextValue;
 const appendContextEntry = string_context.appendContextEntry;

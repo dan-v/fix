@@ -22,7 +22,7 @@ const heap_gc = @import("runtime").heap.heap_gc;
 const thunk_mod = @import("runtime").thunk;
 const vm_force = @import("../vm/force.zig");
 const vm_access = @import("../vm/access.zig");
-const timeline = @import("../probe/timeline.zig");
+const timeline = @import("probe").timeline;
 
 /// Cap on the number of participants in a single collection's mark+evac.
 /// The eval still runs `worker_count`-wide; only the STW mark/evac is

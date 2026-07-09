@@ -26,7 +26,7 @@ const thunk_mod = @import("runtime").thunk;
 const fiber_mod = @import("parallel").fiber;
 const worker_mod = @import("worker.zig");
 const SpinMutex = @import("runtime").stable_segments.SpinMutex;
-const timeline = @import("../probe/timeline.zig");
+const timeline = @import("probe").timeline;
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly
 /// during lookup/insert; the entry's own `Future` coordinates the

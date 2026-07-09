@@ -41,7 +41,7 @@ const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const intern_mod = @import("runtime").intern;
 const chunk_mod = @import("bytecode").chunk;
-const prof = @import("../probe/prof.zig");
+const prof = @import("probe").prof;
 const diagnostics = @import("diagnostics.zig");
 
 const Node = ast.Node;

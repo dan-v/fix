@@ -34,7 +34,7 @@ const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("runtime").worker_id;
 const DeferredTable = @import("compiler/deferred_table.zig").Table;
-const ThunkTrace = @import("probe/thunk_trace.zig").ThunkTrace;
+const ThunkTrace = @import("probe").thunk_trace.ThunkTrace;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
