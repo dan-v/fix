@@ -745,14 +745,19 @@ pub const Evaluator = struct {
             &self.fetchers,
             &self.derivations,
             &self.scheduler,
-            // Helpers (worker_id != 0) don't write to the shared trace or
-            // emit progress events. Both are observable side effects of
-            // *real* evaluation — speculative force must stay invisible to
-            // them. `std.Progress.Node.start` in particular asserts a
-            // single-writer invariant on the parent slot which speculation
-            // would violate.
+            // Helpers (worker_id != 0) don't write to the shared trace —
+            // it's a side effect of *real* evaluation, so speculative force
+            // stays invisible to it.
             if (worker_id == 0) &self.run.trace else null,
-            if (worker_id == 0) self.progress else null,
+            // All workers get the progress sink, but only for the *concurrent
+            // span* channel (`beginSpan`/`endSpan` — store writes, fetches),
+            // whose std.Progress nodes are independent and lock-free-safe from
+            // any thread. The single-writer LIFO stage stack (begin/end/count)
+            // stays demand-fiber-only: every stage emit is gated on `is_demand`
+            // (`progressEligible()`, and the `.derivation` span), and the count
+            // path (`progressCount`) is reached only from the demand result
+            // walk — so no helper ever touches `active[]`.
+            self.progress,
             if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
             // concurrency-shaped wrong-result bugs needs to see every

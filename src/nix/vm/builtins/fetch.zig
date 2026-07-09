@@ -14,6 +14,7 @@ const derivation = @import("derivation");
 const nar = @import("runtime").nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("derivation").source_path;
+const eval_progress = @import("observ").progress;
 const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
@@ -208,10 +209,27 @@ fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.Fet
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
+/// Open a concurrent "fetching <subject>" progress span. Fetches run on
+/// whatever fiber forces them (often off the demand path), so this uses the
+/// thread-safe concurrent-span channel — its node is independent of the demand
+/// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
+fn fetchSpanBegin(self: anytype, subject: []const u8) ?eval_progress.Span {
+    const progress = self.progress orelse return null;
+    var buf: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, "fetching {s}", .{subject}) catch subject;
+    return progress.beginSpan(label);
+}
+
+fn fetchSpanEnd(self: anytype, span: ?eval_progress.Span) void {
+    if (span) |sp| if (self.progress) |progress| progress.endSpan(sp);
+}
+
 pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
+    const span = fetchSpanBegin(self, spec.url);
+    defer fetchSpanEnd(self, span);
     const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return gitResultValue(self, spec.name, result);
@@ -306,6 +324,8 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
 
+    const span = fetchSpanBegin(self, spec.url);
+    defer fetchSpanEnd(self, span);
     const result = try self.fetchers.fetchUrl(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
@@ -352,6 +372,8 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
 
+    const span = fetchSpanBegin(self, spec.url);
+    defer fetchSpanEnd(self, span);
     const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
     defer self.fetchers.allocator.free(path);
     // The unpacked tree is named "source" by default (Nix), independent of the
@@ -393,6 +415,8 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
     const spec = try fetchMercurialSpec(self, arg);
     defer spec.deinit(self.allocator);
 
+    const span = fetchSpanBegin(self, spec.url);
+    defer fetchSpanEnd(self, span);
     const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return mercurialResultValue(self, spec.name, result);
@@ -503,6 +527,11 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     const attrs_id = attrs.asObjectId();
     const type_value = try requiredStringAttr(self, attrs_id, "type");
     defer self.allocator.free(type_value);
+
+    // One span for the whole tree fetch (the network branches below); the
+    // local `path` branch is fast, so a brief span there is harmless.
+    const span = fetchSpanBegin(self, type_value);
+    defer fetchSpanEnd(self, span);
 
     if (std.mem.eql(u8, type_value, "path")) {
         const path = try dupPathAttr(self, attrs_id, "path");
