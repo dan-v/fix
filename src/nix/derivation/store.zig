@@ -62,6 +62,12 @@ pub const DerivationStore = struct {
     /// socket; `instantiated` de-dupes writes across re-forces.
     daemon: ?*rstore.DaemonStore = null,
     daemon_mu: stable.BlockingMutex = .{},
+    /// Store paths we've already ensured are present this run — either because
+    /// we wrote them, or because a pre-write `isValidPath` confirmed the daemon
+    /// already has them. Both cases mean a re-force can skip re-sending the
+    /// bytes. Empty at process start, so the first force of an already-present
+    /// path pays one cheap `isValidPath` round-trip instead of streaming the
+    /// whole text/NAR the daemon would just hash and discard.
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
     io: ?std.Io = null,
     daemon_socket: []const u8 = rstore.default_socket_path,
@@ -161,6 +167,7 @@ pub const DerivationStore = struct {
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return;
         const daemon = try self.ensureDaemon();
+        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
         const written = try daemon.addFlatFile(self.allocator, storePathName(store_path), bytes, &.{});
         self.allocator.free(written);
         try self.markInstantiated(store_path);
@@ -180,6 +187,7 @@ pub const DerivationStore = struct {
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return;
         const daemon = try self.ensureDaemon();
+        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
         const written = try daemon.addTextToStore(self.allocator, storePathName(store_path), text, references);
         self.allocator.free(written);
         try self.markInstantiated(store_path);
@@ -190,6 +198,7 @@ pub const DerivationStore = struct {
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return;
         const daemon = try self.ensureDaemon();
+        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
         const written = try daemon.addPath(self.allocator, storePathName(store_path), nar_bytes, &.{});
         self.allocator.free(written);
         try self.markInstantiated(store_path);
