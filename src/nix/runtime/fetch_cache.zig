@@ -36,6 +36,12 @@ pub const FetchCache = struct {
 
     const TokenEntry = struct { host: []u8, token: []u8 };
 
+    /// The forge whose token-header convention applies to a download. Like Nix,
+    /// `access-tokens` only authenticate forge (and git) fetches, not arbitrary
+    /// `fetchurl`/`fetchTarball`; the header format is per-forge (see
+    /// `authHeader`). Null on a spec = no token, ever.
+    pub const Forge = enum { github, gitlab, sourcehut };
+
     const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
 
@@ -50,11 +56,13 @@ pub const FetchCache = struct {
     pub const UrlSpec = struct {
         url: []const u8,
         name: []const u8,
+        forge: ?Forge = null,
     };
 
     pub const TarballSpec = struct {
         url: []const u8,
         name: []const u8 = "source",
+        forge: ?Forge = null,
     };
 
     pub const MercurialSpec = struct {
@@ -185,6 +193,53 @@ pub const FetchCache = struct {
         return best;
     }
 
+    /// An owned HTTP header for an authenticated forge request.
+    pub const AuthHeader = struct {
+        name: []u8,
+        value: []u8,
+        fn deinit(self: AuthHeader, allocator: std.mem.Allocator) void {
+            allocator.free(self.name);
+            allocator.free(self.value);
+        }
+    };
+
+    /// Build the `access-tokens` auth header for a `forge` request to `url`, per
+    /// Nix's per-forge conventions (`libfetchers/github.cc:accessHeaderFromToken`):
+    ///   - github:    `Authorization: token <tok>`
+    ///   - sourcehut: `Authorization: Bearer <tok>`
+    ///   - gitlab:    token is `<type>:<value>`; `OAuth2:` → `Authorization:
+    ///     Bearer <value>`, `PAT:` → `Private-token: <value>`, any other type →
+    ///     header `<type>: <value>` (a bare, colon-less token yields the Nix
+    ///     degenerate `<token>:` empty-value header). Null if no token matches.
+    fn authHeader(self: *const FetchCache, forge: Forge, url: []const u8) !?AuthHeader {
+        const token = self.tokenFor(url) orelse return null;
+        const alloc = self.allocator;
+        return switch (forge) {
+            .github => .{
+                .name = try alloc.dupe(u8, "Authorization"),
+                .value = try std.fmt.allocPrint(alloc, "token {s}", .{token}),
+            },
+            .sourcehut => .{
+                .name = try alloc.dupe(u8, "Authorization"),
+                .value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token}),
+            },
+            .gitlab => blk: {
+                const colon = std.mem.indexOfScalar(u8, token, ':');
+                const kind = if (colon) |c| token[0..c] else token;
+                const value = if (colon) |c| token[c + 1 ..] else "";
+                if (std.mem.eql(u8, kind, "OAuth2")) break :blk .{
+                    .name = try alloc.dupe(u8, "Authorization"),
+                    .value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}),
+                };
+                if (std.mem.eql(u8, kind, "PAT")) break :blk .{
+                    .name = try alloc.dupe(u8, "Private-token"),
+                    .value = try alloc.dupe(u8, value),
+                };
+                break :blk .{ .name = try alloc.dupe(u8, kind), .value = try alloc.dupe(u8, value) };
+            },
+        };
+    }
+
     /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
     pub fn setMaxConnections(self: *FetchCache, n: u32) void {
         self.max_connections = n;
@@ -221,7 +276,7 @@ pub const FetchCache = struct {
 
     pub fn fetchUrl(self: *FetchCache, files: *FileCache, spec: UrlSpec, reporter: ?Reporter) !UrlResult {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const body = try self.fetchUrlBytes(files, spec.url, reporter);
+        const body = try self.fetchUrlBytes(files, spec.url, spec.forge, reporter);
         defer self.allocator.free(body);
 
         const hash = try nix_hash.hashBytes(self.allocator, "sha256", body);
@@ -239,7 +294,7 @@ pub const FetchCache = struct {
 
     pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) ![]u8 {
         const io = self.io orelse return error.FetchIoUnavailable;
-        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name }, reporter);
+        const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name, .forge = spec.forge }, reporter);
         defer archive.deinit(self.allocator);
 
         const out_path = try self.tarballCachePath(io, spec.name, archive.hash);
@@ -258,25 +313,27 @@ pub const FetchCache = struct {
         return self.remoteMercurial(files, spec);
     }
 
-    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, reporter: ?Reporter) ![]u8 {
+    fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
         if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
 
         const io = self.io orelse return error.FetchIoUnavailable;
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
-        // Authenticate to a matching host (`access-tokens`) with a bearer
-        // header. `extra_headers` (unlike `privileged_headers`) is preserved
-        // across a cross-domain redirect, so the token still reaches
+        // Authenticate a forge fetch with its `access-tokens` header (per-forge
+        // format; see `authHeader`). `extra_headers` (unlike `privileged_headers`)
+        // is preserved across a cross-domain redirect, so the token still reaches
         // codeload.github.com after the `github.com` archive redirect.
-        var auth_value: ?[]u8 = null;
-        defer if (auth_value) |v| self.allocator.free(v);
+        var auth: ?AuthHeader = null;
+        defer if (auth) |a| a.deinit(self.allocator);
         var extra_headers: []const std.http.Header = &.{};
         var auth_storage: [1]std.http.Header = undefined;
-        if (self.tokenFor(url)) |token| {
-            auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
-            auth_storage[0] = .{ .name = "authorization", .value = auth_value.? };
-            extra_headers = auth_storage[0..1];
+        if (forge) |f| {
+            if (try self.authHeader(f, url)) |a| {
+                auth = a;
+                auth_storage[0] = .{ .name = a.name, .value = a.value };
+                extra_headers = auth_storage[0..1];
+            }
         }
 
         // Stream (rather than one-shot `fetch`) so we can read `content_length`
@@ -664,4 +721,33 @@ test "access-tokens: parse and longest-prefix host/path match" {
     // No token for an unlisted host; `github.comX` must not match `github.com`.
     try testing.expect(fc.tokenFor("https://codeberg.org/o/r") == null);
     try testing.expect(fc.tokenFor("https://github.com.evil.example/x") == null);
+}
+
+test "access-tokens: per-forge auth header (matches Nix)" {
+    const testing = std.testing;
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    try fc.setAccessTokens("github.com=ghp_x gl.example.org=PAT:glpat gl2.example.org=OAuth2:oa sh.example.org=shtok gitea.example.org=abc:def git.sr.ht=srhtok");
+
+    const check = struct {
+        fn one(fcp: *FetchCache, forge: FetchCache.Forge, url: []const u8, name: []const u8, value: []const u8) !void {
+            const h = (try fcp.authHeader(forge, url)).?;
+            defer h.deinit(fcp.allocator);
+            try testing.expectEqualStrings(name, h.name);
+            try testing.expectEqualStrings(value, h.value);
+        }
+    };
+
+    // GitHub: `Authorization: token <tok>`.
+    try check.one(&fc, .github, "https://github.com/o/r/archive/HEAD.tar.gz", "Authorization", "token ghp_x");
+    // SourceHut: `Authorization: Bearer <tok>`.
+    try check.one(&fc, .sourcehut, "https://git.sr.ht/~o/r/archive/HEAD.tar.gz", "Authorization", "Bearer srhtok");
+    // GitLab PAT: `Private-token: <value>`.
+    try check.one(&fc, .gitlab, "https://gl.example.org/g/p", "Private-token", "glpat");
+    // GitLab OAuth2: `Authorization: Bearer <value>`.
+    try check.one(&fc, .gitlab, "https://gl2.example.org/g/p", "Authorization", "Bearer oa");
+    // GitLab unrecognized `<type>:<value>` → header `<type>: <value>`.
+    try check.one(&fc, .gitlab, "https://gitea.example.org/g/p", "abc", "def");
+    // No token configured for this host → no header.
+    try testing.expect((try fc.authHeader(.github, "https://unlisted.example/x")) == null);
 }

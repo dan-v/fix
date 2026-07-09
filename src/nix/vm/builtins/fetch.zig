@@ -678,7 +678,15 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {
         const spec = try forgeTreeSpec(self, attrs_id, type_value);
         defer spec.deinit(self.allocator);
-        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
+        // Tag the fetch with the forge so `access-tokens` are applied with the
+        // right per-forge auth header (as in Nix); other fetches get no token.
+        const forge: FetchCache.Forge = if (std.mem.eql(u8, type_value, "github"))
+            .github
+        else if (std.mem.eql(u8, type_value, "gitlab"))
+            .gitlab
+        else
+            .sourcehut;
+        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
         defer self.fetchers.allocator.free(path);
         const out = try ingestFetchedTree(self, path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
