@@ -207,7 +207,7 @@ fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.Fet
     const out = try ingestFetchedTree(self, result.out_path, name, result.rev, hg_filter);
     defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(out.nar_hash)) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, out.out_path, out.nar_hash, ".hg") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, out.out_path) },
         .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
         .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
@@ -299,7 +299,7 @@ fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCach
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(result.last_modified) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(result.last_modified_date)) },
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(out.nar_hash)) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, out.out_path, out.nar_hash, ".git") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, out.out_path) },
         .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
         .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) },
@@ -313,16 +313,31 @@ fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCach
 /// have it (store writes, where ingest computed it), or — when `nar_hash` is
 /// empty (plain eval) — a thunk that computes the real NAR hash of `path` only
 /// if it's accessed, matching Nix (which never hashes a tree eagerly here).
-fn treeNarHashValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+/// `exclude` is a basename dropped from the NAR (".git"/".hg" for VCS checkouts,
+/// "" otherwise) so the lazy hash matches what `ingestFetchedTree` serialized.
+fn treeNarHashValue(self: anytype, path: []const u8, nar_hash: []const u8, exclude: []const u8) !Value {
     if (nar_hash.len != 0) return Value.string(try self.intern.intern(nar_hash));
-    return shared.makeBuiltinThunk(self, .compute_nar_hash, &.{Value.string(try self.intern.intern(path))});
+    return shared.makeBuiltinThunk(self, .compute_nar_hash, &.{
+        Value.string(try self.intern.intern(path)),
+        Value.string(try self.intern.intern(exclude)),
+    });
 }
 
-/// Compute a fetched tree's NAR hash in Nix SRI form (`sha256-<base64>`).
-/// Backs the lazy `narHash` thunk (see `treeNarHashValue`).
-pub fn computeNarHash(self: anytype, path_value: Value) !Value {
+const ExcludeCtx = struct { name: []const u8 };
+fn excludeAccept(context: *anyopaque, path: []const u8, _: file_cache.FileCache.FileKind) anyerror!bool {
+    const ctx: *ExcludeCtx = @ptrCast(@alignCast(context));
+    return !std.mem.eql(u8, path_ops.baseName(path), ctx.name);
+}
+
+/// Compute a fetched tree's NAR hash in Nix SRI form (`sha256-<base64>`),
+/// optionally excluding a basename (e.g. ".git"). Backs the lazy `narHash`
+/// thunk (see `treeNarHashValue`).
+pub fn computeNarHash(self: anytype, path_value: Value, exclude_value: Value) !Value {
     const path = self.intern.get(path_value.asInternId());
-    const nar_bytes = try nar.serialize(self.allocator, self.files, path, null);
+    const exclude = self.intern.get(exclude_value.asInternId());
+    var ctx = ExcludeCtx{ .name = exclude };
+    const filter: ?nar.Filter = if (exclude.len == 0) null else .{ .context = &ctx, .accept = excludeAccept };
+    const nar_bytes = try nar.serialize(self.allocator, self.files, path, filter);
     defer self.allocator.free(nar_bytes);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
@@ -337,7 +352,7 @@ fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
-        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, "") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
@@ -571,7 +586,7 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
     try entries.appendSlice(self.allocator, &.{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
-        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash, "") },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     });
     if (rev) |value| {
@@ -972,7 +987,8 @@ fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
     const ty = (try optionalStringAttr(self, ref_attrs.asObjectId(), "type")) orelse return;
     defer self.allocator.free(ty);
     const verifiable = std.mem.eql(u8, ty, "github") or std.mem.eql(u8, ty, "gitlab") or
-        std.mem.eql(u8, ty, "sourcehut") or std.mem.eql(u8, ty, "tarball") or std.mem.eql(u8, ty, "path");
+        std.mem.eql(u8, ty, "sourcehut") or std.mem.eql(u8, ty, "tarball") or
+        std.mem.eql(u8, ty, "path") or std.mem.eql(u8, ty, "git");
     if (!verifiable) return;
     const locked = (try optionalStringAttr(self, ref_attrs.asObjectId(), "narHash")) orelse return;
     defer self.allocator.free(locked);

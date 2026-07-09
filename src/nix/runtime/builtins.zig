@@ -137,7 +137,8 @@ pub const BuiltinId = enum(u16) {
     resolve_flake_node = 111,
     /// Internal: compute a fetched tree's NAR hash (SRI) on force. Backs the
     /// `narHash` of a fetched tree under plain eval so the (real, Nix-matching)
-    /// hash is only computed when accessed. Arg: (tree path). See fetch.zig.
+    /// hash is only computed when accessed. Args: (tree path, exclude basename |
+    /// "" — e.g. ".git"/".hg" to drop the VCS dir). See fetch.zig.
     compute_nar_hash = 112,
 };
 
@@ -369,7 +370,6 @@ pub fn arity(id: BuiltinId) u8 {
         .ceil,
         .baseNameOf,
         .dirOf,
-        .compute_nar_hash,
         => 1,
         .hasAttr,
         .getAttr,
@@ -416,6 +416,7 @@ pub fn arity(id: BuiltinId) u8 {
         .scopedImport,
         .mapValue,
         .derivationLazyAttr,
+        .compute_nar_hash,
         => 2,
         .foldlStrict,
         .substring,

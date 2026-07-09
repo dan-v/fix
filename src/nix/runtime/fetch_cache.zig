@@ -86,7 +86,6 @@ pub const FetchCache = struct {
         rev_count: i64,
         last_modified: i64,
         last_modified_date: []u8,
-        nar_hash: []u8,
         submodules: bool,
 
         pub fn deinit(self: GitResult, allocator: std.mem.Allocator) void {
@@ -94,7 +93,6 @@ pub const FetchCache = struct {
             allocator.free(self.rev);
             allocator.free(self.short_rev);
             allocator.free(self.last_modified_date);
-            allocator.free(self.nar_hash);
         }
     };
 
@@ -102,13 +100,11 @@ pub const FetchCache = struct {
         out_path: []u8,
         rev: []u8,
         short_rev: []u8,
-        nar_hash: []u8,
 
         pub fn deinit(self: MercurialResult, allocator: std.mem.Allocator) void {
             allocator.free(self.out_path);
             allocator.free(self.rev);
             allocator.free(self.short_rev);
-            allocator.free(self.nar_hash);
         }
     };
 
@@ -339,9 +335,6 @@ pub const FetchCache = struct {
             try self.allocator.dupe(u8, "19700101000000");
         errdefer self.allocator.free(last_modified_date);
 
-        const nar_hash = try self.sourceHash(path, rev);
-        errdefer self.allocator.free(nar_hash);
-
         return .{
             .out_path = try self.allocator.dupe(u8, path),
             .rev = rev,
@@ -349,7 +342,6 @@ pub const FetchCache = struct {
             .rev_count = rev_count,
             .last_modified = last_modified,
             .last_modified_date = last_modified_date,
-            .nar_hash = nar_hash,
             .submodules = submodules,
         };
     }
@@ -402,31 +394,16 @@ pub const FetchCache = struct {
         return std.fs.path.join(self.allocator, &.{ root, "tarball", hash[0..32], clean_name });
     }
 
-    pub fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {
-        var key: std.ArrayListUnmanaged(u8) = .empty;
-        defer key.deinit(self.allocator);
-        try key.appendSlice(self.allocator, path);
-        try key.append(self.allocator, '\n');
-        try key.appendSlice(self.allocator, rev);
-        const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
-        defer self.allocator.free(digest);
-        return std.fmt.allocPrint(self.allocator, "sha256-{s}", .{digest});
-    }
-
     fn mercurialResult(self: *FetchCache, path: []const u8, rev: []const u8) !MercurialResult {
         const clean_rev = stripMercurialDirtySuffix(rev);
         const short_len = @min(clean_rev.len, 12);
         const short_rev = try self.allocator.dupe(u8, clean_rev[0..short_len]);
         errdefer self.allocator.free(short_rev);
 
-        const nar_hash = try self.sourceHash(path, clean_rev);
-        errdefer self.allocator.free(nar_hash);
-
         return .{
             .out_path = try self.allocator.dupe(u8, path),
             .rev = try self.allocator.dupe(u8, clean_rev),
             .short_rev = short_rev,
-            .nar_hash = nar_hash,
         };
     }
 
