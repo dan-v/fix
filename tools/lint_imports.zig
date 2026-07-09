@@ -11,6 +11,11 @@
 //! producing baffling mismatches far from the cause. This linter makes that a
 //! hard, located error instead.
 //!
+//! It also enforces the **down-only** rule: modules form a layered acyclic
+//! graph (see `module_levels`), and a file in one module may only `@import` a
+//! module at a strictly lower level — so "what may I safely import here?" is a
+//! located error, not tribal knowledge.
+//!
 //! Run via `zig build lint`; the `test` step depends on it.
 
 const std = @import("std");
@@ -19,6 +24,32 @@ const std = @import("std");
 /// files by relative path; see `owningModule` for how physical paths (the
 /// `base/`, `nix/`, `cli/` tiers) map onto these names.
 const module_dirs = [_][]const u8{ "syntax", "runtime", "base", "scheduler", "derivation", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
+
+/// Longest-path topological level of each module in the `build.zig` dependency
+/// graph. Imports must point strictly DOWN: a file in module M may only
+/// `@import(name)` a module whose level is LOWER than M's. With longest-path
+/// levels every legitimate edge is strictly decreasing, so this rejects exactly
+/// the up- and sideways-imports. (The `fix` core — `nix/root*`, `nix/eval*` —
+/// and `main.zig` own no lint module; they are the top and aren't checked.)
+const ModuleLevel = struct { name: []const u8, level: u8 };
+const module_levels = [_]ModuleLevel{
+    .{ .name = "base", .level = 0 },
+    .{ .name = "syntax", .level = 0 },
+    .{ .name = "runtime", .level = 1 },
+    .{ .name = "observ", .level = 1 },
+    .{ .name = "scheduler", .level = 2 },
+    .{ .name = "derivation", .level = 2 },
+    .{ .name = "bytecode", .level = 2 },
+    .{ .name = "probe", .level = 3 },
+    .{ .name = "compiler", .level = 4 },
+    .{ .name = "vm", .level = 5 },
+    .{ .name = "cli", .level = 7 },
+};
+
+fn levelOf(name: []const u8) ?u8 {
+    for (module_levels) |ml| if (std.mem.eql(u8, ml.name, name)) return ml.level;
+    return null;
+}
 
 const max_file_bytes = 8 * 1024 * 1024;
 
@@ -45,6 +76,24 @@ pub fn main(init: std.process.Init) !void {
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line| {
             line_no += 1;
+            // Down-only rule for by-name module imports (`@import("vm")`): a
+            // file in module M may only reach a strictly-lower-level module.
+            if (namedImport(line)) |name| {
+                if (owning) |own| {
+                    if (!std.mem.eql(u8, name, own)) {
+                        if (levelOf(name)) |imp_lvl| if (levelOf(own)) |own_lvl| {
+                            if (imp_lvl >= own_lvl) {
+                                violations += 1;
+                                std.debug.print(
+                                    "src/{s}:{d}: up-import — module '{s}' (level {d}) must not import '{s}' (level {d}); imports point down\n    {s}\n",
+                                    .{ entry.path, line_no, own, own_lvl, name, imp_lvl, std.mem.trim(u8, line, " \t") },
+                                );
+                            }
+                        };
+                    }
+                }
+            }
+
             const target = importTarget(line) orelse continue;
             const crossed = crossesModuleBoundary(entry.path, target) orelse continue;
             // Importing your own module's files by relative path is fine.
@@ -94,6 +143,20 @@ fn importTarget(line: []const u8) ?[]const u8 {
     const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
     const target = rest[0..end];
     if (!std.mem.endsWith(u8, target, ".zig")) return null;
+    return target;
+}
+
+/// A bare module name inside `@import("name")` — no `.zig`, no `/`
+/// (i.e. `@import("vm")`, not `@import("vm/run.zig")` or `@import("std")`'s
+/// callers with a path). Null for relative/path imports and lines without one.
+fn namedImport(line: []const u8) ?[]const u8 {
+    const marker = "@import(\"";
+    const start = std.mem.indexOf(u8, line, marker) orelse return null;
+    const rest = line[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const target = rest[0..end];
+    if (std.mem.endsWith(u8, target, ".zig")) return null;
+    if (std.mem.indexOfScalar(u8, target, '/') != null) return null;
     return target;
 }
 
