@@ -2,9 +2,11 @@
 //! `http-connections`, `experimental-features`, `access-tokens`, and the
 //! daemon build settings forwarded via `set_options` (`max-jobs`, `cores`,
 //! `fallback`, `keep-failed`, `max-silent-time`, `substitute`, plus the whole
-//! map as `set_options` overrides). Precedence, lowest to highest:
-//!   1. `/etc/nix/nix.conf`                                   (system)
-//!   2. `$XDG_CONFIG_HOME/nix/nix.conf` (or `~/.config/nix/nix.conf`)  (user)
+//! map as `set_options` overrides). Sources, lowest to highest priority, match
+//! Nix's env-var-driven resolution (see `mergeUserConfig`):
+//!   1. `$NIX_CONF_DIR/nix.conf` (default `/etc/nix/nix.conf`)         (system)
+//!   2. `$NIX_USER_CONF_FILES` (colon list) or, by default, `nix/nix.conf`
+//!      under `$XDG_CONFIG_HOME` (or `~/.config`) then `$XDG_CONFIG_DIRS`  (user)
 //!   3. `$NIX_CONFIG`                             (inline, newline-separated)
 //! Later sources override earlier for scalar keys (last-wins), as in Nix.
 //!
@@ -16,23 +18,19 @@
 const std = @import("std");
 const Evaluator = @import("fix").eval.Evaluator;
 
-/// Build `$<xdg_var>/<tail...>`, or `$HOME/<home_prefix...>/<tail...>` when the
-/// XDG var is unset. Null if neither is available.
-fn dirFile(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, xdg_var: []const u8, home_prefix: []const []const u8, tail: []const []const u8) !?[]u8 {
+/// A non-empty environment variable, or null (treating empty as unset, like Nix).
+fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     const e = env orelse return null;
-    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer parts.deinit(allocator);
-    if (e.get(xdg_var)) |xdg| {
-        if (xdg.len != 0) try parts.append(allocator, xdg);
-    }
-    if (parts.items.len == 0) {
-        const home = e.get("HOME") orelse return null;
-        if (home.len == 0) return null;
-        try parts.append(allocator, home);
-        try parts.appendSlice(allocator, home_prefix);
-    }
-    try parts.appendSlice(allocator, tail);
-    return try std.fs.path.join(allocator, parts.items);
+    const v = e.get(name) orelse return null;
+    return if (v.len == 0) null else v;
+}
+
+/// Read `path` (best-effort — missing/unreadable is skipped, as in Nix) and
+/// merge its `key = value` lines into `settings`.
+fn mergeFile(settings: *Settings, ev: *Evaluator, path: []const u8) !void {
+    if (ev.readSourceFile(path)) |data| {
+        try settings.mergeLines(data);
+    } else |_| {}
 }
 
 pub const Settings = struct {
@@ -96,25 +94,66 @@ pub fn load(allocator: std.mem.Allocator, ev: *Evaluator) !Settings {
     errdefer settings.deinit();
     const env = ev.environment();
 
-    // System.
-    if (ev.readSourceFile("/etc/nix/nix.conf")) |data| {
-        try settings.mergeLines(data);
-    } else |_| {}
-
-    // User.
-    if (try dirFile(allocator, env, "XDG_CONFIG_HOME", &.{".config"}, &.{ "nix", "nix.conf" })) |path| {
+    // 1. System: `$NIX_CONF_DIR/nix.conf` (default `/etc/nix`).
+    {
+        const dir = envGet(env, "NIX_CONF_DIR") orelse "/etc/nix";
+        const path = try std.fs.path.join(allocator, &.{ dir, "nix.conf" });
         defer allocator.free(path);
-        if (ev.readSourceFile(path)) |data| {
-            try settings.mergeLines(data);
-        } else |_| {}
+        try mergeFile(&settings, ev, path);
     }
 
-    // Inline override.
-    if (env) |e| {
-        if (e.get("NIX_CONFIG")) |inline_conf| try settings.mergeLines(inline_conf);
-    }
+    // 2. User config files (lowest priority first, so the highest wins last).
+    try mergeUserConfig(allocator, &settings, ev, env);
+
+    // 3. Inline `$NIX_CONFIG`, highest priority.
+    if (envGet(env, "NIX_CONFIG")) |inline_conf| try settings.mergeLines(inline_conf);
 
     return settings;
+}
+
+/// Merge the user `nix.conf` files, resolved as Nix does:
+///   - `$NIX_USER_CONF_FILES` (colon-separated, first entry highest priority)
+///     if set, replacing the default lookup entirely; else
+///   - `<dir>/nix/nix.conf` for each of `$XDG_CONFIG_HOME` (or `~/.config`)
+///     then the `$XDG_CONFIG_DIRS` list (default `/etc/xdg`).
+/// Nix applies its file list in reverse, so we merge lowest→highest priority
+/// (later `put`s win) to match.
+fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, ev: *Evaluator, env: ?*const std.process.Environ.Map) !void {
+    if (envGet(env, "NIX_USER_CONF_FILES")) |list| {
+        var files: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer files.deinit(allocator);
+        var it = std.mem.splitScalar(u8, list, ':');
+        while (it.next()) |f| if (f.len != 0) try files.append(allocator, f);
+        var i = files.items.len;
+        while (i > 0) {
+            i -= 1;
+            try mergeFile(settings, ev, files.items[i]);
+        }
+        return;
+    }
+
+    // Config dirs, highest priority first: [config-home, ...XDG_CONFIG_DIRS].
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer dirs.deinit(allocator);
+    var home_config: ?[]u8 = null;
+    defer if (home_config) |h| allocator.free(h);
+    if (envGet(env, "XDG_CONFIG_HOME")) |xdg| {
+        try dirs.append(allocator, xdg);
+    } else if (envGet(env, "HOME")) |home| {
+        home_config = try std.fs.path.join(allocator, &.{ home, ".config" });
+        try dirs.append(allocator, home_config.?);
+    }
+    var it = std.mem.splitScalar(u8, envGet(env, "XDG_CONFIG_DIRS") orelse "/etc/xdg", ':');
+    while (it.next()) |d| if (d.len != 0) try dirs.append(allocator, d);
+
+    // Merge lowest priority first (reverse of the priority-ordered list).
+    var i = dirs.items.len;
+    while (i > 0) {
+        i -= 1;
+        const path = try std.fs.path.join(allocator, &.{ dirs.items[i], "nix", "nix.conf" });
+        defer allocator.free(path);
+        try mergeFile(settings, ev, path);
+    }
 }
 
 test "nix.conf scalar parse + last-wins" {

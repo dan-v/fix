@@ -37,9 +37,12 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
-    // Must precede `nix_conf.load`: it reads `ev.environment()` for `NIX_CONFIG`
-    // and the XDG/HOME-relative user config path.
+    // Both must precede `nix_conf.load`: it reads `ev.environment()` for the
+    // config-location env vars, and reads the config files themselves through
+    // the FileCache — which needs its IO handle set (else every config file is
+    // silently skipped and only inline `NIX_CONFIG` is honored).
     ev.setEnvironment(init.environ_map);
+    ev.setFileIo(init.io);
 
     // Experimental features and the concurrent-fetch cap both come from
     // `nix.conf` (best-effort: unreadable config just uses defaults), so load it
