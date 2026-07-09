@@ -75,6 +75,8 @@ pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value
     const contents = self.intern.get(contents_id);
     const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs);
     defer self.allocator.free(path);
+    // When a daemon is attached, populate the text object in the real store.
+    try self.derivations.instantiateText(path, contents, refs);
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
@@ -106,12 +108,10 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
     };
     var context: Context = .{ .vm = self, .pred = pred };
 
-    const hash = try nar.hashPathFiltered(self.allocator, self.files, root, .{
+    const store_path = try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
         .context = &context,
         .accept = Context.accept,
     });
-    defer self.allocator.free(hash);
-    const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, path_ops.baseName(root), hash);
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));
 }

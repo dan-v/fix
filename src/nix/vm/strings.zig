@@ -225,7 +225,7 @@ pub fn sourcePathStringValue(self: *VM, path_id: InternId) !Value {
         return Value.contextString(try self.heap.addContextString(path_id, &entries));
     }
     if (!try self.files.pathExists(path)) return error.FileNotFound;
-    const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+    const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     defer self.allocator.free(store_path);
     const store_path_id = try self.intern.intern(store_path);
     const entries = [_]heap_mod.AttrEntry{

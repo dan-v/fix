@@ -117,7 +117,7 @@ pub fn sourcePathStringValue(self: anytype, path_id: InternId) !Value {
     const path = self.intern.get(path_id);
     if (!std.fs.path.isAbsolute(path)) return string_context.contextStringWithPath(self, path_id);
     if (!try self.files.pathExists(path)) return error.FileNotFound;
-    const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+    const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     defer self.allocator.free(store_path);
     return string_context.contextStringWithPath(self, try self.intern.intern(store_path));
 }

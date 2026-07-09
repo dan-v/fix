@@ -28,7 +28,11 @@ pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u
 pub fn hashPathFiltered(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
     const nar_bytes = try serialize(allocator, files, path, filter);
     defer allocator.free(nar_bytes);
+    return hashSerialized(allocator, nar_bytes);
+}
 
+/// Hex sha256 of an already-serialized NAR byte stream (caller owns result).
+pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);

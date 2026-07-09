@@ -697,7 +697,7 @@ fn normalizeDerivationString(
 }
 
 fn sourceStorePathForContext(self: anytype, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
-    const store_path = try source_paths.storePathForSource(self.allocator, self.files, self.derivations.store_dir, path);
+    const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);
     return store_path;

@@ -92,7 +92,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
     };
 
     const store_path = if (filter_value.isNull())
-        try source_paths.storePathForSourceName(self.allocator, self.files, self.derivations.store_dir, path, store_name)
+        try source_paths.storePathForSourceName(self.allocator, self.derivations, self.files, path, store_name)
     else filtered: {
         const pred = try vm_force.forceValue(self, filter_value);
         const Context = struct {
@@ -105,12 +105,10 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
             }
         };
         var context: Context = .{ .vm = self, .pred = pred };
-        const hash = try nar.hashPathFiltered(self.allocator, self.files, path, .{
+        break :filtered try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, path, store_name, .{
             .context = &context,
             .accept = Context.accept,
         });
-        defer self.allocator.free(hash);
-        break :filtered try derivation.sourcePath(self.allocator, self.derivations.store_dir, store_name, hash);
     };
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));

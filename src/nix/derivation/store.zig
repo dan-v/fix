@@ -102,20 +102,42 @@ pub const DerivationStore = struct {
     }
 
     /// Write `drv_path`'s `.drv` (content `aterm`, referring to `references`)
-    /// to the attached daemon store, exactly once per run. No-op when no daemon
-    /// is attached. Guarded so parallel forcing fibers serialize on the socket.
-    /// Inputs are forced before dependents, so a `.drv`'s referenced input
-    /// `.drv`s are already written by the time we get here (correct order).
+    /// to the attached daemon store. Inputs are forced before dependents, so a
+    /// `.drv`'s referenced input `.drv`s are already written when we get here.
     pub fn instantiateDrv(self: *DerivationStore, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
+        return self.instantiateText(drv_path, aterm, references);
+    }
+
+    /// Write a text-addressed object at `store_path` (content `text`, referring
+    /// to `references`) to the attached daemon store, exactly once per run.
+    /// No-op when no daemon is attached. Guarded for parallel forcing fibers.
+    pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         const daemon = self.daemon orelse return;
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
-
-        if (self.instantiated.contains(drv_path)) return;
-        const written = try daemon.addTextToStore(self.allocator, storePathName(drv_path), aterm, references);
+        if (self.instantiated.contains(store_path)) return;
+        const written = try daemon.addTextToStore(self.allocator, storePathName(store_path), text, references);
         self.allocator.free(written);
+        try self.markInstantiated(store_path);
+    }
 
-        const key = try self.allocator.dupe(u8, drv_path);
+    /// Write a NAR-serialized source tree at `store_path` (content `nar_bytes`)
+    /// to the attached daemon store, exactly once per run. No-op when no daemon
+    /// is attached. Sources are ingested during derivation normalization —
+    /// before the `.drv` that references them is written — so a `.drv`'s
+    /// `input_srcs` are valid by the time the `.drv` is added.
+    pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
+        const daemon = self.daemon orelse return;
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        if (self.instantiated.contains(store_path)) return;
+        const written = try daemon.addPath(self.allocator, storePathName(store_path), nar_bytes, &.{});
+        self.allocator.free(written);
+        try self.markInstantiated(store_path);
+    }
+
+    fn markInstantiated(self: *DerivationStore, store_path: []const u8) !void {
+        const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.instantiated.put(self.allocator, key, {});
     }
