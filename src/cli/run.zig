@@ -66,7 +66,13 @@ pub const Source = struct {
 pub fn getSource(ev: *Evaluator, source: SourceArg) !Source {
     return switch (source) {
         .expr => |text| .{ .text = text },
-        .file => |path| .{ .text = try ev.readSourceFile(path) },
+        .file => |path| blk: {
+            const text = try ev.readSourceFile(path);
+            // Resolve the file's relative path literals (`./x`, `import ./y`)
+            // against the file's directory, like Nix — not the process cwd.
+            try ev.setBasePathToFileDir(path);
+            break :blk .{ .text = text };
+        },
         .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable) },
     };
 }

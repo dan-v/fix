@@ -326,6 +326,20 @@ pub const Evaluator = struct {
         self.fetchers.setIo(io);
     }
 
+    /// Point the base path (used to resolve relative path literals like `./x`)
+    /// at the directory containing `file_path`, resolved against the current
+    /// base path. This makes a file's relative paths resolve relative to the
+    /// file, as Nix does — not the process cwd.
+    pub fn setBasePathToFileDir(self: *Evaluator, file_path: []const u8) !void {
+        const base = self.base_path orelse ".";
+        const abs = try std.fs.path.resolve(self.allocator, &.{ base, file_path });
+        defer self.allocator.free(abs);
+        const dir = std.fs.path.dirname(abs) orelse abs;
+        const owned = try self.allocator.dupeZ(u8, dir);
+        if (self.base_path) |old| self.allocator.free(old);
+        self.base_path = owned;
+    }
+
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
         self.env_map = env_map;
     }
