@@ -37,12 +37,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
-    // Both must precede `nix_conf.load`: it reads `ev.environment()` for the
-    // config-location env vars, and reads the config files themselves through
-    // the FileCache — which needs its IO handle set (else every config file is
-    // silently skipped and only inline `NIX_CONFIG` is honored).
     ev.setEnvironment(init.environ_map);
-    ev.setFileIo(init.io);
 
     // Experimental features and the concurrent-fetch cap both come from
     // `nix.conf` (best-effort: unreadable config just uses defaults), so load it
@@ -56,7 +51,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // Start from the loaded config (empty if unreadable), then layer `--option`
     // overrides on top at highest precedence, before reading the settings fix
     // acts on.
-    var settings = nix_conf.load(ev.allocator, ev) catch nix_conf.Settings{ .allocator = ev.allocator };
+    var settings = nix_conf.load(ev.allocator, init.environ_map, init.io) catch nix_conf.Settings{ .allocator = ev.allocator };
     defer settings.deinit();
     for (options.option_overrides.items) |o| try settings.put(o.name, o.value);
     if (!options.experimental_features_reset) {

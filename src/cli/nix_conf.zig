@@ -16,7 +16,9 @@
 //! (scalar last-wins covers `http-connections`, `max-jobs`, `cores`, ...).
 
 const std = @import("std");
-const Evaluator = @import("fix").eval.Evaluator;
+
+/// Config files are tiny; cap the read so a pathological path can't blow up.
+const max_conf_bytes = 1 << 20;
 
 /// A non-empty environment variable, or null (treating empty as unset, like Nix).
 fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
@@ -25,12 +27,13 @@ fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
-/// Read `path` (best-effort — missing/unreadable is skipped, as in Nix) and
-/// merge its `key = value` lines into `settings`.
-fn mergeFile(settings: *Settings, ev: *Evaluator, path: []const u8) !void {
-    if (ev.readSourceFile(path)) |data| {
-        try settings.mergeLines(data);
-    } else |_| {}
+/// Read `path` directly (NOT via the evaluator's source cache — this is CLI
+/// config, not a Nix source file) and merge its `key = value` lines into
+/// `settings`. Best-effort: a missing/unreadable file is skipped, as in Nix.
+fn mergeFile(settings: *Settings, io: std.Io, path: []const u8) !void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, settings.allocator, .limited(max_conf_bytes)) catch return;
+    defer settings.allocator.free(data);
+    try settings.mergeLines(data);
 }
 
 pub const Settings = struct {
@@ -89,21 +92,20 @@ pub const Settings = struct {
 /// Load and merge the standard `nix.conf` sources. Missing/unreadable files are
 /// skipped (best-effort, like Nix). The returned `Settings` owns its storage;
 /// the caller must `deinit` it.
-pub fn load(allocator: std.mem.Allocator, ev: *Evaluator) !Settings {
+pub fn load(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, io: std.Io) !Settings {
     var settings: Settings = .{ .allocator = allocator };
     errdefer settings.deinit();
-    const env = ev.environment();
 
     // 1. System: `$NIX_CONF_DIR/nix.conf` (default `/etc/nix`).
     {
         const dir = envGet(env, "NIX_CONF_DIR") orelse "/etc/nix";
         const path = try std.fs.path.join(allocator, &.{ dir, "nix.conf" });
         defer allocator.free(path);
-        try mergeFile(&settings, ev, path);
+        try mergeFile(&settings, io, path);
     }
 
     // 2. User config files (lowest priority first, so the highest wins last).
-    try mergeUserConfig(allocator, &settings, ev, env);
+    try mergeUserConfig(allocator, &settings, io, env);
 
     // 3. Inline `$NIX_CONFIG`, highest priority.
     if (envGet(env, "NIX_CONFIG")) |inline_conf| try settings.mergeLines(inline_conf);
@@ -118,7 +120,7 @@ pub fn load(allocator: std.mem.Allocator, ev: *Evaluator) !Settings {
 ///     then the `$XDG_CONFIG_DIRS` list (default `/etc/xdg`).
 /// Nix applies its file list in reverse, so we merge lowest→highest priority
 /// (later `put`s win) to match.
-fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, ev: *Evaluator, env: ?*const std.process.Environ.Map) !void {
+fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, io: std.Io, env: ?*const std.process.Environ.Map) !void {
     if (envGet(env, "NIX_USER_CONF_FILES")) |list| {
         var files: std.ArrayListUnmanaged([]const u8) = .empty;
         defer files.deinit(allocator);
@@ -127,7 +129,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, ev: *Evalu
         var i = files.items.len;
         while (i > 0) {
             i -= 1;
-            try mergeFile(settings, ev, files.items[i]);
+            try mergeFile(settings, io, files.items[i]);
         }
         return;
     }
@@ -152,7 +154,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, ev: *Evalu
         i -= 1;
         const path = try std.fs.path.join(allocator, &.{ dirs.items[i], "nix", "nix.conf" });
         defer allocator.free(path);
-        try mergeFile(settings, ev, path);
+        try mergeFile(settings, io, path);
     }
 }
 
