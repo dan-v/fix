@@ -3,7 +3,7 @@
 //! sorted per-record output of paths, hashes, inputs, env, and ATerm text.
 
 const std = @import("std");
-const cli = @import("../cli.zig");
+const cli = @import("cli.zig");
 const derivation = @import("derivation");
 
 pub const Mode = enum {

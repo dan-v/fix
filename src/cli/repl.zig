@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const cli = @import("../cli.zig");
+const cli = @import("cli.zig");
 const run = @import("run.zig");
 const Options = @import("args.zig").Options;
 const Evaluator = @import("fix").Evaluator;

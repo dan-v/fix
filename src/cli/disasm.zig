@@ -4,7 +4,7 @@ const std = @import("std");
 const fix = @import("fix");
 const eval = fix.eval;
 const bytecode = fix.bytecode;
-const cli = @import("../cli.zig");
+const cli = @import("cli.zig");
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;

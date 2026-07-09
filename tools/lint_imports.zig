@@ -15,9 +15,9 @@
 
 const std = @import("std");
 
-/// Directories under `src/` that are their own build module. A file outside
-/// `src/<name>/` may not import `src/<name>/**` or the facade `src/<name>.zig`
-/// by relative path.
+/// Every build module's name. A file outside a module may not reach into its
+/// files by relative path; see `owningModule` for how physical paths (the
+/// `base/`, `nix/`, `cli/` tiers) map onto these names.
 const module_dirs = [_][]const u8{ "syntax", "runtime", "base", "scheduler", "derivation", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
 
 const max_file_bytes = 8 * 1024 * 1024;
@@ -64,13 +64,23 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("import lint: ok ({d} module boundaries enforced)\n", .{module_dirs.len});
 }
 
-/// Which module (if any) `src/<rel>` belongs to — either a file inside
-/// `src/<m>/` or the module's facade/root file `src/<m>.zig`. Both may freely
-/// import the module's internals by relative path.
+/// Which module (if any) `src/<rel>` belongs to.
+///
+/// Sources are grouped into three physical tiers under `src/`:
+///   - `base/**` is a single module (`base`) — the whole tier.
+///   - `cli/**` is a single module (`cli`) — the whole tier.
+///   - `nix/**` holds one module per subsystem: `nix/<m>/**` and the facade
+///     `nix/<m>.zig` belong to module `<m>` (the `fix` core files `nix/root*`
+///     and `nix/eval*` belong to no lint module).
+/// A module's own files may freely import its internals by relative path.
 fn owningModule(rel: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, rel, "base/")) return "base";
+    if (std.mem.startsWith(u8, rel, "cli/")) return "cli";
+    // Strip the `nix/` tier segment (if present) before matching subsystem dirs.
+    const inner = if (std.mem.startsWith(u8, rel, "nix/")) rel["nix/".len..] else rel;
     for (module_dirs) |m| {
-        if (std.mem.startsWith(u8, rel, m) and rel.len > m.len and rel[m.len] == '/') return m;
-        if (rel.len == m.len + 4 and std.mem.startsWith(u8, rel, m) and std.mem.eql(u8, rel[m.len..], ".zig")) return m;
+        if (std.mem.startsWith(u8, inner, m) and inner.len > m.len and inner[m.len] == '/') return m;
+        if (inner.len == m.len + 4 and std.mem.startsWith(u8, inner, m) and std.mem.eql(u8, inner[m.len..], ".zig")) return m;
     }
     return null;
 }
@@ -92,15 +102,7 @@ fn importTarget(line: []const u8) ?[]const u8 {
 fn crossesModuleBoundary(importer_rel: []const u8, target: []const u8) ?[]const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = resolve(importer_rel, target, &buf) orelse return null;
-    for (module_dirs) |m| {
-        // src/<m>/...  (a module-internal file)
-        if (std.mem.startsWith(u8, resolved, m) and resolved.len > m.len and resolved[m.len] == '/') return m;
-        // src/<m>.zig  (the module facade)
-        if (resolved.len == m.len + 4 and
-            std.mem.startsWith(u8, resolved, m) and
-            std.mem.eql(u8, resolved[m.len..], ".zig")) return m;
-    }
-    return null;
+    return owningModule(resolved);
 }
 
 /// Resolve `target` (relative to `importer_rel`'s directory) to an

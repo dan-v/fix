@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
     // its internals. The modules form an acyclic graph (see docs/build.md),
     // topped by the `fix` evaluator layer (src/root.zig).
     const syntax_mod = b.addModule("syntax", .{
-        .root_source_file = b.path("src/syntax.zig"),
+        .root_source_file = b.path("src/nix/syntax.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const gen_tables_exe = b.addExecutable(.{
         .name = "gen-parser-tables",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/syntax/gen_parser_tables.zig"),
+            .root_source_file = b.path("src/nix/syntax/gen_parser_tables.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
         }),
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const runtime_mod = b.addModule("runtime", .{
-        .root_source_file = b.path("src/runtime.zig"),
+        .root_source_file = b.path("src/nix/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("base", base_mod);
 
     const scheduler_mod = b.addModule("scheduler", .{
-        .root_source_file = b.path("src/scheduler.zig"),
+        .root_source_file = b.path("src/nix/scheduler.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
     scheduler_mod.addImport("base", base_mod);
 
     const derivation_mod = b.addModule("derivation", .{
-        .root_source_file = b.path("src/derivation.zig"),
+        .root_source_file = b.path("src/nix/derivation.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
     // Evaluation observability sinks (progress protocol + error-trace collector).
     // Leaf types the interpreter writes to; the evaluator/CLI implement them.
     const observ_mod = b.addModule("observ", .{
-        .root_source_file = b.path("src/observ.zig"),
+        .root_source_file = b.path("src/nix/observ.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     // Bytecode IR: the instruction set, chunk encoding/registry, disassembler.
     // A leaf of the eval engine — depends only on runtime types.
     const bytecode_mod = b.addModule("bytecode", .{
-        .root_source_file = b.path("src/bytecode.zig"),
+        .root_source_file = b.path("src/nix/bytecode.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
     // Opt-in diagnostic instrumentation (timelines, profilers, thunk traces).
     // Reaches into runtime types and bytecode for its trace payloads.
     const probe_mod = b.addModule("probe", .{
-        .root_source_file = b.path("src/probe.zig"),
+        .root_source_file = b.path("src/nix/probe.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
     // AST → bytecode compiler. Consumes the syntax AST and emits into the
     // bytecode IR; no dependency on the VM/runtime engine.
     const compiler_mod = b.addModule("compiler", .{
-        .root_source_file = b.path("src/compiler.zig"),
+        .root_source_file = b.path("src/nix/compiler.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -171,7 +171,7 @@ pub fn build(b: *std.Build) void {
     // (dispatch, builtins, forcing, worker fibers). Depends on the compiler
     // (deferred-attr compilation) and probe, plus the runtime/parallel leaves.
     const vm_mod = b.addModule("vm", .{
-        .root_source_file = b.path("src/vm.zig"),
+        .root_source_file = b.path("src/nix/vm.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -189,7 +189,7 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("probe", probe_mod);
 
     const mod = b.addModule("fix", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/nix/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
@@ -211,7 +211,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("vm", vm_mod);
 
     const cli_mod = b.addModule("cli", .{
-        .root_source_file = b.path("src/cli.zig"),
+        .root_source_file = b.path("src/cli/cli.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,

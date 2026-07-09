@@ -9,16 +9,16 @@ const gc = @import("runtime").gc;
 
 // Command modules, re-exported so `main.zig` reaches them through the `cli`
 // module by name instead of importing `src/cli/*.zig` by relative path.
-pub const args = @import("cli/args.zig");
-pub const run = @import("cli/run.zig");
-pub const repl = @import("cli/repl.zig");
-pub const disasm = @import("cli/disasm.zig");
-pub const inspect = @import("cli/inspect.zig");
-pub const trace = @import("cli/trace.zig");
-pub const thunks = @import("cli/thunks.zig");
-pub const stats = @import("cli/stats.zig");
-pub const trace_setup = @import("cli/trace_setup.zig");
-pub const render = @import("cli/render.zig");
+pub const args = @import("args.zig");
+pub const run = @import("run.zig");
+pub const repl = @import("repl.zig");
+pub const disasm = @import("disasm.zig");
+pub const inspect = @import("inspect.zig");
+pub const trace = @import("trace.zig");
+pub const thunks = @import("thunks.zig");
+pub const stats = @import("stats.zig");
+pub const trace_setup = @import("trace_setup.zig");
+pub const render = @import("render.zig");
 
 pub const When = enum {
     auto,

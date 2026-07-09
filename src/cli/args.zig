@@ -1,7 +1,7 @@
 //! Command-line option parsing for `fix`.
 
 const std = @import("std");
-const cli = @import("../cli.zig");
+const cli = @import("cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval_gc = @import("fix").eval_gc;
 

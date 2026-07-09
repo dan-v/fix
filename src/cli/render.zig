@@ -1,7 +1,7 @@
 //! Rendering of evaluation errors and trace frames to stderr.
 
 const std = @import("std");
-const cli = @import("../cli.zig");
+const cli = @import("cli.zig");
 const diagnostic = @import("syntax").diagnostic;
 const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
