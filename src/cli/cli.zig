@@ -16,6 +16,7 @@ pub const eval = @import("eval.zig");
 pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
 pub const runcmd = @import("runcmd.zig");
+pub const shell = @import("shell.zig");
 pub const repl = @import("repl.zig");
 pub const disasm = @import("disasm.zig");
 pub const inspect = @import("inspect.zig");

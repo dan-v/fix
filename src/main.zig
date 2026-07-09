@@ -13,6 +13,7 @@ const eval_cmd = cli.eval;
 const instantiate_cmd = cli.instantiate;
 const build_cmd = cli.build;
 const run_cmd = cli.runcmd;
+const shell_cmd = cli.shell;
 const block_cache = @import("base").block_cache;
 const mem_tag = @import("runtime").mem_tag;
 
@@ -29,6 +30,7 @@ const subcommands = [_]Subcommand{
     .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run_cmd },
     .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = build_cmd.run_cmd },
     .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = run_cmd.run_cmd },
+    .{ .name = "shell", .summary = "build a derivation and open a shell with its bin/ on PATH", .run = shell_cmd.run_cmd },
     .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run_cmd },
     .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = disasm_cmd.run },
     .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },
