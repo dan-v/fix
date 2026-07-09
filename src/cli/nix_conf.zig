@@ -1,6 +1,8 @@
-//! Minimal `nix.conf` reader — enough to honor the settings `fix` acts on
-//! (currently `http-connections` and `experimental-features`). Precedence,
-//! lowest to highest:
+//! Minimal `nix.conf` reader — enough to honor the settings `fix` acts on:
+//! `http-connections`, `experimental-features`, `access-tokens`, and the
+//! daemon build settings forwarded via `set_options` (`max-jobs`, `cores`,
+//! `fallback`, `keep-failed`, `max-silent-time`, `substitute`, plus the whole
+//! map as `set_options` overrides). Precedence, lowest to highest:
 //!   1. `/etc/nix/nix.conf`                                   (system)
 //!   2. `$XDG_CONFIG_HOME/nix/nix.conf` (or `~/.config/nix/nix.conf`)  (user)
 //!   3. `$NIX_CONFIG`                             (inline, newline-separated)
