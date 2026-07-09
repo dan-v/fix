@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const fix = @import("fix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
+const nix_conf = @import("nix_conf.zig");
 
 const Evaluator = fix.Evaluator;
 
@@ -40,6 +41,16 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
     ev.setEnvironment(init.environ_map);
+    // Concurrent-fetch cap from nix.conf `http-connections` (Nix default 25;
+    // 0 = unlimited). Best-effort: unreadable config just uses the default.
+    if (nix_conf.load(ev.allocator, ev)) |loaded| {
+        var settings = loaded;
+        defer settings.deinit();
+        const http_conn = settings.getUint("http-connections") orelse 25;
+        ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
+    } else |_| {
+        ev.setFetchConnections(25);
+    }
     try ev.setBasePathFromCurrentPath(init.io);
     if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
 

@@ -7,6 +7,7 @@
 const std = @import("std");
 const nix_hash = @import("hash.zig");
 const FileCache = @import("file_cache.zig").FileCache;
+const sync = @import("base").sync;
 
 /// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
 /// mirroring Nix's `~/.cache/nix`; falls back to `./.zig-cache/fix` when the
@@ -24,6 +25,10 @@ pub const FetchCache = struct {
     /// `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. When unset (e.g. tests
     /// that never call `setEnvironment`) it falls back to `./.zig-cache/fix`.
     cache_root: ?[]u8 = null,
+    /// Max concurrent fetches (`http-connections`; 0 = unlimited). The offload
+    /// path (`vm.io_offload.runFetch`) acquires `conn_sem` when this is > 0.
+    max_connections: u32 = 0,
+    conn_sem: sync.Semaphore = sync.Semaphore.init(0),
 
     const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
@@ -108,6 +113,17 @@ pub const FetchCache = struct {
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
         self.io = io;
+    }
+
+    /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
+    pub fn setMaxConnections(self: *FetchCache, n: u32) void {
+        self.max_connections = n;
+        self.conn_sem = sync.Semaphore.init(n);
+    }
+
+    /// The permit semaphore to gate a fetch on, or null when unlimited.
+    pub fn connSem(self: *FetchCache) ?*sync.Semaphore {
+        return if (self.max_connections > 0) &self.conn_sem else null;
     }
 
     /// Set the download-cache root (duped/owned). See `cache_root`.

@@ -12,8 +12,10 @@
 //! `work` closure's arguments (which live on the parked fiber's stack, in
 //! non-GC allocator memory) remain valid and stable throughout.
 
+const std = @import("std");
 const io_runtime = @import("runtime").io_runtime;
 const thunk_mod = @import("runtime").thunk;
+const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("worker.zig");
 
@@ -60,6 +62,54 @@ const Cell = struct {
         // fiber resumes and reuses its frame); `publish` only touches
         // `future`, which lives on the stable WorkerFiber.
         self.work(self.work_ctx);
+        self.future.publish();
+    }
+};
+
+/// Like `run`, but spawns a dedicated thread for this one fetch instead of
+/// queueing on the shared serial IO thread — fetches are independent and run in
+/// parallel, bounded by `sem` (from `http-connections`; null = unlimited). The
+/// blocking download/subprocess happens on the spawned thread; the fiber parks.
+/// The CPU-cheap parts stay on the compute pool; only the syscall-blocking part
+/// is offloaded, so a parked fetch thread costs no CPU.
+pub fn runFetch(sem: ?*sync.Semaphore, work: *const fn (*anyopaque) void, work_ctx: *anyopaque) void {
+    const inner = fiber_mod.currentFiber() orelse {
+        work(work_ctx);
+        return;
+    };
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
+
+    var cell: FetchCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future, .sem = sem };
+    var thread = std.Thread.spawn(.{}, FetchCell.run, .{&cell}) catch {
+        // Can't spawn a thread — run inline (blocks this worker, but correct).
+        work(work_ctx);
+        return;
+    };
+    thread.detach();
+
+    if (wf.io_future.enrollWaiter(&wf.waiter)) {
+        wf.state = .suspended;
+        fiber_mod.Fiber.yield();
+        wf.state = .running;
+    }
+}
+
+const FetchCell = struct {
+    work: *const fn (*anyopaque) void,
+    work_ctx: *anyopaque,
+    future: *thunk_mod.Future,
+    sem: ?*sync.Semaphore,
+
+    fn run(p: *anyopaque) void {
+        const self: *FetchCell = @ptrCast(@alignCast(p));
+        // Bound concurrent fetches: acquire a permit before the blocking work,
+        // release after. A thread that blocks here is parked (free), so the cap
+        // limits concurrent network ops without limiting thread count.
+        if (self.sem) |s| s.acquire();
+        self.work(self.work_ctx);
+        if (self.sem) |s| s.release();
+        // Publish last: after this the fiber may resume and reuse `self`'s frame.
         self.future.publish();
     }
 };

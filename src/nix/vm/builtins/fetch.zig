@@ -224,13 +224,45 @@ fn fetchSpanEnd(self: anytype, span: ?eval_progress.Span) void {
     if (span) |sp| if (self.progress) |progress| progress.endSpan(sp);
 }
 
+const io_offload = @import("../io_offload.zig");
+const FetchCache = fetch_cache.FetchCache;
+const FileCache = file_cache.FileCache;
+
+/// Run a blocking `FetchCache` fetch on a dedicated fetch thread (bounded by
+/// `http-connections`) while the calling fiber parks — so the compute worker is
+/// free to run other fibers instead of blocking on network/subprocess I/O. The
+/// fetch's borrowed args stay valid because the fiber stays parked for the whole
+/// call. `call` is a `FetchCache` method, e.g. `FetchCache.fetchUrl`.
+fn offloadFetch(self: anytype, comptime call: anytype, spec: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload {
+    const Res = @typeInfo(@typeInfo(@TypeOf(call)).@"fn".return_type.?).error_union.payload;
+    const Cell = struct {
+        fetchers: *FetchCache,
+        files: *FileCache,
+        spec: @TypeOf(spec),
+        res: Res = undefined,
+        err: ?anyerror = null,
+
+        fn run(p: *anyopaque) void {
+            const c: *@This() = @ptrCast(@alignCast(p));
+            c.res = call(c.fetchers, c.files, c.spec) catch |e| {
+                c.err = e;
+                return;
+            };
+        }
+    };
+    var cell: Cell = .{ .fetchers = self.fetchers, .files = self.files, .spec = spec };
+    io_offload.runFetch(self.fetchers.connSem(), Cell.run, &cell);
+    if (cell.err) |e| return e;
+    return cell.res;
+}
+
 pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
+    const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return gitResultValue(self, spec.name, result);
 }
@@ -326,7 +358,7 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const result = try self.fetchers.fetchUrl(self.files, spec.borrowed());
+    const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
     defer self.allocator.free(path);
@@ -374,7 +406,7 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+    const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name });
     defer self.fetchers.allocator.free(path);
     // The unpacked tree is named "source" by default (Nix), independent of the
     // archive's URL basename which named the download.
@@ -417,7 +449,7 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
+    const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
     return mercurialResultValue(self, spec.name, result);
 }
@@ -544,7 +576,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "file")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, null);
         defer spec.deinit(self.allocator);
-        const result = try self.fetchers.fetchUrl(self.files, spec.borrowed());
+        const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
         defer self.allocator.free(path);
@@ -554,7 +586,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name });
         defer self.fetchers.allocator.free(path);
         const out = try ingestFetchedTree(self, path, spec.name, "", null);
         defer out.deinit(self.allocator);
@@ -564,7 +596,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "git")) {
         const spec = try fetchGitSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
+        const result = try offloadFetch(self, FetchCache.fetchGit, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return gitResultValue(self, spec.name, result);
     }
@@ -572,7 +604,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "github")) {
         const spec = try githubTreeSpec(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
+        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name });
         defer self.fetchers.allocator.free(path);
         const out = try ingestFetchedTree(self, path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
@@ -582,7 +614,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "mercurial")) {
         const spec = try fetchMercurialSpecFromAttrs(self, attrs_id);
         defer spec.deinit(self.allocator);
-        const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
+        const result = try offloadFetch(self, FetchCache.fetchMercurial, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
         return mercurialResultValue(self, spec.name, result);
     }

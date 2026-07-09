@@ -20,6 +20,53 @@ pub const SpinMutex = struct {
     }
 };
 
+/// Futex-based counting semaphore. Used to cap concurrent fetches
+/// (`http-connections`); acquirers park on the count word when it hits zero.
+/// Threads that block here are IO threads (not compute workers), so parking is
+/// free — it bounds concurrent network ops, the resource actually being limited.
+pub const Semaphore = struct {
+    count: std.atomic.Value(u32),
+
+    pub fn init(permits: u32) Semaphore {
+        return .{ .count = .init(permits) };
+    }
+
+    pub fn acquire(self: *Semaphore) void {
+        while (true) {
+            var c = self.count.load(.acquire);
+            while (c > 0) {
+                if (self.count.cmpxchgWeak(c, c - 1, .acquire, .monotonic)) |actual| {
+                    c = actual;
+                } else {
+                    return;
+                }
+            }
+            // count == 0: wait for a release to bump it.
+            switch (builtin.os.tag) {
+                .linux => _ = std.os.linux.futex_4arg(
+                    @ptrCast(&self.count),
+                    .{ .cmd = .WAIT, .private = true },
+                    0,
+                    null,
+                ),
+                else => std.Thread.yield() catch {},
+            }
+        }
+    }
+
+    pub fn release(self: *Semaphore) void {
+        _ = self.count.fetchAdd(1, .release);
+        switch (builtin.os.tag) {
+            .linux => _ = std.os.linux.futex_3arg(
+                @ptrCast(&self.count),
+                .{ .cmd = .WAKE, .private = true },
+                1,
+            ),
+            else => {},
+        }
+    }
+};
+
 /// Tri-state futex mutex. Uncontended lock/unlock is a single cmpxchg
 /// plus a release store. Under contention, waiters park on a futex
 /// (Linux) or yield (other platforms) instead of burning the core.

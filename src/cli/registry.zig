@@ -27,8 +27,8 @@ pub fn resolve(allocator: std.mem.Allocator, ev: *Evaluator, id: []const u8) !?[
 }
 
 /// Build `$<xdg_var>/<tail...>`, or `$HOME/<home_prefix...>/<tail...>` when the
-/// XDG var is unset. Null if neither is available.
-fn dirFile(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, xdg_var: []const u8, home_prefix: []const []const u8, tail: []const []const u8) !?[]u8 {
+/// XDG var is unset. Null if neither is available. Shared with `nix_conf.zig`.
+pub fn dirFile(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, xdg_var: []const u8, home_prefix: []const []const u8, tail: []const []const u8) !?[]u8 {
     const e = env orelse return null;
     var parts: std.ArrayListUnmanaged([]const u8) = .empty;
     defer parts.deinit(allocator);

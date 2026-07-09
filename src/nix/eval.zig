@@ -335,6 +335,11 @@ pub const Evaluator = struct {
         self.derivations.setDebugEnabled(enabled);
     }
 
+    /// Cap concurrent fetches (`http-connections`; 0 = unlimited).
+    pub fn setFetchConnections(self: *Evaluator, n: u32) void {
+        self.fetchers.setMaxConnections(n);
+    }
+
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
         return self.derivations.debugRecords();
     }

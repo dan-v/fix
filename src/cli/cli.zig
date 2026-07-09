@@ -13,6 +13,7 @@ const sync = @import("base").sync;
 pub const args = @import("args.zig");
 pub const run = @import("run.zig");
 pub const setup = @import("setup.zig");
+pub const nix_conf = @import("nix_conf.zig");
 pub const eval = @import("eval.zig");
 pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
