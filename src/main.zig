@@ -83,7 +83,10 @@ pub fn main(init: std.process.Init) !void {
     // is pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.lazy_shells_visible = options.output == .xml;
     ev.pipe_operators_enabled = options.experimental_features.contains(.pipe_operators);
-    ev.fetch_tree_enabled = options.experimental_features.contains(.fetch_tree);
+    ev.flakes_enabled = options.experimental_features.contains(.flakes);
+    // `flakes` implies `fetch-tree` (as in Nix): flake evaluation leans on the
+    // tree fetchers, so enabling flakes should not also require fetch-tree.
+    ev.fetch_tree_enabled = options.experimental_features.contains(.fetch_tree) or ev.flakes_enabled;
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
@@ -116,10 +119,18 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (source_arg == .flake and !ev.flakes_enabled) {
+        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(error.FlakesFeatureRequired), usage });
+        std.process.exit(1);
+    }
+
     const source = run.getSource(&ev, source_arg) catch |err| {
         std.debug.print("Error reading source: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    // `--flake` synthesizes its source text on `ev.allocator`; expr/file text
+    // is borrowed (argv) or owned by the evaluator's file cache.
+    defer if (source_arg == .flake) ev.allocator.free(source.text);
 
     var progress = cli.EvalProgress.init(init.io, show_progress);
     errdefer progress.deinit(false);
@@ -147,12 +158,14 @@ pub fn main(init: std.process.Init) !void {
         timeline.setSource(switch (source_arg) {
             .file => |p| p,
             .expr => "(expression)",
+            .flake => |inst| inst,
         });
     }
 
     const eval_label = switch (source_arg) {
         .file => |p| std.fs.path.basename(p),
         .expr => "expression",
+        .flake => |inst| inst,
     };
     const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text, eval_label);
     progress.deinit(ok);

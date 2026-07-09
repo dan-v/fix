@@ -95,6 +95,12 @@ pub const Evaluator = struct {
     /// `initVm`. Default false. (`getFlake` calls the fetcher directly and is
     /// unaffected by this gate.)
     fetch_tree_enabled: bool = false,
+    /// Whether the flake builtins (`getFlake`, `parseFlakeRef`,
+    /// `flakeRefToString`) may be called, and whether `--flake` is accepted.
+    /// Gated on the `flakes` experimental feature, like Nix. The CLI sets it
+    /// true for `--extra-experimental-features flakes` (which also implies
+    /// `fetch-tree`). Propagated to each VM in `initVm`. Default false.
+    flakes_enabled: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -725,6 +731,7 @@ pub const Evaluator = struct {
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.fetch_tree_enabled = self.fetch_tree_enabled;
+        vm.flakes_enabled = self.flakes_enabled;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Only worker-0 VMs (the demand path) publish their block subject, and

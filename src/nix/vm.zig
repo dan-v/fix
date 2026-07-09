@@ -296,6 +296,12 @@ pub const VM = struct {
     /// `Evaluator.fetch_tree_enabled`; checked in the builtin dispatch.
     fetch_tree_enabled: bool,
 
+    /// Whether the flake builtins (`getFlake`, `parseFlakeRef`,
+    /// `flakeRefToString`) are permitted (Nix's `flakes` experimental
+    /// feature). Set per-eval from `Evaluator.flakes_enabled`; checked in the
+    /// builtin dispatch.
+    flakes_enabled: bool,
+
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`
     /// outside a collection; `void` in normal builds.
@@ -378,6 +384,7 @@ pub const VM = struct {
             .spec_create_worker = 0,
             .lazy_shells_visible = false,
             .fetch_tree_enabled = false,
+            .flakes_enabled = false,
         };
     }
 

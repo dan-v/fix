@@ -67,5 +67,66 @@ pub fn getSource(ev: *Evaluator, source: SourceArg) !Source {
     return switch (source) {
         .expr => |text| .{ .text = text },
         .file => |path| .{ .text = try ev.readSourceFile(path) },
+        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable) },
     };
+}
+
+/// Lower a flake installable `<flakeref>[#<attrpath>]` into a Nix expression
+/// `(builtins.getFlake "<ref>").<attrpath>` and hand it to the normal evaluate
+/// path. `.` and relative flakerefs resolve against the evaluator's base path
+/// (the CLI's cwd); scheme refs (`github:`, `path:`, …) pass through to
+/// `getFlake`. The attrpath is dot-split into quoted selections, so component
+/// names may contain any character except `.`. The returned text is owned by
+/// `ev.allocator` and lives for the rest of the (one-shot) run.
+fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
+    const hash = std.mem.indexOfScalar(u8, installable, '#');
+    const flake_ref = if (hash) |i| installable[0..i] else installable;
+    const attr_path = if (hash) |i| installable[i + 1 ..] else "";
+
+    const resolved = try resolveFlakeRef(ev, flake_ref);
+    defer if (resolved.owned) ev.allocator.free(resolved.ref);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(ev.allocator);
+
+    try out.appendSlice(ev.allocator, "(builtins.getFlake \"");
+    try appendNixEscaped(ev.allocator, &out, resolved.ref);
+    try out.appendSlice(ev.allocator, "\")");
+
+    var it = std.mem.splitScalar(u8, attr_path, '.');
+    while (it.next()) |component| {
+        if (component.len == 0) continue;
+        try out.appendSlice(ev.allocator, ".\"");
+        try appendNixEscaped(ev.allocator, &out, component);
+        try out.append(ev.allocator, '"');
+    }
+
+    return out.toOwnedSlice(ev.allocator);
+}
+
+const ResolvedRef = struct { ref: []const u8, owned: bool };
+
+/// Turn a CLI flakeref into one `builtins.getFlake` accepts. `.` and paths
+/// (`/…`, `./…`, `../…`) become an absolute path resolved against the base
+/// path; everything else (scheme refs like `github:…`/`path:…`, bare registry
+/// names) passes through unchanged for `getFlake`/`parseFlakeRef` to handle.
+fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
+    const is_path = flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.');
+    if (!is_path) return .{ .ref = flake_ref, .owned = false };
+
+    const base = ev.base_path orelse return .{ .ref = flake_ref, .owned = false };
+    const abs = try std.fs.path.resolve(ev.allocator, &.{ base, flake_ref });
+    return .{ .ref = abs, .owned = true };
+}
+
+/// Append `text` escaped for a Nix double-quoted string literal. `$` is escaped
+/// too so a `${` in a flakeref/attr name can never start an interpolation.
+fn appendNixEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '\\', '"', '$' => try out.append(allocator, '\\'),
+            else => {},
+        }
+        try out.append(allocator, c);
+    }
 }

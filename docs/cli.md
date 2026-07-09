@@ -36,10 +36,11 @@ Parsed in `src/cli/args.zig`. Defaults shown; `[=X]` means the value is optional
 |---|---|
 | `-e, --expr EXPR` | evaluate expression text |
 | `--file PATH` | evaluate a file (mutually exclusive with `-e`) |
+| `--flake INSTALLABLE` | evaluate a flake output `<flakeref>[#<attrpath>]`; lowered to `(builtins.getFlake "<ref>").<attrpath>`. `.`/relative refs resolve against cwd; `github:`/`path:`/… pass through. Requires the `flakes` feature. |
 | `--repl` | interactive loop; rejects a source arg |
 | `--json` / `--xml` | render the value as JSON / XML instead of Nix |
 | `--strict` | recursively force attr values + list items before writing |
-| `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call. Both off by default. |
+| `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
 | `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`). Effective only on a `-Dgc` build → [gc.md](gc.md) |
 | `--show-trace` | full evaluation traces on error |

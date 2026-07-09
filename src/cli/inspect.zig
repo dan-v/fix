@@ -67,12 +67,17 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const source = switch (source_arg) {
         .expr => |text| text,
         .file => |path| try ev.readSourceFile(path),
+        .flake => {
+            std.debug.print("error: --flake is not supported by this subcommand\n", .{});
+            return 1;
+        },
     };
 
     if (options.no_eval) {
         _ = ev.compileSource(source, switch (source_arg) {
             .expr => null,
             .file => |path| path,
+            .flake => unreachable,
         }) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
             return 1;

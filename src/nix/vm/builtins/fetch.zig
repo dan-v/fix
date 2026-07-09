@@ -474,6 +474,32 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     return error.InvalidFlakeRef;
 }
 
+/// Gate for the flake builtins on the `flakes` experimental feature (Nix
+/// parity). A hard eval error, like the `fetch-tree` gate: not catchable by
+/// `builtins.tryEval`. `getFlake`/`parseFlakeRef` call each other and the
+/// fetcher via their un-suffixed impls, so those internal calls bypass this.
+fn requireFlakes(self: anytype) !void {
+    if (!self.flakes_enabled) {
+        try vm_trace.setErrorMessage(self, "flakes are disabled; pass --extra-experimental-features flakes to enable them");
+        return error.MissingExperimentalFeature;
+    }
+}
+
+pub fn builtinGetFlakeEntry(self: anytype, arg: Value) !Value {
+    try requireFlakes(self);
+    return builtinGetFlake(self, arg);
+}
+
+pub fn builtinParseFlakeRefEntry(self: anytype, arg: Value) !Value {
+    try requireFlakes(self);
+    return builtinParseFlakeRef(self, arg);
+}
+
+pub fn builtinFlakeRefToStringEntry(self: anytype, arg: Value) !Value {
+    try requireFlakes(self);
+    return builtinFlakeRefToString(self, arg);
+}
+
 pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     const ref_value = Value.string(try self.intern.intern(ref));

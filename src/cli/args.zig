@@ -11,6 +11,8 @@ pub const usage =
     \\options:
     \\  --repl                 read and evaluate expressions interactively
     \\  -e, --expr EXPR        evaluate expression text
+    \\  --flake INSTALLABLE    evaluate a flake output: <flakeref>[#<attrpath>]
+    \\                         (requires the flakes experimental feature)
     \\  --json                 write the evaluated value as JSON
     \\  --xml                  write the evaluated value as XML
     \\  --strict               recursively force attr values and list items before writing
@@ -51,10 +53,12 @@ pub const OutputFormat = enum {
 pub const ExperimentalFeature = enum {
     pipe_operators,
     fetch_tree,
+    flakes,
 
     pub fn fromName(name: []const u8) ?ExperimentalFeature {
         if (std.mem.eql(u8, name, "pipe-operators")) return .pipe_operators;
         if (std.mem.eql(u8, name, "fetch-tree")) return .fetch_tree;
+        if (std.mem.eql(u8, name, "flakes")) return .flakes;
         return null;
     }
 };
@@ -80,6 +84,10 @@ pub const EvaluationMode = struct {
 pub const SourceArg = union(enum) {
     expr: []const u8,
     file: []const u8,
+    /// A flake installable `<flakeref>[#<attrpath>]` from `--flake`. Lowered
+    /// to a `builtins.getFlake` expression at source-load time (see
+    /// `cli/run.zig`). Requires the `flakes` experimental feature.
+    flake: []const u8,
 };
 
 pub const Options = struct {
@@ -188,6 +196,8 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
         } else if (std.mem.eql(u8, arg, "--file")) {
             try options.setSource(.{ .file = args_iter.next() orelse return error.MissingPath });
+        } else if (std.mem.eql(u8, arg, "--flake")) {
+            try options.setSource(.{ .flake = args_iter.next() orelse return error.MissingFlakeInstallable });
         } else if (std.mem.eql(u8, arg, "--vm-trace")) {
             options.vm_trace_path = "-"; // stderr
         } else if (std.mem.startsWith(u8, arg, "--vm-trace=")) {
@@ -250,6 +260,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.MissingExpression => "missing expression after -e or --expr",
         error.MissingPath => "missing path after --file",
+        error.MissingFlakeInstallable => "missing installable after --flake",
+        error.FlakesFeatureRequired => "--flake requires the flakes experimental feature; pass --extra-experimental-features flakes",
         error.MissingDerivationDebugFilter => "missing text after --debug-derivation-filter",
         error.MissingDerivationDebugName => "missing name after --debug-derivation-name",
         error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
@@ -262,7 +274,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.MissingExperimentalFeatures => "missing feature list after --experimental-features or --extra-experimental-features",
-        error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree)",
+        error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
         error.MissingWorkers => "missing N after --workers",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.MissingMaxMemory => "missing size after --max-memory",
