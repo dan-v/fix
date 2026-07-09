@@ -190,6 +190,20 @@ pub const DaemonStore = struct {
         return path;
     }
 
+    /// Add a flat (non-NAR) file's raw `bytes` to the store under `name`,
+    /// content-addressed as `fixed:sha256` (flat) — the addressing
+    /// `builtins.fetchurl` uses. Returns the store path (owned by `allocator`).
+    pub fn addFlatFile(self: *DaemonStore, allocator: std.mem.Allocator, name: []const u8, bytes: []const u8, references: []const []const u8) ![]u8 {
+        try self.beginOp(.add_to_store);
+        try wire.writeString(self.w(), name);
+        try wire.writeString(self.w(), "fixed:sha256"); // flat (no `r:`)
+        try wire.writeStrings(self.w(), references);
+        try wire.writeBool(self.w(), false); // repair
+        try self.writeFramed(bytes);
+        try self.flushAndDrain();
+        return try self.readValidPathInfo(allocator);
+    }
+
     /// Stream `data` through the worker protocol's framed sink: one
     /// `[u64 len][bytes]` frame followed by a zero-length terminator frame.
     /// Frame payloads are raw (not 8-byte padded like protocol strings).

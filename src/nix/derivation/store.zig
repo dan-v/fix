@@ -153,6 +153,19 @@ pub const DerivationStore = struct {
         return self.addPathToStore(store_path, nar_bytes);
     }
 
+    /// Add a flat file's raw bytes to the store (fetchurl), gated on
+    /// `store_writes_enabled`.
+    pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
+        if (!self.store_writes_enabled) return;
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        if (self.instantiated.contains(store_path)) return;
+        const daemon = try self.ensureDaemon();
+        const written = try daemon.addFlatFile(self.allocator, storePathName(store_path), bytes, &.{});
+        self.allocator.free(written);
+        try self.markInstantiated(store_path);
+    }
+
     fn addText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();

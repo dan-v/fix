@@ -35,6 +35,7 @@ pub const DerivationStore = store_mod.DerivationStore;
 
 pub const sourcePath = path_mod.sourcePath;
 pub const textPath = path_mod.textPath;
+pub const fixedOutputPath = path_mod.fixedOutputPath;
 pub const outputPathName = path_mod.outputPathName;
 pub const drvPathName = path_mod.drvPathName;
 pub const hashToBase16 = hash_codec.hashToBase16;
