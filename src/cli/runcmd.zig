@@ -61,6 +61,10 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     defer if (source_arg == .flake) ev.allocator.free(source.text);
 
     ev.enableStoreWrites();
+    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var torn = false;
+    defer if (!torn) progress.deinit(false);
+    if (term.show_progress) ev.setProgressSink(progress.sink());
     ev.progressSessionBegin(run.sourceLabel(source_arg));
     ev.startProgressSampler();
 
@@ -88,13 +92,21 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     };
 
     ev.stopProgressSampler();
-    ev.progressSessionEnd();
 
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    ev.buildDerivations(&.{derived}, null) catch |err| {
+    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
+    const build_sink = if (term.show_progress) build_progress.sink() else null;
+    ev.buildDerivations(&.{derived}, build_sink) catch |err| {
+        build_progress.deinit();
+        ev.progressSessionEnd();
         return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
     };
+    // Tear the progress bar down before the program takes over the terminal.
+    build_progress.deinit();
+    ev.progressSessionEnd();
+    progress.deinit(true);
+    torn = true;
 
     // Assemble argv = [$out/bin/<program>] ++ (args after `--`) and exec it.
     const exe = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ out_path, program });

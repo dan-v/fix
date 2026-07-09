@@ -15,6 +15,7 @@ const run = @import("run.zig");
 
 const Evaluator = fix.Evaluator;
 const EnvMap = std.process.Environ.Map;
+const BuildSink = @import("runtime").store.BuildSink;
 
 pub const usage =
     \\usage: fix shell [options] (-p <pkgs...> | -e <expr> | --file <path> | --flake <inst>) [-- cmd args...]
@@ -55,14 +56,31 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const term = try setup.configure(&ev, init, options);
     ev.enableStoreWrites();
 
+    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var torn = false;
+    defer if (!torn) progress.deinit(false);
+    if (term.show_progress) ev.setProgressSink(progress.sink());
+    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
+    const build_sink = if (term.show_progress) build_progress.sink() else null;
+
+    const label = if (options.packages.items.len > 0) "packages" else run.sourceLabel(options.source.?);
+    ev.progressSessionBegin(label);
+    ev.startProgressSampler();
+
     // Collect the output paths whose bin/ dirs go on PATH.
     var out_paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer out_paths.deinit(allocator);
 
     const failed = if (options.packages.items.len > 0)
-        try realizePackages(allocator, init, &ev, term, options, &out_paths)
+        try realizePackages(allocator, init, &ev, term, options, build_sink, &out_paths)
     else
-        try realizeSource(allocator, init, &ev, term, options, &out_paths);
+        try realizeSource(allocator, init, &ev, term, options, build_sink, &out_paths);
+
+    // Tear the progress bar down before the shell/command takes over.
+    build_progress.deinit();
+    ev.progressSessionEnd();
+    progress.deinit(failed == null);
+    torn = true;
     if (failed) |code| return code;
 
     return launch(allocator, init, out_paths.items, args_iter);
@@ -70,11 +88,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
 /// Build each `-p` package from `<nixpkgs>`, appending its outPath. Returns a
 /// non-null exit code on failure (already reported).
-fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
-    ev.progressSessionBegin("packages");
-    ev.startProgressSampler();
-    defer ev.progressSessionEnd();
-
+fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const nixpkgs = ev.evaluate("import <nixpkgs> { }") catch |err| {
         ev.stopProgressSampler();
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "import <nixpkgs> {}", err);
@@ -108,14 +122,14 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     }
 
     ev.stopProgressSampler();
-    ev.buildDerivations(derived.items, null) catch |err| {
+    ev.buildDerivations(derived.items, sink) catch |err| {
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "packages", err);
     };
     return null;
 }
 
 /// Build the `-e`/`--file`/`--flake` derivation, appending its outPath.
-fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
+fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Evaluator, term: setup.Terminal, options: args.Options, sink: ?BuildSink, out_paths: *std.ArrayListUnmanaged([]const u8)) !?u8 {
     const source_arg = options.source.?;
     if (source_arg == .flake and !ev.flakes_enabled) {
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
@@ -126,10 +140,6 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         return 1;
     };
     defer if (source_arg == .flake) ev.allocator.free(source.text);
-
-    ev.progressSessionBegin(run.sourceLabel(source_arg));
-    ev.startProgressSampler();
-    defer ev.progressSessionEnd();
 
     const result = ev.evaluate(source.text) catch |err| {
         ev.stopProgressSampler();
@@ -148,7 +158,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     ev.stopProgressSampler();
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    ev.buildDerivations(&.{derived}, null) catch |err| {
+    ev.buildDerivations(&.{derived}, sink) catch |err| {
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     };
     return null;
