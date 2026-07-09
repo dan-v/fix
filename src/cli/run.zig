@@ -8,8 +8,17 @@ const derivation_debug = @import("derivation_debug.zig");
 const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
 const Value = @import("runtime").value.Value;
+const rstore = @import("runtime").store;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
+
+/// The build realization mode selected by `--check`/`--repair` (`--check`
+/// takes precedence). `--repair`/`--check` require a trusted daemon user.
+pub fn buildMode(options: args.Options) rstore.BuildMode {
+    if (options.check) return .check;
+    if (options.repair) return .repair;
+    return .normal;
+}
 
 /// Evaluate `source`, write the result (or render the failure), and emit any
 /// requested derivation-debug records. Returns whether evaluation succeeded.

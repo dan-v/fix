@@ -114,7 +114,7 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     }
 
     ev.stopProgressSampler();
-    ev.buildDerivations(derived.items, sink) catch |err| {
+    ev.buildDerivations(derived.items, sink, run.buildMode(options)) catch |err| {
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "packages", err);
     };
     return null;
@@ -150,7 +150,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     ev.stopProgressSampler();
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    ev.buildDerivations(&.{derived}, sink) catch |err| {
+    ev.buildDerivations(&.{derived}, sink, run.buildMode(options)) catch |err| {
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     };
     return null;

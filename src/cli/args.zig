@@ -114,6 +114,10 @@ pub const Options = struct {
     drv_link: ?[]const u8 = null,
     /// `--add-drv-link`: also create a symlink to the top-level `.drv`.
     add_drv_link: bool = false,
+    /// `--check`: rebuild and verify outputs are unchanged (BuildMode check).
+    check: bool = false,
+    /// `--repair`: rebuild and repair corrupted store paths (BuildMode repair).
+    repair: bool = false,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -212,6 +216,9 @@ const Opt = enum {
     out_link,
     drv_link,
     add_drv_link,
+    // Build realization.
+    check,
+    repair,
     // Diagnostics.
     show_trace,
     color,
@@ -277,6 +284,8 @@ const Spec = struct {
 const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
+/// Commands that realize (build/substitute) derivations via the daemon.
+const realize_cmds = &[_]Cmd{ .build, .run, .shell };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-e", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text", .show_in = source_cmds },
@@ -300,6 +309,9 @@ const specs = [_]Spec{
     .{ .id = .no_link, .long = "--no-link", .hidden = true }, // alias of --no-out-link
     .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
+
+    .{ .id = .check, .long = "--check", .help = "rebuild and check that outputs are unchanged", .show_in = realize_cmds },
+    .{ .id = .repair, .long = "--repair", .help = "rebuild and repair corrupted store paths", .show_in = realize_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error" },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
@@ -461,6 +473,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .out_link => options.out_link = v0.?,
         .drv_link => options.drv_link = v0.?,
         .add_drv_link => options.add_drv_link = true,
+        .check => options.check = true,
+        .repair => options.repair = true,
 
         .show_trace => options.show_trace = true,
         .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,

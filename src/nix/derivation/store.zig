@@ -232,11 +232,11 @@ pub const DerivationStore = struct {
 
     /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon,
     /// forwarding the build activity/log stream to `sink` if given.
-    pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink) !void {
+    pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
         const daemon = try self.ensureDaemon();
-        try daemon.buildPaths(derived_paths, sink);
+        try daemon.buildPaths(derived_paths, sink, mode);
     }
 
     const DaemonOp = union(enum) {

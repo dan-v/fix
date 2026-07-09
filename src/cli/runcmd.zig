@@ -88,7 +88,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     defer allocator.free(derived);
     var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
     const build_sink = if (term.show_progress) build_progress.sink() else null;
-    ev.buildDerivations(&.{derived}, build_sink) catch |err| {
+    ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
         build_progress.deinit();
         ev.progressSessionEnd();
         return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);

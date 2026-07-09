@@ -906,8 +906,8 @@ pub const Evaluator = struct {
 
     /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon store,
     /// forwarding the build activity/log stream to `sink` if given.
-    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink) !void {
-        return self.derivations.buildPaths(derived_paths, sink);
+    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
+        return self.derivations.buildPaths(derived_paths, sink, mode);
     }
 
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,

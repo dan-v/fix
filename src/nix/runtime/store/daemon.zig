@@ -36,6 +36,11 @@ pub const BuildSink = struct {
 /// handshake). Trusted clients may perform privileged ops without restriction.
 pub const Trust = enum { unknown, trusted, not_trusted };
 
+/// Build realization mode sent with `build_paths` (Nix's `BuildMode`): the
+/// default build, `--repair` (rebuild and fix corrupted paths), or `--check`
+/// (rebuild and verify outputs are unchanged).
+pub const BuildMode = enum(u64) { normal = 0, repair = 1, check = 2 };
+
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -243,10 +248,10 @@ pub const DaemonStore = struct {
     /// `/nix/store/xxx.drv^*` for all outputs). The daemon builds or substitutes
     /// the outputs; build logs stream over STDERR_NEXT and are forwarded to our
     /// stderr while this runs. Errors (with the daemon's message) on failure.
-    pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink) !void {
+    pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) !void {
         try self.beginOp(.build_paths);
         try wire.writeStrings(self.w(), derived_paths);
-        try wire.writeInt(self.w(), 0); // buildMode = Normal
+        try wire.writeInt(self.w(), @intFromEnum(mode));
         self.build_sink = sink;
         self.log_build = sink == null; // sink consumes logs itself
         defer {
