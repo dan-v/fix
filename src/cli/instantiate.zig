@@ -77,8 +77,10 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     ok = true;
 
+    // nix-instantiate roots the .drv only when asked, and makes a direct root
+    // unless --indirect.
     if (options.add_root) |root_path| {
-        build.linkRoot(init.io, allocator, &ev, root_path, drv_path);
+        build.linkRoot(init.io, allocator, &ev, root_path, drv_path, options.indirect);
     }
     if (options.add_drv_link) {
         const name = options.drv_link orelse "derivation";

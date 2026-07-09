@@ -97,16 +97,14 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionEnd();
     ok = true;
 
-    // Result link: `--add-root PATH` puts it at PATH and registers a GC root;
-    // else `-o`/`--out-link` (default `result`), a plain symlink, unless
-    // `--no-out-link`.
-    if (options.add_root) |root_path| {
-        linkRoot(init.io, allocator, &ev, root_path, out_path);
-    } else if (!options.no_link) {
-        const name = options.out_link orelse "result";
-        makeLink(init.io, name, out_path) catch |err| {
-            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
-        };
+    // The output link, which — as in nix-build — is registered as an indirect
+    // GC root. `--add-root PATH` relocates it (and, per nix-store/-instantiate,
+    // makes a direct root unless `--indirect`); `--out-link`/`-o` name it;
+    // `--no-out-link` suppresses it (unless `--add-root` asks for one).
+    const link_name = options.add_root orelse (if (options.no_link) null else (options.out_link orelse "result"));
+    if (link_name) |name| {
+        const indirect = options.add_root == null or options.indirect;
+        linkRoot(init.io, allocator, &ev, name, out_path, indirect);
     }
     if (options.add_drv_link) {
         const name = options.drv_link orelse "derivation";
@@ -132,10 +130,12 @@ pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     try cwd.symLink(io, target, name, .{});
 }
 
-/// Create the symlink `name` -> `target`, then register `name` as an indirect
-/// GC root via the daemon (`--add-root`). Warns (does not fail the build) on
-/// either step. Shared by `build` and `instantiate`.
-pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: []const u8, target: []const u8) void {
+/// Create the symlink `name` -> `target` and register `name` as a GC root, as
+/// nix does. `indirect` picks an indirect root (the daemon records
+/// `<gcroots>/auto/<hash>` -> `name`, so `name` may live anywhere) versus a
+/// direct root (the symlink itself, effective only under the gcroots dir).
+/// Warns (does not fail) on any step. Shared by `build` and `instantiate`.
+pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: []const u8, target: []const u8, indirect: bool) void {
     makeLink(io, name, target) catch |err| {
         std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
         return;
@@ -145,15 +145,23 @@ pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: 
         return;
     };
     defer allocator.free(abs);
+    if (!indirect) {
+        // A direct root is just the symlink; the GC only honors it when it lives
+        // under the gcroots dir. Warn otherwise, as nix does.
+        if (!std.mem.startsWith(u8, abs, "/nix/var/nix/gcroots/"))
+            std.debug.print("warning: {s} is not in the gcroots directory, so it will not be an effective GC root (pass --indirect)\n", .{abs});
+        return;
+    }
     ev.addIndirectRoot(abs) catch |err| {
         std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
     };
 }
 
-/// Absolute, cwd-joined form of `name` (the link path the daemon roots).
+/// Absolute, normalized (cwd-joined) form of `name` — the link path the daemon
+/// roots. `resolve` collapses `.`/`..` so the root path is canonical.
 fn absPath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
+    if (std.fs.path.isAbsolute(name)) return std.fs.path.resolve(allocator, &.{name});
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
-    return std.fs.path.join(allocator, &.{ cwd, name });
+    return std.fs.path.resolve(allocator, &.{ cwd, name });
 }

@@ -77,21 +77,21 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     return .{ .use_color = use_color, .show_progress = show_progress };
 }
 
-/// Send per-connection daemon settings (`--cores`/`--max-jobs`/`--fallback`/…
-/// and `--verbose`) via `set_options` when the store connects. Gated on the
-/// user actually asking for something (any `--option`/build-setting flag or
-/// `--verbose`); otherwise the daemon keeps its own config, preserving the
-/// default `fix build` behaviour. The overrides map carries every provided
-/// setting (so arbitrary keys like `timeout` reach the daemon); the fixed
-/// fields are read back from the merged config so system `nix.conf` values
-/// (e.g. `max-jobs`) are honoured too.
+/// Send per-connection daemon settings via `set_options` when the store
+/// connects. Like Nix, this is always sent: the client's resolved config is
+/// authoritative for the connection. The fixed fields come from the merged
+/// `nix.conf` (system + user + `$NIX_CONFIG` + `--option`/build-setting flags),
+/// and the whole merged map is forwarded as the overrides map (so any set key —
+/// `timeout`, `substituters`, … — reaches the daemon). `fix` reads the same
+/// `/etc/nix/nix.conf` the daemon does, so unchanged values are no-ops; only
+/// user/CLI overrides differ. `set_options` is only emitted when the store
+/// actually connects (build/instantiate/run/shell), never for plain `eval`.
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
-    if (options.option_overrides.items.len == 0 and options.verbose == 0) return;
-
     var overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty;
     defer overrides.deinit(ev.allocator);
-    for (options.option_overrides.items) |o|
-        try overrides.append(ev.allocator, .{ .name = o.name, .value = o.value });
+    var it = settings.map.iterator();
+    while (it.next()) |e|
+        try overrides.append(ev.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
 
     // setDaemonBuildSettings dupes the overrides into owned storage, so this
     // borrowed slice need only live across the call.
