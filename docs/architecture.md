@@ -24,26 +24,25 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[derivation](derivation/model.md)** — the `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths. [String context](derivation/context.md) tracks which store paths each string depends on.
 
-## Two kinds of module
+## The module DAG
 
-The build (`build.zig`, see [build](build.md)) splits the code into **clean-cut modules** and one **coupled core**:
+The build (`build.zig`, see [build](build.md)) arranges the code as an acyclic graph of Zig modules. Each module exposes a single facade file; reaching into another module's internals by relative path is a lint error (`zig build lint`) — and would silently duplicate-compile those files into a second, incompatible copy of their types. Every dependency arrow points down:
 
 ```
-containers ┐
-syntax     │
-runtime    ├─ genuinely acyclic → separate Zig modules, imported by name,
-parallel   │   boundaries enforced by `zig build lint`
-derivation │
-cli        ┘
-
-fix (core) ── bytecode · compiler · vm · eval · probe
-              real dependency cycles (eval/worker ↔ vm/force,
-              vm/force → compiler/deferred → eval) → stays one module
+containers   syntax   runtime   parallel   derivation      (leaf subsystems)
+                 observ                    → syntax
+   bytecode                               → runtime
+   probe                                  → bytecode, runtime, parallel
+   compiler                               → bytecode, runtime, syntax, probe
+   vm                                     → bytecode, compiler, runtime, parallel,
+                                            derivation, observ, probe, syntax
+   fix  (src/root.zig)                    → all of the above
+   cli                                    → fix
 ```
 
-Six modules are genuinely tree-shaped and become real Zig modules: `containers` (lock-free deques shared by the GC and scheduler), `syntax`, `runtime`, `parallel`, `derivation`, and `cli`. Each exposes a single facade file; reaching into its internals is a lint error (it also silently duplicate-compiles into a second, incompatible type). `cli` sits on top and imports the `fix` core by name; the other five never import the core.
+Eleven of these are lint-enforced modules: `containers` (lock-free deques shared by the GC and scheduler), `syntax`, `runtime`, `parallel`, `derivation`, `observ` (the progress/trace sinks the interpreter writes to), `bytecode` (the instruction set + chunk encoding), `probe` (opt-in diagnostics), `compiler`, `vm`, and `cli`. The `fix` module (`src/root.zig`) is the top layer — the `Evaluator` orchestration: it owns the shared state, composes the pipeline, and drives evaluation. `cli` and the executable import `fix` by name.
 
-The core stays one module because it has genuine cycles that a module boundary could only break with forward-declared interfaces buying nothing: the VM's `forceThunk` reaches into `compiler/deferred` to compile deferred thunk bodies on demand, and that compile path in turn needs the `Evaluator` (`vm/force → compiler/deferred → eval`); the parallel eval worker drives the VM while the VM's force path re-enters the worker to schedule and steal (`eval/worker ↔ vm/force`, a direct two-file cycle). So the engine lives together and is organised by directory instead. See [build](build.md).
+The layering mirrors the [pipeline](#the-evaluation-pipeline): `compiler` lowers the AST onto `bytecode`; `vm` is the execution engine — the threaded dispatcher, thunk forcing, the fiber worker pool, and the builtins — and `fix` composes it all into the `Evaluator`. The VM's on-demand compilation of deferred thunk bodies calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* `vm` alongside the force path, so the force↔worker relationship is intra-module cohesion rather than a cycle. See [build](build.md).
 
 ## Laziness and parallelism are one primitive
 

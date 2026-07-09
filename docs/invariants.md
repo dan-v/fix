@@ -41,5 +41,5 @@ These span subsystems, so they're collected here. Violating one usually shows up
 ## Build & structure
 
 - **LLVM is forced** (`use_llvm=true`) because the threaded dispatcher relies on `@call(.always_tail)`; other backends would unbounded-recurse. → [build](build.md), [vm/dispatch](vm/dispatch.md)
-- **Module-boundary hygiene.** Import a clean-cut module (`containers`/`syntax`/`runtime`/`parallel`/`derivation`/`cli`) by name through its facade — never a relative path into its internals (that silently duplicate-compiles into an incompatible second type). `zig build lint` enforces it, and those modules' unit tests need explicit test steps. → [build](build.md)
+- **Module-boundary hygiene.** Import a module by name through its facade — never a relative path into its internals (that silently duplicate-compiles into an incompatible second type). `zig build lint` enforces this across all module boundaries, and each module's unit tests need an explicit test step. → [build](build.md)
 - **Chunks are immutable after registration**, and their constants are permanent GC roots (never swept). Per-thread inline caches/memos are guarded by `heap_token`. → [vm/dispatch](vm/dispatch.md)

@@ -32,10 +32,10 @@ pub fn build(b: *std.Build) void {
     // SAME module object, else Zig sees the generated file in two modules.
     const build_options_mod = build_options.createModule();
 
-    // Clean-cut subsystem modules: genuinely-acyclic subsystems are real
-    // modules so consumers import them by name (`@import("syntax")`) and the
-    // compiler enforces that nothing reaches into their internals. The coupled
-    // evaluator engine stays in the main module (see docs/plans/cleanup-plan.md).
+    // Every subsystem is a real module: consumers import it by name
+    // (`@import("syntax")`) and the compiler enforces that nothing reaches into
+    // its internals. The modules form an acyclic graph (see docs/build.md),
+    // topped by the `fix` evaluator layer (src/root.zig).
     const syntax_mod = b.addModule("syntax", .{
         .root_source_file = b.path("src/syntax.zig"),
         .target = target,

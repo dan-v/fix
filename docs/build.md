@@ -2,25 +2,30 @@
 
 *The build graph, module layout, and hygiene that keep the fast paths honest.*
 
-`fix` builds with `zig build` from a single `build.zig`. The build's shape is deliberate: a small ring of genuinely-acyclic subsystems are real Zig modules imported by name, while the coupled evaluator core stays in one module because it has real dependency cycles. The build also forces LLVM (the threaded dispatcher needs it), wires per-module unit tests by hand, and lints module boundaries.
+`fix` builds with `zig build` from a single `build.zig`. The build's shape is deliberate: every subsystem is a real Zig module imported by name, arranged as an acyclic dependency graph and topped by the `fix` evaluator layer. The build also forces LLVM (the threaded dispatcher needs it), wires per-module unit tests by hand, and lints module boundaries.
 
-## Model: clean-cut modules vs the coupled core
+## Module model
 
-Zig's `@import("<name>")` reaches a module only through its facade; the compiler then enforces that outside code cannot touch the module's internal files. `fix` uses this to carve out the subsystems that are genuinely tree-shaped from the engine that isn't. See [architecture.md](architecture.md) for the boundary rationale.
+Zig's `@import("<name>")` reaches a module only through its facade; the compiler then enforces that outside code cannot touch the module's internal files. `fix` arranges every subsystem as an acyclic dependency graph of such modules — the layering mirrors the evaluation pipeline. See [architecture.md](architecture.md) for the rationale.
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `containers` | `src/containers.zig` | — | lock-free work-stealing deques + cache-line isolation; bottom of the graph, depends only on `std` |
-| `syntax` | `src/syntax.zig` | `parser_tables` | lexer + parser + AST; no engine deps |
-| `runtime` | `src/runtime.zig` | `build_options`, `containers` | values, heap, interning, thunk representation, GC tracer |
-| `parallel` | `src/parallel.zig` | `build_options`, `runtime`, `containers` | fibers, scheduler, workers; adds arch asm `src/parallel/fiber/swap_x86_64.S` |
-| `derivation` | `src/derivation.zig` | `runtime` | derivation model, hashing, context |
-| `fix` (core) | `src/root.zig` | all of the above + `build_options` | bytecode, compiler, vm, eval/worker, eval/progress, eval/gc, probe |
+| `containers` | `src/containers.zig` | — | lock-free work-stealing deques + cache-line isolation; depends only on `std` |
+| `syntax` | `src/syntax.zig` | `parser_tables` | lexer + LALR(1) parser + AST |
+| `runtime` | `src/runtime.zig` | `build_options`, `containers` | values, heap, interning, thunk/Future, GC tracer |
+| `parallel` | `src/parallel.zig` | `build_options`, `runtime`, `containers` | fibers + scheduler; adds arch asm `src/parallel/fiber/swap_x86_64.S` |
+| `derivation` | `src/derivation.zig` | `runtime` | derivation model, hashing, string context |
+| `observ` | `src/observ.zig` | `syntax` | progress sink + error-trace collector — the sinks the VM writes to |
+| `bytecode` | `src/bytecode.zig` | `build_options`, `runtime` | instruction set, chunk encoding/registry, disassembler |
+| `probe` | `src/probe.zig` | `build_options`, `runtime`, `parallel`, `bytecode` | opt-in profilers, timeline, thunk-trace |
+| `compiler` | `src/compiler.zig` | `build_options`, `runtime`, `syntax`, `bytecode`, `probe` | single-pass AST → bytecode lowering |
+| `vm` | `src/vm.zig` | `bytecode`, `compiler`, `runtime`, `parallel`, `derivation`, `observ`, `probe`, `syntax`, `build_options` | interpreter: dispatch, thunk forcing, the fiber worker pool, builtins |
+| `fix` | `src/root.zig` | all of the above + `build_options` | the `Evaluator` orchestration layer (imports, GC orchestration, config) |
 | `cli` | `src/cli.zig` | `fix` + the shared set | command surface, arg parsing, subcommands, rendering, progress |
 
-`containers`, `syntax`, `runtime`, `parallel`, `derivation`, and `cli` are the six clean-cut modules the linter guards. The core stays one module because its cycles are real: `vm/force ↔ compiler/deferred` (forcing a thunk can trigger compilation of its deferred body) and `eval/worker ↔ vm/force` (the worker drives the VM, whose force path re-enters the worker to schedule/steal). Splitting them would need forward-declared interfaces that buy nothing. Reaching into any named module by relative path is a lint error (below).
+Eleven modules are lint-guarded (`containers`, `syntax`, `runtime`, `parallel`, `derivation`, `observ`, `bytecode`, `probe`, `compiler`, `vm`, `cli`); `fix` (`src/root.zig`) is the top orchestration layer. The graph is acyclic — every import points down. What could look like an `Evaluator`/VM cycle is avoided by placement: the VM's on-demand compilation of a deferred thunk body calls *down* into `compiler`, and the fiber worker that drives forcing lives *inside* the `vm` module next to the force path, so force↔worker is intra-module. Reaching into any module by relative path is a lint error (below).
 
-`cli` is its own module rather than part of the core: it imports `fix` by name, so the command tools reach the engine through its public facade instead of poking at engine internals. The `exe` module (`src/main.zig`) imports both `fix` and `cli`; `addSharedImports` gives `fix`, `cli`, and `exe` the identical shared set — `build_options`, `syntax`, `runtime`, `parallel`, `derivation`, `containers` — and the `mod` (over `fix`) and `exe` test artifacts reuse those same modules.
+`cli` imports `fix` by name, so the command tools reach the engine through its public facade instead of poking at internals. The `exe` module (`src/main.zig`) imports both `fix` and `cli`. `addSharedImports` gives `fix`, `cli`, and `exe` the identical leaf set — `build_options`, `syntax`, `runtime`, `parallel`, `derivation`, `containers`, `observ` — while the engine modules (`bytecode`, `probe`, `compiler`, `vm`) are wired to `fix` and to each other explicitly, bottom-up.
 
 ## Parser-table codegen
 
@@ -57,21 +62,22 @@ The threaded VM dispatcher (`src/vm/run.zig`) chains handlers with `@call(.alway
 
 ## Per-module test wiring
 
-`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `fix`, `exe_tests` over `exe`) therefore collect **only** core-module tests; a clean-cut module is pulled into `fix` by module *name*, so its unit tests are invisible to the root artifacts. Each clean-cut module needs its own `addTest` step, run explicitly:
+`zig build test` (aliased by `check`) walks import graphs — but only a module's *own* `@import` graph. The root test artifacts (`mod_tests` over `fix`, `exe_tests` over `exe`) therefore collect **only** the `fix`-layer tests; a module pulled in by *name* has its own unit tests invisible to the root artifacts. Each module needs its own `addTest` step, run explicitly:
 
 ```
 test → lint, mod_tests, exe_tests,
        runtime_tests, syntax_tests, parallel_tests,
-       derivation_tests, containers_tests, cli_tests
+       derivation_tests, containers_tests, cli_tests,
+       bytecode_tests, probe_tests, compiler_tests
 ```
 
-This wiring is easy to get wrong: a clean-cut module whose test step is missing from `test_step` still compiles but is never *run*. When adding a clean-cut module, add its test step to `test_step` or its tests never execute. `zig build test-syntax` runs the `syntax` tests alone for fast lexer/parser/AST iteration; `zig build bench -- <file.nix>` runs the parse microbenchmark against the `syntax` module.
+This wiring is easy to get wrong: a module whose test step is missing from `test_step` still compiles but is never *run*. When adding a module, add its test step to `test_step` or its tests never execute. `zig build test-syntax` runs the `syntax` tests alone for fast lexer/parser/AST iteration; `zig build bench -- <file.nix>` runs the parse microbenchmark against the `syntax` module.
 
 Integration tests live in the core graph (`src/root/tests`, `src/eval/tests`) so the root artifacts pick them up; `test/*.nix` holds pathology and spec fixtures driven through eval.
 
 ## `zig build lint` — module-boundary hygiene
 
-`tools/lint_imports.zig` (`zig build lint`, and a dependency of `test`) enforces the facade pattern. A stray `@import("../runtime/value.zig")` from a core file does **not** fail to compile — it drags that file into a second module instance, silently duplicating its types (`runtime.Value` ≠ the copy's `Value`) and producing baffling mismatches far from the cause. The linter walks every `src/**/*.zig`, resolves each relative `@import`, and errors (with `src/path:line`) if the target lands inside a clean-cut module's files or its facade. A file *inside* `src/<module>/` may import its own module's internals freely; only cross-boundary reaches are rejected. Use `@import("<module>")` across a boundary, always.
+`tools/lint_imports.zig` (`zig build lint`, and a dependency of `test`) enforces the facade pattern. A stray `@import("../runtime/value.zig")` from a core file does **not** fail to compile — it drags that file into a second module instance, silently duplicating its types (`runtime.Value` ≠ the copy's `Value`) and producing baffling mismatches far from the cause. The linter walks every `src/**/*.zig`, resolves each relative `@import`, and errors (with `src/path:line`) if the target lands inside another module's files or its facade. A file *inside* `src/<module>/` may import its own module's internals freely; only cross-boundary reaches are rejected. Use `@import("<module>")` across a boundary, always.
 
 ## The correctness gate
 
