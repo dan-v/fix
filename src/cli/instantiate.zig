@@ -8,7 +8,6 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
-const store = @import("runtime").store;
 
 const Evaluator = fix.Evaluator;
 
@@ -62,13 +61,9 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     };
     defer if (source_arg == .flake) ev.allocator.free(source.text);
 
-    // Attach the daemon store: forcing a derivation now writes its `.drv`.
-    const daemon = store.DaemonStore.connect(allocator, init.io, store.default_socket_path) catch |err| {
-        std.debug.print("error: connecting to nix-daemon at {s}: {s}\n", .{ store.default_socket_path, @errorName(err) });
-        return 1;
-    };
-    defer daemon.deinit();
-    ev.attachDaemon(daemon);
+    // Forcing a derivation now writes its `.drv` (and sources) to the store.
+    // The daemon connects lazily on the first write.
+    ev.enableStoreWrites();
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     var ok = false;
@@ -80,17 +75,11 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     defer ev.stopProgressSampler();
 
     const result = ev.evaluate(source.text) catch |err| {
-        try render.evalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
-        return 1;
+        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
 
     const drv_path = ev.derivationDrvPath(result) catch |err| {
-        if (err == error.DaemonError) {
-            std.debug.print("error: daemon: {s}\n", .{daemon.last_error orelse "unknown"});
-            return 1;
-        }
-        try render.evalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
-        return 1;
+        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     } orelse {
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
@@ -105,6 +94,17 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 }
 
 const render = @import("render.zig");
+
+/// Render a store-op failure (daemon down / daemon error) specially, else fall
+/// back to the normal eval-failure trace.
+fn storeOrEvalFailure(init: std.process.Init, term: setup.Terminal, options: args.Options, ev: *Evaluator, source: []const u8, err: anyerror) !u8 {
+    switch (err) {
+        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
+        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
+        else => try render.evalFailure(init.io, term.use_color, options.show_trace, ev, source, err),
+    }
+    return 1;
+}
 
 fn label(source_arg: args.SourceArg) []const u8 {
     return switch (source_arg) {

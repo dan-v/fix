@@ -56,13 +56,20 @@ pub const DerivationStore = struct {
     lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
     lazy_drv_mu: stable.SpinMutex = .{},
 
-    /// When attached (`fix instantiate`/`build`), each derivation's `.drv` is
-    /// written to the real Nix store as it is forced. Not owned. Guarded by
-    /// `daemon_mu` so parallel forcing fibers serialize on the single socket;
-    /// `instantiated` de-dupes writes across re-forces.
+    /// The nix-daemon connection, connected lazily on the first store write and
+    /// owned/closed here (like Nix, which only touches the store on demand).
+    /// Guarded by `daemon_mu` so parallel forcing fibers serialize on the one
+    /// socket; `instantiated` de-dupes writes across re-forces.
     daemon: ?*rstore.DaemonStore = null,
     daemon_mu: stable.BlockingMutex = .{},
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
+    io: ?std.Io = null,
+    daemon_socket: []const u8 = rstore.default_socket_path,
+    /// Whether forced derivations + their sources are written to the store
+    /// (`fix instantiate`/`build` enable it). Off for plain `eval`, so the hot
+    /// eval path never does store I/O per derivation. Fetchers ignore this —
+    /// a fetch's value is a materialized path, so they always ingest.
+    store_writes_enabled: bool = false,
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
 
@@ -94,43 +101,79 @@ pub const DerivationStore = struct {
         var inst = self.instantiated.keyIterator();
         while (inst.next()) |key| self.allocator.free(key.*);
         self.instantiated.deinit(self.allocator);
+        if (self.daemon) |d| d.deinit();
     }
 
-    /// Attach a daemon store so forced derivations are written to `/nix/store`.
-    pub fn attachDaemon(self: *DerivationStore, daemon: *rstore.DaemonStore) void {
-        self.daemon = daemon;
+    /// Provide the IO handle used to connect to the daemon on demand.
+    pub fn setIo(self: *DerivationStore, io: std.Io) void {
+        self.io = io;
     }
 
-    /// Write `drv_path`'s `.drv` (content `aterm`, referring to `references`)
-    /// to the attached daemon store. Inputs are forced before dependents, so a
+    /// Enable writing forced derivations + their sources to the store
+    /// (`fix instantiate`/`build`). Off by default so plain eval stays pure.
+    pub fn enableStoreWrites(self: *DerivationStore) void {
+        self.store_writes_enabled = true;
+    }
+
+    /// Connect to the daemon on first use and return it (owned here). Errors if
+    /// no IO handle was set or the daemon is unreachable — matching Nix, which
+    /// fails a store op when the daemon is down. Caller must hold `daemon_mu`.
+    fn ensureDaemon(self: *DerivationStore) !*rstore.DaemonStore {
+        if (self.daemon) |d| return d;
+        const io = self.io orelse return error.StoreUnavailable;
+        const d = try rstore.DaemonStore.connect(self.allocator, io, self.daemon_socket);
+        self.daemon = d;
+        return d;
+    }
+
+    /// Read the last daemon error message (for surfacing `error.DaemonError`).
+    pub fn lastStoreError(self: *DerivationStore) ?[]const u8 {
+        return if (self.daemon) |d| d.last_error else null;
+    }
+
+    /// Write `drv_path`'s `.drv` to the store (text-addressed), gated on
+    /// `store_writes_enabled`. Inputs are forced before dependents, so a
     /// `.drv`'s referenced input `.drv`s are already written when we get here.
     pub fn instantiateDrv(self: *DerivationStore, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
         return self.instantiateText(drv_path, aterm, references);
     }
 
-    /// Write a text-addressed object at `store_path` (content `text`, referring
-    /// to `references`) to the attached daemon store, exactly once per run.
-    /// No-op when no daemon is attached. Guarded for parallel forcing fibers.
+    /// Write a text-addressed object (a `.drv` or `builtins.toFile` result),
+    /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
-        const daemon = self.daemon orelse return;
+        if (!self.store_writes_enabled) return;
+        return self.addText(store_path, text, references);
+    }
+
+    /// Write a NAR-serialized source tree, gated on `store_writes_enabled`.
+    /// Sources ingest during derivation normalization — before the `.drv` that
+    /// references them — so `input_srcs` are valid in time.
+    pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
+        if (!self.store_writes_enabled) return;
+        return self.addPathToStore(store_path, nar_bytes);
+    }
+
+    /// Ingest a fetched tree unconditionally (fetchers always materialize their
+    /// result to the store, like Nix — regardless of `store_writes_enabled`).
+    pub fn ingestFetched(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
+        return self.addPathToStore(store_path, nar_bytes);
+    }
+
+    fn addText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return;
+        const daemon = try self.ensureDaemon();
         const written = try daemon.addTextToStore(self.allocator, storePathName(store_path), text, references);
         self.allocator.free(written);
         try self.markInstantiated(store_path);
     }
 
-    /// Write a NAR-serialized source tree at `store_path` (content `nar_bytes`)
-    /// to the attached daemon store, exactly once per run. No-op when no daemon
-    /// is attached. Sources are ingested during derivation normalization —
-    /// before the `.drv` that references them is written — so a `.drv`'s
-    /// `input_srcs` are valid by the time the `.drv` is added.
-    pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
-        const daemon = self.daemon orelse return;
+    fn addPathToStore(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return;
+        const daemon = try self.ensureDaemon();
         const written = try daemon.addPath(self.allocator, storePathName(store_path), nar_bytes, &.{});
         self.allocator.free(written);
         try self.markInstantiated(store_path);

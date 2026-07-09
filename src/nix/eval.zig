@@ -317,6 +317,7 @@ pub const Evaluator = struct {
     pub fn setBasePathFromCurrentPath(self: *Evaluator, io: std.Io) !void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
+        self.derivations.setIo(io);
         if (self.base_path) |path| self.allocator.free(path);
         self.base_path = try std.process.currentPathAlloc(io, self.allocator);
     }
@@ -324,6 +325,7 @@ pub const Evaluator = struct {
     pub fn setFileIo(self: *Evaluator, io: std.Io) void {
         self.files.setIo(io);
         self.fetchers.setIo(io);
+        self.derivations.setIo(io);
     }
 
     /// Point the base path (used to resolve relative path literals like `./x`)
@@ -777,10 +779,16 @@ pub const Evaluator = struct {
         return self.runWithVm(vm_force.forceValue, .{value});
     }
 
-    /// Attach a daemon store so derivations write their `.drv` to `/nix/store`
-    /// as they are forced (`fix instantiate`/`build`). See `DerivationStore`.
-    pub fn attachDaemon(self: *Evaluator, daemon: *runtime.store.DaemonStore) void {
-        self.derivations.attachDaemon(daemon);
+    /// Enable writing forced derivations + their sources to the store as they
+    /// are forced (`fix instantiate`/`build`). The daemon connects lazily on
+    /// first use; plain eval leaves this off and never touches the store.
+    pub fn enableStoreWrites(self: *Evaluator) void {
+        self.derivations.enableStoreWrites();
+    }
+
+    /// The last daemon error message, for surfacing `error.DaemonError`.
+    pub fn lastStoreError(self: *Evaluator) ?[]const u8 {
+        return self.derivations.lastStoreError();
     }
 
     /// If `value` is a derivation (an attrset with a `drvPath`), force it — which

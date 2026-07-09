@@ -203,7 +203,7 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     // derivation's `.drv` to the real store as it is forced. Its input `.drv`s
     // were forced (hence written) during `normalizeDerivation` above, so their
     // paths are already valid references — correct topological order for free.
-    if (self.derivations.daemon != null) {
+    if (self.derivations.store_writes_enabled) {
         if (self.progress) |progress| progress.begin(.store, drv_name);
         defer if (self.progress) |progress| progress.end(.store, drv_name);
 
