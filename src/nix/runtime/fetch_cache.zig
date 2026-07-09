@@ -469,9 +469,32 @@ pub const FetchCache = struct {
             error.UnsupportedCompressionMethod,
             error.FetchClientError,
             error.FetchInvalidUrl,
+            error.FetchTooManyRedirects,
             => false,
             else => true,
         };
+    }
+
+    /// Resolve a redirect `Location` against the current absolute URL `base`,
+    /// returning a new owned absolute URL. Handles an absolute Location (the
+    /// common case), a scheme-relative `//host/…`, an absolute path `/…`, and a
+    /// relative path (against `base`'s directory).
+    fn resolveRedirect(self: *FetchCache, base: []const u8, loc: []const u8) ![]u8 {
+        const alloc = self.allocator;
+        if (std.mem.startsWith(u8, loc, "http://") or std.mem.startsWith(u8, loc, "https://"))
+            return alloc.dupe(u8, loc);
+        const scheme_end = std.mem.indexOf(u8, base, "://") orelse return error.FetchInvalidUrl;
+        if (std.mem.startsWith(u8, loc, "//")) // scheme-relative: keep base's scheme
+            return std.fmt.allocPrint(alloc, "{s}:{s}", .{ base[0..scheme_end], loc });
+        const authority_start = scheme_end + 3;
+        const path_start = std.mem.indexOfScalarPos(u8, base, authority_start, '/') orelse base.len;
+        const origin = base[0..path_start]; // scheme://authority
+        if (std.mem.startsWith(u8, loc, "/")) // absolute path on the same origin
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ origin, loc });
+        // Relative path: replace the last path segment of `base`.
+        const last_slash = std.mem.lastIndexOfScalar(u8, base, '/') orelse return error.FetchInvalidUrl;
+        const dir = if (last_slash >= path_start) base[0 .. last_slash + 1] else origin;
+        return std.fmt.allocPrint(alloc, "{s}{s}", .{ dir, loc });
     }
 
     fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
@@ -493,77 +516,102 @@ pub const FetchCache = struct {
         }
     }
 
-    fn fetchUrlAttempt(self: *FetchCache, io: std.Io, uri: std.Uri, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
+    fn fetchUrlAttempt(self: *FetchCache, io: std.Io, initial_uri: std.Uri, initial_url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
-        // Authenticate the request: a forge fetch with its per-forge
-        // `access-tokens` header (see `authHeader`), else a plain download with
-        // `netrc` basic-auth for the host. Both go via `extra_headers`, which is
-        // preserved across a cross-domain redirect — needed for the forge token
-        // to reach codeload.github.com after the `github.com` archive redirect.
-        // (`privileged_headers` would be the safer home for netrc creds, being
-        // stripped on such a redirect, but std.http does not emit them.)
-        var auth: ?AuthHeader = if (forge) |f| try self.authHeader(f, url) else null;
-        if (auth == null) auth = try self.netrcHeader(url);
-        defer if (auth) |a| a.deinit(self.allocator);
-        var extra_headers: []const std.http.Header = &.{};
-        var auth_storage: [1]std.http.Header = undefined;
-        if (auth) |a| {
-            auth_storage[0] = .{ .name = a.name, .value = a.value };
-            extra_headers = auth_storage[0..1];
-        }
+        // A forge fetch's token is sticky across redirects (computed once): it
+        // must reach codeload.github.com after the github.com archive redirect,
+        // and the forge is trusted. A plain download's `netrc` credentials are
+        // re-evaluated for the *current* host on every hop, so they are never
+        // sent to a different host after a redirect. We follow redirects
+        // ourselves (`.unhandled`) because std.http can't strip auth for us
+        // (it never emits `privileged_headers`).
+        const forge_auth: ?AuthHeader = if (forge) |f| try self.authHeader(f, initial_url) else null;
+        defer if (forge_auth) |a| a.deinit(self.allocator);
 
-        // Stream (rather than one-shot `fetch`) so we can read `content_length`
-        // up front and report bytes as they arrive to the fetch progress span.
-        var req = try client.request(.GET, uri, .{
-            .redirect_behavior = @enumFromInt(10),
-            .headers = .{ .user_agent = .{ .override = user_agent } },
-            .extra_headers = extra_headers,
-        });
-        defer req.deinit();
-        try req.sendBodiless();
+        var current_url: []const u8 = initial_url;
+        var current_uri = initial_uri;
+        var owned_url: ?[]u8 = null;
+        defer if (owned_url) |u| self.allocator.free(u);
+        var redirects_left: u32 = 10;
 
-        var redirect_buffer: [8 * 1024]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buffer);
-        // 4xx is a permanent client error (bad URL, auth); anything else
-        // non-2xx (5xx, unexpected) is treated as transient and retried.
-        if (response.head.status.class() == .client_error) return error.FetchClientError;
-        if (response.head.status.class() != .success) return error.FetchHttpStatus;
-        // Content-Length is the compressed wire size; we count decompressed
-        // bytes, so it's only a valid progress total when the body is identity.
-        const total: u64 = if (response.head.content_encoding == .identity)
-            (response.head.content_length orelse 0)
-        else
-            0;
-
-        // Decompress like std.http's one-shot fetch does, else we'd hash/store
-        // the raw gzip/deflate/zstd bytes instead of the real content.
-        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-            .identity => &.{},
-            .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
-            .deflate, .gzip => try self.allocator.alloc(u8, std.compress.flate.max_window_len),
-            .compress => return error.UnsupportedCompressionMethod,
-        };
-        defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);
-
-        var transfer_buffer: [64 * 1024]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-
-        var body = std.Io.Writer.Allocating.init(self.allocator);
-        defer body.deinit();
-        var chunk: [64 * 1024]u8 = undefined;
-        var downloaded: u64 = 0;
-        Reporter.emit(reporter, 0, total);
         while (true) {
-            const n = reader.readSliceShort(&chunk) catch return error.FetchHttpStatus;
-            if (n == 0) break;
-            try body.writer.writeAll(chunk[0..n]);
-            downloaded += n;
-            Reporter.emit(reporter, downloaded, total);
+            // Per-hop auth: the sticky forge token, else netrc for the host we
+            // are about to contact (so creds don't cross a redirect boundary).
+            const hop_netrc: ?AuthHeader = if (forge_auth == null) try self.netrcHeader(current_url) else null;
+            defer if (hop_netrc) |a| a.deinit(self.allocator);
+            var extra_headers: []const std.http.Header = &.{};
+            var auth_storage: [1]std.http.Header = undefined;
+            if (forge_auth orelse hop_netrc) |a| {
+                auth_storage[0] = .{ .name = a.name, .value = a.value };
+                extra_headers = auth_storage[0..1];
+            }
+
+            var req = try client.request(.GET, current_uri, .{
+                .redirect_behavior = .unhandled,
+                .headers = .{ .user_agent = .{ .override = user_agent } },
+                .extra_headers = extra_headers,
+            });
+            defer req.deinit();
+            try req.sendBodiless();
+
+            var redirect_buffer: [8 * 1024]u8 = undefined;
+            var response = try req.receiveHead(&redirect_buffer);
+            const class = response.head.status.class();
+            if (class == .redirect) {
+                if (redirects_left == 0) return error.FetchTooManyRedirects;
+                const loc = response.head.location orelse return error.FetchHttpStatus;
+                const next = try self.resolveRedirect(current_url, loc);
+                if (owned_url) |u| self.allocator.free(u);
+                owned_url = next;
+                current_url = next;
+                current_uri = std.Uri.parse(next) catch return error.FetchInvalidUrl;
+                redirects_left -= 1;
+                continue;
+            }
+            // 4xx is a permanent client error (bad URL, auth); anything else
+            // non-2xx (5xx, unexpected) is transient and gets retried.
+            if (class == .client_error) return error.FetchClientError;
+            if (class != .success) return error.FetchHttpStatus;
+
+            // Stream (rather than one-shot `fetch`) so we can read `content_length`
+            // up front and report bytes as they arrive to the fetch progress span.
+            // Content-Length is the compressed wire size; we count decompressed
+            // bytes, so it's only a valid progress total when the body is identity.
+            const total: u64 = if (response.head.content_encoding == .identity)
+                (response.head.content_length orelse 0)
+            else
+                0;
+
+            // Decompress like std.http's one-shot fetch does, else we'd hash/store
+            // the raw gzip/deflate/zstd bytes instead of the real content.
+            const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+                .identity => &.{},
+                .zstd => try self.allocator.alloc(u8, std.compress.zstd.default_window_len),
+                .deflate, .gzip => try self.allocator.alloc(u8, std.compress.flate.max_window_len),
+                .compress => return error.UnsupportedCompressionMethod,
+            };
+            defer if (decompress_buffer.len > 0) self.allocator.free(decompress_buffer);
+
+            var transfer_buffer: [64 * 1024]u8 = undefined;
+            var decompress: std.http.Decompress = undefined;
+            const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+            var body = std.Io.Writer.Allocating.init(self.allocator);
+            defer body.deinit();
+            var chunk: [64 * 1024]u8 = undefined;
+            var downloaded: u64 = 0;
+            Reporter.emit(reporter, 0, total);
+            while (true) {
+                const n = reader.readSliceShort(&chunk) catch return error.FetchHttpStatus;
+                if (n == 0) break;
+                try body.writer.writeAll(chunk[0..n]);
+                downloaded += n;
+                Reporter.emit(reporter, downloaded, total);
+            }
+            return body.toOwnedSlice();
         }
-        return body.toOwnedSlice();
     }
 
     fn localGit(self: *FetchCache, files: *FileCache, path: []const u8, spec: GitSpec) !GitResult {
