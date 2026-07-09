@@ -87,6 +87,14 @@ pub const Evaluator = struct {
     /// sets it true for `--extra-experimental-features pipe-operators`.
     /// Default false.
     pipe_operators_enabled: bool = false,
+    /// Whether `builtins.fetchTree` may be called. Like Nix, the builtin is
+    /// gated on the `fetch-tree` experimental feature: the implementation is
+    /// always present, but a direct `builtins.fetchTree` call errors unless
+    /// this is set. The CLI sets it true for
+    /// `--extra-experimental-features fetch-tree`. Propagated to each VM in
+    /// `initVm`. Default false. (`getFlake` calls the fetcher directly and is
+    /// unaffected by this gate.)
+    fetch_tree_enabled: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -716,6 +724,7 @@ pub const Evaluator = struct {
             vm.claimer_id = wf.vm.claimer_id;
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
+        vm.fetch_tree_enabled = self.fetch_tree_enabled;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Only worker-0 VMs (the demand path) publish their block subject, and

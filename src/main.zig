@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     // is pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.lazy_shells_visible = options.output == .xml;
     ev.pipe_operators_enabled = options.experimental_features.contains(.pipe_operators);
+    ev.fetch_tree_enabled = options.experimental_features.contains(.fetch_tree);
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;

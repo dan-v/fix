@@ -19,6 +19,7 @@ const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const vm_force = @import("../force.zig");
 const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
 const attrEntryNameIndex = attrsets.attrEntryNameIndex;
 const coerceStringContextValue = strings.coerceStringContextValue;
@@ -372,6 +373,18 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
         try appendStringAttr(self, &entries, "shortRev", value[0..@min(value.len, 7)]);
     }
     return Value.attrs(try self.heap.addAttrs(entries.items));
+}
+
+/// Dispatch entry for a direct `builtins.fetchTree` call. Gated on the
+/// `fetch-tree` experimental feature (Nix parity). `getFlake` bypasses this by
+/// calling `builtinFetchTree` directly, matching Nix where flake fetching does
+/// not additionally require the user to enable `fetch-tree`.
+pub fn builtinFetchTreeEntry(self: anytype, arg: Value) !Value {
+    if (!self.fetch_tree_enabled) {
+        try vm_trace.setErrorMessage(self, "builtins.fetchTree is disabled; pass --extra-experimental-features fetch-tree to enable it");
+        return error.NixThrow;
+    }
+    return builtinFetchTree(self, arg);
 }
 
 pub fn builtinFetchTree(self: anytype, arg: Value) !Value {

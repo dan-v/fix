@@ -6,6 +6,7 @@ const Value = @import("runtime").value.Value;
 const path_ops = @import("runtime").paths;
 const helpers = @import("../test_helpers.zig");
 const renderForTest = helpers.renderForTest;
+const renderWithFetchTree = helpers.renderWithFetchTree;
 const renderStrictForTest = helpers.renderStrictForTest;
 const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
@@ -364,6 +365,7 @@ test "evaluate fetchTree builtin through fetch cache" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
+    ev.fetch_tree_enabled = true;
 
     const out_path = try ev.evaluate(path_source);
     try std.testing.expectEqualStrings(cwd, ev.intern.get(out_path.asInternId()));
@@ -434,10 +436,20 @@ test "flakeRefToString round-trips path refs and rejects unsupported types" {
 test "fetchTree rejects unrecognized or non-attrset input without touching the network" {
     try std.testing.expectError(
         error.InvalidFlakeRef,
-        renderForTest("builtins.fetchTree { type = \"bogus\"; }"),
+        renderWithFetchTree("builtins.fetchTree { type = \"bogus\"; }"),
     );
-    try std.testing.expectError(error.TypeError, renderForTest("builtins.fetchTree 1"));
-    try std.testing.expectError(error.MissingAttribute, renderForTest("builtins.fetchTree { }"));
+    try std.testing.expectError(error.TypeError, renderWithFetchTree("builtins.fetchTree 1"));
+    try std.testing.expectError(error.MissingAttribute, renderWithFetchTree("builtins.fetchTree { }"));
+}
+
+test "fetchTree is gated on the fetch-tree experimental feature" {
+    // Without the feature the builtin errors before touching its argument.
+    try std.testing.expectError(
+        error.NixThrow,
+        renderForTest("builtins.fetchTree { type = \"path\"; path = \"/nonexistent\"; }"),
+    );
+    // getFlake reaches the fetcher directly, so it is unaffected by the gate;
+    // exercised by the "evaluate getFlake builtin for local path ref" test.
 }
 
 test "evaluate getFlake builtin for local path ref" {

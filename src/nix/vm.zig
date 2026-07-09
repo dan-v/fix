@@ -291,6 +291,11 @@ pub const VM = struct {
     /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
     lazy_shells_visible: bool,
 
+    /// Whether a direct `builtins.fetchTree` call is permitted (Nix's
+    /// `fetch-tree` experimental feature). Set per-eval from
+    /// `Evaluator.fetch_tree_enabled`; checked in the builtin dispatch.
+    fetch_tree_enabled: bool,
+
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`
     /// outside a collection; `void` in normal builds.
@@ -372,6 +377,7 @@ pub const VM = struct {
             .spec_create_limit = NO_SPEC_BUDGET,
             .spec_create_worker = 0,
             .lazy_shells_visible = false,
+            .fetch_tree_enabled = false,
         };
     }
 

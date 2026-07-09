@@ -127,7 +127,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .fetchGit => fetch.builtinFetchGit(self, args[0]),
         .fetchurl => fetch.builtinFetchurl(self, args[0]),
         .fetchTarball => fetch.builtinFetchTarball(self, args[0]),
-        .fetchTree => fetch.builtinFetchTree(self, args[0]),
+        .fetchTree => fetch.builtinFetchTreeEntry(self, args[0]),
         .parseFlakeRef => fetch.builtinParseFlakeRef(self, args[0]),
         .flakeRefToString => fetch.builtinFlakeRefToString(self, args[0]),
         .fetchMercurial => fetch.builtinFetchMercurial(self, args[0]),

@@ -16,7 +16,8 @@ pub const usage =
     \\  --strict               recursively force attr values and list items before writing
     \\  --experimental-features FEATS
     \\                         space-separated experimental features to enable,
-    \\                         replacing the current set (available: pipe-operators)
+    \\                         replacing the current set
+    \\                         (available: pipe-operators, fetch-tree)
     \\  --extra-experimental-features FEATS
     \\                         like --experimental-features, but adds to the set
     \\  --debug-derivations[=MODE]
@@ -49,9 +50,11 @@ pub const OutputFormat = enum {
 /// same `--experimental-features pipe-operators` invocation works here.
 pub const ExperimentalFeature = enum {
     pipe_operators,
+    fetch_tree,
 
     pub fn fromName(name: []const u8) ?ExperimentalFeature {
         if (std.mem.eql(u8, name, "pipe-operators")) return .pipe_operators;
+        if (std.mem.eql(u8, name, "fetch-tree")) return .fetch_tree;
         return null;
     }
 };
@@ -259,7 +262,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
         error.MissingExperimentalFeatures => "missing feature list after --experimental-features or --extra-experimental-features",
-        error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators)",
+        error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree)",
         error.MissingWorkers => "missing N after --workers",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.MissingMaxMemory => "missing size after --max-memory",
