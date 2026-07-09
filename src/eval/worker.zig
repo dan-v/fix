@@ -48,7 +48,7 @@ const fiber_mod = @import("parallel").fiber;
 const InnerFiber = fiber_mod.Fiber;
 const worker_id_mod = @import("runtime").worker_id;
 const gc = @import("runtime").gc;
-const eval_trace = @import("trace.zig");
+const eval_trace = @import("observ").trace;
 const prof = @import("../probe/prof.zig");
 const timeline = @import("../probe/timeline.zig");
 // Used only by the test fixture below.

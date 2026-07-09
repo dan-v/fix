@@ -574,7 +574,7 @@ pub fn recordCollection(objects_freed: u64, live_bytes: u64, total_after: u64) v
 /// Live collector counters for the progress indicator: how many collections
 /// have run, the surviving live bytes after the last one, and the cumulative
 /// objects freed. Cheap (plain global loads); all zero in a build that never
-/// collects. See `eval/progress.zig`.
+/// collects. See `observ/progress.zig`.
 pub const LiveReport = struct {
     collections: u64,
     live_bytes: u64,

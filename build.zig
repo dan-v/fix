@@ -108,6 +108,17 @@ pub fn build(b: *std.Build) void {
     });
     derivation_mod.addImport("runtime", runtime_mod);
 
+    // Evaluation observability sinks (progress protocol + error-trace collector).
+    // Leaf types the interpreter writes to; the evaluator/CLI implement them.
+    const observ_mod = b.addModule("observ", .{
+        .root_source_file = b.path("src/observ.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    observ_mod.addImport("syntax", syntax_mod);
+
     const mod = b.addModule("fix", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -122,6 +133,7 @@ pub fn build(b: *std.Build) void {
         .parallel = parallel_mod,
         .derivation = derivation_mod,
         .containers = containers_mod,
+        .observ = observ_mod,
     };
     addSharedImports(mod, shared_imports);
 
@@ -279,6 +291,7 @@ const SharedImports = struct {
     parallel: *std.Build.Module,
     derivation: *std.Build.Module,
     containers: *std.Build.Module,
+    observ: *std.Build.Module,
 };
 
 fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
@@ -288,4 +301,5 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("parallel", imports.parallel);
     module.addImport("derivation", imports.derivation);
     module.addImport("containers", imports.containers);
+    module.addImport("observ", imports.observ);
 }
