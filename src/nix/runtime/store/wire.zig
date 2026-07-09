@@ -104,6 +104,14 @@ pub fn skipString(r: *std.Io.Reader) !void {
     try r.discardAll(padLen(@intCast(len)));
 }
 
+/// Read and discard a string list (count + that many strings).
+pub fn skipStrings(r: *std.Io.Reader) !void {
+    const n = try readInt(r);
+    if (n > max_wire_len) return error.WireListTooLong;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) try skipString(r);
+}
+
 pub fn writeStrings(w: *std.Io.Writer, items: []const []const u8) !void {
     try writeInt(w, items.len);
     for (items) |item| try writeString(w, item);

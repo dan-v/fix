@@ -10,6 +10,7 @@ const trace_cmd = cli.trace;
 const thunks_cmd = cli.thunks;
 const store_cmd = cli.store;
 const eval_cmd = cli.eval;
+const instantiate_cmd = cli.instantiate;
 const block_cache = @import("base").block_cache;
 const mem_tag = @import("runtime").mem_tag;
 
@@ -23,6 +24,7 @@ const Subcommand = struct {
 
 const subcommands = [_]Subcommand{
     .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run_cmd },
+    .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run_cmd },
     .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run_cmd },
     .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = disasm_cmd.run },
     .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },

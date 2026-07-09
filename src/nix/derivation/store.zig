@@ -10,6 +10,7 @@ const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
 const clone = @import("clone.zig");
 const stable = @import("base").sync;
+const rstore = @import("runtime").store;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -25,6 +26,15 @@ const freeOutputNames = clone.freeOutputNames;
 /// Thread safety: all access to `records` and `debug_records` goes through
 /// `mu`. The store is read-mostly during evaluation but writes (record /
 /// recordDebug) happen on whichever worker forces the originating thunk.
+/// The name portion of a store path: `/nix/store/<hash>-<name>` -> `<name>`.
+/// Store hashes are 32 base32 chars followed by `-`. Used as the `name` arg to
+/// `addTextToStore`, which recomputes the full path from name+content+refs.
+fn storePathName(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    if (base.len > 33 and base[32] == '-') return base[33..];
+    return base;
+}
+
 pub const DerivationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
@@ -45,6 +55,14 @@ pub const DerivationStore = struct {
     /// GC id-reuse (see `lookupLazyDerivation`).
     lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
     lazy_drv_mu: stable.SpinMutex = .{},
+
+    /// When attached (`fix instantiate`/`build`), each derivation's `.drv` is
+    /// written to the real Nix store as it is forced. Not owned. Guarded by
+    /// `daemon_mu` so parallel forcing fibers serialize on the single socket;
+    /// `instantiated` de-dupes writes across re-forces.
+    daemon: ?*rstore.DaemonStore = null,
+    daemon_mu: stable.BlockingMutex = .{},
+    instantiated: std.StringHashMapUnmanaged(void) = .empty,
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
 
@@ -73,6 +91,33 @@ pub const DerivationStore = struct {
         }
         self.records.deinit(self.allocator);
         self.lazy_drv_cache.deinit(self.allocator);
+        var inst = self.instantiated.keyIterator();
+        while (inst.next()) |key| self.allocator.free(key.*);
+        self.instantiated.deinit(self.allocator);
+    }
+
+    /// Attach a daemon store so forced derivations are written to `/nix/store`.
+    pub fn attachDaemon(self: *DerivationStore, daemon: *rstore.DaemonStore) void {
+        self.daemon = daemon;
+    }
+
+    /// Write `drv_path`'s `.drv` (content `aterm`, referring to `references`)
+    /// to the attached daemon store, exactly once per run. No-op when no daemon
+    /// is attached. Guarded so parallel forcing fibers serialize on the socket.
+    /// Inputs are forced before dependents, so a `.drv`'s referenced input
+    /// `.drv`s are already written by the time we get here (correct order).
+    pub fn instantiateDrv(self: *DerivationStore, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
+        const daemon = self.daemon orelse return;
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+
+        if (self.instantiated.contains(drv_path)) return;
+        const written = try daemon.addTextToStore(self.allocator, storePathName(drv_path), aterm, references);
+        self.allocator.free(written);
+
+        const key = try self.allocator.dupe(u8, drv_path);
+        errdefer self.allocator.free(key);
+        try self.instantiated.put(self.allocator, key, {});
     }
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.

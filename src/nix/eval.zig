@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const runtime = @import("runtime");
 const types = @import("runtime").types;
 const bytecode = @import("bytecode");
 const opcode = bytecode.opcode;
@@ -760,6 +761,30 @@ pub const Evaluator = struct {
     pub fn forceValue(self: *Evaluator, value: Value) !Value {
         self.run.trace.clear();
         return self.runWithVm(vm_force.forceValue, .{value});
+    }
+
+    /// Attach a daemon store so derivations write their `.drv` to `/nix/store`
+    /// as they are forced (`fix instantiate`/`build`). See `DerivationStore`.
+    pub fn attachDaemon(self: *Evaluator, daemon: *runtime.store.DaemonStore) void {
+        self.derivations.attachDaemon(daemon);
+    }
+
+    /// If `value` is a derivation (an attrset with a `drvPath`), force it — which
+    /// also instantiates its closure when a daemon is attached — and return the
+    /// drv path (borrowed from the intern table). Returns null if `value` is not
+    /// a derivation-shaped attrset.
+    pub fn derivationDrvPath(self: *Evaluator, value: Value) !?[]const u8 {
+        const forced = try self.forceValue(value);
+        if (!forced.isAttrs()) return null;
+        const name_id = try self.intern.intern("drvPath");
+        const attr = (try self.heap.getAttrValueOpt(forced.asObjectId(), name_id)) orelse return null;
+        const path_value = try self.forceValue(attr);
+        const text_id = switch (path_value.kind()) {
+            .string, .path => path_value.asInternId(),
+            .string_context => (try self.heap.getContextString(path_value.asObjectId())).text,
+            else => return null,
+        };
+        return self.intern.get(text_id);
     }
 
     pub fn forceDeep(self: *Evaluator, value: Value) !void {

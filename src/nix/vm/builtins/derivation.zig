@@ -199,6 +199,21 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
     try self.derivations.recordDebug(&normalized.drv, computed);
 
+    // When a daemon store is attached (`fix instantiate`/`build`), write this
+    // derivation's `.drv` to the real store as it is forced. Its input `.drv`s
+    // were forced (hence written) during `normalizeDerivation` above, so their
+    // paths are already valid references — correct topological order for free.
+    if (self.derivations.daemon != null) {
+        if (self.progress) |progress| progress.begin(.store, drv_name);
+        defer if (self.progress) |progress| progress.end(.store, drv_name);
+
+        const aterm = try normalized.drv.toATerm(self.allocator, false, null);
+        defer self.allocator.free(aterm);
+        const references = try normalized.drv.textReferences(self.allocator);
+        defer self.allocator.free(references); // elements borrowed from the Drv
+        try self.derivations.instantiateDrv(computed.drv_path, aterm, references);
+    }
+
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {

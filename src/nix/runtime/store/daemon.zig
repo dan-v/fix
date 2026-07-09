@@ -150,12 +150,7 @@ pub const DaemonStore = struct {
         try wire.writeBool(self.w(), false); // repair
         try self.writeFramed(text);
         try self.flushAndDrain();
-        // The response is a ValidPathInfo whose first field is the path (a bare
-        // path in older daemons); reading one string yields the store path in
-        // both shapes. We use a fresh connection per op for now, so any trailing
-        // ValidPathInfo fields are left unread harmlessly. TODO: consume the
-        // full record once connections are reused across a forced eval.
-        return try wire.readString(allocator, self.r());
+        return try self.readValidPathInfo(allocator);
     }
 
     /// Add a NAR-serialized tree to the store under `name`, content-addressed
@@ -174,7 +169,25 @@ pub const DaemonStore = struct {
         try wire.writeBool(self.w(), false); // repair
         try self.writeFramed(nar_bytes);
         try self.flushAndDrain();
-        return try wire.readString(allocator, self.r());
+        return try self.readValidPathInfo(allocator);
+    }
+
+    /// Read an `AddToStore` response — a `ValidPathInfo` — returning its path
+    /// (owned by `allocator`) and consuming the rest so the connection stays in
+    /// sync for the next op. Field order (protocol >= 16): path, deriver,
+    /// narHash, references, registrationTime, narSize, ultimate, sigs, ca.
+    fn readValidPathInfo(self: *DaemonStore, allocator: std.mem.Allocator) ![]u8 {
+        const path = try wire.readString(allocator, self.r());
+        errdefer allocator.free(path);
+        try wire.skipString(self.r()); // deriver
+        try wire.skipString(self.r()); // narHash
+        try wire.skipStrings(self.r()); // references
+        _ = try wire.readInt(self.r()); // registrationTime
+        _ = try wire.readInt(self.r()); // narSize
+        _ = try wire.readInt(self.r()); // ultimate (bool)
+        try wire.skipStrings(self.r()); // sigs
+        try wire.skipString(self.r()); // ca
+        return path;
     }
 
     /// Stream `data` through the worker protocol's framed sink: one
