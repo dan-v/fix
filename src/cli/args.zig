@@ -102,6 +102,9 @@ pub const Options = struct {
     derivation_debug: derivation_debug.Options = .{},
     /// `fix build --no-link`: skip creating the `./result` symlink.
     no_link: bool = false,
+    /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
+    /// argv; the list backing is owned (caller frees via `packages.deinit`).
+    packages: std.ArrayListUnmanaged([]const u8) = .empty,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -141,11 +144,11 @@ pub const Options = struct {
     }
 };
 
-pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
+pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
     var options: Options = .{};
 
     var carried = first;
-    while (true) {
+    parse_loop: while (true) {
         const arg = if (carried) |c| blk: {
             carried = null;
             break :blk c;
@@ -244,6 +247,14 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
         } else if (std.mem.startsWith(u8, arg, "--timeline-flows=")) {
             const v = arg["--timeline-flows=".len..];
             options.timeline_flows = if (std.mem.eql(u8, v, "off")) 0 else if (std.mem.eql(u8, v, "all")) 1 else (std.fmt.parseInt(u32, v, 10) catch return error.UnknownOption);
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--packages")) {
+            // Greedy: every following token is a package name (an attr path in
+            // `<nixpkgs>`) until `--` or end. `fix shell -p ripgrep jq`.
+            while (args_iter.next()) |name| {
+                if (std.mem.eql(u8, name, "--")) break :parse_loop;
+                try options.packages.append(allocator, name);
+            }
+            break :parse_loop;
         } else if (std.mem.eql(u8, arg, "--")) {
             // End of options: leave the rest in the iterator (e.g. `fix run`
             // forwards them as program arguments).

@@ -870,6 +870,20 @@ pub const Evaluator = struct {
         return self.derivations.buildPaths(derived_paths);
     }
 
+    /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,
+    /// forcing each step. Returns null if any component is missing or non-attrs.
+    pub fn attrPathValue(self: *Evaluator, value: Value, path: []const u8) !?Value {
+        var current = try self.forceValue(value);
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |component| {
+            if (!current.isAttrs()) return null;
+            const name_id = try self.intern.intern(component);
+            const attr = (try self.heap.getAttrValueOpt(current.asObjectId(), name_id)) orelse return null;
+            current = try self.forceValue(attr);
+        }
+        return current;
+    }
+
     pub fn forceDeep(self: *Evaluator, value: Value) !void {
         self.progressBegin(.render, "strict result");
         defer self.progressEnd(.render, "strict result");

@@ -26,7 +26,7 @@ pub const usage =
 
 /// `fix repl` subcommand entry point.
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
-    const options = args.parse(args_iter, null) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
             cli.printHelp(init.io, usage);
             return 0;
@@ -36,6 +36,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
             return 2;
         },
     };
+    defer options.packages.deinit(allocator);
     if (options.source != null) {
         std.debug.print("error: repl takes no expression, file, or flake\n\n{s}", .{usage});
         return 2;
