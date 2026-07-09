@@ -31,10 +31,12 @@ fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
 /// any `include` directives. Returns whether the file was read: a missing or
 /// unreadable file yields `false` (best-effort, as in Nix); OOM and parse errors
 /// propagate.
-/// The only error the (mutually-recursive) config-merge functions can produce;
-/// an explicit set breaks the inferred-error-set cycle. I/O read failures are
-/// handled in `mergeFile` (skip), so they never surface here.
-const MergeError = error{OutOfMemory};
+/// The errors the (mutually-recursive) config-merge functions can produce; an
+/// explicit set breaks the inferred-error-set cycle. Missing top-level files are
+/// tolerated in `mergeFile` (skip); `ConfigError` is a fatal config problem (a
+/// missing required `include`) whose message is already printed — the caller
+/// aborts without re-reporting it.
+pub const MergeError = error{ OutOfMemory, ConfigError };
 
 fn mergeFile(settings: *Settings, io: std.Io, path: []const u8, depth: u8) MergeError!bool {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, settings.allocator, .limited(max_conf_bytes)) catch |err| switch (err) {
@@ -43,7 +45,7 @@ fn mergeFile(settings: *Settings, io: std.Io, path: []const u8, depth: u8) Merge
     };
     defer settings.allocator.free(data);
     const dir = std.fs.path.dirname(path) orelse ".";
-    try mergeConfigText(settings, .{ .io = io, .dir = dir, .depth = depth }, data);
+    try mergeConfigText(settings, .{ .io = io, .dir = dir, .depth = depth, .parent = path }, data);
     return true;
 }
 
@@ -122,7 +124,7 @@ pub const Settings = struct {
 
 const max_include_depth = 100; // guards against include cycles
 
-const IncludeCtx = struct { io: std.Io, dir: []const u8, depth: u8 };
+const IncludeCtx = struct { io: std.Io, dir: []const u8, depth: u8, parent: []const u8 };
 const IncludeSpec = struct { path: []const u8, required: bool };
 
 /// Parse config `content` line by line into `settings`. With an `IncludeCtx`,
@@ -151,8 +153,8 @@ fn includeSpec(line: []const u8) ?IncludeSpec {
 }
 
 /// Resolve and merge an included config file (relative to `ctx.dir`). A missing
-/// required `include` warns (Nix errors; we stay best-effort to not brick the
-/// CLI on a bad system config); a missing `!include` is silently skipped.
+/// required `include` is a fatal `ConfigError` (as in Nix); a missing `!include`
+/// is silently skipped.
 fn includeFile(settings: *Settings, ctx: IncludeCtx, spec: IncludeSpec) MergeError!void {
     if (spec.path.len == 0 or ctx.depth >= max_include_depth) return;
     const alloc = settings.allocator;
@@ -162,8 +164,12 @@ fn includeFile(settings: *Settings, ctx: IncludeCtx, spec: IncludeSpec) MergeErr
         try std.fs.path.join(alloc, &.{ ctx.dir, spec.path });
     defer alloc.free(path);
     const found = try mergeFile(settings, ctx.io, path, ctx.depth + 1);
-    if (!found and spec.required)
-        std.debug.print("warning: nix.conf: cannot include missing file '{s}'\n", .{path});
+    if (!found and spec.required) {
+        // Match Nix: abort with the file that couldn't be included and its
+        // source. The message is printed here, so the caller must not re-report.
+        std.debug.print("error: file '{s}' included from '{s}' not found\n", .{ path, ctx.parent });
+        return error.ConfigError;
+    }
 }
 
 /// Load and merge the standard `nix.conf` sources. Missing/unreadable files are

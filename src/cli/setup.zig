@@ -51,7 +51,9 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // Start from the loaded config (empty if unreadable), then layer `--option`
     // overrides on top at highest precedence, before reading the settings fix
     // acts on.
-    var settings = nix_conf.load(ev.allocator, init.environ_map, init.io) catch nix_conf.Settings{ .allocator = ev.allocator };
+    // A fatal config problem (e.g. a missing required `include`) aborts with a
+    // printed message, like Nix; a missing top-level nix.conf is not an error.
+    var settings = try nix_conf.load(ev.allocator, init.environ_map, init.io);
     defer settings.deinit();
     // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
     for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);

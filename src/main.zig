@@ -102,7 +102,9 @@ fn runSubcommand(name: []const u8, allocator: std.mem.Allocator, init: std.proce
     inline for (subcommands) |subcommand| {
         if (std.mem.eql(u8, name, subcommand.name)) {
             return subcommand.run(allocator, init, args_iter) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
+                // `error.ConfigError` (e.g. a bad nix.conf include) already
+                // printed its own message; don't double-report.
+                if (err != error.ConfigError) std.debug.print("error: {s}\n", .{@errorName(err)});
                 return 1;
             };
         }
