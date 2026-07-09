@@ -34,7 +34,7 @@ const heap_mod = @import("runtime").heap;
 const gc = @import("runtime").gc;
 const thunk_trace = @import("probe").thunk_trace;
 const ChunkId = types.ChunkId;
-const deferred_compile = @import("../compiler/deferred.zig");
+const deferred_compile = @import("compiler").deferred;
 const force_label = @import("force_label.zig");
 const speculate = @import("force_speculate.zig");
 

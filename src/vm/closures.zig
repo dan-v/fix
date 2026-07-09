@@ -15,7 +15,7 @@ const heap_mod = @import("runtime").heap;
 const Closure = heap_mod.Closure;
 const BytecodeThunk = @import("runtime").thunk.BytecodeThunk;
 const Thunk = @import("runtime").thunk.Thunk;
-const deferred_mod = @import("../compiler/deferred_table.zig");
+const deferred_mod = @import("compiler").deferred_table;
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");

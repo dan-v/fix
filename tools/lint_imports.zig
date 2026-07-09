@@ -18,7 +18,7 @@ const std = @import("std");
 /// Directories under `src/` that are their own build module. A file outside
 /// `src/<name>/` may not import `src/<name>/**` or the facade `src/<name>.zig`
 /// by relative path.
-const module_dirs = [_][]const u8{ "syntax", "runtime", "parallel", "derivation", "containers", "cli", "observ", "bytecode", "probe" };
+const module_dirs = [_][]const u8{ "syntax", "runtime", "parallel", "derivation", "containers", "cli", "observ", "bytecode", "probe", "compiler" };
 
 const max_file_bytes = 8 * 1024 * 1024;
 
