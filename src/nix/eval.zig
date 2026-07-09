@@ -222,7 +222,7 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
-        mem_report.report(self);
+        mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.env_map);
         // Detach the import-prefetch sink before teardown (module-level
         // global; only clear it if it still points at THIS evaluator).
         if (ChunkRegistry.path_const_sink) |sink| {
@@ -536,7 +536,7 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
-        tuning.apply(self);
+        tuning.apply(&self.scheduler, &self.heap, self.env_map, self.worker_count);
         // Speculative import prefetch: `.nix` path constants of freshly
         // compiled chunks are parse+compile+evaluated ahead of demand on
         // the spec lane (the braid-window perf decomposition measured

@@ -9,19 +9,28 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const heap_mod = @import("runtime").heap;
+const intern_mod = @import("runtime").intern;
 const Value = @import("runtime").value.Value;
 const gc = @import("runtime").gc;
 const mem_tag = @import("runtime").mem_tag;
 const vma_mod = mem_tag.vma;
 const block_cache = @import("base").block_cache;
 const bytecode = @import("bytecode");
+const ast = @import("syntax").ast;
 
 /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see
 /// where the memory actually goes (the tracked object stores are only part
 /// of it — interned strings, bytecode, and AST arenas are large and the GC
 /// never sees them). Printed at deinit, before any teardown frees state.
-pub fn report(ev: anytype) void {
-    const on = if (ev.env_map) |em| em.get("FIX_MEM_REPORT") != null else false;
+/// Takes the lower-layer state it reads, not the whole Evaluator.
+pub fn report(
+    heap: *heap_mod.ObjectHeap,
+    intern: *intern_mod.InternTable,
+    registry: *bytecode.ChunkRegistry,
+    retained_arenas: []const ast.AstArena,
+    env: ?*const std.process.Environ.Map,
+) void {
+    const on = if (env) |em| em.get("FIX_MEM_REPORT") != null else false;
     if (!on) return;
     const mb = struct {
         fn f(bytes: u64) f64 {
@@ -34,34 +43,34 @@ pub fn report(ev: anytype) void {
     // cursor starts past the (possibly never-armed) nursery gap, and
     // `count()` would bill those phantom slots as used (~175 MB of
     // pages that don't exist on a dormant-GC run).
-    const obj_b = @as(u64, ev.heap.objects.count()) * @sizeOf(heap_mod.Object);
-    const val_b = @as(u64, ev.heap.values.reservedSlots()) * @sizeOf(Value);
-    const attr_b = @as(u64, ev.heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
-    const apos_b = @as(u64, ev.heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
+    const obj_b = @as(u64, heap.objects.count()) * @sizeOf(heap_mod.Object);
+    const val_b = @as(u64, heap.values.reservedSlots()) * @sizeOf(Value);
+    const attr_b = @as(u64, heap.attrs.reservedSlots()) * @sizeOf(heap_mod.AttrEntry);
+    const apos_b = @as(u64, heap.attr_positions.reservedSlots()) * @sizeOf(heap_mod.AttrPosEntry);
     const stores_b = obj_b + val_b + attr_b + apos_b;
 
-    const is = ev.intern.stats();
+    const is = intern.stats();
     const intern_b = @as(u64, is.entries) * 12 + is.data_bytes; // Entry = 3×u32
 
-    const cs = ev.registry.stats();
+    const cs = registry.stats();
     const code_b = cs.code_bytes + cs.const_count * @sizeOf(Value) +
         cs.source_map_entries * @sizeOf(bytecode.chunk.Chunk.SourceMapEntry);
 
     var arena_b: u64 = 0;
-    for (ev.retained_arenas.items) |*a| arena_b += a.inner.queryCapacity();
+    for (retained_arenas) |*a| arena_b += a.inner.queryCapacity();
 
     const accounted = stores_b + intern_b + code_b + arena_b;
     const rss = gc.peakRssBytes();
 
     p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
-    p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), ev.heap.objects.count() });
-    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), ev.heap.values.reservedSlots() });
-    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), ev.heap.attrs.reservedSlots() });
+    p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap.objects.count() });
+    p("  value store:    {d:>8.1} MB  ({d} vals)\n", .{ mb(val_b), heap.values.reservedSlots() });
+    p("  attr store:     {d:>8.1} MB  ({d} attrs)\n", .{ mb(attr_b), heap.attrs.reservedSlots() });
     p("  attr-pos store: {d:>8.1} MB\n", .{mb(apos_b)});
     p("  -- stores total:{d:>8.1} MB\n", .{mb(stores_b)});
     p("  interned strs:  {d:>8.1} MB  ({d} entries, {d:.1} MB data)\n", .{ mb(intern_b), is.entries, mb(is.data_bytes) });
     p("  bytecode:       {d:>8.1} MB  ({d} chunks, {d:.1} MB code)\n", .{ mb(code_b), cs.chunks, mb(cs.code_bytes) });
-    p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), ev.retained_arenas.items.len });
+    p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), retained_arenas.len });
     p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
     p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
     if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
@@ -92,7 +101,7 @@ pub fn report(ev: anytype) void {
         p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_rss - tracked_total) });
     if (res.dropped > 0)
         p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
-    const dump = if (ev.env_map) |em| em.get("FIX_MEM_REPORT") else null;
+    const dump = if (env) |em| em.get("FIX_MEM_REPORT") else null;
     if (dump != null and std.mem.eql(u8, dump.?, "dump")) vma_mod.dumpRegions();
 
     // Decompose the "untracked" bucket above via /proc/self/smaps:

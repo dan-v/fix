@@ -16,9 +16,11 @@
 //! Value — so cycle detection for them is a thread-local linked list
 //! threaded through the import call stack.
 //!
-//! The top-level functions (importPath, forceEntry, scopedImportPath)
-//! take `ev: anytype` so the evaluator stays loosely coupled and we
-//! don't introduce a cycle in the @import graph.
+//! The top-level functions (importPath, forceEntry, scopedImportPath) are
+//! Evaluator methods split into this file to keep eval.zig manageable — they
+//! re-enter the Evaluator (evaluateSource, resolveHostPath, progress). `ev:
+//! anytype` isn't loose coupling; it's how a method body in a sibling file
+//! names its receiver without a *file*-level @import cycle with eval.zig.
 
 const std = @import("std");
 const Value = @import("runtime").value.Value;
@@ -115,9 +117,10 @@ pub fn checkScopedCycle(path: []const u8) !void {
 
 /// Resolve `path` against `ev.base_path` if relative, then dedup
 /// through the registry and force the entry to completion. The
-/// evaluator is passed by anytype to avoid an @import cycle; it must
-/// expose `allocator`, `imports`, `files`, `progress*`, `evaluateSource`,
-/// and `resolveHostPath`.
+/// evaluator is passed by anytype only to avoid a *file*-level @import cycle
+/// with eval.zig (this is an extracted Evaluator method, not loose coupling);
+/// it must expose `allocator`, `imports`, `files`, `progress*`,
+/// `evaluateSource`, and `resolveHostPath`.
 pub fn importPath(ev: anytype, path: []const u8, parent_depth: u32) !Value {
     const resolved = try ev.resolveHostPath(path);
     defer if (resolved.owned) ev.allocator.free(resolved.text);

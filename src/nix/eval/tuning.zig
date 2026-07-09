@@ -10,26 +10,34 @@
 
 const std = @import("std");
 const scheduler_mod = @import("scheduler");
+const heap_mod = @import("runtime").heap;
 const worker_mod = @import("vm").worker;
 const vm_closures = @import("vm").closures;
 const vm_force = @import("vm").force;
 
-/// Resolve and apply the scheduler/speculation tuning knobs to `ev`.
-pub fn apply(ev: anytype) void {
+/// Resolve and apply the scheduler/speculation tuning knobs. Takes exactly the
+/// lower-layer state it touches — the scheduler, the heap's scavenge flag, the
+/// environment, and the worker count — never the whole Evaluator.
+pub fn apply(
+    sched: *scheduler_mod.Scheduler,
+    heap: *heap_mod.ObjectHeap,
+    env: ?*const std.process.Environ.Map,
+    worker_count: u8,
+) void {
     // FIX_SPEC_BACKLOG: sweep the speculation backlog cap (peak-RSS↔wall knob).
-    if (ev.env_map) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
+    if (env) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
         if (std.fmt.parseInt(u32, s, 10)) |n| scheduler_mod.setSpecBacklog(n) else |_| {}
     };
     // FIX_SPEC_EVICT: ring semantics for the speculation backlog — at the
     // cap, drop the oldest queued spec task instead of rejecting the
     // newest submission (see scheduler.spec_evict).
-    if (ev.env_map) |em| if (em.get("FIX_SPEC_EVICT")) |s| {
-        ev.scheduler.spec_evict = !std.mem.eql(u8, s, "0");
+    if (env) |em| if (em.get("FIX_SPEC_EVICT")) |s| {
+        sched.spec_evict = !std.mem.eql(u8, s, "0");
     };
     // FIX_SPEC_LIFO: helpers steal the newest speculative task instead of
     // the oldest (see scheduler.spec_lifo).
-    if (ev.env_map) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
-        ev.scheduler.spec_lifo = !std.mem.eql(u8, s, "0");
+    if (env) |em| if (em.get("FIX_SPEC_LIFO")) |s| {
+        sched.spec_lifo = !std.mem.eql(u8, s, "0");
     };
     // Novel-chunk priority lane: first-ever speculation of each chunk
     // goes to the high-priority novel lane (see scheduler.spec_novel).
@@ -40,21 +48,21 @@ pub fn apply(ev: anytype) void {
     // off too - the lane is exempt from the backlog cap, and 31 idle
     // helpers chase every novel root deep (measured w=32: median 1.06
     // -> 1.11, median RSS 2940 -> 3581MB). FIX_SPEC_NOVEL=0/1 overrides.
-    ev.scheduler.spec_novel = ev.worker_count > 1 and ev.worker_count <= 16;
-    if (ev.env_map) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
-        ev.scheduler.spec_novel = !std.mem.eql(u8, s, "0");
+    sched.spec_novel = worker_count > 1 and worker_count <= 16;
+    if (env) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
+        sched.spec_novel = !std.mem.eql(u8, s, "0");
     };
     // FIX_WORK_FIRST: route strict collection-force acceleration through the
     // work-first split-and-steal primitive instead of the eager fan-out.
-    if (ev.env_map) |em| ev.scheduler.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
+    if (env) |em| sched.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
     // FIX_FIBER_MADV=dontneed: eager (visible-RSS) comparator for the
     // overflow-fiber stack release; default is MADV_FREE (lazy reclaim).
-    if (ev.env_map) |em| if (em.get("FIX_FIBER_MADV")) |s| {
+    if (env) |em| if (em.get("FIX_FIBER_MADV")) |s| {
         worker_mod.stack_release_lazy = !std.mem.eql(u8, s, "dontneed");
     };
     // FIX_NO_EAGER: disable the strictness-driven eager thunk submit
     // (see closures.zig makeBytecodeThunkFromCapturesEager) — A/B knob.
-    if (ev.env_map) |em| if (em.get("FIX_NO_EAGER")) |s| {
+    if (env) |em| if (em.get("FIX_NO_EAGER")) |s| {
         vm_closures.eager_submit_enabled = std.mem.eql(u8, s, "0");
     };
     // FIX_SPEC_CREATE_BUDGET: per-task thunk-creation budget for
@@ -68,15 +76,15 @@ pub fn apply(ev: anytype) void {
     // don't recover it — the cheaper steal path converts those
     // cascades into demand hits), so the DEFAULT IS OFF at every
     // worker count. See Scheduler.spec_task_create_budget.
-    ev.scheduler.spec_task_create_budget = 0;
-    if (ev.env_map) |em| if (em.get("FIX_SPEC_CREATE_BUDGET")) |s| {
+    sched.spec_task_create_budget = 0;
+    if (env) |em| if (em.get("FIX_SPEC_CREATE_BUDGET")) |s| {
         if (std.fmt.parseInt(u64, s, 10)) |v| {
-            ev.scheduler.spec_task_create_budget = v;
+            sched.spec_task_create_budget = v;
         } else |_| {}
     };
     // FIX_FANOUT_BATCH: items per force_list_range/force_attrs_range
     // task (default 16) — batch-size sweep knob.
-    if (ev.env_map) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
+    if (env) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {
         if (std.fmt.parseInt(u8, s, 10)) |v| {
             if (v > 0) vm_force.fan_out_batch_items = v;
         } else |_| {}
@@ -84,7 +92,7 @@ pub fn apply(ev: anytype) void {
     // FIX_SCAVENGE: idle helpers pre-force old unresolved thunks from the
     // per-worker creation rings. FIX_SCAV_MARGIN tunes how many of the
     // newest entries stay reserved to their creator (default 4096).
-    if (ev.env_map) |em| {
+    if (env) |em| {
         const scav_on = em.get("FIX_SCAVENGE") != null;
         var scav_margin: u64 = 4096;
         if (em.get("FIX_SCAV_MARGIN")) |s| {
@@ -94,7 +102,7 @@ pub fn apply(ev: anytype) void {
             if (std.fmt.parseInt(u64, s, 10)) |n| vm_force.scav_hot_threshold_cy = n else |_| {}
         }
         if (em.get("FIX_SCAV_WORKERS")) |s| {
-            if (std.fmt.parseInt(u8, s, 10)) |n| ev.scheduler.scav_workers = n else |_| {}
+            if (std.fmt.parseInt(u8, s, 10)) |n| sched.scav_workers = n else |_| {}
         }
         if (em.get("FIX_SCAV_MULT")) |s| {
             if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_take_mult = n else |_| {}
@@ -105,8 +113,8 @@ pub fn apply(ev: anytype) void {
         if (em.get("FIX_SCAV_MINDEM")) |s| {
             if (std.fmt.parseInt(u32, s, 10)) |n| vm_force.scav_min_demand = n else |_| {}
         }
-        ev.scheduler.setScavenge(scav_on, scav_margin);
-        ev.heap.scav_record = scav_on;
+        sched.setScavenge(scav_on, scav_margin);
+        heap.scav_record = scav_on;
     }
     // Demand-sibling prefetch is ON by default when helpers exist
     // (~15% wall win on the NixOS toplevel; junk bounded by the
@@ -118,10 +126,10 @@ pub fn apply(ev: anytype) void {
     // entry-count gate (defaults 16/64, from the -Dprof-main sibling
     // census).
     {
-        var sib_on = ev.worker_count > 1;
+        var sib_on = worker_count > 1;
         var sib_min: u32 = 16;
         var sib_max: u32 = 64;
-        if (ev.env_map) |em| {
+        if (env) |em| {
             if (em.get("FIX_SIBLING")) |s| sib_on = !std.mem.eql(u8, s, "0");
             if (em.get("FIX_SIBLING_MIN")) |s| {
                 if (std.fmt.parseInt(u32, s, 10)) |n| sib_min = n else |_| {}
@@ -131,19 +139,19 @@ pub fn apply(ev: anytype) void {
             }
             if (em.get("FIX_SIBLING_BUDGET")) |s| {
                 if (std.fmt.parseInt(u64, s, 10)) |n| {
-                    ev.scheduler.sibling_budget = n;
-                    ev.scheduler.sibling_claim_budget = n;
+                    sched.sibling_budget = n;
+                    sched.sibling_claim_budget = n;
                 } else |_| {}
             }
             if (em.get("FIX_SIBLING_CLAIMS")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |n| ev.scheduler.sibling_claim_budget = n else |_| {}
+                if (std.fmt.parseInt(u64, s, 10)) |n| sched.sibling_claim_budget = n else |_| {}
             }
             if (em.get("FIX_SIBLING_URGENT")) |s| {
-                ev.scheduler.sibling_urgent = !std.mem.eql(u8, s, "0");
+                sched.sibling_urgent = !std.mem.eql(u8, s, "0");
             }
-            ev.scheduler.sibling_log = em.get("FIX_SIBLING_LOG") != null;
-            ev.scheduler.touch_log = em.get("FIX_TOUCH_LOG");
+            sched.sibling_log = em.get("FIX_SIBLING_LOG") != null;
+            sched.touch_log = em.get("FIX_TOUCH_LOG");
         }
-        ev.scheduler.setSiblingPrefetch(sib_on, sib_min, sib_max);
+        sched.setSiblingPrefetch(sib_on, sib_min, sib_max);
     }
 }
