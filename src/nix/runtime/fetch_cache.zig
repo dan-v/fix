@@ -8,14 +8,22 @@ const std = @import("std");
 const nix_hash = @import("hash.zig");
 const FileCache = @import("file_cache.zig").FileCache;
 
-/// Trap: this does NOT memoize within a process run. There is no
-/// in-memory cache — the only cache is the on-disk `.zig-cache/fix-fetch`
-/// store, and it merely skips re-writing/re-extracting already-present
-/// paths. Each `fetchUrl`/`fetchTarball` call still re-downloads and
-/// re-hashes the bytes on every invocation.
+/// Download-staging cache under `$XDG_CACHE_HOME/fix` (default `~/.cache/fix`,
+/// mirroring Nix's `~/.cache/nix`; falls back to `./.zig-cache/fix` when the
+/// environment is unset). This is only a place to land downloads before they
+/// are hashed/added to the real store — never a substitute for `/nix/store`.
+///
+/// Trap: this does NOT memoize within a process run. There is no in-memory
+/// cache; the on-disk cache merely skips re-writing/re-extracting
+/// already-present paths. Each `fetchUrl`/`fetchTarball` call still
+/// re-downloads and re-hashes the bytes on every invocation.
 pub const FetchCache = struct {
     allocator: std.mem.Allocator,
     io: ?std.Io,
+    /// Download-cache root (owned). Set to `$XDG_CACHE_HOME/fix` (default
+    /// `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. When unset (e.g. tests
+    /// that never call `setEnvironment`) it falls back to `./.zig-cache/fix`.
+    cache_root: ?[]u8 = null,
 
     const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
@@ -95,11 +103,27 @@ pub const FetchCache = struct {
     }
 
     pub fn deinit(self: *FetchCache) void {
-        _ = self;
+        if (self.cache_root) |root| self.allocator.free(root);
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
         self.io = io;
+    }
+
+    /// Set the download-cache root (duped/owned). See `cache_root`.
+    pub fn setCacheRoot(self: *FetchCache, root: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, root);
+        if (self.cache_root) |old| self.allocator.free(old);
+        self.cache_root = owned;
+    }
+
+    /// The download-cache root: the configured `cache_root`, else
+    /// `<cwd>/.zig-cache/fix` as a fallback (caller frees).
+    fn cacheRootDir(self: *FetchCache, io: std.Io) ![]u8 {
+        if (self.cache_root) |root| return self.allocator.dupe(u8, root);
+        const cwd = try std.process.currentPathAlloc(io, self.allocator);
+        defer self.allocator.free(cwd);
+        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix" });
     }
 
     pub fn fetchGit(self: *FetchCache, files: *FileCache, spec: GitSpec) !GitResult {
@@ -279,9 +303,9 @@ pub const FetchCache = struct {
 
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
-        const cwd = try std.process.currentPathAlloc(io, self.allocator);
-        defer self.allocator.free(cwd);
-        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "git", digest[0..32] });
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        return std.fs.path.join(self.allocator, &.{ root, "git", digest[0..32] });
     }
 
     fn remoteMercurialPath(self: *FetchCache, io: std.Io, spec: MercurialSpec) ![]u8 {
@@ -293,25 +317,25 @@ pub const FetchCache = struct {
 
         const digest = try nix_hash.hashBytes(self.allocator, "sha256", key.items);
         defer self.allocator.free(digest);
-        const cwd = try std.process.currentPathAlloc(io, self.allocator);
-        defer self.allocator.free(cwd);
-        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "hg", digest[0..32] });
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
+        return std.fs.path.join(self.allocator, &.{ root, "hg", digest[0..32] });
     }
 
     fn urlCachePath(self: *FetchCache, io: std.Io, name: []const u8, hash: []const u8) ![]u8 {
-        const cwd = try std.process.currentPathAlloc(io, self.allocator);
-        defer self.allocator.free(cwd);
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
         const clean_name = try cleanStoreName(self.allocator, name);
         defer self.allocator.free(clean_name);
-        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "url", hash[0..32], clean_name });
+        return std.fs.path.join(self.allocator, &.{ root, "url", hash[0..32], clean_name });
     }
 
     fn tarballCachePath(self: *FetchCache, io: std.Io, name: []const u8, hash: []const u8) ![]u8 {
-        const cwd = try std.process.currentPathAlloc(io, self.allocator);
-        defer self.allocator.free(cwd);
+        const root = try self.cacheRootDir(io);
+        defer self.allocator.free(root);
         const clean_name = try cleanStoreName(self.allocator, name);
         defer self.allocator.free(clean_name);
-        return std.fs.path.join(self.allocator, &.{ cwd, ".zig-cache", "fix-fetch", "tarball", hash[0..32], clean_name });
+        return std.fs.path.join(self.allocator, &.{ root, "tarball", hash[0..32], clean_name });
     }
 
     pub fn sourceHash(self: *FetchCache, path: []const u8, rev: []const u8) ![]u8 {

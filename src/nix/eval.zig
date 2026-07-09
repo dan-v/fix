@@ -344,6 +344,30 @@ pub const Evaluator = struct {
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
         self.env_map = env_map;
+        // Point the fetch download-cache at `$XDG_CACHE_HOME/fix` (default
+        // `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. Best-effort; without
+        // HOME/XDG the FetchCache keeps its `./.zig-cache/fix` fallback.
+        self.setFetchCacheRoot() catch {};
+    }
+
+    fn setFetchCacheRoot(self: *Evaluator) !void {
+        const env = self.env_map orelse return;
+        const base: []const u8, const sub: []const []const u8 = blk: {
+            if (env.get("XDG_CACHE_HOME")) |xdg| {
+                if (xdg.len != 0) break :blk .{ xdg, &.{"fix"} };
+            }
+            if (env.get("HOME")) |home| {
+                if (home.len != 0) break :blk .{ home, &.{ ".cache", "fix" } };
+            }
+            return;
+        };
+        var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer parts.deinit(self.allocator);
+        try parts.append(self.allocator, base);
+        try parts.appendSlice(self.allocator, sub);
+        const root = try std.fs.path.join(self.allocator, parts.items);
+        defer self.allocator.free(root);
+        try self.fetchers.setCacheRoot(root);
     }
 
     pub fn setVmTrace(self: *Evaluator, vm_trace: ?*VmTrace) void {

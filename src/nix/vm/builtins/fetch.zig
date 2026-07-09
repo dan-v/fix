@@ -189,6 +189,25 @@ fn gitFilterAccept(_: *anyopaque, path: []const u8, _: file_cache.FileCache.File
 var git_filter_ctx: u8 = 0;
 const git_filter = nar.Filter{ .context = &git_filter_ctx, .accept = gitFilterAccept };
 
+/// NAR filter that drops any `.hg` entry (the Mercurial repository metadata).
+fn hgFilterAccept(_: *anyopaque, path: []const u8, _: file_cache.FileCache.FileKind) anyerror!bool {
+    return !std.mem.eql(u8, path_ops.baseName(path), ".hg");
+}
+var hg_filter_ctx: u8 = 0;
+const hg_filter = nar.Filter{ .context = &hg_filter_ctx, .accept = hgFilterAccept };
+
+fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCache.MercurialResult) !Value {
+    const out = try ingestFetchedTree(self, result.out_path, name, result.rev, hg_filter);
+    defer out.deinit(self.allocator);
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(out.nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, out.out_path) },
+        .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
+        .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
+    };
+    return Value.attrs(try self.heap.addAttrs(&entries));
+}
+
 pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
@@ -376,14 +395,7 @@ pub fn builtinFetchMercurial(self: anytype, arg: Value) !Value {
 
     const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
-
-    const entries = [_]heap_mod.AttrEntry{
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
-        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
-        .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
-        .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
-    };
-    return Value.attrs(try self.heap.addAttrs(&entries));
+    return mercurialResultValue(self, spec.name, result);
 }
 
 fn fetchMercurialSpec(self: anytype, arg: Value) !FetchMercurialSpec {
@@ -543,13 +555,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         const result = try self.fetchers.fetchMercurial(self.files, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
-        const entries = [_]heap_mod.AttrEntry{
-            .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
-            .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
-            .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
-            .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
-        };
-        return Value.attrs(try self.heap.addAttrs(&entries));
+        return mercurialResultValue(self, spec.name, result);
     }
 
     return error.InvalidFlakeRef;
