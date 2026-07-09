@@ -108,12 +108,30 @@ pub const Count = struct {
     total: usize,
 };
 
-/// Opaque handle to a *concurrent* (non-nested) progress span — one standalone
-/// progress node that may be opened on one thread/fiber and closed on another.
-/// Unlike the `begin`/`end` stage spans (which drive a single-writer LIFO stack
-/// owned by the demand fiber), a `Span` node is independent, so store-writes and
-/// other work that happens off the demand path can report progress safely. The
-/// CLI encodes its render node into `token`; the evaluator treats it as opaque.
+/// A category of concurrent work that gets its own grouping node with a live
+/// `[done/total]` count; individual activities nest under it (rather than a flat
+/// list under the run node). Add categories here as new off-demand work appears.
+pub const SpanGroup = enum {
+    fetch,
+    store,
+    source,
+
+    pub fn label(self: SpanGroup) []const u8 {
+        return switch (self) {
+            .fetch => "fetching",
+            .store => "writing to store",
+            .source => "copying sources",
+        };
+    }
+};
+
+/// Opaque handle to a *concurrent* progress span — one standalone progress node,
+/// a child of its `SpanGroup`'s grouping node, that may be opened on one
+/// thread/fiber and closed on another. Unlike the `begin`/`end` stage spans
+/// (which drive a single-writer LIFO stack owned by the demand fiber), a `Span`
+/// node is independent, so store-writes/fetches that happen off the demand path
+/// report progress safely. The CLI encodes its render node into `token`; the
+/// evaluator treats it as opaque.
 pub const Span = struct { token: usize };
 
 pub const Sink = struct {
@@ -121,18 +139,19 @@ pub const Sink = struct {
     emit_fn: *const fn (*anyopaque, Event) void,
     /// Open/close a concurrent span. Both null when the sink doesn't support
     /// them (then `beginSpan` returns null and `endSpan` is a no-op).
-    begin_span_fn: ?*const fn (*anyopaque, []const u8) Span = null,
+    begin_span_fn: ?*const fn (*anyopaque, SpanGroup, []const u8) Span = null,
     end_span_fn: ?*const fn (*anyopaque, Span) void = null,
 
     pub fn emit(self: Sink, event: Event) void {
         self.emit_fn(self.context, event);
     }
 
-    /// Open a concurrent (non-nested) span. Thread-safe: the returned handle can
-    /// be closed with `endSpan` from any thread. Returns null if unsupported.
-    pub fn beginSpan(self: Sink, subject: []const u8) ?Span {
+    /// Open a concurrent span nested under `group`'s counting node. Thread-safe:
+    /// the returned handle can be closed with `endSpan` from any thread. Returns
+    /// null if unsupported.
+    pub fn beginSpan(self: Sink, group: SpanGroup, subject: []const u8) ?Span {
         const f = self.begin_span_fn orelse return null;
-        return f(self.context, subject);
+        return f(self.context, group, subject);
     }
 
     /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.

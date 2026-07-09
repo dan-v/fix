@@ -217,8 +217,8 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         var store_span: ?eval_progress.Span = null;
         if (self.progress) |progress| {
             var name_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(&name_buf, "writing {s}.drv", .{drv_name}) catch drv_name;
-            store_span = progress.beginSpan(label);
+            const label = std.fmt.bufPrint(&name_buf, "{s}.drv", .{drv_name}) catch drv_name;
+            store_span = progress.beginSpan(.store, label);
         }
         defer if (store_span) |sp| {
             if (self.progress) |progress| progress.endSpan(sp);
@@ -714,6 +714,8 @@ fn normalizeDerivationString(
 }
 
 fn sourceStorePathForContext(self: anytype, path: []const u8, owned_strings: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+    const src_span = self.storeCopySpanBegin(std.fs.path.basename(path));
+    defer self.storeCopySpanEnd(src_span);
     const store_path = try source_paths.storePathForSource(self.allocator, self.derivations, self.files, path);
     errdefer self.allocator.free(store_path);
     try owned_strings.append(self.allocator, store_path);

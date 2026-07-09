@@ -6,6 +6,7 @@
 const std = @import("std");
 const eval_progress = @import("fix").eval_progress;
 const gc = @import("runtime").gc;
+const sync = @import("base").sync;
 
 // Command modules, re-exported so `main.zig` reaches them through the `cli`
 // module by name instead of importing `src/cli/*.zig` by relative path.
@@ -196,6 +197,14 @@ pub const EvalProgress = struct {
     /// sampler thread as the block comes and goes, so it vanishes the moment
     /// work resumes. Sampler-owned, same as `stats`.
     waiting: ?std.Progress.Node = null,
+    /// One grouping node per concurrent-span category (fetch / store / source),
+    /// created lazily under the run node on the first span of that category and
+    /// showing a live `[done/total]` count; individual spans nest under it.
+    /// Created/read from any worker fiber, so guarded by `span_mu`. Persist for
+    /// the session (ended in `endSessionNodes`).
+    span_groups: [std.enums.values(eval_progress.SpanGroup).len]?std.Progress.Node =
+        [_]?std.Progress.Node{null} ** std.enums.values(eval_progress.SpanGroup).len,
+    span_mu: sync.SpinMutex = .{},
 
     const Active = struct {
         stage: eval_progress.Stage,
@@ -274,6 +283,8 @@ pub const EvalProgress = struct {
         }
         if (self.waiting) |n| { n.end(); self.waiting = null; }
         if (self.stats) |*s| { s.deinit(); self.stats = null; }
+        // Span group nodes (all children long since ended by their owners).
+        for (&self.span_groups) |*g| if (g.*) |n| { n.end(); g.* = null; };
         if (self.run_node) |n| { n.end(); self.run_node = null; }
     }
 
@@ -294,16 +305,27 @@ pub const EvalProgress = struct {
         return parent.start(name[0..@min(name.len, std.Progress.Node.max_name_len)], 0);
     }
 
-    /// Concurrent-span support (see `eval_progress.Span`). A span is a single
-    /// standalone `std.Progress` node under the run node — allocated/freed via
-    /// the lock-free node freelist, so it is safe to open on one thread/fiber
-    /// and close on another (unlike the single-writer `active[]` stage stack).
-    /// A `std.Progress.Node` is just its `index`, so we round-trip it losslessly
-    /// through the opaque token with no allocation. Node-storage exhaustion
-    /// yields `Node.none`, whose `.end()` is a safe no-op.
-    fn beginSpan(context: *anyopaque, subject: []const u8) eval_progress.Span {
+    /// Concurrent-span support (see `eval_progress.Span`). A span is a child of
+    /// its group's counting node — safe to open on one thread/fiber and close on
+    /// another (unlike the single-writer `active[]` stage stack): std.Progress
+    /// node start/end use a lock-free freelist, and `span_mu` only guards the
+    /// lazy group-node creation + the per-group total bump. Ending a child span
+    /// auto-increments the group's completed count, so the group renders
+    /// `label [done/total]`. A `std.Progress.Node` is just its `index`, so we
+    /// round-trip it through the opaque token with no allocation; node-storage
+    /// exhaustion yields `Node.none`, whose `.end()` is a safe no-op.
+    fn beginSpan(context: *anyopaque, group: eval_progress.SpanGroup, subject: []const u8) eval_progress.Span {
         const self: *EvalProgress = @ptrCast(@alignCast(context));
-        const node = self.childNode(subject);
+        self.span_mu.lock();
+        defer self.span_mu.unlock();
+        const gi = @intFromEnum(group);
+        const parent = self.span_groups[gi] orelse blk: {
+            const n = self.childNode(group.label());
+            self.span_groups[gi] = n;
+            break :blk n;
+        };
+        parent.increaseEstimatedTotalItems(1);
+        const node = parent.start(subject[0..@min(subject.len, std.Progress.Node.max_name_len)], 0);
         return .{ .token = @intFromEnum(node.index) };
     }
 

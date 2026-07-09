@@ -419,6 +419,20 @@ pub const VM = struct {
         if (self.progress) |sink| sink.count(completed, total);
     }
 
+    /// Open a concurrent "copying <subject> to store" span around a source
+    /// ingest (a local path NAR'd into the store, e.g. a derivation `src`).
+    /// Runs on whatever fiber forces the coercion, so — like fetches — it uses
+    /// the thread-safe concurrent-span channel, not the demand stage stack.
+    /// Null (no-op `end`) when progress isn't drawn.
+    pub fn storeCopySpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
+        const progress = self.progress orelse return null;
+        return progress.beginSpan(.source, subject);
+    }
+
+    pub fn storeCopySpanEnd(self: *VM, span: ?eval_progress.Span) void {
+        if (span) |sp| if (self.progress) |progress| progress.endSpan(sp);
+    }
+
     pub fn deinit(self: *VM) void {
         if (comptime opcode_profile_enabled) flushOpcodeProfile(self);
         if (comptime build_options.gc) self.gc_force_chain.deinit(self.allocator);

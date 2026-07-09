@@ -109,6 +109,8 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
     };
     var context: Context = .{ .vm = self, .pred = pred };
 
+    const src_span = self.storeCopySpanBegin(path_ops.baseName(root));
+    defer self.storeCopySpanEnd(src_span);
     const store_path = try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
         .context = &context,
         .accept = Context.accept,
@@ -215,9 +217,7 @@ fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.Fet
 /// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
 fn fetchSpanBegin(self: anytype, subject: []const u8) ?eval_progress.Span {
     const progress = self.progress orelse return null;
-    var buf: [160]u8 = undefined;
-    const label = std.fmt.bufPrint(&buf, "fetching {s}", .{subject}) catch subject;
-    return progress.beginSpan(label);
+    return progress.beginSpan(.fetch, subject);
 }
 
 fn fetchSpanEnd(self: anytype, span: ?eval_progress.Span) void {

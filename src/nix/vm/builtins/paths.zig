@@ -91,6 +91,8 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
         else => return err,
     };
 
+    const src_span = self.storeCopySpanBegin(store_name);
+    defer self.storeCopySpanEnd(src_span);
     const store_path = if (filter_value.isNull())
         try source_paths.storePathForSourceName(self.allocator, self.derivations, self.files, path, store_name)
     else filtered: {
