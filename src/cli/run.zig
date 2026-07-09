@@ -142,16 +142,12 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
     // With an attr path, try the `nix build`/`nix eval` installable prefixes —
     // `packages.<system>.<attr>`, then `legacyPackages.<system>.<attr>` (for
     // `nixpkgs#hello`), falling back to the literal `<attr>` (for flake outputs
-    // at top level). The system-indexed sets are bound first (`… or {}`) so the
-    // final `or`-chain over `<suffix>` uses only static attr paths — fix'
-    // `or`-fallback currently mishandles a missing attr when a dynamic `${…}`
-    // component sits earlier in the same path.
+    // at top level). `or` catches a missing attr at any point in each path.
     try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
     try appendNixEscaped(alloc, &out, resolved.ref);
-    try out.appendSlice(alloc, "\"; s = builtins.currentSystem;");
-    try out.appendSlice(alloc, " ps = f.packages.${s} or {}; lp = f.legacyPackages.${s} or {}; in ps");
+    try out.appendSlice(alloc, "\"; s = builtins.currentSystem; in f.packages.${s}");
     try out.appendSlice(alloc, suffix.items);
-    try out.appendSlice(alloc, " or lp");
+    try out.appendSlice(alloc, " or f.legacyPackages.${s}");
     try out.appendSlice(alloc, suffix.items);
     try out.appendSlice(alloc, " or f");
     try out.appendSlice(alloc, suffix.items);

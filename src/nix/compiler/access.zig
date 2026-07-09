@@ -50,53 +50,73 @@ pub fn compileAttrDynamic(self: *Compiler, node: *const Node) !void {
 
 pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
     const attr_or = node.data.attr_or;
-    if (attr_or.attr_path.tag == .attr_dynamic) {
-        const dynamic = attr_or.attr_path.data.attr_dynamic;
-        if (dynamic.root.tag == .attr_path) {
-            const root_path = dynamic.root.data.attr_path;
-            try self.compileNode(root_path.root);
-            try thunks.compileThunk(self, dynamic.name);
-            try thunks.compileThunk(self, attr_or.default);
-            const wide = try emit.attrSegmentsWide(self, root_path.segments);
-            try emit.emitOp(self, if (wide) .get_attr_path_dynamic_or_long else .get_attr_path_dynamic_or);
-            try emit.writeStaticAttrPathOperand(self, root_path.segments, attrPathDiagnosticAtom(root_path), wide);
-            return;
-        }
-        try self.compileNode(dynamic.root);
-        try thunks.compileThunk(self, dynamic.name);
-        try thunks.compileThunk(self, attr_or.default);
-        try emit.emitOp(self, .get_attr_dynamic_or);
-        return;
-    }
 
-    const apath = attr_or.attr_path.data.attr_path;
-    if (attrPathHasInterpolation(self, apath)) {
-        try self.compileNode(apath.root);
-        var dynamic_count: usize = 0;
-        for (apath.segments) |seg| {
-            if (attrs.attrSegmentHasInterpolation(self, seg)) {
-                try thunks.compileStringAtomThunk(self, seg);
+    // Flatten the whole select path — across nested `attr_path`/`attr_dynamic`
+    // (e.g. `root.a.${b}.c` parses as an `attr_path` whose root is an
+    // `attr_dynamic`) — into one segment list, so the `or` default covers a
+    // missing attr at ANY position, static or dynamic. Compiling the nested
+    // dynamic root separately (the old code) left it outside the fallback, so
+    // `x.a.${b}.c or d` threw instead of yielding `d`.
+    var segments: std.ArrayListUnmanaged(Node.HasAttrMixedSegment) = .empty;
+    defer segments.deinit(self.allocator);
+    const base = try flattenAttrPath(self, attr_or.attr_path, &segments);
+    const atom = diagnosticAtom(attr_or.attr_path);
+
+    var dynamic_count: usize = 0;
+    for (segments.items) |segment| {
+        switch (segment) {
+            .static => |seg| if (attrs.attrSegmentHasInterpolation(self, seg)) {
                 dynamic_count += 1;
-            }
+            },
+            .dynamic => dynamic_count += 1,
         }
+    }
+
+    if (dynamic_count == 0) {
+        // All-static path: the fast encoding.
+        var atoms: std.ArrayListUnmanaged(Node.Atom) = .empty;
+        defer atoms.deinit(self.allocator);
+        for (segments.items) |segment| try atoms.append(self.allocator, segment.static);
+        try self.compileNode(base);
         try thunks.compileThunk(self, attr_or.default);
-        try emit.emitOp(self, .get_attr_path_mixed_or);
-        try emit.writeMixedAttrPathOperand(self, apath.segments, dynamic_count, attrPathDiagnosticAtom(apath));
+        const wide = try emit.attrSegmentsWide(self, atoms.items);
+        try emit.emitOp(self, if (wide) .get_attr_path_or_long else .get_attr_path_or);
+        try emit.writeStaticAttrPathOperand(self, atoms.items, atom, wide);
         return;
     }
 
-    try self.compileNode(apath.root);
+    // Mixed static/dynamic path: push root, then each dynamic segment's name
+    // thunk in path order, then the default thunk.
+    try self.compileNode(base);
+    for (segments.items) |segment| {
+        switch (segment) {
+            .static => |seg| if (attrs.attrSegmentHasInterpolation(self, seg)) try thunks.compileStringAtomThunk(self, seg),
+            .dynamic => |name| try thunks.compileThunk(self, name),
+        }
+    }
     try thunks.compileThunk(self, attr_or.default);
-    const wide = try emit.attrSegmentsWide(self, apath.segments);
-    try emit.emitOp(self, if (wide) .get_attr_path_or_long else .get_attr_path_or);
-    try emit.writeStaticAttrPathOperand(self, apath.segments, attrPathDiagnosticAtom(apath), wide);
+    try emit.emitOp(self, .get_attr_path_mixed_or);
+    try emit.writeHasAttrMixedOperand(self, segments.items, dynamic_count, atom);
 }
 
-fn attrPathHasInterpolation(self: *Compiler, path: Node.AttrPath) bool {
-    for (path.segments) |seg| {
-        if (attrs.attrSegmentHasInterpolation(self, seg)) return true;
+/// Flatten a nested attribute-access node into `segments` (root-first) and
+/// return the base root (the first non-`attr_path`/`attr_dynamic` node).
+fn flattenAttrPath(self: *Compiler, node: *const Node, segments: *std.ArrayListUnmanaged(Node.HasAttrMixedSegment)) !*const Node {
+    switch (node.tag) {
+        .attr_path => {
+            const apath = node.data.attr_path;
+            const base = try flattenAttrPath(self, apath.root, segments);
+            for (apath.segments) |seg| try segments.append(self.allocator, .{ .static = seg });
+            return base;
+        },
+        .attr_dynamic => {
+            const dynamic = node.data.attr_dynamic;
+            const base = try flattenAttrPath(self, dynamic.root, segments);
+            try segments.append(self.allocator, .{ .dynamic = dynamic.name });
+            return base;
+        },
+        else => return node,
     }
-    return false;
 }
 
 pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
