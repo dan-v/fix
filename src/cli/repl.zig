@@ -4,8 +4,56 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const run = @import("run.zig");
+const args = @import("args.zig");
+const setup = @import("setup.zig");
 const Options = @import("args.zig").Options;
 const Evaluator = @import("fix").Evaluator;
+
+pub const usage =
+    \\usage: fix repl [options]
+    \\
+    \\start an interactive read-eval-print loop.
+    \\
+    \\options:
+    \\  --json / --xml / --strict     result output format
+    \\  --experimental-features FEATS / --extra-experimental-features FEATS
+    \\  --show-trace                  show full evaluation traces on error
+    \\  --color[=when] / --no-color
+    \\  --progress[=when] / --no-progress
+    \\  -h, --help                    show this help
+    \\
+;
+
+/// `fix repl` subcommand entry point.
+pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const options = args.parse(args_iter, null) catch |err| switch (err) {
+        error.Help => {
+            cli.printHelp(init.io, usage);
+            return 0;
+        },
+        else => {
+            std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
+            return 2;
+        },
+    };
+    if (options.source != null) {
+        std.debug.print("error: repl takes no expression, file, or flake\n\n{s}", .{usage});
+        return 2;
+    }
+
+    const worker_count = try setup.workerCount(options);
+    var ev = try Evaluator.init(allocator, worker_count);
+    defer ev.deinit();
+    const term = try setup.configure(&ev, init, options);
+
+    var progress = cli.EvalProgress.init(init.io, term.show_progress);
+    var repl_ok = false;
+    defer progress.deinit(repl_ok);
+    if (term.show_progress) ev.setProgressSink(progress.sink());
+    try run_loop(allocator, init.io, options, term.use_color, &ev);
+    repl_ok = true;
+    return 0;
+}
 
 pub const History = struct {
     allocator: std.mem.Allocator,

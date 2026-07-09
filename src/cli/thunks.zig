@@ -19,6 +19,7 @@
 //! location in either log (so the report flows causally).
 
 const std = @import("std");
+const cli = @import("cli.zig");
 
 const usage =
     \\usage: fix thunks <subcommand> [args]
@@ -29,7 +30,7 @@ const usage =
     \\             outcomes differs.
     \\
     \\to record a log:
-    \\  fix --thunks-log=PATH -e EXPR
+    \\  fix eval --thunks-log=PATH -e EXPR
     \\
     \\options for diff:
     \\  --asymmetric          show only locations where one side has
@@ -51,14 +52,15 @@ const usage =
     \\
 ;
 
-pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    _ = allocator;
     const sub = args_iter.next() orelse {
         std.debug.print("{s}", .{usage});
         return 2;
     };
     if (std.mem.eql(u8, sub, "diff")) return runDiff(init, args_iter);
-    if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help")) {
-        std.debug.print("{s}", .{usage});
+    if (cli.isHelpFlag(sub)) {
+        cli.printHelp(init.io, usage);
         return 0;
     }
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });

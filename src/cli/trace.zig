@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const fix = @import("fix");
+const cli = @import("cli.zig");
 const bytecode = fix.bytecode;
 const trace_log = fix.vm.trace_log;
 
@@ -25,11 +26,12 @@ const usage =
     \\  dump PATH   pretty-print a binary trace as text.
     \\
     \\To record a trace:
-    \\  fix --vm-trace=PATH --vm-trace-format=binary -e EXPR
+    \\  fix eval --vm-trace=PATH --vm-trace-format=binary -e EXPR
     \\
 ;
 
-pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    _ = allocator;
     const sub = args_iter.next() orelse {
         std.debug.print("{s}", .{usage});
         return 2;
@@ -52,8 +54,8 @@ pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
         };
         return runDump(init, path);
     }
-    if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help")) {
-        std.debug.print("{s}", .{usage});
+    if (cli.isHelpFlag(sub)) {
+        cli.printHelp(init.io, usage);
         return 0;
     }
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });

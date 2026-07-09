@@ -11,6 +11,8 @@ const gc = @import("runtime").gc;
 // module by name instead of importing `src/cli/*.zig` by relative path.
 pub const args = @import("args.zig");
 pub const run = @import("run.zig");
+pub const setup = @import("setup.zig");
+pub const eval = @import("eval.zig");
 pub const repl = @import("repl.zig");
 pub const disasm = @import("disasm.zig");
 pub const inspect = @import("inspect.zig");
@@ -31,6 +33,21 @@ pub fn parseWhen(text: []const u8) ?When {
     if (std.mem.eql(u8, text, "always")) return .always;
     if (std.mem.eql(u8, text, "never")) return .never;
     return null;
+}
+
+/// Write help/usage text to **stdout** and flush. POSIX convention: `-h`/help
+/// goes to stdout with exit 0 (whereas usage-on-error goes to stderr via
+/// `std.debug.print` with a nonzero exit). Best-effort — a failed write must
+/// not change the exit status.
+pub fn printHelp(io: std.Io, text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
+    w.interface.writeAll(text) catch return;
+    w.interface.flush() catch {};
+}
+
+pub fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 pub fn stderrInteractive(io: std.Io, env: *const std.process.Environ.Map) bool {

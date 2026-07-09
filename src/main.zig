@@ -3,32 +3,46 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
-const fix = @import("fix");
 const repl = cli.repl;
 const disasm_cmd = cli.disasm;
 const inspect_cmd = cli.inspect;
 const trace_cmd = cli.trace;
 const thunks_cmd = cli.thunks;
-const timeline = fix.probe.timeline;
-const stats = cli.stats;
-const args = cli.args;
-const run = cli.run;
-const trace_setup = cli.trace_setup;
+const eval_cmd = cli.eval;
 const block_cache = @import("base").block_cache;
 const mem_tag = @import("runtime").mem_tag;
-const Evaluator = fix.Evaluator;
 
-const usage = args.usage;
 const ArgsIterator = std.process.Args.Iterator;
-const SubcommandRun = *const fn (std.process.Init, *ArgsIterator) anyerror!u8;
-const Subcommand = struct { name: []const u8, run: SubcommandRun };
+const SubcommandRun = *const fn (std.mem.Allocator, std.process.Init, *ArgsIterator) anyerror!u8;
+const Subcommand = struct {
+    name: []const u8,
+    summary: []const u8,
+    run: SubcommandRun,
+};
 
 const subcommands = [_]Subcommand{
-    .{ .name = "disasm", .run = disasm_cmd.run },
-    .{ .name = "inspect", .run = inspect_cmd.run },
-    .{ .name = "trace", .run = trace_cmd.run },
-    .{ .name = "thunks", .run = thunks_cmd.run },
+    .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run_cmd },
+    .{ .name = "repl", .summary = "start an interactive read-eval-print loop", .run = repl.run_cmd },
+    .{ .name = "disasm", .summary = "disassemble compiled bytecode for an expression", .run = disasm_cmd.run },
+    .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },
+    .{ .name = "trace", .summary = "work with binary VM trace files", .run = trace_cmd.run },
+    .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = thunks_cmd.run },
 };
+
+fn writeTopUsage(writer: *std.Io.Writer) !void {
+    try writer.writeAll("usage: fix <command> [options]\n\ncommands:\n");
+    inline for (subcommands) |c| {
+        try writer.print("  {s:<9} {s}\n", .{ c.name, c.summary });
+    }
+    try writer.writeAll("\nrun `fix <command> -h` for command-specific help.\n");
+}
+
+/// Render the top-level usage into a heap buffer for one-shot printing.
+fn topUsage(allocator: std.mem.Allocator) []const u8 {
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    writeTopUsage(&buf.writer) catch return "usage: fix <command> [options]\n";
+    return buf.toOwnedSlice() catch "usage: fix <command> [options]\n";
+}
 
 pub fn main(init: std.process.Init) !void {
     // The std-provided Debug `gpa` captures a DWARF stack trace on every
@@ -52,137 +66,35 @@ pub fn main(init: std.process.Init) !void {
     var args_iter = try init.minimal.args.iterateAllocator(allocator);
     defer args_iter.deinit();
 
-    const prog_name = args_iter.next() orelse {
-        std.debug.print("{s}", .{usage});
-        std.process.exit(1);
-    };
-    _ = prog_name;
+    _ = args_iter.next(); // argv[0]
 
-    const first_arg = args_iter.next();
-    if (first_arg) |first| {
-        const code = runSubcommand(first, init, &args_iter) catch |err| {
-            std.debug.print("error: {s}\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
-        if (code) |exit_code| std.process.exit(exit_code);
-    }
-
-    const options = args.parse(&args_iter, first_arg) catch |err| {
-        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
-        std.process.exit(1);
+    // A subcommand is required. Missing/unknown commands are a usage error:
+    // print to stderr and exit nonzero (2). `-h`/`--help` prints to stdout and
+    // exits 0 (POSIX).
+    const command = args_iter.next() orelse {
+        std.debug.print("{s}", .{topUsage(allocator)});
+        std.process.exit(2);
     };
 
-    const worker_count: u8 = options.workers orelse if (builtin.single_threaded)
-        1
-    else
-        @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
-
-    var ev = try Evaluator.init(allocator, worker_count);
-    defer ev.deinit();
-    // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap
-    // is pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
-    ev.lazy_shells_visible = options.output == .xml;
-    ev.pipe_operators_enabled = options.experimental_features.contains(.pipe_operators);
-    ev.flakes_enabled = options.experimental_features.contains(.flakes);
-    // `flakes` implies `fetch-tree` (as in Nix): flake evaluation leans on the
-    // tree fetchers, so enabling flakes should not also require fetch-tree.
-    ev.fetch_tree_enabled = options.experimental_features.contains(.fetch_tree) or ev.flakes_enabled;
-    ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
-    ev.setDerivationDebug(options.derivation_debug.enabled());
-    ev.max_memory_bytes = options.max_memory;
-    ev.setEnvironment(init.environ_map);
-    try ev.setBasePathFromCurrentPath(init.io);
-    if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
-    const use_color = cli.shouldColor(options.color, init.io, init.environ_map);
-    const show_progress = cli.shouldProgress(options.progress, init.io, init.environ_map);
-    if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
-
-    if (options.repl) {
-        if (options.source != null) {
-            std.debug.print("error: --repl does not take an expression or file\n\n{s}", .{usage});
-            std.process.exit(1);
-        }
-        var progress = cli.EvalProgress.init(init.io, show_progress);
-        var repl_ok = false;
-        defer progress.deinit(repl_ok);
-        // Only wire the sink when we'll actually draw: it drives a per-quantum
-        // counter sampler (a /proc RSS read + scheduler tally), so a null sink
-        // keeps that fully out of the hot path when progress is off.
-        if (show_progress) ev.setProgressSink(progress.sink());
-        try repl.run_loop(allocator, init.io, options, use_color, &ev);
-        repl_ok = true;
-        return;
+    if (cli.isHelpFlag(command)) {
+        cli.printHelp(init.io, topUsage(allocator));
+        std.process.exit(0);
     }
 
-    const source_arg = options.source orelse {
-        std.debug.print("{s}", .{usage});
-        std.process.exit(1);
+    const code = runSubcommand(command, allocator, init, &args_iter) orelse {
+        std.debug.print("fix: unknown command '{s}'\n\n{s}", .{ command, topUsage(allocator) });
+        std.process.exit(2);
     };
-
-    if (source_arg == .flake and !ev.flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(error.FlakesFeatureRequired), usage });
-        std.process.exit(1);
-    }
-
-    const source = run.getSource(&ev, source_arg) catch |err| {
-        std.debug.print("Error reading source: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
-    // `--flake` synthesizes its source text on `ev.allocator`; expr/file text
-    // is borrowed (argv) or owned by the evaluator's file cache.
-    defer if (source_arg == .flake) ev.allocator.free(source.text);
-
-    var progress = cli.EvalProgress.init(init.io, show_progress);
-    errdefer progress.deinit(false);
-    // Only wire the sink when we'll actually draw (see the REPL path above):
-    // keeps the per-quantum counter sampler out of the hot path when off.
-    if (show_progress) ev.setProgressSink(progress.sink());
-
-    var vm_trace = try trace_setup.setupVmTrace(allocator, init.io, options);
-    defer vm_trace.deinit(allocator);
-    if (vm_trace.trace) |t| ev.setVmTrace(t);
-
-    var thunks_setup = try trace_setup.setupThunkTrace(allocator, init.io, &ev, options);
-    defer thunks_setup.deinit(allocator);
-    if (thunks_setup.trace) |t| ev.setThunkTrace(t);
-
-    // Timeline is always compiled in and RUNTIME-gated: `--timeline[=path]`
-    // calls `init()` which flips the runtime gate on; without it the probe
-    // stays dormant (one predictable branch at quantum granularity, ~free).
-    const timeline_path = options.timeline_path;
-    if (timeline_path != null) {
-        timeline.init(allocator, worker_count, 1 << 21, &ev.intern);
-        timeline.setFlowSample(options.timeline_flows);
-        // Stamp push times so steal arrows anchor to the producing quantum.
-        ev.scheduler.setTraceFlows(true);
-        timeline.setSource(switch (source_arg) {
-            .file => |p| p,
-            .expr => "(expression)",
-            .flake => |inst| inst,
-        });
-    }
-
-    const eval_label = switch (source_arg) {
-        .file => |p| std.fs.path.basename(p),
-        .expr => "expression",
-        .flake => |inst| inst,
-    };
-    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, &ev, source.text, eval_label);
-    progress.deinit(ok);
-
-    if (timeline_path) |p| timeline.dump(init.io, p, worker_count);
-    vm_trace.finish();
-    thunks_setup.finish();
-    if (options.print_sched_stats) stats.report(&ev);
-    if (!ok) {
-        std.process.exit(1);
-    }
+    std.process.exit(code);
 }
 
-fn runSubcommand(name: []const u8, init: std.process.Init, args_iter: *ArgsIterator) !?u8 {
+fn runSubcommand(name: []const u8, allocator: std.mem.Allocator, init: std.process.Init, args_iter: *ArgsIterator) ?u8 {
     inline for (subcommands) |subcommand| {
         if (std.mem.eql(u8, name, subcommand.name)) {
-            return try subcommand.run(init, args_iter);
+            return subcommand.run(allocator, init, args_iter) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                return 1;
+            };
         }
     }
     return null;

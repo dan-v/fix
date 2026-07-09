@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const fix = @import("fix");
+const cli = @import("cli.zig");
 const eval = fix.eval;
 const bytecode = fix.bytecode;
 const intern_mod = @import("runtime").intern;
@@ -36,11 +37,10 @@ const Options = struct {
     workers: ?u8 = null,
 };
 
-pub fn run(init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
-    const allocator = init.gpa;
+pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     const options = parseOptions(args_iter) catch |err| switch (err) {
         error.Help => {
-            std.debug.print("{s}", .{usage});
+            cli.printHelp(init.io, usage);
             return 0;
         },
         else => {

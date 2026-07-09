@@ -2,25 +2,24 @@
 
 *The command surface and the introspection tools that read the machine's mind.*
 
-The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`), which imports the `fix` core by name and reaches the engine only through its public facade — the tools never poke at engine internals ([build.md](build.md)). `src/main.zig` is composition only: it wires `cli` and `fix` together, dispatches subcommands, then parses options and drives an `Evaluator`. `src/cli/args.zig` owns the option grammar. Everything a developer needs to disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`), which imports the `fix` core by name and reaches the engine only through its public facade — the tools never poke at engine internals ([build.md](build.md)). `src/main.zig` is composition only: it sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar; `src/cli/setup.zig` folds the common `Options → Evaluator` configuration. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
 
 ## Invocation
 
 ```
-fix [options] (-e EXPR | --file PATH)
-fix <subcommand> [args]
+fix <command> [options]
 ```
 
-The **first argument** is checked against the subcommand table *before* normal option parsing. If it names a subcommand, that command runs and the process exits; otherwise the first arg is fed back into `args.parse` and `fix` evaluates.
+A subcommand is **required** (there is no default command). POSIX conventions: `-h`/`--help` prints help to **stdout** and exits `0`; a missing/unknown command or a bad argument prints usage to **stderr** and exits nonzero (`2`). `fix <command> -h` prints that command's scoped help.
 
 ## Subcommands
 
-Each is a self-contained tool with its own `-h`. They share the compiler/VM but bypass the normal evaluate-and-render path.
+Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compiler/VM and the standard evaluate-and-render path; the rest are introspection tools that bypass it.
 
 | Subcommand | Purpose | Link |
 |---|---|---|
-| *(none)* / `-e` / `--file` | compile → evaluate → render value (default) | — |
-| `--repl` | interactive read-eval loop (an option, not a subcommand) | — |
+| `eval` | evaluate an expression/file/flake output → render value (the `-e`/`--file`/`--flake` flags live here) | — |
+| `repl` | interactive read-eval loop | — |
 | `disasm` | decompile bytecode per-chunk with source-span + constant annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `inspect` | post-eval heap size / intern stats / chunk count; `--top N` longest interned strings | [runtime/interning.md](runtime/interning.md) |
 | `trace dump PATH` / `trace diff A B` | read binary VM-execution trace files: `dump` pretty-prints one as text; `diff` walks two in lockstep to the first divergent event | [vm/dispatch.md](vm/dispatch.md) |
@@ -30,14 +29,13 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 ## Key flags
 
-Parsed in `src/cli/args.zig`. Defaults shown; `[=X]` means the value is optional.
+Parsed in `src/cli/args.zig` (shared by `eval`/`repl`). Defaults shown; `[=X]` means the value is optional.
 
 | Flag | Meaning |
 |---|---|
 | `-e, --expr EXPR` | evaluate expression text |
 | `--file PATH` | evaluate a file (mutually exclusive with `-e`) |
 | `--flake INSTALLABLE` | evaluate a flake output `<flakeref>[#<attrpath>]`; lowered to `(builtins.getFlake "<ref>").<attrpath>`. `.`/relative refs resolve against cwd; `github:`/`path:`/… pass through. Requires the `flakes` feature. |
-| `--repl` | interactive loop; rejects a source arg |
 | `--json` / `--xml` | render the value as JSON / XML instead of Nix |
 | `--strict` | recursively force attr values + list items before writing |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |

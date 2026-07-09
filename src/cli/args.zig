@@ -6,11 +6,13 @@ const derivation_debug = @import("derivation_debug.zig");
 const eval_gc = @import("fix").eval_gc;
 
 pub const usage =
-    \\usage: fix [options] (-e <expression> | --expr <expression> | --file <path>)
+    \\usage: fix eval [options] (-e <expression> | --file <path> | --flake <installable>)
+    \\
+    \\evaluate a Nix expression, file, or flake output and print the value.
     \\
     \\options:
-    \\  --repl                 read and evaluate expressions interactively
     \\  -e, --expr EXPR        evaluate expression text
+    \\  --file PATH            evaluate a file
     \\  --flake INSTALLABLE    evaluate a flake output: <flakeref>[#<attrpath>]
     \\                         (requires the flakes experimental feature)
     \\  --json                 write the evaluated value as JSON
@@ -19,7 +21,7 @@ pub const usage =
     \\  --experimental-features FEATS
     \\                         space-separated experimental features to enable,
     \\                         replacing the current set
-    \\                         (available: pipe-operators, fetch-tree)
+    \\                         (available: pipe-operators, fetch-tree, flakes)
     \\  --extra-experimental-features FEATS
     \\                         like --experimental-features, but adds to the set
     \\  --debug-derivations[=MODE]
@@ -98,7 +100,6 @@ pub const Options = struct {
     progress: cli.When = .auto,
     show_trace: bool = false,
     derivation_debug: derivation_debug.Options = .{},
-    repl: bool = false,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -147,9 +148,7 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             carried = null;
             break :blk c;
         } else (args_iter.next() orelse break);
-        if (std.mem.eql(u8, arg, "--repl")) {
-            options.repl = true;
-        } else if (std.mem.eql(u8, arg, "--json")) {
+        if (std.mem.eql(u8, arg, "--json")) {
             options.output = .json;
         } else if (std.mem.eql(u8, arg, "--xml")) {
             options.output = .xml;
@@ -190,8 +189,7 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
         } else if (std.mem.eql(u8, arg, "--no-progress")) {
             options.progress = .never;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print("{s}", .{usage});
-            std.process.exit(0);
+            return error.Help;
         } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
             try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
         } else if (std.mem.eql(u8, arg, "--file")) {
