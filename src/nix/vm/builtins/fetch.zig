@@ -514,15 +514,24 @@ const GithubTreeSpec = struct {
     }
 };
 
-fn githubTreeSpec(self: anytype, attrs_id: ObjectId) !GithubTreeSpec {
+/// Build the codeload archive URL for github/gitlab/sourcehut, honoring a
+/// `host` override (self-hosted forges) and pinning `rev`/`ref` (else HEAD).
+fn forgeTreeSpec(self: anytype, attrs_id: ObjectId, forge: []const u8) !GithubTreeSpec {
     const owner = try requiredStringAttr(self, attrs_id, "owner");
     defer self.allocator.free(owner);
     const repo = try requiredStringAttr(self, attrs_id, "repo");
     defer self.allocator.free(repo);
     const rev = try optionalStringAttr(self, attrs_id, "rev") orelse try optionalStringAttr(self, attrs_id, "ref");
     errdefer if (rev) |owned| self.allocator.free(owned);
+    const host = try optionalStringAttr(self, attrs_id, "host");
+    defer if (host) |h| self.allocator.free(h);
     const archive_ref = rev orelse "HEAD";
-    const url = try std.fmt.allocPrint(self.allocator, "https://github.com/{s}/{s}/archive/{s}.tar.gz", .{ owner, repo, archive_ref });
+    const url = if (std.mem.eql(u8, forge, "gitlab"))
+        try std.fmt.allocPrint(self.allocator, "https://{s}/{s}/{s}/-/archive/{s}/{s}-{s}.tar.gz", .{ host orelse "gitlab.com", owner, repo, archive_ref, repo, archive_ref })
+    else if (std.mem.eql(u8, forge, "sourcehut"))
+        try std.fmt.allocPrint(self.allocator, "https://{s}/{s}/{s}/archive/{s}.tar.gz", .{ host orelse "git.sr.ht", owner, repo, archive_ref })
+    else
+        try std.fmt.allocPrint(self.allocator, "https://{s}/{s}/{s}/archive/{s}.tar.gz", .{ host orelse "github.com", owner, repo, archive_ref });
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse try self.allocator.dupe(u8, "source");
     return .{ .url = url, .name = name, .rev = rev };
@@ -623,8 +632,8 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
         return gitResultValue(self, spec.name, result);
     }
 
-    if (std.mem.eql(u8, type_value, "github")) {
-        const spec = try githubTreeSpec(self, attrs_id);
+    if (std.mem.eql(u8, type_value, "github") or std.mem.eql(u8, type_value, "gitlab") or std.mem.eql(u8, type_value, "sourcehut")) {
+        const spec = try forgeTreeSpec(self, attrs_id, type_value);
         defer spec.deinit(self.allocator);
         const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
         defer self.fetchers.allocator.free(path);
@@ -673,23 +682,28 @@ pub fn builtinFlakeRefToStringEntry(self: anytype, arg: Value) !Value {
 pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     const ref_value = Value.string(try self.intern.intern(ref));
-    const source_info = try builtinFetchTree(self, try builtinParseFlakeRef(self, ref_value));
     // GC: many intermediate flake values are held live across fetches / output
     // forces that can collect. Root everything created here until we return.
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
+    const parsed = try builtinParseFlakeRef(self, ref_value);
+    vm_force.rootKeep(self, parsed);
+    const source_info = try builtinFetchTree(self, parsed);
     vm_force.rootKeep(self, source_info);
     const out_path = try requiredStringAttr(self, source_info.asObjectId(), "outPath");
     defer self.allocator.free(out_path);
+    // Subflake: `?dir=sub` puts flake.nix (and flake.lock) in a subdirectory.
+    const dir = try optionalStringAttr(self, parsed.asObjectId(), "dir");
+    defer if (dir) |d| self.allocator.free(d);
 
-    const outputs_func = try flakeOutputsFunc(self, out_path);
+    const outputs_func = try flakeOutputsFunc(self, out_path, dir);
     vm_force.rootKeep(self, outputs_func);
 
     // Resolve the flake's inputs from flake.lock (transitively, honoring
     // `follows`), then add `self`. A lockless flake gets just `self`.
     var input_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer input_entries.deinit(self.allocator);
-    try resolveRootInputs(self, out_path, &input_entries);
+    try resolveRootInputs(self, out_path, dir, &input_entries);
     try input_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, source_info) });
 
     const inputs = Value.attrs(try self.heap.addAttrs(input_entries.items));
@@ -700,9 +714,12 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     return flakeResultValue(self, source_info, inputs, outputs);
 }
 
-/// Import `<out_path>/flake.nix` and return its (forced) `outputs` function.
-fn flakeOutputsFunc(self: anytype, out_path: []const u8) !Value {
-    const flake_path = try std.fs.path.join(self.allocator, &.{ out_path, "flake.nix" });
+/// Import the flake.nix at `<out_path>[/dir]` and return its (forced) `outputs`.
+fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
+    const flake_path = if (dir) |d|
+        try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.nix" })
+    else
+        try std.fs.path.join(self.allocator, &.{ out_path, "flake.nix" });
     defer self.allocator.free(flake_path);
     const host = self.import_host orelse return error.ImportUnavailable;
     const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path, self.native_depth));
@@ -711,11 +728,14 @@ fn flakeOutputsFunc(self: anytype, out_path: []const u8) !Value {
     return vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
 }
 
-/// Parse `<out_path>/flake.lock` and resolve the root flake's declared inputs
-/// into `out_entries` (each a fetched, evaluated input flake). No-op when there
-/// is no lock file (a flake with no inputs).
-fn resolveRootInputs(self: anytype, out_path: []const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
-    const lock_path = try std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
+/// Parse `<out_path>[/dir]/flake.lock` and resolve the root flake's declared
+/// inputs into `out_entries` (each a fetched, evaluated input flake). No-op when
+/// there is no lock file (a flake with no inputs).
+fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
+    const lock_path = if (dir) |d|
+        try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
+    else
+        try std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
     defer self.allocator.free(lock_path);
     const lock_data = self.files.readFile(lock_path) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -795,12 +815,17 @@ fn resolveNode(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, 
 
     const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
     defer self.allocator.free(src_out);
-    const fnix_path = try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
+    // Subflake input: locked `dir` puts the input's flake.nix in a subdirectory.
+    const dir: ?[]const u8 = if (locked_v.object.get("dir")) |d| (if (d == .string) d.string else null) else null;
+    const fnix_path = if (dir) |d|
+        try std.fs.path.join(self.allocator, &.{ src_out, d, "flake.nix" })
+    else
+        try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
     defer self.allocator.free(fnix_path);
 
     var val: Value = src_info;
     if (is_flake and (self.files.pathExists(fnix_path) catch false)) {
-        const outputs_func = try flakeOutputsFunc(self, src_out);
+        const outputs_func = try flakeOutputsFunc(self, src_out, dir);
         vm_force.rootKeep(self, outputs_func);
 
         var node_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
@@ -843,12 +868,12 @@ fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
     if (type_v != .string) return null;
     const ty = type_v.string;
 
-    // Recursive-NAR (sourcePath) inputs only: github/tarball/path. git/mercurial
+    // Recursive-NAR (sourcePath) inputs only: forges/tarball/path. git/mercurial
     // ingest differently and are left to fetch; file is flat, not a tree.
-    const is_github = std.mem.eql(u8, ty, "github");
+    const is_forge = std.mem.eql(u8, ty, "github") or std.mem.eql(u8, ty, "gitlab") or std.mem.eql(u8, ty, "sourcehut");
     const is_tarball = std.mem.eql(u8, ty, "tarball");
     const is_path = std.mem.eql(u8, ty, "path");
-    if (!is_github and !is_tarball and !is_path) return null;
+    if (!is_forge and !is_tarball and !is_path) return null;
 
     // The store-path name must match what the fetch would use (see builtinFetchTree).
     const name = if (is_path)
@@ -861,7 +886,7 @@ fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
     defer self.allocator.free(store_path);
     if (!try self.derivations.pathIsValid(store_path)) return null;
 
-    if (is_github) {
+    if (is_forge) {
         const rev = if (locked.get("rev")) |r| (if (r == .string) r.string else null) else null;
         return try githubTreeValue(self, store_path, nar_hash, rev);
     }
@@ -934,40 +959,85 @@ fn appendExistingAttr(self: anytype, entries: *std.ArrayListUnmanaged(heap_mod.A
     try entries.append(self.allocator, .{ .name = name_id, .value = value });
 }
 
+/// A 40-char lowercase-hex git revision (as opposed to a branch/tag `ref`).
+fn looksLikeGitRev(s: []const u8) bool {
+    if (s.len != 40) return false;
+    for (s) |c| if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return false;
+    return true;
+}
+
 pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
     const ref = try stringArg(self, arg);
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
 
-    if (std.mem.startsWith(u8, ref, "github:")) {
-        try appendStringAttr(self, &entries, "type", "github");
-        var parts = std.mem.splitScalar(u8, ref["github:".len..], '/');
-        const owner = parts.next() orelse return error.InvalidFlakeRef;
-        const repo = parts.next() orelse return error.InvalidFlakeRef;
-        try appendStringAttr(self, &entries, "owner", owner);
-        try appendStringAttr(self, &entries, "repo", repo);
-        if (parts.next()) |branch| {
-            if (branch.len != 0) try appendStringAttr(self, &entries, "ref", branch);
+    // Query string (`?dir=…&rev=…`) applies to every scheme; split it off first
+    // so it never leaks into a path/repo/url segment.
+    const q_idx = std.mem.indexOfScalar(u8, ref, '?');
+    const base = if (q_idx) |i| ref[0..i] else ref;
+    const query = if (q_idx) |i| ref[i + 1 ..] else "";
+
+    // Shorthand forge refs: github:/gitlab:/sourcehut: owner/repo[/refOrRev].
+    inline for (.{ "github", "gitlab", "sourcehut" }) |forge| {
+        if (std.mem.startsWith(u8, base, forge ++ ":")) {
+            try appendStringAttr(self, &entries, "type", forge);
+            var parts = std.mem.splitScalar(u8, base[forge.len + 1 ..], '/');
+            const owner = parts.next() orelse return error.InvalidFlakeRef;
+            const repo = parts.next() orelse return error.InvalidFlakeRef;
+            try appendStringAttr(self, &entries, "owner", owner);
+            try appendStringAttr(self, &entries, "repo", repo);
+            if (parts.next()) |seg| if (seg.len != 0) {
+                try appendStringAttr(self, &entries, if (looksLikeGitRev(seg)) "rev" else "ref", seg);
+            };
+            try appendFlakeQueryAttrs(self, &entries, query);
+            return Value.attrs(try self.heap.addAttrs(entries.items));
         }
+    }
+
+    // git+<transport> / bare git:/ssh: → a git flake; the URL is what git clones.
+    if (std.mem.startsWith(u8, base, "git+")) {
+        try appendStringAttr(self, &entries, "type", "git");
+        try appendStringAttr(self, &entries, "url", base["git+".len..]);
+        try appendFlakeQueryAttrs(self, &entries, query);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+    if (std.mem.startsWith(u8, base, "git://") or std.mem.startsWith(u8, base, "ssh://")) {
+        try appendStringAttr(self, &entries, "type", "git");
+        try appendStringAttr(self, &entries, "url", base);
+        try appendFlakeQueryAttrs(self, &entries, query);
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
 
-    if (std.mem.startsWith(u8, ref, "path:")) {
+    // tarball+<url>, or a bare http(s) URL (Nix treats bare http(s) as a tarball).
+    if (std.mem.startsWith(u8, base, "tarball+")) {
+        try appendStringAttr(self, &entries, "type", "tarball");
+        try appendStringAttr(self, &entries, "url", base["tarball+".len..]);
+        try appendFlakeQueryAttrs(self, &entries, query);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+    if (std.mem.startsWith(u8, base, "http://") or std.mem.startsWith(u8, base, "https://")) {
+        try appendStringAttr(self, &entries, "type", "tarball");
+        try appendStringAttr(self, &entries, "url", base);
+        try appendFlakeQueryAttrs(self, &entries, query);
+        return Value.attrs(try self.heap.addAttrs(entries.items));
+    }
+
+    // path: / bare absolute path.
+    if (std.mem.startsWith(u8, base, "path:")) {
         try appendStringAttr(self, &entries, "type", "path");
-        const rest = ref["path:".len..];
-        const query_start = std.mem.indexOfScalar(u8, rest, '?');
-        const path = if (query_start) |i| rest[0..i] else rest;
-        try appendStringAttr(self, &entries, "path", path);
-        if (query_start) |i| try appendFlakeQueryAttrs(self, &entries, rest[i + 1 ..]);
+        try appendStringAttr(self, &entries, "path", base["path:".len..]);
+        try appendFlakeQueryAttrs(self, &entries, query);
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
-
-    if (std.fs.path.isAbsolute(ref)) {
+    if (std.fs.path.isAbsolute(base)) {
         try appendStringAttr(self, &entries, "type", "path");
-        try appendStringAttr(self, &entries, "path", ref);
+        try appendStringAttr(self, &entries, "path", base);
+        try appendFlakeQueryAttrs(self, &entries, query);
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
 
+    // Bare indirect ids (`nixpkgs`) need registry resolution, which the CLI does
+    // before calling getFlake; the builtin itself can't reach the registry.
     return error.InvalidFlakeRef;
 }
 
@@ -1016,8 +1086,11 @@ fn appendFlakeQueryAttrs(self: anytype, entries: *std.ArrayListUnmanaged(heap_mo
         const eq = std.mem.indexOfScalar(u8, part, '=') orelse continue;
         const key = part[0..eq];
         const value = part[eq + 1 ..];
-        if (std.mem.eql(u8, key, "ref") or std.mem.eql(u8, key, "rev") or std.mem.eql(u8, key, "narHash")) {
-            try appendStringAttr(self, entries, key, value);
+        inline for (.{ "ref", "rev", "narHash", "dir", "host", "submodules" }) |known| {
+            if (std.mem.eql(u8, key, known)) {
+                try appendStringAttr(self, entries, key, value);
+                break;
+            }
         }
     }
 }
