@@ -1,5 +1,6 @@
 //! Minimal `nix.conf` reader — enough to honor the settings `fix` acts on
-//! (currently `http-connections`). Precedence, lowest to highest:
+//! (currently `http-connections` and `experimental-features`). Precedence,
+//! lowest to highest:
 //!   1. `/etc/nix/nix.conf`                                   (system)
 //!   2. `$XDG_CONFIG_HOME/nix/nix.conf` (or `~/.config/nix/nix.conf`)  (user)
 //!   3. `$NIX_CONFIG`                             (inline, newline-separated)
@@ -56,7 +57,9 @@ pub const Settings = struct {
         return std.fmt.parseInt(u64, std.mem.trim(u8, v, " \t"), 10) catch null;
     }
 
-    fn put(self: *Settings, key: []const u8, value: []const u8) !void {
+    /// Insert or replace `key`, duping both strings. Used both by config-file
+    /// parsing and by `--option` overrides (which layer over the config).
+    pub fn put(self: *Settings, key: []const u8, value: []const u8) !void {
         const gop = try self.map.getOrPut(self.allocator, key);
         if (gop.found_existing) {
             self.allocator.free(gop.value_ptr.*);

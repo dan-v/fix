@@ -1,48 +1,13 @@
-//! Command-line option parsing for `fix`.
+//! Command-line option parsing for `fix`, driven by a single option table
+//! (`specs`). The table is the source of truth for names, value arity, and help
+//! text, so `parse` matches generically, `--help` renders from it, and shell
+//! completions can be generated from it. Adding an option means adding a `Spec`
+//! entry plus one `apply` arm.
 
 const std = @import("std");
 const cli = @import("cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval_gc = @import("fix").eval_gc;
-
-pub const usage =
-    \\usage: fix eval [options] (-e <expression> | --file <path> | --flake <installable>)
-    \\
-    \\evaluate a Nix expression, file, or flake output and print the value.
-    \\
-    \\options:
-    \\  -e, --expr EXPR        evaluate expression text
-    \\  --file PATH            evaluate a file
-    \\  --flake INSTALLABLE    evaluate a flake output: <flakeref>[#<attrpath>]
-    \\                         (requires the flakes experimental feature)
-    \\  --json                 write the evaluated value as JSON
-    \\  --xml                  write the evaluated value as XML
-    \\  --strict               recursively force attr values and list items before writing
-    \\  --experimental-features FEATS
-    \\                         space-separated experimental features to enable,
-    \\                         replacing the current set
-    \\                         (available: pipe-operators, fetch-tree, flakes)
-    \\  --extra-experimental-features FEATS
-    \\                         like --experimental-features, but adds to the set
-    \\  --debug-derivations[=MODE]
-    \\                         write derivation debug records to stderr: summary, full
-    \\  --debug-derivation-filter TEXT
-    \\                         only show derivations whose name/path/input mentions TEXT
-    \\  --debug-derivation-name NAME
-    \\                         only show derivations with exactly NAME
-    \\  --debug-derivation-drv PATH
-    \\                         only show the derivation with exactly PATH
-    \\  --max-memory SIZE      memory budget before garbage collection kicks in
-    \\                         (MiB, or with a k/m/g suffix; 0 = never collect;
-    \\                         default: half of MemAvailable). -Dgc builds only.
-    \\  --show-trace           show full evaluation traces
-    \\  --color[=when]         color diagnostics: auto, always, never
-    \\  --no-color             disable color diagnostics
-    \\  --progress[=when]      show evaluation progress on stderr: auto, always, never
-    \\  --no-progress          disable evaluation progress
-    \\  -h, --help             show this help
-    \\
-;
 
 pub const OutputFormat = enum {
     nix,
@@ -78,6 +43,17 @@ fn parseFeatureList(set: *ExperimentalFeatures, list: []const u8) !void {
     }
 }
 
+/// Like `parseFeatureList`, but for features sourced from `nix.conf` rather than
+/// argv: unknown names are silently skipped (Nix only warns for config-sourced
+/// `experimental-features`, and rejecting would make an unrelated Nix setting
+/// break `fix`). Never fails.
+pub fn mergeConfigFeatures(set: *ExperimentalFeatures, list: []const u8) void {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |name| {
+        if (ExperimentalFeature.fromName(name)) |feat| set.insert(feat);
+    }
+}
+
 pub const EvaluationMode = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
@@ -92,10 +68,40 @@ pub const SourceArg = union(enum) {
     flake: []const u8,
 };
 
+/// A `--arg NAME EXPR` / `--argstr NAME STR` top-level function argument. When
+/// the source evaluates to a function, it is auto-called with these (as in
+/// `nix-instantiate`). `value` is a Nix expression when `is_string` is false,
+/// or a literal string when true. Both fields are borrowed from argv.
+pub const ArgDef = struct {
+    name: []const u8,
+    value: []const u8,
+    is_string: bool,
+};
+
+/// A `--option NAME VALUE` override for a `nix.conf` setting. Applied over the
+/// loaded config at highest precedence (see `setup.configure`). Borrowed from
+/// argv.
+pub const OptionOverride = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Which subcommand is asking (used only to scope `--help` output; every
+/// subcommand shares this one parser and accepts the whole option set).
+pub const Cmd = enum { eval, instantiate, build, run, shell, repl };
+
 pub const Options = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
     experimental_features: ExperimentalFeatures = .{},
+    /// True once `--experimental-features` (the replace form) has been seen on
+    /// the CLI. It overrides the `nix.conf` base entirely; without it the config
+    /// value is the base and `--extra-experimental-features` appends to it (Nix
+    /// precedence). See `setup.configure`.
+    experimental_features_reset: bool = false,
+    /// `--option NAME VALUE`: nix.conf setting overrides, in argv order.
+    /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
+    option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
     color: cli.When = .auto,
     progress: cli.When = .auto,
     show_trace: bool = false,
@@ -103,8 +109,21 @@ pub const Options = struct {
     /// `fix build --no-link`: skip creating the `./result` symlink.
     no_link: bool = false,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
-    /// argv; the list backing is owned (caller frees via `packages.deinit`).
+    /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// `-I`/`--include` search-path entries (`[prefix=]path`), in argv order.
+    /// Prepended to `$NIX_PATH` at setup (they take precedence, as in Nix).
+    /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
+    include: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// `--flake`: interpret the (positional or default) source as a flake
+    /// installable rather than a file. See `defaultSource`.
+    flake_mode: bool = false,
+    /// `-A`/`--attr`: dotted attribute path to select from the evaluated value
+    /// (as in `nix-build -A`). Borrowed from argv.
+    attr: ?[]const u8 = null,
+    /// `--arg`/`--argstr` top-level function arguments, in argv order. Borrowed
+    /// from argv; the list backing is owned (caller frees via `deinit`).
+    arg_defs: std.ArrayListUnmanaged(ArgDef) = .empty,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -136,6 +155,22 @@ pub const Options = struct {
         self.source = source;
     }
 
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+        self.packages.deinit(allocator);
+        self.include.deinit(allocator);
+        self.arg_defs.deinit(allocator);
+        self.option_overrides.deinit(allocator);
+    }
+
+    /// The source to evaluate when none was given on the command line: the
+    /// flake in the current directory under `--flake`, else `./default.nix`
+    /// (matching `nix-build`/`nix-instantiate`). Subcommands that want a
+    /// no-source default (`eval`, `build`, `instantiate`, `run`) call this;
+    /// `repl`/`shell` handle a null source themselves.
+    pub fn defaultSource(self: Options) SourceArg {
+        return if (self.flake_mode) .{ .flake = "." } else .{ .file = "default.nix" };
+    }
+
     pub fn evaluationMode(self: Options) EvaluationMode {
         return .{
             .output = self.output,
@@ -144,8 +179,167 @@ pub const Options = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Option table
+// ---------------------------------------------------------------------------
+
+/// Stable identity of each option. `apply` switches on it.
+const Opt = enum {
+    // Source selection.
+    expr,
+    file,
+    flake,
+    include,
+    attr,
+    arg,
+    argstr,
+    // Output.
+    json,
+    xml,
+    strict,
+    // Settings / features.
+    experimental_features,
+    extra_experimental_features,
+    option,
+    // Build.
+    no_link,
+    // Diagnostics.
+    show_trace,
+    color,
+    no_color,
+    progress,
+    no_progress,
+    debug_derivations,
+    debug_derivation_filter,
+    debug_derivation_name,
+    debug_derivation_drv,
+    max_memory,
+    help,
+    // Shell.
+    packages,
+    // Internal perf/trace knobs (hidden from help, still parsed everywhere).
+    workers,
+    vm_trace,
+    vm_trace_format,
+    vm_trace_max_events,
+    vm_trace_main_only,
+    thunks_log,
+    speculate,
+    no_spec_thunks,
+    no_fanout,
+    print_sched_stats,
+    timeline,
+    timeline_flows,
+};
+
+/// Value arity of an option.
+const Arg = enum {
+    /// No value: `--json`. (`--json=x` is an error.)
+    flag,
+    /// Optional value, supplied only via `--x=value`; the bare `--x` form is
+    /// valid. Never consumes the next token (avoids swallowing a positional).
+    opt,
+    /// One required value: `--x value`, `--x=value`, or short `-Xvalue`.
+    req,
+    /// Two required values: `--x NAME VALUE`.
+    req2,
+    /// Consumes every following token until `--` or end (`-p pkg1 pkg2`).
+    greedy,
+};
+
+const Spec = struct {
+    id: Opt,
+    long: ?[]const u8 = null,
+    short: ?[]const u8 = null,
+    arg: Arg = .flag,
+    /// Placeholder shown in help (`PATH`, `NAME EXPR`, `WHEN`, ...). For `.flag`
+    /// options a non-empty metavar renders as an optional operand, e.g.
+    /// `--flake [INSTALLABLE]`.
+    metavar: []const u8 = "",
+    /// One-line (or multi-line, `\n`-separated) help text.
+    help: []const u8 = "",
+    /// Subcommands whose `--help` lists this option; empty = all of them.
+    show_in: []const Cmd = &.{},
+    /// Internal knob: parsed everywhere but never shown in help.
+    hidden: bool = false,
+};
+
+/// Commands that take a source expression (everything but the bare `repl`).
+const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
+
+const specs = [_]Spec{
+    .{ .id = .expr, .short = "-e", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text", .show_in = source_cmds },
+    .{ .id = .file, .long = "--file", .arg = .req, .metavar = "PATH", .help = "evaluate a file (same as a bare PATH)", .show_in = source_cmds },
+    .{ .id = .flake, .long = "--flake", .arg = .flag, .metavar = "INSTALLABLE", .help = "evaluate a flake output <flakeref>[#<attrpath>]\n(default flakeref `.`; requires the flakes feature)", .show_in = source_cmds },
+    .{ .id = .include, .short = "-I", .long = "--include", .arg = .req, .metavar = "PATH", .help = "prepend a search-path entry (as in NIX_PATH);\nPATH may be `prefix=path`. Repeatable.", .show_in = source_cmds },
+    .{ .id = .attr, .short = "-A", .long = "--attr", .arg = .req, .metavar = "ATTR", .help = "select attribute path ATTR from the result", .show_in = source_cmds },
+    .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = source_cmds },
+    .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = source_cmds },
+
+    .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON" },
+    .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML" },
+    .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing" },
+
+    .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
+    .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
+    .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting" },
+
+    .{ .id = .no_link, .long = "--no-link", .help = "do not create the ./result symlink", .show_in = &.{.build} },
+
+    .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error" },
+    .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
+    .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
+    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never" },
+    .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress" },
+    .{ .id = .debug_derivations, .long = "--debug-derivations", .arg = .opt, .metavar = "MODE", .help = "write derivation debug records to stderr: summary, full", .show_in = source_cmds },
+    .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = source_cmds },
+    .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = source_cmds },
+    .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = source_cmds },
+    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only." },
+    .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
+
+    .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
+
+    // Hidden perf/trace knobs.
+    .{ .id = .workers, .long = "--workers", .arg = .req, .metavar = "N", .hidden = true },
+    .{ .id = .vm_trace, .long = "--vm-trace", .arg = .opt, .metavar = "PATH", .hidden = true },
+    .{ .id = .vm_trace_format, .long = "--vm-trace-format", .arg = .req, .metavar = "FMT", .hidden = true },
+    .{ .id = .vm_trace_max_events, .long = "--vm-trace-max-events", .arg = .req, .metavar = "N", .hidden = true },
+    .{ .id = .vm_trace_main_only, .long = "--vm-trace-main-only", .hidden = true },
+    .{ .id = .thunks_log, .long = "--thunks-log", .arg = .req, .metavar = "PATH", .hidden = true },
+    .{ .id = .speculate, .long = "--speculate", .hidden = true },
+    .{ .id = .no_spec_thunks, .long = "--no-spec-thunks", .hidden = true },
+    .{ .id = .no_fanout, .long = "--no-fanout", .hidden = true },
+    .{ .id = .print_sched_stats, .long = "--print-sched-stats", .hidden = true },
+    .{ .id = .timeline, .long = "--timeline", .arg = .opt, .metavar = "PATH", .hidden = true },
+    .{ .id = .timeline_flows, .long = "--timeline-flows", .arg = .req, .metavar = "N", .hidden = true },
+};
+
+fn findLong(name: []const u8) ?*const Spec {
+    for (&specs) |*s| {
+        if (s.long) |l| if (std.mem.eql(u8, l, name)) return s;
+    }
+    return null;
+}
+
+fn findShort(name: []const u8) ?*const Spec {
+    for (&specs) |*s| {
+        if (s.short) |sh| if (std.mem.eql(u8, sh, name)) return s;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+// ---------------------------------------------------------------------------
+
 pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Options {
     var options: Options = .{};
+
+    // A bare (non-flag) token is the source path/installable. Resolved into
+    // `options.source` after the loop, once `--flake` (which may appear on
+    // either side of it) has been seen.
+    var positional: ?[]const u8 = null;
 
     var carried = first;
     parse_loop: while (true) {
@@ -153,118 +347,141 @@ pub fn parse(allocator: std.mem.Allocator, args_iter: *std.process.Args.Iterator
             carried = null;
             break :blk c;
         } else (args_iter.next() orelse break);
-        if (std.mem.eql(u8, arg, "--json")) {
-            options.output = .json;
-        } else if (std.mem.eql(u8, arg, "--xml")) {
-            options.output = .xml;
-        } else if (std.mem.eql(u8, arg, "--strict")) {
-            options.strict = true;
-        } else if (std.mem.eql(u8, arg, "--experimental-features")) {
-            options.experimental_features = .{};
-            try parseFeatureList(&options.experimental_features, args_iter.next() orelse return error.MissingExperimentalFeatures);
-        } else if (std.mem.startsWith(u8, arg, "--experimental-features=")) {
-            options.experimental_features = .{};
-            try parseFeatureList(&options.experimental_features, arg["--experimental-features=".len..]);
-        } else if (std.mem.eql(u8, arg, "--extra-experimental-features")) {
-            try parseFeatureList(&options.experimental_features, args_iter.next() orelse return error.MissingExperimentalFeatures);
-        } else if (std.mem.startsWith(u8, arg, "--extra-experimental-features=")) {
-            try parseFeatureList(&options.experimental_features, arg["--extra-experimental-features=".len..]);
-        } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
-            options.derivation_debug.mode = .summary;
-        } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
-            options.derivation_debug.mode = derivation_debug.parseMode(arg["--debug-derivations=".len..]) orelse return error.InvalidDerivationDebugMode;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-filter")) {
-            options.derivation_debug.filter = args_iter.next() orelse return error.MissingDerivationDebugFilter;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-name")) {
-            options.derivation_debug.name = args_iter.next() orelse return error.MissingDerivationDebugName;
-        } else if (std.mem.eql(u8, arg, "--debug-derivation-drv")) {
-            options.derivation_debug.drv_path = args_iter.next() orelse return error.MissingDerivationDebugDrv;
-        } else if (std.mem.eql(u8, arg, "--no-link")) {
-            options.no_link = true;
-        } else if (std.mem.eql(u8, arg, "--show-trace")) {
-            options.show_trace = true;
-        } else if (std.mem.eql(u8, arg, "--color")) {
-            options.color = .always;
-        } else if (std.mem.startsWith(u8, arg, "--color=")) {
-            options.color = cli.parseWhen(arg["--color=".len..]) orelse return error.InvalidColorMode;
-        } else if (std.mem.eql(u8, arg, "--no-color")) {
-            options.color = .never;
-        } else if (std.mem.eql(u8, arg, "--progress")) {
-            options.progress = .always;
-        } else if (std.mem.startsWith(u8, arg, "--progress=")) {
-            options.progress = cli.parseWhen(arg["--progress=".len..]) orelse return error.InvalidProgressMode;
-        } else if (std.mem.eql(u8, arg, "--no-progress")) {
-            options.progress = .never;
-        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return error.Help;
-        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
-            try options.setSource(.{ .expr = args_iter.next() orelse return error.MissingExpression });
-        } else if (std.mem.eql(u8, arg, "--file")) {
-            try options.setSource(.{ .file = args_iter.next() orelse return error.MissingPath });
-        } else if (std.mem.eql(u8, arg, "--flake")) {
-            try options.setSource(.{ .flake = args_iter.next() orelse return error.MissingFlakeInstallable });
-        } else if (std.mem.eql(u8, arg, "--vm-trace")) {
-            options.vm_trace_path = "-"; // stderr
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace=")) {
-            options.vm_trace_path = arg["--vm-trace=".len..];
-        } else if (std.mem.eql(u8, arg, "--vm-trace-format")) {
-            const text = args_iter.next() orelse return error.MissingVmTraceFormat;
-            options.vm_trace_format = parseVmTraceFormat(text) orelse return error.InvalidVmTraceFormat;
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace-format=")) {
-            options.vm_trace_format = parseVmTraceFormat(arg["--vm-trace-format=".len..]) orelse return error.InvalidVmTraceFormat;
-        } else if (std.mem.eql(u8, arg, "--vm-trace-max-events")) {
-            const text = args_iter.next() orelse return error.MissingVmTraceMaxEvents;
-            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
-        } else if (std.mem.startsWith(u8, arg, "--vm-trace-max-events=")) {
-            const text = arg["--vm-trace-max-events=".len..];
-            options.vm_trace_max_events = std.fmt.parseInt(u64, text, 10) catch return error.InvalidVmTraceMaxEvents;
-        } else if (std.mem.eql(u8, arg, "--vm-trace-main-only")) {
-            options.vm_trace_main_only = true;
-        } else if (std.mem.eql(u8, arg, "--max-memory")) {
-            const text = args_iter.next() orelse return error.MissingMaxMemory;
-            options.max_memory = eval_gc.parseMemorySize(text) orelse return error.InvalidMaxMemory;
-        } else if (std.mem.startsWith(u8, arg, "--max-memory=")) {
-            options.max_memory = eval_gc.parseMemorySize(arg["--max-memory=".len..]) orelse return error.InvalidMaxMemory;
-        } else if (std.mem.eql(u8, arg, "--workers")) {
-            const text = args_iter.next() orelse return error.MissingWorkers;
-            options.workers = std.fmt.parseInt(u8, text, 10) catch return error.InvalidWorkers;
-        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
-            options.workers = std.fmt.parseInt(u8, arg["--workers=".len..], 10) catch return error.InvalidWorkers;
-        } else if (std.mem.startsWith(u8, arg, "--thunks-log=")) {
-            options.thunks_log_path = arg["--thunks-log=".len..];
-        } else if (std.mem.eql(u8, arg, "--speculate")) {
-            options.disable_spec_thunks = false;
-        } else if (std.mem.eql(u8, arg, "--no-spec-thunks")) {
-            options.disable_spec_thunks = true; // now the default; kept for A/B
-        } else if (std.mem.eql(u8, arg, "--no-fanout")) {
-            options.disable_fanout = true;
-        } else if (std.mem.eql(u8, arg, "--print-sched-stats")) {
-            options.print_sched_stats = true;
-        } else if (std.mem.eql(u8, arg, "--timeline")) {
-            options.timeline_path = "fix-timeline.json";
-        } else if (std.mem.startsWith(u8, arg, "--timeline=")) {
-            options.timeline_path = arg["--timeline=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--timeline-flows=")) {
-            const v = arg["--timeline-flows=".len..];
-            options.timeline_flows = if (std.mem.eql(u8, v, "off")) 0 else if (std.mem.eql(u8, v, "all")) 1 else (std.fmt.parseInt(u32, v, 10) catch return error.UnknownOption);
-        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--packages")) {
-            // Greedy: every following token is a package name (an attr path in
-            // `<nixpkgs>`) until `--` or end. `fix shell -p ripgrep jq`.
+
+        // End of options: leave the rest in the iterator (e.g. `fix run`
+        // forwards them as program arguments).
+        if (std.mem.eql(u8, arg, "--")) break;
+
+        // Match the token against the table, extracting any inline `=value`.
+        var spec: ?*const Spec = null;
+        var inline_value: ?[:0]const u8 = null;
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+                spec = findLong(arg[0..eq]);
+                inline_value = arg[eq + 1 ..];
+            } else {
+                spec = findLong(arg);
+            }
+        } else if (arg.len >= 2 and arg[0] == '-') {
+            spec = findShort(arg);
+            if (spec == null) {
+                // Attached short value, e.g. `-Ifoo=bar` for a `.req` short.
+                const s = findShort(arg[0..2]);
+                if (s != null and s.?.arg == .req) {
+                    spec = s;
+                    inline_value = arg[2..];
+                }
+            }
+        } else {
+            // A bare token: the source path (or flake installable under
+            // `--flake`). Only one is allowed.
+            if (positional != null) return error.TooManySources;
+            positional = arg;
+            continue;
+        }
+
+        const s = spec orelse return error.UnknownOption;
+
+        // Greedy options drain the rest of argv themselves.
+        if (s.arg == .greedy) {
+            if (inline_value != null) return error.UnexpectedValue;
             while (args_iter.next()) |name| {
                 if (std.mem.eql(u8, name, "--")) break :parse_loop;
                 try options.packages.append(allocator, name);
             }
             break :parse_loop;
-        } else if (std.mem.eql(u8, arg, "--")) {
-            // End of options: leave the rest in the iterator (e.g. `fix run`
-            // forwards them as program arguments).
-            break;
-        } else {
-            return error.UnknownOption;
         }
+
+        // Gather the option's value(s) per arity.
+        var v0: ?[:0]const u8 = null;
+        var v1: ?[:0]const u8 = null;
+        switch (s.arg) {
+            .flag => if (inline_value != null) return error.UnexpectedValue,
+            .opt => v0 = inline_value,
+            .req => v0 = inline_value orelse (args_iter.next() orelse return error.MissingValue),
+            .req2 => {
+                v0 = inline_value orelse (args_iter.next() orelse return error.MissingValue);
+                v1 = args_iter.next() orelse return error.MissingSecondValue;
+            },
+            .greedy => unreachable,
+        }
+
+        try apply(&options, allocator, s.id, v0, v1);
     }
 
+    // Fold the positional into the source, respecting `--flake`. An explicit
+    // `-e`/`--file` plus a positional is contradictory (`setSource` rejects it).
+    if (positional) |p|
+        try options.setSource(if (options.flake_mode) .{ .flake = p } else .{ .file = p });
+
     return options;
+}
+
+/// Apply a matched option to `options`. `v0`/`v1` carry the gathered values
+/// (present according to the spec's arity). Value-format failures surface as
+/// the specific `Invalid*` errors.
+fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]const u8, v1: ?[:0]const u8) !void {
+    switch (id) {
+        .expr => try options.setSource(.{ .expr = v0.? }),
+        .file => try options.setSource(.{ .file = v0.? }),
+        .flake => options.flake_mode = true,
+        .include => try options.include.append(allocator, v0.?),
+        .attr => options.attr = v0.?,
+        .arg => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = false }),
+        .argstr => try options.arg_defs.append(allocator, .{ .name = v0.?, .value = v1.?, .is_string = true }),
+
+        .json => options.output = .json,
+        .xml => options.output = .xml,
+        .strict => options.strict = true,
+
+        .experimental_features => {
+            options.experimental_features = .{};
+            options.experimental_features_reset = true;
+            try parseFeatureList(&options.experimental_features, v0.?);
+        },
+        .extra_experimental_features => try parseFeatureList(&options.experimental_features, v0.?),
+        .option => try options.option_overrides.append(allocator, .{ .name = v0.?, .value = v1.? }),
+
+        .no_link => options.no_link = true,
+
+        .show_trace => options.show_trace = true,
+        .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,
+        .no_color => options.color = .never,
+        .progress => options.progress = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidProgressMode) else .always,
+        .no_progress => options.progress = .never,
+        .debug_derivations => options.derivation_debug.mode = if (v0) |v|
+            (derivation_debug.parseMode(v) orelse return error.InvalidDerivationDebugMode)
+        else
+            .summary,
+        .debug_derivation_filter => options.derivation_debug.filter = v0.?,
+        .debug_derivation_name => options.derivation_debug.name = v0.?,
+        .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
+        .max_memory => options.max_memory = eval_gc.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
+        .help => return error.Help,
+
+        .packages => unreachable, // handled in the parse loop
+
+        .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
+        .vm_trace => options.vm_trace_path = v0 orelse "-",
+        .vm_trace_format => options.vm_trace_format = parseVmTraceFormat(v0.?) orelse return error.InvalidVmTraceFormat,
+        .vm_trace_max_events => options.vm_trace_max_events = std.fmt.parseInt(u64, v0.?, 10) catch return error.InvalidVmTraceMaxEvents,
+        .vm_trace_main_only => options.vm_trace_main_only = true,
+        .thunks_log => options.thunks_log_path = v0.?,
+        .speculate => options.disable_spec_thunks = false,
+        .no_spec_thunks => options.disable_spec_thunks = true, // now the default; kept for A/B
+        .no_fanout => options.disable_fanout = true,
+        .print_sched_stats => options.print_sched_stats = true,
+        .timeline => options.timeline_path = v0 orelse "fix-timeline.json",
+        .timeline_flows => {
+            const v = v0.?;
+            options.timeline_flows = if (std.mem.eql(u8, v, "off"))
+                0
+            else if (std.mem.eql(u8, v, "all"))
+                1
+            else
+                (std.fmt.parseInt(u32, v, 10) catch return error.InvalidTimelineFlows);
+        },
+    }
 }
 
 fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trace_format) {
@@ -273,29 +490,104 @@ fn parseVmTraceFormat(text: []const u8) ?@TypeOf(@as(Options, undefined).vm_trac
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Help rendering (from the table)
+// ---------------------------------------------------------------------------
+
+const help_col = 26;
+
+/// Print `synopsis`, then the options section for `cmd`, to stdout. Best-effort
+/// (a failed write must not change exit status), mirroring `cli.printHelp`.
+pub fn writeHelp(io: std.Io, synopsis: []const u8, cmd: Cmd) void {
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(io, &buf);
+    writeHelpInner(&w.interface, synopsis, cmd) catch return;
+    w.interface.flush() catch {};
+}
+
+fn writeHelpInner(w: *std.Io.Writer, synopsis: []const u8, cmd: Cmd) !void {
+    try w.writeAll(synopsis);
+    try w.writeAll("\n\noptions:\n");
+    for (&specs) |*s| {
+        if (s.hidden) continue;
+        if (s.show_in.len != 0 and std.mem.indexOfScalar(Cmd, s.show_in, cmd) == null) continue;
+        try writeOptionLine(w, s);
+    }
+}
+
+fn writeOptionLine(w: *std.Io.Writer, s: *const Spec) !void {
+    try w.writeAll("  ");
+    var col: usize = 2;
+    if (s.short) |sh| {
+        try w.writeAll(sh);
+        col += sh.len;
+        if (s.long != null) {
+            try w.writeAll(", ");
+            col += 2;
+        }
+    }
+    if (s.long) |l| {
+        try w.writeAll(l);
+        col += l.len;
+    }
+    if (s.metavar.len != 0) {
+        switch (s.arg) {
+            .flag => {
+                try w.print(" [{s}]", .{s.metavar});
+                col += s.metavar.len + 3;
+            },
+            .opt => {
+                try w.print("[={s}]", .{s.metavar});
+                col += s.metavar.len + 3;
+            },
+            .req, .req2, .greedy => {
+                try w.print(" {s}", .{s.metavar});
+                col += s.metavar.len + 1;
+            },
+        }
+    }
+
+    if (s.help.len == 0) {
+        try w.writeByte('\n');
+        return;
+    }
+    // Align the help column; wrap to a fresh line if the head is too wide.
+    if (col + 2 <= help_col) {
+        try w.splatByteAll(' ', help_col - col);
+    } else {
+        try w.writeByte('\n');
+        try w.splatByteAll(' ', help_col);
+    }
+    // Continuation lines in a multi-line `help` re-indent to the help column.
+    var lines = std.mem.splitScalar(u8, s.help, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) {
+            try w.writeByte('\n');
+            try w.splatByteAll(' ', help_col);
+        }
+        try w.writeAll(line);
+        first = false;
+    }
+    try w.writeByte('\n');
+}
+
 pub fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.MissingExpression => "missing expression after -e or --expr",
-        error.MissingPath => "missing path after --file",
-        error.MissingFlakeInstallable => "missing installable after --flake",
+        error.MissingValue => "missing value after that option",
+        error.MissingSecondValue => "that option expects two values (NAME and VALUE)",
+        error.UnexpectedValue => "that option does not take a value",
         error.FlakesFeatureRequired => "--flake requires the flakes experimental feature; pass --extra-experimental-features flakes",
-        error.MissingDerivationDebugFilter => "missing text after --debug-derivation-filter",
-        error.MissingDerivationDebugName => "missing name after --debug-derivation-name",
-        error.MissingDerivationDebugDrv => "missing path after --debug-derivation-drv",
         error.TooManySources => "provide only one expression or file",
         error.InvalidColorMode => "expected --color to be auto, always, or never",
         error.InvalidProgressMode => "expected --progress to be auto, always, or never",
         error.InvalidDerivationDebugMode => "expected --debug-derivations to be summary or full",
-        error.MissingVmTraceFormat => "missing format after --vm-trace-format",
         error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
-        error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
-        error.MissingExperimentalFeatures => "missing feature list after --experimental-features or --extra-experimental-features",
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
-        error.MissingWorkers => "missing N after --workers",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
-        error.MissingMaxMemory => "missing size after --max-memory",
         error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
+        error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };

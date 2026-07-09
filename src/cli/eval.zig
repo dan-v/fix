@@ -13,25 +13,28 @@ const timeline = fix.probe.timeline;
 
 const Evaluator = fix.Evaluator;
 
-pub const usage = args.usage;
+pub const synopsis =
+    \\usage: fix eval [options] [path | -e <expression>]
+    \\
+    \\evaluate a Nix expression, file, or flake output and print the value.
+    \\with no source, evaluates ./default.nix (or, with --flake, the flake in the
+    \\current directory).
+;
 
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            args.writeHelp(init.io, synopsis, .eval);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
             return 2;
         },
     };
-    defer options.packages.deinit(allocator);
+    defer options.deinit(allocator);
 
-    const source_arg = options.source orelse {
-        std.debug.print("error: no expression, file, or flake given\n\n{s}", .{usage});
-        return 2;
-    };
+    const source_arg = options.source orelse options.defaultSource();
 
     const worker_count = try setup.workerCount(options);
     var ev = try Evaluator.init(allocator, worker_count);
@@ -39,17 +42,18 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const term = try setup.configure(&ev, init, options);
 
     if (source_arg == .flake and !ev.flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(error.FlakesFeatureRequired), usage });
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
 
-    const source = run.getSource(&ev, source_arg) catch |err| {
+    const source = run.getSource(&ev, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    // `--flake` synthesizes its source text on `ev.allocator`; expr/file text
-    // is borrowed (argv) or owned by the evaluator's file cache.
-    defer if (source_arg == .flake) ev.allocator.free(source.text);
+    // `--flake` and `-A`/`--arg` wrapping synthesize source text on
+    // `ev.allocator`; plain expr/file text is borrowed (argv) or owned by the
+    // evaluator's file cache.
+    defer if (source.owned) ev.allocator.free(source.text);
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);

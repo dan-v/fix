@@ -33,29 +33,69 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap is
     // pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.lazy_shells_visible = options.output == .xml;
-    ev.pipe_operators_enabled = options.experimental_features.contains(.pipe_operators);
-    ev.flakes_enabled = options.experimental_features.contains(.flakes);
-    // `flakes` implies `fetch-tree` (as in Nix).
-    ev.fetch_tree_enabled = options.experimental_features.contains(.fetch_tree) or ev.flakes_enabled;
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;
+    // Must precede `nix_conf.load`: it reads `ev.environment()` for `NIX_CONFIG`
+    // and the XDG/HOME-relative user config path.
     ev.setEnvironment(init.environ_map);
-    // Concurrent-fetch cap from nix.conf `http-connections` (Nix default 25;
-    // 0 = unlimited). Best-effort: unreadable config just uses the default.
-    if (nix_conf.load(ev.allocator, ev)) |loaded| {
-        var settings = loaded;
-        defer settings.deinit();
-        const http_conn = settings.getUint("http-connections") orelse 25;
-        ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
-    } else |_| {
-        ev.setFetchConnections(25);
+
+    // Experimental features and the concurrent-fetch cap both come from
+    // `nix.conf` (best-effort: unreadable config just uses defaults), so load it
+    // once. The CLI-parsed feature set is the starting point; unless the CLI
+    // *replaced* it with `--experimental-features`, the config's
+    // `experimental-features` is the base and any `--extra-experimental-features`
+    // additions are layered on top (Nix precedence). Config-sourced features
+    // that `fix` doesn't recognize are silently skipped, as in Nix.
+    var features = options.experimental_features;
+    var http_conn: u64 = 25; // Nix default; 0 = unlimited.
+    // Start from the loaded config (empty if unreadable), then layer `--option`
+    // overrides on top at highest precedence, before reading the settings fix
+    // acts on.
+    var settings = nix_conf.load(ev.allocator, ev) catch nix_conf.Settings{ .allocator = ev.allocator };
+    defer settings.deinit();
+    for (options.option_overrides.items) |o| try settings.put(o.name, o.value);
+    if (!options.experimental_features_reset) {
+        if (settings.get("experimental-features")) |list|
+            args.mergeConfigFeatures(&features, list);
     }
+    http_conn = settings.getUint("http-connections") orelse 25;
+
+    ev.pipe_operators_enabled = features.contains(.pipe_operators);
+    ev.flakes_enabled = features.contains(.flakes);
+    // `flakes` implies `fetch-tree` (as in Nix).
+    ev.fetch_tree_enabled = features.contains(.fetch_tree) or ev.flakes_enabled;
+    ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
     try ev.setBasePathFromCurrentPath(init.io);
-    if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
+    try applyNixPath(ev, init, options);
 
     const use_color = cli.shouldColor(options.color, init.io, init.environ_map);
     const show_progress = cli.shouldProgress(options.progress, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
     return .{ .use_color = use_color, .show_progress = show_progress };
+}
+
+/// Build the evaluator's search path from `-I`/`--include` entries followed by
+/// `$NIX_PATH`. Command-line entries come first so they take precedence, as in
+/// Nix. A no-op when neither is present.
+fn applyNixPath(ev: *Evaluator, init: std.process.Init, options: args.Options) !void {
+    const env_path = init.environ_map.get("NIX_PATH");
+    if (options.include.items.len == 0) {
+        if (env_path) |nix_path| try ev.setNixPath(nix_path);
+        return;
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(ev.allocator);
+    for (options.include.items) |entry| {
+        if (buf.items.len != 0) try buf.append(ev.allocator, ':');
+        try buf.appendSlice(ev.allocator, entry);
+    }
+    if (env_path) |nix_path| {
+        if (nix_path.len != 0) {
+            try buf.append(ev.allocator, ':');
+            try buf.appendSlice(ev.allocator, nix_path);
+        }
+    }
+    try ev.setNixPath(buf.items);
 }

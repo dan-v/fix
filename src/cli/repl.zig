@@ -9,36 +9,27 @@ const setup = @import("setup.zig");
 const Options = @import("args.zig").Options;
 const Evaluator = @import("fix").Evaluator;
 
-pub const usage =
+pub const synopsis =
     \\usage: fix repl [options]
     \\
     \\start an interactive read-eval-print loop.
-    \\
-    \\options:
-    \\  --json / --xml / --strict     result output format
-    \\  --experimental-features FEATS / --extra-experimental-features FEATS
-    \\  --show-trace                  show full evaluation traces on error
-    \\  --color[=when] / --no-color
-    \\  --progress[=when] / --no-progress
-    \\  -h, --help                    show this help
-    \\
 ;
 
 /// `fix repl` subcommand entry point.
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            args.writeHelp(init.io, synopsis, .repl);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
             return 2;
         },
     };
-    defer options.packages.deinit(allocator);
+    defer options.deinit(allocator);
     if (options.source != null) {
-        std.debug.print("error: repl takes no expression, file, or flake\n\n{s}", .{usage});
+        std.debug.print("error: repl takes no expression, file, or flake\n\n{s}\n", .{synopsis});
         return 2;
     }
 

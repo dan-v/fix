@@ -17,36 +17,28 @@ const Evaluator = fix.Evaluator;
 const EnvMap = std.process.Environ.Map;
 const BuildSink = @import("runtime").store.BuildSink;
 
-pub const usage =
-    \\usage: fix shell [options] (-p <pkgs...> | -e <expr> | --file <path> | --flake <inst>) [-- cmd args...]
+pub const synopsis =
+    \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]
     \\
     \\build one or more derivations and start a shell with their $out/bin on PATH.
     \\With `-- cmd args`, run that command in the environment instead of a shell.
-    \\
-    \\options:
-    \\  -p, --packages NAMES   packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq
-    \\  -e, --expr EXPR / --file PATH / --flake INSTALLABLE
-    \\  --experimental-features FEATS / --extra-experimental-features FEATS
-    \\  --show-trace / --color[=when] / --no-color / --progress[=when] / --no-progress
-    \\  -h, --help             show this help
-    \\
 ;
 
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            args.writeHelp(init.io, synopsis, .shell);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
             return 2;
         },
     };
-    defer options.packages.deinit(allocator);
+    defer options.deinit(allocator);
 
     if (options.packages.items.len == 0 and options.source == null) {
-        std.debug.print("error: give packages (-p) or an expression (-e/--file/--flake)\n\n{s}", .{usage});
+        std.debug.print("error: give packages (-p) or an expression (-e/--file/--flake)\n\n{s}\n", .{synopsis});
         return 2;
     }
 
@@ -135,11 +127,11 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: {s}\n", .{args.errorMessage(error.FlakesFeatureRequired)});
         return 2;
     }
-    const source = run.getSource(ev, source_arg) catch |err| {
+    const source = run.getSource(ev, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (source_arg == .flake) ev.allocator.free(source.text);
+    defer if (source.owned) ev.allocator.free(source.text);
 
     const result = ev.evaluate(source.text) catch |err| {
         ev.stopProgressSampler();

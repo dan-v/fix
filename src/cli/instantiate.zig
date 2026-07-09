@@ -11,40 +11,28 @@ const run = @import("run.zig");
 
 const Evaluator = fix.Evaluator;
 
-pub const usage =
-    \\usage: fix instantiate [options] (-e <expr> | --file <path> | --flake <installable>)
+pub const synopsis =
+    \\usage: fix instantiate [options] [path | -e <expr>]
     \\
     \\evaluate to a derivation, add its .drv closure to the store, and print the
-    \\top-level .drv path.
-    \\
-    \\options:
-    \\  -e, --expr EXPR        evaluate expression text
-    \\  --file PATH            evaluate a file
-    \\  --flake INSTALLABLE    evaluate a flake output (requires the flakes feature)
-    \\  --experimental-features FEATS / --extra-experimental-features FEATS
-    \\  --show-trace           show full evaluation traces on error
-    \\  --color[=when] / --no-color / --progress[=when] / --no-progress
-    \\  -h, --help             show this help
-    \\
+    \\top-level .drv path. With no source, uses ./default.nix (or, with --flake,
+    \\the flake in the current directory).
 ;
 
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
     var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            args.writeHelp(init.io, synopsis, .instantiate);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(err), usage });
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
             return 2;
         },
     };
-    defer options.packages.deinit(allocator);
+    defer options.deinit(allocator);
 
-    const source_arg = options.source orelse {
-        std.debug.print("error: no expression, file, or flake given\n\n{s}", .{usage});
-        return 2;
-    };
+    const source_arg = options.source orelse options.defaultSource();
 
     const worker_count = try setup.workerCount(options);
     var ev = try Evaluator.init(allocator, worker_count);
@@ -52,15 +40,15 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const term = try setup.configure(&ev, init, options);
 
     if (source_arg == .flake and !ev.flakes_enabled) {
-        std.debug.print("error: {s}\n\n{s}", .{ args.errorMessage(error.FlakesFeatureRequired), usage });
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }
 
-    const source = run.getSource(&ev, source_arg) catch |err| {
+    const source = run.getSource(&ev, source_arg, options) catch |err| {
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (source_arg == .flake) ev.allocator.free(source.text);
+    defer if (source.owned) ev.allocator.free(source.text);
 
     // Forcing a derivation now writes its `.drv` (and sources) to the store.
     // The daemon connects lazily on the first write.

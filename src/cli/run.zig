@@ -61,6 +61,9 @@ fn writeResult(io: std.Io, mode: EvaluationMode, ev: *Evaluator, result: Value) 
 
 pub const Source = struct {
     text: []const u8,
+    /// True when `text` was freshly allocated on `ev.allocator` (a `--flake`
+    /// lowering and/or `-A`/`--arg` wrapping); the caller must free it.
+    owned: bool = false,
 };
 
 /// A short human label for the progress "evaluating <label>" node.
@@ -84,18 +87,73 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
     return 1;
 }
 
-pub fn getSource(ev: *Evaluator, source: SourceArg) !Source {
-    return switch (source) {
-        .expr => |text| .{ .text = text },
+pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Source {
+    // Load the base source text (borrowed for expr/file, owned for flake).
+    const base: Source = switch (source) {
+        .expr => |text| .{ .text = text, .owned = false },
         .file => |path| blk: {
             const text = try ev.readSourceFile(path);
             // Resolve the file's relative path literals (`./x`, `import ./y`)
             // against the file's directory, like Nix — not the process cwd.
             try ev.setBasePathToFileDir(path);
-            break :blk .{ .text = text };
+            break :blk .{ .text = text, .owned = false };
         },
-        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable) },
+        .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
     };
+
+    // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the base flake
+    // lowering (if any) is now embedded in the wrapper, so free it.
+    const selected = try applySelectors(ev, base.text, options);
+    if (selected.owned and base.owned) ev.allocator.free(base.text);
+    return if (selected.owned) selected else base;
+}
+
+/// Wrap `base_text` to apply `-A`/`--arg`/`--argstr`, as in `nix-instantiate`:
+/// when `--arg`/`--argstr` are given and the value is a function, auto-call it
+/// with those args intersected against its formals; then select the `-A`
+/// attribute path. Returns owned wrapped text, or `base_text` borrowed when no
+/// selector applies.
+fn applySelectors(ev: *Evaluator, base_text: []const u8, options: args.Options) !Source {
+    const alloc = ev.allocator;
+    const has_args = options.arg_defs.items.len > 0;
+    // A `-A` with only empty components (`.`/``) selects nothing.
+    const has_attr = if (options.attr) |a| std.mem.indexOfNone(u8, a, ".") != null else false;
+    if (!has_args and !has_attr) return .{ .text = base_text, .owned = false };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "let __fix_top = (");
+    try out.appendSlice(alloc, base_text);
+    try out.appendSlice(alloc, ");\n");
+
+    // Auto-call a top-level function with `--arg`/`--argstr` args intersected
+    // against its formals (as in `nix-instantiate`, so missing formals fall
+    // back to their defaults and extra args are dropped). A non-function value
+    // passes through unchanged, so plain attrset files still work with `-A`.
+    try out.appendSlice(alloc, "    __fix_args = {");
+    for (options.arg_defs.items) |a| {
+        try out.appendSlice(alloc, " \"");
+        try appendNixEscaped(alloc, &out, a.name);
+        try out.appendSlice(alloc, "\" = ");
+        if (a.is_string) {
+            try out.append(alloc, '"');
+            try appendNixEscaped(alloc, &out, a.value);
+            try out.append(alloc, '"');
+        } else {
+            try out.append(alloc, '(');
+            try out.appendSlice(alloc, a.value);
+            try out.append(alloc, ')');
+        }
+        try out.append(alloc, ';');
+    }
+    try out.appendSlice(alloc, " };\n    __fix_v = if builtins.isFunction __fix_top" ++
+        " then __fix_top (builtins.intersectAttrs (builtins.functionArgs __fix_top) __fix_args)" ++
+        " else __fix_top;\n");
+
+    try out.appendSlice(alloc, "in __fix_v");
+    if (options.attr) |attr| _ = try appendAttrPathSuffix(alloc, &out, attr);
+    return .{ .text = try out.toOwnedSlice(alloc), .owned = true };
 }
 
 /// Lower a flake installable `<flakeref>[#<attrpath>]` into a Nix expression
@@ -117,15 +175,7 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
     // Build the attr-select suffix (`."a"."b"`) from the fragment.
     var suffix: std.ArrayListUnmanaged(u8) = .empty;
     defer suffix.deinit(alloc);
-    var it = std.mem.splitScalar(u8, attr_path, '.');
-    var has_attr = false;
-    while (it.next()) |component| {
-        if (component.len == 0) continue;
-        has_attr = true;
-        try suffix.appendSlice(alloc, ".\"");
-        try appendNixEscaped(alloc, &suffix, component);
-        try suffix.append(alloc, '"');
-    }
+    const has_attr = (try appendAttrPathSuffix(alloc, &suffix, attr_path)) > 0;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
@@ -168,6 +218,23 @@ fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
         return .{ .ref = abs, .owned = true };
     }
     return .{ .ref = flake_ref, .owned = false };
+}
+
+/// Append `."a"."b"` selections for the dotted `attr_path` to `out`, each
+/// component quoted and escaped so it may contain any character except `.`.
+/// Empty components (from `a..b`, a leading/trailing `.`, or a bare `.`) are
+/// skipped. Returns the number of components appended.
+fn appendAttrPathSuffix(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), attr_path: []const u8) !usize {
+    var it = std.mem.splitScalar(u8, attr_path, '.');
+    var count: usize = 0;
+    while (it.next()) |component| {
+        if (component.len == 0) continue;
+        count += 1;
+        try out.appendSlice(allocator, ".\"");
+        try appendNixEscaped(allocator, out, component);
+        try out.append(allocator, '"');
+    }
+    return count;
 }
 
 /// Append `text` escaped for a Nix double-quoted string literal. `$` is escaped
