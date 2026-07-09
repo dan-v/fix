@@ -8,6 +8,7 @@ const disasm_cmd = cli.disasm;
 const inspect_cmd = cli.inspect;
 const trace_cmd = cli.trace;
 const thunks_cmd = cli.thunks;
+const store_cmd = cli.store;
 const eval_cmd = cli.eval;
 const block_cache = @import("base").block_cache;
 const mem_tag = @import("runtime").mem_tag;
@@ -27,6 +28,7 @@ const subcommands = [_]Subcommand{
     .{ .name = "inspect", .summary = "evaluate and dump evaluator statistics", .run = inspect_cmd.run },
     .{ .name = "trace", .summary = "work with binary VM trace files", .run = trace_cmd.run },
     .{ .name = "thunks", .summary = "diff thunks-logs to find divergent resolutions", .run = thunks_cmd.run },
+    .{ .name = "store", .summary = "query the nix-daemon (protocol version, path validity)", .run = store_cmd.run },
 };
 
 fn writeTopUsage(writer: *std.Io.Writer) !void {

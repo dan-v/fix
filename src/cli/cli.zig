@@ -18,6 +18,7 @@ pub const disasm = @import("disasm.zig");
 pub const inspect = @import("inspect.zig");
 pub const trace = @import("trace.zig");
 pub const thunks = @import("thunks.zig");
+pub const store = @import("store.zig");
 pub const stats = @import("stats.zig");
 pub const trace_setup = @import("trace_setup.zig");
 pub const render = @import("render.zig");
