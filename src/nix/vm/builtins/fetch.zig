@@ -834,6 +834,7 @@ pub fn resolveFlakeNode(self: anytype, ref_attrs: Value, sub_inputs: Value, is_f
     // valid (Nix pins inputs by narHash; a valid CA path IS the content).
     const src_info = (try flakeInputFromStore(self, ref_attrs)) orelse try builtinFetchTree(self, ref_attrs);
     vm_force.rootKeep(self, src_info);
+    try verifyLockedNarHash(self, ref_attrs, src_info);
     if (!is_flake.asBool()) return src_info; // `flake = false`
 
     const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
@@ -932,6 +933,29 @@ fn buildNodeThunk(self: anytype, nodes: std.json.ObjectMap, node_name: []const u
     vm_force.rootKeep(self, thunk);
     try memo.put(self.allocator, node_name, thunk);
     return thunk;
+}
+
+/// Verify a fetched input's NAR hash against the lock, as Nix does — a mismatch
+/// means the locked content changed under the pin (corruption / tampering).
+/// Only under store writes, where fix computes the real NAR hash (plain eval
+/// uses an offline synthetic), and only for the tree types whose NAR hash is
+/// confirmed to match Nix (forges/tarball/path); git/mercurial/file are skipped.
+fn verifyLockedNarHash(self: anytype, ref_attrs: Value, src_info: Value) !void {
+    if (!self.derivations.store_writes_enabled) return;
+    if (!ref_attrs.isAttrs()) return;
+    const ty = (try optionalStringAttr(self, ref_attrs.asObjectId(), "type")) orelse return;
+    defer self.allocator.free(ty);
+    const verifiable = std.mem.eql(u8, ty, "github") or std.mem.eql(u8, ty, "gitlab") or
+        std.mem.eql(u8, ty, "sourcehut") or std.mem.eql(u8, ty, "tarball") or std.mem.eql(u8, ty, "path");
+    if (!verifiable) return;
+    const locked = (try optionalStringAttr(self, ref_attrs.asObjectId(), "narHash")) orelse return;
+    defer self.allocator.free(locked);
+    const got = (try optionalStringAttr(self, src_info.asObjectId(), "narHash")) orelse return;
+    defer self.allocator.free(got);
+    if (!std.mem.eql(u8, locked, got)) {
+        try vm_trace.setErrorMessage(self, "flake input NAR hash mismatch: lock does not match fetched content");
+        return error.FlakeNarHashMismatch;
+    }
 }
 
 /// If store writes are enabled and this ref's narHash names a store path that is
