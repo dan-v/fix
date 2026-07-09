@@ -1,4 +1,4 @@
-//! Minimal NAR serialization for hashing source paths.
+//! Minimal NAR serialization for hashing and adding source paths.
 
 const std = @import("std");
 const FileCache = @import("file_cache.zig").FileCache;
@@ -8,19 +8,29 @@ pub const Filter = struct {
     accept: *const fn (context: *anyopaque, path: []const u8, kind: FileCache.FileKind) anyerror!bool,
 };
 
+/// Serialize `path` to a NAR byte stream (`nix-archive-1` format), applying
+/// `filter` to directory descent. Caller owns the returned buffer. This is the
+/// dump the daemon's `AddToStore` (recursive/NAR ingestion) reads.
+pub fn serialize(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try appendString(allocator, &out, "nix-archive-1");
+    try appendNode(allocator, files, &out, path, filter);
+
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![]u8 {
     return hashPathFiltered(allocator, files, path, null);
 }
 
 pub fn hashPathFiltered(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-
-    try appendString(allocator, &out, "nix-archive-1");
-    try appendNode(allocator, files, &out, path, filter);
+    const nar_bytes = try serialize(allocator, files, path, filter);
+    defer allocator.free(nar_bytes);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(out.items, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &encoded);
 }

@@ -4,7 +4,10 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const store = @import("runtime").store;
+const runtime = @import("runtime");
+const store = runtime.store;
+const nar = runtime.nar;
+const FileCache = runtime.file_cache.FileCache;
 
 const usage =
     \\usage: fix store <subcommand> [args]
@@ -14,6 +17,7 @@ const usage =
     \\  is-valid PATH        print whether PATH is a valid store path
     \\  query-valid PATH...  print the subset of PATHs the daemon considers valid
     \\  add-text NAME TEXT   add TEXT to the store as NAME; print the store path
+    \\  add-path PATH [NAME] NAR-add PATH (recursively) to the store; print the path
     \\
     \\  -h, --help           show this help
     \\
@@ -33,6 +37,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     if (std.mem.eql(u8, sub, "is-valid")) return runIsValid(allocator, init, args_iter);
     if (std.mem.eql(u8, sub, "query-valid")) return runQueryValid(allocator, init, args_iter);
     if (std.mem.eql(u8, sub, "add-text")) return runAddText(allocator, init, args_iter);
+    if (std.mem.eql(u8, sub, "add-path")) return runAddPath(allocator, init, args_iter);
 
     std.debug.print("error: unknown subcommand '{s}'\n\n{s}", .{ sub, usage });
     return 2;
@@ -120,6 +125,46 @@ fn runAddText(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *
     try w.interface.print("{s}\n", .{path});
     try w.interface.flush();
     return 0;
+}
+
+fn runAddPath(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
+    const raw_path = args_iter.next() orelse {
+        std.debug.print("error: add-path needs a PATH\n\n{s}", .{usage});
+        return 2;
+    };
+    const explicit_name = args_iter.next();
+
+    const abs = try toAbsolute(allocator, init.io, raw_path);
+    defer allocator.free(abs);
+    const name = explicit_name orelse std.fs.path.basename(abs);
+
+    var files = FileCache.init(allocator);
+    defer files.deinit();
+    files.setIo(init.io);
+
+    const nar_bytes = nar.serialize(allocator, &files, abs, null) catch |err| {
+        std.debug.print("error: serializing {s}: {s}\n", .{ abs, @errorName(err) });
+        return 1;
+    };
+    defer allocator.free(nar_bytes);
+
+    const daemon = try connect(allocator, init);
+    defer daemon.deinit();
+
+    const path = daemon.addPath(allocator, name, nar_bytes, &.{}) catch |err| return reportDaemonError(daemon, err);
+    defer allocator.free(path);
+    var stdout_buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+    try w.interface.print("{s}\n", .{path});
+    try w.interface.flush();
+    return 0;
+}
+
+fn toAbsolute(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
 fn reportDaemonError(daemon: *store.DaemonStore, err: anyerror) u8 {

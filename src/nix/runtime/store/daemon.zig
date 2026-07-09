@@ -158,6 +158,25 @@ pub const DaemonStore = struct {
         return try wire.readString(allocator, self.r());
     }
 
+    /// Add a NAR-serialized tree to the store under `name`, content-addressed
+    /// recursively (`nar:sha256`) — the addressing `builtins.path`/`filterSource`
+    /// and fetched sources use. `nar_bytes` is a `nix-archive-1` stream (see
+    /// `runtime.nar.serialize`). Returns the resulting store path (owned by
+    /// `allocator`). Idempotent.
+    pub fn addPath(self: *DaemonStore, allocator: std.mem.Allocator, name: []const u8, nar_bytes: []const u8, references: []const []const u8) ![]u8 {
+        try self.beginOp(.add_to_store);
+        try wire.writeString(self.w(), name);
+        // `fixed:r:sha256` = fixed-output, recursive (NAR) ingestion, sha256 —
+        // the addressing `builtins.path`/`nix store add` use. (The daemon
+        // rejects `nar:...`; recognized prefixes are `text` and `fixed`.)
+        try wire.writeString(self.w(), "fixed:r:sha256");
+        try wire.writeStrings(self.w(), references);
+        try wire.writeBool(self.w(), false); // repair
+        try self.writeFramed(nar_bytes);
+        try self.flushAndDrain();
+        return try wire.readString(allocator, self.r());
+    }
+
     /// Stream `data` through the worker protocol's framed sink: one
     /// `[u64 len][bytes]` frame followed by a zero-length terminator frame.
     /// Frame payloads are raw (not 8-byte padded like protocol strings).
