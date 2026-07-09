@@ -29,6 +29,12 @@ pub const FetchCache = struct {
     /// path (`vm.io_offload.runFetch`) acquires `conn_sem` when this is > 0.
     max_connections: u32 = 0,
     conn_sem: sync.Semaphore = sync.Semaphore.init(0),
+    /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, used to
+    /// add an `Authorization: Bearer` header on downloads to a matching host
+    /// (private GitHub/GitLab/… archives). Owned; see `setAccessTokens`.
+    access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
+
+    const TokenEntry = struct { host: []u8, token: []u8 };
 
     const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
@@ -117,10 +123,66 @@ pub const FetchCache = struct {
 
     pub fn deinit(self: *FetchCache) void {
         if (self.cache_root) |root| self.allocator.free(root);
+        for (self.access_tokens.items) |t| {
+            self.allocator.free(t.host);
+            self.allocator.free(t.token);
+        }
+        self.access_tokens.deinit(self.allocator);
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
         self.io = io;
+    }
+
+    /// Parse a `nix.conf` `access-tokens` value — space-separated
+    /// `<host>[/<path>]=<token>` entries — replacing the current set. Later
+    /// entries win on a duplicate key. Malformed entries (no `=`) are skipped.
+    pub fn setAccessTokens(self: *FetchCache, raw: []const u8) !void {
+        for (self.access_tokens.items) |t| {
+            self.allocator.free(t.host);
+            self.allocator.free(t.token);
+        }
+        self.access_tokens.clearRetainingCapacity();
+
+        var it = std.mem.tokenizeAny(u8, raw, " \t");
+        while (it.next()) |entry| {
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            const host = entry[0..eq];
+            const token = entry[eq + 1 ..];
+            if (host.len == 0 or token.len == 0) continue;
+            try self.access_tokens.append(self.allocator, .{
+                .host = try self.allocator.dupe(u8, host),
+                .token = try self.allocator.dupe(u8, token),
+            });
+        }
+    }
+
+    /// The access token for a request to `url`, matched by the longest
+    /// `<host>[/<path>]` key that is a prefix of the URL's `host/path` (so
+    /// `github.com/org` beats a bare `github.com`). Null if none matches.
+    fn tokenFor(self: *const FetchCache, url: []const u8) ?[]const u8 {
+        if (self.access_tokens.items.len == 0) return null;
+        // Reduce the URL to `host/path` (drop scheme, any `user@`, and `:port`).
+        var rest = url;
+        if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+        const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        var authority = rest[0..path_start];
+        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+        if (std.mem.indexOfScalar(u8, authority, ':')) |c| authority = authority[0..c];
+        const lookup = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ authority, rest[path_start..] }) catch return null;
+        defer self.allocator.free(lookup);
+
+        var best: ?[]const u8 = null;
+        var best_len: usize = 0;
+        for (self.access_tokens.items) |t| {
+            const matches = std.mem.eql(u8, lookup, t.host) or
+                (lookup.len > t.host.len and std.mem.startsWith(u8, lookup, t.host) and lookup[t.host.len] == '/');
+            if (matches and t.host.len >= best_len) {
+                best = t.token;
+                best_len = t.host.len;
+            }
+        }
+        return best;
     }
 
     /// Set the concurrent-fetch cap (`http-connections`; 0 = unlimited).
@@ -203,10 +265,24 @@ pub const FetchCache = struct {
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
+        // Authenticate to a matching host (`access-tokens`) with a bearer
+        // header. `extra_headers` (unlike `privileged_headers`) is preserved
+        // across a cross-domain redirect, so the token still reaches
+        // codeload.github.com after the `github.com` archive redirect.
+        var auth_value: ?[]u8 = null;
+        defer if (auth_value) |v| self.allocator.free(v);
+        var extra_headers: []const std.http.Header = &.{};
+        var auth_storage: [1]std.http.Header = undefined;
+        if (self.tokenFor(url)) |token| {
+            auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+            auth_storage[0] = .{ .name = "authorization", .value = auth_value.? };
+            extra_headers = auth_storage[0..1];
+        }
+
         // Stream (rather than one-shot `fetch`) so we can read `content_length`
         // up front and report bytes as they arrive to the fetch progress span.
         const uri = try std.Uri.parse(url);
-        var req = try client.request(.GET, uri, .{ .redirect_behavior = @enumFromInt(10) });
+        var req = try client.request(.GET, uri, .{ .redirect_behavior = @enumFromInt(10), .extra_headers = extra_headers });
         defer req.deinit();
         try req.sendBodiless();
 
@@ -570,4 +646,22 @@ fn localFetchPath(url: []const u8) ?[]const u8 {
 fn stripMercurialDirtySuffix(rev: []const u8) []const u8 {
     if (std.mem.endsWith(u8, rev, "+")) return rev[0 .. rev.len - 1];
     return rev;
+}
+
+test "access-tokens: parse and longest-prefix host/path match" {
+    const testing = std.testing;
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    try fc.setAccessTokens("github.com=ghp_base gitlab.example.org=glpat github.com/acme=ghp_acme  =skip  bad_no_eq");
+
+    // Bare host match, and the port/scheme are ignored.
+    try testing.expectEqualStrings("ghp_base", fc.tokenFor("https://github.com/owner/repo/archive/HEAD.tar.gz").?);
+    try testing.expectEqualStrings("ghp_base", fc.tokenFor("https://github.com").?);
+    // The longer `github.com/acme` key wins for that org.
+    try testing.expectEqualStrings("ghp_acme", fc.tokenFor("https://github.com/acme/thing/archive/HEAD.tar.gz").?);
+    // A different self-hosted host.
+    try testing.expectEqualStrings("glpat", fc.tokenFor("https://gitlab.example.org/g/p/-/archive/v1/p-v1.tar.gz").?);
+    // No token for an unlisted host; `github.comX` must not match `github.com`.
+    try testing.expect(fc.tokenFor("https://codeberg.org/o/r") == null);
+    try testing.expect(fc.tokenFor("https://github.com.evil.example/x") == null);
 }

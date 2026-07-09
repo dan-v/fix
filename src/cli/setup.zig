@@ -67,6 +67,9 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // `flakes` implies `fetch-tree` (as in Nix).
     ev.fetch_tree_enabled = features.contains(.fetch_tree) or ev.flakes_enabled;
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
+    // `access-tokens` from nix.conf (incl. `--option access-tokens ...`):
+    // authenticate fetches to private GitHub/GitLab/… hosts.
+    if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);
     try applyDaemonSettings(ev, options, &settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);

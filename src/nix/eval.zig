@@ -340,6 +340,12 @@ pub const Evaluator = struct {
         self.fetchers.setMaxConnections(n);
     }
 
+    /// Set the fetcher's `access-tokens` (a raw `nix.conf` value), used to
+    /// authenticate downloads to matching hosts. See `setup.configure`.
+    pub fn setAccessTokens(self: *Evaluator, raw: []const u8) !void {
+        try self.fetchers.setAccessTokens(raw);
+    }
+
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
         return self.derivations.debugRecords();
     }
