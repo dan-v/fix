@@ -35,11 +35,14 @@ pub const FetchCache = struct {
     access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
     /// The process environment (borrowed), inherited by git/tar/hg subprocesses.
     env: ?*const std.process.Environ.Map = null,
-    /// Lazily-built subprocess environment = `env` plus `GIT_TERMINAL_PROMPT=0`,
-    /// so a git CLI fetch of a private remote fails fast instead of blocking on
-    /// an interactive credential prompt. Nix gets this for free by fetching via
-    /// libgit2; we shell out to git, so we disable the prompt ourselves. Built
-    /// on first subprocess run (most evals never fetch); owned, freed in deinit.
+    /// Lazily-built subprocess environment = `env` plus:
+    ///   - `GIT_TERMINAL_PROMPT=0` — a git CLI fetch of a private remote fails
+    ///     fast instead of blocking on an interactive credential prompt. Nix
+    ///     gets this for free via libgit2; we shell out to git, so we set it.
+    ///   - `HGPLAIN=` — consistent `hg` output, ignoring a user/system `.hgrc`,
+    ///     exactly as Nix's mercurial fetcher (`hgOptions`).
+    /// Both are harmless to the unrelated subprocesses (git/tar/hg share this).
+    /// Built on first subprocess run (most evals never fetch); freed in deinit.
     subprocess_env: ?std.process.Environ.Map = null,
 
     const TokenEntry = struct { host: []u8, token: []u8 };
@@ -161,8 +164,8 @@ pub const FetchCache = struct {
     }
 
     /// The environment for a git/tar/hg subprocess: the inherited process env
-    /// plus `GIT_TERMINAL_PROMPT=0`. Built once and cached. Null (inherit the
-    /// parent env unchanged) when no environment was set (e.g. tests).
+    /// plus `GIT_TERMINAL_PROMPT=0` and `HGPLAIN=`. Built once and cached. Null
+    /// (inherit the parent env unchanged) when no environment was set (tests).
     fn subprocessEnviron(self: *FetchCache) !?*const std.process.Environ.Map {
         if (self.subprocess_env) |*e| return e;
         const parent = self.env orelse return null;
@@ -170,6 +173,7 @@ pub const FetchCache = struct {
         errdefer env.deinit();
         for (parent.keys(), parent.values()) |k, v| try env.put(k, v);
         try env.put("GIT_TERMINAL_PROMPT", "0");
+        try env.put("HGPLAIN", "");
         self.subprocess_env = env;
         return &self.subprocess_env.?;
     }
@@ -769,6 +773,7 @@ test "subprocess env: inherits parent and disables the git terminal prompt" {
 
     const env = (try fc.subprocessEnviron()).?;
     try testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
+    try testing.expectEqualStrings("", env.get("HGPLAIN").?);
     try testing.expectEqualStrings("/home/u", env.get("HOME").?); // inherited
     try testing.expectEqualStrings("/run/ssh", env.get("SSH_AUTH_SOCK").?); // inherited (creds/ssh)
 
