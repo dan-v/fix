@@ -272,6 +272,15 @@ pub const DerivationStore = struct {
         try daemon.buildPaths(derived_paths, sink, mode);
     }
 
+    /// Register `link_path` (an existing absolute symlink into the store) as an
+    /// indirect GC root via the daemon.
+    pub fn addIndirectRoot(self: *DerivationStore, link_path: []const u8) !void {
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        const daemon = try self.ensureDaemon();
+        try daemon.addIndirectRoot(link_path);
+    }
+
     const DaemonOp = union(enum) {
         text: struct { store_path: []const u8, text: []const u8, references: []const []const u8 },
         path: struct { store_path: []const u8, nar_bytes: []const u8 },

@@ -916,6 +916,12 @@ pub const Evaluator = struct {
         return self.derivations.setBuildSettings(settings);
     }
 
+    /// Register `link_path` (an existing absolute symlink into the store) as an
+    /// indirect GC root via the daemon (`--add-root`/`--indirect`).
+    pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8) !void {
+        return self.derivations.addIndirectRoot(link_path);
+    }
+
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,
     /// forcing each step. Returns null if any component is missing or non-attrs.
     pub fn attrPathValue(self: *Evaluator, value: Value, path: []const u8) !?Value {

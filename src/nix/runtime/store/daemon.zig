@@ -282,6 +282,16 @@ pub const DaemonStore = struct {
         _ = try wire.readInt(self.r()); // dummy result int
     }
 
+    /// Register an indirect GC root (`add_indirect_root`, op 12): the daemon
+    /// records `<gcroots>/auto/<hash>` -> `link_path`, so the store path the
+    /// symlink at `link_path` points to survives GC. `link_path` must be an
+    /// existing absolute symlink into the store; the caller creates it first.
+    pub fn addIndirectRoot(self: *DaemonStore, link_path: []const u8) !void {
+        try self.beginOp(.add_indirect_root);
+        try wire.writeString(self.w(), link_path);
+        try self.flushAndDrain(); // no result, just the stderr stream
+    }
+
     /// Send per-connection client settings (`set_options`, op 19). Field order
     /// matches Nix's `RemoteStore::setOptions`: the fixed settings, four obsolete
     /// placeholders, then (protocol minor >= 12) the `name/value` overrides map.

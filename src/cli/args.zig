@@ -114,6 +114,12 @@ pub const Options = struct {
     drv_link: ?[]const u8 = null,
     /// `--add-drv-link`: also create a symlink to the top-level `.drv`.
     add_drv_link: bool = false,
+    /// `--add-root PATH`: create the output/`.drv` link at PATH and register it
+    /// as an (indirect) GC root. Borrowed from argv.
+    add_root: ?[]const u8 = null,
+    /// `--indirect`: make the `--add-root` root indirect (accepted; roots here
+    /// are always registered indirectly).
+    indirect: bool = false,
     /// `--check`: rebuild and verify outputs are unchanged (BuildMode check).
     check: bool = false,
     /// `--repair`: rebuild and repair corrupted store paths (BuildMode repair).
@@ -218,6 +224,8 @@ const Opt = enum {
     out_link,
     drv_link,
     add_drv_link,
+    add_root,
+    indirect,
     // Build realization.
     check,
     repair,
@@ -319,6 +327,8 @@ const specs = [_]Spec{
     .{ .id = .no_link, .long = "--no-link", .hidden = true }, // alias of --no-out-link
     .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
     .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
+    .{ .id = .add_root, .long = "--add-root", .arg = .req, .metavar = "PATH", .help = "create the link at PATH and register it as a GC root", .show_in = drv_cmds },
+    .{ .id = .indirect, .long = "--indirect", .help = "make the --add-root GC root indirect", .show_in = drv_cmds },
 
     .{ .id = .check, .long = "--check", .help = "rebuild and check that outputs are unchanged", .show_in = realize_cmds },
     .{ .id = .repair, .long = "--repair", .help = "rebuild and repair corrupted store paths", .show_in = realize_cmds },
@@ -490,6 +500,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .out_link => options.out_link = v0.?,
         .drv_link => options.drv_link = v0.?,
         .add_drv_link => options.add_drv_link = true,
+        .add_root => options.add_root = v0.?,
+        .indirect => options.indirect = true,
         .check => options.check = true,
         .repair => options.repair = true,
         // Build-setting sugar: fold into the nix.conf override list so

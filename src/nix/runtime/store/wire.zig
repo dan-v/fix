@@ -31,6 +31,7 @@ pub const Op = enum(u64) {
     add_text_to_store = 8,
     build_paths = 9,
     add_temp_root = 11,
+    add_indirect_root = 12,
     set_options = 19,
     query_path_info = 26,
     query_valid_paths = 31,

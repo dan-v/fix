@@ -97,7 +97,12 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionEnd();
     ok = true;
 
-    if (!options.no_link) {
+    // Result link: `--add-root PATH` puts it at PATH and registers a GC root;
+    // else `-o`/`--out-link` (default `result`), a plain symlink, unless
+    // `--no-out-link`.
+    if (options.add_root) |root_path| {
+        linkRoot(init.io, allocator, &ev, root_path, out_path);
+    } else if (!options.no_link) {
         const name = options.out_link orelse "result";
         makeLink(init.io, name, out_path) catch |err| {
             std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
@@ -125,4 +130,30 @@ pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
         else => return err,
     };
     try cwd.symLink(io, target, name, .{});
+}
+
+/// Create the symlink `name` -> `target`, then register `name` as an indirect
+/// GC root via the daemon (`--add-root`). Warns (does not fail the build) on
+/// either step. Shared by `build` and `instantiate`.
+pub fn linkRoot(io: std.Io, allocator: std.mem.Allocator, ev: *Evaluator, name: []const u8, target: []const u8) void {
+    makeLink(io, name, target) catch |err| {
+        std.debug.print("warning: could not create {s}: {s}\n", .{ name, @errorName(err) });
+        return;
+    };
+    const abs = absPath(io, allocator, name) catch |err| {
+        std.debug.print("warning: could not resolve {s}: {s}\n", .{ name, @errorName(err) });
+        return;
+    };
+    defer allocator.free(abs);
+    ev.addIndirectRoot(abs) catch |err| {
+        std.debug.print("warning: could not register GC root {s}: {s}\n", .{ abs, @errorName(err) });
+    };
+}
+
+/// Absolute, cwd-joined form of `name` (the link path the daemon roots).
+fn absPath(io: std.Io, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, name });
 }

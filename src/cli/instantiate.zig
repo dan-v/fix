@@ -77,6 +77,9 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     ok = true;
 
+    if (options.add_root) |root_path| {
+        build.linkRoot(init.io, allocator, &ev, root_path, drv_path);
+    }
     if (options.add_drv_link) {
         const name = options.drv_link orelse "derivation";
         build.makeLink(init.io, name, drv_path) catch |err| {
