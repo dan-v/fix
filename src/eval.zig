@@ -972,7 +972,7 @@ pub const Evaluator = struct {
     fn progressEligible() bool {
         const inner = fiber_mod.currentFiber() orelse return true;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-        return wf.is_demand;
+        return wf.vm.is_demand;
     }
 
     pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {

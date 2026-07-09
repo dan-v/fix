@@ -143,10 +143,6 @@ pub const WorkerFiber = struct {
     /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
     /// `flowIn` treats 0 as "no flow", so this is inert when tracing is off.
     flow_in_id: u64 = 0,
-    /// Timeline: this is the top-level DEMAND fiber (set in `runTopLevel`,
-    /// cleared when it finishes). Its blocking waits on busy thunks are the
-    /// critical path — recorded on the dedicated crit track (see force.zig).
-    is_demand: bool = false,
     /// Fiber census: suspensions since the current task started. Updated
     /// and consumed under `run_mu` (runFiber's state switch), reset before
     /// the fiber is recycled.
@@ -389,7 +385,7 @@ pub const Worker = struct {
         const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
         const top = try self.acquireFreeFiber();
         top.current_task = null;
-        top.is_demand = true; // its blocking waits are the critical path
+        top.vm.is_demand = true; // its blocking waits are the critical path
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -698,7 +694,7 @@ pub const Worker = struct {
                 // resumed a stolen fiber. Nudge the owning worker so
                 // its `runTopLevel` loop observes the completion (it
                 // may be parked waiting on this very fiber).
-                f.is_demand = false; // clear before recycle (else a reused fiber mislabels)
+                f.vm.is_demand = false; // clear before recycle (else a reused fiber mislabels)
                 if (comptime census_on) {
                     self.census.finished += 1;
                     if (f.census_suspends > 0) {

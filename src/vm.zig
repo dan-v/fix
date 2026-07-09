@@ -243,6 +243,13 @@ pub const VM = struct {
     /// entry points (see `vm/force.zig`).
     in_speculation: bool,
 
+    /// Timeline/profiling (`-Dprof-main`): true only on the top-level DEMAND
+    /// fiber's VM. Its blocking waits on busy thunks are the serial critical
+    /// path, recorded on the dedicated crit track (see `vm/force.zig`). The
+    /// worker sets it when it launches the top fiber and clears it before the
+    /// fiber recycles. Default false — every helper/speculative VM.
+    is_demand: bool = false,
+
     /// Bounded speculation (`FIX_SIBLING`): remaining claimed-force budget
     /// for the current speculative task. `NO_SPEC_BUDGET` (the default)
     /// disables the bound; a sibling-sweep task arms it per member force
@@ -359,6 +366,7 @@ pub const VM = struct {
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
+            .is_demand = false,
             .spec_budget = NO_SPEC_BUDGET,
             .spec_create_limit = NO_SPEC_BUDGET,
             .spec_create_worker = 0,
