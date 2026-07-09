@@ -33,6 +33,10 @@ pub const FetchCache = struct {
     /// add an `Authorization: Bearer` header on downloads to a matching host
     /// (private GitHub/GitLab/… archives). Owned; see `setAccessTokens`.
     access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
+    /// Parsed `netrc-file` entries: HTTP basic-auth credentials applied to a
+    /// plain (non-forge) download whose host matches, as Nix does via curl.
+    /// Owned; see `setNetrc`.
+    netrc: std.ArrayListUnmanaged(NetrcEntry) = .empty,
     /// The process environment (borrowed), inherited by git/tar/hg subprocesses.
     env: ?*const std.process.Environ.Map = null,
     /// Lazily-built subprocess environment = `env` plus:
@@ -46,6 +50,8 @@ pub const FetchCache = struct {
     subprocess_env: ?std.process.Environ.Map = null,
 
     const TokenEntry = struct { host: []u8, token: []u8 };
+    /// A `netrc` machine entry (owned). `machine == null` is the `default` entry.
+    const NetrcEntry = struct { machine: ?[]u8, login: []u8, password: []u8 };
 
     /// The forge whose token-header convention applies to a download. Like Nix,
     /// `access-tokens` only authenticate forge (and git) fetches, not arbitrary
@@ -147,7 +153,95 @@ pub const FetchCache = struct {
             self.allocator.free(t.token);
         }
         self.access_tokens.deinit(self.allocator);
+        self.clearNetrc();
+        self.netrc.deinit(self.allocator);
         if (self.subprocess_env) |*e| e.deinit();
+    }
+
+    fn clearNetrc(self: *FetchCache) void {
+        for (self.netrc.items) |e| {
+            if (e.machine) |m| self.allocator.free(m);
+            self.allocator.free(e.login);
+            self.allocator.free(e.password);
+        }
+        self.netrc.clearRetainingCapacity();
+    }
+
+    /// Parse a `netrc`-format file into credential entries, replacing the
+    /// current set. Handles the `machine`/`default`/`login`/`password`/`account`
+    /// keywords (whitespace-separated tokens); `macdef` bodies are not executed
+    /// (the name and next token are skipped). Later duplicate machines just add
+    /// another entry; lookup takes the first match.
+    pub fn setNetrc(self: *FetchCache, content: []const u8) !void {
+        self.clearNetrc();
+        var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
+        var cur: ?usize = null;
+        while (it.next()) |tok| {
+            if (std.mem.eql(u8, tok, "machine")) {
+                const name = it.next() orelse break;
+                try self.netrc.append(self.allocator, .{
+                    .machine = try self.allocator.dupe(u8, name),
+                    .login = try self.allocator.dupe(u8, ""),
+                    .password = try self.allocator.dupe(u8, ""),
+                });
+                cur = self.netrc.items.len - 1;
+            } else if (std.mem.eql(u8, tok, "default")) {
+                try self.netrc.append(self.allocator, .{
+                    .machine = null,
+                    .login = try self.allocator.dupe(u8, ""),
+                    .password = try self.allocator.dupe(u8, ""),
+                });
+                cur = self.netrc.items.len - 1;
+            } else if (std.mem.eql(u8, tok, "login")) {
+                const v = it.next() orelse break;
+                if (cur) |i| {
+                    self.allocator.free(self.netrc.items[i].login);
+                    self.netrc.items[i].login = try self.allocator.dupe(u8, v);
+                }
+            } else if (std.mem.eql(u8, tok, "password")) {
+                const v = it.next() orelse break;
+                if (cur) |i| {
+                    self.allocator.free(self.netrc.items[i].password);
+                    self.netrc.items[i].password = try self.allocator.dupe(u8, v);
+                }
+            } else if (std.mem.eql(u8, tok, "account") or std.mem.eql(u8, tok, "macdef")) {
+                _ = it.next(); // skip the value / macro name
+            }
+        }
+    }
+
+    /// The `Authorization: Basic` header for a request to `url` if the netrc has
+    /// credentials for its host (exact `machine` match, else the `default`
+    /// entry). Null if none. Owned; caller frees.
+    fn netrcHeader(self: *const FetchCache, url: []const u8) !?AuthHeader {
+        if (self.netrc.items.len == 0) return null;
+        const host = urlHostPath(url).host;
+        var match: ?NetrcEntry = null;
+        for (self.netrc.items) |e| {
+            if (e.machine) |m| if (std.mem.eql(u8, m, host)) {
+                match = e;
+                break;
+            };
+        }
+        if (match == null) for (self.netrc.items) |e| {
+            if (e.machine == null) {
+                match = e;
+                break;
+            }
+        };
+        const e = match orelse return null;
+        if (e.login.len == 0) return null;
+        const alloc = self.allocator;
+        const creds = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ e.login, e.password });
+        defer alloc.free(creds);
+        const enc = std.base64.standard.Encoder;
+        const buf = try alloc.alloc(u8, enc.calcSize(creds.len));
+        defer alloc.free(buf);
+        const b64 = enc.encode(buf, creds);
+        return .{
+            .name = try alloc.dupe(u8, "Authorization"),
+            .value = try std.fmt.allocPrint(alloc, "Basic {s}", .{b64}),
+        };
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
@@ -201,19 +295,24 @@ pub const FetchCache = struct {
         }
     }
 
-    /// The access token for a request to `url`, matched by the longest
-    /// `<host>[/<path>]` key that is a prefix of the URL's `host/path` (so
-    /// `github.com/org` beats a bare `github.com`). Null if none matches.
-    fn tokenFor(self: *const FetchCache, url: []const u8) ?[]const u8 {
-        if (self.access_tokens.items.len == 0) return null;
-        // Reduce the URL to `host/path` (drop scheme, any `user@`, and `:port`).
+    /// Split `url` into its host (authority without `user@`/`:port`) and path.
+    fn urlHostPath(url: []const u8) struct { host: []const u8, path: []const u8 } {
         var rest = url;
         if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
         const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
         var authority = rest[0..path_start];
         if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
         if (std.mem.indexOfScalar(u8, authority, ':')) |c| authority = authority[0..c];
-        const lookup = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ authority, rest[path_start..] }) catch return null;
+        return .{ .host = authority, .path = rest[path_start..] };
+    }
+
+    /// The access token for a request to `url`, matched by the longest
+    /// `<host>[/<path>]` key that is a prefix of the URL's `host/path` (so
+    /// `github.com/org` beats a bare `github.com`). Null if none matches.
+    fn tokenFor(self: *const FetchCache, url: []const u8) ?[]const u8 {
+        if (self.access_tokens.items.len == 0) return null;
+        const hp = urlHostPath(url);
+        const lookup = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ hp.host, hp.path }) catch return null;
         defer self.allocator.free(lookup);
 
         var best: ?[]const u8 = null;
@@ -356,20 +455,21 @@ pub const FetchCache = struct {
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
-        // Authenticate a forge fetch with its `access-tokens` header (per-forge
-        // format; see `authHeader`). `extra_headers` (unlike `privileged_headers`)
-        // is preserved across a cross-domain redirect, so the token still reaches
-        // codeload.github.com after the `github.com` archive redirect.
-        var auth: ?AuthHeader = null;
+        // Authenticate the request: a forge fetch with its per-forge
+        // `access-tokens` header (see `authHeader`), else a plain download with
+        // `netrc` basic-auth for the host. Both go via `extra_headers`, which is
+        // preserved across a cross-domain redirect — needed for the forge token
+        // to reach codeload.github.com after the `github.com` archive redirect.
+        // (`privileged_headers` would be the safer home for netrc creds, being
+        // stripped on such a redirect, but std.http does not emit them.)
+        var auth: ?AuthHeader = if (forge) |f| try self.authHeader(f, url) else null;
+        if (auth == null) auth = try self.netrcHeader(url);
         defer if (auth) |a| a.deinit(self.allocator);
         var extra_headers: []const std.http.Header = &.{};
         var auth_storage: [1]std.http.Header = undefined;
-        if (forge) |f| {
-            if (try self.authHeader(f, url)) |a| {
-                auth = a;
-                auth_storage[0] = .{ .name = a.name, .value = a.value };
-                extra_headers = auth_storage[0..1];
-            }
+        if (auth) |a| {
+            auth_storage[0] = .{ .name = a.name, .value = a.value };
+            extra_headers = auth_storage[0..1];
         }
 
         // Stream (rather than one-shot `fetch`) so we can read `content_length`
@@ -758,6 +858,42 @@ test "access-tokens: parse and longest-prefix host/path match" {
     // No token for an unlisted host; `github.comX` must not match `github.com`.
     try testing.expect(fc.tokenFor("https://codeberg.org/o/r") == null);
     try testing.expect(fc.tokenFor("https://github.com.evil.example/x") == null);
+}
+
+test "netrc: basic-auth header by machine, else default" {
+    const testing = std.testing;
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    try fc.setNetrc(
+        \\machine example.com login alice password s3cret
+        \\machine noauth.example
+        \\default login guest password g
+    );
+
+    const decoded = struct {
+        fn creds(fcp: *FetchCache, url: []const u8, out: []u8) ![]const u8 {
+            const h = (try fcp.netrcHeader(url)).?;
+            defer h.deinit(fcp.allocator);
+            try testing.expectEqualStrings("Authorization", h.name);
+            const b64 = h.value["Basic ".len..];
+            const dec = std.base64.standard.Decoder;
+            const n = try dec.calcSizeForSlice(b64);
+            try dec.decode(out[0..n], b64);
+            return out[0..n];
+        }
+    };
+    var buf: [64]u8 = undefined;
+    // Exact machine match.
+    try testing.expectEqualStrings("alice:s3cret", try decoded.creds(&fc, "https://example.com/repo.git", &buf));
+    // Unknown host falls back to the `default` entry.
+    try testing.expectEqualStrings("guest:g", try decoded.creds(&fc, "https://unknown.example/x", &buf));
+    // A matched machine with no login yields no header (and does not fall back
+    // to `default` — the host has its own entry).
+    try testing.expect((try fc.netrcHeader("https://noauth.example/x")) == null);
+
+    var empty = FetchCache.init(testing.allocator);
+    defer empty.deinit();
+    try testing.expect((try empty.netrcHeader("https://example.com")) == null);
 }
 
 test "subprocess env: inherits parent and disables the git terminal prompt" {

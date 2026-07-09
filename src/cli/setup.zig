@@ -69,6 +69,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // `access-tokens` from nix.conf (incl. `--option access-tokens ...`):
     // authenticate fetches to private GitHub/GitLab/… hosts.
     if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);
+    try applyNetrc(ev, init, &settings);
     try applyDaemonSettings(ev, options, &settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
@@ -108,6 +109,22 @@ fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_con
         .use_substitutes = boolSetting(settings, "substitute", true),
         .overrides = overrides.items,
     });
+}
+
+/// Load the `netrc-file` (default `$NIX_CONF_DIR/netrc`, matching Nix) and hand
+/// its credentials to the fetcher for HTTP basic-auth on plain downloads.
+/// Best-effort: a missing/unreadable file just means no netrc auth.
+fn applyNetrc(ev: *Evaluator, init: std.process.Init, settings: *nix_conf.Settings) !void {
+    const path: []u8 = if (settings.get("netrc-file")) |p|
+        try ev.allocator.dupe(u8, p)
+    else blk: {
+        const dir = init.environ_map.get("NIX_CONF_DIR") orelse "/etc/nix";
+        break :blk try std.fs.path.join(ev.allocator, &.{ dir, "netrc" });
+    };
+    defer ev.allocator.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(init.io, path, ev.allocator, .limited(1 << 20)) catch return;
+    defer ev.allocator.free(data);
+    try ev.setNetrc(data);
 }
 
 /// Read a boolean `nix.conf` setting (`true`/`1` = true, any other value =

@@ -346,6 +346,12 @@ pub const Evaluator = struct {
         try self.fetchers.setAccessTokens(raw);
     }
 
+    /// Set the fetcher's `netrc` credentials (raw file content) for HTTP
+    /// basic-auth on plain downloads. See `setup.configure`.
+    pub fn setNetrc(self: *Evaluator, content: []const u8) !void {
+        try self.fetchers.setNetrc(content);
+    }
+
     pub fn derivationDebugRecords(self: *const Evaluator) []const derivation.DebugRecord {
         return self.derivations.debugRecords();
     }
