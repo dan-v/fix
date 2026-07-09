@@ -81,7 +81,7 @@ Associativity follows canonical Nix: `->` (`impl`), `//` (`update`), and `++` (`
 - `x |> f` == `f x` — **left**-associative → `apply(func=f, arg=x, .forward)`
 - `f <| x` == `f x` — **right**-associative → `apply(func=f, arg=x, .backward)`
 
-Both always parse; the parser records that a pipe was seen (`used_pipe_operators`, plus the earliest pipe token for a precise diagnostic) but does not itself reject them. Compiling a file that uses one requires the `--pipe-operators` feature; otherwise the compile chokepoint (`Evaluator.parseAndCompile`) rejects the file *on presence* — like Nix, an unused or deferred binding still fails — pointing the diagnostic at the operator. The flag is documented in [cli](../cli.md).
+Both always parse; the parser records that a pipe was seen (`used_pipe_operators`, plus the earliest pipe token for a precise diagnostic) but does not itself reject them. Compiling a file that uses one requires the `pipe-operators` experimental feature (`--extra-experimental-features pipe-operators`, Nix-style); otherwise the compile chokepoint (`Evaluator.parseAndCompile`) rejects the file *on presence* — like Nix, an unused or deferred binding still fails — pointing the diagnostic at the operator. The flag is documented in [cli](../cli.md).
 
 ## List juxtaposition restriction
 

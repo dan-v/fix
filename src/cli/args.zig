@@ -14,7 +14,11 @@ pub const usage =
     \\  --json                 write the evaluated value as JSON
     \\  --xml                  write the evaluated value as XML
     \\  --strict               recursively force attr values and list items before writing
-    \\  --pipe-operators       enable the |> and <| pipe operators (experimental)
+    \\  --experimental-features FEATS
+    \\                         space-separated experimental features to enable,
+    \\                         replacing the current set (available: pipe-operators)
+    \\  --extra-experimental-features FEATS
+    \\                         like --experimental-features, but adds to the set
     \\  --debug-derivations[=MODE]
     \\                         write derivation debug records to stderr: summary, full
     \\  --debug-derivation-filter TEXT
@@ -41,6 +45,30 @@ pub const OutputFormat = enum {
     xml,
 };
 
+/// Nix-style experimental features. Names match Nix's spelling so that the
+/// same `--experimental-features pipe-operators` invocation works here.
+pub const ExperimentalFeature = enum {
+    pipe_operators,
+
+    pub fn fromName(name: []const u8) ?ExperimentalFeature {
+        if (std.mem.eql(u8, name, "pipe-operators")) return .pipe_operators;
+        return null;
+    }
+};
+
+pub const ExperimentalFeatures = std.EnumSet(ExperimentalFeature);
+
+/// Parse a space-separated feature list into `set`, inserting each recognized
+/// feature. Unknown names are an error (Nix warns; we reject to keep the CLI's
+/// fail-fast behaviour). An empty/whitespace-only list inserts nothing.
+fn parseFeatureList(set: *ExperimentalFeatures, list: []const u8) !void {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |name| {
+        const feat = ExperimentalFeature.fromName(name) orelse return error.UnknownExperimentalFeature;
+        set.insert(feat);
+    }
+}
+
 pub const EvaluationMode = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
@@ -54,7 +82,7 @@ pub const SourceArg = union(enum) {
 pub const Options = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
-    pipe_operators: bool = false,
+    experimental_features: ExperimentalFeatures = .{},
     color: cli.When = .auto,
     progress: cli.When = .auto,
     show_trace: bool = false,
@@ -116,8 +144,16 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.output = .xml;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             options.strict = true;
-        } else if (std.mem.eql(u8, arg, "--pipe-operators")) {
-            options.pipe_operators = true;
+        } else if (std.mem.eql(u8, arg, "--experimental-features")) {
+            options.experimental_features = .{};
+            try parseFeatureList(&options.experimental_features, args_iter.next() orelse return error.MissingExperimentalFeatures);
+        } else if (std.mem.startsWith(u8, arg, "--experimental-features=")) {
+            options.experimental_features = .{};
+            try parseFeatureList(&options.experimental_features, arg["--experimental-features=".len..]);
+        } else if (std.mem.eql(u8, arg, "--extra-experimental-features")) {
+            try parseFeatureList(&options.experimental_features, args_iter.next() orelse return error.MissingExperimentalFeatures);
+        } else if (std.mem.startsWith(u8, arg, "--extra-experimental-features=")) {
+            try parseFeatureList(&options.experimental_features, arg["--extra-experimental-features=".len..]);
         } else if (std.mem.eql(u8, arg, "--debug-derivations")) {
             options.derivation_debug.mode = .summary;
         } else if (std.mem.startsWith(u8, arg, "--debug-derivations=")) {
@@ -222,6 +258,8 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidVmTraceFormat => "expected --vm-trace-format to be text or binary",
         error.MissingVmTraceMaxEvents => "missing count after --vm-trace-max-events",
         error.InvalidVmTraceMaxEvents => "expected --vm-trace-max-events to be a non-negative integer",
+        error.MissingExperimentalFeatures => "missing feature list after --experimental-features or --extra-experimental-features",
+        error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators)",
         error.MissingWorkers => "missing N after --workers",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.MissingMaxMemory => "missing size after --max-memory",

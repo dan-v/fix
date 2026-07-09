@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     // Lazy shells only matter for lazy-XML rendering; elsewhere the wrap
     // is pure thunk-allocation overhead (see `vm.lazy_shells_visible`).
     ev.lazy_shells_visible = options.output == .xml;
-    ev.pipe_operators_enabled = options.pipe_operators;
+    ev.pipe_operators_enabled = options.experimental_features.contains(.pipe_operators);
     ev.setParallelismToggles(options.disable_spec_thunks, options.disable_fanout);
     ev.setDerivationDebug(options.derivation_debug.enabled());
     ev.max_memory_bytes = options.max_memory;

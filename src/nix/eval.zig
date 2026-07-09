@@ -84,7 +84,8 @@ pub const Evaluator = struct {
     /// Whether the `|>`/`<|` pipe operators are permitted. They always
     /// parse; when this is false, `parseAndCompile` rejects any source that
     /// used one (matching Nix, which gates the feature on presence). The CLI
-    /// sets it true for `--pipe-operators`. Default false.
+    /// sets it true for `--extra-experimental-features pipe-operators`.
+    /// Default false.
     pipe_operators_enabled: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
@@ -417,7 +418,7 @@ pub const Evaluator = struct {
                 .offset = tok.offset,
                 .len = tok.len,
                 .token_type = tok.type,
-                .message = "pipe operators are disabled; pass --pipe-operators to enable them",
+                .message = "pipe operators are disabled; pass --extra-experimental-features pipe-operators to enable them",
             }}, source, source_path);
             return error.PipeOperatorsDisabled;
         }
