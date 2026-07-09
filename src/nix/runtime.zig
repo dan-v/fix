@@ -22,6 +22,7 @@ pub const builtins = @import("runtime/builtins.zig");
 pub const file_cache = @import("runtime/file_cache.zig");
 pub const fetch_cache = @import("runtime/fetch_cache.zig");
 pub const store = @import("runtime/store.zig");
+pub const io_runtime = @import("runtime/io_runtime.zig");
 pub const mem_tag = @import("runtime/mem_tag.zig");
 
 // Common flat re-exports for the most-used types.
@@ -46,5 +47,6 @@ test {
     _ = builtins;
     _ = file_cache;
     _ = fetch_cache;
+    _ = io_runtime;
     _ = mem_tag;
 }

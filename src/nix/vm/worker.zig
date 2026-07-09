@@ -168,7 +168,15 @@ pub const WorkerFiber = struct {
     ready_node: scheduler_mod.ReadyNode,
     /// Thunk waiter — `wake_fn` recovers the parent via `@fieldParentPtr`
     /// and enqueues the fiber onto its allocator-worker's ready queue.
+    /// Reused for IO waits too (a fiber never waits on a thunk and an IO
+    /// completion at the same time).
     waiter: thunk_mod.Waiter,
+    /// Completion cell for a daemon/fetch IO offload (see `vm/io_offload.zig`).
+    /// Lives on the (stable) WorkerFiber rather than the fiber's stack because
+    /// the IO thread touches it inside `publish()` *after* the woken fiber may
+    /// have already resumed and reused its stack frame. Re-`initClaimed`ed
+    /// before each offload; idle otherwise.
+    io_future: thunk_mod.Future,
     /// Scratch trace used during speculative `force_thunk` tasks. Lets
     /// the failing thunk's error message be captured (and copied onto the
     /// thunk's cached error info) without polluting the user's shared
@@ -895,6 +903,7 @@ pub const Worker = struct {
             .next_free = null,
             .ready_node = .{},
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },
+            .io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(fiber_id)),
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
         errdefer f.scratch.deinit();

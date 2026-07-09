@@ -77,6 +77,20 @@ pub const DerivationStore = struct {
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
 
+    /// Optional off-thread executor for blocking daemon ops. When set (by the
+    /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
+    /// on the shared IO thread while the calling fiber parks — keeping the
+    /// socket syscalls off the compute workers. Null → ops run inline on the
+    /// caller (the `fix store` CLI and tests, which have no fiber to park).
+    offload: ?Offload = null,
+
+    /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
+    /// on the IO thread and blocks the calling fiber until it returns.
+    pub const Offload = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, work: *const fn (*anyopaque) void, work_ctx: *anyopaque) void,
+    };
+
     const LazyDrvEntry = struct { token: u64, bits: u64 };
 
     const Record = struct {
@@ -121,6 +135,17 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
+    /// Install the off-thread daemon-op executor. Must be called before any
+    /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
+    /// torn down.
+    pub fn setOffload(self: *DerivationStore, off: Offload) void {
+        self.offload = off;
+    }
+
+    pub fn clearOffload(self: *DerivationStore) void {
+        self.offload = null;
+    }
+
     /// Connect to the daemon on first use and return it (owned here). Errors if
     /// no IO handle was set or the daemon is unreachable — matching Nix, which
     /// fails a store op when the daemon is down. Caller must hold `daemon_mu`.
@@ -148,7 +173,7 @@ pub const DerivationStore = struct {
     /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.addText(store_path, text, references);
+        return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
     }
 
     /// Write a NAR-serialized source tree, gated on `store_writes_enabled`.
@@ -156,21 +181,14 @@ pub const DerivationStore = struct {
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.addPathToStore(store_path, nar_bytes);
+        return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
         if (!self.store_writes_enabled) return;
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        if (self.instantiated.contains(store_path)) return;
-        const daemon = try self.ensureDaemon();
-        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
-        const written = try daemon.addFlatFile(self.allocator, storePathName(store_path), bytes, &.{});
-        self.allocator.free(written);
-        try self.markInstantiated(store_path);
+        return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } });
     }
 
     /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon,
@@ -182,24 +200,55 @@ pub const DerivationStore = struct {
         try daemon.buildPaths(derived_paths, sink);
     }
 
-    fn addText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        if (self.instantiated.contains(store_path)) return;
-        const daemon = try self.ensureDaemon();
-        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
-        const written = try daemon.addTextToStore(self.allocator, storePathName(store_path), text, references);
-        self.allocator.free(written);
-        try self.markInstantiated(store_path);
+    const DaemonOp = union(enum) {
+        text: struct { store_path: []const u8, text: []const u8, references: []const []const u8 },
+        path: struct { store_path: []const u8, nar_bytes: []const u8 },
+        flat: struct { store_path: []const u8, bytes: []const u8 },
+    };
+
+    /// Dispatch a store write onto the IO thread (when an offload is installed
+    /// and we're on a fiber) or inline on the caller. The op's args are borrowed
+    /// and, in the offloaded path, stay valid because the calling fiber parks —
+    /// its stack (holding the non-GC NAR/text buffers) is preserved for the
+    /// whole transfer, so no copy is needed.
+    fn runDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
+        if (self.offload) |off| {
+            var cell: OpCell = .{ .store = self, .op = op };
+            off.run(off.ctx, OpCell.run, &cell);
+            return cell.err;
+        }
+        return self.applyDaemonOp(op);
     }
 
-    fn addPathToStore(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
+    const OpCell = struct {
+        store: *DerivationStore,
+        op: DaemonOp,
+        err: anyerror!void = {},
+
+        fn run(p: *anyopaque) void {
+            const self: *OpCell = @ptrCast(@alignCast(p));
+            self.err = self.store.applyDaemonOp(self.op);
+        }
+    };
+
+    /// Perform a store write against the daemon. Runs on the IO thread when
+    /// offloaded (the single serial consumer of the connection), else inline;
+    /// `daemon_mu` still guards against a concurrent inline `buildPaths`. Skips
+    /// the transfer when the path is already valid (see `instantiated`).
+    fn applyDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
+        const store_path = switch (op) {
+            inline else => |o| o.store_path,
+        };
         if (self.instantiated.contains(store_path)) return;
         const daemon = try self.ensureDaemon();
         if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
-        const written = try daemon.addPath(self.allocator, storePathName(store_path), nar_bytes, &.{});
+        const written = switch (op) {
+            .text => |o| try daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
+            .path => |o| try daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),
+            .flat => |o| try daemon.addFlatFile(self.allocator, storePathName(store_path), o.bytes, &.{}),
+        };
         self.allocator.free(written);
         try self.markInstantiated(store_path);
     }

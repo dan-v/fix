@@ -50,6 +50,7 @@ pub const trace = @import("vm/trace.zig");
 pub const debug = @import("vm/debug.zig");
 pub const trace_log = @import("vm/trace_log.zig");
 pub const worker = @import("vm/worker.zig");
+pub const io_offload = @import("vm/io_offload.zig");
 
 pub const opcode_profile_enabled = build_options.vm_opcode_profile;
 pub const thunks_log_enabled = build_options.thunks_log;

@@ -45,6 +45,8 @@ const tuning = @import("eval/tuning.zig");
 const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("vm").worker;
+const io_offload = @import("vm").io_offload;
+const io_runtime_mod = @import("runtime").io_runtime;
 const eval_gc = @import("eval/gc.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe").prof;
@@ -68,6 +70,11 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
+    /// Single background thread that runs blocking daemon store ops off the
+    /// compute fibers (see `runtime.io_runtime`). Heap-allocated so its address
+    /// is stable — the thread captures it, and the Evaluator itself is returned
+    /// by value from `init`.
+    io_runtime: *io_runtime_mod.IoRuntime,
     /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
     regexes: regex_mod.PatternCache,
     imports: imports_mod.Registry,
@@ -204,7 +211,13 @@ pub const Evaluator = struct {
         } else {};
         errdefer if (gc.enabled) allocator.free(gc_workers);
 
-        return .{
+        const io_rt = try allocator.create(io_runtime_mod.IoRuntime);
+        errdefer allocator.destroy(io_rt);
+        io_rt.* = io_runtime_mod.IoRuntime.init();
+        try io_rt.start();
+        errdefer io_rt.deinit();
+
+        var ev: Evaluator = .{
             .allocator = allocator,
             .intern = intern,
             .registry = registry,
@@ -213,6 +226,7 @@ pub const Evaluator = struct {
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
+            .io_runtime = io_rt,
             .regexes = regex_mod.PatternCache.init(allocator),
             .imports = .{},
             .search_paths = .{},
@@ -235,6 +249,11 @@ pub const Evaluator = struct {
             .gc_import_vms_mu = if (gc.enabled) .{} else {},
             .gc_workers = gc_workers,
         };
+        // Route daemon store writes through the IO thread. `offload` is plain
+        // movable data (a stable heap ptr + a fn ptr), so it survives the
+        // by-value return of `ev`.
+        ev.derivations.setOffload(.{ .ctx = io_rt, .run = io_offload.run });
+        return ev;
     }
 
     pub fn deinit(self: *Evaluator) void {
@@ -282,6 +301,12 @@ pub const Evaluator = struct {
         self.imports.deinit(self.allocator);
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
+        // Stop the IO thread before the daemon connection it drives is closed.
+        // Safe here: the scheduler + main worker are already joined above, so
+        // no fiber is still parked on an in-flight store op.
+        self.derivations.clearOffload();
+        self.io_runtime.deinit();
+        self.allocator.destroy(self.io_runtime);
         self.derivations.deinit();
         self.regexes.deinit();
         self.files.deinit();
