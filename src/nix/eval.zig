@@ -380,6 +380,7 @@ pub const Evaluator = struct {
 
     pub fn setEnvironment(self: *Evaluator, env_map: *const std.process.Environ.Map) void {
         self.env_map = env_map;
+        self.fetchers.setEnvironment(env_map);
         // Point the fetch download-cache at `$XDG_CACHE_HOME/fix` (default
         // `~/.cache/fix`), mirroring Nix's `~/.cache/nix`. Best-effort; without
         // HOME/XDG the FetchCache keeps its `./.zig-cache/fix` fallback.

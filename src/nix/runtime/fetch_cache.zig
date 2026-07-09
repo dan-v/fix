@@ -33,6 +33,14 @@ pub const FetchCache = struct {
     /// add an `Authorization: Bearer` header on downloads to a matching host
     /// (private GitHub/GitLab/… archives). Owned; see `setAccessTokens`.
     access_tokens: std.ArrayListUnmanaged(TokenEntry) = .empty,
+    /// The process environment (borrowed), inherited by git/tar/hg subprocesses.
+    env: ?*const std.process.Environ.Map = null,
+    /// Lazily-built subprocess environment = `env` plus `GIT_TERMINAL_PROMPT=0`,
+    /// so a git CLI fetch of a private remote fails fast instead of blocking on
+    /// an interactive credential prompt. Nix gets this for free by fetching via
+    /// libgit2; we shell out to git, so we disable the prompt ourselves. Built
+    /// on first subprocess run (most evals never fetch); owned, freed in deinit.
+    subprocess_env: ?std.process.Environ.Map = null,
 
     const TokenEntry = struct { host: []u8, token: []u8 };
 
@@ -136,10 +144,34 @@ pub const FetchCache = struct {
             self.allocator.free(t.token);
         }
         self.access_tokens.deinit(self.allocator);
+        if (self.subprocess_env) |*e| e.deinit();
     }
 
     pub fn setIo(self: *FetchCache, io: std.Io) void {
         self.io = io;
+    }
+
+    /// Set the process environment inherited by git/tar/hg subprocesses.
+    pub fn setEnvironment(self: *FetchCache, env: *const std.process.Environ.Map) void {
+        self.env = env;
+        if (self.subprocess_env) |*e| { // rebuild lazily on next use
+            e.deinit();
+            self.subprocess_env = null;
+        }
+    }
+
+    /// The environment for a git/tar/hg subprocess: the inherited process env
+    /// plus `GIT_TERMINAL_PROMPT=0`. Built once and cached. Null (inherit the
+    /// parent env unchanged) when no environment was set (e.g. tests).
+    fn subprocessEnviron(self: *FetchCache) !?*const std.process.Environ.Map {
+        if (self.subprocess_env) |*e| return e;
+        const parent = self.env orelse return null;
+        var env = std.process.Environ.Map.init(self.allocator);
+        errdefer env.deinit();
+        for (parent.keys(), parent.values()) |k, v| try env.put(k, v);
+        try env.put("GIT_TERMINAL_PROMPT", "0");
+        self.subprocess_env = env;
+        return &self.subprocess_env.?;
     }
 
     /// Parse a `nix.conf` `access-tokens` value — space-separated
@@ -660,6 +692,7 @@ pub const FetchCache = struct {
         const result = try std.process.run(self.allocator, io, .{
             .argv = argv,
             .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = try self.subprocessEnviron(),
             .stdout_limit = .limited(command_stdout_limit),
             .stderr_limit = .limited(command_stderr_limit),
         });
@@ -721,6 +754,28 @@ test "access-tokens: parse and longest-prefix host/path match" {
     // No token for an unlisted host; `github.comX` must not match `github.com`.
     try testing.expect(fc.tokenFor("https://codeberg.org/o/r") == null);
     try testing.expect(fc.tokenFor("https://github.com.evil.example/x") == null);
+}
+
+test "subprocess env: inherits parent and disables the git terminal prompt" {
+    const testing = std.testing;
+    var parent = std.process.Environ.Map.init(testing.allocator);
+    defer parent.deinit();
+    try parent.put("HOME", "/home/u");
+    try parent.put("SSH_AUTH_SOCK", "/run/ssh");
+
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    fc.setEnvironment(&parent);
+
+    const env = (try fc.subprocessEnviron()).?;
+    try testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
+    try testing.expectEqualStrings("/home/u", env.get("HOME").?); // inherited
+    try testing.expectEqualStrings("/run/ssh", env.get("SSH_AUTH_SOCK").?); // inherited (creds/ssh)
+
+    // With no environment set, subprocesses inherit the parent unchanged (null).
+    var bare = FetchCache.init(testing.allocator);
+    defer bare.deinit();
+    try testing.expect((try bare.subprocessEnviron()) == null);
 }
 
 test "access-tokens: per-forge auth header (matches Nix)" {
