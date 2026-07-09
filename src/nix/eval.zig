@@ -350,6 +350,10 @@ pub const Evaluator = struct {
         self.setFetchCacheRoot() catch {};
     }
 
+    pub fn environment(self: *const Evaluator) ?*const std.process.Environ.Map {
+        return self.env_map;
+    }
+
     fn setFetchCacheRoot(self: *Evaluator) !void {
         const env = self.env_map orelse return;
         const base: []const u8, const sub: []const []const u8 = blk: {

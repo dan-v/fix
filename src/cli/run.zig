@@ -4,6 +4,7 @@
 const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
+const registry = @import("registry.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
@@ -106,44 +107,76 @@ pub fn getSource(ev: *Evaluator, source: SourceArg) !Source {
 /// names may contain any character except `.`. The returned text is owned by
 /// `ev.allocator` and lives for the rest of the (one-shot) run.
 fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
+    const alloc = ev.allocator;
     const hash = std.mem.indexOfScalar(u8, installable, '#');
     const flake_ref = if (hash) |i| installable[0..i] else installable;
     const attr_path = if (hash) |i| installable[i + 1 ..] else "";
 
     const resolved = try resolveFlakeRef(ev, flake_ref);
-    defer if (resolved.owned) ev.allocator.free(resolved.ref);
+    defer if (resolved.owned) alloc.free(resolved.ref);
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(ev.allocator);
-
-    try out.appendSlice(ev.allocator, "(builtins.getFlake \"");
-    try appendNixEscaped(ev.allocator, &out, resolved.ref);
-    try out.appendSlice(ev.allocator, "\")");
-
+    // Build the attr-select suffix (`."a"."b"`) from the fragment.
+    var suffix: std.ArrayListUnmanaged(u8) = .empty;
+    defer suffix.deinit(alloc);
     var it = std.mem.splitScalar(u8, attr_path, '.');
+    var has_attr = false;
     while (it.next()) |component| {
         if (component.len == 0) continue;
-        try out.appendSlice(ev.allocator, ".\"");
-        try appendNixEscaped(ev.allocator, &out, component);
-        try out.append(ev.allocator, '"');
+        has_attr = true;
+        try suffix.appendSlice(alloc, ".\"");
+        try appendNixEscaped(alloc, &suffix, component);
+        try suffix.append(alloc, '"');
     }
 
-    return out.toOwnedSlice(ev.allocator);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    // No attr path: the whole flake.
+    if (!has_attr) {
+        try out.appendSlice(alloc, "(builtins.getFlake \"");
+        try appendNixEscaped(alloc, &out, resolved.ref);
+        try out.appendSlice(alloc, "\")");
+        return out.toOwnedSlice(alloc);
+    }
+
+    // With an attr path, try the `nix build`/`nix eval` installable prefixes —
+    // `packages.<system>.<attr>`, then `legacyPackages.<system>.<attr>` (for
+    // `nixpkgs#hello`), falling back to the literal `<attr>` (for flake outputs
+    // at top level). `or` catches a missing attr at any point in each path.
+    try out.appendSlice(alloc, "(let f = builtins.getFlake \"");
+    try appendNixEscaped(alloc, &out, resolved.ref);
+    try out.appendSlice(alloc, "\"; s = builtins.currentSystem; in f.packages.${s}");
+    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, " or f.legacyPackages.${s}");
+    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, " or f");
+    try out.appendSlice(alloc, suffix.items);
+    try out.appendSlice(alloc, ")");
+    return out.toOwnedSlice(alloc);
 }
 
 const ResolvedRef = struct { ref: []const u8, owned: bool };
 
 /// Turn a CLI flakeref into one `builtins.getFlake` accepts. `.` and paths
 /// (`/…`, `./…`, `../…`) become an absolute path resolved against the base
-/// path; everything else (scheme refs like `github:…`/`path:…`, bare registry
-/// names) passes through unchanged for `getFlake`/`parseFlakeRef` to handle.
+/// path; scheme refs (`github:…`/`path:…`) pass through; a bare id (`nixpkgs`,
+/// `nixpkgs/branch`) is resolved through the Nix registry (`registry.json`).
 fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
-    const is_path = flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.');
-    if (!is_path) return .{ .ref = flake_ref, .owned = false };
+    if (flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.')) {
+        const base = ev.base_path orelse return .{ .ref = flake_ref, .owned = false };
+        const abs = try std.fs.path.resolve(ev.allocator, &.{ base, flake_ref });
+        return .{ .ref = abs, .owned = true };
+    }
+    // A scheme ref (`github:`, `path:`, `git+…`) passes through.
+    if (std.mem.indexOfScalar(u8, flake_ref, ':') != null) return .{ .ref = flake_ref, .owned = false };
 
-    const base = ev.base_path orelse return .{ .ref = flake_ref, .owned = false };
-    const abs = try std.fs.path.resolve(ev.allocator, &.{ base, flake_ref });
-    return .{ .ref = abs, .owned = true };
+    // Bare id: resolve `<id>` (before any `/branch`) via the registry.
+    const id_end = std.mem.indexOfScalar(u8, flake_ref, '/') orelse flake_ref.len;
+    const id = flake_ref[0..id_end];
+    if (id.len != 0) {
+        if (try registry.resolve(ev.allocator, ev, id)) |ref| return .{ .ref = ref, .owned = true };
+    }
+    return .{ .ref = flake_ref, .owned = false };
 }
 
 /// Append `text` escaped for a Nix double-quoted string literal. `$` is escaped
