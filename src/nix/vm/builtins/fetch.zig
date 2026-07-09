@@ -626,8 +626,13 @@ fn flakeSelfInput(self: anytype, source_info: Value) !Value {
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
     try entries.append(self.allocator, .{ .name = try self.intern.intern("_type"), .value = Value.string(try self.intern.intern("flake")) });
-    try appendExistingAttr(self, &entries, source_info.asObjectId(), "outPath");
     try entries.append(self.allocator, .{ .name = try self.intern.intern("sourceInfo"), .value = source_info });
+    // Promote the sourceInfo fields onto `self`, as Nix does — flakes (nixpkgs
+    // among them) read `self.lastModified`, `self.rev`, etc. directly.
+    const source_id = source_info.asObjectId();
+    for ([_][]const u8{ "outPath", "narHash", "lastModified", "lastModifiedDate", "rev", "revCount", "shortRev" }) |field| {
+        try appendExistingAttr(self, &entries, source_id, field);
+    }
     return Value.attrs(try self.heap.addAttrs(entries.items));
 }
 
