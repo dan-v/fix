@@ -106,8 +106,14 @@ pub const Options = struct {
     progress: cli.When = .auto,
     show_trace: bool = false,
     derivation_debug: derivation_debug.Options = .{},
-    /// `fix build --no-link`: skip creating the `./result` symlink.
+    /// `fix build --no-link`/`--no-out-link`: skip creating the result symlink.
     no_link: bool = false,
+    /// `--out-link NAME`/`-o`: name of the result symlink (default `result`).
+    out_link: ?[]const u8 = null,
+    /// `--drv-link NAME`: name of the derivation symlink (default `derivation`).
+    drv_link: ?[]const u8 = null,
+    /// `--add-drv-link`: also create a symlink to the top-level `.drv`.
+    add_drv_link: bool = false,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -201,8 +207,11 @@ const Opt = enum {
     experimental_features,
     extra_experimental_features,
     option,
-    // Build.
+    // Build outputs / links.
     no_link,
+    out_link,
+    drv_link,
+    add_drv_link,
     // Diagnostics.
     show_trace,
     color,
@@ -266,6 +275,8 @@ const Spec = struct {
 
 /// Commands that take a source expression (everything but the bare `repl`).
 const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
+/// Commands that produce a top-level `.drv` a link/root can point at.
+const drv_cmds = &[_]Cmd{ .build, .instantiate };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-e", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text", .show_in = source_cmds },
@@ -284,7 +295,11 @@ const specs = [_]Spec{
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
     .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting" },
 
-    .{ .id = .no_link, .long = "--no-link", .help = "do not create the ./result symlink", .show_in = &.{.build} },
+    .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build} },
+    .{ .id = .no_link, .long = "--no-out-link", .help = "do not create the result symlink", .show_in = &.{.build} },
+    .{ .id = .no_link, .long = "--no-link", .hidden = true }, // alias of --no-out-link
+    .{ .id = .drv_link, .long = "--drv-link", .arg = .req, .metavar = "NAME", .help = "name of the derivation symlink (default: derivation)", .show_in = drv_cmds },
+    .{ .id = .add_drv_link, .long = "--add-drv-link", .help = "also create a symlink to the .drv", .show_in = drv_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error" },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
@@ -443,6 +458,9 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .option => try options.option_overrides.append(allocator, .{ .name = v0.?, .value = v1.? }),
 
         .no_link => options.no_link = true,
+        .out_link => options.out_link = v0.?,
+        .drv_link => options.drv_link = v0.?,
+        .add_drv_link => options.add_drv_link = true,
 
         .show_trace => options.show_trace = true,
         .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,

@@ -8,6 +8,7 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
+const build = @import("build.zig");
 
 const Evaluator = fix.Evaluator;
 
@@ -75,6 +76,14 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     };
 
     ok = true;
+
+    if (options.add_drv_link) {
+        const name = options.drv_link orelse "derivation";
+        build.makeLink(init.io, name, drv_path) catch |err| {
+            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
+        };
+    }
+
     var stdout_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     try w.interface.print("{s}\n", .{drv_path});

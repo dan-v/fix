@@ -97,9 +97,18 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionEnd();
     ok = true;
 
-    if (!options.no_link) linkResult(init.io, out_path) catch |err| {
-        std.debug.print("warning: could not create ./result: {s}\n", .{@errorName(err)});
-    };
+    if (!options.no_link) {
+        const name = options.out_link orelse "result";
+        makeLink(init.io, name, out_path) catch |err| {
+            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
+        };
+    }
+    if (options.add_drv_link) {
+        const name = options.drv_link orelse "derivation";
+        makeLink(init.io, name, drv_path) catch |err| {
+            std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
+        };
+    }
 
     var stdout_buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
@@ -108,11 +117,12 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     return 0;
 }
 
-fn linkResult(io: std.Io, out_path: []const u8) !void {
+/// Replace `./<name>` with a symlink to `target` (the result/derivation link).
+pub fn makeLink(io: std.Io, name: []const u8, target: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
-    cwd.deleteFile(io, "result") catch |err| switch (err) {
+    cwd.deleteFile(io, name) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
-    try cwd.symLink(io, out_path, "result", .{});
+    try cwd.symLink(io, target, name, .{});
 }
