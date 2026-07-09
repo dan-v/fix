@@ -782,7 +782,10 @@ fn resolveNode(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, 
 
     const locked_v = node.get("locked") orelse return error.InvalidFlakeLock;
     if (locked_v != .object) return error.InvalidFlakeLock;
-    const src_info = try builtinFetchTree(self, try jsonObjectToAttrs(self, locked_v.object));
+    // Skip the download+ingest when the locked narHash's store path is already
+    // valid (Nix pins inputs by narHash; a valid CA path IS the content).
+    const src_info = (try flakeInputFromStore(self, locked_v.object)) orelse
+        try builtinFetchTree(self, try jsonObjectToAttrs(self, locked_v.object));
     vm_force.rootKeep(self, src_info);
 
     const is_flake = switch (node.get("flake") orelse std.json.Value{ .bool = true }) {
@@ -823,6 +826,46 @@ fn resolveNode(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, 
     vm_force.rootKeep(self, val);
     try memo.put(self.allocator, node_name, val);
     return val;
+}
+
+/// If store writes are enabled and this locked input's narHash names a store
+/// path that is already valid, return the equivalent tree value directly —
+/// skipping the download + ingest. Fail-open: any miss (no narHash, unsupported
+/// type, unparseable hash, path not valid) returns null and the caller fetches.
+/// Reuses the same store-path scheme (`sourcePath`) and value constructors the
+/// real fetch would, so a skipped fetch is indistinguishable from a real one.
+fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
+    if (!self.derivations.store_writes_enabled) return null;
+    const nh_v = locked.get("narHash") orelse return null;
+    if (nh_v != .string) return null;
+    const nar_hash = nh_v.string;
+    const type_v = locked.get("type") orelse return null;
+    if (type_v != .string) return null;
+    const ty = type_v.string;
+
+    // Recursive-NAR (sourcePath) inputs only: github/tarball/path. git/mercurial
+    // ingest differently and are left to fetch; file is flat, not a tree.
+    const is_github = std.mem.eql(u8, ty, "github");
+    const is_tarball = std.mem.eql(u8, ty, "tarball");
+    const is_path = std.mem.eql(u8, ty, "path");
+    if (!is_github and !is_tarball and !is_path) return null;
+
+    // The store-path name must match what the fetch would use (see builtinFetchTree).
+    const name = if (is_path)
+        path_ops.baseName((locked.get("path") orelse return null).string)
+    else if (locked.get("name")) |n| (if (n == .string) n.string else "source") else "source";
+
+    const hex = derivation.hashToBase16(self.allocator, "sha256", nar_hash) catch return null;
+    defer self.allocator.free(hex);
+    const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, name, hex);
+    defer self.allocator.free(store_path);
+    if (!try self.derivations.pathIsValid(store_path)) return null;
+
+    if (is_github) {
+        const rev = if (locked.get("rev")) |r| (if (r == .string) r.string else null) else null;
+        return try githubTreeValue(self, store_path, nar_hash, rev);
+    }
+    return try pathTreeValue(self, store_path, nar_hash);
 }
 
 /// Build a Nix attrset from a flake.lock `locked` node's JSON (string + integer

@@ -191,6 +191,45 @@ pub const DerivationStore = struct {
         return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } });
     }
 
+    /// Is `store_path` already valid in the store? Used to skip fetching an
+    /// input we already have (content-addressed, so a valid path for a given
+    /// hash IS the right content). Only meaningful with store writes enabled
+    /// (else there is no daemon); returns false otherwise. Offloaded like the
+    /// writes so the calling fiber parks rather than blocking on the socket.
+    pub fn pathIsValid(self: *DerivationStore, store_path: []const u8) !bool {
+        if (!self.store_writes_enabled) return false;
+        if (self.offload) |off| {
+            var cell: QueryCell = .{ .store = self, .store_path = store_path };
+            off.run(off.ctx, QueryCell.run, &cell);
+            if (cell.err) |e| return e;
+            return cell.valid;
+        }
+        return self.applyIsValid(store_path);
+    }
+
+    const QueryCell = struct {
+        store: *DerivationStore,
+        store_path: []const u8,
+        valid: bool = false,
+        err: ?anyerror = null,
+
+        fn run(p: *anyopaque) void {
+            const c: *QueryCell = @ptrCast(@alignCast(p));
+            c.valid = c.store.applyIsValid(c.store_path) catch |e| {
+                c.err = e;
+                return;
+            };
+        }
+    };
+
+    fn applyIsValid(self: *DerivationStore, store_path: []const u8) !bool {
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        if (self.instantiated.contains(store_path)) return true;
+        const daemon = try self.ensureDaemon();
+        return daemon.isValidPath(store_path);
+    }
+
     /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon,
     /// forwarding the build activity/log stream to `sink` if given.
     pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink) !void {
