@@ -135,6 +135,10 @@ pub const BuiltinId = enum(u16) {
     /// Args: (ref_attrs, sub_inputs | null, is_flake). Backs each `inputs.<name>`
     /// so unused inputs are never fetched. See vm/builtins/fetch.zig.
     resolve_flake_node = 111,
+    /// Internal: compute a fetched tree's NAR hash (SRI) on force. Backs the
+    /// `narHash` of a fetched tree under plain eval so the (real, Nix-matching)
+    /// hash is only computed when accessed. Arg: (tree path). See fetch.zig.
+    compute_nar_hash = 112,
 };
 
 const BuiltinBinding = struct {
@@ -365,6 +369,7 @@ pub fn arity(id: BuiltinId) u8 {
         .ceil,
         .baseNameOf,
         .dirOf,
+        .compute_nar_hash,
         => 1,
         .hasAttr,
         .getAttr,

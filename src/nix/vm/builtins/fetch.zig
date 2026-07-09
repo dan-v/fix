@@ -162,15 +162,17 @@ const FetchedOut = struct {
 };
 
 fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
+    _ = rev;
     if (self.derivations.store_writes_enabled) {
         const ingested = try source_paths.ingest(self.allocator, self.derivations, self.files, cache_path, name, filter);
         return .{ .out_path = ingested.store_path, .nar_hash = ingested.nar_hash };
     }
-    const synthetic = try self.fetchers.sourceHash(cache_path, rev);
-    defer self.fetchers.allocator.free(synthetic);
+    // Plain eval: keep the on-disk cache path (readable) and defer the NAR hash
+    // (empty sentinel -> `treeNarHashValue` makes it a lazy thunk), so we match
+    // Nix's real narHash without eagerly hashing trees that aren't inspected.
     return .{
         .out_path = try self.allocator.dupe(u8, cache_path),
-        .nar_hash = try self.allocator.dupe(u8, synthetic),
+        .nar_hash = try self.allocator.dupe(u8, ""),
     };
 }
 
@@ -307,11 +309,35 @@ fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCach
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
 
+/// The `narHash` value for a fetched tree: an eager SRI string when we already
+/// have it (store writes, where ingest computed it), or — when `nar_hash` is
+/// empty (plain eval) — a thunk that computes the real NAR hash of `path` only
+/// if it's accessed, matching Nix (which never hashes a tree eagerly here).
+fn treeNarHashValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
+    if (nar_hash.len != 0) return Value.string(try self.intern.intern(nar_hash));
+    return shared.makeBuiltinThunk(self, .compute_nar_hash, &.{Value.string(try self.intern.intern(path))});
+}
+
+/// Compute a fetched tree's NAR hash in Nix SRI form (`sha256-<base64>`).
+/// Backs the lazy `narHash` thunk (see `treeNarHashValue`).
+pub fn computeNarHash(self: anytype, path_value: Value) !Value {
+    const path = self.intern.get(path_value.asInternId());
+    const nar_bytes = try nar.serialize(self.allocator, self.files, path, null);
+    defer self.allocator.free(nar_bytes);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
+    const enc = std.base64.standard.Encoder;
+    var buf: [7 + 44]u8 = undefined;
+    @memcpy(buf[0..7], "sha256-");
+    const encoded = enc.encode(buf[7..], &digest);
+    return Value.string(try self.intern.intern(buf[0 .. 7 + encoded.len]));
+}
+
 fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash) },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
@@ -545,7 +571,7 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
     try entries.appendSlice(self.allocator, &.{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
+        .{ .name = try self.intern.intern("narHash"), .value = try treeNarHashValue(self, path, nar_hash) },
         .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     });
     if (rev) |value| {
