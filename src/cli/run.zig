@@ -4,7 +4,6 @@
 const std = @import("std");
 const render = @import("render.zig");
 const args = @import("args.zig");
-const registry = @import("registry.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
@@ -157,24 +156,16 @@ fn lowerFlakeInstallable(ev: *Evaluator, installable: []const u8) ![]const u8 {
 
 const ResolvedRef = struct { ref: []const u8, owned: bool };
 
-/// Turn a CLI flakeref into one `builtins.getFlake` accepts. `.` and paths
-/// (`/…`, `./…`, `../…`) become an absolute path resolved against the base
-/// path; scheme refs (`github:…`/`path:…`) pass through; a bare id (`nixpkgs`,
-/// `nixpkgs/branch`) is resolved through the Nix registry (`registry.json`).
+/// Turn a CLI flakeref into one `builtins.getFlake` accepts. Only the
+/// CLI-specific bit lives here: `.` and paths (`/…`, `./…`, `../…`) resolve to
+/// an absolute path against the base path (the cwd). Everything else — scheme
+/// refs (`github:…`, `git+…`) and bare indirect ids (`nixpkgs`) — passes through
+/// to getFlake, which resolves indirect ids via the flake registry itself.
 fn resolveFlakeRef(ev: *Evaluator, flake_ref: []const u8) !ResolvedRef {
     if (flake_ref.len > 0 and (flake_ref[0] == '/' or flake_ref[0] == '.')) {
         const base = ev.base_path orelse return .{ .ref = flake_ref, .owned = false };
         const abs = try std.fs.path.resolve(ev.allocator, &.{ base, flake_ref });
         return .{ .ref = abs, .owned = true };
-    }
-    // A scheme ref (`github:`, `path:`, `git+…`) passes through.
-    if (std.mem.indexOfScalar(u8, flake_ref, ':') != null) return .{ .ref = flake_ref, .owned = false };
-
-    // Bare id: resolve `<id>` (before any `/branch`) via the registry.
-    const id_end = std.mem.indexOfScalar(u8, flake_ref, '/') orelse flake_ref.len;
-    const id = flake_ref[0..id_end];
-    if (id.len != 0) {
-        if (try registry.resolve(ev.allocator, ev, id)) |ref| return .{ .ref = ref, .owned = true };
     }
     return .{ .ref = flake_ref, .owned = false };
 }

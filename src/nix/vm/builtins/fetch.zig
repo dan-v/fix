@@ -15,6 +15,7 @@ const nar = @import("runtime").nar;
 const path_ops = @import("runtime").paths;
 const source_paths = @import("derivation").source_path;
 const eval_progress = @import("observ").progress;
+const flake_registry = @import("flake_registry.zig");
 const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
@@ -1122,8 +1123,17 @@ pub fn builtinParseFlakeRef(self: anytype, arg: Value) !Value {
         return Value.attrs(try self.heap.addAttrs(entries.items));
     }
 
-    // Bare indirect ids (`nixpkgs`) need registry resolution, which the CLI does
-    // before calling getFlake; the builtin itself can't reach the registry.
+    // Bare indirect id (`nixpkgs`, `nixpkgs/nixos-24.05`): resolve through the
+    // flake registry to a concrete ref, re-attach the query, and re-parse.
+    if (try flake_registry.resolve(self, base)) |concrete| {
+        defer self.allocator.free(concrete);
+        const full = if (q_idx != null)
+            try std.fmt.allocPrint(self.allocator, "{s}?{s}", .{ concrete, query })
+        else
+            try self.allocator.dupe(u8, concrete);
+        defer self.allocator.free(full);
+        return builtinParseFlakeRef(self, Value.string(try self.intern.intern(full)));
+    }
     return error.InvalidFlakeRef;
 }
 

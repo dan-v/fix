@@ -11,8 +11,26 @@
 //! (scalar last-wins covers `http-connections`, `max-jobs`, `cores`, ...).
 
 const std = @import("std");
-const registry = @import("registry.zig");
 const Evaluator = @import("fix").eval.Evaluator;
+
+/// Build `$<xdg_var>/<tail...>`, or `$HOME/<home_prefix...>/<tail...>` when the
+/// XDG var is unset. Null if neither is available.
+fn dirFile(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, xdg_var: []const u8, home_prefix: []const []const u8, tail: []const []const u8) !?[]u8 {
+    const e = env orelse return null;
+    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    if (e.get(xdg_var)) |xdg| {
+        if (xdg.len != 0) try parts.append(allocator, xdg);
+    }
+    if (parts.items.len == 0) {
+        const home = e.get("HOME") orelse return null;
+        if (home.len == 0) return null;
+        try parts.append(allocator, home);
+        try parts.appendSlice(allocator, home_prefix);
+    }
+    try parts.appendSlice(allocator, tail);
+    return try std.fs.path.join(allocator, parts.items);
+}
 
 pub const Settings = struct {
     allocator: std.mem.Allocator,
@@ -79,7 +97,7 @@ pub fn load(allocator: std.mem.Allocator, ev: *Evaluator) !Settings {
     } else |_| {}
 
     // User.
-    if (try registry.dirFile(allocator, env, "XDG_CONFIG_HOME", &.{".config"}, &.{ "nix", "nix.conf" })) |path| {
+    if (try dirFile(allocator, env, "XDG_CONFIG_HOME", &.{".config"}, &.{ "nix", "nix.conf" })) |path| {
         defer allocator.free(path);
         if (ev.readSourceFile(path)) |data| {
             try settings.mergeLines(data);
