@@ -64,13 +64,23 @@ pub fn build(b: *std.Build) void {
     const gen_tables_step = b.step("gen-parser-tables", "Regenerate the LALR parser tables");
     gen_tables_step.dependOn(&run_gen_tables.step);
 
-    const containers_mod = b.addModule("containers", .{
-        .root_source_file = b.path("src/containers.zig"),
+    // Generic, reusable infrastructure with zero Nix coupling: the bottom of
+    // the module graph. Absorbs the old `containers` and `fiber` modules plus
+    // the generic primitives that lived in `runtime`.
+    const base_mod = b.addModule("base", .{
+        .root_source_file = b.path("src/base/base.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
+    base_mod.addImport("build_options", build_options_mod);
+    // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
+    // resolved target. Lives with the fiber code.
+    switch (target.result.cpu.arch) {
+        .x86_64 => base_mod.addAssemblyFile(b.path("src/base/fiber/swap_x86_64.S")),
+        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
+    }
 
     const runtime_mod = b.addModule("runtime", .{
         .root_source_file = b.path("src/runtime.zig"),
@@ -80,22 +90,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     runtime_mod.addImport("build_options", build_options_mod);
-    runtime_mod.addImport("containers", containers_mod);
-
-    const fiber_mod = b.addModule("fiber", .{
-        .root_source_file = b.path("src/fiber.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .omit_frame_pointer = omit_frame_pointer,
-    });
-    fiber_mod.addImport("build_options", build_options_mod);
-    // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
-    // resolved target. Lives with the fiber code.
-    switch (target.result.cpu.arch) {
-        .x86_64 => fiber_mod.addAssemblyFile(b.path("src/fiber/swap_x86_64.S")),
-        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
-    }
+    runtime_mod.addImport("base", base_mod);
 
     const scheduler_mod = b.addModule("scheduler", .{
         .root_source_file = b.path("src/scheduler.zig"),
@@ -106,7 +101,7 @@ pub fn build(b: *std.Build) void {
     });
     scheduler_mod.addImport("build_options", build_options_mod);
     scheduler_mod.addImport("runtime", runtime_mod);
-    scheduler_mod.addImport("containers", containers_mod);
+    scheduler_mod.addImport("base", base_mod);
 
     const derivation_mod = b.addModule("derivation", .{
         .root_source_file = b.path("src/derivation.zig"),
@@ -116,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     derivation_mod.addImport("runtime", runtime_mod);
+    derivation_mod.addImport("base", base_mod);
 
     // Evaluation observability sinks (progress protocol + error-trace collector).
     // Leaf types the interpreter writes to; the evaluator/CLI implement them.
@@ -139,6 +135,7 @@ pub fn build(b: *std.Build) void {
     });
     bytecode_mod.addImport("build_options", build_options_mod);
     bytecode_mod.addImport("runtime", runtime_mod);
+    bytecode_mod.addImport("base", base_mod);
 
     // Opt-in diagnostic instrumentation (timelines, profilers, thunk traces).
     // Reaches into runtime types and bytecode for its trace payloads.
@@ -151,8 +148,7 @@ pub fn build(b: *std.Build) void {
     });
     probe_mod.addImport("build_options", build_options_mod);
     probe_mod.addImport("runtime", runtime_mod);
-    probe_mod.addImport("fiber", fiber_mod);
-    probe_mod.addImport("scheduler", scheduler_mod);
+    probe_mod.addImport("base", base_mod);
     probe_mod.addImport("bytecode", bytecode_mod);
 
     // AST → bytecode compiler. Consumes the syntax AST and emits into the
@@ -166,6 +162,7 @@ pub fn build(b: *std.Build) void {
     });
     compiler_mod.addImport("build_options", build_options_mod);
     compiler_mod.addImport("runtime", runtime_mod);
+    compiler_mod.addImport("base", base_mod);
     compiler_mod.addImport("syntax", syntax_mod);
     compiler_mod.addImport("bytecode", bytecode_mod);
     compiler_mod.addImport("probe", probe_mod);
@@ -182,8 +179,8 @@ pub fn build(b: *std.Build) void {
     });
     vm_mod.addImport("build_options", build_options_mod);
     vm_mod.addImport("runtime", runtime_mod);
+    vm_mod.addImport("base", base_mod);
     vm_mod.addImport("syntax", syntax_mod);
-    vm_mod.addImport("fiber", fiber_mod);
     vm_mod.addImport("scheduler", scheduler_mod);
     vm_mod.addImport("derivation", derivation_mod);
     vm_mod.addImport("observ", observ_mod);
@@ -202,10 +199,9 @@ pub fn build(b: *std.Build) void {
         .build_options = build_options_mod,
         .syntax = syntax_mod,
         .runtime = runtime_mod,
-        .fiber = fiber_mod,
+        .base = base_mod,
         .scheduler = scheduler_mod,
         .derivation = derivation_mod,
-        .containers = containers_mod,
         .observ = observ_mod,
     };
     addSharedImports(mod, shared_imports);
@@ -270,17 +266,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // `runtime`, `syntax`, `fiber`, `scheduler`, `derivation`, and `containers` are each
+    // `runtime`, `syntax`, `scheduler`, `derivation`, and `base` are each
     // separate modules (clean-cut subsystems, see the comment above
     // `syntax_mod`), so their unit tests aren't collected by the root-module
     // test artifacts above — Zig only walks a module's own `@import` graph,
     // and these are pulled into `fix` by module name, not by file inclusion.
     // Run each explicitly, the same way `runtime_tests` already was.
-    const containers_tests = b.addTest(.{
-        .root_module = containers_mod,
+    const base_tests = b.addTest(.{
+        .root_module = base_mod,
         .use_llvm = true,
     });
-    const run_containers_tests = b.addRunArtifact(containers_tests);
+    const run_base_tests = b.addRunArtifact(base_tests);
 
     const runtime_tests = b.addTest(.{
         .root_module = runtime_mod,
@@ -293,12 +289,6 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
     const run_syntax_tests = b.addRunArtifact(syntax_tests);
-
-    const fiber_tests = b.addTest(.{
-        .root_module = fiber_mod,
-        .use_llvm = true,
-    });
-    const run_fiber_tests = b.addRunArtifact(fiber_tests);
 
     const scheduler_tests = b.addTest(.{
         .root_module = scheduler_mod,
@@ -357,10 +347,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
-    test_step.dependOn(&run_fiber_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
-    test_step.dependOn(&run_containers_tests.step);
+    test_step.dependOn(&run_base_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_bytecode_tests.step);
     test_step.dependOn(&run_probe_tests.step);
@@ -393,10 +382,9 @@ const SharedImports = struct {
     build_options: *std.Build.Module,
     syntax: *std.Build.Module,
     runtime: *std.Build.Module,
-    fiber: *std.Build.Module,
+    base: *std.Build.Module,
     scheduler: *std.Build.Module,
     derivation: *std.Build.Module,
-    containers: *std.Build.Module,
     observ: *std.Build.Module,
 };
 
@@ -404,9 +392,8 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("build_options", imports.build_options);
     module.addImport("syntax", imports.syntax);
     module.addImport("runtime", imports.runtime);
-    module.addImport("fiber", imports.fiber);
+    module.addImport("base", imports.base);
     module.addImport("scheduler", imports.scheduler);
     module.addImport("derivation", imports.derivation);
-    module.addImport("containers", imports.containers);
     module.addImport("observ", imports.observ);
 }

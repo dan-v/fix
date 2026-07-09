@@ -4,7 +4,7 @@
 
 pub const types = @import("runtime").types;
 pub const value = @import("runtime").value;
-pub const stable_segments = @import("runtime").stable_segments;
+pub const stable_segments = @import("base").segments;
 pub const token = @import("syntax").token;
 pub const scanner = @import("syntax").scanner;
 pub const string_syntax = @import("syntax").string_syntax;
@@ -18,7 +18,7 @@ pub const compiler = @import("compiler");
 pub const intern = @import("runtime").intern;
 pub const thunk = @import("runtime").thunk;
 pub const scheduler = @import("scheduler");
-pub const fiber = @import("fiber");
+pub const fiber = @import("base").fiber;
 pub const worker = @import("vm").worker;
 pub const file_cache = @import("runtime").file_cache;
 pub const vm = @import("vm");

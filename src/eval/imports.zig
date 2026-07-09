@@ -23,9 +23,9 @@
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
-const fiber_mod = @import("fiber");
+const fiber_mod = @import("base").fiber;
 const worker_mod = @import("vm").worker;
-const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const SpinMutex = @import("base").sync.SpinMutex;
 const timeline = @import("probe").timeline;
 
 /// Path → in-flight `ImportEntry`. The mutex is held only briefly

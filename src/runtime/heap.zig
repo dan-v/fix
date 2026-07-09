@@ -27,8 +27,9 @@ const types = @import("types.zig");
 /// traps at the first stale read with a stack trace, instead of a
 /// nondeterministic segfault much later. Off in ReleaseFast (production).
 pub const gc_debug = build_options.gc and builtin.mode == .ReleaseSafe;
-const stable = @import("stable_segments.zig");
-const worker_id_mod = @import("worker_id.zig");
+const stable = @import("base").segments;
+const sync = @import("base").sync;
+const worker_id_mod = @import("base").worker_id;
 /// GC (`-Dgc`) collector driver: the non-inline mark/sweep/evac/minor-collect
 /// machinery, extracted to keep this file from being a god-file. Free
 /// functions over `*ObjectHeap`; the hot inline alloc-path helpers stay here.
@@ -377,7 +378,7 @@ pub const ObjectHeap = struct {
     /// realistic NixOS toplevel produces ~hundreds of entries against a
     /// heap of millions of objects.
     errored_infos: std.ArrayListUnmanaged(*ErrorInfo),
-    errored_infos_mu: stable.SpinMutex,
+    errored_infos_mu: sync.SpinMutex,
     /// Unique-per-init id for cache invalidation. Same trick as the
     /// intern table: thread-local caches outlive an Evaluator, and the
     /// allocator can reuse heap addresses, so a stale slot would match

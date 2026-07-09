@@ -16,7 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const stable = @import("stable_segments.zig");
+const stable = @import("base").sync;
 const TargetKind = @import("thunk.zig").TargetKind;
 
 /// `-Dprof-main` age-at-force probe support: every Future carries its

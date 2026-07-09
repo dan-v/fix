@@ -47,4 +47,4 @@ pub fn tagName(t: MemTag) [:0]const u8 {
 
 /// The single shared region registry. `Vma(MemTag, …)` memoizes on its
 /// arguments, so this is one process-wide instance everywhere it is named.
-pub const vma = @import("vma.zig").Vma(MemTag, .bigblock, tagName);
+pub const vma = @import("base").vma.Vma(MemTag, .bigblock, tagName);

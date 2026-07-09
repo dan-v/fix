@@ -23,7 +23,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
-const SpinMutex = @import("stable_segments.zig").SpinMutex;
+const SpinMutex = @import("sync.zig").SpinMutex;
 
 const MIN_LOG2: u6 = 16; // 64 KB — the smallest block class
 const CLASS_COUNT: usize = 11; // 64 KB .. 64 MB
@@ -226,8 +226,19 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
     };
 }
 
+/// A throwaway `Vma` instantiation for the tests below: the cache is generic
+/// over its Vma, and these tests only exercise the reuse/passthrough logic, so
+/// the attribution taxonomy is irrelevant. The evaluator's real instantiation
+/// lives in `nix`'s `mem_tag.zig`.
+const TestTag = enum { none };
+const TestVma = @import("vma.zig").Vma(TestTag, .none, struct {
+    fn n(_: TestTag) [:0]const u8 {
+        return "none";
+    }
+}.n);
+
 test "block cache: round-trips and reuses a large block" {
-    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
+    var cache = BlockCacheAllocator(TestVma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 
@@ -244,7 +255,7 @@ test "block cache: round-trips and reuses a large block" {
 }
 
 test "block cache: small and huge allocations pass through" {
-    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
+    var cache = BlockCacheAllocator(TestVma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 
@@ -255,7 +266,7 @@ test "block cache: small and huge allocations pass through" {
 }
 
 test "block cache: in-place resize allowed only within one class" {
-    var cache = BlockCacheAllocator(@import("mem_tag.zig").vma).init(std.testing.allocator);
+    var cache = BlockCacheAllocator(TestVma).init(std.testing.allocator);
     defer cache.deinit();
     const a = cache.allocator();
 

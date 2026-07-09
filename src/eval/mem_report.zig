@@ -13,7 +13,7 @@ const Value = @import("runtime").value.Value;
 const gc = @import("runtime").gc;
 const mem_tag = @import("runtime").mem_tag;
 const vma_mod = mem_tag.vma;
-const block_cache = @import("runtime").block_cache;
+const block_cache = @import("base").block_cache;
 const bytecode = @import("bytecode");
 
 /// `FIX_MEM_REPORT`: attribute peak RSS across every subsystem so we can see

@@ -28,10 +28,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("runtime").types;
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").sync;
 const gc = @import("runtime").gc;
 const heap_mod = @import("runtime").heap;
-const containers = @import("containers");
+const containers = @import("base");
 const build_options = @import("build_options");
 
 /// Idle-scan cost census (piggybacks on `-Dprof-main`, like the probes in

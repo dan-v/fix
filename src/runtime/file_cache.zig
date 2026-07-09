@@ -15,7 +15,7 @@
 //! single-file-at-a-time pipeline and a fan-out.
 
 const std = @import("std");
-const stable = @import("stable_segments.zig");
+const stable = @import("base").sync;
 const vma = @import("mem_tag.zig").vma;
 
 pub const FileCache = struct {

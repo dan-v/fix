@@ -9,7 +9,7 @@ const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("runtime").value.Value;
 const AttrEntry = @import("runtime").heap.AttrEntry;
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").segments;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 

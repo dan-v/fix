@@ -1,7 +1,7 @@
 //! Small POSIX-ERE-style matcher for Nix regex builtins.
 
 const std = @import("std");
-const SpinMutex = @import("stable_segments.zig").SpinMutex;
+const SpinMutex = @import("sync.zig").SpinMutex;
 
 pub const Match = struct {
     start: usize,

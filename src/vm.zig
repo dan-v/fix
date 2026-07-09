@@ -32,7 +32,7 @@ const eval_trace = @import("observ").trace;
 const eval_progress = @import("observ").progress;
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const thunk_mod = @import("runtime").thunk;
-const worker_id_mod = @import("runtime").worker_id;
+const worker_id_mod = @import("base").worker_id;
 const DeferredTable = @import("compiler").deferred_table.Table;
 const ThunkTrace = @import("probe").thunk_trace.ThunkTrace;
 
@@ -56,9 +56,9 @@ pub const thunks_log_enabled = build_options.thunks_log;
 pub const OpcodeCounts = [opcode.count]u64;
 const OpcodeProfileSink = if (opcode_profile_enabled) *OpcodeCounts else void;
 const OpcodeProfileState = if (opcode_profile_enabled) OpcodeCounts else void;
-const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const SpinMutex = @import("base").sync.SpinMutex;
 const vma = @import("runtime").mem_tag.vma;
-const PatternCache = @import("runtime").regex.PatternCache;
+const PatternCache = @import("base").regex.PatternCache;
 
 /// Reusable VM buffers — the value stack + frame stack, the two large
 /// per-VM allocations (~0.5 MB together). Pooled by the evaluator:

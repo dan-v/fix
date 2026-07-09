@@ -21,7 +21,7 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_gc = @import("runtime").heap.heap_gc;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
-const regex_mod = @import("runtime").regex;
+const regex_mod = @import("base").regex;
 const vma_mod = @import("runtime").mem_tag.vma;
 const DerivationStore = @import("derivation").DerivationStore;
 const derivation = @import("derivation");
@@ -45,15 +45,15 @@ const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("vm").worker;
 const eval_gc = @import("eval/gc.zig");
-const fiber_mod = @import("fiber");
+const fiber_mod = @import("base").fiber;
 const prof = @import("probe").prof;
 const compiler_mod = @import("compiler");
 const VmTrace = @import("vm").trace_log.VmTrace;
 const ThunkTrace = @import("probe").thunk_trace.ThunkTrace;
-const SpinMutex = @import("runtime").stable_segments.SpinMutex;
+const SpinMutex = @import("base").sync.SpinMutex;
 const gc = @import("runtime").gc;
 const thunk_mod = @import("runtime").thunk;
-const worker_id_mod = @import("runtime").worker_id;
+const worker_id_mod = @import("base").worker_id;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;

@@ -18,7 +18,8 @@ const std = @import("std");
 const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const Capture = @import("types.zig").Capture;
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").segments;
+const sync = @import("base").sync;
 const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
 
@@ -110,13 +111,13 @@ pub const Table = struct {
     /// compiles of bodies from the same file share one line index instead
     /// of each rebuilding it over the whole (16MB+) source.
     line_indexes: std.AutoHashMapUnmanaged(usize, *diagnostic.LineIndex) = .{},
-    line_index_mu: stable.SpinMutex = .{},
+    line_index_mu: sync.SpinMutex = .{},
     /// Adopted scope snapshots (see `Entry.scope`), freed at deinit.
     scopes: std.ArrayListUnmanaged([]const Capture) = .empty,
     /// Owned base/source path strings, deduped by content: all entries of
     /// one file share the same two paths, so dupe each once, not per entry.
     paths: std.StringHashMapUnmanaged(void) = .empty,
-    shared_mu: stable.SpinMutex = .{},
+    shared_mu: sync.SpinMutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) Table {
         return .{ .allocator = allocator, .entries = .empty };

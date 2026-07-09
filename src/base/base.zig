@@ -1,0 +1,41 @@
+//! `base` module facade — generic, reusable infrastructure with zero Nix
+//! coupling.
+//!
+//! Sits at the very bottom of the module dependency graph (depends only on
+//! `std` and `build_options`) so every higher subsystem can import it without
+//! creating a cycle. Absorbs what used to be the `containers` and `fiber`
+//! modules plus the generic primitives that lived in `runtime`: the lock-free
+//! work-stealing `Deque`, the stack-switching `Fiber`, the mutual-exclusion
+//! primitives, the segmented storage, the RSS region-tracker, the block reuse
+//! cache, and the regex/TOML/worker-id helpers. Consumers import this module
+//! by name (`@import("base")`) and reach submodules through it.
+
+pub const deque = @import("deque.zig");
+pub const cache_line = @import("cache_line.zig");
+pub const fiber = @import("fiber.zig");
+pub const sync = @import("sync.zig");
+pub const segments = @import("segments.zig");
+pub const vma = @import("vma.zig");
+pub const block_cache = @import("block_cache.zig");
+pub const regex = @import("regex.zig");
+pub const toml = @import("toml.zig");
+pub const worker_id = @import("worker_id.zig");
+
+// Common flat re-exports for the most-used types.
+pub const Deque = deque.Deque;
+pub const GrowableDeque = deque.GrowableDeque;
+pub const Isolated = cache_line.Isolated;
+pub const Fiber = fiber.Fiber;
+
+test {
+    _ = deque;
+    _ = cache_line;
+    _ = fiber;
+    _ = sync;
+    _ = segments;
+    _ = vma;
+    _ = block_cache;
+    _ = regex;
+    _ = toml;
+    _ = worker_id;
+}

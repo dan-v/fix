@@ -14,7 +14,7 @@ const stats = cli.stats;
 const args = cli.args;
 const run = cli.run;
 const trace_setup = cli.trace_setup;
-const block_cache = @import("runtime").block_cache;
+const block_cache = @import("base").block_cache;
 const mem_tag = @import("runtime").mem_tag;
 const Evaluator = fix.Evaluator;
 

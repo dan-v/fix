@@ -9,7 +9,7 @@ const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
 const clone = @import("clone.zig");
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").sync;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;

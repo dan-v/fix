@@ -15,7 +15,8 @@
 
 const std = @import("std");
 const types = @import("types.zig");
-const stable = @import("stable_segments.zig");
+const stable = @import("base").segments;
+const sync = @import("base").sync;
 const mem_tag = @import("mem_tag.zig");
 const InternId = types.InternId;
 
@@ -93,7 +94,7 @@ const StringAdapter = struct {
 
 const Shard = struct {
     lookup: Lookup = .empty,
-    mu: stable.SpinMutex = .{},
+    mu: sync.SpinMutex = .{},
 };
 
 pub const InternTable = struct {

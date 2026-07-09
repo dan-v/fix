@@ -12,7 +12,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const types = @import("runtime").types;
 const bytecode = @import("bytecode");
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").sync;
 
 const OpCode = bytecode.OpCode;
 const ChunkId = types.ChunkId;

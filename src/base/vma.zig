@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const SpinMutex = @import("stable_segments.zig").SpinMutex;
+const SpinMutex = @import("sync.zig").SpinMutex;
 
 /// Generic RSS region-tracker, parameterized over the caller's attribution
 /// taxonomy. The mechanism (open-addressed registry, `mincore` residency,

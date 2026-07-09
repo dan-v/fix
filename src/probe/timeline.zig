@@ -34,7 +34,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const worker_id_mod = @import("runtime").worker_id;
+const worker_id_mod = @import("base").worker_id;
 const InternTable = @import("runtime").intern.InternTable;
 
 /// Always compiled in — timeline is now RUNTIME-gated (`--timeline[=path]`):

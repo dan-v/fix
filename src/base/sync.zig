@@ -1,0 +1,82 @@
+//! Low-level mutual-exclusion primitives.
+//!
+//! Two complementary locks used across the tree: `SpinMutex` for very short
+//! critical sections (an allocator call at most) and `BlockingMutex` for
+//! sections that may contend, where parking beats burning a core.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+/// Spinlock built on `std.atomic.Mutex`. Short critical sections only —
+/// writers on the segmented-storage primitives are O(allocator call) at most.
+pub const SpinMutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    pub fn lock(self: *SpinMutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub fn unlock(self: *SpinMutex) void {
+        self.inner.unlock();
+    }
+};
+
+/// Tri-state futex mutex. Uncontended lock/unlock is a single cmpxchg
+/// plus a release store. Under contention, waiters park on a futex
+/// (Linux) or yield (other platforms) instead of burning the core.
+///
+/// State encoding:
+///   0 = unlocked
+///   1 = locked, no waiters known
+///   2 = locked, at least one waiter is parked or about to park
+pub const BlockingMutex = struct {
+    state: std.atomic.Value(u32) = .init(0),
+
+    const SPIN_ATTEMPTS: u32 = 40;
+
+    pub fn lock(self: *BlockingMutex) void {
+        if (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
+        self.lockSlow();
+    }
+
+    fn lockSlow(self: *BlockingMutex) void {
+        var i: u32 = 0;
+        while (i < SPIN_ATTEMPTS) : (i += 1) {
+            if (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
+            std.atomic.spinLoopHint();
+        }
+        while (true) {
+            // Swap to "contended" so the unlocker knows to wake us. If the
+            // mutex was unlocked between our spins and now, we've taken it
+            // by virtue of swapping in 2.
+            const prev = self.state.swap(2, .acquire);
+            if (prev == 0) return;
+            switch (builtin.os.tag) {
+                .linux => {
+                    _ = std.os.linux.futex_4arg(
+                        @ptrCast(&self.state),
+                        .{ .cmd = .WAIT, .private = true },
+                        2,
+                        null,
+                    );
+                },
+                else => std.Thread.yield() catch {},
+            }
+        }
+    }
+
+    pub fn unlock(self: *BlockingMutex) void {
+        const prev = self.state.swap(0, .release);
+        if (prev == 2) {
+            switch (builtin.os.tag) {
+                .linux => {
+                    _ = std.os.linux.futex_3arg(
+                        @ptrCast(&self.state),
+                        .{ .cmd = .WAKE, .private = true },
+                        1,
+                    );
+                },
+                else => {},
+            }
+        }
+    }
+};

@@ -46,7 +46,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
-const worker_id = @import("runtime").worker_id;
+const worker_id = @import("base").worker_id;
 
 pub const enabled: bool = build_options.prof_path and builtin.cpu.arch == .x86_64;
 

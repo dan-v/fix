@@ -12,7 +12,7 @@
 const std = @import("std");
 const diagnostic = @import("syntax").diagnostic;
 const trace_mod = @import("observ").trace;
-const stable = @import("runtime").stable_segments;
+const stable = @import("base").sync;
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const Trace = trace_mod.Trace;

@@ -6,7 +6,7 @@
 //! orchestrating `report()`.
 
 const std = @import("std");
-const worker_id = @import("runtime").worker_id;
+const worker_id = @import("base").worker_id;
 const prof = @import("prof.zig");
 const prof_path_mod = @import("prof_path.zig");
 const enabled = prof.enabled;
