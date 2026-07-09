@@ -29,6 +29,10 @@ pub const FetchCache = struct {
     /// path (`vm.io_offload.runFetch`) acquires `conn_sem` when this is > 0.
     max_connections: u32 = 0,
     conn_sem: sync.Semaphore = sync.Semaphore.init(0),
+    /// `download-attempts` (nix default 5): how many times to try a download
+    /// before giving up, retrying only transient failures (connection errors,
+    /// 5xx). See `fetchUrlBytes`.
+    download_attempts: u32 = 5,
     /// `access-tokens` from `nix.conf`: `<host>[/<path>] -> <token>`, used to
     /// add an `Authorization: Bearer` header on downloads to a matching host
     /// (private GitHub/GitLab/… archives). Owned; see `setAccessTokens`.
@@ -61,6 +65,9 @@ pub const FetchCache = struct {
 
     const command_stdout_limit = 4 * 1024 * 1024;
     const command_stderr_limit = 512 * 1024;
+    /// HTTP `User-Agent` for downloads — identifies fix (some hosts, e.g. the
+    /// GitHub API, require a non-empty one), mirroring Nix's `Nix/<v>` string.
+    const user_agent = "fix";
 
     pub const GitSpec = struct {
         url: []const u8,
@@ -381,6 +388,11 @@ pub const FetchCache = struct {
         self.conn_sem = sync.Semaphore.init(n);
     }
 
+    /// Set `download-attempts` (total tries per download; clamped to >= 1).
+    pub fn setDownloadAttempts(self: *FetchCache, n: u32) void {
+        self.download_attempts = @max(1, n);
+    }
+
     /// The permit semaphore to gate a fetch on, or null when unlimited.
     pub fn connSem(self: *FetchCache) ?*sync.Semaphore {
         return if (self.max_connections > 0) &self.conn_sem else null;
@@ -448,10 +460,40 @@ pub const FetchCache = struct {
         return self.remoteMercurial(files, spec);
     }
 
+    /// Whether `err` from a download attempt is worth retrying (a transient
+    /// connection/server problem) vs. a permanent failure (bad URL, 4xx, OOM).
+    fn retryable(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.FetchIoUnavailable,
+            error.UnsupportedCompressionMethod,
+            error.FetchClientError,
+            error.FetchInvalidUrl,
+            => false,
+            else => true,
+        };
+    }
+
     fn fetchUrlBytes(self: *FetchCache, files: *FileCache, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
         if (localFetchPath(url)) |path| return self.allocator.dupe(u8, try files.readFile(path));
 
         const io = self.io orelse return error.FetchIoUnavailable;
+        const uri = std.Uri.parse(url) catch return error.FetchInvalidUrl;
+
+        // Retry transient failures up to `download-attempts` times (nix default
+        // 5), with a short linear backoff. A permanent failure (4xx, bad URL)
+        // returns immediately.
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            return self.fetchUrlAttempt(io, uri, url, forge, reporter) catch |err| {
+                if (attempt >= self.download_attempts or !retryable(err)) return err;
+                io.sleep(std.Io.Duration.fromMilliseconds(@min(5_000, 250 * @as(i64, attempt))), .awake) catch {};
+                continue;
+            };
+        }
+    }
+
+    fn fetchUrlAttempt(self: *FetchCache, io: std.Io, uri: std.Uri, url: []const u8, forge: ?Forge, reporter: ?Reporter) ![]u8 {
         var client = std.http.Client{ .allocator = self.allocator, .io = io };
         defer client.deinit();
 
@@ -474,13 +516,19 @@ pub const FetchCache = struct {
 
         // Stream (rather than one-shot `fetch`) so we can read `content_length`
         // up front and report bytes as they arrive to the fetch progress span.
-        const uri = try std.Uri.parse(url);
-        var req = try client.request(.GET, uri, .{ .redirect_behavior = @enumFromInt(10), .extra_headers = extra_headers });
+        var req = try client.request(.GET, uri, .{
+            .redirect_behavior = @enumFromInt(10),
+            .headers = .{ .user_agent = .{ .override = user_agent } },
+            .extra_headers = extra_headers,
+        });
         defer req.deinit();
         try req.sendBodiless();
 
         var redirect_buffer: [8 * 1024]u8 = undefined;
         var response = try req.receiveHead(&redirect_buffer);
+        // 4xx is a permanent client error (bad URL, auth); anything else
+        // non-2xx (5xx, unexpected) is treated as transient and retried.
+        if (response.head.status.class() == .client_error) return error.FetchClientError;
         if (response.head.status.class() != .success) return error.FetchHttpStatus;
         // Content-Length is the compressed wire size; we count decompressed
         // bytes, so it's only a valid progress total when the body is identity.
