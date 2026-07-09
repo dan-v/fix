@@ -63,4 +63,4 @@ The evaluator-wide limits live in `runtime/types.zig`: `VM_STACK_CAP = 65536`, `
 
 Out of scope: the `//` opcode's execution and inline cache → [vm/access.md](../vm/access.md); thunk internals/state machine → [thunks.md](thunks.md); the collection algorithm → [gc.md](../gc.md).
 
-Code: `src/runtime/heap.zig`
+Code: `src/nix/runtime/heap.zig`

@@ -98,4 +98,4 @@ Emit-time super-op fusion (see [pipeline.md](pipeline.md)) shrinks a body's enco
 
 Out of scope: thunk states / how `thunk_captures` and force behave → [runtime/thunks.md](../runtime/thunks.md); how substantial bodies get speculated → [parallel/speculation.md](../parallel/speculation.md); emission & fusion → [pipeline.md](pipeline.md).
 
-Code: `src/compiler/`
+Code: `src/nix/compiler/`

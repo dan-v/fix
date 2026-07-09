@@ -106,4 +106,4 @@ A `Diagnostic` carries `{ severity, kind (parse|compile), line, column, offset, 
 - **The value stack is untagged.** A `Value` variant is only valid for the symbol that produced it; reading the wrong variant is undefined. The grammar, not a runtime tag, guarantees correctness — changing a production's RHS means updating its action in lockstep.
 - **The elision scanner must stay side-effect-free** — it runs on a scanner copy and, apart from noting pipe-operator provenance for the feature gate, touches nothing the real parse depends on; giving it observable effects would desynchronize the eager parse from the deferred sub-parse.
 
-Code: `src/syntax/`
+Code: `src/nix/syntax/`

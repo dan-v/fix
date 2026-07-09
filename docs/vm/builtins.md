@@ -40,7 +40,7 @@ Arguments live in Zig locals / a C-stack slice, never on the VM operand stack, s
 
 Builtins that merge [string context](../derivation/context.md) or build large intermediates (`toJSON` in `serial`, `derivationStrict` in `derivation`, the `fetch*` family, string ops in `strings`/`string_context`) open their own `rootsBegin`/`rootKeep`/`rootsEnd` scope around those intermediates. All of this compiles away without `-Dgc`.
 
-## File-group split (`src/vm/builtins/`)
+## File-group split (`src/nix/vm/builtins/`)
 
 | Group | Holds |
 |---|---|
@@ -81,4 +81,4 @@ Some builtins do internal I/O within their one frame — `readFile`/`readDir`, t
 - A builtin's own logic never runs across threads; parallelism is expressed by producing independent per-element thunks (and optionally submitting them to the scheduler for speculative forcing), not by the builtin computing concurrently.
 - Result parity is byte-identical `.drv`; the interpreter path is canonical.
 
-Code: `src/vm/builtins/`
+Code: `src/nix/vm/builtins/`

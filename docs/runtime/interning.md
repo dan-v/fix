@@ -45,4 +45,4 @@ A `threadlocal` **direct-mapped cache** (`cache_size = 512` slots, indexed by `h
 
 Out of scope: string *values* and NaN-boxing of `string`/`path` → [values.md](values.md); string context / derivation string provenance → [derivation/context.md](../derivation/context.md).
 
-Code: `src/runtime/intern.zig`
+Code: `src/nix/runtime/intern.zig`

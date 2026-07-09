@@ -102,4 +102,4 @@ Fan-out and speculation are independent levers and each contributes a substantia
 
 See [cli.md](../cli.md). The `FIX_*` tuning knobs named above are read once before workers start.
 
-Code: `src/vm/force.zig`, `src/vm/force_speculate.zig`, `src/vm/closures.zig`, `src/vm/access.zig`, `src/eval/worker.zig`
+Code: `src/nix/vm/force.zig`, `src/nix/vm/force_speculate.zig`, `src/nix/vm/closures.zig`, `src/nix/vm/access.zig`, `src/nix/vm/worker.zig`

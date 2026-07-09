@@ -74,4 +74,4 @@ Statically-bound names always win over `with` (Nix scoping): `with` is consulted
 
 Out of scope: how `lookup_with` / `capture_upvalue` / `get_upvalue` execute → [vm/access.md](../vm/access.md) and [vm/calls.md](../vm/calls.md); which upvalues get pre-forced → [strictness.md](strictness.md); node dispatch → [pipeline.md](pipeline.md).
 
-Code: `src/compiler/`
+Code: `src/nix/compiler/`

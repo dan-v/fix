@@ -122,7 +122,7 @@ Store-path hashes are 32-character nixBase32, **not** standard base32:
 - **Compress**: XOR-fold the 32-byte sha256 into 20 bytes (`compressed[i % 20] ^= digest[i]`).
 - **Encode**: 5-bit radix over the alphabet `"0123456789abcdfghijklmnpqrsvwxyz"` (note: no `e`, `o`, `t`, `u` — Nix's set), emitting **bit-swapped**, i.e. output char *n* reads bits low-to-high and is placed at `len - 1 - n` (LSB→MSB). 20 bytes → 32 chars.
 
-This store-path encoder (`hash_codec.zig`) is distinct from the flat lowercase-hex encoder used for `sha256_hex`. It is also a separate function from the base-32 encoder behind the hash builtins (`hashBytesNixBase32` in `src/runtime/hash.zig`): that one shares the same 32-char alphabet and bit-swapped emission but encodes the **full** digest (`(len*8+4)/5` chars, for md5/sha1/sha256/sha512) with no 32→20 XOR fold — the fold is specific to store-path hashes, which always compress to 20 bytes → 32 chars.
+This store-path encoder (`hash_codec.zig`) is distinct from the flat lowercase-hex encoder used for `sha256_hex`. It is also a separate function from the base-32 encoder behind the hash builtins (`hashBytesNixBase32` in `src/nix/runtime/hash.zig`): that one shares the same 32-char alphabet and bit-swapped emission but encodes the **full** digest (`(len*8+4)/5` chars, for md5/sha1/sha256/sha512) with no 32→20 XOR fold — the fold is specific to store-path hashes, which always compress to 20 bytes → 32 chars.
 
 ### NAR hashing
 
@@ -153,4 +153,4 @@ Any drift here silently produces the wrong store path. The oracle enforces exact
 
 For value-shape and interned string handling see [runtime values](../runtime/values.md).
 
-Code: `src/derivation/`
+Code: `src/nix/derivation/`

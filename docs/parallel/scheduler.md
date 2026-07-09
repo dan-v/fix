@@ -119,4 +119,4 @@ When the optional generational [collector](../gc.md) is built in, the scheduler 
 
 ---
 
-Code: `src/parallel/scheduler.zig`, `src/eval/worker.zig`
+Code: `src/nix/scheduler.zig`, `src/nix/vm/worker.zig`

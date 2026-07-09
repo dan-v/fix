@@ -66,4 +66,4 @@ Arithmetic lives in `numeric.zig` and matches the C++ evaluator exactly (the [co
 
 Out of scope: object layouts → [heap.md](heap.md); thunk states → [thunks.md](thunks.md); string context → [derivation/context.md](../derivation/context.md).
 
-Code: `src/runtime/value.zig`
+Code: `src/nix/runtime/value.zig`

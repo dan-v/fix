@@ -29,7 +29,7 @@ Collections are **minor** and young-gated: each minor examines only the objects 
 
 ## Root set
 
-Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/eval/gc.zig`):
+Marking starts from every place a live ObjectId can be reached without going through the heap (`markRoots` in `src/nix/eval/gc.zig`):
 
 ```
 Root set (all must be enumerated — precise):
@@ -98,4 +98,4 @@ At `--workers=1` a minor is serial on the lone mutator. At `--workers>1` every l
 - **`FIX_GC_OFF`** (never enable reclaim — bump-only), **`FIX_GC_NOREUSE`** (skip free-list reuse; A/B the reuse path), **`FIX_GC_PAR_CAP`** (mark/evac participant cap), **`FIX_MAX_MEMORY`** (budget override) — measurement/tuning knobs.
 - **`FIX_GC_REPORT`**: dump the per-run collection report (pauses, promoted/freed, live vs reserved breakdown) to stderr; off by default so ordinary `-Dgc` runs stay quiet.
 
-Code: `src/runtime/gc.zig` (the precise `Tracer` / marker), `src/runtime/heap/gc.zig` (collector driver: arm / evac / sweep / threshold), `src/eval/gc.zig` (root enumeration, stop-the-world glue, budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
+Code: `src/nix/runtime/gc.zig` (the precise `Tracer` / marker), `src/nix/runtime/heap/gc.zig` (collector driver: arm / evac / sweep / threshold), `src/nix/eval/gc.zig` (root enumeration, stop-the-world glue, budget resolution). The reclaimable-headroom analysis this bounds is in [perf/model](perf/model.md); the measurement flags are in [perf/probes](perf/probes.md).
