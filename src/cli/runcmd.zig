@@ -92,7 +92,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    ev.buildDerivations(&.{derived}) catch |err| {
+    ev.buildDerivations(&.{derived}, null) catch |err| {
         return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
     };
 

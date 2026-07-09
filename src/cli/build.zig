@@ -90,17 +90,24 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     };
     const out_path = (try ev.derivationOutPath(result)) orelse drv_path;
 
-    // Tear down the eval progress bar before build logs stream to stderr.
+    // Stop the eval sampler; keep the progress session open so build activity
+    // nodes render under the same tree.
     ev.stopProgressSampler();
-    ev.progressSessionEnd();
 
     // Legacy derived-path wire form `<drvpath>!<outputs>` (`*` = all outputs).
     // This daemon (Lix) parses that, not the newer `<drvpath>^*` form.
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    ev.buildDerivations(&.{derived}) catch |err| {
+
+    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
+    defer build_progress.deinit();
+    const build_sink = if (term.show_progress) build_progress.sink() else null;
+    ev.buildDerivations(&.{derived}, build_sink) catch |err| {
+        ev.progressSessionEnd();
         return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
     };
+    build_progress.deinit();
+    ev.progressSessionEnd();
     ok = true;
 
     if (!options.no_link) linkResult(init.io, out_path) catch |err| {

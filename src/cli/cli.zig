@@ -17,6 +17,7 @@ pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
 pub const runcmd = @import("runcmd.zig");
 pub const shell = @import("shell.zig");
+pub const build_progress = @import("build_progress.zig");
 pub const repl = @import("repl.zig");
 pub const disasm = @import("disasm.zig");
 pub const inspect = @import("inspect.zig");
@@ -281,6 +282,14 @@ pub const EvalProgress = struct {
             .context = self,
             .emit_fn = emit,
         };
+    }
+
+    /// Create a child node under the run node for a build activity (a build /
+    /// substitute / download). Caller ends it. Used by the build progress
+    /// group, which drives its own set of nodes off the daemon activity stream.
+    pub fn childNode(self: *EvalProgress, name: []const u8) std.Progress.Node {
+        const parent = self.run_node orelse self.root;
+        return parent.start(name[0..@min(name.len, std.Progress.Node.max_name_len)], 0);
     }
 
     fn emit(context: *anyopaque, event: eval_progress.Event) void {
