@@ -131,6 +131,10 @@ pub const BuiltinId = enum(u16) {
     derivationLazyAttr = 108,
     mapValue = 109,
     constantValue = 110,
+    /// Internal: lazily resolve one flake input (fetch + evaluate on force).
+    /// Args: (ref_attrs, sub_inputs | null, is_flake). Backs each `inputs.<name>`
+    /// so unused inputs are never fetched. See vm/builtins/fetch.zig.
+    resolve_flake_node = 111,
 };
 
 const BuiltinBinding = struct {
@@ -413,6 +417,7 @@ pub fn arity(id: BuiltinId) u8 {
         .replaceStrings,
         .mapAttrValue,
         .zipAttrsValue,
+        .resolve_flake_node,
         => 3,
     };
 }

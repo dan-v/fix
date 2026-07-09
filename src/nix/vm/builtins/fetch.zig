@@ -16,6 +16,7 @@ const path_ops = @import("runtime").paths;
 const source_paths = @import("derivation").source_path;
 const eval_progress = @import("observ").progress;
 const flake_registry = @import("flake_registry.zig");
+const shared = @import("shared.zig");
 const attrsets = @import("attrsets.zig");
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
@@ -708,7 +709,7 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     var input_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer input_entries.deinit(self.allocator);
     if (!try resolveRootInputs(self, out_path, dir, &input_entries)) {
-        try resolveFlakeNixInputs(self, flake_value, &input_entries, 0);
+        try buildFlakeNixInputThunks(self, flake_value, &input_entries);
     }
     try input_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, source_info) });
 
@@ -779,21 +780,19 @@ fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_
     var it = root_inputs.object.iterator();
     while (it.next()) |entry| {
         const target_node = try followInput(nodes, root_name, entry.value_ptr.*);
-        const val = try resolveNode(self, nodes, target_node, root_name, &memo, 0);
-        try out_entries.append(self.allocator, .{ .name = try self.intern.intern(entry.key_ptr.*), .value = val });
+        const thunk = try buildNodeThunk(self, nodes, target_node, root_name, &memo, 0);
+        try out_entries.append(self.allocator, .{ .name = try self.intern.intern(entry.key_ptr.*), .value = thunk });
     }
     return true;
 }
 
-/// Lockless fallback: resolve a flake's inputs directly from its flake.nix
-/// `inputs` declarations, fetching each unlocked (latest). Each input is a
-/// flakeref string, `{ url = …; }`, or a ref attrset; `flake = false` yields the
-/// bare source. Recurses into input flakes' own inputs (self-recursive, so the
-/// inferred error set resolves without a mutual-recursion loop). No
-/// `follows`/override dedup across inputs (the lock does that) — a shared input
-/// may be fetched more than once. Depth-guarded.
-fn resolveFlakeNixInputs(self: anytype, flake_value: Value, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), depth: u32) !void {
-    if (depth > 32) return error.InvalidFlakeRef;
+/// Lockless: build a lazy thunk for each of a flake's flake.nix `inputs`
+/// declarations. Each input is a flakeref string, `{ url = …; }`, or an inline
+/// ref attrset; `flake = false` yields the bare source. `sub_inputs` is passed
+/// as null so `resolveFlakeNode`, on force, builds the input flake's own
+/// sub-inputs from its flake.nix (recursively, also lazily). Because each input
+/// is a thunk, an input an output never touches is never fetched.
+fn buildFlakeNixInputThunks(self: anytype, flake_value: Value, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
     const inputs_id = try self.intern.intern("inputs");
     const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), inputs_id) catch return) orelse return;
     const inputs = try vm_force.forceValue(self, inputs_v);
@@ -801,14 +800,11 @@ fn resolveFlakeNixInputs(self: anytype, flake_value: Value, out_entries: *std.Ar
 
     for (try self.heap.getAttrs(inputs.asObjectId())) |entry| {
         const decl = try vm_force.forceValue(self, entry.value);
-        // `flake = false` -> treat as a plain source, never evaluate outputs.
         const as_flake = if (decl.isAttrs())
             (try optionalBoolAttr(self, decl.asObjectId(), "flake")) orelse true
         else
             true;
-
-        // The ref attrset: a bare string, an `.url` string, or an inline `{type=…}`.
-        const parsed: Value = if (decl.isString() or decl.isPath())
+        const ref_attrs: Value = if (decl.isString() or decl.isPath())
             try builtinParseFlakeRef(self, decl)
         else if (decl.isAttrs()) blk: {
             if (try self.heap.getAttrValueOpt(decl.asObjectId(), try self.intern.intern("url"))) |u| {
@@ -816,42 +812,59 @@ fn resolveFlakeNixInputs(self: anytype, flake_value: Value, out_entries: *std.Ar
             }
             break :blk decl; // already a {type=…} ref attrset
         } else return error.InvalidFlakeRef;
-        vm_force.rootKeep(self, parsed);
-
-        const src_info = try builtinFetchTree(self, parsed);
-        vm_force.rootKeep(self, src_info);
-
-        var val: Value = src_info;
-        if (as_flake) {
-            const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
-            defer self.allocator.free(src_out);
-            const dir = try optionalStringAttr(self, parsed.asObjectId(), "dir");
-            defer if (dir) |dd| self.allocator.free(dd);
-            const fnix_path = if (dir) |dd|
-                try std.fs.path.join(self.allocator, &.{ src_out, dd, "flake.nix" })
-            else
-                try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
-            defer self.allocator.free(fnix_path);
-            if (self.files.pathExists(fnix_path) catch false) {
-                const nested = try importFlakeValue(self, src_out, dir);
-                vm_force.rootKeep(self, nested);
-                const outputs_func = try flakeOutputs(self, nested);
-                vm_force.rootKeep(self, outputs_func);
-
-                var node_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
-                defer node_entries.deinit(self.allocator);
-                try resolveFlakeNixInputs(self, nested, &node_entries, depth + 1);
-                try node_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, src_info) });
-                const node_inputs = Value.attrs(try self.heap.addAttrs(node_entries.items));
-                vm_force.rootKeep(self, node_inputs);
-                const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, node_inputs));
-                if (!outputs.isAttrs()) return error.TypeError;
-                val = try flakeResultValue(self, src_info, node_inputs, outputs);
-            }
-        }
-        vm_force.rootKeep(self, val);
-        try out_entries.append(self.allocator, .{ .name = entry.name, .value = val });
+        vm_force.rootKeep(self, ref_attrs);
+        const thunk = try shared.makeBuiltinThunk(self, .resolve_flake_node, &.{ ref_attrs, Value.null_val, Value.boolVal(as_flake) });
+        vm_force.rootKeep(self, thunk);
+        try out_entries.append(self.allocator, .{ .name = entry.name, .value = thunk });
     }
+}
+
+/// Internal builtin backing a lazy flake input (`inputs.<name>`): forced only
+/// when the input is used, so unused inputs are never fetched. Fetches
+/// `ref_attrs` and, if it's a flake, evaluates its outputs. `sub_inputs` is the
+/// pre-built input thunks from the lock, or null — in which case the input
+/// flake's own sub-inputs are built (lazily) from its fetched flake.nix.
+pub fn resolveFlakeNode(self: anytype, ref_attrs: Value, sub_inputs: Value, is_flake: Value) anyerror!Value {
+    const gc_roots = vm_force.rootsBegin(self);
+    defer vm_force.rootsEnd(self, gc_roots);
+    vm_force.rootKeep(self, ref_attrs);
+    vm_force.rootKeep(self, sub_inputs);
+
+    // Skip the download+ingest when the locked narHash's store path is already
+    // valid (Nix pins inputs by narHash; a valid CA path IS the content).
+    const src_info = (try flakeInputFromStore(self, ref_attrs)) orelse try builtinFetchTree(self, ref_attrs);
+    vm_force.rootKeep(self, src_info);
+    if (!is_flake.asBool()) return src_info; // `flake = false`
+
+    const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
+    defer self.allocator.free(src_out);
+    const dir = try optionalStringAttr(self, ref_attrs.asObjectId(), "dir");
+    defer if (dir) |d| self.allocator.free(d);
+    const fnix_path = if (dir) |d|
+        try std.fs.path.join(self.allocator, &.{ src_out, d, "flake.nix" })
+    else
+        try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
+    defer self.allocator.free(fnix_path);
+    if (!(self.files.pathExists(fnix_path) catch false)) return src_info; // non-flake source
+
+    const flake_value = try importFlakeValue(self, src_out, dir);
+    vm_force.rootKeep(self, flake_value);
+    const outputs_func = try flakeOutputs(self, flake_value);
+    vm_force.rootKeep(self, outputs_func);
+
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    if (sub_inputs.isAttrs()) {
+        for (try self.heap.getAttrs(sub_inputs.asObjectId())) |e| try entries.append(self.allocator, e);
+    } else {
+        try buildFlakeNixInputThunks(self, flake_value, &entries);
+    }
+    try entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, src_info) });
+    const inputs = Value.attrs(try self.heap.addAttrs(entries.items));
+    vm_force.rootKeep(self, inputs);
+    const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, inputs));
+    if (!outputs.isAttrs()) return error.TypeError;
+    return flakeResultValue(self, src_info, inputs, outputs);
 }
 
 /// Resolve `input_target` (a node name string, or a `follows` path array from
@@ -879,8 +892,12 @@ fn followInput(nodes: std.json.ObjectMap, root_name: []const u8, input_target: s
 /// Fetch + evaluate one locked node into an input value: a flake value when the
 /// input has a flake.nix (and isn't `flake = false`), else the bare fetched
 /// source. Memoized per node so shared inputs (diamonds) resolve once.
-fn resolveNode(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, root_name: []const u8, memo: *std.StringHashMapUnmanaged(Value), depth: u32) !Value {
-    if (memo.get(node_name)) |v| return v;
+/// Build a lazy thunk for one locked node (fetched + evaluated only on force).
+/// Its own inputs are pre-built as thunks — cheap, no fetching — and handed to
+/// `resolveFlakeNode`, so the whole lock graph is lazy. Memoized by node name so
+/// a shared node (a diamond) is a single thunk, forced at most once.
+fn buildNodeThunk(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, root_name: []const u8, memo: *std.StringHashMapUnmanaged(Value), depth: u32) !Value {
+    if (memo.get(node_name)) |t| return t;
     if (depth > 256) return error.InvalidFlakeLock; // runaway / cyclic lock guard
 
     const node_v = nodes.get(node_name) orelse return error.InvalidFlakeLock;
@@ -889,71 +906,48 @@ fn resolveNode(self: anytype, nodes: std.json.ObjectMap, node_name: []const u8, 
 
     const locked_v = node.get("locked") orelse return error.InvalidFlakeLock;
     if (locked_v != .object) return error.InvalidFlakeLock;
-    // Skip the download+ingest when the locked narHash's store path is already
-    // valid (Nix pins inputs by narHash; a valid CA path IS the content).
-    const src_info = (try flakeInputFromStore(self, locked_v.object)) orelse
-        try builtinFetchTree(self, try jsonObjectToAttrs(self, locked_v.object));
-    vm_force.rootKeep(self, src_info);
+    const ref_attrs = try jsonObjectToAttrs(self, locked_v.object);
+    vm_force.rootKeep(self, ref_attrs);
 
     const is_flake = switch (node.get("flake") orelse std.json.Value{ .bool = true }) {
         .bool => |b| b,
         else => true,
     };
 
-    const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
-    defer self.allocator.free(src_out);
-    // Subflake input: locked `dir` puts the input's flake.nix in a subdirectory.
-    const dir: ?[]const u8 = if (locked_v.object.get("dir")) |d| (if (d == .string) d.string else null) else null;
-    const fnix_path = if (dir) |d|
-        try std.fs.path.join(self.allocator, &.{ src_out, d, "flake.nix" })
-    else
-        try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
-    defer self.allocator.free(fnix_path);
-
-    var val: Value = src_info;
-    if (is_flake and (self.files.pathExists(fnix_path) catch false)) {
-        const outputs_func = try flakeOutputsFunc(self, src_out, dir);
-        vm_force.rootKeep(self, outputs_func);
-
-        var node_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
-        defer node_entries.deinit(self.allocator);
-        if (node.get("inputs")) |ins| {
-            if (ins == .object) {
-                var it = ins.object.iterator();
-                while (it.next()) |e| {
-                    const tnode = try followInput(nodes, root_name, e.value_ptr.*);
-                    const cval = try resolveNode(self, nodes, tnode, root_name, memo, depth + 1);
-                    try node_entries.append(self.allocator, .{ .name = try self.intern.intern(e.key_ptr.*), .value = cval });
-                }
-            }
+    // Pre-build this node's input thunks from the lock graph (no fetching).
+    var sub_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer sub_entries.deinit(self.allocator);
+    if (node.get("inputs")) |ins| if (ins == .object) {
+        var it = ins.object.iterator();
+        while (it.next()) |e| {
+            const tnode = try followInput(nodes, root_name, e.value_ptr.*);
+            const sub_thunk = try buildNodeThunk(self, nodes, tnode, root_name, memo, depth + 1);
+            try sub_entries.append(self.allocator, .{ .name = try self.intern.intern(e.key_ptr.*), .value = sub_thunk });
         }
-        try node_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, src_info) });
-        const node_inputs = Value.attrs(try self.heap.addAttrs(node_entries.items));
-        vm_force.rootKeep(self, node_inputs);
-        const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, node_inputs));
-        if (!outputs.isAttrs()) return error.TypeError;
-        val = try flakeResultValue(self, src_info, node_inputs, outputs);
-    }
+    };
+    const sub_inputs = Value.attrs(try self.heap.addAttrs(sub_entries.items));
+    vm_force.rootKeep(self, sub_inputs);
 
-    vm_force.rootKeep(self, val);
-    try memo.put(self.allocator, node_name, val);
-    return val;
+    const thunk = try shared.makeBuiltinThunk(self, .resolve_flake_node, &.{ ref_attrs, sub_inputs, Value.boolVal(is_flake) });
+    vm_force.rootKeep(self, thunk);
+    try memo.put(self.allocator, node_name, thunk);
+    return thunk;
 }
 
-/// If store writes are enabled and this locked input's narHash names a store
-/// path that is already valid, return the equivalent tree value directly —
-/// skipping the download + ingest. Fail-open: any miss (no narHash, unsupported
-/// type, unparseable hash, path not valid) returns null and the caller fetches.
+/// If store writes are enabled and this ref's narHash names a store path that is
+/// already valid, return the equivalent tree value directly — skipping the
+/// download + ingest. Fail-open: any miss (no narHash, unsupported type,
+/// unparseable hash, path not valid) returns null and the caller fetches.
 /// Reuses the same store-path scheme (`sourcePath`) and value constructors the
 /// real fetch would, so a skipped fetch is indistinguishable from a real one.
-fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
+fn flakeInputFromStore(self: anytype, attrs: Value) !?Value {
     if (!self.derivations.store_writes_enabled) return null;
-    const nh_v = locked.get("narHash") orelse return null;
-    if (nh_v != .string) return null;
-    const nar_hash = nh_v.string;
-    const type_v = locked.get("type") orelse return null;
-    if (type_v != .string) return null;
-    const ty = type_v.string;
+    if (!attrs.isAttrs()) return null;
+    const id = attrs.asObjectId();
+    const nar_hash = (try optionalStringAttr(self, id, "narHash")) orelse return null;
+    defer self.allocator.free(nar_hash);
+    const ty = (try optionalStringAttr(self, id, "type")) orelse return null;
+    defer self.allocator.free(ty);
 
     // Recursive-NAR (sourcePath) inputs only: forges/tarball/path. git/mercurial
     // ingest differently and are left to fetch; file is flat, not a tree.
@@ -963,9 +957,14 @@ fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
     if (!is_forge and !is_tarball and !is_path) return null;
 
     // The store-path name must match what the fetch would use (see builtinFetchTree).
+    const path_attr = if (is_path) (try optionalStringAttr(self, id, "path")) else null;
+    defer if (path_attr) |p| self.allocator.free(p);
+    const name_attr = if (!is_path) (try optionalStringAttr(self, id, "name")) else null;
+    defer if (name_attr) |n| self.allocator.free(n);
     const name = if (is_path)
-        path_ops.baseName((locked.get("path") orelse return null).string)
-    else if (locked.get("name")) |n| (if (n == .string) n.string else "source") else "source";
+        (if (path_attr) |p| path_ops.baseName(p) else return null)
+    else
+        (name_attr orelse "source");
 
     const hex = derivation.hashToBase16(self.allocator, "sha256", nar_hash) catch return null;
     defer self.allocator.free(hex);
@@ -974,7 +973,8 @@ fn flakeInputFromStore(self: anytype, locked: std.json.ObjectMap) !?Value {
     if (!try self.derivations.pathIsValid(store_path)) return null;
 
     if (is_forge) {
-        const rev = if (locked.get("rev")) |r| (if (r == .string) r.string else null) else null;
+        const rev = try optionalStringAttr(self, id, "rev");
+        defer if (rev) |r| self.allocator.free(r);
         return try githubTreeValue(self, store_path, nar_hash, rev);
     }
     return try pathTreeValue(self, store_path, nar_hash);

@@ -148,5 +148,6 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .derivationLazyAttr => derivation_builtins.builtinDerivationLazyAttr(self, args[0], args[1]),
         .mapValue => lists.builtinMapValue(self, args[0], args[1]),
         .constantValue => args[0],
+        .resolve_flake_node => fetch.resolveFlakeNode(self, args[0], args[1], args[2]),
     };
 }
