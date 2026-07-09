@@ -65,10 +65,10 @@ pub const DerivationStore = struct {
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
     io: ?std.Io = null,
     daemon_socket: []const u8 = rstore.default_socket_path,
-    /// Whether forced derivations + their sources are written to the store
-    /// (`fix instantiate`/`build` enable it). Off for plain `eval`, so the hot
-    /// eval path never does store I/O per derivation. Fetchers ignore this —
-    /// a fetch's value is a materialized path, so they always ingest.
+    /// Whether forced derivations, their sources, and fetched trees are
+    /// materialized to the store (`fix instantiate`/`build` enable it). Off for
+    /// plain `eval` so the hot eval path never does store I/O per derivation
+    /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
@@ -150,12 +150,6 @@ pub const DerivationStore = struct {
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         if (!self.store_writes_enabled) return;
-        return self.addPathToStore(store_path, nar_bytes);
-    }
-
-    /// Ingest a fetched tree unconditionally (fetchers always materialize their
-    /// result to the store, like Nix — regardless of `store_writes_enabled`).
-    pub fn ingestFetched(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
         return self.addPathToStore(store_path, nar_bytes);
     }
 

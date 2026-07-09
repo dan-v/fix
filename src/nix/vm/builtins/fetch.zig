@@ -141,21 +141,71 @@ const FetchGitSpec = struct {
     }
 };
 
+/// A fetched tree's realized `outPath` and `narHash`. When store writes are
+/// enabled (`fix instantiate`/`build`) the tree is NAR-added to the real store
+/// and these are the store path + real SRI NAR hash; otherwise (plain `eval`)
+/// they are the local download-cache path + synthetic hash (offline-friendly,
+/// matching the pre-store behaviour).
+const FetchedOut = struct {
+    out_path: []u8,
+    nar_hash: []u8,
+
+    fn deinit(self: FetchedOut, allocator: std.mem.Allocator) void {
+        allocator.free(self.out_path);
+        allocator.free(self.nar_hash);
+    }
+};
+
+fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
+    if (self.derivations.store_writes_enabled) {
+        const ingested = try source_paths.ingest(self.allocator, self.derivations, self.files, cache_path, name, filter);
+        return .{ .out_path = ingested.store_path, .nar_hash = ingested.nar_hash };
+    }
+    const synthetic = try self.fetchers.sourceHash(cache_path, rev);
+    defer self.fetchers.allocator.free(synthetic);
+    return .{
+        .out_path = try self.allocator.dupe(u8, cache_path),
+        .nar_hash = try self.allocator.dupe(u8, synthetic),
+    };
+}
+
+/// A fetched `outPath` string value. When the tree was materialized to the
+/// store it carries string context referencing that store path, so using it as
+/// a derivation `src` records it in `inputSrcs` (like Nix). Off-store (plain
+/// eval) it is a bare string of the download-cache path.
+fn fetchedPathValue(self: anytype, path: []const u8) !Value {
+    const id = try self.intern.intern(path);
+    return if (self.derivations.store_writes_enabled)
+        contextStringWithPath(self, id)
+    else
+        Value.string(id);
+}
+
+/// NAR filter that drops any `.git` entry, so a git checkout ingests as the
+/// tree Nix stores (working tree at the rev, minus the repository metadata).
+fn gitFilterAccept(_: *anyopaque, path: []const u8, _: file_cache.FileCache.FileKind) anyerror!bool {
+    return !std.mem.eql(u8, path_ops.baseName(path), ".git");
+}
+var git_filter_ctx: u8 = 0;
+const git_filter = nar.Filter{ .context = &git_filter_ctx, .accept = gitFilterAccept };
+
 pub fn builtinFetchGit(self: anytype, arg: Value) !Value {
     const spec = try fetchGitSpec(self, arg);
     defer spec.deinit(self.allocator);
 
     const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
     defer result.deinit(self.fetchers.allocator);
-    return gitResultValue(self, result);
+    return gitResultValue(self, spec.name, result);
 }
 
-fn gitResultValue(self: anytype, result: fetch_cache.FetchCache.GitResult) !Value {
+fn gitResultValue(self: anytype, name: []const u8, result: fetch_cache.FetchCache.GitResult) !Value {
+    const out = try ingestFetchedTree(self, result.out_path, name, result.rev, git_filter);
+    defer out.deinit(self.allocator);
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(result.last_modified) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern(result.last_modified_date)) },
-        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(result.nar_hash)) },
-        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(result.out_path)) },
+        .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(out.nar_hash)) },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, out.out_path) },
         .{ .name = try self.intern.intern("rev"), .value = Value.string(try self.intern.intern(result.rev)) },
         .{ .name = try self.intern.intern("revCount"), .value = Value.int(result.rev_count) },
         .{ .name = try self.intern.intern("shortRev"), .value = Value.string(try self.intern.intern(result.short_rev)) },
@@ -169,7 +219,7 @@ fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
         .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
-        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
@@ -177,7 +227,7 @@ fn pathTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
 fn fileTreeValue(self: anytype, path: []const u8, nar_hash: []const u8) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
-        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     };
     return Value.attrs(try self.heap.addAttrs(&entries));
 }
@@ -272,7 +322,23 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
 
     const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
     defer self.fetchers.allocator.free(path);
-    return Value.string(try self.intern.intern(path));
+    // The unpacked tree is named "source" by default (Nix), independent of the
+    // archive's URL basename which named the download.
+    const tree_name = try tarballTreeName(self, arg);
+    defer self.allocator.free(tree_name);
+    const out = try ingestFetchedTree(self, path, tree_name, "", null);
+    defer out.deinit(self.allocator);
+    return fetchedPathValue(self, out.out_path);
+}
+
+/// The store name for a `fetchTarball` unpacked tree: an explicit `name` attr,
+/// else "source" (matching Nix — not the archive's URL basename).
+fn tarballTreeName(self: anytype, arg: Value) ![]u8 {
+    const value = try vm_force.forceValue(self, arg);
+    if (value.isAttrs()) {
+        if (try optionalStringAttr(self, value.asObjectId(), "name")) |name| return name;
+    }
+    return self.allocator.dupe(u8, "source");
 }
 
 const FetchMercurialSpec = struct {
@@ -366,7 +432,7 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
         .{ .name = try self.intern.intern("lastModified"), .value = Value.int(0) },
         .{ .name = try self.intern.intern("lastModifiedDate"), .value = Value.string(try self.intern.intern("19700101000000")) },
         .{ .name = try self.intern.intern("narHash"), .value = Value.string(try self.intern.intern(nar_hash)) },
-        .{ .name = try self.intern.intern("outPath"), .value = Value.string(try self.intern.intern(path)) },
+        .{ .name = try self.intern.intern("outPath"), .value = try fetchedPathValue(self, path) },
     });
     if (rev) |value| {
         try appendStringAttr(self, &entries, "rev", value);
@@ -393,9 +459,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (attrs.isPath()) {
         const path = self.intern.get(attrs.asInternId());
-        const nar_hash = try self.fetchers.sourceHash(path, "");
-        defer self.fetchers.allocator.free(nar_hash);
-        return pathTreeValue(self, path, nar_hash);
+        const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
+        defer out.deinit(self.allocator);
+        return pathTreeValue(self, out.out_path, out.nar_hash);
     }
     if (attrs.isString()) {
         const parsed = try builtinParseFlakeRef(self, attrs);
@@ -416,9 +482,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "path")) {
         const path = try dupPathAttr(self, attrs_id, "path");
         defer self.allocator.free(path);
-        const nar_hash = try self.fetchers.sourceHash(path, "");
-        defer self.fetchers.allocator.free(nar_hash);
-        return pathTreeValue(self, path, nar_hash);
+        const out = try ingestFetchedTree(self, path, path_ops.baseName(path), "", null);
+        defer out.deinit(self.allocator);
+        return pathTreeValue(self, out.out_path, out.nar_hash);
     }
 
     if (std.mem.eql(u8, type_value, "file")) {
@@ -434,9 +500,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
         defer self.fetchers.allocator.free(path);
-        const nar_hash = try self.fetchers.sourceHash(path, "");
-        defer self.fetchers.allocator.free(nar_hash);
-        return pathTreeValue(self, path, nar_hash);
+        const out = try ingestFetchedTree(self, path, spec.name, "", null);
+        defer out.deinit(self.allocator);
+        return pathTreeValue(self, out.out_path, out.nar_hash);
     }
 
     if (std.mem.eql(u8, type_value, "git")) {
@@ -444,7 +510,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         const result = try self.fetchers.fetchGit(self.files, spec.borrowed());
         defer result.deinit(self.fetchers.allocator);
-        return gitResultValue(self, result);
+        return gitResultValue(self, spec.name, result);
     }
 
     if (std.mem.eql(u8, type_value, "github")) {
@@ -452,9 +518,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
         defer spec.deinit(self.allocator);
         const path = try self.fetchers.fetchTarball(self.files, .{ .url = spec.url, .name = spec.name });
         defer self.fetchers.allocator.free(path);
-        const nar_hash = try self.fetchers.sourceHash(path, spec.rev orelse "");
-        defer self.fetchers.allocator.free(nar_hash);
-        return githubTreeValue(self, path, nar_hash, spec.rev);
+        const out = try ingestFetchedTree(self, path, spec.name, spec.rev orelse "", null);
+        defer out.deinit(self.allocator);
+        return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev);
     }
 
     if (std.mem.eql(u8, type_value, "mercurial")) {
