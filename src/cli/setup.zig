@@ -53,7 +53,8 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // acts on.
     var settings = nix_conf.load(ev.allocator, init.environ_map, init.io) catch nix_conf.Settings{ .allocator = ev.allocator };
     defer settings.deinit();
-    for (options.option_overrides.items) |o| try settings.put(o.name, o.value);
+    // `--option NAME VALUE` overrides; `--option extra-NAME VALUE` appends (Nix).
+    for (options.option_overrides.items) |o| try settings.setOrAppend(o.name, o.value);
     if (!options.experimental_features_reset) {
         if (settings.get("experimental-features")) |list|
             args.mergeConfigFeatures(&features, list);

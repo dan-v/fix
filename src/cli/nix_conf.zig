@@ -10,10 +10,9 @@
 //!   3. `$NIX_CONFIG`                             (inline, newline-separated)
 //! Later sources override earlier for scalar keys (last-wins), as in Nix.
 //!
-//! Format handled: `key = value` lines; `#` comments; blank lines ignored.
-//! `include`/`!include` directives and list-append (`extra-*`) semantics are
-//! deliberately NOT handled yet — add them when a setting first needs them
-//! (scalar last-wins covers `http-connections`, `max-jobs`, `cores`, ...).
+//! Format handled: `key = value` lines; `#` comments; blank lines ignored;
+//! `include`/`!include <path>` directives; and the `extra-<name>` append form
+//! (`extra-foo = x` appends to `foo`, as in Nix — see `setOrAppend`).
 
 const std = @import("std");
 
@@ -28,12 +27,24 @@ fn envGet(env: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
 }
 
 /// Read `path` directly (NOT via the evaluator's source cache — this is CLI
-/// config, not a Nix source file) and merge its `key = value` lines into
-/// `settings`. Best-effort: a missing/unreadable file is skipped, as in Nix.
-fn mergeFile(settings: *Settings, io: std.Io, path: []const u8) !void {
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, settings.allocator, .limited(max_conf_bytes)) catch return;
+/// config, not a Nix source file) and merge its lines into `settings`, following
+/// any `include` directives. Returns whether the file was read: a missing or
+/// unreadable file yields `false` (best-effort, as in Nix); OOM and parse errors
+/// propagate.
+/// The only error the (mutually-recursive) config-merge functions can produce;
+/// an explicit set breaks the inferred-error-set cycle. I/O read failures are
+/// handled in `mergeFile` (skip), so they never surface here.
+const MergeError = error{OutOfMemory};
+
+fn mergeFile(settings: *Settings, io: std.Io, path: []const u8, depth: u8) MergeError!bool {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, settings.allocator, .limited(max_conf_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
     defer settings.allocator.free(data);
-    try settings.mergeLines(data);
+    const dir = std.fs.path.dirname(path) orelse ".";
+    try mergeConfigText(settings, .{ .io = io, .dir = dir, .depth = depth }, data);
+    return true;
 }
 
 pub const Settings = struct {
@@ -72,22 +83,88 @@ pub const Settings = struct {
         gop.value_ptr.* = try self.allocator.dupe(u8, value);
     }
 
-    /// Merge `key = value` lines from `content` (a whole file or `$NIX_CONFIG`).
-    fn mergeLines(self: *Settings, content: []const u8) !void {
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |raw| {
-            const line = std.mem.trim(u8, raw, " \t\r");
-            if (line.len == 0 or line[0] == '#') continue;
-            // include / !include are not supported yet; skip rather than choke.
-            if (std.mem.startsWith(u8, line, "include ") or std.mem.startsWith(u8, line, "!include ")) continue;
-            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-            const key = std.mem.trim(u8, line[0..eq], " \t");
-            const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-            if (key.len == 0) continue;
-            try self.put(key, value);
+    /// Apply `name = value`, honoring Nix's `extra-<name>` append convention:
+    /// `extra-foo = x` appends (space-separated) to `foo` instead of replacing.
+    pub fn setOrAppend(self: *Settings, name: []const u8, value: []const u8) !void {
+        if (std.mem.startsWith(u8, name, "extra-")) {
+            try self.append(name["extra-".len..], value);
+        } else {
+            try self.put(name, value);
         }
     }
+
+    /// Space-append `value` to `key`'s current value (set it if unset). Matches
+    /// Nix's append semantics for the list-like settings (experimental-features,
+    /// access-tokens, substituters, …).
+    fn append(self: *Settings, key: []const u8, value: []const u8) !void {
+        const existing = self.map.get(key) orelse return self.put(key, value);
+        if (existing.len == 0) return self.put(key, value);
+        const joined = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ existing, value });
+        defer self.allocator.free(joined);
+        try self.put(key, joined);
+    }
+
+    /// Apply one `key = value` config line (blank/keyless lines are ignored).
+    fn applyLine(self: *Settings, line: []const u8) !void {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (key.len == 0) return;
+        try self.setOrAppend(key, value);
+    }
+
+    /// Merge `key = value` lines from inline content (`$NIX_CONFIG`). `include`
+    /// directives are ignored here — a bare string has no base directory.
+    fn mergeLines(self: *Settings, content: []const u8) !void {
+        try mergeConfigText(self, null, content);
+    }
 };
+
+const max_include_depth = 100; // guards against include cycles
+
+const IncludeCtx = struct { io: std.Io, dir: []const u8, depth: u8 };
+const IncludeSpec = struct { path: []const u8, required: bool };
+
+/// Parse config `content` line by line into `settings`. With an `IncludeCtx`,
+/// `include`/`!include` directives pull in other files (relative paths resolved
+/// against `ctx.dir`); without one (inline `$NIX_CONFIG`) they are skipped.
+fn mergeConfigText(settings: *Settings, ctx: ?IncludeCtx, content: []const u8) MergeError!void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (includeSpec(line)) |spec| {
+            if (ctx) |c| try includeFile(settings, c, spec);
+            continue;
+        }
+        try settings.applyLine(line);
+    }
+}
+
+/// Parse an `include <path>` (required) / `!include <path>` (optional) line.
+fn includeSpec(line: []const u8) ?IncludeSpec {
+    if (std.mem.startsWith(u8, line, "include "))
+        return .{ .path = std.mem.trim(u8, line["include ".len..], " \t"), .required = true };
+    if (std.mem.startsWith(u8, line, "!include "))
+        return .{ .path = std.mem.trim(u8, line["!include ".len..], " \t"), .required = false };
+    return null;
+}
+
+/// Resolve and merge an included config file (relative to `ctx.dir`). A missing
+/// required `include` warns (Nix errors; we stay best-effort to not brick the
+/// CLI on a bad system config); a missing `!include` is silently skipped.
+fn includeFile(settings: *Settings, ctx: IncludeCtx, spec: IncludeSpec) MergeError!void {
+    if (spec.path.len == 0 or ctx.depth >= max_include_depth) return;
+    const alloc = settings.allocator;
+    const path = if (std.fs.path.isAbsolute(spec.path))
+        try alloc.dupe(u8, spec.path)
+    else
+        try std.fs.path.join(alloc, &.{ ctx.dir, spec.path });
+    defer alloc.free(path);
+    const found = try mergeFile(settings, ctx.io, path, ctx.depth + 1);
+    if (!found and spec.required)
+        std.debug.print("warning: nix.conf: cannot include missing file '{s}'\n", .{path});
+}
 
 /// Load and merge the standard `nix.conf` sources. Missing/unreadable files are
 /// skipped (best-effort, like Nix). The returned `Settings` owns its storage;
@@ -101,7 +178,7 @@ pub fn load(allocator: std.mem.Allocator, env: ?*const std.process.Environ.Map, 
         const dir = envGet(env, "NIX_CONF_DIR") orelse "/etc/nix";
         const path = try std.fs.path.join(allocator, &.{ dir, "nix.conf" });
         defer allocator.free(path);
-        try mergeFile(&settings, io, path);
+        _ = try mergeFile(&settings, io, path, 0);
     }
 
     // 2. User config files (lowest priority first, so the highest wins last).
@@ -129,7 +206,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, io: std.Io
         var i = files.items.len;
         while (i > 0) {
             i -= 1;
-            try mergeFile(settings, io, files.items[i]);
+            _ = try mergeFile(settings, io, files.items[i], 0);
         }
         return;
     }
@@ -154,7 +231,7 @@ fn mergeUserConfig(allocator: std.mem.Allocator, settings: *Settings, io: std.Io
         i -= 1;
         const path = try std.fs.path.join(allocator, &.{ dirs.items[i], "nix", "nix.conf" });
         defer allocator.free(path);
-        try mergeFile(settings, io, path);
+        _ = try mergeFile(settings, io, path, 0);
     }
 }
 
@@ -174,4 +251,21 @@ test "nix.conf scalar parse + last-wins" {
     try testing.expectEqual(@as(?u64, 4), s.getUint("cores"));
     try testing.expectEqualStrings("nix-command flakes", s.get("experimental-features").?);
     try testing.expectEqual(@as(?[]const u8, null), s.get("missing"));
+}
+
+test "nix.conf extra-<name> appends (as in Nix)" {
+    const testing = std.testing;
+    var s: Settings = .{ .allocator = testing.allocator };
+    defer s.deinit();
+    try s.mergeLines(
+        \\access-tokens = github.com=a
+        \\extra-access-tokens = gitlab.com=b
+        \\extra-access-tokens = sr.ht=c
+    );
+    // `extra-` appends space-separated; a bare `extra-` on an unset key sets it.
+    try testing.expectEqualStrings("github.com=a gitlab.com=b sr.ht=c", s.get("access-tokens").?);
+    try s.setOrAppend("extra-experimental-features", "flakes");
+    try testing.expectEqualStrings("flakes", s.get("experimental-features").?);
+    try s.setOrAppend("access-tokens", "only=x"); // non-extra replaces
+    try testing.expectEqualStrings("only=x", s.get("access-tokens").?);
 }
