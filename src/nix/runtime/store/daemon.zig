@@ -33,6 +33,9 @@ pub const DaemonStore = struct {
     /// Last daemon-reported error message (owned), surfaced with
     /// `error.DaemonError`. Freed on deinit / overwritten on the next error.
     last_error: ?[]u8 = null,
+    /// While true, STDERR_NEXT build-log lines are forwarded to our stderr
+    /// (set during `buildPaths`) instead of being discarded.
+    log_build: bool = false,
 
     /// Connect to the daemon socket and complete the handshake. Heap-allocated
     /// so the framed reader/writer (which hold interior pointers) stay put.
@@ -215,6 +218,20 @@ pub const DaemonStore = struct {
         try wire.writeInt(self.w(), 0);
     }
 
+    /// Realize `derived_paths` (each a `<drvpath>^<outputs>` string, e.g.
+    /// `/nix/store/xxx.drv^*` for all outputs). The daemon builds or substitutes
+    /// the outputs; build logs stream over STDERR_NEXT and are forwarded to our
+    /// stderr while this runs. Errors (with the daemon's message) on failure.
+    pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8) !void {
+        try self.beginOp(.build_paths);
+        try wire.writeStrings(self.w(), derived_paths);
+        try wire.writeInt(self.w(), 0); // buildMode = Normal
+        self.log_build = true;
+        defer self.log_build = false;
+        try self.flushAndDrain();
+        _ = try wire.readInt(self.r()); // dummy result int
+    }
+
     // --- op plumbing ------------------------------------------------------
 
     fn beginOp(self: *DaemonStore, op: wire.Op) !void {
@@ -236,7 +253,11 @@ pub const DaemonStore = struct {
             switch (try wire.readInt(self.r())) {
                 wire.stderr_last => return,
                 wire.stderr_error => return self.readError(),
-                wire.stderr_next => try wire.skipString(self.r()),
+                wire.stderr_next => if (self.log_build) {
+                    const line = try wire.readString(self.allocator, self.r());
+                    defer self.allocator.free(line);
+                    std.debug.print("{s}", .{line});
+                } else try wire.skipString(self.r()),
                 wire.stderr_start_activity => try self.skipStartActivity(),
                 wire.stderr_stop_activity => _ = try wire.readInt(self.r()),
                 wire.stderr_result => try self.skipResult(),

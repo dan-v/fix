@@ -166,6 +166,14 @@ pub const DerivationStore = struct {
         try self.markInstantiated(store_path);
     }
 
+    /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon.
+    pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8) !void {
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        const daemon = try self.ensureDaemon();
+        try daemon.buildPaths(derived_paths);
+    }
+
     fn addText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();

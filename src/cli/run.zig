@@ -63,6 +63,27 @@ pub const Source = struct {
     text: []const u8,
 };
 
+/// A short human label for the progress "evaluating <label>" node.
+pub fn sourceLabel(source: SourceArg) []const u8 {
+    return switch (source) {
+        .file => |p| std.fs.path.basename(p),
+        .expr => "expression",
+        .flake => |inst| inst,
+    };
+}
+
+/// Render a store-op failure (daemon down / daemon error) specially, else fall
+/// back to the normal eval-failure trace. Returns exit code 1. Shared by the
+/// store-writing subcommands (`instantiate`, `build`).
+pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Evaluator, source: []const u8, err: anyerror) !u8 {
+    switch (err) {
+        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
+        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
+        else => try render.evalFailure(io, use_color, show_trace, ev, source, err),
+    }
+    return 1;
+}
+
 pub fn getSource(ev: *Evaluator, source: SourceArg) !Source {
     return switch (source) {
         .expr => |text| .{ .text = text },

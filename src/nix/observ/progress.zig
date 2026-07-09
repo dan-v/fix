@@ -13,6 +13,7 @@ pub const Stage = enum {
     import,
     derivation,
     store,
+    build,
     render,
 };
 
@@ -152,6 +153,7 @@ pub fn stageName(stage: Stage) []const u8 {
         .import => "import",
         .derivation => "derivation",
         .store => "store",
+        .build => "build",
         .render => "render",
     };
 }

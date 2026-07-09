@@ -14,6 +14,7 @@ pub const run = @import("run.zig");
 pub const setup = @import("setup.zig");
 pub const eval = @import("eval.zig");
 pub const instantiate = @import("instantiate.zig");
+pub const build = @import("build.zig");
 pub const repl = @import("repl.zig");
 pub const disasm = @import("disasm.zig");
 pub const inspect = @import("inspect.zig");

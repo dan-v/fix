@@ -820,9 +820,19 @@ pub const Evaluator = struct {
     /// drv path (borrowed from the intern table). Returns null if `value` is not
     /// a derivation-shaped attrset.
     pub fn derivationDrvPath(self: *Evaluator, value: Value) !?[]const u8 {
+        return self.derivationAttrPath(value, "drvPath");
+    }
+
+    /// The default output path (`outPath`) of a derivation `value`, or null if
+    /// it is not a derivation-shaped attrset.
+    pub fn derivationOutPath(self: *Evaluator, value: Value) !?[]const u8 {
+        return self.derivationAttrPath(value, "outPath");
+    }
+
+    fn derivationAttrPath(self: *Evaluator, value: Value, attr_name: []const u8) !?[]const u8 {
         const forced = try self.forceValue(value);
         if (!forced.isAttrs()) return null;
-        const name_id = try self.intern.intern("drvPath");
+        const name_id = try self.intern.intern(attr_name);
         const attr = (try self.heap.getAttrValueOpt(forced.asObjectId(), name_id)) orelse return null;
         const path_value = try self.forceValue(attr);
         const text_id = switch (path_value.kind()) {
@@ -831,6 +841,11 @@ pub const Evaluator = struct {
             else => return null,
         };
         return self.intern.get(text_id);
+    }
+
+    /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon store.
+    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8) !void {
+        return self.derivations.buildPaths(derived_paths);
     }
 
     pub fn forceDeep(self: *Evaluator, value: Value) !void {

@@ -100,6 +100,8 @@ pub const Options = struct {
     progress: cli.When = .auto,
     show_trace: bool = false,
     derivation_debug: derivation_debug.Options = .{},
+    /// `fix build --no-link`: skip creating the `./result` symlink.
+    no_link: bool = false,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -174,6 +176,8 @@ pub fn parse(args_iter: *std.process.Args.Iterator, first: ?[:0]const u8) !Optio
             options.derivation_debug.name = args_iter.next() orelse return error.MissingDerivationDebugName;
         } else if (std.mem.eql(u8, arg, "--debug-derivation-drv")) {
             options.derivation_debug.drv_path = args_iter.next() orelse return error.MissingDerivationDebugDrv;
+        } else if (std.mem.eql(u8, arg, "--no-link")) {
+            options.no_link = true;
         } else if (std.mem.eql(u8, arg, "--show-trace")) {
             options.show_trace = true;
         } else if (std.mem.eql(u8, arg, "--color")) {
