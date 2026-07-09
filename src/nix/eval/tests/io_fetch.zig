@@ -543,6 +543,37 @@ test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)"
     }
 }
 
+test "getFlake resolves inputs from flake.nix when there is no lock" {
+    // A flake with an input but no flake.lock: inputs come from the flake.nix
+    // `inputs` declarations (fetched unlocked), including transitively.
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var tr = std.testing.tmpDir(.{});
+    defer tr.cleanup();
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const dir_d = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &td.sub_path });
+    defer std.testing.allocator.free(dir_d);
+    const dir_r = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tr.sub_path });
+    defer std.testing.allocator.free(dir_r);
+
+    try td.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = "{ outputs = i: { v = 55; }; }" });
+    const root_flake = try std.fmt.allocPrint(std.testing.allocator, "{{ inputs.dep.url = \"path:{s}\"; outputs = i: {{ x = i.dep.v; }}; }}", .{dir_d});
+    defer std.testing.allocator.free(root_flake);
+    try tr.dir.writeFile(std.testing.io, .{ .sub_path = "flake.nix", .data = root_flake });
+    // deliberately no flake.lock
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    ev.flakes_enabled = true;
+
+    const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").x", .{dir_r});
+    defer std.testing.allocator.free(src);
+    try std.testing.expectEqual(@as(i64, 55), (try ev.evaluate(src)).asInt());
+}
+
 test "flake builtins are gated on the flakes experimental feature" {
     // getFlake / parseFlakeRef / flakeRefToString are hard-gated (uncatchable
     // by tryEval), like Nix. Without the feature they error before doing work.

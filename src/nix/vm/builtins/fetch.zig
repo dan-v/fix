@@ -696,14 +696,19 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     const dir = try optionalStringAttr(self, parsed.asObjectId(), "dir");
     defer if (dir) |d| self.allocator.free(d);
 
-    const outputs_func = try flakeOutputsFunc(self, out_path, dir);
+    const flake_value = try importFlakeValue(self, out_path, dir);
+    vm_force.rootKeep(self, flake_value);
+    const outputs_func = try flakeOutputs(self, flake_value);
     vm_force.rootKeep(self, outputs_func);
 
-    // Resolve the flake's inputs from flake.lock (transitively, honoring
-    // `follows`), then add `self`. A lockless flake gets just `self`.
+    // Inputs: from flake.lock (transitive, honoring `follows`) when present;
+    // otherwise from the flake.nix `inputs` declarations (fetched unlocked).
+    // Then add `self`.
     var input_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer input_entries.deinit(self.allocator);
-    try resolveRootInputs(self, out_path, dir, &input_entries);
+    if (!try resolveRootInputs(self, out_path, dir, &input_entries)) {
+        try resolveFlakeNixInputs(self, flake_value, &input_entries, 0);
+    }
     try input_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, source_info) });
 
     const inputs = Value.attrs(try self.heap.addAttrs(input_entries.items));
@@ -714,8 +719,8 @@ pub fn builtinGetFlake(self: anytype, arg: Value) !Value {
     return flakeResultValue(self, source_info, inputs, outputs);
 }
 
-/// Import the flake.nix at `<out_path>[/dir]` and return its (forced) `outputs`.
-fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
+/// Import + force the flake.nix attrset at `<out_path>[/dir]`.
+fn importFlakeValue(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
     const flake_path = if (dir) |d|
         try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.nix" })
     else
@@ -724,21 +729,32 @@ fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Valu
     const host = self.import_host orelse return error.ImportUnavailable;
     const flake_value = try vm_force.forceValue(self, try host.import_value(host.context, flake_path, self.native_depth));
     if (!flake_value.isAttrs()) return error.TypeError;
+    return flake_value;
+}
+
+/// The (forced) `outputs` function of an imported flake attrset.
+fn flakeOutputs(self: anytype, flake_value: Value) !Value {
     const outputs_id = try self.intern.intern("outputs");
     return vm_force.forceValue(self, try self.heap.getAttrValue(flake_value.asObjectId(), outputs_id));
 }
 
+/// Import the flake.nix at `<out_path>[/dir]` and return its (forced) `outputs`.
+fn flakeOutputsFunc(self: anytype, out_path: []const u8, dir: ?[]const u8) !Value {
+    return flakeOutputs(self, try importFlakeValue(self, out_path, dir));
+}
+
 /// Parse `<out_path>[/dir]/flake.lock` and resolve the root flake's declared
-/// inputs into `out_entries` (each a fetched, evaluated input flake). No-op when
-/// there is no lock file (a flake with no inputs).
-fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !void {
+/// inputs into `out_entries` (each a fetched, evaluated input flake). Returns
+/// false (leaving `out_entries` untouched) when there is no lock file, so the
+/// caller can fall back to the flake.nix `inputs` declarations.
+fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry)) !bool {
     const lock_path = if (dir) |d|
         try std.fs.path.join(self.allocator, &.{ out_path, d, "flake.lock" })
     else
         try std.fs.path.join(self.allocator, &.{ out_path, "flake.lock" });
     defer self.allocator.free(lock_path);
     const lock_data = self.files.readFile(lock_path) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return false,
         else => return err,
     };
 
@@ -753,7 +769,7 @@ fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_
 
     const root_node = nodes.get(root_name) orelse return error.InvalidFlakeLock;
     if (root_node != .object) return error.InvalidFlakeLock;
-    const root_inputs = root_node.object.get("inputs") orelse return; // flake with no inputs
+    const root_inputs = root_node.object.get("inputs") orelse return true; // lock exists, flake has no inputs
     if (root_inputs != .object) return error.InvalidFlakeLock;
 
     var memo: std.StringHashMapUnmanaged(Value) = .empty;
@@ -764,6 +780,76 @@ fn resolveRootInputs(self: anytype, out_path: []const u8, dir: ?[]const u8, out_
         const target_node = try followInput(nodes, root_name, entry.value_ptr.*);
         const val = try resolveNode(self, nodes, target_node, root_name, &memo, 0);
         try out_entries.append(self.allocator, .{ .name = try self.intern.intern(entry.key_ptr.*), .value = val });
+    }
+    return true;
+}
+
+/// Lockless fallback: resolve a flake's inputs directly from its flake.nix
+/// `inputs` declarations, fetching each unlocked (latest). Each input is a
+/// flakeref string, `{ url = …; }`, or a ref attrset; `flake = false` yields the
+/// bare source. Recurses into input flakes' own inputs (self-recursive, so the
+/// inferred error set resolves without a mutual-recursion loop). No
+/// `follows`/override dedup across inputs (the lock does that) — a shared input
+/// may be fetched more than once. Depth-guarded.
+fn resolveFlakeNixInputs(self: anytype, flake_value: Value, out_entries: *std.ArrayListUnmanaged(heap_mod.AttrEntry), depth: u32) !void {
+    if (depth > 32) return error.InvalidFlakeRef;
+    const inputs_id = try self.intern.intern("inputs");
+    const inputs_v = (self.heap.getAttrValueOpt(flake_value.asObjectId(), inputs_id) catch return) orelse return;
+    const inputs = try vm_force.forceValue(self, inputs_v);
+    if (!inputs.isAttrs()) return;
+
+    for (try self.heap.getAttrs(inputs.asObjectId())) |entry| {
+        const decl = try vm_force.forceValue(self, entry.value);
+        // `flake = false` -> treat as a plain source, never evaluate outputs.
+        const as_flake = if (decl.isAttrs())
+            (try optionalBoolAttr(self, decl.asObjectId(), "flake")) orelse true
+        else
+            true;
+
+        // The ref attrset: a bare string, an `.url` string, or an inline `{type=…}`.
+        const parsed: Value = if (decl.isString() or decl.isPath())
+            try builtinParseFlakeRef(self, decl)
+        else if (decl.isAttrs()) blk: {
+            if (try self.heap.getAttrValueOpt(decl.asObjectId(), try self.intern.intern("url"))) |u| {
+                break :blk try builtinParseFlakeRef(self, try vm_force.forceValue(self, u));
+            }
+            break :blk decl; // already a {type=…} ref attrset
+        } else return error.InvalidFlakeRef;
+        vm_force.rootKeep(self, parsed);
+
+        const src_info = try builtinFetchTree(self, parsed);
+        vm_force.rootKeep(self, src_info);
+
+        var val: Value = src_info;
+        if (as_flake) {
+            const src_out = try requiredStringAttr(self, src_info.asObjectId(), "outPath");
+            defer self.allocator.free(src_out);
+            const dir = try optionalStringAttr(self, parsed.asObjectId(), "dir");
+            defer if (dir) |dd| self.allocator.free(dd);
+            const fnix_path = if (dir) |dd|
+                try std.fs.path.join(self.allocator, &.{ src_out, dd, "flake.nix" })
+            else
+                try std.fs.path.join(self.allocator, &.{ src_out, "flake.nix" });
+            defer self.allocator.free(fnix_path);
+            if (self.files.pathExists(fnix_path) catch false) {
+                const nested = try importFlakeValue(self, src_out, dir);
+                vm_force.rootKeep(self, nested);
+                const outputs_func = try flakeOutputs(self, nested);
+                vm_force.rootKeep(self, outputs_func);
+
+                var node_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+                defer node_entries.deinit(self.allocator);
+                try resolveFlakeNixInputs(self, nested, &node_entries, depth + 1);
+                try node_entries.append(self.allocator, .{ .name = try self.intern.intern("self"), .value = try flakeSelfInput(self, src_info) });
+                const node_inputs = Value.attrs(try self.heap.addAttrs(node_entries.items));
+                vm_force.rootKeep(self, node_inputs);
+                const outputs = try vm_force.forceValue(self, try vm_closures.callValue(self, outputs_func, node_inputs));
+                if (!outputs.isAttrs()) return error.TypeError;
+                val = try flakeResultValue(self, src_info, node_inputs, outputs);
+            }
+        }
+        vm_force.rootKeep(self, val);
+        try out_entries.append(self.allocator, .{ .name = entry.name, .value = val });
     }
 }
 
