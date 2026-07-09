@@ -9,6 +9,7 @@ const fix = @import("fix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
+const rstore = @import("runtime").store;
 
 const Evaluator = fix.Evaluator;
 
@@ -66,6 +67,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // `flakes` implies `fetch-tree` (as in Nix).
     ev.fetch_tree_enabled = features.contains(.fetch_tree) or ev.flakes_enabled;
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
+    try applyDaemonSettings(ev, options, &settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);
 
@@ -73,6 +75,53 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     const show_progress = cli.shouldProgress(options.progress, init.io, init.environ_map);
     if (use_color) std.Io.File.stderr().enableAnsiEscapeCodes(init.io) catch {};
     return .{ .use_color = use_color, .show_progress = show_progress };
+}
+
+/// Send per-connection daemon settings (`--cores`/`--max-jobs`/`--fallback`/…
+/// and `--verbose`) via `set_options` when the store connects. Gated on the
+/// user actually asking for something (any `--option`/build-setting flag or
+/// `--verbose`); otherwise the daemon keeps its own config, preserving the
+/// default `fix build` behaviour. The overrides map carries every provided
+/// setting (so arbitrary keys like `timeout` reach the daemon); the fixed
+/// fields are read back from the merged config so system `nix.conf` values
+/// (e.g. `max-jobs`) are honoured too.
+fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
+    if (options.option_overrides.items.len == 0 and options.verbose == 0) return;
+
+    var overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty;
+    defer overrides.deinit(ev.allocator);
+    for (options.option_overrides.items) |o|
+        try overrides.append(ev.allocator, .{ .name = o.name, .value = o.value });
+
+    // setDaemonBuildSettings dupes the overrides into owned storage, so this
+    // borrowed slice need only live across the call.
+    try ev.setDaemonBuildSettings(.{
+        .keep_failed = boolSetting(settings, "keep-failed", false),
+        .keep_going = boolSetting(settings, "keep-going", false),
+        .fallback = boolSetting(settings, "fallback", false),
+        .verbosity = @min(7, options.verbose),
+        .max_build_jobs = jobsSetting(settings, "max-jobs", 1),
+        .max_silent_time = settings.getUint("max-silent-time") orelse 0,
+        .build_cores = settings.getUint("cores") orelse 0,
+        .use_substitutes = boolSetting(settings, "substitute", true),
+        .overrides = overrides.items,
+    });
+}
+
+/// Read a boolean `nix.conf` setting (`true`/`1` = true, any other value =
+/// false), falling back to `default` when unset.
+fn boolSetting(settings: *nix_conf.Settings, key: []const u8, default: bool) bool {
+    const v = settings.get(key) orelse return default;
+    const t = std.mem.trim(u8, v, " \t");
+    return std.mem.eql(u8, t, "true") or std.mem.eql(u8, t, "1");
+}
+
+/// Read `max-jobs`, resolving `auto` to the CPU count (as in Nix).
+fn jobsSetting(settings: *nix_conf.Settings, key: []const u8, default: u64) u64 {
+    const v = settings.get(key) orelse return default;
+    const t = std.mem.trim(u8, v, " \t");
+    if (std.mem.eql(u8, t, "auto")) return @intCast(std.Thread.getCpuCount() catch 1);
+    return std.fmt.parseInt(u64, t, 10) catch default;
 }
 
 /// Build the evaluator's search path from `-I`/`--include` entries followed by

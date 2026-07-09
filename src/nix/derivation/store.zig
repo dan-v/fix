@@ -71,6 +71,12 @@ pub const DerivationStore = struct {
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
     io: ?std.Io = null,
     daemon_socket: []const u8 = rstore.default_socket_path,
+    /// Per-connection daemon settings (`--cores`/`--max-jobs`/`--fallback`/…),
+    /// sent via `set_options` right after the handshake. Null = send nothing
+    /// (the daemon uses its own config). Its `overrides` slice is owned via
+    /// `daemon_overrides` below.
+    daemon_options: ?rstore.BuildSettings = null,
+    daemon_overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty,
     /// Whether forced derivations, their sources, and fetched trees are
     /// materialized to the store (`fix instantiate`/`build` enable it). Off for
     /// plain `eval` so the hot eval path never does store I/O per derivation
@@ -121,7 +127,31 @@ pub const DerivationStore = struct {
         var inst = self.instantiated.keyIterator();
         while (inst.next()) |key| self.allocator.free(key.*);
         self.instantiated.deinit(self.allocator);
+        for (self.daemon_overrides.items) |o| {
+            self.allocator.free(o.name);
+            self.allocator.free(o.value);
+        }
+        self.daemon_overrides.deinit(self.allocator);
         if (self.daemon) |d| d.deinit();
+    }
+
+    /// Set the per-connection daemon settings to apply on connect. Dupes the
+    /// overrides into owned storage (freed in `deinit`).
+    pub fn setBuildSettings(self: *DerivationStore, settings: rstore.BuildSettings) !void {
+        for (self.daemon_overrides.items) |o| {
+            self.allocator.free(o.name);
+            self.allocator.free(o.value);
+        }
+        self.daemon_overrides.clearRetainingCapacity();
+        for (settings.overrides) |o| {
+            try self.daemon_overrides.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, o.name),
+                .value = try self.allocator.dupe(u8, o.value),
+            });
+        }
+        var owned = settings;
+        owned.overrides = self.daemon_overrides.items;
+        self.daemon_options = owned;
     }
 
     /// Provide the IO handle used to connect to the daemon on demand.
@@ -153,6 +183,9 @@ pub const DerivationStore = struct {
         if (self.daemon) |d| return d;
         const io = self.io orelse return error.StoreUnavailable;
         const d = try rstore.DaemonStore.connect(self.allocator, io, self.daemon_socket);
+        errdefer d.deinit();
+        // Apply per-connection settings once, before any build op.
+        if (self.daemon_options) |opts| try d.setOptions(opts);
         self.daemon = d;
         return d;
     }

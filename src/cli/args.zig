@@ -118,6 +118,8 @@ pub const Options = struct {
     check: bool = false,
     /// `--repair`: rebuild and repair corrupted store paths (BuildMode repair).
     repair: bool = false,
+    /// `--verbose`/`-v` repeat count → daemon build-log verbosity.
+    verbose: u8 = 0,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -219,6 +221,14 @@ const Opt = enum {
     // Build realization.
     check,
     repair,
+    // Daemon build settings (folded into option_overrides, applied via set_options).
+    max_jobs,
+    cores,
+    fallback,
+    keep_failed,
+    max_silent_time,
+    timeout,
+    verbose,
     // Diagnostics.
     show_trace,
     color,
@@ -312,6 +322,13 @@ const specs = [_]Spec{
 
     .{ .id = .check, .long = "--check", .help = "rebuild and check that outputs are unchanged", .show_in = realize_cmds },
     .{ .id = .repair, .long = "--repair", .help = "rebuild and repair corrupted store paths", .show_in = realize_cmds },
+    .{ .id = .max_jobs, .short = "-j", .long = "--max-jobs", .arg = .req, .metavar = "N", .help = "maximum number of parallel build jobs (or `auto`)", .show_in = realize_cmds },
+    .{ .id = .cores, .long = "--cores", .arg = .req, .metavar = "N", .help = "build cores per job (0 = all available)", .show_in = realize_cmds },
+    .{ .id = .fallback, .long = "--fallback", .help = "build from source if a substitute fails", .show_in = realize_cmds },
+    .{ .id = .keep_failed, .short = "-K", .long = "--keep-failed", .help = "keep the build tree of failed builds", .show_in = realize_cmds },
+    .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = realize_cmds },
+    .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = realize_cmds },
+    .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error" },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
@@ -475,6 +492,16 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .add_drv_link => options.add_drv_link = true,
         .check => options.check = true,
         .repair => options.repair = true,
+        // Build-setting sugar: fold into the nix.conf override list so
+        // `setup.configure` applies them via `set_options` (same path as
+        // `--option`). `--cores 4` == `--option cores 4`.
+        .max_jobs => try options.option_overrides.append(allocator, .{ .name = "max-jobs", .value = v0.? }),
+        .cores => try options.option_overrides.append(allocator, .{ .name = "cores", .value = v0.? }),
+        .max_silent_time => try options.option_overrides.append(allocator, .{ .name = "max-silent-time", .value = v0.? }),
+        .timeout => try options.option_overrides.append(allocator, .{ .name = "timeout", .value = v0.? }),
+        .fallback => try options.option_overrides.append(allocator, .{ .name = "fallback", .value = "true" }),
+        .keep_failed => try options.option_overrides.append(allocator, .{ .name = "keep-failed", .value = "true" }),
+        .verbose => options.verbose +|= 1,
 
         .show_trace => options.show_trace = true,
         .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,

@@ -910,6 +910,12 @@ pub const Evaluator = struct {
         return self.derivations.buildPaths(derived_paths, sink, mode);
     }
 
+    /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
+    /// `set_options`) applied when the store connects. See `setup.configure`.
+    pub fn setDaemonBuildSettings(self: *Evaluator, settings: runtime.store.BuildSettings) !void {
+        return self.derivations.setBuildSettings(settings);
+    }
+
     /// Navigate a dotted attr path (e.g. `python3Packages.requests`) from `value`,
     /// forcing each step. Returns null if any component is missing or non-attrs.
     pub fn attrPathValue(self: *Evaluator, value: Value, path: []const u8) !?Value {

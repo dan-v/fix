@@ -7,5 +7,7 @@ pub const daemon = @import("store/daemon.zig");
 pub const DaemonStore = daemon.DaemonStore;
 pub const BuildSink = daemon.BuildSink;
 pub const BuildMode = daemon.BuildMode;
+pub const BuildSettings = daemon.BuildSettings;
+pub const Setting = daemon.Setting;
 pub const Trust = daemon.Trust;
 pub const default_socket_path = daemon.default_socket_path;

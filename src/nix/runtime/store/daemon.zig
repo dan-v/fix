@@ -41,6 +41,26 @@ pub const Trust = enum { unknown, trusted, not_trusted };
 /// (rebuild and verify outputs are unchanged).
 pub const BuildMode = enum(u64) { normal = 0, repair = 1, check = 2 };
 
+/// A `name = value` daemon setting carried in the `set_options` overrides map.
+pub const Setting = struct { name: []const u8, value: []const u8 };
+
+/// Per-connection daemon settings applied via `set_options` (op 19). Mirrors
+/// the client settings Nix sends after the handshake: the fixed fields plus a
+/// trailing overrides map for any other `nix.conf` key (e.g. `timeout`). The
+/// daemon applies the map after the fixed fields, so an override wins.
+pub const BuildSettings = struct {
+    keep_failed: bool = false,
+    keep_going: bool = false,
+    fallback: bool = false,
+    /// Daemon log verbosity (Nix `Verbosity`: 0 = error … 7 = vomit).
+    verbosity: u64 = 0,
+    max_build_jobs: u64 = 1,
+    max_silent_time: u64 = 0,
+    build_cores: u64 = 0,
+    use_substitutes: bool = true,
+    overrides: []const Setting = &.{},
+};
+
 pub const DaemonStore = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -260,6 +280,34 @@ pub const DaemonStore = struct {
         }
         try self.flushAndDrain();
         _ = try wire.readInt(self.r()); // dummy result int
+    }
+
+    /// Send per-connection client settings (`set_options`, op 19). Field order
+    /// matches Nix's `RemoteStore::setOptions`: the fixed settings, four obsolete
+    /// placeholders, then (protocol minor >= 12) the `name/value` overrides map.
+    pub fn setOptions(self: *DaemonStore, s: BuildSettings) !void {
+        try self.beginOp(.set_options);
+        const out = self.w();
+        try wire.writeBool(out, s.keep_failed);
+        try wire.writeBool(out, s.keep_going);
+        try wire.writeBool(out, s.fallback);
+        try wire.writeInt(out, s.verbosity);
+        try wire.writeInt(out, s.max_build_jobs);
+        try wire.writeInt(out, s.max_silent_time);
+        try wire.writeInt(out, 0); // obsolete useBuildHook
+        try wire.writeInt(out, 7); // verboseBuild != lvlError -> quiet build logs
+        try wire.writeInt(out, 0); // obsolete logType
+        try wire.writeInt(out, 0); // obsolete printBuildTrace
+        try wire.writeInt(out, s.build_cores);
+        try wire.writeBool(out, s.use_substitutes);
+        if (wire.protocolMinor(self.daemon_version) >= 12) {
+            try wire.writeInt(out, s.overrides.len);
+            for (s.overrides) |o| {
+                try wire.writeString(out, o.name);
+                try wire.writeString(out, o.value);
+            }
+        }
+        try self.flushAndDrain(); // set_options has no result, just the stderr stream
     }
 
     // --- op plumbing ------------------------------------------------------
