@@ -445,8 +445,14 @@ test "fetchTree rejects unrecognized or non-attrset input without touching the n
 test "fetchTree is gated on the fetch-tree experimental feature" {
     // Without the feature the builtin errors before touching its argument.
     try std.testing.expectError(
-        error.NixThrow,
+        error.MissingExperimentalFeature,
         renderForTest("builtins.fetchTree { type = \"path\"; path = \"/nonexistent\"; }"),
+    );
+    // A hard error like Nix: tryEval does not catch it, so the whole
+    // evaluation fails rather than resolving to `{ success = false; }`.
+    try std.testing.expectError(
+        error.MissingExperimentalFeature,
+        renderForTest("(builtins.tryEval (builtins.fetchTree { type = \"path\"; path = \"/x\"; })).success"),
     );
     // getFlake reaches the fetcher directly, so it is unaffected by the gate;
     // exercised by the "evaluate getFlake builtin for local path ref" test.

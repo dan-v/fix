@@ -381,8 +381,10 @@ fn githubTreeValue(self: anytype, path: []const u8, nar_hash: []const u8, rev: ?
 /// not additionally require the user to enable `fetch-tree`.
 pub fn builtinFetchTreeEntry(self: anytype, arg: Value) !Value {
     if (!self.fetch_tree_enabled) {
+        // A hard eval error, like Nix: not catchable by `builtins.tryEval`
+        // (which only intercepts NixThrow/NixAbort/AssertionFailed/FileNotFound).
         try vm_trace.setErrorMessage(self, "builtins.fetchTree is disabled; pass --extra-experimental-features fetch-tree to enable it");
-        return error.NixThrow;
+        return error.MissingExperimentalFeature;
     }
     return builtinFetchTree(self, arg);
 }
