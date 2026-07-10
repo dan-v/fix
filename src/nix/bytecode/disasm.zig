@@ -391,7 +391,7 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
 /// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
-fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_in_group: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     const base = off.*;
     const total = line.total();
     line.paint(seq);
@@ -408,7 +408,14 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
                 if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), use_color) else try writer.writeAll("   ");
             }
         }
-        for (guides) |gc| try writeGuide(writer, gc, use_color); // hierarchy gutter
+        // The hierarchy gutter runs down every row EXCEPT the wrapped
+        // continuation rows of the group's last member — a guide shouldn't
+        // dangle past the last actual line just because a record has more bytes.
+        if (r == 0 or !last_in_group) {
+            for (guides) |gc| try writeGuide(writer, gc, use_color);
+        } else {
+            for (guides) |_| try writer.writeAll("  ");
+        }
         if (r != 0) continue; // continuation rows: bytes + gutter only
         for (line.toks[0..line.n]) |t| {
             if (use_color) {
@@ -431,7 +438,7 @@ fn emitChunkLine(writer: *std.Io.Writer, code: []const u8, off: *usize, id_len: 
     l.glue("chunk ", .{});
     l.group(0, id_len, "0x{x}", .{id});
     if (chunkNameOf(symbols, id)) |name| l.glue(" {s}", .{name});
-    try emitLine(writer, code, off, &l, seq, guides, cc, show_bytes, use_color);
+    try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
 }
 
 /// A `{count} {label}` line (count is a u16 at `off`).
@@ -439,7 +446,7 @@ fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: [
     var l = Line{};
     l.group(0, 2, "{d}", .{readU16(code, off.*)});
     l.glue(" {s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, cc, show_bytes, use_color);
+    try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
@@ -453,7 +460,7 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         l.glue("[", .{});
         l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
         l.glue("]", .{});
-        try emitLine(writer, code, off, &l, seq, guides, cc, show_bytes, use_color);
+        try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
     }
 }
 
@@ -495,7 +502,7 @@ fn writeOperandFields(
             var l = Line{};
             l.group(0, 2, "{d}", .{readU16(code, off)});
             l.glue(" upvalues (from stack)", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
         },
         .thunk_captures, .thunk_captures_eager, .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
             const wide = op == .thunk_captures_long or op == .thunk_captures_eager_long or op == .apply_arg;
@@ -528,7 +535,7 @@ fn writeOperandFields(
             l.glue("→ local[", .{});
             l.group(0, 1, "{d}", .{code[off]});
             l.glue("]", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
         },
         .build_attrs_with_pos, .build_attrs_with_pos_sorted => {
             try emitCountLine(writer, code, &off, "entries", &seq, g[0..1], cc, show_bytes, use_color);
@@ -554,14 +561,14 @@ fn writeOperandFields(
                 l.group(12, 4, "{d}", .{cl});
                 l.glue(" ", .{});
                 if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file 0x{x}", .{fl});
-                try emitLine(writer, code, &off, &l, &seq, g[0..2], cc, show_bytes, use_color);
+                try emitLine(writer, code, &off, &l, &seq, g[0..2], k == pos_count - 1, cc, show_bytes, use_color);
             }
         },
         .defer_attr_value => {
             var l = Line{};
             l.glue("deferred #", .{});
             l.group(0, 4, "{d}", .{readU32(code, off)});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
             const env = readU16(code, off);
             g[1] = hueColor(seq);
             try emitCountLine(writer, code, &off, "env", &seq, g[0..1], cc, show_bytes, use_color);
@@ -573,7 +580,7 @@ fn writeOperandFields(
             if (end_ip > off) {
                 var l = Line{};
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, &seq, g[0..1], cc, show_bytes, use_color);
+                try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
             }
         },
     }
@@ -581,7 +588,7 @@ fn writeOperandFields(
     if (off < end_ip) {
         var l = Line{};
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, &seq, g[0..1], cc, show_bytes, use_color);
+        try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
     }
 }
 
