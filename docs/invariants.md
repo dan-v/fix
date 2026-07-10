@@ -38,6 +38,10 @@ These span subsystems, so they're collected here. Violating one usually shows up
 - **Stolen fibers return home.** A finished fiber goes back to its *allocator*-worker's free list, not the stealer's, so teardown ownership is unambiguous. → [parallel/workers](parallel/workers.md)
 - **Speculation stays one layer deep and bails only after demand.** `in_speculation` stops a speculative force from cascading more speculation; `SpeculativeBail` only triggers once the demanded result already exists — so byte-identity is preserved and there's nothing to tune. → [parallel/speculation](parallel/speculation.md)
 
+## Observability
+
+- **Progress instrumentation samples; it never rides the hot path.** Live counters and the stage tree are read by a dedicated sampler thread on a ~100ms refresh tick — never updated per-quantum from the evaluation hot path — and the sampler thread is spawned only when a progress sink is installed. All progress/live-counter instrumentation must stay gated on that sink, so a run without progress drawn pays nothing. → [cli](cli.md)
+
 ## Build & structure
 
 - **LLVM is forced** (`use_llvm=true`) because the threaded dispatcher relies on `@call(.always_tail)`; other backends would unbounded-recurse. → [build](build.md), [vm/dispatch](vm/dispatch.md)

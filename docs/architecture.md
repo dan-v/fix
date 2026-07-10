@@ -14,6 +14,8 @@ source text
   → single-pass compiler                      → bytecode Chunk [compiler + bytecode]
   → threaded VM forces lazy thunks            → Value          [vm + runtime]
   → derivation builtins hash the drv graph    → .drv + store paths  [derivation]
+  → nix-daemon client realizes the closure    → .drv files in the store, built
+                                                outputs, result links  [runtime store/]
 ```
 
 Each stage is lazy at the seams: the compiler emits **thunks** for anything not needed immediately, and the VM forces them only on demand (or *speculatively*, ahead of demand, on idle cores).
@@ -23,6 +25,7 @@ Each stage is lazy at the seams: the compiler emits **thunks** for anything not 
 - **[runtime](runtime/values.md)** — the data model: an 8-byte NaN-boxed [`Value`](runtime/values.md), a flat [object heap](runtime/heap.md), string [interning](runtime/interning.md), and the [thunk](runtime/thunks.md) that carries laziness.
 - **[vm](vm/dispatch.md)** — a direct-threaded bytecode interpreter that [forces thunks](runtime/thunks.md), [calls closures](vm/calls.md), [reads attrsets/lists](vm/access.md), and runs the [builtins](vm/builtins.md).
 - **[derivation](derivation/model.md)** — the `derivation` builtins assemble a `Drv`, then [hash](derivation/hashing.md) it (ATerm serialization → SHA-256 → nixBase32) to compute store paths. [String context](derivation/context.md) tracks which store paths each string depends on.
+- **store / daemon** — evaluation parity ends at the `.drv`; the `instantiate`/`build`/`run`/`shell` [subcommands](cli.md) then *realize* it. A hand-rolled nix-daemon **worker-protocol client** (`runtime/store/daemon.zig`, wire framing in `runtime/store/wire.zig`; Lix + CppNix compatible, version-negotiated handshake) adds the `.drv` closure to the store (NAR serialization in `runtime/nar.zig`) and asks the daemon to build, streaming build activity back. The fetching side lives next to it: `runtime/fetch_cache.zig` caches downloads, `vm/builtins/fetch.zig` implements the `fetch*` builtins, and `vm/builtins/flake_registry.zig` resolves flake refs.
 
 ## The module DAG
 
@@ -37,7 +40,9 @@ src/base/    one `base` module — generic infrastructure, nothing Nix-specific:
 src/nix/     the evaluator — one module per subsystem, layered:
    syntax                    → (parser tables)
    runtime                   → base        Nix value model, heap, thunk/Future,
-                                            interning, GC tracer, the MemTag taxonomy
+                                            interning, GC tracer, the MemTag taxonomy,
+                                            the nix-daemon client (store/), NAR,
+                                            the fetch cache
    observ                    → syntax       progress sink + error-trace collector
    scheduler   derivation    → runtime, base
    bytecode                  → runtime, base
@@ -48,7 +53,9 @@ src/nix/     the evaluator — one module per subsystem, layered:
    fix (src/nix/root.zig)    → all of nix + base   the Evaluator (composes the
                                                     pipeline, owns shared state)
 
-src/cli/     the `cli` module + `src/main.zig`  → fix
+src/cli/     the `cli` module + `src/main.zig`  → fix + the shared leaf set
+                                                   (runtime, syntax, scheduler,
+                                                   derivation, observ, base)
 ```
 
 `base` is generic enough to be a standalone library. The one place the evaluator would otherwise leak its taxonomy *into* `base` is dependency-inverted: the RSS tracker is `Vma(comptime Tag)`, and `nix` supplies the concrete `MemTag` enum at instantiation, so the generic mechanism never names an application memory bucket.
@@ -86,4 +93,4 @@ Measured on the NixOS toplevel at `--workers=32`, the main worker runs the **ser
 6. **Performance & memory:** [perf/model](perf/model.md) → [perf/probes](perf/probes.md); [gc](gc.md).
 7. **Operating it:** [build](build.md); [cli](cli.md).
 
-Historical design notes and A/B logs live in [`docs/plans/`](plans/).
+Historical design notes and A/B logs live in [`docs/superpowers/plans/`](superpowers/plans/).

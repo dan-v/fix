@@ -2,7 +2,7 @@
 
 *The command surface and the introspection tools that read the machine's mind.*
 
-The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`), which imports the `fix` core by name and reaches the engine only through its public facade — the tools never poke at engine internals ([build.md](build.md)). `src/main.zig` is composition only: it sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar; `src/cli/setup.zig` folds the common `Options → Evaluator` configuration. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
+The command surface lives in the `cli` module (`src/cli/cli.zig` facade over `src/cli/`), which imports the `fix` core plus the shared leaf modules (`runtime`, `syntax`, `scheduler`, `derivation`, `observ`, `base`) by name — facade-granularity only: the tools may use any public facade but never a module's internal files, and the engine-only modules (`bytecode`, `probe`, `compiler`, `vm`) stay unreachable ([build.md](build.md)). `src/main.zig` is composition only: it sets up the allocator, then dispatches to a **required** subcommand. `src/cli/args.zig` owns the shared option grammar; `src/cli/setup.zig` folds the common `Options → Evaluator` configuration. Everything a developer needs to evaluate, disassemble bytecode, snapshot the heap, replay execution, and pinpoint a parallelism divergence lives here.
 
 ## Invocation
 
