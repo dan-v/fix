@@ -167,7 +167,6 @@ fn writeChunkAt(
     // Each chunk is a top-level group: a colored header and a left-margin guide
     // (in the chunk's own color) down every line of its body.
     const cc: [3]u8 = if (chunk_id) |id| hueColor(id) else .{ 0x9a, 0x9a, 0x9a };
-    try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, options.use_color);
     // The chunk's recorded upvalue names (slot order), used by the header table
     // and by upvalue-slot comments throughout the body.
     const up_names: ?[]const InternId = blk: {
@@ -175,6 +174,9 @@ fn writeChunkAt(
         const reg = symbols.registry orelse break :blk null;
         break :blk reg.upvalueNamesOf(id);
     };
+    // The strict/deep flags fold into the upvalues table when it renders;
+    // otherwise the header prints its fallback flag lines.
+    try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.use_color);
 
     if (options.show_constants and chunk.constants.len > 0) {
         try writeGuide(writer, cc, null, options.use_color);
@@ -201,9 +203,13 @@ fn writeChunkAt(
         }
     }
 
-    // Upvalue table: the best-effort binding name behind each upvalue slot,
-    // mirrored by the `upvalue[N] name` comments in the body.
+    // Upvalue table: the best-effort binding name behind each upvalue slot
+    // (mirrored by the `upvalue[N] name` comments in the body), with the
+    // chunk's strictness flags folded in per slot. `#N` takes the slot's
+    // identity color — the same hue every `up_get #N` operand carries.
     if (up_names) |ups| {
+        const strict = chunk.scheduling.strictness.forced_upvalues;
+        const deep = chunk.scheduling.strictness.deep_upvalues & ~strict;
         try writeGuide(writer, cc, null, options.use_color);
         try writer.writeAll("  upvalues:\n");
         for (ups, 0..) |name_id, i| {
@@ -212,7 +218,12 @@ fn writeChunkAt(
             try writeTreeGuide(writer, sec_upvalues_color, if (i == ups.len - 1) .corner else .vert, null, options.use_color);
             var ibuf: [8]u8 = undefined;
             const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
-            try writer.writeAll(istr);
+            if (options.use_color) {
+                const uc = upvColor(i);
+                try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ uc[0], uc[1], uc[2], istr });
+            } else {
+                try writer.writeAll(istr);
+            }
             try writer.splatByteAll(' ', 6 -| istr.len);
             if (symbols.internName(name_id)) |name| {
                 if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
@@ -220,6 +231,13 @@ fn writeChunkAt(
                 if (options.use_color) try writer.writeAll("\x1b[0m");
             } else {
                 try writer.print("0x{x}", .{name_id});
+            }
+            const is_strict = i < 64 and (strict >> @intCast(i)) & 1 == 1;
+            const is_deep = i < 64 and (deep >> @intCast(i)) & 1 == 1;
+            if (is_strict or is_deep) {
+                try setCommentFg(writer, options.use_color);
+                try writer.print(" ; {s}", .{if (is_strict) "strict" else "deep"});
+                if (options.use_color) try writer.writeAll("\x1b[0m");
             }
             try writer.writeByte('\n');
         }
@@ -301,7 +319,6 @@ fn writeChunkAt(
         op_scratch.writer.end = 0;
         ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, up_names, &referenced_chunks);
         const operand_text = op_scratch.writer.buffered();
-        const insn = chunk.code[start..ip];
 
         // Find the narrowest source span covering this instruction; hoist its
         // filename onto its own line when it changes from the previous one.
@@ -316,60 +333,20 @@ fn writeChunkAt(
             }
         }
 
+        // Every instruction renders through the same head/tail token model:
+        // the mnemonic row carries the head operand (raw accessors, byte-linked,
+        // with a colored token comment); multiline ops add indented child rows.
         const bg = takeBg(&stripe, options.use_color);
         try beginRow(writer, bg, options.use_color);
         try writeGuide(writer, cc, bg, options.use_color);
         try writeOffset(writer, start, bg, options.use_color);
         try writer.writeAll("  ");
+        var seq: usize = @intFromEnum(op) + 1;
+        var head = Line{};
+        const head_len = buildHead(&head, op, chunk, start, symbols, up_names, operand_text, ip, &seq);
+        try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
         if (isMultiline(op)) {
-            // The mnemonic row carries the opcode + head operand (a chunk id, or
-            // attrset counts); list operands become indented child rows below,
-            // each its own stripe unit.
-            var seq: usize = @intFromEnum(op) + 1;
-            var head = Line{};
-            const head_len = buildHead(&head, op, chunk.code, start, symbols, &seq);
-            try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
             try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, up_names, &stripe, env);
-        } else {
-            // Zero or one simple operand: keep it all on the mnemonic row. The
-            // opcode byte + mnemonic share one color; the operand bytes and its
-            // interpretation share another (linked), like the multi-row style.
-            // A `push_const` takes its constant's identity color instead, so the
-            // reference and the pool row it names share a hue.
-            const opcol = switch (op) {
-                .push_const, .push_const_ret => if (insn.len >= 3) constColor(readU16(insn, 1)) else hueColor(@intFromEnum(op) + 1),
-                else => hueColor(@intFromEnum(op) + 1),
-            };
-            if (options.show_bytes) {
-                var c: usize = 0;
-                while (c < bytes_per_line) : (c += 1) {
-                    if (c >= insn.len) {
-                        try writer.writeAll("   ");
-                    } else {
-                        try writeByteCellColored(writer, insn[c], if (c == 0) byteRgb(op_byte) else opcol, bg, options.use_color);
-                    }
-                }
-            }
-            try writer.writeByte(' '); // gap column between the bytes and the mnemonic
-            try writeMnemonic(writer, op, bg, options.use_color);
-            var w: u16 = @intCast(@tagName(op).len + 1);
-            if (operand_text.len > 0) {
-                w = try writeInlineOperand(writer, operand_text, opcol, w, bg, options.use_color);
-            }
-            try endRow(writer, bg, env.prefixWidth() + w, env);
-            // Wrap any remaining instruction bytes onto continuation rows (the
-            // same stripe unit as the instruction).
-            if (options.show_bytes and insn.len > bytes_per_line) {
-                var o: usize = bytes_per_line;
-                while (o < insn.len) : (o += bytes_per_line) {
-                    try beginRow(writer, bg, options.use_color);
-                    try writeGuide(writer, cc, bg, options.use_color);
-                    try writer.writeAll("        ");
-                    var c: usize = o;
-                    while (c < o + bytes_per_line and c < insn.len) : (c += 1) try writeByteCellColored(writer, insn[c], opcol, bg, options.use_color);
-                    try endRow(writer, bg, @intCast(10 + 3 * (@min(o + bytes_per_line, insn.len) - o)), env);
-                }
-            }
         }
     }
 
@@ -518,6 +495,13 @@ fn heapColor(id: anytype) [3]u8 {
     return hueColor(@as(usize, @intCast(id)) + 9000);
 }
 
+/// Identity color for an upvalue slot (chunk-local): the upvalues table row,
+/// every `up_get #N` operand, and capture-descriptor indexes referencing the
+/// slot all share it — like constants' `#N`.
+fn upvColor(slot: anytype) [3]u8 {
+    return hueColor(@as(usize, @intCast(slot)) + 1500);
+}
+
 /// Fixed keyword color for the store name in a `store[accessor]` reference
 /// (`chunk[…]`, `str[…]`, …): the store reads as a keyword, the accessor
 /// carries the identity color, and the brackets stay dim.
@@ -595,30 +579,6 @@ fn setCommentFg(writer: *std.Io.Writer, use_color: bool) !void {
     if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
 }
 
-/// Render a single instruction's inline operand text: everything before the
-/// first ` ; ` is the raw decoded value (in `col`, linked to its bytes); the
-/// ` ; …` interpretation that follows takes the shared comment grey and is
-/// padded out to the mnemonic-line comment column. `start_w` is the width
-/// already written on the line from the mnemonic's first character; returns
-/// the width after the operand.
-fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, start_w: u16, bg: ?[3]u8, use_color: bool) !u16 {
-    const cut = std.mem.indexOf(u8, text, " ; ") orelse text.len;
-    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
-    try writer.writeAll(text[0..cut]);
-    var w = start_w + visibleWidth(text[0..cut]);
-    if (cut < text.len) {
-        try sgrReset(writer, bg, use_color);
-        if (w < mnem_comment_col) {
-            try writer.splatByteAll(' ', mnem_comment_col - w);
-            w = mnem_comment_col;
-        }
-        try setCommentFg(writer, use_color);
-        try writer.writeAll(text[cut..]);
-        w += visibleWidth(text[cut..]);
-    }
-    try sgrReset(writer, bg, use_color);
-    return w;
-}
 
 /// Reset the foreground (and any attributes), then — inside a background-tinted
 /// row (`bg` set) — re-establish that background so the tint survives per-cell
@@ -838,11 +798,57 @@ fn chunkIdWide(op: OpCode) bool {
     };
 }
 
-/// Build the *head* operand — the scalar accessor(s) the mnemonic line carries
-/// (a chunk id, or an attrset's entry/position counts) — as a `Line` whose byte
-/// offsets are relative to the opcode byte (byte 0). Returns the number of
-/// operand bytes consumed (so the list tail starts at opcode + 1 + head_len).
-fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symbols, seq: *usize) u16 {
+/// Escape `text` (middle-truncated at `max`) into `buf`, returning the slice.
+fn escSnippet(buf: []u8, text: []const u8, max: usize) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    writeEscapedSnippet(&w, text, max) catch {};
+    return w.buffered();
+}
+
+/// Token form of `writeStringRef`: `str[0xN] → "text"`, the id and the
+/// resolved text in the intern id's identity color.
+fn lineStringRef(l: *Line, kind: []const u8, id: InternId, symbols: Symbols, max: usize) void {
+    const c = internColor(id);
+    l.storeRef(kind, c, "0x{x}", .{id});
+    if (symbols.internName(id)) |text| {
+        var buf: [128]u8 = undefined;
+        l.glue(" → ", .{});
+        l.tint(c, "\"{s}\"", .{escSnippet(&buf, text, max)});
+    }
+}
+
+/// Token form of `writeValueDigest`: `type[accessor] → value` with identity
+/// colors, for mnemonic-line comments.
+fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
+    switch (value.kind()) {
+        .null => l.glue("null", .{}),
+        .bool_true => l.glue("true", .{}),
+        .bool_false => l.glue("false", .{}),
+        .int => l.glue("int {d}", .{value.asInt()}),
+        .float => l.glue("float {d}", .{value.asFloat()}),
+        .string => lineStringRef(l, "str", value.asInternId(), symbols, max),
+        .path => lineStringRef(l, "path", value.asInternId(), symbols, max),
+        .list => l.storeRef("list", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .attrs => l.storeRef("attrs", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .closure => l.storeRef("closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .thunk => l.storeRef("thunk", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .builtin => l.storeRef("builtin", heapColor(value.asBuiltinId()), "0x{x}", .{value.asBuiltinId()}),
+        .builtin_closure => l.storeRef("builtin_closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .string_context => l.storeRef("string_ctx", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .boxed_int => l.storeRef("boxed_int", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+        .partial_app => l.storeRef("partial_app", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
+    }
+}
+
+/// Build the *head* operand — the accessor(s) the mnemonic line carries — as a
+/// `Line` whose byte offsets are relative to the opcode byte (byte 0). For
+/// multiline ops this is the leading scalar (chunk id / counts) and the list
+/// tail follows on child rows; for single-line ops it is the WHOLE operand,
+/// with the interpretation as a colored token comment. Ops without a bespoke
+/// arm fall back to the compact `operand_text` decode. Returns the number of
+/// operand bytes the head covers.
+fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
+    const code = chunk.code;
     switch (op) {
         .clos, .clos_w, .clos_cap, .clos_cap_w, .thk, .thk_w, .thk_eag, .thk_eag_w, .thk_arg, .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const wide = chunkIdWide(op);
@@ -893,7 +899,171 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
             l.tint(c_a, "extra {s}", .{if (allow != 0) "allowed" else "rejected"});
             return 3;
         },
-        else => return 0,
+
+        // ---- single-line ops: the whole operand IS the head ----
+        .push_const, .push_const_ret => {
+            const idx = readU16(code, start + 1);
+            l.groupPinned(1, 2, constColor(idx), "#{d}", .{idx});
+            if (idx < chunk.constants.len) {
+                l.comment();
+                lineValueDigest(l, chunk.constants[idx], symbols, snippet_max);
+            }
+            return 2;
+        },
+        .loc_get, .loc_set, .loc_grab, .cell_init, .loc_get_ret, .cell_set => {
+            const slot = code[start + 1];
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 1, c, "#{d}", .{slot});
+            l.comment();
+            l.glue("local[", .{});
+            l.tint(c, "{d}", .{slot});
+            l.glue("]", .{});
+            return 1;
+        },
+        .loc_get_w, .loc_set_w, .loc_grab_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => {
+            const slot = readU16(code, start + 1);
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 2, c, "#{d}", .{slot});
+            l.comment();
+            l.glue("local[", .{});
+            l.tint(c, "{d}", .{slot});
+            l.glue("]", .{});
+            return 2;
+        },
+        .up_grab, .up_get, .up_get_ret => {
+            const slot = readU16(code, start + 1);
+            const c = upvColor(slot);
+            l.groupPinned(1, 2, c, "#{d}", .{slot});
+            l.comment();
+            l.glue("upvalue[", .{});
+            l.tint(c, "{d}", .{slot});
+            l.glue("]", .{});
+            if (upvalueName(up_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
+            return 2;
+        },
+        .up_get_attr => {
+            const slot = readU16(code, start + 1);
+            const id: InternId = @intCast(readU16(code, start + 3));
+            const c = upvColor(slot);
+            const ci = internColor(id);
+            l.groupPinned(1, 2, c, "#{d}", .{slot});
+            l.glue(" ", .{});
+            l.groupPinned(3, 2, ci, "0x{x}", .{id});
+            l.comment();
+            l.glue("upvalue[", .{});
+            l.tint(c, "{d}", .{slot});
+            l.glue("].", .{});
+            if (symbols.internName(id)) |nm| {
+                var buf: [128]u8 = undefined;
+                l.tint(ci, "\"{s}\"", .{escSnippet(&buf, nm, snippet_max)});
+            } else {
+                l.tint(ci, "0x{x}", .{id});
+            }
+            if (upvalueName(up_names, symbols, slot)) |nm| l.tint(name_color, " ({s})", .{nm});
+            return 4;
+        },
+        .loc_get_attr, .loc_get_attr_w => {
+            const wide = op == .loc_get_attr_w;
+            const slot: u16 = if (wide) readU16(code, start + 1) else code[start + 1];
+            const slot_len: u16 = if (wide) 2 else 1;
+            const id: InternId = @intCast(readU16(code, start + 1 + slot_len));
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            const ci = internColor(id);
+            l.groupPinned(1, slot_len, c, "#{d}", .{slot});
+            l.glue(" ", .{});
+            l.groupPinned(1 + slot_len, 2, ci, "0x{x}", .{id});
+            l.comment();
+            l.glue("local[", .{});
+            l.tint(c, "{d}", .{slot});
+            l.glue("].", .{});
+            if (symbols.internName(id)) |nm| {
+                var buf: [128]u8 = undefined;
+                l.tint(ci, "\"{s}\"", .{escSnippet(&buf, nm, snippet_max)});
+            } else {
+                l.tint(ci, "0x{x}", .{id});
+            }
+            return 2 + slot_len;
+        },
+        .call_n, .call_tail_n => {
+            const n = code[start + 1];
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 1, c, "#{d}", .{n});
+            l.comment();
+            l.tint(c, "{d}", .{n});
+            l.glue(" args", .{});
+            return 1;
+        },
+        .jump, .jump_false => {
+            const off = readU32(code, start + 1);
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 4, c, "+{d}", .{off});
+            l.comment();
+            l.glue("→ ", .{});
+            l.tint(c, "{x:0>4}", .{start + 5 + off});
+            return 4;
+        },
+        .attrs_new, .attrs_new_srt, .list_new, .str_cat => {
+            const n = readU16(code, start + 1);
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 2, c, "#{d}", .{n});
+            l.comment();
+            l.tint(c, "{d}", .{n});
+            l.glue(" {s}", .{switch (op) {
+                .list_new => "items",
+                .str_cat => "parts",
+                else => "entries",
+            }});
+            return 2;
+        },
+        .attr_get, .attr_get_w, .file_find, .file_find_w => {
+            const wide = op == .attr_get_w or op == .file_find_w;
+            const id_len: u16 = if (wide) 4 else 2;
+            const id: InternId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
+            l.groupPinned(1, id_len, internColor(id), "0x{x}", .{id});
+            l.comment();
+            lineStringRef(l, "str", id, symbols, snippet_max);
+            return id_len;
+        },
+        .with_lookup, .with_lookup_w => {
+            const wide = op == .with_lookup_w;
+            const id_len: u16 = if (wide) 4 else 2;
+            const id: InternId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
+            const scopes = code[start + 1 + id_len];
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, id_len, internColor(id), "0x{x}", .{id});
+            l.glue(" ", .{});
+            l.groupPinned(1 + id_len, 1, c, "#{d}", .{scopes});
+            l.comment();
+            lineStringRef(l, "str", id, symbols, snippet_max);
+            l.glue(" (", .{});
+            l.tint(c, "{d}", .{scopes});
+            l.glue(" scopes)", .{});
+            return id_len + 1;
+        },
+        else => {
+            // No bespoke arm: fall back to the compact decode — raw part as one
+            // byte-linked group, its ` ; ` interpretation as a grey comment.
+            const oplen: u16 = @intCast(end_ip - (start + 1));
+            const cut = std.mem.indexOf(u8, operand_text, " ; ") orelse operand_text.len;
+            if (oplen > 0 and cut > 0) l.group(1, oplen, "{s}", .{operand_text[0..cut]});
+            if (cut < operand_text.len) {
+                l.comment();
+                l.glue("{s}", .{operand_text[cut + 3 ..]});
+            } else if (oplen == 0 and operand_text.len > 0) {
+                // Stack-only operands (e.g. "(dynamic, with default)"): pure
+                // interpretation, no bytes.
+                l.comment();
+                l.glue("{s}", .{operand_text});
+            }
+            return oplen;
+        },
     }
 }
 
@@ -936,6 +1106,23 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
         w += visibleWidth(t.text);
     }
     try endRow(writer, bg, env.prefixWidth() + w, env);
+    // Heads longer than the byte column (attr paths etc.) wrap their remaining
+    // bytes onto continuation rows — same stripe unit as the instruction.
+    if (env.show_bytes and head_len + 1 > bytes_per_line) {
+        var o: usize = bytes_per_line;
+        while (o < head_len + 1) : (o += bytes_per_line) {
+            try beginRow(writer, bg, env.use_color);
+            try writeGuide(writer, env.cc, bg, env.use_color);
+            try writer.writeAll("        ");
+            var c: usize = o;
+            var cnt: u16 = 0;
+            while (c < o + bytes_per_line and c < head_len + 1) : (c += 1) {
+                try writeByteCellColored(writer, code[start + c], head.colorAt(@intCast(c)), bg, env.use_color);
+                cnt += 1;
+            }
+            try endRow(writer, bg, 10 + 3 * cnt, env);
+        }
+    }
 }
 
 /// A `#{count} ; {label}` line (count is a u16 at `off`). Fits one row — never
@@ -962,7 +1149,9 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         var l = Line{};
         l.group(0, 1, "{s}", .{if (is_upvalue) "upvalue" else "local"});
         l.glue("[", .{});
-        l.group(1, 2, "{d}", .{idx});
+        // An upvalue index reads the enclosing chunk's slot — give it that
+        // slot's identity color (matching the upvalues table and up_get ops).
+        if (is_upvalue) l.groupPinned(1, 2, upvColor(idx), "{d}", .{idx}) else l.group(1, 2, "{d}", .{idx});
         l.glue("]", .{});
         if (is_upvalue) {
             if (upvalueName(up_names, symbols, idx)) |nm| {
@@ -1174,7 +1363,7 @@ fn isMultiline(op: OpCode) bool {
     };
 }
 
-fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
+fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, has_upvalue_table: bool, use_color: bool) !void {
     if (chunk_id) |id| {
         // Same `store[accessor]` coloring as every reference to this chunk —
         // keyword, dim brackets, id in the chunk's identity color (bold: this
@@ -1216,6 +1405,9 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         try writer.print(", arity {d}", .{chunk.arity});
     }
     try writer.writeAll(")\n");
+    // Strictness flags fold into the upvalues table when one renders; these
+    // lines are the fallback for chunks with no recorded upvalue names.
+    if (has_upvalue_table) return;
     if (chunk.scheduling.strictness.forced_upvalues != 0) {
         try writeGuide(writer, cc, null, use_color);
         try writer.writeAll("  strict upvalues:");
