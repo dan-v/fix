@@ -47,9 +47,10 @@ pub const Options = struct {
     max_depth: u8 = 4,
 };
 
-/// Width (in bytes) the hex column pads to, so mnemonics/comments align across
-/// the header row and the per-operand field lines.
-const bytes_per_row = 6;
+/// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
+/// byte, operand bytes, mnemonic, and interpretation all align), and longer
+/// records wrap onto continuation rows.
+const bytes_per_line = 4;
 /// Left-justified width of the mnemonic column.
 const mnemonic_width = 28;
 
@@ -174,7 +175,7 @@ fn writeChunkAt(
 /// `bytes.len` must be ≤ `bytes_per_row`.
 fn writeByteField(writer: *std.Io.Writer, bytes: []const u8, use_color: bool) !void {
     for (bytes) |b| try writeByteCell(writer, b, use_color);
-    try writer.splatByteAll(' ', (bytes_per_row - bytes.len) * 3);
+    try writer.splatByteAll(' ', (bytes_per_line - bytes.len) * 3);
 }
 
 /// One `xx ` hex cell, color-coded per byte value when `use_color`.
@@ -331,10 +332,6 @@ const Line = struct {
     }
 };
 
-/// Max raw bytes shown per row; longer groups (e.g. 16-byte position records)
-/// wrap onto continuation rows, with the comment kept on the first row only.
-const bytes_per_line = 4;
-
 /// One hierarchy indent guide, drawn once per ancestor group and colored by
 /// that group's title — a background block in color mode, `│` otherwise. This
 /// is what nests capture/position lists under their count line.
@@ -346,10 +343,13 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     }
 }
 
-/// Render one operand line at `off` under `guides` (ancestor colors), wrapping
-/// the bytes at `bytes_per_line` with the comment on the first row only, then
-/// advance `off` past its bytes. `seq` is the running per-instruction color
-/// counter (shared with the mnemonic).
+/// Render one operand line at `off` under `guides` (ancestor colors), then
+/// advance `off` past its bytes. Bytes stay in their fixed column (aligned under
+/// the opcode byte); the hierarchy guides sit in the mnemonic gutter to the
+/// right of the bytes, so the interpretation reads as an indented child of the
+/// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
+/// row (a continuous gutter) but the interpretation only on the first. `seq` is
+/// the running per-instruction color counter (shared with the mnemonic).
 fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, show_bytes: bool, use_color: bool) !void {
     const base = off.*;
     const total = line.total();
@@ -358,8 +358,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
     var r: u16 = 0;
     while (r < rows) : (r += 1) {
         try writer.writeByte('\n');
-        try writer.writeAll("      "); // base indent (under the opcode column)
-        for (guides) |gc| try writeGuide(writer, gc, use_color);
+        try writer.writeAll("        "); // blank offset column
         if (show_bytes) {
             var c: u16 = 0;
             while (c < bytes_per_line) : (c += 1) {
@@ -367,9 +366,8 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
                 if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), use_color) else try writer.writeAll("   ");
             }
         }
-        if (r != 0) continue; // continuation rows carry bytes only
-        if (use_color) try writer.writeAll("\x1b[2m");
-        try writer.writeAll("; ");
+        for (guides) |gc| try writeGuide(writer, gc, use_color); // hierarchy gutter
+        if (r != 0) continue; // continuation rows: bytes + gutter only
         for (line.toks[0..line.n]) |t| {
             if (use_color) {
                 if (t.colored and t.len > 0) {
