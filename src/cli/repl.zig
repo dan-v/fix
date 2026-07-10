@@ -442,7 +442,6 @@ const Repl = struct {
             .type_of => {
                 if (try self.evalExpr(rest)) |v| {
                     const forced = self.ev.forceValue(v) catch v;
-                    try self.bind("it", forced);
                     var out = self.stdout();
                     defer out.interface.flush() catch {};
                     try self.describeType(&out.interface, forced);
@@ -463,7 +462,6 @@ const Repl = struct {
             },
             .inspect => {
                 if (try self.evalExpr(rest)) |v| {
-                    try self.bind("it", v);
                     var out = self.stdout();
                     defer out.interface.flush() catch {};
                     try self.inspectValue(&out.interface, v);
@@ -729,7 +727,6 @@ const Repl = struct {
                 },
                 else => {},
             }
-            try self.bind("it", value);
         } else return; // evaluation failed; error already rendered
 
         if (chunk_id == null) {
