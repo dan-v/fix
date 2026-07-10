@@ -213,8 +213,8 @@ test "compileLambda and compileLambdaAttrs produce different chunk shapes" {
     try testing.expect(attrs_lambda.contains("attr_check"));
 
     // Both compile to a top-level closure creation over a nested body chunk.
-    try testing.expect(value_lambda.contains("clos"));
-    try testing.expect(attrs_lambda.contains("clos"));
+    try testing.expect(value_lambda.contains("closure"));
+    try testing.expect(attrs_lambda.contains("closure"));
 }
 
 test "applying a non-callable value raises NotCallable instead of panicking" {

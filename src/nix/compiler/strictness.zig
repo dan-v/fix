@@ -521,7 +521,7 @@ pub fn analyzeChunkBody(
 
 /// For each binding name, decide in ONE walk of the let body:
 ///   - `out_eager[i]`       — the body *may* force it (shallow may-force
-///                            set). Drives the `thk_eag`
+///                            set). Drives the `thunk_eag`
 ///                            submit hint: helpers race the binding ahead
 ///                            of demand instead of waiting for the
 ///                            chunk-size speculation heuristic.

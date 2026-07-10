@@ -1,6 +1,6 @@
 //! Compiles a sub-expression into its own thunk chunk and chooses the
-//! emission mode: plain lazy `thk`, eager-spawn (strictness says
-//! it will be forced), or runtime-adaptive `thk_arg` (callee decides),
+//! emission mode: plain lazy `thunk`, eager-spawn (strictness says
+//! it will be forced), or runtime-adaptive `thunk_arg` (callee decides),
 //! with trivial-bodied args falling back to a plain thunk.
 //! `finishCompiledChild` is the shared funnel so the force-time deferred
 //! compile reuses the exact eager child-body path.
@@ -61,9 +61,9 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
     }
 }
 
-/// Compile a function argument as a runtime-adaptive `thk_arg` (the
+/// Compile a function argument as a runtime-adaptive `thunk_arg` (the
 /// callee, already on the stack, decides thunk-vs-eager at run time).
-/// Trivial-body args fall back to a plain `thk`: they
+/// Trivial-body args fall back to a plain `thunk`: they
 /// short-circuit to a value with no thunk either way, so the adaptive
 /// runtime check would be pure overhead.
 pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {

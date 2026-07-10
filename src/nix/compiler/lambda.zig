@@ -66,7 +66,7 @@ fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 }
 
 /// Compile one argument of a flattened `call_n` spine. We deliberately do
-/// NOT use the runtime-adaptive `thk_arg` op here: its eager-vs-thunk
+/// NOT use the runtime-adaptive `thunk_arg` op here: its eager-vs-thunk
 /// check reads the callee at `stack[sp-1]`, which is the real callee only
 /// for the *first* spine arg (later args would see the previous arg). So
 /// immediate container values stay thunk-free and everything else becomes
@@ -130,7 +130,7 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
         // wrapping it in a forwarding thunk (see `compileSpineArg`).
     } else {
         // Dynamically-dispatched call: defer the thunk-vs-eager decision
-        // to runtime via `thk_arg`, which reads the callee's strictness.
+        // to runtime via `thunk_arg`, which reads the callee's strictness.
         try thunks.compileApplyArgThunk(self, ap.arg);
     }
     try emit.emitOp(self, op);
@@ -245,7 +245,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     } else {
         // Uncurried chunk: a per-param must-force bitmask. The saturated
         // `call_n` path forces these arg positions eagerly, recovering the
-        // eager-arg behavior `thk_arg` gives the single-param shape (and
+        // eager-arg behavior `thunk_arg` gives the single-param shape (and
         // avoiding lazy-thunk-chain buildup in accumulator recursion).
         var mask: u8 = 0;
         var si: u16 = 0;

@@ -118,14 +118,14 @@ pub fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
 
 const StoreTarget = enum { narrow_local, narrow_cell };
 
-/// Rewrite a just-emitted `thk` / `thk_eag` op
+/// Rewrite a just-emitted `thunk` / `thunk_eag` op
 /// into the fused `*_store_local` / `*_store_cell_local` variant by
 /// appending the destination slot byte. Saves the push/pop of the
 /// new thunk reference plus one dispatch.
 ///
 /// Only fuses for 1-byte slots (`loc_set`/`cell_set`, not
 /// the `_long` forms); ~all let-bindings fit. Only the short-chunk-id
-/// variants of `thk` are fused — `_long` is rare and
+/// variants of `thunk` are fused — `_long` is rare and
 /// adding it would double the opcode count without a meaningful win.
 fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     if (slot > std.math.maxInt(u8)) return false;
@@ -134,13 +134,13 @@ fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     if (offset >= code.len) return false;
     const last_op: OpCode = @enumFromInt(code[offset]);
     const fused: OpCode = switch (last_op) {
-        .thk => switch (target) {
-            .narrow_local => .thk_st,
-            .narrow_cell => .thk_st_cell,
+        .thunk => switch (target) {
+            .narrow_local => .thunk_st,
+            .narrow_cell => .thunk_st_cell,
         },
-        .thk_eag => switch (target) {
-            .narrow_local => .thk_eag_st,
-            .narrow_cell => .thk_eag_st_cell,
+        .thunk_eag => switch (target) {
+            .narrow_local => .thunk_eag_st,
+            .narrow_cell => .thunk_eag_st_cell,
         },
         else => return false,
     };
@@ -244,9 +244,9 @@ pub fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
 
 pub fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u16) !void {
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .clos, @intCast(chunk_id));
+        try emitOpU16(self, .closure, @intCast(chunk_id));
     } else {
-        try emitOp(self, .clos_w);
+        try emitOp(self, .closure_w);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);
@@ -257,9 +257,9 @@ pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, capture
     const upvalue_count = try captureCount(captures.len);
 
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .clos_cap, @intCast(chunk_id));
+        try emitOpU16(self, .closure_cap, @intCast(chunk_id));
     } else {
-        try emitOp(self, .clos_cap_w);
+        try emitOp(self, .closure_cap_w);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);
@@ -270,7 +270,7 @@ pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures:
     return emitThunkWithCapturesImpl(self, chunk_id, captures, false);
 }
 
-/// Same as `emitThunkWithCaptures` but emits the `thk_eag`
+/// Same as `emitThunkWithCaptures` but emits the `thunk_eag`
 /// variant — runtime will submit the thunk to the urgent scheduler
 /// queue at creation. Called by `compileThunk` when the surrounding
 /// chunk's strictness signature says this binding will be forced.
@@ -282,10 +282,10 @@ fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures:
     const upvalue_count = try captureCount(captures.len);
 
     if (chunk_id <= std.math.maxInt(u16)) {
-        const op: bytecode.OpCode = if (eager) .thk_eag else .thk;
+        const op: bytecode.OpCode = if (eager) .thunk_eag else .thunk;
         try emitOpU16(self, op, @intCast(chunk_id));
     } else {
-        const op: bytecode.OpCode = if (eager) .thk_eag_w else .thk_w;
+        const op: bytecode.OpCode = if (eager) .thunk_eag_w else .thunk_w;
         try emitOp(self, op);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
@@ -293,23 +293,23 @@ fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures:
     try emitCaptureDescriptors(self, captures);
 }
 
-/// Emit `thk_arg` — a function argument whose laziness is decided at
+/// Emit `thunk_arg` — a function argument whose laziness is decided at
 /// runtime from the callee's strictness. Always wide chunk-id (the 2
 /// extra operand bytes are negligible vs. avoiding a second opcode).
 pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
     const upvalue_count = try captureCount(captures.len);
-    try emitOp(self, .thk_arg);
+    try emitOp(self, .thunk_arg);
     try self.builder.writeU32(self.allocator, chunk_id);
     try self.builder.writeU16(self.allocator, upvalue_count);
     try emitCaptureDescriptors(self, captures);
 }
 
-/// Emit `thk_defer` (lazy per-attr compilation): a deferred-table
+/// Emit `thunk_defer` (lazy per-attr compilation): a deferred-table
 /// id plus the enclosing-scope snapshot as capture descriptors. Mirrors
 /// `emitApplyArg`'s always-wide-id layout.
 pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capture) !void {
     const env_count = try captureCount(scope.len);
-    try emitOp(self, .thk_defer);
+    try emitOp(self, .thunk_defer);
     try self.builder.writeU32(self.allocator, deferred_id);
     try self.builder.writeU16(self.allocator, env_count);
     try emitCaptureDescriptors(self, scope);

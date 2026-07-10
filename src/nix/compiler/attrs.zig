@@ -442,7 +442,7 @@ const DeferScope = struct {
     source_path: ?[]const u8,
 };
 
-/// Register a deferred value body and emit `thk_defer`. `name` is the
+/// Register a deferred value body and emit `thunk_defer`. `name` is the
 /// attr the body is bound to, carried through for best-effort chunk naming
 /// (`fix disasm`); null / ignored when naming is off.
 fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: DeferScope) !void {

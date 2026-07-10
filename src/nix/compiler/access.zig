@@ -233,7 +233,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
                 // consumer marks it demanded, matching the
                 // observable laziness of a true thunk-wrapped list.
                 try compileList(self, unwrapped);
-                try emit.emitOp(self, .thk_shell);
+                try emit.emitOp(self, .thunk_shell);
             }
         },
         .attr_set => {
@@ -250,15 +250,15 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             if (unwrapped.data.attr_set.recursive) return false;
             self.name_hint = null; // composite value: see the .list note above
             try attrs.compileAttrSet(self, unwrapped);
-            try emit.emitOp(self, .thk_shell);
+            try emit.emitOp(self, .thunk_shell);
         },
         .lambda => {
             try ops.compileLambda(self, unwrapped);
-            try emit.emitOp(self, .thk_shell);
+            try emit.emitOp(self, .thunk_shell);
         },
         .lambda_attrs => {
             try ops.compileLambdaAttrs(self, unwrapped);
-            try emit.emitOp(self, .thk_shell);
+            try emit.emitOp(self, .thunk_shell);
         },
         .identifier => {
             if (!options.raw_identifier) return false;

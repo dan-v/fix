@@ -118,7 +118,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     defer prof.end(.make_bytecode_thunk, t);
     // Read the trivial classification + `body_is_substantial` from the
     // registry's dense slot — the Chunk itself is only dereferenced by
-    // the one arm that needs its code (`clos_cap`).
+    // the one arm that needs its code (`closure_cap`).
     const slot = self.registry.slot(chunk_id) orelse return error.InvalidChunk;
 
     // Trivial-body short-circuit: if the chunk's whole body is
@@ -129,7 +129,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     // running a 4-byte chunk through the dispatcher. Saves a heap
     // alloc, a markDemanded, a frame push/pop, and several dispatches
     // per occurrence — the dominant pattern that drives the
-    // `thk` op count (~15% of all ops on NixOS toplevel).
+    // `thunk` op count (~15% of all ops on NixOS toplevel).
     switch (slot.trivial) {
         .identity_upvalue => |idx| {
             return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
@@ -193,7 +193,7 @@ pub fn calleeForcesArg(self: *VM, callee: Value) bool {
     return false;
 }
 
-/// Evaluate an `thk_arg` argument eagerly to a value (used when the
+/// Evaluate an `thunk_arg` argument eagerly to a value (used when the
 /// callee forces it). Stages the captured upvalues onto the stack below
 /// a fresh frame, runs the argument chunk, then replaces the staged
 /// upvalues with the resulting value. No thunk is allocated.
@@ -304,7 +304,7 @@ inline fn shortCircuitClosureCaptures(
 
 
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
-/// urgent queue at creation time. Used by `thk_eag` —
+/// urgent queue at creation time. Used by `thunk_eag` —
 /// the compiler emits that op when strictness analysis confirms the
 /// surrounding chunk's body forces this binding.
 ///

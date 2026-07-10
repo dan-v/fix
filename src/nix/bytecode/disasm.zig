@@ -795,7 +795,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
 /// Whether a chunk-id-carrying op uses the wide (u32) id form.
 fn chunkIdWide(op: OpCode) bool {
     return switch (op) {
-        .clos_w, .clos_cap_w, .thk_w, .thk_eag_w, .thk_arg => true,
+        .closure_w, .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg => true,
         else => false,
     };
 }
@@ -868,7 +868,7 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
 fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
     const code = chunk.code;
     switch (op) {
-        .clos, .clos_w, .clos_cap, .clos_cap_w, .thk, .thk_w, .thk_eag, .thk_eag_w, .thk_arg, .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
+        .closure, .closure_w, .closure_cap, .closure_cap_w, .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
             const wide = chunkIdWide(op);
             const id_len: u16 = if (wide) 4 else 2;
             const id: ChunkId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
@@ -895,7 +895,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue(" positions", .{});
             return 4;
         },
-        .thk_defer => {
+        .thunk_defer => {
             const id = readU32(code, start + 1);
             l.group(1, 4, "#{d}", .{id});
             l.comment();
@@ -1218,19 +1218,19 @@ fn writeOperandTail(
     var g: [3][3]u8 = undefined;
     g[0] = byteRgb(@intFromEnum(op));
     switch (op) {
-        .clos, .clos_w => {
+        .closure, .closure_w => {
             // The chunk id rode the mnemonic line; only the upvalue count
             // remains — the block's only (and thus last) row.
             try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], 0b01, stripe, env);
         },
-        .thk, .thk_eag, .thk_w, .thk_eag_w, .thk_arg, .clos_cap, .clos_cap_w => {
+        .thunk, .thunk_eag, .thunk_w, .thunk_eag_w, .thunk_arg, .closure_cap, .closure_cap_w => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*); // the "captures" count line's color
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
             // The last descriptor closes both the list (level 1) and the block.
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
-        .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
+        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], 0, stripe, env);
@@ -1309,7 +1309,7 @@ fn writeOperandTail(
                 try emitLine(writer, code, &off, &l2, seq, g[0..1], if (k == pos_count - 1) 0b01 else 0, bg, env);
             }
         },
-        .thk_defer => {
+        .thunk_defer => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
             try emitCountLine(writer, code, &off, "env", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
@@ -1361,22 +1361,22 @@ fn writeOperandTail(
 /// across multiple indented rows; everything else fits on one line.
 fn isMultiline(op: OpCode) bool {
     return switch (op) {
-        .clos,
-        .clos_w,
-        .thk,
-        .thk_eag,
-        .thk_w,
-        .thk_eag_w,
-        .thk_arg,
-        .clos_cap,
-        .clos_cap_w,
-        .thk_st,
-        .thk_st_cell,
-        .thk_eag_st,
-        .thk_eag_st_cell,
+        .closure,
+        .closure_w,
+        .thunk,
+        .thunk_eag,
+        .thunk_w,
+        .thunk_eag_w,
+        .thunk_arg,
+        .closure_cap,
+        .closure_cap_w,
+        .thunk_st,
+        .thunk_st_cell,
+        .thunk_eag_st,
+        .thunk_eag_st_cell,
         .attrs_new_pos,
         .attrs_new_pos_srt,
-        .thk_defer,
+        .thunk_defer,
         .attr_check,
         .attr_check_w,
         => true,
@@ -1552,7 +1552,7 @@ fn writeOperands(
         .fail, .push_builtins,
         .attrs_merge, .attrs_merge_strict, .list_cat,
         .attr_get_dyn,
-        .call, .call_tail, .cell_new, .thk_shell, .ret, .halt => {},
+        .call, .call_tail, .cell_new, .thunk_shell, .ret, .halt => {},
 
         .call_n, .call_tail_n => {
             const n = code[ip];
@@ -1606,9 +1606,9 @@ fn writeOperands(
             try writeInternRef(writer, id, symbols);
         },
 
-        .clos => {
-            // `.clos` carries no inline capture descriptors (captures come
-            // off the stack); `.clos_cap`/`.thk*` do.
+        .closure => {
+            // `.closure` carries no inline capture descriptors (captures come
+            // off the stack); `.closure_cap`/`.thunk*` do.
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -1617,7 +1617,7 @@ fn writeOperands(
             try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thk, .thk_eag => {
+        .thunk, .thunk_eag => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -1627,7 +1627,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
+        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -1640,7 +1640,7 @@ fn writeOperands(
             try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .clos_w => {
+        .closure_w => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -1649,7 +1649,7 @@ fn writeOperands(
             try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thk_w, .thk_eag_w, .thk_arg => {
+        .thunk_w, .thunk_eag_w, .thunk_arg => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -1659,7 +1659,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .clos_cap => {
+        .closure_cap => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -1669,7 +1669,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .clos_cap_w => {
+        .closure_cap_w => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -1679,7 +1679,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thk_defer => {
+        .thunk_defer => {
             // Operand: 4-byte deferred-table id, 2-byte env count, then
             // env_count capture descriptors. No chunk id (compiled lazily).
             const id: u32 = readU32(code, ip);

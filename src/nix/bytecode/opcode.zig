@@ -128,57 +128,57 @@ pub const OpCode = enum(u8) {
     /// Create a closure value from a chunk and captured upvalues.
     /// Operand: 2-byte ChunkId, 2-byte upvalue count.
     /// Upvalues are the top N values on the stack, popped.
-    clos,
+    closure,
     /// Create a closure whose chunk id does not fit in the short form.
     /// Operand: 4-byte ChunkId, 2-byte upvalue count.
-    clos_w,
+    closure_w,
     /// Create a closure and fill upvalues from inline capture descriptors.
     /// Operand: 2-byte ChunkId, 2-byte count, then repeated
     /// 1-byte kind (0=local, 1=upvalue), 2-byte index.
-    clos_cap,
-    /// Wide-chunk-id form of clos_cap.
+    closure_cap,
+    /// Wide-chunk-id form of closure_cap.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    clos_cap_w,
+    closure_cap_w,
     /// Function-argument with a runtime-adaptive laziness decision. The
     /// callee is already on the stack (just below where the argument
     /// goes). If it is a closure whose chunk's body must-forces its
     /// parameter (`scheduling.strict_param`), the argument expression is
     /// evaluated eagerly to a value — no thunk; otherwise it is
-    /// materialised as a thunk exactly like `thk`. Lets us
+    /// materialised as a thunk exactly like `thunk`. Lets us
     /// skip the thunk for dynamically-dispatched strict calls, which the
     /// compiler can't resolve statically.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    thk_arg,
+    thunk_arg,
     /// Create a thunk directly from a chunk and inline capture descriptors.
     /// Operand: 2-byte ChunkId, 2-byte count, then repeated descriptors.
-    thk,
-    /// Wide-chunk-id form of thk.
+    thunk,
+    /// Wide-chunk-id form of thunk.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    thk_w,
-    /// Same as `thk` but submits the thunk to the urgent
+    thunk_w,
+    /// Same as `thunk` but submits the thunk to the urgent
     /// scheduler queue at creation time. Emitted by the compiler when
     /// strictness analysis says the surrounding chunk's body will
     /// unconditionally force this binding — turns the chunk-size
     /// speculation heuristic into a deterministic decision and
     /// bypasses the speculation backlog cap.
-    thk_eag,
-    /// Wide-chunk-id form of thk_eag.
-    thk_eag_w,
+    thunk_eag,
+    /// Wide-chunk-id form of thunk_eag.
+    thunk_eag_w,
 
-    /// Fused `thk + cell_set`. Creates the thunk
+    /// Fused `thunk + cell_set`. Creates the thunk
     /// from the chunk-id + descriptors, then `publishCellBinding`s it
     /// into the cell-thunk at frame_base + slot (skipping the
     /// push/pop of the new thunk reference). Operand layout:
     ///   chunk_id:2 + K:2 + 3K descriptors + slot:1
-    /// The slot byte is at the END so we can rewrite `thk`
+    /// The slot byte is at the END so we can rewrite `thunk`
     /// in place at emit time without shifting the descriptor bytes.
-    thk_st_cell,
-    /// Fused `thk + loc_set`.
-    thk_st,
-    /// Fused `thk_eag + cell_set`.
-    thk_eag_st_cell,
-    /// Fused `thk_eag + loc_set`.
-    thk_eag_st,
+    thunk_st_cell,
+    /// Fused `thunk + loc_set`.
+    thunk_st,
+    /// Fused `thunk_eag + cell_set`.
+    thunk_eag_st_cell,
+    /// Fused `thunk_eag + loc_set`.
+    thunk_eag_st,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
@@ -237,11 +237,11 @@ pub const OpCode = enum(u8) {
     /// (list / attrset / lambda) appears in a context that requires
     /// the value to *look* like a lazy thunk to renderers (XML lazy
     /// mode in particular) — we skip emitting a child chunk +
-    /// `thk` and just wrap the already-built shell. The
+    /// `thunk` and just wrap the already-built shell. The
     /// resulting thunk's `force` is O(1) (resolved fast path); the
     /// XML serializer keeps printing `<unevaluated />` until a real
     /// caller marks it demanded.
-    thk_shell,
+    thunk_shell,
     /// Allocate an empty (null-wrapped) lazy cell and store it
     /// directly into a local slot. Operand: 1-byte slot index. Fuses
     /// the `push_null + cell_new + loc_set` sequence that the
@@ -318,8 +318,8 @@ pub const OpCode = enum(u8) {
     /// is compiled on first force (see `compiler/deferred_table.zig` and
     /// `compiler/deferred.zig`).
     /// Operand: 4-byte deferred-table id, 2-byte env count, then `env`
-    /// capture descriptors (kind:1, index:2) — same format as thk.
-    thk_defer,
+    /// capture descriptors (kind:1, index:2) — same format as thunk.
+    thunk_defer,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,

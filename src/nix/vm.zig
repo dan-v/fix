@@ -286,7 +286,7 @@ pub const VM = struct {
     /// True only when the result will be rendered as lazy XML, where
     /// eagerly-built shapes (list/attrset/lambda) must appear unevaluated
     /// (`<unevaluated />`) until demanded. The compiler emits
-    /// `thk_shell` to wrap such values; when this is false (the
+    /// `thunk_shell` to wrap such values; when this is false (the
     /// common default/JSON/`.drv`/strict path) the wrap is pure overhead
     /// — millions of throwaway thunks — so the op pushes the value
     /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.

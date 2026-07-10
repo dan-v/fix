@@ -46,7 +46,7 @@ pub const Chunk = struct {
     /// chunk's body unconditionally forces — the multi-param analogue of
     /// `scheduling.strict_param`. The saturated `call_n` path eagerly
     /// forces these arg positions before running the body, recovering the
-    /// eager-arg optimization the single-param path gets via `thk_arg`
+    /// eager-arg optimization the single-param path gets via `thunk_arg`
     /// (and avoiding lazy-thunk-chain buildup in accumulator recursion).
     /// 0 for arity-1 chunks (handled by `strict_param`) and thunk bodies.
     strict_params: u8 = 0,
@@ -97,33 +97,33 @@ pub const ChunkStrictness = struct {
 
 /// Compile-time classification of trivial chunk shapes. When a
 /// chunk's entire body is a single value-load followed by ret, we can
-/// short-circuit `thk` and skip creating a thunk altogether
+/// short-circuit `thunk` and skip creating a thunk altogether
 /// — just push the inlined value at the caller. Cuts a heap alloc, a
 /// future force, a frame push/pop, and 2 dispatches per occurrence.
 pub const TrivialBody = union(enum) {
     /// Not a trivial shape — full thunk creation required.
     none,
     /// Body is `up_get_ret upvalue[N]` (or `up_get N; ret`).
-    /// At thk we know upvalue N's value from the descriptor,
+    /// At thunk we know upvalue N's value from the descriptor,
     /// so we push that value directly instead of allocating a thunk.
     identity_upvalue: u16,
-    /// Body is `clos CL, 0; ret; halt` (or `clos_w`). The
-    /// chunk wraps a zero-upvalue closure. At thk we
+    /// Body is `closure CL, 0; ret; halt` (or `closure_w`). The
+    /// chunk wraps a zero-upvalue closure. At thunk we
     /// allocate the closure directly, skipping the thunk wrapper.
     /// Each invocation still gets a fresh closure ObjectId — same as
     /// running the body — but the thunk alloc + future force vanish.
     closure_zero: ChunkId,
-    /// Body is `clos_cap CL, K, descriptors; ret; halt` with
+    /// Body is `closure_cap CL, K, descriptors; ret; halt` with
     /// K >= 1 and every inner descriptor of kind=upvalue (which is
     /// guaranteed since thunk bodies have local_count == 0). At
-    /// `thk`, the closure's upvalue values can be resolved
+    /// `thunk`, the closure's upvalue values can be resolved
     /// directly: inner_upvalue[i] = outer_descriptors[inner_idx[i]]
     /// evaluated against the outer frame. We compose the two
     /// descriptor layers and build the closure in place, skipping
     /// thunk creation entirely.
     closure_captures: ClosureCaptures,
     /// Body is `push_builtins; ret; halt` — the binding aliases the
-    /// evaluator's builtins attrset. At thk we push
+    /// evaluator's builtins attrset. At thunk we push
     /// `vm.builtins` directly. Common via `with builtins;` blocks and
     /// `let lib = import ...; in ...` patterns where lib transitively
     /// embeds `builtins`.
@@ -344,7 +344,7 @@ pub const ChunkBuilder = struct {
 };
 
 /// Classify the body of a freshly-built chunk as one of the trivial
-/// shapes that let `thk` skip thunk allocation entirely.
+/// shapes that let `thunk` skip thunk allocation entirely.
 /// Run once at chunk-finish; result lives on the immutable Chunk so
 /// the hot path reads it without re-parsing the bytecode.
 fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: u16) TrivialBody {
@@ -352,7 +352,7 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
     // *thunk bodies*. Thunk bodies have local_count == 0 (no args,
     // no temporaries). Closure bodies (lambdas) have local_count >= 1
     // for the param and may have additional locals. We must not
-    // short-circuit those because `thk` against a chunk
+    // short-circuit those because `thunk` against a chunk
     // assumes the chunk is a thunk body, not a lambda body.
     if (local_count != 0) return .none;
     if (code.len < 2) return .none;
@@ -409,8 +409,8 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             };
             return .{ .literal = literal };
         },
-        // `clos CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
-        .clos => {
+        // `closure CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
+        .closure => {
             if (code.len != 7) return .none;
             if (@as(OpCode, @enumFromInt(code[5])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[6])) != .halt) return .none;
@@ -418,8 +418,8 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (upvalue_count != 0) return .none; // non-zero closure needs stack values
             return .{ .closure_zero = readU16Inline(code, 1) };
         },
-        // `clos_w CL(4), 0; ret; halt` — 1 + 4 + 2 + 1 + 1 = 9 bytes.
-        .clos_w => {
+        // `closure_w CL(4), 0; ret; halt` — 1 + 4 + 2 + 1 + 1 = 9 bytes.
+        .closure_w => {
             if (code.len != 9) return .none;
             if (@as(OpCode, @enumFromInt(code[7])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[8])) != .halt) return .none;
@@ -427,12 +427,12 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (upvalue_count != 0) return .none;
             return .{ .closure_zero = readU32Inline(code, 1) };
         },
-        // `clos_cap CL, K, descriptors(3K); ret; halt`
+        // `closure_cap CL, K, descriptors(3K); ret; halt`
         // 1 op + 2 chunk_id + 2 K + 3K descriptors + 1 ret + 1 halt = 7 + 3K.
-        .clos_cap => {
+        .closure_cap => {
             if (code.len < 7) return .none;
             const k = readU16Inline(code, 3);
-            if (k == 0) return .none; // shouldn't happen — emit drops to .clos when K==0
+            if (k == 0) return .none; // shouldn't happen — emit drops to .closure when K==0
             const desc_len: usize = @as(usize, k) * 3;
             if (code.len != 7 + desc_len) return .none;
             if (@as(OpCode, @enumFromInt(code[5 + desc_len])) != .ret) return .none;
@@ -451,9 +451,9 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
                 .inner_descriptors_len = @intCast(desc_len),
             } };
         },
-        // `clos_cap_w CL(4), K, descriptors(3K); ret; halt`
+        // `closure_cap_w CL(4), K, descriptors(3K); ret; halt`
         // 1 + 4 + 2 + 3K + 1 + 1 = 9 + 3K.
-        .clos_cap_w => {
+        .closure_cap_w => {
             if (code.len < 9) return .none;
             const k = readU16Inline(code, 5);
             if (k == 0) return .none;
@@ -524,7 +524,7 @@ pub const WellKnownChunks = struct {
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
     /// Dense per-chunk slot: the Chunk pointer plus a copy of the hot
-    /// scheduling metadata. The thunk-creation path (`thk`,
+    /// scheduling metadata. The thunk-creation path (`thunk`,
     /// ~6M executions per NixOS toplevel) and the speculation gates only
     /// need `trivial`/`body_is_substantial`; reading them through `ptr`
     /// is a cache-missing deref into a heap-scattered Chunk, while the
