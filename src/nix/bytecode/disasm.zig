@@ -957,10 +957,12 @@ fn writeOperandTail(
             g[1] = hueColor(seq.*);
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], stripe, env);
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
+            // The trailing slot byte: raw accessor in the value zone, the
+            // store-target interpretation as its comment.
             var l = Line{};
-            l.glue("→ local[", .{});
-            l.group(0, 1, "{d}", .{code[off]});
-            l.glue("]", .{});
+            l.group(0, 1, "#{d}", .{code[off]});
+            l.comment();
+            l.glue("→ local[{d}]", .{code[off]});
             try emitLine(writer, code, &off, &l, seq, g[0..1], false, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
