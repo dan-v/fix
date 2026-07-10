@@ -1249,15 +1249,29 @@ pub const Evaluator = struct {
         if (self.progress) |p| p.stage.metrics(self.readMetrics());
     }
 
-    /// Sampler thread body: push a snapshot, then sleep ~100ms (waking every
-    /// 20ms to observe the stop flag). Decoupled from fiber quanta so the
+    /// Live-counter sample period. Paired with the render refresh in
+    /// `cli.EvalProgress.init` — sampling faster than the redraw is invisible,
+    /// so bump both together. 50ms (20 Hz) keeps the counters feeling live
+    /// while staying "reasonable sampling": the cost is a handful of atomic
+    /// loads + one /proc read on a background thread that only exists while
+    /// progress is drawn — never the eval path. (Deliberately a timer thread,
+    /// NOT a per-fiber-quantum hook: quantum emission was tried and starved
+    /// `--workers=1` — one long non-yielding quantum → ~2 samples per eval —
+    /// and cost a branch per quantum even with progress off.)
+    const sample_period_ms = 50;
+    /// Stop-flag poll granularity within a sample period (bounds
+    /// `stopProgressSampler`'s join latency).
+    const stop_check_ms = 10;
+
+    /// Sampler thread body: push a snapshot, then sleep out the sample period
+    /// (waking to observe the stop flag). Decoupled from fiber quanta so the
     /// display advances even during a single long `--workers=1` quantum.
     fn progressSampleLoop(self: *Evaluator) void {
         while (!self.progress_stop.load(.acquire)) {
             self.progressSample();
             var slept: u32 = 0;
-            while (slept < 100 and !self.progress_stop.load(.acquire)) : (slept += 20) {
-                var req: std.os.linux.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            while (slept < sample_period_ms and !self.progress_stop.load(.acquire)) : (slept += stop_check_ms) {
+                var req: std.os.linux.timespec = .{ .sec = 0, .nsec = stop_check_ms * std.time.ns_per_ms };
                 _ = std.os.linux.nanosleep(&req, null);
             }
         }
