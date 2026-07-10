@@ -228,6 +228,15 @@ pub const Compiler = struct {
         const id = try self.registry.register(ch);
         if (self.chunk_name) |name| try self.registry.recordName(id, name);
         if (self.source_file_id) |file| try self.registry.recordFile(id, file);
+        // This compiler's capture list IS the chunk's upvalue vector (slot
+        // order), and every capture carries its binding name — record them for
+        // the disassembler's upvalue table.
+        if (self.registry.capture_names and self.captures.items.len > 0) {
+            const names = try self.allocator.alloc(types.InternId, self.captures.items.len);
+            defer self.allocator.free(names);
+            for (self.captures.items, names) |cap, *n| n.* = cap.name_id;
+            try self.registry.recordUpvalueNames(id, names);
+        }
         return id;
     }
 

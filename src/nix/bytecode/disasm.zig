@@ -118,7 +118,7 @@ fn collectRefs(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHashMa
         const op: OpCode = @enumFromInt(op_byte);
         ip += 1;
         scratch.writer.end = 0;
-        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, refs);
+        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, refs);
     }
 }
 
@@ -168,15 +168,23 @@ fn writeChunkAt(
     // (in the chunk's own color) down every line of its body.
     const cc: [3]u8 = if (chunk_id) |id| hueColor(id) else .{ 0x9a, 0x9a, 0x9a };
     try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, options.use_color);
+    // The chunk's recorded upvalue names (slot order), used by the header table
+    // and by upvalue-slot comments throughout the body.
+    const up_names: ?[]const InternId = blk: {
+        const id = chunk_id orelse break :blk null;
+        const reg = symbols.registry orelse break :blk null;
+        break :blk reg.upvalueNamesOf(id);
+    };
+
     if (options.show_constants and chunk.constants.len > 0) {
         try writeGuide(writer, cc, null, options.use_color);
         try writer.writeAll("  constants:\n");
         for (chunk.constants, 0..) |c, i| {
             // Table rows sit under their own colored `│` gutter, like operand
-            // groups do under their count line.
+            // groups do under their count line; the run closes with `└`.
             try writeGuide(writer, cc, null, options.use_color);
             try writer.writeAll("  ");
-            try writeTreeGuide(writer, sec_constants_color, .vert, null, options.use_color);
+            try writeTreeGuide(writer, sec_constants_color, if (i == chunk.constants.len - 1) .corner else .vert, null, options.use_color);
             // `#N` in the slot's identity color — the same hue a `push_const #N`
             // reference carries, so a reference ties back to its row here.
             var ibuf: [8]u8 = undefined;
@@ -193,6 +201,30 @@ fn writeChunkAt(
         }
     }
 
+    // Upvalue table: the best-effort binding name behind each upvalue slot,
+    // mirrored by the `upvalue[N] name` comments in the body.
+    if (up_names) |ups| {
+        try writeGuide(writer, cc, null, options.use_color);
+        try writer.writeAll("  upvalues:\n");
+        for (ups, 0..) |name_id, i| {
+            try writeGuide(writer, cc, null, options.use_color);
+            try writer.writeAll("  ");
+            try writeTreeGuide(writer, sec_upvalues_color, if (i == ups.len - 1) .corner else .vert, null, options.use_color);
+            var ibuf: [8]u8 = undefined;
+            const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
+            try writer.writeAll(istr);
+            try writer.splatByteAll(' ', 6 -| istr.len);
+            if (symbols.internName(name_id)) |name| {
+                if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+                try writer.writeAll(name);
+                if (options.use_color) try writer.writeAll("\x1b[0m");
+            } else {
+                try writer.print("0x{x}", .{name_id});
+            }
+            try writer.writeByte('\n');
+        }
+    }
+
     // References section: which chunks reach this one and which it reaches.
     if (chunk_id) |id| if (options.refs) |graph| {
         const inc = graph.incoming(id);
@@ -200,8 +232,8 @@ fn writeChunkAt(
         if (inc.len > 0 or out.len > 0) {
             try writeGuide(writer, cc, null, options.use_color);
             try writer.writeAll("  references:\n");
-            try writeRefList(writer, "incoming", sec_incoming_color, inc, symbols, cc, options.use_color);
-            try writeRefList(writer, "outgoing", sec_outgoing_color, out, symbols, cc, options.use_color);
+            try writeRefList(writer, "incoming", sec_incoming_color, inc, out.len == 0, symbols, cc, options.use_color);
+            try writeRefList(writer, "outgoing", sec_outgoing_color, out, true, symbols, cc, options.use_color);
         }
     };
 
@@ -267,7 +299,7 @@ fn writeChunkAt(
         // byte-range (to print the raw-byte column ahead of the mnemonic) before
         // writing the line.
         op_scratch.writer.end = 0;
-        ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, &referenced_chunks);
+        ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, up_names, &referenced_chunks);
         const operand_text = op_scratch.writer.buffered();
         const insn = chunk.code[start..ip];
 
@@ -295,9 +327,9 @@ fn writeChunkAt(
             // each its own stripe unit.
             var seq: usize = @intFromEnum(op) + 1;
             var head = Line{};
-            const head_len = buildHead(&head, op, chunk.code, start, symbols);
+            const head_len = buildHead(&head, op, chunk.code, start, symbols, &seq);
             try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
-            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, &stripe, env);
+            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, up_names, &stripe, env);
         } else {
             // Zero or one simple operand: keep it all on the mnemonic row. The
             // opcode byte + mnemonic share one color; the operand bytes and its
@@ -494,6 +526,7 @@ const store_kw_color: [3]u8 = .{ 0x7f, 0xbf, 0xd8 };
 /// Section guide colors (constants / references and its subsections), so each
 /// indented table gets its own `│` gutter like operand groups do.
 const sec_constants_color: [3]u8 = .{ 0xb8, 0xa6, 0x5c };
+const sec_upvalues_color: [3]u8 = .{ 0xb8, 0x5c, 0x74 };
 const sec_references_color: [3]u8 = .{ 0x5c, 0xb8, 0xa6 };
 const sec_incoming_color: [3]u8 = .{ 0xa6, 0x5c, 0xb8 };
 const sec_outgoing_color: [3]u8 = .{ 0x5c, 0x8a, 0xb8 };
@@ -713,13 +746,14 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, use_color: bool) !
     }
 }
 
-/// One operand-hierarchy gutter cell: a plain vertical `│` that descends through
-/// every one of the group's members and their descendants, going `.blank` only
-/// once the whole subtree has ended. A column wider than the thin chunk margin.
-const GuideKind = enum { vert, blank };
+/// One operand-hierarchy gutter cell: a vertical `│` that descends through the
+/// group's members, closing with an L-shaped `└` on the run's last row. A
+/// column wider than the thin chunk margin.
+const GuideKind = enum { vert, corner, blank };
 fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u8, use_color: bool) !void {
     const glyph: []const u8 = switch (kind) {
         .vert => "│  ",
+        .corner => "└  ",
         .blank => "   ",
     };
     if (use_color and kind != .blank) {
@@ -737,7 +771,7 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u
 /// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
-fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, ends_group: bool, bg: ?[3]u8, env: Env) !void {
+fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, bg: ?[3]u8, env: Env) !void {
     const base = off.*;
     const total = line.total();
     line.paint(seq);
@@ -760,11 +794,11 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         }
         try writer.writeByte(' '); // gap column between the bytes and the gutter
         // Tree gutter: every ancestor level draws a vertical bar `│` down the
-        // gutter. A level's bar must not dangle past its last member, so on the
-        // wrapped continuation rows (r != 0) of the line that *ends* the group
-        // we blank all the bars.
-        for (guides) |gc| {
-            const kind: GuideKind = if (r != 0 and ends_group) .blank else .vert;
+        // gutter; a level whose run ends at this line (`last_mask` bit i)
+        // closes with `└` on the line's final row.
+        for (guides, 0..) |gc, gi| {
+            const ends = (last_mask >> @intCast(gi)) & 1 == 1;
+            const kind: GuideKind = if (ends and r == rows - 1) .corner else .vert;
             try writeTreeGuide(writer, gc, kind, bg, env.use_color);
         }
         var w: u16 = 0;
@@ -808,7 +842,7 @@ fn chunkIdWide(op: OpCode) bool {
 /// (a chunk id, or an attrset's entry/position counts) — as a `Line` whose byte
 /// offsets are relative to the opcode byte (byte 0). Returns the number of
 /// operand bytes consumed (so the list tail starts at opcode + 1 + head_len).
-fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symbols) u16 {
+fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symbols, seq: *usize) u16 {
     switch (op) {
         .clos, .clos_w, .clos_cap, .clos_cap_w, .thk, .thk_w, .thk_eag, .thk_eag_w, .thk_arg, .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const wide = chunkIdWide(op);
@@ -821,13 +855,20 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
             return id_len;
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
+            // Each raw count and its mention in the comment share a color.
             const entries = readU16(code, start + 1);
             const positions = readU16(code, start + 3);
-            l.group(1, 2, "#{d}", .{entries});
+            const c_e = hueColor(seq.*);
+            const c_p = hueColor(seq.* + 1);
+            seq.* += 2;
+            l.groupPinned(1, 2, c_e, "#{d}", .{entries});
             l.glue(" ", .{});
-            l.group(3, 2, "#{d}", .{positions});
+            l.groupPinned(3, 2, c_p, "#{d}", .{positions});
             l.comment();
-            l.glue("{d} entries, {d} positions", .{ entries, positions });
+            l.tint(c_e, "{d}", .{entries});
+            l.glue(" entries, ", .{});
+            l.tint(c_p, "{d}", .{positions});
+            l.glue(" positions", .{});
             return 4;
         },
         .thk_defer => {
@@ -840,11 +881,16 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
         .attr_check, .attr_check_w => {
             const allow = code[start + 1];
             const expected = readU16(code, start + 2);
-            l.group(1, 1, "#{d}", .{allow});
+            const c_a = hueColor(seq.*);
+            const c_n = hueColor(seq.* + 1);
+            seq.* += 2;
+            l.groupPinned(1, 1, c_a, "#{d}", .{allow});
             l.glue(" ", .{});
-            l.group(2, 2, "#{d}", .{expected});
+            l.groupPinned(2, 2, c_n, "#{d}", .{expected});
             l.comment();
-            l.glue("{d} expected, extra {s}", .{ expected, if (allow != 0) "allowed" else "rejected" });
+            l.tint(c_n, "{d}", .{expected});
+            l.glue(" expected, ", .{});
+            l.tint(c_a, "extra {s}", .{if (allow != 0) "allowed" else "rejected"});
             return 3;
         },
         else => return 0,
@@ -894,27 +940,46 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
 
 /// A `#{count} ; {label}` line (count is a u16 at `off`). Fits one row — never
 /// wraps — so its guides never blank on a continuation.
-fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, stripe: *usize, env: Env) !void {
+fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, last_mask: u8, stripe: *usize, env: Env) !void {
     var l = Line{};
     l.group(0, 2, "#{d}", .{readU16(code, off.*)});
     l.comment();
     l.glue("{s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, false, takeBg(stripe, env.use_color), env);
+    try emitLine(writer, code, off, &l, seq, guides, last_mask, takeBg(stripe, env.use_color), env);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
 /// each a child line under `guides`, tinting `local`/`upvalue` with the kind
-/// byte and the index with its bytes. Each descriptor fits one row.
-fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, stripe: *usize, env: Env) !void {
+/// byte and the index with its bytes. Each descriptor fits one row. A kind ==
+/// upvalue descriptor reads from the ENCLOSING chunk's upvalues, so its
+/// best-effort name (when recorded) becomes the row's comment. `end_mask` is
+/// the `last_mask` applied to the list's final row (which guide runs it closes).
+fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, end_mask: u8, up_names: ?[]const InternId, symbols: Symbols, stripe: *usize, env: Env) !void {
     var k: usize = 0;
     while (k < n) : (k += 1) {
+        const is_upvalue = code[off.*] != 0;
+        const idx = readU16(code, off.* + 1);
         var l = Line{};
-        l.group(0, 1, "{s}", .{if (code[off.*] == 0) "local" else "upvalue"});
+        l.group(0, 1, "{s}", .{if (is_upvalue) "upvalue" else "local"});
         l.glue("[", .{});
-        l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
+        l.group(1, 2, "{d}", .{idx});
         l.glue("]", .{});
-        try emitLine(writer, code, off, &l, seq, guides, false, takeBg(stripe, env.use_color), env);
+        if (is_upvalue) {
+            if (upvalueName(up_names, symbols, idx)) |nm| {
+                l.comment();
+                l.tint(name_color, "{s}", .{nm});
+            }
+        }
+        const mask: u8 = if (k == n - 1) end_mask else 0;
+        try emitLine(writer, code, off, &l, seq, guides, mask, takeBg(stripe, env.use_color), env);
     }
+}
+
+/// Resolve upvalue slot `idx`'s best-effort binding name, if recorded.
+fn upvalueName(up_names: ?[]const InternId, symbols: Symbols, idx: usize) ?[]const u8 {
+    const list = up_names orelse return null;
+    if (idx >= list.len) return null;
+    return symbols.internName(list[idx]);
 }
 
 /// Render an instruction's operands as one line per field. `ip` is the byte
@@ -932,6 +997,7 @@ fn writeOperandTail(
     operand_text: []const u8,
     seq: *usize,
     symbols: Symbols,
+    up_names: ?[]const InternId,
     stripe: *usize,
     env: Env,
 ) !void {
@@ -943,27 +1009,35 @@ fn writeOperandTail(
     g[0] = byteRgb(@intFromEnum(op));
     switch (op) {
         .clos, .clos_w => {
-            // The chunk id rode the mnemonic line; only the upvalue count remains.
-            try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], stripe, env);
+            // The chunk id rode the mnemonic line; only the upvalue count
+            // remains — the block's only (and thus last) row.
+            try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], 0b01, stripe, env);
         },
         .thk, .thk_eag, .thk_w, .thk_eag_w, .thk_arg, .clos_cap, .clos_cap_w => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*); // the "captures" count line's color
-            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], stripe, env);
-            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
+            // The last descriptor closes both the list (level 1) and the block.
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
         .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
-            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], stripe, env);
-            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], 0, stripe, env);
+            // The list (level 1) closes at the last descriptor; the block
+            // (level 0) continues to the store-target row below.
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b10, up_names, symbols, stripe, env);
             // The trailing slot byte: raw accessor in the value zone, the
-            // store-target interpretation as its comment.
+            // store-target interpretation (same color) as its comment.
+            const c_slot = hueColor(seq.*);
+            seq.* += 1;
             var l = Line{};
-            l.group(0, 1, "#{d}", .{code[off]});
+            l.groupPinned(0, 1, c_slot, "#{d}", .{code[off]});
             l.comment();
-            l.glue("→ local[{d}]", .{code[off]});
-            try emitLine(writer, code, &off, &l, seq, g[0..1], false, takeBg(stripe, env.use_color), env);
+            l.glue("→ local[", .{});
+            l.tint(c_slot, "{d}", .{code[off]});
+            l.glue("]", .{});
+            try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
             // Entry/position counts rode the mnemonic line; the positions count
@@ -1021,15 +1095,15 @@ fn writeOperandTail(
                 // The whole 2-row record is ONE stripe unit, so the zebra
                 // alternates per entry, not per line.
                 const bg = takeBg(stripe, env.use_color);
-                try emitLine(writer, code, &off, &l1, seq, g[0..1], false, bg, env);
-                try emitLine(writer, code, &off, &l2, seq, g[0..1], false, bg, env);
+                try emitLine(writer, code, &off, &l1, seq, g[0..1], 0, bg, env);
+                try emitLine(writer, code, &off, &l2, seq, g[0..1], if (k == pos_count - 1) 0b01 else 0, bg, env);
             }
         },
         .thk_defer => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
-            try emitCountLine(writer, code, &off, "env", seq, g[0..1], stripe, env);
-            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
+            try emitCountLine(writer, code, &off, "env", seq, g[0..1], if (n == 0) 0b01 else 0, stripe, env);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
         .attr_check, .attr_check_w => {
             // The flag + count rode the mnemonic line (count = its last 2 head
@@ -1053,7 +1127,7 @@ fn writeOperandTail(
                     l.glue(" → ", .{});
                     l.tint(c, "\"{s}\"", .{esc[0..ew.end]});
                 }
-                try emitLine(writer, code, &off, &l, seq, g[0..1], false, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == expected - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
             }
         },
         else => {
@@ -1061,7 +1135,7 @@ fn writeOperandTail(
             if (end_ip > off) {
                 var l = Line{};
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], true, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
             }
         },
     }
@@ -1069,7 +1143,7 @@ fn writeOperandTail(
     if (off < end_ip) {
         var l = Line{};
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, seq, g[0..1], true, takeBg(stripe, env.use_color), env);
+        try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
     }
 }
 
@@ -1169,19 +1243,20 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
 
 /// A `references:` sub-section (`incoming`/`outgoing`): one `chunk[0xN] name`
 /// per referenced chunk, each in that chunk's identity color. No-op when empty.
-fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
+fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, outer_last: bool, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
     if (ids.len == 0) return;
     // Sub-section header under the references gutter, then one row per chunk
-    // under the sub-section's own gutter.
+    // under the sub-section's own gutter; each vertical run closes with `└`.
     try writeGuide(writer, cc, null, use_color);
     try writer.writeAll("  ");
     try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
     try writer.print("{s}:\n", .{label});
-    for (ids) |id| {
+    for (ids, 0..) |id, i| {
+        const sub_last = i == ids.len - 1;
         try writeGuide(writer, cc, null, use_color);
         try writer.writeAll("  ");
-        try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
-        try writeTreeGuide(writer, sub_color, .vert, null, use_color);
+        try writeTreeGuide(writer, sec_references_color, if (outer_last and sub_last) .corner else .vert, null, use_color);
+        try writeTreeGuide(writer, sub_color, if (sub_last) .corner else .vert, null, use_color);
         try writeStoreRefText(writer, "chunk", id, objColor(id), use_color);
         if (chunkNameOf(symbols, id)) |name| {
             if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
@@ -1212,6 +1287,7 @@ fn writeOperands(
     op: OpCode,
     ip_in: usize,
     symbols: Symbols,
+    up_names: ?[]const InternId,
     referenced_chunks: *std.AutoArrayHashMapUnmanaged(ChunkId, void),
 ) !usize {
     var ip = ip_in;
@@ -1248,6 +1324,7 @@ fn writeOperands(
             const slot = readU16(code, ip);
             ip += 2;
             try writer.print("#{d} ; upvalue[{d}]", .{ slot, slot });
+            if (upvalueName(up_names, symbols, slot)) |nm| try writer.print(" {s}", .{nm});
         },
 
         .int_add, .int_sub, .int_mul, .int_div, .int_neg,
@@ -1409,6 +1486,7 @@ fn writeOperands(
             const id: InternId = @intCast(readU16(code, ip + 2));
             ip += 4;
             try writeSlotAttr(writer, "upvalue", slot, id, symbols);
+            if (upvalueName(up_names, symbols, slot)) |nm| try writer.print(" ({s})", .{nm});
         },
         .loc_get_attr => {
             const slot = code[ip];

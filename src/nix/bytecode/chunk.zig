@@ -564,6 +564,9 @@ pub const ChunkRegistry = struct {
     /// Companion to `names`: the source file each chunk was compiled from
     /// (interned path id), so even chunks with no per-op source map get a file.
     files: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
+    /// Companion to `names`: per-chunk upvalue binding names (slot order), from
+    /// the compiler's capture list. Slices owned by `allocator`.
+    upvalue_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -646,6 +649,9 @@ pub const ChunkRegistry = struct {
         self.chunks.deinit(self.allocator);
         self.names.deinit(self.allocator);
         self.files.deinit(self.allocator);
+        var it = self.upvalue_names.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.*);
+        self.upvalue_names.deinit(self.allocator);
     }
 
     /// Assert the unsynchronized sidecar maps are only ever touched from a
@@ -674,6 +680,23 @@ pub const ChunkRegistry = struct {
         if (!self.capture_names) return;
         self.checkSingleThread();
         try self.files.put(self.allocator, id, file);
+    }
+
+    /// Record the chunk's upvalue binding names (slot order). No-op unless
+    /// `capture_names` is on; the slice is duped into the registry.
+    pub fn recordUpvalueNames(self: *ChunkRegistry, id: ChunkId, names_in: []const types.InternId) !void {
+        if (!self.capture_names or names_in.len == 0) return;
+        self.checkSingleThread();
+        const copy = try self.allocator.dupe(types.InternId, names_in);
+        errdefer self.allocator.free(copy);
+        const gop = try self.upvalue_names.getOrPut(self.allocator, id);
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = copy;
+    }
+
+    /// The chunk's recorded upvalue names (slot order), if any.
+    pub fn upvalueNamesOf(self: *const ChunkRegistry, id: ChunkId) ?[]const types.InternId {
+        return self.upvalue_names.get(id);
     }
 
     /// The best-effort name attributed to `id`, if any.

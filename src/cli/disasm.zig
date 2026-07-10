@@ -88,8 +88,14 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // chunk (a bad `--chunk` should fail cleanly, not through the pager).
     var target_id: ChunkId = 0;
     var target_chunk: ?*const bytecode.Chunk = null;
+    // Only a plain `--file`/positional (no selector wrapping) carries a real
+    // source path for span annotations; synthesized text has none.
+    const source_path: ?[]const u8 = switch (source_arg) {
+        .file => |p| if (source.owned) null else p,
+        else => null,
+    };
     if (options.disasm_eval) {
-        try compileByEval(&ev, source.text);
+        try compileByEval(&ev, source.text, source_path);
         if (options.disasm_chunk) |id| {
             target_id = id;
             target_chunk = ev.getChunk(id) orelse {
@@ -98,12 +104,6 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
             };
         }
     } else {
-        // Only a plain `--file`/positional (no selector wrapping) carries a real
-        // source path for span annotations; synthesized text has none.
-        const source_path: ?[]const u8 = switch (source_arg) {
-            .file => |p| if (source.owned) null else p,
-            else => null,
-        };
         const top_id = ev.compileSource(source.text, source_path) catch |err| {
             std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
             return 1;
@@ -220,8 +220,8 @@ const Pager = struct {
 /// (and would FrameOverflow, or blow a speculative worker's stack). Best-effort:
 /// a failing eval still leaves its compiled chunks behind to inspect, so a
 /// failure is a warning, not an abort.
-fn compileByEval(ev: *Evaluator, source: []const u8) !void {
-    _ = ev.evaluate(source) catch |err| {
+fn compileByEval(ev: *Evaluator, source: []const u8, source_path: ?[]const u8) !void {
+    _ = ev.evaluatePath(source, source_path) catch |err| {
         std.debug.print("warning: evaluation failed: {s} (dumping chunks compiled so far)\n", .{@errorName(err)});
     };
 }

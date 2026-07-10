@@ -555,6 +555,12 @@ pub const Evaluator = struct {
         );
         compiler.base_path = base_path;
         compiler.source_path = source_path;
+        // Set eagerly (not lazily on first position record, see sourceFileId):
+        // chunks registered before any position record would otherwise miss
+        // their file in the disasm sidecar.
+        if (self.registry.capture_names) {
+            if (source_path) |p| compiler.source_file_id = try self.intern.intern(p);
+        }
         compiler.deferred_table = &self.deferred_table;
         // Elided bodies materialize into the file's AST arena (retained
         // below alongside deferred bodies); this compile is single-threaded,
@@ -579,6 +585,9 @@ pub const Evaluator = struct {
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
         const chunk_id = try self.registry.register(chunk);
+        // The top-level chunk registers outside registerChunk; record its file
+        // in the disasm sidecar too (no-op unless name capture is on).
+        if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
         // `chunk` now owns persistent copies of its bytecode; `scratch`
         // (incl. `builder`'s buffers) is freed by the defers above.
 
@@ -647,6 +656,13 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
+        return self.evaluatePath(source, null);
+    }
+
+    /// `evaluate`, attributing the top-level source to `source_path` — source
+    /// spans and the disasm file sidecar then carry the entry file's name, the
+    /// same way imported files do. Used by `fix disasm --eval`.
+    pub fn evaluatePath(self: *Evaluator, source: []const u8, source_path: ?[]const u8) !Value {
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -710,7 +726,16 @@ pub const Evaluator = struct {
         try self.scheduler.start(helperLoop, self);
         self.clearDiagnostics();
         self.derivations.clearDebugRecords();
-        return self.evaluateSource(source, self.base_path, null, null, 0);
+        // Not routed through `evaluateSource`: its top-level detection is
+        // `source_path == null`, so passing the path there would send the
+        // top-level eval down the nested-import path (wrong fiber). Attribute
+        // the source at compile time, then run on the main worker as usual.
+        const chunk_id = try self.parseAndCompile(source, self.base_path, source_path, null);
+        const subject = source_path orelse "expression";
+        self.progressBegin(.evaluate, subject);
+        defer self.progressEnd(.evaluate, subject);
+        timeline.instant(.evaluate, subject);
+        return self.runChunkOnMainWorker(chunk_id);
     }
 
     pub fn evaluateSource(
