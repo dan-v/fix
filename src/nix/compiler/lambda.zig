@@ -210,7 +210,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
 
     // Unbound lambda (no attr/let binding armed a name): synthesize one from
     // the parameter, so e.g. a module's top `pkgs: …` reads as `λpkgs`.
-    if (n > 0) {
+    if (self.registry.capture_names and n > 0) {
         var nbuf: [128]u8 = undefined;
         if (std.fmt.bufPrint(&nbuf, "λ{s}", .{params[0]})) |txt| self.armSyntheticName(txt) else |_| {}
     }
@@ -270,7 +270,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
 
     // Unbound pattern lambda: synthesize `λ{first,…}` from the pattern (or the
     // @-binding when present), so module toplevels read as `λ{config,…}`.
-    {
+    if (self.registry.capture_names) {
         var nbuf: [128]u8 = undefined;
         const txt: ?[]const u8 = if (lambda.bind_name) |bn|
             std.fmt.bufPrint(&nbuf, "λ{s}@", .{self.source[bn.offset .. bn.offset + bn.len]}) catch null

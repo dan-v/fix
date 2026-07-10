@@ -168,6 +168,7 @@ fn compileDynamicAttrValueThunk(self: *Compiler, entry: Node.AttrSetEntry) !void
 }
 
 fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEntry, recursive: bool) !void {
+    self.armSyntheticName("(attrs)");
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
 
@@ -455,7 +456,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
         .base_path = snapshot.base_path,
         .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
-        .name = if (self.registry.capture_names) (self.combinedName(name) catch name) else null,
+        .name = if (self.registry.capture_names) (self.combinedName(name, ".") catch name) else null,
     });
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;
@@ -702,6 +703,7 @@ fn nonAttrSetDuplicateLeaf(group: AttrEntryGroup) ?AttrEntryView {
 }
 
 pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, recursive: bool) anyerror!void {
+    self.armSyntheticName("(attrs)");
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
 

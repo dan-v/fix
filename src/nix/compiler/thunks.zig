@@ -42,6 +42,7 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
 /// compile when strictness analysis on the let-body confirms the
 /// binding will be forced.
 pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void {
+    self.armNodeTagName(expr);
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
 
@@ -66,6 +67,7 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
 /// short-circuit to a value with no thunk either way, so the adaptive
 /// runtime check would be pure overhead.
 pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
+    self.armNodeTagName(expr);
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
 

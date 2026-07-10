@@ -1467,8 +1467,14 @@ fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids
 /// The best-effort name attributed to chunk `id`, resolved to text.
 fn chunkNameOf(symbols: Symbols, id: ChunkId) ?[]const u8 {
     const reg = symbols.registry orelse return null;
-    const name_id = reg.nameOf(id) orelse return null;
-    return symbols.internName(name_id);
+    if (reg.nameOf(id)) |name_id| {
+        if (symbols.internName(name_id)) |n| return n;
+    }
+    // The two registry-synthesized apply trampolines register before name
+    // capture can be enabled — name them statically.
+    if (id == reg.well_known.genlist_apply) return "builtin·genlist_apply";
+    if (id == reg.well_known.mapattrs_apply) return "builtin·mapattrs_apply";
+    return null;
 }
 
 /// `chunk[0x{id}]` followed by its best-effort name when known, so a reference

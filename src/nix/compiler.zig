@@ -128,9 +128,14 @@ pub const Compiler = struct {
     /// `name_hint` is set by let/attr-set compilation just before a bound value
     /// is compiled; the first child compiler spun up for that value consumes it
     /// into its own `chunk_name`, which is recorded against the chunk id at
-    /// registration. `name_prefix` is the `$`-joined path of enclosing named
-    /// chunks, so nested bindings read `a$b$c`. All null (and free) when off.
+    /// registration. `name_prefix` is the joined path of enclosing named chunks:
+    /// real attr/let segments join with `.` (`a.b.c`), synthetic segments (λ…,
+    /// node-tag tags) join with `·` so the name never reads as a false attr
+    /// path. All null (and free) when off.
     name_hint: ?InternId = null,
+    /// Whether `name_hint` is synthetic (λ/tag) rather than a real binding name
+    /// — selects the `·` joiner and lets real names take precedence.
+    name_hint_synthetic: bool = false,
     chunk_name: ?InternId = null,
     name_prefix: ?[]const u8 = null,
 
@@ -195,10 +200,12 @@ pub const Compiler = struct {
         // Unnamed children inherit the prefix unchanged. One branch when off.
         child.name_prefix = self.name_prefix;
         if (self.name_hint) |seg| {
-            const full = self.combinedName(seg) catch seg;
+            const sep: []const u8 = if (self.name_hint_synthetic) "·" else ".";
+            const full = self.combinedName(seg, sep) catch seg;
             child.chunk_name = full;
             child.name_prefix = self.intern.get(full);
             self.name_hint = null;
+            self.name_hint_synthetic = false;
         }
         return child;
     }
@@ -208,25 +215,49 @@ pub const Compiler = struct {
     /// A no-op unless `fix disasm` turned name capture on, so callers can arm
     /// unconditionally without gating on the hot path.
     pub fn armName(self: *Compiler, name_id: InternId) void {
-        if (self.registry.capture_names) self.name_hint = name_id;
+        if (!self.registry.capture_names) return;
+        self.name_hint = name_id;
+        self.name_hint_synthetic = false;
     }
 
-    /// Arm a *synthetic* name (e.g. `λpkgs` for an unbound lambda) — only when
-    /// no real binding name is already pending, since a binding name is always
-    /// the better attribution.
+    /// Arm a *synthetic* name (e.g. `λpkgs` for an unbound lambda, `(apply)`
+    /// for an argument thunk) — only when no real binding name is already
+    /// pending, since a binding name is always the better attribution.
     pub fn armSyntheticName(self: *Compiler, text: []const u8) void {
         if (!self.registry.capture_names or self.name_hint != null) return;
         self.name_hint = self.intern.intern(text) catch return;
+        self.name_hint_synthetic = true;
     }
 
-    /// Qualify a segment name with this compiler's `name_prefix` into an interned
-    /// `prefix.segment`. Returns the bare segment when there is no prefix (or the
-    /// combined name would be pathologically long).
-    pub fn combinedName(self: *Compiler, segment: InternId) !InternId {
+    /// Arm a synthetic tag derived from the node kind — `(apply)`, `(if_expr)`,
+    /// `(string)`, … — for child chunks with no binding name (argument thunks,
+    /// operands, interpolations).
+    pub fn armNodeTagName(self: *Compiler, node: *const Node) void {
+        if (!self.registry.capture_names or self.name_hint != null) return;
+        var buf: [64]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "({s})", .{@tagName(node.tag)}) catch return;
+        self.armSyntheticName(t);
+    }
+
+    /// Qualify a segment name with this compiler's `name_prefix` into an
+    /// interned `prefix<sep>segment`. Returns the bare segment when there is no
+    /// prefix (or the combined name would be pathologically long).
+    pub fn combinedName(self: *Compiler, segment: InternId, sep: []const u8) !InternId {
         const prefix = self.name_prefix orelse return segment;
         var buf: [1024]u8 = undefined;
-        const full = std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, self.intern.get(segment) }) catch return segment;
+        const full = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix, sep, self.intern.get(segment) }) catch return segment;
         return self.intern.intern(full);
+    }
+
+    /// Intern `segment_text` qualified by this compiler's prefix with `sep`.
+    fn internSegmentWithPrefix(self: *Compiler, segment_text: []const u8, sep: []const u8) !InternId {
+        if (self.name_prefix) |p| {
+            var buf: [1024]u8 = undefined;
+            if (std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ p, sep, segment_text })) |t| {
+                return self.intern.intern(t);
+            } else |_| {}
+        }
+        return self.intern.intern(segment_text);
     }
 
     /// Detect the pure forwarder body shape — `up_get_ret slot` (or
@@ -249,30 +280,35 @@ pub const Compiler = struct {
         const id = try self.registry.register(ch);
         if (self.registry.capture_names) {
             var name = self.chunk_name;
-            // Pure forwarders (`foo = <up>foo` module-arg plumbing) get a
-            // `.fwd` suffix — named after the forwarded upvalue when the chunk
-            // has no binding name of its own.
+            // Pure forwarders (`foo = <up>foo` module-arg plumbing) read as
+            // `name→up` — the arrow marks "returns that upvalue" without
+            // implying an attr path. Nameless forwarders become `→up`.
             if (forwarderSlot(&ch)) |slot| {
                 if (slot < self.captures.items.len) {
-                    const up = self.captures.items[slot].name_id;
+                    const raw = self.intern.get(self.captures.items[slot].name_id);
+                    const up_txt = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
                     var buf: [1024]u8 = undefined;
-                    const base = name orelse self.combinedName(up) catch up;
-                    if (std.fmt.bufPrint(&buf, "{s}.fwd", .{self.intern.get(base)})) |txt| {
-                        name = try self.intern.intern(txt);
+                    if (name) |n| {
+                        if (std.fmt.bufPrint(&buf, "{s}→{s}", .{ self.intern.get(n), up_txt })) |txt| {
+                            name = try self.intern.intern(txt);
+                        } else |_| {}
+                    } else if (std.fmt.bufPrint(&buf, "→{s}", .{up_txt})) |txt| {
+                        name = try self.internSegmentWithPrefix(txt, "·");
                     } else |_| {}
                 }
             }
+            // Guaranteed fallback: every chunk gets at least an anonymous tag
+            // under its enclosing prefix.
+            if (name == null) name = try self.internSegmentWithPrefix("(anon)", "·");
             // Uniquify: later chunks claiming an already-used name get `~N`.
-            if (name) |base| {
-                const uses = try self.registry.bumpNameUse(base);
-                if (uses > 1) {
-                    var buf: [1024]u8 = undefined;
-                    if (std.fmt.bufPrint(&buf, "{s}~{d}", .{ self.intern.get(base), uses })) |txt| {
-                        name = try self.intern.intern(txt);
-                    } else |_| {}
-                }
-                try self.registry.recordName(id, name.?);
+            const uses = try self.registry.bumpNameUse(name.?);
+            if (uses > 1) {
+                var buf: [1024]u8 = undefined;
+                if (std.fmt.bufPrint(&buf, "{s}~{d}", .{ self.intern.get(name.?), uses })) |txt| {
+                    name = try self.intern.intern(txt);
+                } else |_| {}
             }
+            try self.registry.recordName(id, name.?);
         }
         if (self.source_file_id) |file| try self.registry.recordFile(id, file);
         // This compiler's capture list IS the chunk's upvalue vector (slot

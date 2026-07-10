@@ -588,6 +588,20 @@ pub const Evaluator = struct {
         // The top-level chunk registers outside registerChunk; record its file
         // in the disasm sidecar too (no-op unless name capture is on).
         if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
+        // Name a file's top-level chunk after its basename (uniquified with
+        // `~N` for repeated basenames), or `(top)` for pathless expressions.
+        if (self.registry.capture_names) {
+            const base_txt: []const u8 = if (source_path) |p| std.fs.path.basename(p) else "(top)";
+            var name_id = try self.intern.intern(base_txt);
+            const uses = try self.registry.bumpNameUse(name_id);
+            if (uses > 1) {
+                var nbuf: [256]u8 = undefined;
+                if (std.fmt.bufPrint(&nbuf, "{s}~{d}", .{ base_txt, uses })) |t| {
+                    name_id = try self.intern.intern(t);
+                } else |_| {}
+            }
+            try self.registry.recordName(chunk_id, name_id);
+        }
         // `chunk` now owns persistent copies of its bytecode; `scratch`
         // (incl. `builder`'s buffers) is freed by the defers above.
 
