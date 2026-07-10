@@ -45,7 +45,79 @@ pub const Options = struct {
     /// Recursion cap when `recurse` is true; 0 = unlimited (a visited set still
     /// guarantees termination). The trace pretty-printer bounds this.
     max_depth: u8 = 4,
+    /// Optional cross-reference graph; when set, each chunk header lists its
+    /// incoming and outgoing chunk references.
+    refs: ?*const RefGraph = null,
 };
+
+/// Chunk cross-reference graph over the whole registry: for each chunk, which
+/// chunks it references (outgoing) and which reference it (incoming). Built once
+/// per disassembly; scanning is O(total bytecode). Uses `page_allocator`, to
+/// match the rest of the disassembler's scratch allocations.
+pub const RefGraph = struct {
+    out: []std.ArrayListUnmanaged(ChunkId),
+    inc: []std.ArrayListUnmanaged(ChunkId),
+
+    pub fn build(registry: *const ChunkRegistry, symbols: Symbols) !RefGraph {
+        const a = std.heap.page_allocator;
+        const n = registry.count();
+        const out = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
+        const inc = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
+        for (out) |*l| l.* = .empty;
+        for (inc) |*l| l.* = .empty;
+        var scratch: std.Io.Writer.Allocating = .init(a);
+        defer scratch.deinit();
+        var id: ChunkId = 0;
+        while (id < n) : (id += 1) {
+            const chunk = registry.get(id) orelse continue;
+            var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
+            defer refs.deinit(a);
+            collectRefs(chunk, symbols, &refs, &scratch) catch continue;
+            var it = refs.iterator();
+            while (it.next()) |e| {
+                const t = e.key_ptr.*;
+                out[id].append(a, t) catch {};
+                if (t < n) inc[t].append(a, id) catch {};
+            }
+        }
+        for (out) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
+        for (inc) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
+        return .{ .out = out, .inc = inc };
+    }
+
+    pub fn deinit(self: *RefGraph) void {
+        const a = std.heap.page_allocator;
+        for (self.out) |*l| l.deinit(a);
+        for (self.inc) |*l| l.deinit(a);
+        a.free(self.out);
+        a.free(self.inc);
+    }
+
+    fn outgoing(self: *const RefGraph, id: ChunkId) []const ChunkId {
+        return if (id < self.out.len) self.out[id].items else &.{};
+    }
+    fn incoming(self: *const RefGraph, id: ChunkId) []const ChunkId {
+        return if (id < self.inc.len) self.inc[id].items else &.{};
+    }
+};
+
+/// Walk a chunk's bytecode, collecting every chunk id it references. Reuses
+/// `writeOperands` (into a throwaway buffer) so the operand-length and
+/// chunk-extraction logic lives in exactly one place.
+fn collectRefs(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHashMapUnmanaged(ChunkId, void), scratch: *std.Io.Writer.Allocating) !void {
+    var ip: usize = 0;
+    while (ip < chunk.code.len) {
+        const op_byte = chunk.code[ip];
+        if (op_byte >= opcode_mod.count) {
+            ip += 1;
+            continue;
+        }
+        const op: OpCode = @enumFromInt(op_byte);
+        ip += 1;
+        scratch.writer.end = 0;
+        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, refs);
+    }
+}
 
 /// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
 /// byte, operand bytes, mnemonic, and interpretation all align), and longer
@@ -117,6 +189,18 @@ fn writeChunkAt(
             try writer.writeByte('\n');
         }
     }
+
+    // References section: which chunks reach this one and which it reaches.
+    if (chunk_id) |id| if (options.refs) |graph| {
+        const inc = graph.incoming(id);
+        const out = graph.outgoing(id);
+        if (inc.len > 0 or out.len > 0) {
+            try writeGuide(writer, cc, options.use_color);
+            try writer.writeAll("  references:\n");
+            try writeRefList(writer, "incoming", inc, symbols, cc, options.use_color);
+            try writeRefList(writer, "outgoing", out, symbols, cc, options.use_color);
+        }
+    };
 
     var ip: usize = 0;
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
@@ -879,6 +963,28 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
             const slot = @ctz(mask);
             try writer.print(" {d}", .{slot});
             mask &= mask - 1;
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+/// A `references:` sub-section (`incoming`/`outgoing`): one `chunk[0xN] name`
+/// per referenced chunk, each in that chunk's identity color. No-op when empty.
+fn writeRefList(writer: *std.Io.Writer, label: []const u8, ids: []const ChunkId, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
+    if (ids.len == 0) return;
+    try writeGuide(writer, cc, use_color);
+    try writer.print("    {s}:\n", .{label});
+    for (ids) |id| {
+        try writeGuide(writer, cc, use_color);
+        try writer.writeAll("      ");
+        const col = objColor(id);
+        if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
+        try writer.print("chunk[0x{x}]", .{id});
+        if (use_color) try writer.writeAll("\x1b[0m");
+        if (chunkNameOf(symbols, id)) |name| {
+            if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+            try writer.print(" {s}", .{name});
+            if (use_color) try writer.writeAll("\x1b[0m");
         }
         try writer.writeByte('\n');
     }

@@ -119,6 +119,11 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         .intern = ev.internTable(),
         .registry = ev.chunkRegistry(),
     };
+    // Cross-reference graph over the whole registry, so each chunk header can
+    // list its incoming/outgoing chunk references. Best-effort: on failure we
+    // simply omit the section.
+    var ref_graph: ?bytecode.disasm.RefGraph = bytecode.disasm.RefGraph.build(ev.chunkRegistry(), symbols) catch null;
+    defer if (ref_graph) |*g| g.deinit();
     const opts = bytecode.disasm.Options{
         .show_constants = !options.disasm_no_constants,
         .show_source = !options.disasm_no_source,
@@ -128,6 +133,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         .recurse = !options.disasm_eval and !options.disasm_no_recurse,
         .use_color = use_color,
         .max_depth = 0, // unlimited: the visited set guarantees termination.
+        .refs = if (ref_graph) |*g| g else null,
     };
 
     // Pipe to $PAGER when interactive; fall back to stdout on any spawn failure.
