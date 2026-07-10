@@ -1,150 +1,224 @@
-//! `fix disasm` — pretty-print compiled bytecode for an expression.
+//! `fix disasm` — compile a Nix expression and pretty-print its bytecode.
+//!
+//! By default this statically compiles the top expression and disassembles the
+//! reachable chunk graph. `--eval` instead evaluates the expression first, so
+//! imported files and lazily-compiled attribute bodies are compiled too, then
+//! dumps every chunk in the registry. When stdout is a terminal the output is
+//! piped to `$PAGER`.
 
 const std = @import("std");
 const fix = @import("fix");
-const eval = fix.eval;
 const bytecode = fix.bytecode;
 const cli = @import("cli.zig");
-const builtin = @import("builtin");
+const args = @import("args.zig");
+const setup = @import("setup.zig");
+const runner = @import("run.zig");
 
-const Evaluator = eval.Evaluator;
+const Evaluator = fix.Evaluator;
 const ChunkId = @import("runtime").types.ChunkId;
 
-const usage =
-    \\usage: fix disasm [options] (-e <expression> | --file <path>)
+pub const synopsis =
+    \\usage: fix disasm [options] [path | -e <expression>]
     \\
-    \\options:
-    \\  -e, --expr EXPR    expression to compile
-    \\  --file PATH        read expression from PATH
-    \\  --chunk N          disassemble only chunk #N (defaults to all reachable)
-    \\  --no-recurse       only show the top chunk
-    \\  --no-source        omit source-span annotations
-    \\  --no-constants     omit constant pool listing
-    \\  -h, --help         show this help
+    \\compile a Nix expression, file, or flake output and disassemble its
+    \\bytecode. With no source, uses ./default.nix (or, with --flake, the flake
+    \\in the current directory).
     \\
+    \\When stdout is a terminal the output is piped to $PAGER (disable with
+    \\--no-pager). For color through the pager, set e.g. PAGER='less -R' or LESS=R.
 ;
 
-const SourceArg = @import("args.zig").SourceArg;
-
-const Options = struct {
-    source: ?SourceArg = null,
-    chunk: ?ChunkId = null,
-    recurse: bool = true,
-    show_source: bool = true,
-    show_constants: bool = true,
-};
-
 pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
-    const options = parseOptions(args_iter) catch |err| switch (err) {
+    var options = args.parse(allocator, args_iter, null) catch |err| switch (err) {
         error.Help => {
-            cli.printHelp(init.io, usage);
+            args.writeHelp(init.io, synopsis, .disasm);
             return 0;
         },
         else => {
-            std.debug.print("error: {s}\n\n{s}", .{ optionErrorMessage(err), usage });
+            std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(err), synopsis });
             return 2;
         },
     };
+    defer options.deinit(allocator);
 
-    const source_arg = options.source orelse {
-        std.debug.print("{s}", .{usage});
-        return 2;
-    };
+    const source_arg = options.source orelse options.defaultSource();
 
-    const worker_count: u8 = if (builtin.single_threaded)
-        1
-    else
-        @intCast(@min(@as(u32, 4), @as(u32, @intCast(try std.Thread.getCpuCount()))));
-
+    // `--eval` runs the evaluator single-threaded and without speculation: we
+    // want exactly the chunks the demand path compiles, and speculative forcing
+    // on unguarded worker fibers can blow their stacks on deeply or infinitely
+    // recursive values (e.g. a NixOS toplevel). The static path never evaluates,
+    // so its worker count is immaterial.
+    const worker_count: u8 = if (options.disasm_eval) 1 else try setup.workerCount(options);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
-    ev.setEnvironment(init.environ_map);
-    try ev.setBasePathFromCurrentPath(init.io);
-    if (init.environ_map.get("NIX_PATH")) |nix_path| try ev.setNixPath(nix_path);
+    // Configure features (pipe-operators/flakes), base path, and NIX_PATH so the
+    // compile matches what `eval`/`build` would see. No progress: disasm prints
+    // bytecode, not a progress bar.
+    _ = try setup.configure(&ev, init, options);
+    if (options.disasm_eval) ev.setParallelismToggles(true, true);
 
-    const source = switch (source_arg) {
-        .expr => |text| text,
-        .file => |path| try ev.readSourceFile(path),
-        .flake => {
-            std.debug.print("error: --flake is not supported by this subcommand\n", .{});
-            return 1;
-        },
-    };
-    const source_path = switch (source_arg) {
-        .expr => null,
-        .file => |path| path,
-        .flake => unreachable,
+    if (source_arg == .flake and !ev.flakes_enabled) {
+        std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
+        return 2;
+    }
+
+    // Coloring and paging both follow stdout (where the disassembly goes),
+    // unlike the eval commands whose diagnostics go to stderr.
+    const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const use_color = switch (options.color) {
+        .always => true,
+        .never => false,
+        .auto => cli.autoColor(stdout_tty, init.environ_map),
     };
 
-    const top_id = ev.compileSource(source, source_path) catch |err| {
-        std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
+    const source = runner.getSource(&ev, source_arg, options) catch |err| {
+        std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
+    // `--flake`/`-A`/`--arg` synthesize source text on `ev.allocator`; plain
+    // expr/file text is borrowed (argv) or owned by the evaluator's file cache.
+    defer if (source.owned) ev.allocator.free(source.text);
 
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
-    const writer = &stdout.interface;
+    // Compile (or evaluate) up front, before any pager is spawned: this is where
+    // user-facing errors and warnings surface, and it resolves the single target
+    // chunk (a bad `--chunk` should fail cleanly, not through the pager).
+    var target_id: ChunkId = 0;
+    var target_chunk: ?*const bytecode.Chunk = null;
+    if (options.disasm_eval) {
+        try compileByEval(&ev, source.text);
+        if (options.disasm_chunk) |id| {
+            target_id = id;
+            target_chunk = ev.getChunk(id) orelse {
+                std.debug.print("error: chunk #{d} not found\n", .{id});
+                return 1;
+            };
+        }
+    } else {
+        // Only a plain `--file`/positional (no selector wrapping) carries a real
+        // source path for span annotations; synthesized text has none.
+        const source_path: ?[]const u8 = switch (source_arg) {
+            .file => |p| if (source.owned) null else p,
+            else => null,
+        };
+        const top_id = ev.compileSource(source.text, source_path) catch |err| {
+            std.debug.print("error: compilation failed: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        target_id = options.disasm_chunk orelse top_id;
+        target_chunk = ev.getChunk(target_id) orelse {
+            std.debug.print("error: chunk #{d} not found\n", .{target_id});
+            return 1;
+        };
+    }
 
     const symbols = bytecode.disasm.Symbols{
         .intern = ev.internTable(),
         .registry = ev.chunkRegistry(),
     };
     const opts = bytecode.disasm.Options{
-        .show_constants = options.show_constants,
-        .show_source = options.show_source,
-        .recurse = options.recurse,
-        .max_depth = 16,
+        .show_constants = !options.disasm_no_constants,
+        .show_source = !options.disasm_no_source,
+        .show_bytes = !options.disasm_no_bytes,
+        .fielded = options.disasm_fields,
+        // The `--eval` registry walk visits every chunk once, so recursion is
+        // only for the static single-chunk-graph path.
+        .recurse = !options.disasm_eval and !options.disasm_no_recurse,
+        .use_color = use_color,
+        .max_depth = 0, // unlimited: the visited set guarantees termination.
     };
 
-    const target_id = options.chunk orelse top_id;
-    const chunk = ev.getChunk(target_id) orelse {
-        std.debug.print("error: chunk #{d} not found\n", .{target_id});
-        return 1;
+    // Pipe to $PAGER when interactive; fall back to stdout on any spawn failure.
+    const pager_cmd: ?[]const u8 = if (!options.disasm_no_pager and stdout_tty) blk: {
+        const p = init.environ_map.get("PAGER") orelse break :blk null;
+        break :blk if (p.len == 0) null else p;
+    } else null;
+    var pager: ?Pager = if (pager_cmd) |cmd| Pager.start(init, cmd) else null;
+    const sink: std.Io.File = if (pager) |p| p.child.stdin.? else std.Io.File.stdout();
+    if (use_color and pager == null) std.Io.File.stdout().enableAnsiEscapeCodes(init.io) catch {};
+
+    var out_buffer: [1 << 15]u8 = undefined;
+    var stream = sink.writerStreaming(init.io, &out_buffer);
+    const writer = &stream.interface;
+
+    const write_err: ?anyerror = blk: {
+        if (options.disasm_eval and options.disasm_chunk == null) {
+            dumpAll(writer, &ev, symbols, opts) catch |e| break :blk e;
+        } else {
+            bytecode.disasm.writeChunk(writer, target_id, target_chunk.?, symbols, opts) catch |e| break :blk e;
+        }
+        stream.interface.flush() catch |e| break :blk e;
+        break :blk null;
     };
-    try bytecode.disasm.writeChunk(writer, target_id, chunk, symbols, opts);
-    try writer.flush();
+
+    if (pager) |*p| p.finish(init.io);
+
+    if (write_err) |e| {
+        // A broken pipe means a downstream reader closed early — our own $PAGER,
+        // or a manual `| less` / `| head`. That's a normal exit, not an error.
+        // The interface collapses the real cause into `WriteFailed`; the actual
+        // errno is stashed on the file writer.
+        const broken_pipe = if (stream.err) |we| we == error.BrokenPipe else false;
+        if (broken_pipe or pager != null) return 0;
+        return e;
+    }
     return 0;
 }
 
-fn parseOptions(args_iter: *std.process.Args.Iterator) !Options {
-    var options: Options = .{};
-    while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            return error.Help;
-        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--expr")) {
-            const text = args_iter.next() orelse return error.MissingExpression;
-            if (options.source != null) return error.TooManySources;
-            options.source = .{ .expr = text };
-        } else if (std.mem.eql(u8, arg, "--file")) {
-            const path = args_iter.next() orelse return error.MissingPath;
-            if (options.source != null) return error.TooManySources;
-            options.source = .{ .file = path };
-        } else if (std.mem.eql(u8, arg, "--chunk")) {
-            const text = args_iter.next() orelse return error.MissingChunkId;
-            options.chunk = std.fmt.parseInt(ChunkId, text, 10) catch return error.InvalidChunkId;
-        } else if (std.mem.eql(u8, arg, "--no-recurse")) {
-            options.recurse = false;
-        } else if (std.mem.eql(u8, arg, "--no-source")) {
-            options.show_source = false;
-        } else if (std.mem.eql(u8, arg, "--no-constants")) {
-            options.show_constants = false;
-        } else if (cli.parseWhen(arg)) |_| {
-            // Ignored — no progress/color for disasm.
-        } else {
-            return error.UnknownOption;
-        }
+/// A `$PAGER` child process fed the disassembly on its stdin.
+const Pager = struct {
+    child: std.process.Child,
+
+    /// Spawn `sh -c <cmd>` with a stdin pipe (so `$PAGER` may carry arguments,
+    /// e.g. `less -R`). Returns null on any spawn failure — the caller then
+    /// writes straight to stdout.
+    fn start(init: std.process.Init, cmd: []const u8) ?Pager {
+        const child = std.process.spawn(init.io, .{
+            .argv = &[_][]const u8{ "sh", "-c", cmd },
+            .environ_map = init.environ_map,
+            .stdin = .pipe,
+        }) catch return null;
+        return .{ .child = child };
     }
-    return options;
+
+    /// Close our end of the pipe (EOF for the pager) and wait for it to exit.
+    fn finish(self: *Pager, io: std.Io) void {
+        if (self.child.stdin) |f| {
+            f.close(io);
+            self.child.stdin = null;
+        }
+        _ = self.child.wait(io) catch {};
+    }
+};
+
+/// Evaluate `source` to weak head normal form — the same non-strict evaluation
+/// `fix eval` does — so imports (and any attribute bodies forced along the way)
+/// compile into the registry, then dump whatever compiled. We deliberately do
+/// NOT deep-force: a full force of e.g. a NixOS toplevel recurses without bound
+/// (and would FrameOverflow, or blow a speculative worker's stack). Best-effort:
+/// a failing eval still leaves its compiled chunks behind to inspect, so a
+/// failure is a warning, not an abort.
+fn compileByEval(ev: *Evaluator, source: []const u8) !void {
+    _ = ev.evaluate(source) catch |err| {
+        std.debug.print("warning: evaluation failed: {s} (dumping chunks compiled so far)\n", .{@errorName(err)});
+    };
 }
 
-fn optionErrorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.MissingExpression => "missing expression after -e or --expr",
-        error.MissingPath => "missing path after --file",
-        error.MissingChunkId => "missing N after --chunk",
-        error.InvalidChunkId => "expected --chunk to be a non-negative integer",
-        error.TooManySources => "provide only one expression or file",
-        error.UnknownOption => "unknown option",
-        else => @errorName(err),
-    };
+/// Dump every compiled chunk in id order. Recursion is off in `opts` here: the
+/// registry walk already visits every chunk exactly once.
+fn dumpAll(
+    writer: *std.Io.Writer,
+    ev: *Evaluator,
+    symbols: bytecode.disasm.Symbols,
+    opts: bytecode.disasm.Options,
+) !void {
+    const registry = ev.chunkRegistry();
+    const total = registry.count();
+    var id: ChunkId = 0;
+    var first = true;
+    while (id < total) : (id += 1) {
+        const chunk = registry.get(id) orelse continue;
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        try bytecode.disasm.writeChunk(writer, id, chunk, symbols, opts);
+    }
 }

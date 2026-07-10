@@ -88,7 +88,7 @@ pub const OptionOverride = struct {
 
 /// Which subcommand is asking (used only to scope `--help` output; every
 /// subcommand shares this one parser and accepts the whole option set).
-pub const Cmd = enum { eval, instantiate, build, run, shell, repl };
+pub const Cmd = enum { eval, instantiate, build, run, shell, repl, disasm };
 
 pub const Options = struct {
     output: OutputFormat = .nix,
@@ -142,6 +142,25 @@ pub const Options = struct {
     /// `--arg`/`--argstr` top-level function arguments, in argv order. Borrowed
     /// from argv; the list backing is owned (caller frees via `deinit`).
     arg_defs: std.ArrayListUnmanaged(ArgDef) = .empty,
+    /// `fix disasm --chunk N`: disassemble only chunk #N (else all reachable).
+    disasm_chunk: ?u32 = null,
+    /// `fix disasm --no-recurse`: only show the top chunk.
+    disasm_no_recurse: bool = false,
+    /// `fix disasm --no-source`: omit source-span annotations.
+    disasm_no_source: bool = false,
+    /// `fix disasm --no-constants`: omit the constant-pool listing.
+    disasm_no_constants: bool = false,
+    /// `fix disasm --no-bytes`: omit the raw-bytecode hex column.
+    disasm_no_bytes: bool = false,
+    /// `fix disasm --fields`: put each operand field on its own line with its
+    /// bytes and an interpreting comment.
+    disasm_fields: bool = false,
+    /// `fix disasm --no-pager`: never pipe output to `$PAGER`.
+    disasm_no_pager: bool = false,
+    /// `fix disasm --eval`: evaluate first, then disassemble every chunk that
+    /// compiled (follows imports and lazy attr bodies), instead of statically
+    /// compiling the top expression only.
+    disasm_eval: bool = false,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -251,6 +270,15 @@ const Opt = enum {
     help,
     // Shell.
     packages,
+    // Disasm.
+    chunk,
+    no_recurse,
+    no_source,
+    no_constants,
+    no_bytes,
+    fields,
+    no_pager,
+    disasm_eval,
     // Internal perf/trace knobs (hidden from help, still parsed everywhere).
     workers,
     vm_trace,
@@ -298,8 +326,20 @@ const Spec = struct {
     hidden: bool = false,
 };
 
-/// Commands that take a source expression (everything but the bare `repl`).
-const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
+/// Commands that take a source expression and its selectors (everything but the
+/// bare `repl`). `disasm` compiles rather than evaluates, but shares the same
+/// source model (bare path / `-e` / `--file` / `--flake` / `-A` / `-I`).
+const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm };
+/// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
+/// progress, and the GC memory budget apply. `disasm` stops at compilation, so
+/// it is excluded.
+const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl };
+/// Commands that print an evaluated value, so the output format (`--json`,
+/// `--xml`) and `--strict` apply. The realizing commands print store paths, not
+/// a value, and `disasm` prints bytecode.
+const value_cmds = &[_]Cmd{ .eval, .repl };
+/// Commands that evaluate to a derivation whose debug records make sense.
+const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
@@ -314,9 +354,9 @@ const specs = [_]Spec{
     .{ .id = .arg, .long = "--arg", .arg = .req2, .metavar = "NAME EXPR", .help = "pass EXPR as top-level function argument NAME", .show_in = source_cmds },
     .{ .id = .argstr, .long = "--argstr", .arg = .req2, .metavar = "NAME STR", .help = "pass string STR as top-level function argument NAME", .show_in = source_cmds },
 
-    .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON" },
-    .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML" },
-    .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing" },
+    .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON", .show_in = value_cmds },
+    .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
+    .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
 
     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
@@ -340,19 +380,29 @@ const specs = [_]Spec{
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = realize_cmds },
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
 
-    .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error" },
+    .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
-    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never" },
-    .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress" },
-    .{ .id = .debug_derivations, .long = "--debug-derivations", .arg = .opt, .metavar = "MODE", .help = "write derivation debug records to stderr: summary, full", .show_in = source_cmds },
-    .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = source_cmds },
-    .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = source_cmds },
-    .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = source_cmds },
-    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only." },
+    .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never", .show_in = eval_cmds },
+    .{ .id = .no_progress, .long = "--no-progress", .help = "disable evaluation progress", .show_in = eval_cmds },
+    .{ .id = .debug_derivations, .long = "--debug-derivations", .arg = .opt, .metavar = "MODE", .help = "write derivation debug records to stderr: summary, full", .show_in = derivation_debug_cmds },
+    .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = derivation_debug_cmds },
+    .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = derivation_debug_cmds },
+    .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = derivation_debug_cmds },
+    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only.", .show_in = eval_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
+
+    // Disasm.
+    .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (follows imports and lazy attr bodies)", .show_in = &.{.disasm} },
+    .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk #N (default: all reachable)", .show_in = &.{.disasm} },
+    .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
+    .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
+    .{ .id = .fields, .long = "--fields", .help = "break each instruction into per-operand lines,\nwith bytes and an interpreting comment", .show_in = &.{.disasm} },
+    .{ .id = .no_pager, .long = "--no-pager", .help = "do not pipe output to $PAGER", .show_in = &.{.disasm} },
+    .{ .id = .no_source, .long = "--no-source", .help = "omit source-span annotations", .show_in = &.{.disasm} },
+    .{ .id = .no_constants, .long = "--no-constants", .help = "omit the constant pool listing", .show_in = &.{.disasm} },
 
     // Hidden perf/trace knobs.
     .{ .id = .workers, .long = "--workers", .arg = .req, .metavar = "N", .hidden = true },
@@ -532,6 +582,15 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
 
         .packages => unreachable, // handled in the parse loop
 
+        .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 10) catch return error.InvalidChunkId,
+        .no_recurse => options.disasm_no_recurse = true,
+        .no_source => options.disasm_no_source = true,
+        .no_constants => options.disasm_no_constants = true,
+        .no_bytes => options.disasm_no_bytes = true,
+        .fields => options.disasm_fields = true,
+        .no_pager => options.disasm_no_pager = true,
+        .disasm_eval => options.disasm_eval = true,
+
         .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
         .vm_trace => options.vm_trace_path = v0 orelse "-",
         .vm_trace_format => options.vm_trace_format = parseVmTraceFormat(v0.?) orelse return error.InvalidVmTraceFormat,
@@ -659,6 +718,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
+        error.InvalidChunkId => "expected --chunk to be a non-negative integer",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };
