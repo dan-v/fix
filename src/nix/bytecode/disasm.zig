@@ -386,16 +386,14 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     }
 }
 
-/// One operand-hierarchy gutter cell, `kind` chosen by the tree position:
-/// `.vert` (`│`) an ancestor branch that continues, `.tee` (`├`) this node with
-/// more siblings, `.corner` (`└`) this node as the last sibling, `.blank` a
-/// closed ancestor branch. Each is a column wider than the thin chunk margin.
-const GuideKind = enum { vert, tee, corner, blank };
+/// One operand-hierarchy gutter cell: a plain vertical `│` runs straight down
+/// every level, closing with the L-shaped `└` on a group's last member; a
+/// closed branch is `.blank`. Each is a column wider than the thin chunk margin.
+const GuideKind = enum { vert, corner, blank };
 fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, use_color: bool) !void {
     const glyph: []const u8 = switch (kind) {
         .vert => "│  ",
-        .tee => "├─ ",
-        .corner => "└─ ",
+        .corner => "└  ",
         .blank => "   ",
     };
     if (use_color and kind != .blank) {
@@ -437,12 +435,15 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         for (guides, 0..) |gc, gi| {
             const is_last = (last_mask >> @intCast(gi)) & 1 == 1;
             const innermost = gi + 1 == guides.len;
-            const kind: GuideKind = if (!innermost)
-                (if (is_last) .blank else .vert)
-            else if (r != 0)
-                (if (is_last) .blank else .vert)
+            // Vertical everywhere, except the last member closes with `└` on its
+            // content row and its branch is blank thereafter (and up any ancestor
+            // branch that has already closed).
+            const kind: GuideKind = if (!is_last)
+                .vert
+            else if (innermost and r == 0)
+                .corner
             else
-                (if (is_last) .corner else .tee);
+                .blank;
             try writeTreeGuide(writer, gc, kind, use_color);
         }
         if (r != 0) continue; // continuation rows: bytes + gutter only
