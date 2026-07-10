@@ -237,6 +237,14 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             }
         },
         .attr_set => {
+            // `{}` mirrors the empty-list fast path above: nothing to
+            // fix-point, nothing lazily observable — build it in place, no
+            // thunk, no chunk. (15k chunks on a NixOS toplevel existed solely
+            // to build `{}`.)
+            if (unwrapped.data.attr_set.entries.len == 0 and !unwrapped.data.attr_set.recursive) {
+                try emit.emitOpU16(self, .attrs_new, 0);
+                return true;
+            }
             // Only inline in eager let-binding context (set by
             // compileLetRootBinding when strictness says forced).
             // Other contexts — attrset-entry values, function
