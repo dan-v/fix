@@ -211,14 +211,35 @@ pub const Compiler = struct {
         if (self.registry.capture_names) self.name_hint = name_id;
     }
 
+    /// Arm a *synthetic* name (e.g. `λpkgs` for an unbound lambda) — only when
+    /// no real binding name is already pending, since a binding name is always
+    /// the better attribution.
+    pub fn armSyntheticName(self: *Compiler, text: []const u8) void {
+        if (!self.registry.capture_names or self.name_hint != null) return;
+        self.name_hint = self.intern.intern(text) catch return;
+    }
+
     /// Qualify a segment name with this compiler's `name_prefix` into an interned
-    /// `prefix$segment`. Returns the bare segment when there is no prefix (or the
+    /// `prefix.segment`. Returns the bare segment when there is no prefix (or the
     /// combined name would be pathologically long).
     pub fn combinedName(self: *Compiler, segment: InternId) !InternId {
         const prefix = self.name_prefix orelse return segment;
         var buf: [1024]u8 = undefined;
-        const full = std.fmt.bufPrint(&buf, "{s}${s}", .{ prefix, self.intern.get(segment) }) catch return segment;
+        const full = std.fmt.bufPrint(&buf, "{s}.{s}", .{ prefix, self.intern.get(segment) }) catch return segment;
         return self.intern.intern(full);
+    }
+
+    /// Detect the pure forwarder body shape — `up_get_ret slot` (or
+    /// `up_get slot; ret`) and nothing else — returning the forwarded slot.
+    /// These chunks just look a value up from an upvalue and return it.
+    fn forwarderSlot(ch: *const chunk.Chunk) ?u16 {
+        const code = ch.code;
+        const enc = bytecode.encoding;
+        if (code.len == 4 and code[0] == @intFromEnum(bytecode.OpCode.up_get_ret))
+            return enc.readU16(code, 1);
+        if (code.len == 5 and code[0] == @intFromEnum(bytecode.OpCode.up_get) and code[3] == @intFromEnum(bytecode.OpCode.ret))
+            return enc.readU16(code, 1);
+        return null;
     }
 
     /// Register `ch` and, when this compiler is building a named value chunk
@@ -226,7 +247,33 @@ pub const Compiler = struct {
     /// is a no-op unless naming is on, so this stays free on the hot path.
     pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
         const id = try self.registry.register(ch);
-        if (self.chunk_name) |name| try self.registry.recordName(id, name);
+        if (self.registry.capture_names) {
+            var name = self.chunk_name;
+            // Pure forwarders (`foo = <up>foo` module-arg plumbing) get a
+            // `.fwd` suffix — named after the forwarded upvalue when the chunk
+            // has no binding name of its own.
+            if (forwarderSlot(&ch)) |slot| {
+                if (slot < self.captures.items.len) {
+                    const up = self.captures.items[slot].name_id;
+                    var buf: [1024]u8 = undefined;
+                    const base = name orelse self.combinedName(up) catch up;
+                    if (std.fmt.bufPrint(&buf, "{s}.fwd", .{self.intern.get(base)})) |txt| {
+                        name = try self.intern.intern(txt);
+                    } else |_| {}
+                }
+            }
+            // Uniquify: later chunks claiming an already-used name get `~N`.
+            if (name) |base| {
+                const uses = try self.registry.bumpNameUse(base);
+                if (uses > 1) {
+                    var buf: [1024]u8 = undefined;
+                    if (std.fmt.bufPrint(&buf, "{s}~{d}", .{ self.intern.get(base), uses })) |txt| {
+                        name = try self.intern.intern(txt);
+                    } else |_| {}
+                }
+                try self.registry.recordName(id, name.?);
+            }
+        }
         if (self.source_file_id) |file| try self.registry.recordFile(id, file);
         // This compiler's capture list IS the chunk's upvalue vector (slot
         // order), and every capture carries its binding name — record them for

@@ -225,7 +225,9 @@ fn writeChunkAt(
                 try writer.writeAll(istr);
             }
             try writer.splatByteAll(' ', 6 -| istr.len);
-            if (symbols.internName(name_id)) |name| {
+            if (symbols.internName(name_id)) |raw| {
+                // Strip the leading NUL off compiler-internal names.
+                const name = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
                 if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
                 try writer.writeAll(name);
                 if (options.use_color) try writer.writeAll("\x1b[0m");
@@ -1165,10 +1167,13 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
 }
 
 /// Resolve upvalue slot `idx`'s best-effort binding name, if recorded.
+/// Compiler-internal names carry a leading NUL (e.g. the attrset-pattern
+/// argument holder `\x00args`) — strip it so no NUL reaches the output.
 fn upvalueName(up_names: ?[]const InternId, symbols: Symbols, idx: usize) ?[]const u8 {
     const list = up_names orelse return null;
     if (idx >= list.len) return null;
-    return symbols.internName(list[idx]);
+    const name = symbols.internName(list[idx]) orelse return null;
+    return if (name.len > 0 and name[0] == 0) name[1..] else name;
 }
 
 /// Render an instruction's operands as one line per field. `ip` is the byte

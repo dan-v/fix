@@ -208,6 +208,13 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     }
     const body = cur;
 
+    // Unbound lambda (no attr/let binding armed a name): synthesize one from
+    // the parameter, so e.g. a module's top `pkgs: …` reads as `λpkgs`.
+    if (n > 0) {
+        var nbuf: [128]u8 = undefined;
+        if (std.fmt.bufPrint(&nbuf, "λ{s}", .{params[0]})) |txt| self.armSyntheticName(txt) else |_| {}
+    }
+
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);
 
@@ -260,6 +267,22 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
 
 pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     const lambda = node.data.lambda_attrs;
+
+    // Unbound pattern lambda: synthesize `λ{first,…}` from the pattern (or the
+    // @-binding when present), so module toplevels read as `λ{config,…}`.
+    {
+        var nbuf: [128]u8 = undefined;
+        const txt: ?[]const u8 = if (lambda.bind_name) |bn|
+            std.fmt.bufPrint(&nbuf, "λ{s}@", .{self.source[bn.offset .. bn.offset + bn.len]}) catch null
+        else if (lambda.params.len == 0)
+            "λ{}"
+        else blk: {
+            const p0 = lambda.params[0].name;
+            const first = self.source[p0.offset .. p0.offset + p0.len];
+            break :blk std.fmt.bufPrint(&nbuf, "λ{{{s}{s}}}", .{ first, if (lambda.params.len > 1) ",…" else "" }) catch null;
+        };
+        if (txt) |t| self.armSyntheticName(t);
+    }
 
     var child_builder = try self.acquireBuilder();
     defer self.releaseBuilder(&child_builder);

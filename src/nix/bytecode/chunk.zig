@@ -567,6 +567,9 @@ pub const ChunkRegistry = struct {
     /// Companion to `names`: per-chunk upvalue binding names (slot order), from
     /// the compiler's capture list. Slices owned by `allocator`.
     upvalue_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
+    /// How many chunks already claimed each base name, so `recordName` callers
+    /// can uniquify duplicates with a `~N` suffix.
+    name_uses: std.AutoHashMapUnmanaged(types.InternId, u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -652,6 +655,7 @@ pub const ChunkRegistry = struct {
         var it = self.upvalue_names.valueIterator();
         while (it.next()) |v| self.allocator.free(v.*);
         self.upvalue_names.deinit(self.allocator);
+        self.name_uses.deinit(self.allocator);
     }
 
     /// Assert the unsynchronized sidecar maps are only ever touched from a
@@ -680,6 +684,18 @@ pub const ChunkRegistry = struct {
         if (!self.capture_names) return;
         self.checkSingleThread();
         try self.files.put(self.allocator, id, file);
+    }
+
+    /// Claim one use of base name `id`, returning the total claim count (1 for
+    /// the first user). Callers uniquify names claimed more than once. Always
+    /// returns 1 when name capture is off.
+    pub fn bumpNameUse(self: *ChunkRegistry, id: types.InternId) !u32 {
+        if (!self.capture_names) return 1;
+        self.checkSingleThread();
+        const gop = try self.name_uses.getOrPut(self.allocator, id);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+        return gop.value_ptr.*;
     }
 
     /// Record the chunk's upvalue binding names (slot order). No-op unless
