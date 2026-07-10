@@ -177,13 +177,13 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     const drv_name = self.intern.get(drv_name_id);
 
     // The `.derivation` span drives the demand fiber's single-writer LIFO stage
-    // stack, so only emit it on the demand path (`is_demand`) — a speculative
-    // derivation force on a helper fiber interleaving pushes/pops here corrupts
-    // the stack (mis-paired `Node.end` → std.Progress render-future UAF). This
-    // matches `progressEligible()`, which gates parse/compile/evaluate the same.
-    const drv_progress = if (self.is_demand) self.progress else null;
-    if (drv_progress) |progress| progress.begin(.derivation, drv_name);
-    defer if (drv_progress) |progress| progress.end(.derivation, drv_name);
+    // stack — a speculative derivation force on a helper fiber interleaving
+    // pushes/pops here corrupts the stack (mis-paired `Node.end` →
+    // std.Progress render-future UAF). The gate is structural: only the demand
+    // fiber's VMs carry a `progress_stage` handle (helpers hold null), same as
+    // every other stage emit.
+    if (self.progress_stage) |stage| stage.begin(.derivation, drv_name);
+    defer if (self.progress_stage) |stage| stage.end(.derivation, drv_name);
 
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);
@@ -215,13 +215,13 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         // independent concurrent span (its own render node, safe to open/close
         // from any thread) rather than on the demand-only stage stack.
         var store_span: ?eval_progress.Span = null;
-        if (self.progress) |progress| {
+        if (self.progress_spans) |spans| {
             var name_buf: [128]u8 = undefined;
             const label = std.fmt.bufPrint(&name_buf, "{s}.drv", .{drv_name}) catch drv_name;
-            store_span = progress.beginSpan(.store, label);
+            store_span = spans.beginSpan(.store, label);
         }
         defer if (store_span) |sp| {
-            if (self.progress) |progress| progress.endSpan(sp);
+            if (self.progress_spans) |spans| spans.endSpan(sp);
         };
 
         const aterm = try normalized.drv.toATerm(self.allocator, false, null);

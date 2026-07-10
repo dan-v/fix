@@ -291,11 +291,13 @@ pub const EvalProgress = struct {
 
     pub fn sink(self: *EvalProgress) eval_progress.Sink {
         return .{
-            .context = self,
-            .emit_fn = emit,
-            .begin_span_fn = beginSpan,
-            .end_span_fn = endSpan,
-            .update_span_fn = updateSpan,
+            .stage = .{ .context = self, .emit_fn = emit },
+            .spans = .{
+                .context = self,
+                .begin_span_fn = beginSpan,
+                .end_span_fn = endSpan,
+                .update_span_fn = updateSpan,
+            },
         };
     }
 

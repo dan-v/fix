@@ -436,6 +436,11 @@ pub const Evaluator = struct {
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
         self.progress = progress;
+        // Keep the main worker's demand-only stage handle in step (it is
+        // normally installed in `ensureMainWorker`, but the sink may be
+        // (re)set after the worker already exists, e.g. across REPL runs).
+        if (self.main_worker) |w|
+            w.demand_stage = if (progress) |p| p.stage else null;
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -797,15 +802,15 @@ pub const Evaluator = struct {
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
             if (worker_id == 0) &self.run.trace else null,
-            // All workers get the progress sink, but only for the *concurrent
-            // span* channel (`beginSpan`/`endSpan` — store writes, fetches),
-            // whose std.Progress nodes are independent and lock-free-safe from
-            // any thread. The single-writer LIFO stage stack (begin/end/count)
-            // stays demand-fiber-only: every stage emit is gated on `is_demand`
-            // (`progressEligible()`, and the `.derivation` span), and the count
-            // path (`progressCount`) is reached only from the demand result
-            // walk — so no helper ever touches `active[]`.
-            self.progress,
+            // All workers get the *concurrent span* half of the progress
+            // protocol (`beginSpan`/`endSpan` — store writes, fetches), whose
+            // std.Progress nodes are independent and lock-free-safe from any
+            // thread. The single-writer LIFO stage stack stays
+            // demand-fiber-only structurally: its `StageSink` handle
+            // (`vm.progress_stage`) is installed only on the demand VM (see
+            // `Worker.runTopLevel` and the fiber-inherit block below), so a
+            // helper has no way to touch `active[]`.
+            if (self.progress) |p| p.spans else null,
             if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
             // concurrency-shaped wrong-result bugs needs to see every
@@ -826,6 +831,15 @@ pub const Evaluator = struct {
         if (fiber_mod.currentFiber()) |inner| {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.claimer_id = wf.vm.claimer_id;
+            // A nested VM runs on the surrounding fiber, so it is demand iff
+            // that fiber is: inherit the flag and the demand-only stage
+            // handle the same way as the claim identity. This keeps
+            // stage/count/wait emission alive across nested VMs (imports,
+            // render/force bodies) on the demand fiber, while a helper
+            // fiber's nested VMs inherit null — stage emission stays
+            // inexpressible off-demand.
+            vm.is_demand = wf.vm.is_demand;
+            vm.progress_stage = wf.vm.progress_stage;
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.fetch_tree_enabled = self.fetch_tree_enabled;
@@ -1021,6 +1035,11 @@ pub const Evaluator = struct {
             self,
             initVmForWorkerSlot,
         );
+        // The main worker launches the demand fiber, so it (alone) carries
+        // the demand-only stage handle `runTopLevel` installs on that
+        // fiber's VM. Helpers never get one — off-demand stage emission
+        // stays inexpressible.
+        w.demand_stage = if (self.progress) |p| p.stage else null;
         self.main_worker = w;
         // GC (`-Dgc`): register the collect callback now that `self` is at
         // its final address (init returns by value), and enable reclaim. The
@@ -1166,37 +1185,39 @@ pub const Evaluator = struct {
         return self.runWithVm(writeValueBody, .{ self, writer, value });
     }
 
-    /// Progress is a single-threaded UI concern that must be driven only by
-    /// the demand path. Imports/compiles triggered off a speculative or
-    /// fan-out force — OR off a background `import_prefetch` task — run on
-    /// arbitrary worker fibers and would reentrantly interleave begin/end
-    /// pairs into the one std `Progress` tree (whose `active[]` stack is not
-    /// thread-safe) → the `Progress.Node.init` "slot reuse" assert / a torn
-    /// stack. Gate on the fiber's `is_demand` flag: exactly one fiber carries
-    /// it (the top-level entry), it emits sequentially even across a steal, so
-    /// it alone may emit. NB: `!in_speculation` is NOT sufficient — a prefetch
-    /// task fiber has `in_speculation == false` yet must stay silent. begin
-    /// and end share this gate (the flag is stable across a fiber's life), so
-    /// pairs stay balanced. No current fiber = early single-threaded setup.
-    fn progressEligible() bool {
-        const inner = fiber_mod.currentFiber() orelse return true;
+    /// Progress stage events are a single-threaded UI concern that must be
+    /// driven only by the demand path. Imports/compiles triggered off a
+    /// speculative or fan-out force — OR off a background `import_prefetch`
+    /// task — run on arbitrary worker fibers and would reentrantly interleave
+    /// begin/end pairs into the one std `Progress` tree (whose `active[]`
+    /// stack is not thread-safe) → the `Progress.Node.init` "slot reuse"
+    /// assert / a torn stack. So the stage handle is structural, not a flag
+    /// check: only the demand fiber's VM carries a `progress_stage` (exactly
+    /// one fiber, emitting sequentially even across a steal — see
+    /// `Worker.runTopLevel`); every other fiber holds null and this returns
+    /// null. NB: `!in_speculation` would NOT be a sufficient gate — a
+    /// prefetch task fiber has `in_speculation == false` yet must stay
+    /// silent. begin and end share this gate (the handle is stable across a
+    /// fiber's life), so pairs stay balanced. No current fiber =
+    /// single-threaded setup on the main thread (parse/compile before the
+    /// run enters a fiber) — allowed, the demand fiber doesn't exist yet.
+    fn stageSink(self: *Evaluator) ?eval_progress.StageSink {
+        const progress = self.progress orelse return null;
+        const inner = fiber_mod.currentFiber() orelse return progress.stage;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-        return wf.vm.is_demand;
+        return wf.vm.progress_stage;
     }
 
     pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (!progressEligible()) return;
-        if (self.progress) |progress| progress.begin(stage, subject);
+        if (self.stageSink()) |sink| sink.begin(stage, subject);
     }
 
     pub fn progressEnd(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (!progressEligible()) return;
-        if (self.progress) |progress| progress.end(stage, subject);
+        if (self.stageSink()) |sink| sink.end(stage, subject);
     }
 
     pub fn progressInstant(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {
-        if (!progressEligible()) return;
-        if (self.progress) |progress| progress.instant(stage, subject);
+        if (self.stageSink()) |sink| sink.instant(stage, subject);
     }
 
     /// Build a live counter snapshot for the progress indicator. Cheap — a
@@ -1225,7 +1246,7 @@ pub const Evaluator = struct {
     }
 
     fn progressSample(self: *Evaluator) void {
-        if (self.progress) |sink| sink.metrics(self.readMetrics());
+        if (self.progress) |p| p.stage.metrics(self.readMetrics());
     }
 
     /// Sampler thread body: push a snapshot, then sleep ~100ms (waking every
@@ -1266,23 +1287,22 @@ pub const Evaluator = struct {
     /// counting is live; `progressStep` advances it per element (cheap — no
     /// per-element eligibility recheck). Demand path only.
     pub fn progressCountBegin(self: *Evaluator, total: usize) bool {
-        if (!progressEligible()) return false;
-        const sink = self.progress orelse return false;
+        const sink = self.stageSink() orelse return false;
         sink.count(0, total);
         return true;
     }
 
     pub fn progressStep(self: *Evaluator, completed: usize, total: usize) void {
-        if (self.progress) |sink| sink.count(completed, total);
+        if (self.progress) |p| p.stage.count(completed, total);
     }
 
     pub fn progressSessionBegin(self: *Evaluator, label: []const u8) void {
-        if (self.progress) |sink| sink.sessionBegin(label);
+        if (self.progress) |p| p.stage.sessionBegin(label);
     }
 
     pub fn progressSessionEnd(self: *Evaluator) void {
         self.progress_wait.clear();
-        if (self.progress) |sink| sink.sessionEnd();
+        if (self.progress) |p| p.stage.sessionEnd();
     }
 };
 

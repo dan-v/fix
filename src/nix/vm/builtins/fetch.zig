@@ -220,12 +220,12 @@ fn mercurialResultValue(self: anytype, name: []const u8, result: fetch_cache.Fet
 /// thread-safe concurrent-span channel — its node is independent of the demand
 /// LIFO stage stack. Null (and a no-op `end`) when progress isn't drawn.
 fn fetchSpanBegin(self: anytype, subject: []const u8) ?eval_progress.Span {
-    const progress = self.progress orelse return null;
-    return progress.beginSpan(.fetch, subject);
+    const spans = self.progress_spans orelse return null;
+    return spans.beginSpan(.fetch, subject);
 }
 
 fn fetchSpanEnd(self: anytype, span: ?eval_progress.Span) void {
-    if (span) |sp| if (self.progress) |progress| progress.endSpan(sp);
+    if (span) |sp| if (self.progress_spans) |spans| spans.endSpan(sp);
 }
 
 const io_offload = @import("../io_offload.zig");
@@ -236,7 +236,7 @@ const FileCache = file_cache.FileCache;
 /// (`downloaded`/`total`) without knowing the progress types. Lives on the
 /// `offloadFetch` frame, which stays parked for the whole fetch.
 const FetchReport = struct {
-    sink: eval_progress.Sink,
+    sink: eval_progress.SpanSink,
     span: eval_progress.Span,
 
     fn report(ctx: *anyopaque, downloaded: u64, total: u64) void {
@@ -271,7 +271,7 @@ fn offloadFetch(self: anytype, comptime call: anytype, spec: anytype, span: ?eva
     };
     var report_store: FetchReport = undefined;
     const reporter: ?FetchCache.Reporter = reporter: {
-        const sink = self.progress orelse break :reporter null;
+        const sink = self.progress_spans orelse break :reporter null;
         const sp = span orelse break :reporter null;
         report_store = .{ .sink = sink, .span = sp };
         break :reporter .{ .ctx = &report_store, .report = FetchReport.report };

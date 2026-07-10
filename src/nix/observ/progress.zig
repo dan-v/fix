@@ -134,68 +134,93 @@ pub const SpanGroup = enum {
 /// evaluator treats it as opaque.
 pub const Span = struct { token: usize };
 
-pub const Sink = struct {
+/// The demand-path half of the progress protocol: the single-writer LIFO
+/// stage stack (`begin`/`end`/`instant`/`count`) plus the per-run session and
+/// metrics events. The stage stack is NOT thread-safe — exactly one logical
+/// writer may drive it: the main thread during single-threaded setup, then
+/// the demand fiber (which emits sequentially even if a steal migrates it
+/// across workers). That is why this is a separate type from `SpanSink`: the
+/// evaluator hands it out only where the demand flag is set
+/// (`VM.progress_stage`), so an off-demand stage emit has no handle to call
+/// through — helpers only ever hold the thread-safe `SpanSink`. Don't add a
+/// bypass. (`metrics` is the sampler thread's channel and `session_*`
+/// bracket the run on the main thread; they share `emit_fn` but mutate
+/// sampler-/main-owned nodes, never the stage stack — see the CLI impl.)
+pub const StageSink = struct {
     context: *anyopaque,
     emit_fn: *const fn (*anyopaque, Event) void,
-    /// Open/close a concurrent span. Both null when the sink doesn't support
-    /// them (then `beginSpan` returns null and `endSpan` is a no-op).
-    begin_span_fn: ?*const fn (*anyopaque, SpanGroup, []const u8) Span = null,
-    end_span_fn: ?*const fn (*anyopaque, Span) void = null,
-    /// Set byte progress (`downloaded`/`total`, `total` 0 = unknown) on an open
-    /// span — e.g. a fetch reporting download bytes. Thread-safe; called from
-    /// the off-demand fetch thread. Null when unsupported.
-    update_span_fn: ?*const fn (*anyopaque, Span, u64, u64) void = null,
 
-    pub fn emit(self: Sink, event: Event) void {
+    pub fn emit(self: StageSink, event: Event) void {
         self.emit_fn(self.context, event);
     }
 
-    /// Open a concurrent span nested under `group`'s counting node. Thread-safe:
-    /// the returned handle can be closed with `endSpan` from any thread. Returns
-    /// null if unsupported.
-    pub fn beginSpan(self: Sink, group: SpanGroup, subject: []const u8) ?Span {
-        const f = self.begin_span_fn orelse return null;
-        return f(self.context, group, subject);
-    }
-
-    /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.
-    pub fn endSpan(self: Sink, span: Span) void {
-        if (self.end_span_fn) |f| f(self.context, span);
-    }
-
-    /// Report byte progress on an open span (`total` 0 = size not yet known).
-    /// Safe to call from any thread; a no-op when unsupported.
-    pub fn updateSpan(self: Sink, span: Span, downloaded: u64, total: u64) void {
-        if (self.update_span_fn) |f| f(self.context, span, downloaded, total);
-    }
-
-    pub fn begin(self: Sink, stage: Stage, subject: []const u8) void {
+    pub fn begin(self: StageSink, stage: Stage, subject: []const u8) void {
         self.emit(.{ .begin = .{ .stage = stage, .subject = subject } });
     }
 
-    pub fn end(self: Sink, stage: Stage, subject: []const u8) void {
+    pub fn end(self: StageSink, stage: Stage, subject: []const u8) void {
         self.emit(.{ .end = .{ .stage = stage, .subject = subject } });
     }
 
-    pub fn instant(self: Sink, stage: Stage, subject: []const u8) void {
+    pub fn instant(self: StageSink, stage: Stage, subject: []const u8) void {
         self.emit(.{ .instant = .{ .stage = stage, .subject = subject } });
     }
 
-    pub fn metrics(self: Sink, m: Metrics) void {
+    pub fn metrics(self: StageSink, m: Metrics) void {
         self.emit(.{ .metrics = m });
     }
 
-    pub fn count(self: Sink, completed: usize, total: usize) void {
+    pub fn count(self: StageSink, completed: usize, total: usize) void {
         self.emit(.{ .count = .{ .completed = completed, .total = total } });
     }
 
-    pub fn sessionBegin(self: Sink, label: []const u8) void {
+    pub fn sessionBegin(self: StageSink, label: []const u8) void {
         self.emit(.{ .session_begin = label });
     }
 
-    pub fn sessionEnd(self: Sink) void {
+    pub fn sessionEnd(self: StageSink) void {
         self.emit(.{ .session_end = {} });
     }
+};
+
+/// The thread-safe half of the progress protocol: independent concurrent
+/// spans (fetches, store writes, source copies — see `Span`). This is the
+/// ONLY progress channel available off the demand fiber; every VM holds one
+/// (`VM.progress_spans`). A span may be opened on one thread/fiber and closed
+/// on another.
+pub const SpanSink = struct {
+    context: *anyopaque,
+    begin_span_fn: *const fn (*anyopaque, SpanGroup, []const u8) Span,
+    end_span_fn: *const fn (*anyopaque, Span) void,
+    /// Set byte progress (`downloaded`/`total`, `total` 0 = unknown) on an open
+    /// span — e.g. a fetch reporting download bytes. Thread-safe; called from
+    /// the off-demand fetch thread.
+    update_span_fn: *const fn (*anyopaque, Span, u64, u64) void,
+
+    /// Open a concurrent span nested under `group`'s counting node. Thread-safe:
+    /// the returned handle can be closed with `endSpan` from any thread.
+    pub fn beginSpan(self: SpanSink, group: SpanGroup, subject: []const u8) Span {
+        return self.begin_span_fn(self.context, group, subject);
+    }
+
+    /// Close a span opened by `beginSpan`. Idempotent-safe only once per span.
+    pub fn endSpan(self: SpanSink, span: Span) void {
+        self.end_span_fn(self.context, span);
+    }
+
+    /// Report byte progress on an open span (`total` 0 = size not yet known).
+    /// Safe to call from any thread.
+    pub fn updateSpan(self: SpanSink, span: Span, downloaded: u64, total: u64) void {
+        self.update_span_fn(self.context, span, downloaded, total);
+    }
+};
+
+/// Both halves of the progress protocol, as one CLI implementation installs
+/// them on the Evaluator (`setProgressSink`). The evaluator splits it from
+/// there: every VM gets `spans`; only the demand VM ever sees `stage`.
+pub const Sink = struct {
+    stage: StageSink,
+    spans: SpanSink,
 };
 
 pub fn stageName(stage: Stage) []const u8 {
