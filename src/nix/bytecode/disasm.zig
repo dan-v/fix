@@ -800,6 +800,15 @@ fn chunkIdWide(op: OpCode) bool {
     };
 }
 
+/// The builtin's Nix-visible name for a raw builtin id, if the id is valid.
+fn builtinName(id: u64) ?[]const u8 {
+    const BuiltinId = @import("runtime").builtins.BuiltinId;
+    inline for (@typeInfo(BuiltinId).@"enum".fields) |f| {
+        if (f.value == id) return f.name;
+    }
+    return null;
+}
+
 /// Escape `text` (middle-truncated at `max`) into `buf`, returning the slice.
 fn escSnippet(buf: []u8, text: []const u8, max: usize) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -834,7 +843,14 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
         .attrs => l.storeRef("attrs", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .closure => l.storeRef("closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .thunk => l.storeRef("thunk", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
-        .builtin => l.storeRef("builtin", heapColor(value.asBuiltinId()), "0x{x}", .{value.asBuiltinId()}),
+        .builtin => {
+            const bid = value.asBuiltinId();
+            l.storeRef("builtin", heapColor(bid), "0x{x}", .{bid});
+            if (builtinName(bid)) |nm| {
+                l.glue(" → ", .{});
+                l.tint(heapColor(bid), "{s}", .{nm});
+            }
+        },
         .builtin_closure => l.storeRef("builtin_closure", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .string_context => l.storeRef("string_ctx", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
         .boxed_int => l.storeRef("boxed_int", heapColor(value.asObjectId()), "0x{x}", .{value.asObjectId()}),
@@ -1897,7 +1913,20 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max:
         .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .closure => try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), use_color),
-        .builtin => try writeStoreRefText(writer, "builtin", value.asBuiltinId(), heapColor(value.asBuiltinId()), use_color),
+        .builtin => {
+            const bid = value.asBuiltinId();
+            try writeStoreRefText(writer, "builtin", bid, heapColor(bid), use_color);
+            if (builtinName(bid)) |nm| {
+                try setCommentFg(writer, use_color);
+                try writer.writeAll(" → ");
+                if (use_color) {
+                    const c = heapColor(bid);
+                    try writer.print("\x1b[38;2;{d};{d};{d}m", .{ c[0], c[1], c[2] });
+                }
+                try writer.writeAll(nm);
+                if (use_color) try writer.writeAll("\x1b[0m");
+            }
+        },
         .builtin_closure => try writeStoreRefText(writer, "builtin_closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .string_context => try writeStoreRefText(writer, "string_ctx", value.asObjectId(), heapColor(value.asObjectId()), use_color),
         .boxed_int => try writeStoreRefText(writer, "boxed_int", value.asObjectId(), heapColor(value.asObjectId()), use_color),
