@@ -1210,7 +1210,10 @@ pub const Evaluator = struct {
             .values = self.heap.values.count(),
             .attrs = self.heap.attrs.count(),
             .reserved_bytes = self.heap.totalReservedBytes(),
-            .rss_bytes = gc.currentRssBytes(),
+            // Footprint, not raw RSS: hugetlb-backed heap bytes are invisible
+            // to statm (see base/hugetlb.zig) and would make the live memory
+            // counter read near-zero on a --hugetlb run.
+            .rss_bytes = gc.currentFootprintBytes(),
             .pending = self.scheduler.pending_tasks.v.load(.monotonic),
             .forced = st.pops,
             .steals = st.steals,

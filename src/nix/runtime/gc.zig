@@ -610,6 +610,25 @@ pub fn peakRssBytes() u64 {
     return @as(u64, @intCast(ru.maxrss)) * 1024; // ru_maxrss is KiB on Linux
 }
 
+// Hugetlb-backed bytes are invisible to every kernel RSS figure (ru_maxrss,
+// VmRSS/VmHWM, statm) — with `--hugetlb` most of the heap moves off-RSS, so
+// any consumer that means "how much memory is this process using" must use
+// the footprint variants below, which fold in the hugetlb byte tracking
+// from base/hugetlb.zig. (The GC budget itself is immune: it gates on
+// `ObjectHeap.totalReservedBytes()`, internal slot counting.)
+
+/// `currentRssBytes` + currently mapped hugetlb bytes.
+pub fn currentFootprintBytes() u64 {
+    return currentRssBytes() + containers.hugetlb.mappedBytes();
+}
+
+/// `peakRssBytes` + the hugetlb high-water. The two peaks need not have
+/// coincided in time, so this can overshoot slightly — acceptable for the
+/// reporting consumers (a truthful lower bound is impossible post-hoc).
+pub fn peakFootprintBytes() u64 {
+    return peakRssBytes() + containers.hugetlb.peakMappedBytes();
+}
+
 /// Current resident set size in bytes, read from /proc/self/statm (field 2
 /// = resident pages). Returns 0 if unavailable.
 pub fn currentRssBytes() u64 {
@@ -654,6 +673,10 @@ pub fn report() void {
     std.debug.print("barrier wait (total, w>1 spin): {d:.1} ms\n", .{@as(f64, @floatFromInt(barrier_ns_total)) / 1e6});
     std.debug.print("peak RSS (kernel high-water): {d:.1} MB\n", .{mb(peakRssBytes())});
     std.debug.print("current RSS (end of eval): {d:.1} MB\n", .{mb(currentRssBytes())});
+    if (containers.hugetlb.peakMappedBytes() > 0)
+        std.debug.print("hugetlb mapped (now / peak): {d:.1} / {d:.1} MB (excluded from RSS lines above)\n", .{
+            mb(containers.hugetlb.mappedBytes()), mb(containers.hugetlb.peakMappedBytes()),
+        });
     const b = last_breakdown;
     std.debug.print("last-collect per-store (live / reserved):\n", .{});
     std.debug.print("  objects: {d} / {d} ({d:.0}% live)\n", .{ b.obj_live, b.obj_reserved, pct(b.obj_live, b.obj_reserved) });

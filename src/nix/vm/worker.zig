@@ -651,8 +651,14 @@ pub const Worker = struct {
         timeline.counter("heap_slots", std.fmt.bufPrint(&buf, "\"objects\":{d},\"values\":{d},\"attrs\":{d}", .{ heap.objects.count(), heap.values.count(), heap.attrs.count() }) catch return);
         // RSS (peak so far) + total bytes reserved across the object stores — the
         // memory-growth curve, correlatable with the speculation backlog below.
-        var rbuf: [96]u8 = undefined;
-        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d},\"reserved\":{d}", .{ gc.peakRssBytes() >> 20, heap.totalReservedBytes() >> 20 }) catch return);
+        // Hugetlb-backed bytes are invisible to RSS (base/hugetlb.zig), so they
+        // get their own series; rss + hugetlb ≈ the true footprint curve.
+        var rbuf: [128]u8 = undefined;
+        timeline.counter("rss_mb", std.fmt.bufPrint(&rbuf, "\"rss\":{d},\"reserved\":{d},\"hugetlb\":{d}", .{
+            gc.peakRssBytes() >> 20,
+            heap.totalReservedBytes() >> 20,
+            @import("base").hugetlb.mappedBytes() >> 20,
+        }) catch return);
         // Scheduler: live task backlog (the speculation flood as it happens) +
         // cumulative speculation submitted/rejected and steals. Together with
         // rss_mb this is the spec-flood-vs-RSS "money chart".
