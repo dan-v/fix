@@ -128,9 +128,11 @@ pub const Compiler = struct {
     /// `name_hint` is set by let/attr-set compilation just before a bound value
     /// is compiled; the first child compiler spun up for that value consumes it
     /// into its own `chunk_name`, which is recorded against the chunk id at
-    /// registration. Both are null (and cost nothing) when naming is off.
+    /// registration. `name_prefix` is the `$`-joined path of enclosing named
+    /// chunks, so nested bindings read `a$b$c`. All null (and free) when off.
     name_hint: ?InternId = null,
     chunk_name: ?InternId = null,
+    name_prefix: ?[]const u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -188,13 +190,27 @@ pub const Compiler = struct {
         child.source_path = self.source_path;
         child.source_file_id = self.source_file_id;
         // Best-effort naming: the first child spun up for a named bound value
-        // claims the pending name (nested bodies then see none). Costs a single
-        // branch — `name_hint` is null unless naming is on.
-        if (self.name_hint) |name| {
-            child.chunk_name = name;
+        // claims the pending name — qualified by this compiler's prefix into a
+        // full `a$b$c` path — and becomes the prefix for its own nested bodies.
+        // Unnamed children inherit the prefix unchanged. One branch when off.
+        child.name_prefix = self.name_prefix;
+        if (self.name_hint) |seg| {
+            const full = self.combinedName(seg) catch seg;
+            child.chunk_name = full;
+            child.name_prefix = self.intern.get(full);
             self.name_hint = null;
         }
         return child;
+    }
+
+    /// Qualify a segment name with this compiler's `name_prefix` into an interned
+    /// `prefix$segment`. Returns the bare segment when there is no prefix (or the
+    /// combined name would be pathologically long).
+    pub fn combinedName(self: *Compiler, segment: InternId) !InternId {
+        const prefix = self.name_prefix orelse return segment;
+        var buf: [1024]u8 = undefined;
+        const full = std.fmt.bufPrint(&buf, "{s}${s}", .{ prefix, self.intern.get(segment) }) catch return segment;
+        return self.intern.intern(full);
     }
 
     /// Register `ch` and, when this compiler is building a named value chunk
@@ -203,6 +219,7 @@ pub const Compiler = struct {
     pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
         const id = try self.registry.register(ch);
         if (self.chunk_name) |name| try self.registry.recordName(id, name);
+        if (self.source_file_id) |file| try self.registry.recordFile(id, file);
         return id;
     }
 

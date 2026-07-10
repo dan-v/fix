@@ -99,7 +99,7 @@ fn writeChunkAt(
     // mid-chunk. Instruction lines then carry just the `line:col+len` position.
     var last_file: ?InternId = null;
     if (options.show_source) {
-        if (chunkPrimaryFile(chunk)) |f| {
+        if (chunkPrimaryFile(chunk, chunk_id, symbols)) |f| {
             try writeFileLine(writer, f, symbols, options.use_color);
             last_file = f;
         }
@@ -815,10 +815,16 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
 
 /// The chunk's file, from the first source-map entry that carries one. Used to
 /// print a filename header before the chunk's bytes.
-fn chunkPrimaryFile(chunk: *const Chunk) ?InternId {
+fn chunkPrimaryFile(chunk: *const Chunk, chunk_id: ?ChunkId, symbols: Symbols) ?InternId {
     for (chunk.source_map) |entry| {
         if (entry.span.file) |f| return f;
     }
+    // Wrapper thunks (attrset bodies) have no per-op source map but do carry a
+    // representative body span — use its file so they still get a header.
+    if (chunk.body_span) |bs| if (bs.file) |f| return f;
+    // Last resort: the file the chunk was compiled from (registry sidecar),
+    // which covers chunks that carry no source span at all.
+    if (chunk_id) |id| if (symbols.registry) |reg| if (reg.fileOf(id)) |f| return f;
     return null;
 }
 

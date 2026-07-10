@@ -557,6 +557,9 @@ pub const ChunkRegistry = struct {
     /// only enabled for the single-threaded disasm compile.
     capture_names: bool = false,
     names: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
+    /// Companion to `names`: the source file each chunk was compiled from
+    /// (interned path id), so even chunks with no per-op source map get a file.
+    files: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -638,6 +641,7 @@ pub const ChunkRegistry = struct {
         }
         self.chunks.deinit(self.allocator);
         self.names.deinit(self.allocator);
+        self.files.deinit(self.allocator);
     }
 
     /// Record a best-effort name for a chunk. No-op unless `capture_names` is
@@ -647,9 +651,21 @@ pub const ChunkRegistry = struct {
         try self.names.put(self.allocator, id, name);
     }
 
+    /// Record the source file a chunk was compiled from. No-op unless
+    /// `capture_names` is on.
+    pub fn recordFile(self: *ChunkRegistry, id: ChunkId, file: types.InternId) !void {
+        if (!self.capture_names) return;
+        try self.files.put(self.allocator, id, file);
+    }
+
     /// The best-effort name attributed to `id`, if any.
     pub fn nameOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
         return self.names.get(id);
+    }
+
+    /// The source file recorded for `id`, if any.
+    pub fn fileOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
+        return self.files.get(id);
     }
 
     /// Optional import-prefetch discovery sink (`FIX_IMPORT_PREFETCH`): when

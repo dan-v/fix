@@ -455,7 +455,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
         .base_path = snapshot.base_path,
         .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
-        .name = if (self.registry.capture_names) name else null,
+        .name = if (self.registry.capture_names) (self.combinedName(name) catch name) else null,
     });
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;
