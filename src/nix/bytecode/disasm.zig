@@ -51,8 +51,6 @@ pub const Options = struct {
 /// byte, operand bytes, mnemonic, and interpretation all align), and longer
 /// records wrap onto continuation rows.
 const bytes_per_line = 4;
-/// Left-justified width of the mnemonic column.
-const mnemonic_width = 28;
 
 const Visited = std.AutoHashMapUnmanaged(ChunkId, void);
 
@@ -165,11 +163,26 @@ fn writeChunkAt(
             try writeOperandFields(writer, chunk, op, start + 1, ip, operand_text, symbols, cc, options.show_bytes, options.use_color);
             try writer.writeByte('\n');
         } else {
-            // Zero or one simple operand: keep it all on the mnemonic row.
-            const head_len = @min(insn.len, bytes_per_line);
-            if (options.show_bytes) try writeByteField(writer, insn[0..head_len], options.use_color);
+            // Zero or one simple operand: keep it all on the mnemonic row. The
+            // opcode byte + mnemonic share one color; the operand bytes and its
+            // interpretation share another (linked), like the multi-row style.
+            const opcol = hueColor(@intFromEnum(op) + 1);
+            if (options.show_bytes) {
+                var c: usize = 0;
+                while (c < bytes_per_line) : (c += 1) {
+                    if (c >= insn.len) {
+                        try writer.writeAll("   ");
+                    } else {
+                        try writeByteCellColored(writer, insn[c], if (c == 0) byteRgb(op_byte) else opcol, options.use_color);
+                    }
+                }
+            }
             try writeMnemonic(writer, op, options.use_color);
-            try writer.writeAll(operand_text);
+            if (operand_text.len > 0) {
+                if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ opcol[0], opcol[1], opcol[2] });
+                try writer.writeAll(operand_text);
+                if (options.use_color) try writer.writeAll("\x1b[0m");
+            }
             if (span) |s| try writePosColumn(writer, s, options.use_color);
             try writer.writeByte('\n');
             // Wrap any remaining instruction bytes onto continuation rows.
@@ -178,7 +191,8 @@ fn writeChunkAt(
                 while (o < insn.len) : (o += bytes_per_line) {
                     try writeGuide(writer, cc, options.use_color);
                     try writer.writeAll("        ");
-                    try writeByteField(writer, insn[o..@min(o + bytes_per_line, insn.len)], options.use_color);
+                    var c: usize = o;
+                    while (c < o + bytes_per_line and c < insn.len) : (c += 1) try writeByteCellColored(writer, insn[c], opcol, options.use_color);
                     try writer.writeByte('\n');
                 }
             }
@@ -266,9 +280,9 @@ fn writeOffset(writer: *std.Io.Writer, off: usize, use_color: bool) !void {
     if (use_color) try writer.writeAll("\x1b[0m");
 }
 
-/// Write the mnemonic, padded to `mnemonic_width`. When colored, it takes the
+/// Write the mnemonic followed by a single space. When colored, it takes the
 /// same per-value color as its opcode byte, so the mnemonic and its leading hex
-/// cell visually match (and equal opcodes share a color down the column).
+/// cell visually match.
 fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
     const name = @tagName(op);
     if (use_color) {
@@ -277,9 +291,7 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
     } else {
         try writer.writeAll(name);
     }
-    // Pad to the column, but always leave at least one space so an
-    // over-wide mnemonic doesn't abut its operands.
-    if (name.len < mnemonic_width) try writer.splatByteAll(' ', mnemonic_width - name.len) else try writer.writeByte(' ');
+    try writer.writeByte(' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +378,7 @@ const Line = struct {
 /// is what nests capture/position lists under their count line.
 fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     if (use_color) {
-        try writer.print("\x1b[48;2;{d};{d};{d}m \x1b[0m ", .{ rgb[0], rgb[1], rgb[2] });
+        try writer.print("\x1b[38;2;{d};{d};{d}m│\x1b[0m ", .{ rgb[0], rgb[1], rgb[2] });
     } else {
         try writer.writeAll("│ ");
     }
