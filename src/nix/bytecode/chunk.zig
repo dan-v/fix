@@ -62,10 +62,11 @@ pub const Chunk = struct {
     scheduling: SchedulingHints = .{},
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
-    /// Attr-position records referenced by `attrs_new_pos*` ops. Kept OUT of
-    /// the dispatched code stream (they were 16 bytes/entry inline — ~38% of
-    /// all emitted bytecode on a NixOS eval, cold data read only by
-    /// `unsafeGetAttrPos`/diagnostics). Ops carry a (start, count) reference.
+    /// Attr-position records referenced by `attrs_new_named_pos_srt` ops.
+    /// Kept OUT of the dispatched code stream (they were 16 bytes/entry
+    /// inline — ~38% of all emitted bytecode on a NixOS eval, cold data read
+    /// only by `unsafeGetAttrPos`/diagnostics). Ops carry a (start, count)
+    /// reference.
     attr_pos: []const AttrPosEntry = &.{},
     /// Attr names referenced by `attrs_new_named*` ops (interned ids, sorted
     /// per site) — like `attr_pos`, kept out of the code stream; each op
@@ -207,8 +208,8 @@ pub const ChunkBuilder = struct {
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
-    /// Attr-position records collected by emitBuildAttrs — carried onto
-    /// `Chunk.attr_pos` at finish (see that field's doc).
+    /// Attr-position records collected by `emitBuildAttrsSorted` — carried
+    /// onto `Chunk.attr_pos` at finish (see that field's doc).
     attr_pos: std.ArrayListUnmanaged(AttrPosEntry) = .empty,
     /// Attr names for `attrs_new_named*` — carried onto `Chunk.attr_names`.
     attr_names: std.ArrayListUnmanaged(types.InternId) = .empty,
@@ -336,6 +337,21 @@ pub const ChunkBuilder = struct {
         });
     }
 
+    /// Side-table compensation for `body_is_substantial`: attr positions and
+    /// attr names used to live inline in the code stream (16 bytes per
+    /// position record; 3 bytes per name — a `push_const` op + u16 index).
+    /// Extracting them to side tables shrank `code.len`, but the speculation
+    /// threshold (`SPECULATION_MIN_CODE_BYTES`) is tuned against the OLD
+    /// effective sizes and sits on a sharp cliff — measured 2026-07: dropping
+    /// effective chunk size by even 64 bytes cost +52% w=8 wall. These
+    /// constants mirror the removed inline encodings so a chunk's perceived
+    /// weight reflects the work it does, not the encoding; ANY future
+    /// extraction of code bytes into a side table MUST add its own
+    /// compensation here (same rule as `fusion_savings`).
+    fn sideTableWeight(self: *const ChunkBuilder) usize {
+        return self.attr_pos.items.len * 16 + self.attr_names.items.len * 3;
+    }
+
     /// Finalize into an immutable Chunk.
     pub fn finish(self: *ChunkBuilder, allocator: std.mem.Allocator, local_count: u16) !Chunk {
         const code = try allocator.dupe(u8, self.code.items);
@@ -356,7 +372,7 @@ pub const ChunkBuilder = struct {
             .arity = self.arity,
             .strict_params = self.strict_params,
             .scheduling = .{
-                .body_is_substantial = self.code.items.len + self.fusion_savings + self.attr_pos.items.len * 16 + self.attr_names.items.len * 3 >= SPECULATION_MIN_CODE_BYTES,
+                .body_is_substantial = self.code.items.len + self.fusion_savings + self.sideTableWeight() >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,
@@ -787,9 +803,20 @@ pub const ChunkRegistry = struct {
     };
     pub var path_const_sink: ?PathConstSink = null;
 
-    /// Register `chunk`, reusing an existing byte-identical registration when
-    /// possible (see `dedup`). Returns the id and whether it was reused — a
-    /// reused id means the caller must deinit its own copy of `chunk`.
+    // Every field of `Chunk` must either be covered by `contentHash` AND
+    // `contentEql` or be derived from covered fields (`scheduling` is the
+    // one derived field today): a semantic field missing from both silently
+    // merges chunks that differ in it. If you add a field, teach BOTH
+    // functions about it, then bump this count. Diagnostic-only metadata
+    // (names, files, upvalue names, ...) belongs in the registry sidecar
+    // maps instead — those are keyed by id after registration and never
+    // perturb dedup.
+    comptime {
+        const chunk_field_count = 11;
+        if (std.meta.fields(Chunk).len != chunk_field_count)
+            @compileError("Chunk changed shape: update contentHash + contentEql (or route diagnostic-only metadata through the registry sidecar), then adjust chunk_field_count.");
+    }
+
     /// Deterministic content hash over everything that makes a chunk what it
     /// is. Optionals/structs are fed field-by-field (never as raw bytes) so
     /// undefined padding can't perturb the hash.
@@ -852,6 +879,10 @@ pub const ChunkRegistry = struct {
         return true;
     }
 
+    /// Register `chunk`, reusing an existing structurally identical
+    /// registration when possible (see `dedup_shards`). Returns the id and
+    /// whether it was reused — reused=true means the caller still owns (and
+    /// must deinit) its own copy of `chunk`.
     pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk) !struct { id: ChunkId, reused: bool } {
         const h = contentHash(&chunk);
         const shard = &self.dedup_shards[@as(usize, @intCast(h >> 58))];

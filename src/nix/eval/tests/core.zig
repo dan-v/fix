@@ -508,8 +508,8 @@ test "unsafeGetAttrPos reports file positions for file-attributed sources" {
     try std.testing.expect(std.mem.indexOf(u8, folded, "file = \"/test/pos.nix\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, folded, "line = 1") != null);
 
-    // Non-constant entry: the attrset builds at runtime via attrs_new_pos —
-    // positions must flow through that path too.
+    // Non-constant entry: the attrset builds at runtime via
+    // attrs_new_named_pos_srt — positions must flow through that path too.
     const built = try helpers.renderPathForTest(
         "builtins.unsafeGetAttrPos \"email\" { name = toString 1; email = \"e\"; }",
         "/test/pos.nix",

@@ -59,8 +59,8 @@ pub const OpCode = enum(u8) {
     cmp_ge,
     /// Specialized `eq null` — pop one value, push `true` if it
     /// forces to null. Emitted by `compileBinary` when one side of
-    /// `==` is a literal `null`. Skips the generic `valuesEqual`
-    /// dispatch and gives the JIT a type-monomorphic null-check.
+    /// `==` is a literal `null`. Replaces the generic `valuesEqual`
+    /// dispatch with a type-monomorphic null check.
     cmp_eq_null,
     /// Specialized `neq null` — symmetric with `cmp_eq_null`.
     cmp_ne_null,
