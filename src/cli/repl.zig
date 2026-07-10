@@ -34,6 +34,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     }
 
     const worker_count = try setup.workerCount(options);
+    setup.applyMemoryBacking(options.hugetlb, init);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);

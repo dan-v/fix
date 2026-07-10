@@ -8,6 +8,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
 const eval_gc = @import("fix").eval_gc;
+const hugetlb = @import("base").hugetlb;
 
 pub const OutputFormat = enum {
     nix,
@@ -153,6 +154,10 @@ pub const Options = struct {
     /// `eval/gc.zig:memoryBudget`. `null` = resolve the default at eval
     /// setup; `0` = never collect.
     max_memory: ?u64 = null,
+    /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
+    /// huge pages. `null` = not given; resolution (CLI > `FIX_HUGETLB` env >
+    /// `auto`) happens in `setup.applyMemoryBacking`, BEFORE the heap maps.
+    hugetlb: ?hugetlb.Mode = null,
     /// Speculation (eager background thunk forcing) is ON by default: it is
     /// worth ~20-32% wall at --workers>1 (spec-off→on: 2.62→2.11s with GC,
     /// 2.10→1.43s without), and the RSS it costs is absorbed by the GC without
@@ -248,6 +253,7 @@ const Opt = enum {
     debug_derivation_name,
     debug_derivation_drv,
     max_memory,
+    hugetlb,
     help,
     // Shell.
     packages,
@@ -350,6 +356,7 @@ const specs = [_]Spec{
     .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = source_cmds },
     .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = source_cmds },
     .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only." },
+    .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)" },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
@@ -528,6 +535,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debug_derivation_name => options.derivation_debug.name = v0.?,
         .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
         .max_memory => options.max_memory = eval_gc.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
+        .hugetlb => options.hugetlb = hugetlb.parseMode(v0.?) orelse return error.InvalidHugetlbMode,
         .help => return error.Help,
 
         .packages => unreachable, // handled in the parse loop
@@ -658,6 +666,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.UnknownExperimentalFeature => "unknown experimental feature (available: pipe-operators, fetch-tree, flakes)",
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
+        error.InvalidHugetlbMode => "expected --hugetlb to be auto, on, or off",
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
         error.UnknownOption => "unknown option",
         else => @errorName(err),

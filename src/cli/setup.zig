@@ -10,6 +10,7 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
 const rstore = @import("runtime").store;
+const hugetlb = @import("base").hugetlb;
 
 const Evaluator = fix.Evaluator;
 
@@ -26,6 +27,24 @@ pub const Terminal = struct {
     use_color: bool,
     show_progress: bool,
 };
+
+/// Resolve process-level memory-backing policy that must be decided BEFORE
+/// `Evaluator.init` maps the heap (the flat object store picks its mapping
+/// at init): hugetlb mode, precedence `--hugetlb` (`cli_mode`, null for
+/// subcommands without the shared parser) > `FIX_HUGETLB` env > `auto`.
+/// Deliberately NOT a nix.conf setting: config loads in `configure`, after
+/// the heap already exists, so a config-sourced value could only half-apply.
+/// Call before `Evaluator.init` in every eval-producing subcommand.
+pub fn applyMemoryBacking(cli_mode: ?hugetlb.Mode, init: std.process.Init) void {
+    const mode = cli_mode orelse blk: {
+        if (init.environ_map.get("FIX_HUGETLB")) |v| {
+            if (hugetlb.parseMode(v)) |m| break :blk m;
+            std.debug.print("fix: warning: ignoring invalid FIX_HUGETLB value '{s}' (expected auto, on, or off)\n", .{v});
+        }
+        break :blk .auto;
+    };
+    hugetlb.setMode(mode);
+}
 
 /// Apply the shared `Options → Evaluator` configuration (feature toggles,
 /// parallelism, environment, base path, NIX_PATH) and resolve the terminal

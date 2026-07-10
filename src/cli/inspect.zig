@@ -58,6 +58,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     else
         options.workers orelse @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 
+    // No `--hugetlb` in this command's parser; env (`FIX_HUGETLB`) > auto.
+    @import("setup.zig").applyMemoryBacking(null, init);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     ev.setEnvironment(init.environ_map);
