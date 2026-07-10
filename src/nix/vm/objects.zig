@@ -31,7 +31,7 @@ pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mo
     try stack.push(self, Value.attrs(id));
 }
 
-/// `build_attrs_sorted(_with_pos)`: pairs are compile-time sorted by
+/// `attrs_new_srt(_with_pos)`: pairs are compile-time sorted by
 /// interned name and duplicate-free — skip the construction sort.
 pub fn buildAttrsSorted(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
     const value_count: u32 = @as(u32, count) * 2;

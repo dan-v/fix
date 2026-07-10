@@ -7,7 +7,7 @@
 pub const OpCode = enum(u8) {
     // ---- stack ----
     /// Push a constant from the chunk constant pool (operand: 2-byte ConstIdx).
-    constant,
+    push_const,
     /// Push null.
     push_null,
     /// Push true.
@@ -19,166 +19,166 @@ pub const OpCode = enum(u8) {
     pop,
     // ---- locals ----
     /// Push local variable at offset (operand: 1-byte offset from frame base).
-    get_local,
+    loc_get,
     /// Push local variable at offset (operand: 2-byte offset from frame base).
-    get_local_long,
+    loc_get_w,
     /// Push local variable without forcing lazy cells (operand: 1-byte offset).
-    capture_local,
+    loc_grab,
     /// Push local variable without forcing lazy cells (operand: 2-byte offset).
-    capture_local_long,
+    loc_grab_w,
     /// Push captured upvalue without forcing lazy cells (operand: 2-byte index).
-    capture_upvalue,
+    up_grab,
     /// Set local variable at offset, popping from stack.
-    set_local,
+    loc_set,
     /// Set local variable at offset, popping from stack (operand: 2-byte offset).
-    set_local_long,
+    loc_set_w,
     /// Set the value inside a local cell, popping from stack.
-    set_cell_local,
+    cell_set,
     /// Set the value inside a local cell (operand: 2-byte offset).
-    set_cell_local_long,
+    cell_set_w,
     /// Push captured upvalue at offset (operand: 2-byte closure upvalue index).
-    get_upvalue,
+    up_get,
 
     // ---- arithmetic ----
-    add_int,
-    sub_int,
-    mul_int,
-    div_int,
-    negate_int,
-    add_float,
-    sub_float,
-    mul_float,
-    div_float,
+    int_add,
+    int_sub,
+    int_mul,
+    int_div,
+    int_neg,
+    flt_add,
+    flt_sub,
+    flt_mul,
+    flt_div,
 
     // ---- comparison ----
-    eq,
-    neq,
-    lt,
-    lte,
-    gt,
-    gte,
+    cmp_eq,
+    cmp_ne,
+    cmp_lt,
+    cmp_le,
+    cmp_gt,
+    cmp_ge,
     /// Specialized `eq null` — pop one value, push `true` if it
     /// forces to null. Emitted by `compileBinary` when one side of
     /// `==` is a literal `null`. Skips the generic `valuesEqual`
     /// dispatch and gives the JIT a type-monomorphic null-check.
-    eq_null,
-    /// Specialized `neq null` — symmetric with `eq_null`.
-    neq_null,
+    cmp_eq_null,
+    /// Specialized `neq null` — symmetric with `cmp_eq_null`.
+    cmp_ne_null,
 
     // ---- logical ----
-    not,
+    bool_not,
 
     // ---- control flow ----
     /// Relative jump forward (operand: 4-byte unsigned offset).
     jump,
     /// Jump forward if top of stack is false (operand: 4-byte unsigned offset).
-    jump_if_false,
+    jump_false,
     /// Raise an assertion failure.
-    fail_assertion,
+    fail,
 
     // ---- data ----
     /// Build an attribute set from pairs on the stack.
     /// Operand: 2-byte count of entries.
     /// Stack layout from lower to higher indexes: [name1, val1, ..., nameN, valN].
-    build_attrs,
+    attrs_new,
     /// Build an attribute set from pairs on the stack and attach source positions.
     /// Operand: 2-byte count, 2-byte source-position count, then repeated
     /// 4-byte name InternId, 4-byte file InternId, 4-byte line, 4-byte column.
-    build_attrs_with_pos,
-    /// `build_attrs`, but the compiler guarantees the pairs are already on
+    attrs_new_pos,
+    /// `attrs_new`, but the compiler guarantees the pairs are already on
     /// the stack in ascending interned-name order with no duplicates —
     /// static attrset literals are grouped (duplicates rejected at compile
     /// time) and emitted name-sorted, so the runtime skips the
     /// per-construction sort + duplicate scan. Operand: 2-byte count.
-    build_attrs_sorted,
-    /// `build_attrs_with_pos` with the same compile-time sorted+unique
-    /// guarantee as `build_attrs_sorted`. Operands as `build_attrs_with_pos`.
-    build_attrs_with_pos_sorted,
+    attrs_new_srt,
+    /// `attrs_new_pos` with the same compile-time sorted+unique
+    /// guarantee as `attrs_new_srt`. Operands as `attrs_new_pos`.
+    attrs_new_pos_srt,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
-    build_list,
+    list_new,
     /// Merge two attrsets as parts of one attrset literal, recursively rejecting
     /// duplicate leaf attributes.
-    merge_attrs_strict,
+    attrs_merge_strict,
     /// Merge two attrsets, with right-hand keys overriding left-hand keys.
-    merge_attrs,
+    attrs_merge,
     /// Concatenate two lists.
-    concat_lists,
+    list_cat,
     /// Concatenate N string-like values in a single pass. Stack before:
     /// [part1, ..., partN] (part1 lowest); after: [result]. Each part is
     /// coerced exactly like the binary `+` string path (string / path /
     /// attrs-with-__toString), contexts are merged in part order, and the
     /// text is assembled into one exact-size buffer and interned ONCE.
     /// Emitted for `${...}` interpolation literals: the equivalent
-    /// `add_int` fold interns (hashes + copies + permanently retains)
+    /// `int_add` fold interns (hashes + copies + permanently retains)
     /// every intermediate prefix of a k-part string. With N == 1 the op
     /// is a bare string coercion — no re-intern of the coerced text.
     /// Operand: 2-byte count (N >= 1).
-    concat_strings,
+    str_cat,
     /// Push the evaluator-owned builtins attrset.
     push_builtins,
     /// Resolve an evaluator search-path literal.
     /// Operand: 2-byte InternId of the search path text without angle brackets.
-    find_file,
+    file_find,
     /// Resolve an evaluator search-path literal with a wide intern id.
     /// Operand: 4-byte InternId.
-    find_file_long,
+    file_find_w,
 
     // ---- closures and thunks ----
     /// Create a closure value from a chunk and captured upvalues.
     /// Operand: 2-byte ChunkId, 2-byte upvalue count.
     /// Upvalues are the top N values on the stack, popped.
-    closure,
+    clos,
     /// Create a closure whose chunk id does not fit in the short form.
     /// Operand: 4-byte ChunkId, 2-byte upvalue count.
-    closure_long,
+    clos_w,
     /// Create a closure and fill upvalues from inline capture descriptors.
     /// Operand: 2-byte ChunkId, 2-byte count, then repeated
     /// 1-byte kind (0=local, 1=upvalue), 2-byte index.
-    closure_captures,
-    /// Wide-chunk-id form of closure_captures.
+    clos_cap,
+    /// Wide-chunk-id form of clos_cap.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    closure_captures_long,
+    clos_cap_w,
     /// Function-argument with a runtime-adaptive laziness decision. The
     /// callee is already on the stack (just below where the argument
     /// goes). If it is a closure whose chunk's body must-forces its
     /// parameter (`scheduling.strict_param`), the argument expression is
     /// evaluated eagerly to a value — no thunk; otherwise it is
-    /// materialised as a thunk exactly like `thunk_captures`. Lets us
+    /// materialised as a thunk exactly like `thk`. Lets us
     /// skip the thunk for dynamically-dispatched strict calls, which the
     /// compiler can't resolve statically.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    apply_arg,
+    thk_arg,
     /// Create a thunk directly from a chunk and inline capture descriptors.
     /// Operand: 2-byte ChunkId, 2-byte count, then repeated descriptors.
-    thunk_captures,
-    /// Wide-chunk-id form of thunk_captures.
+    thk,
+    /// Wide-chunk-id form of thk.
     /// Operand: 4-byte ChunkId, 2-byte count, then repeated descriptors.
-    thunk_captures_long,
-    /// Same as `thunk_captures` but submits the thunk to the urgent
+    thk_w,
+    /// Same as `thk` but submits the thunk to the urgent
     /// scheduler queue at creation time. Emitted by the compiler when
     /// strictness analysis says the surrounding chunk's body will
     /// unconditionally force this binding — turns the chunk-size
     /// speculation heuristic into a deterministic decision and
     /// bypasses the speculation backlog cap.
-    thunk_captures_eager,
-    /// Wide-chunk-id form of thunk_captures_eager.
-    thunk_captures_eager_long,
+    thk_eag,
+    /// Wide-chunk-id form of thk_eag.
+    thk_eag_w,
 
-    /// Fused `thunk_captures + set_cell_local`. Creates the thunk
+    /// Fused `thk + cell_set`. Creates the thunk
     /// from the chunk-id + descriptors, then `publishCellBinding`s it
     /// into the cell-thunk at frame_base + slot (skipping the
     /// push/pop of the new thunk reference). Operand layout:
     ///   chunk_id:2 + K:2 + 3K descriptors + slot:1
-    /// The slot byte is at the END so we can rewrite `thunk_captures`
+    /// The slot byte is at the END so we can rewrite `thk`
     /// in place at emit time without shifting the descriptor bytes.
-    thunk_captures_store_cell_local,
-    /// Fused `thunk_captures + set_local`.
-    thunk_captures_store_local,
-    /// Fused `thunk_captures_eager + set_cell_local`.
-    thunk_captures_eager_store_cell_local,
-    /// Fused `thunk_captures_eager + set_local`.
-    thunk_captures_eager_store_local,
+    thk_st_cell,
+    /// Fused `thk + loc_set`.
+    thk_st,
+    /// Fused `thk_eag + cell_set`.
+    thk_eag_st_cell,
+    /// Fused `thk_eag + loc_set`.
+    thk_eag_st,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.
@@ -187,7 +187,7 @@ pub const OpCode = enum(u8) {
     call,
     /// Call in tail position. Closure callees reuse the current frame; other
     /// callees behave like `call` and are followed by the normal `ret`.
-    tail_call,
+    call_tail,
     /// Apply a callee to N arguments in one op. Stack before:
     /// [callee, arg1, ..., argN]; after: [result]. Operand: 1-byte N
     /// (N >= 1). Semantically identical to N sequential `call`s, but when
@@ -197,129 +197,129 @@ pub const OpCode = enum(u8) {
     /// fall back to one-arg-at-a-time application. See `vm/closures.zig`.
     call_n,
     /// `call_n` in tail position.
-    tail_call_n,
+    call_tail_n,
 
     // ---- fused value+ret super-ops ----
-    /// Fused `constant + ret`: load constant N onto the stack and
+    /// Fused `push_const + ret`: load constant N onto the stack and
     /// return from the current frame in one dispatch. Operand:
     /// 2-byte constant index. Emitted by `compileTailExpression`
     /// when the tail expression is a literal — saves one of the two
     /// dispatches that dominate the bytecode loop's per-thunk
     /// overhead.
-    constant_ret,
-    /// Fused `get_local + ret` (narrow slot).
-    get_local_ret,
-    /// Fused `get_local + ret` (wide slot — 2-byte operand).
-    get_local_ret_long,
-    /// Fused `get_upvalue + ret` (always 2-byte upvalue index).
-    get_upvalue_ret,
+    push_const_ret,
+    /// Fused `loc_get + ret` (narrow slot).
+    loc_get_ret,
+    /// Fused `loc_get + ret` (wide slot — 2-byte operand).
+    loc_get_ret_w,
+    /// Fused `up_get + ret` (always 2-byte upvalue index).
+    up_get_ret,
 
     // ---- fused compound super-ops ----
-    /// Fused `get_upvalue + get_attr` — read upvalue, force, look up
+    /// Fused `up_get + attr_get` — read upvalue, force, look up
     /// attribute. Operand: 2-byte upvalue index + 2-byte name InternId.
     /// Saves the push/pop of the attrs value plus one dispatch. The
     /// `lib.foo` and `config.bar` patterns are everywhere in NixOS
-    /// modules; profiling shows `get_upvalue` is 10% of all ops and
-    /// `get_attr` is 3%, much of it the same upvalue→attr chain.
-    get_upvalue_attr,
-    /// Fused `get_local + get_attr` (narrow slot — 1-byte). Operand:
+    /// modules; profiling shows `up_get` is 10% of all ops and
+    /// `attr_get` is 3%, much of it the same upvalue→attr chain.
+    up_get_attr,
+    /// Fused `loc_get + attr_get` (narrow slot — 1-byte). Operand:
     /// 1-byte slot + 2-byte name InternId.
-    get_local_attr,
-    /// Fused `get_local_long + get_attr` (wide slot — 2-byte). Operand:
+    loc_get_attr,
+    /// Fused `loc_get_w + attr_get` (wide slot — 2-byte). Operand:
     /// 2-byte slot + 2-byte name InternId.
-    get_local_attr_long,
+    loc_get_attr_w,
 
     // ---- thunks ----
     /// Wrap the top-of-stack value in a mutable lazy cell.
-    make_cell,
+    cell_new,
     /// Wrap the top-of-stack value in a pre-resolved, undemanded
     /// thunk. Used by the compiler when an eagerly-buildable shape
     /// (list / attrset / lambda) appears in a context that requires
     /// the value to *look* like a lazy thunk to renderers (XML lazy
     /// mode in particular) — we skip emitting a child chunk +
-    /// `thunk_captures` and just wrap the already-built shell. The
+    /// `thk` and just wrap the already-built shell. The
     /// resulting thunk's `force` is O(1) (resolved fast path); the
     /// XML serializer keeps printing `<unevaluated />` until a real
     /// caller marks it demanded.
-    make_lazy_shell,
+    thk_shell,
     /// Allocate an empty (null-wrapped) lazy cell and store it
     /// directly into a local slot. Operand: 1-byte slot index. Fuses
-    /// the `push_null + make_cell + set_local` sequence that the
+    /// the `push_null + cell_new + loc_set` sequence that the
     /// compiler emits once per let-binding / recursive-attrset
     /// binding / lambda parameter — saving two dispatches and the
     /// intermediate stack push/pop per call.
-    init_cell_slot,
-    /// Wide-slot variant of `init_cell_slot`. Operand: 2-byte slot index.
-    init_cell_slot_long,
+    cell_init,
+    /// Wide-slot variant of `cell_init`. Operand: 2-byte slot index.
+    cell_init_w,
 
     // ---- attribute access ----
     /// Select an attribute from attrset on stack top.
     /// Operand: 2-byte InternId of the attribute name.
-    get_attr,
+    attr_get,
     /// Select an attribute from attrset on stack top with a wide intern id.
     /// Operand: 4-byte InternId.
-    get_attr_long,
+    attr_get_w,
     /// Select an attribute by a runtime string name.
     /// Stack layout before: [attrs, name].
-    get_attr_dynamic,
+    attr_get_dyn,
     /// Select a runtime string attribute with a lazy default.
     /// Stack layout before: [attrs, name, default_thunk].
-    get_attr_dynamic_or,
+    attr_get_dyn_or,
     /// Select a static attribute path prefix followed by a runtime string
     /// attribute with a lazy default if any segment is missing.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, name, default_thunk].
-    get_attr_path_dynamic_or,
-    /// Wide-intern-id form of get_attr_path_dynamic_or.
+    attr_get_path_dyn_or,
+    /// Wide-intern-id form of attr_get_path_dyn_or.
     /// Operand: 1-byte segment count, then that many 4-byte InternIds.
-    get_attr_path_dynamic_or_long,
+    attr_get_path_dyn_or_w,
     /// Select an attribute path with a lazy default if any segment is missing.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs, default_thunk].
-    get_attr_path_or,
-    /// Wide-intern-id form of get_attr_path_or.
+    attr_get_path_or,
+    /// Wide-intern-id form of attr_get_path_or.
     /// Operand: 1-byte segment count, then that many 4-byte InternIds.
-    get_attr_path_or_long,
+    attr_get_path_or_w,
     /// Select an attribute path containing static and runtime string segments
     /// with a lazy default if any segment is missing.
     /// Operand: 1-byte segment count, 1-byte dynamic segment count, then for
     /// each segment a 1-byte tag: 0 followed by 4-byte InternId for static,
     /// 1 for the next runtime string from the stack.
     /// Stack layout before: [attrs, dynamic_name..., default_thunk].
-    get_attr_path_mixed_or,
+    attr_get_path_mix_or,
     /// Test whether an attribute path exists without forcing the final value.
     /// Operand: 1-byte segment count, then that many 2-byte InternIds.
     /// Stack layout before: [attrs].
-    has_attr_path,
-    /// Wide-intern-id form of has_attr_path.
+    attr_has_path,
+    /// Wide-intern-id form of attr_has_path.
     /// Operand: 1-byte segment count, then that many 4-byte InternIds.
-    has_attr_path_long,
+    attr_has_path_w,
     /// Test whether an attribute path containing static and runtime string
     /// segments exists without forcing the final value.
-    /// Operand: same segment stream as get_attr_path_mixed_or.
+    /// Operand: same segment stream as attr_get_path_mix_or.
     /// Stack layout before: [attrs, dynamic_name_thunk...].
-    has_attr_path_mixed,
+    attr_has_path_mix,
     /// Validate an attrset function argument.
     /// Operand: 1-byte allow_extra flag, 2-byte expected count, then expected InternIds.
     /// Stack layout before: [attrs].
-    validate_attrs,
-    /// Wide-intern-id form of validate_attrs.
+    attr_check,
+    /// Wide-intern-id form of attr_check.
     /// Operand: 1-byte allow_extra flag, 2-byte expected count, then 4-byte InternIds.
-    validate_attrs_long,
+    attr_check_w,
     /// Look up a variable name through active with-scopes.
     /// Operand: 2-byte InternId, 1-byte scope count.
     /// Stack layout before: [scope1, ..., scopeN], ordered nearest to farthest.
-    lookup_with,
-    /// Wide-intern-id form of lookup_with.
+    with_lookup,
+    /// Wide-intern-id form of with_lookup.
     /// Operand: 4-byte InternId, 1-byte scope count.
-    lookup_with_long,
+    with_lookup_w,
     /// Lazy per-attr compilation: create a `.deferred` thunk for an
     /// attrset value body whose bytecode has NOT been compiled. The body
     /// is compiled on first force (see `compiler/deferred_table.zig` and
     /// `compiler/deferred.zig`).
     /// Operand: 4-byte deferred-table id, 2-byte env count, then `env`
-    /// capture descriptors (kind:1, index:2) — same format as thunk_captures.
-    defer_attr_value,
+    /// capture descriptors (kind:1, index:2) — same format as thk.
+    thk_defer,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,

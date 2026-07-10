@@ -34,14 +34,14 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
     }
 
     // Specialized comparison with literal `null`. Emit only the
-    // non-null side and use `eq_null`/`neq_null` so the runtime
+    // non-null side and use `cmp_eq_null`/`cmp_ne_null` so the runtime
     // (and the eventual JIT) sees a type-monomorphic null check.
     if (bin.op == .eq or bin.op == .neq) {
         const left_null = unwrapParens(bin.left).tag == .null;
         const right_null = unwrapParens(bin.right).tag == .null;
         if (left_null != right_null) {
             try self.compileNode(if (left_null) bin.right else bin.left);
-            try emit.emitOp(self, if (bin.op == .eq) .eq_null else .neq_null);
+            try emit.emitOp(self, if (bin.op == .eq) .cmp_eq_null else .cmp_ne_null);
             return;
         }
     }
@@ -50,20 +50,20 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
     try self.compileNode(bin.right);
 
     switch (bin.op) {
-        .add => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .add_float else .add_int),
-        .sub => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .sub_float else .sub_int),
-        .mul => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .mul_float else .mul_int),
-        .div => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .div_float else .div_int),
-        .eq => try emit.emitOp(self, .eq),
-        .neq => try emit.emitOp(self, .neq),
-        .lt => try emit.emitOp(self, .lt),
-        .lte => try emit.emitOp(self, .lte),
-        .gt => try emit.emitOp(self, .gt),
-        .gte => try emit.emitOp(self, .gte),
+        .add => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .flt_add else .int_add),
+        .sub => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .flt_sub else .int_sub),
+        .mul => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .flt_mul else .int_mul),
+        .div => try emit.emitOp(self, if (nodeMayEvaluateToFloat(bin.left) or nodeMayEvaluateToFloat(bin.right)) .flt_div else .int_div),
+        .eq => try emit.emitOp(self, .cmp_eq),
+        .neq => try emit.emitOp(self, .cmp_ne),
+        .lt => try emit.emitOp(self, .cmp_lt),
+        .lte => try emit.emitOp(self, .cmp_le),
+        .gt => try emit.emitOp(self, .cmp_gt),
+        .gte => try emit.emitOp(self, .cmp_ge),
         .and_, .or_ => unreachable,
-        .update => try emit.emitOp(self, .merge_attrs),
+        .update => try emit.emitOp(self, .attrs_merge),
         .impl => unreachable,
-        .concat => try emit.emitOp(self, .concat_lists),
+        .concat => try emit.emitOp(self, .list_cat),
     }
 }
 
@@ -268,7 +268,7 @@ fn compileAnd(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const end_jump = self.builder.code.items.len;
-    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_false, 0);
     try emit.emitOp(self, .pop);
 
     try self.compileNode(right);
@@ -279,7 +279,7 @@ fn compileOr(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
-    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_false, 0);
 
     const end_jump = self.builder.code.items.len;
     try emit.emitOpU32(self, .jump, 0);
@@ -295,7 +295,7 @@ fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
     try self.compileNode(left);
 
     const false_jump = self.builder.code.items.len;
-    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_false, 0);
     try emit.emitOp(self, .pop);
 
     try self.compileNode(right);
@@ -316,7 +316,7 @@ pub fn compileUnary(self: *Compiler, node: *const Node) !void {
     const un = node.data.unary;
     try self.compileNode(un.expr);
     switch (un.op) {
-        .negate => try emit.emitOp(self, .negate_int),
-        .not => try emit.emitOp(self, .not),
+        .negate => try emit.emitOp(self, .int_neg),
+        .not => try emit.emitOp(self, .bool_not),
     }
 }

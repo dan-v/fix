@@ -44,9 +44,9 @@ pub fn compileIfElseBody(self: *Compiler, node: *const Node, tail_branches: bool
 
     try self.compileNode(ife.cond);
 
-    // Emit placeholder for jump_if_false
+    // Emit placeholder for jump_false
     const jump_pos = self.builder.code.items.len;
-    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_false, 0);
     try emit.emitOp(self, .pop);
 
     if (tail_branches) {
@@ -57,7 +57,7 @@ pub fn compileIfElseBody(self: *Compiler, node: *const Node, tail_branches: bool
     const jump_over_pos = self.builder.code.items.len;
     try emit.emitOpU32(self, .jump, 0);
 
-    // Patch jump_if_false target
+    // Patch jump_false target
     emit.patchJump(self, jump_pos, self.builder.code.items.len);
 
     try emit.emitOp(self, .pop);
@@ -85,7 +85,7 @@ pub fn compileAssertBody(self: *Compiler, node: *const Node, tail_body: bool) an
     try self.compileNode(assert_node.cond);
 
     const fail_jump = self.builder.code.items.len;
-    try emit.emitOpU32(self, .jump_if_false, 0);
+    try emit.emitOpU32(self, .jump_false, 0);
     try emit.emitOp(self, .pop);
 
     if (tail_body) {
@@ -98,7 +98,7 @@ pub fn compileAssertBody(self: *Compiler, node: *const Node, tail_body: bool) an
 
     emit.patchJump(self, fail_jump, self.builder.code.items.len);
     try emit.emitOp(self, .pop);
-    try emit.emitOp(self, .fail_assertion);
+    try emit.emitOp(self, .fail);
 
     emit.patchJump(self, end_jump, self.builder.code.items.len);
 }

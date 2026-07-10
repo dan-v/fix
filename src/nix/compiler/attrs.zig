@@ -1,6 +1,6 @@
 //! Lowers attribute-set construction — plain, recursive (`rec`), and
 //! dynamic/mixed sets — grouping entries by interned name for dedup and
-//! sorted `build_attrs`.
+//! sorted `attrs_new`.
 //! Also drives lazy per-attr compilation: substantial single-leaf value
 //! bodies are registered in the root's deferred table (with an enclosing-
 //! scope + with-chain snapshot) and compiled at first force, concurrently
@@ -67,15 +67,15 @@ fn compileMixedAttrSet(self: *Compiler, entries: []const Node.AttrSetEntry, recu
         defer self.allocator.free(views);
         try compileAttrEntries(self, views, false);
     } else {
-        try emit.emitOpU16(self, .build_attrs, 0);
+        try emit.emitOpU16(self, .attrs_new, 0);
     }
 
     for (entries) |entry| {
         if (!isDynamicAttrEntry(self, entry)) continue;
         try compileDynamicAttrName(self, entry);
         try compileDynamicAttrValueThunk(self, entry);
-        try emit.emitOpU16(self, .build_attrs, 1);
-        try emit.emitOp(self, .merge_attrs_strict);
+        try emit.emitOpU16(self, .attrs_new, 1);
+        try emit.emitOp(self, .attrs_merge_strict);
     }
 }
 
@@ -109,8 +109,8 @@ fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEn
         if (!isDynamicAttrEntry(self, entry)) continue;
         try compileDynamicAttrName(self, entry);
         try compileDynamicAttrValueThunk(self, entry);
-        try emit.emitOpU16(self, .build_attrs, 1);
-        try emit.emitOp(self, .merge_attrs_strict);
+        try emit.emitOpU16(self, .attrs_new, 1);
+        try emit.emitOp(self, .attrs_merge_strict);
     }
 
     scope.endScope(self);
@@ -220,15 +220,15 @@ fn compileMixedAttrEntryViews(self: *Compiler, entries: []const AttrEntryView, r
 
         try compileAttrEntries(self, static_entries, false);
     } else {
-        try emit.emitOpU16(self, .build_attrs, 0);
+        try emit.emitOpU16(self, .attrs_new, 0);
     }
 
     for (entries) |entry| {
         if (!isDynamicAttrEntryView(self, entry)) continue;
         try compileDynamicAttrViewName(self, entry);
         try compileDynamicAttrViewValueThunk(self, entry);
-        try emit.emitOpU16(self, .build_attrs, 1);
-        try emit.emitOp(self, .merge_attrs_strict);
+        try emit.emitOpU16(self, .attrs_new, 1);
+        try emit.emitOp(self, .attrs_merge_strict);
     }
 }
 
@@ -259,8 +259,8 @@ fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEnt
         if (!isDynamicAttrEntryView(self, entry)) continue;
         try compileDynamicAttrViewName(self, entry);
         try compileDynamicAttrViewValueThunk(self, entry);
-        try emit.emitOpU16(self, .build_attrs, 1);
-        try emit.emitOp(self, .merge_attrs_strict);
+        try emit.emitOpU16(self, .attrs_new, 1);
+        try emit.emitOp(self, .attrs_merge_strict);
     }
 
     scope.endScope(self);
@@ -441,7 +441,7 @@ const DeferScope = struct {
     source_path: ?[]const u8,
 };
 
-/// Register a deferred value body and emit `defer_attr_value`. `name` is the
+/// Register a deferred value body and emit `thk_defer`. `name` is the
 /// attr the body is bound to, carried through for best-effort chunk naming
 /// (`fix disasm`); null / ignored when naming is off.
 fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: DeferScope) !void {
@@ -466,7 +466,7 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
     defer grouped.deinit(self.allocator);
 
     // Emit groups in ascending interned-name order (groups are unique by
-    // name_id, duplicates rejected below) so `build_attrs_sorted` can skip
+    // name_id, duplicates rejected below) so `attrs_new_srt` can skip
     // the runtime sort + duplicate scan on every construction. Value code
     // in a plain attr literal is non-strict (thunks/constants/captures),
     // so emission order is not observable. Sorts a compact index array —
@@ -544,7 +544,7 @@ fn compilePlainAttrGroup(
         // Tail-only group (`a.b = …`): the value is the `{ b = … }` thunk,
         // which the binding name `a` describes.
         try emitAttrNameId(self, group.name_id);
-        if (self.registry.capture_names) self.name_hint = group.name_id;
+        self.armName(group.name_id);
         try compileAttrEntriesThunk(self, group.tails, false);
         try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
@@ -564,7 +564,7 @@ fn compilePlainAttrGroup(
             return error.DuplicateAttribute;
         }
         try emitAttrNameId(self, group.name_id);
-        if (self.registry.capture_names) self.name_hint = group.name_id;
+        self.armName(group.name_id);
         try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
         try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
@@ -591,7 +591,7 @@ fn compilePlainAttrGroup(
     var body = leaf.?.expr;
     if (body.tag == .elided) body = try literals.materializeElided(self, body);
     try emitAttrNameId(self, group.name_id);
-    if (self.registry.capture_names) self.name_hint = group.name_id;
+    self.armName(group.name_id);
     try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
 }
@@ -625,7 +625,7 @@ fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) an
         }
         const previous_skip = self.skip_local_slot;
         if (leaf.?.inherit_outer) self.skip_local_slot = slot;
-        if (self.registry.capture_names) self.name_hint = group.name_id;
+        self.armName(group.name_id);
         const compile_result = access.compileContainerValue(self, leaf.?.expr, .{});
         self.skip_local_slot = previous_skip;
         try compile_result;
@@ -637,8 +637,8 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
-    // Emit the (name, capture_local) pairs in ascending interned-name
-    // order for `build_attrs_sorted` — the cells were already declared
+    // Emit the (name, loc_grab) pairs in ascending interned-name
+    // order for `attrs_new_srt` — the cells were already declared
     // and filled in source order above; this loop only reads locals, so
     // its order is not observable.
     const order = try sortedGroupOrder(self, groups);

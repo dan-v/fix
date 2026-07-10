@@ -300,9 +300,9 @@ test "evaluate curried binary builtins" {
     defer std.testing.allocator.free(missing_attr);
     try std.testing.expectEqualStrings("false", missing_attr);
 
-    const get_attr = try renderForTest("builtins.getAttr \"a\" { a = 3; }");
-    defer std.testing.allocator.free(get_attr);
-    try std.testing.expectEqualStrings("3", get_attr);
+    const attr_get = try renderForTest("builtins.getAttr \"a\" { a = 3; }");
+    defer std.testing.allocator.free(attr_get);
+    try std.testing.expectEqualStrings("3", attr_get);
 
     const elem_at = try renderForTest("builtins.elemAt [ 1 2 3 ] 1");
     defer std.testing.allocator.free(elem_at);

@@ -121,12 +121,12 @@ pub fn emitWithLookup(self: *Compiler, name: []const u8) !bool {
     for (scopes.items) |scope| {
         switch (scope.kind) {
             .local => try emit.emitCaptureLocal(self, scope.index),
-            .upvalue => try emit.emitOpU16(self, .capture_upvalue, scope.index),
+            .upvalue => try emit.emitOpU16(self, .up_grab, scope.index),
         }
     }
 
     const name_id = try self.intern.intern(name);
-    try emit.emitInternOp(self, .lookup_with, .lookup_with_long, name_id);
+    try emit.emitInternOp(self, .with_lookup, .with_lookup_w, name_id);
     try self.builder.writeByte(self.allocator, @intCast(scopes.items.len));
     return true;
 }

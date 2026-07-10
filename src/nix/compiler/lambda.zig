@@ -1,7 +1,7 @@
 //! Lowers lambdas and function application into chunks: value-lambda
 //! uncurrying (`a: b: …` → one multi-param chunk), attrset-pattern lambdas
 //! (formal validation, defaults, mutually-recursive binding cells), and
-//! call-spine flattening into `call_n`/`tail_call_n`.
+//! call-spine flattening into `call_n`/`call_tail_n`.
 //! Emits per-chunk strictness metadata (`strict_param`/`strict_params`/
 //! forwarding upvalue) that drives eager-vs-lazy argument passing.
 
@@ -56,7 +56,7 @@ pub fn compileTailExpression(self: *Compiler, node: *const Node) anyerror!void {
 
 fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
     switch (node.tag) {
-        .apply => try compileApplyWithOp(self, node, .tail_call),
+        .apply => try compileApplyWithOp(self, node, .call_tail),
         .if_else => try control.compileIfElseTail(self, node),
         .let_in => try let.compileLetInWithTailBody(self, node),
         .assert => try control.compileAssertTail(self, node),
@@ -66,7 +66,7 @@ fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 }
 
 /// Compile one argument of a flattened `call_n` spine. We deliberately do
-/// NOT use the runtime-adaptive `apply_arg` op here: its eager-vs-thunk
+/// NOT use the runtime-adaptive `thk_arg` op here: its eager-vs-thunk
 /// check reads the callee at `stack[sp-1]`, which is the real callee only
 /// for the *first* spine arg (later args would see the previous arg). So
 /// immediate container values stay thunk-free and everything else becomes
@@ -75,7 +75,7 @@ fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 /// recovering eager-arg behavior with the callee actually known.
 fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
     // `raw_identifier`: a bare local/upvalue argument is already a lazy value in
-    // its slot — push it directly (`capture_local`/`capture_upvalue`) instead of
+    // its slot — push it directly (`loc_grab`/`up_grab`) instead of
     // wrapping it in a forwarding thunk that would just return it. Same laziness,
     // one fewer chunk + allocation each (as attr-set values already do).
     if (try access.compileImmediateContainerValue(self, arg, .{ .raw_identifier = true })) return;
@@ -108,7 +108,7 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
                 i -= 1;
                 try compileSpineArg(self, args[i]);
             }
-            const call_op: OpCode = if (op == .tail_call) .tail_call_n else .call_n;
+            const call_op: OpCode = if (op == .call_tail) .call_tail_n else .call_n;
             try emit.emitOpByte(self, call_op, @intCast(k));
             return;
         }
@@ -130,7 +130,7 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
         // wrapping it in a forwarding thunk (see `compileSpineArg`).
     } else {
         // Dynamically-dispatched call: defer the thunk-vs-eager decision
-        // to runtime via `apply_arg`, which reads the callee's strictness.
+        // to runtime via `thk_arg`, which reads the callee's strictness.
         try thunks.compileApplyArgThunk(self, ap.arg);
     }
     try emit.emitOp(self, op);
@@ -238,7 +238,7 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     } else {
         // Uncurried chunk: a per-param must-force bitmask. The saturated
         // `call_n` path forces these arg positions eagerly, recovering the
-        // eager-arg behavior `apply_arg` gives the single-param shape (and
+        // eager-arg behavior `thk_arg` gives the single-param shape (and
         // avoiding lazy-thunk-chain buildup in accumulator recursion).
         var mask: u8 = 0;
         var si: u16 = 0;
@@ -283,7 +283,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     }
 
     try emit.emitGetLocal(&child, arg_slot);
-    try emit.emitOp(&child, if (wide_params) .validate_attrs_long else .validate_attrs);
+    try emit.emitOp(&child, if (wide_params) .attr_check_w else .attr_check);
     try child.builder.writeByte(child.allocator, if (lambda.allow_extra) 1 else 0);
     const param_count = try diagnostics.requireU16At(self, lambda.params.len, diagnosticAtom(node), "too many function parameters");
     try child.builder.writeU16(child.allocator, param_count);
@@ -307,7 +307,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     // The overwhelmingly common case — no defaults at all, or defaults
     // that don't reference sibling formals (every NixOS module function,
     // `{ config, lib, pkgs, ... }`) — needs no cells: each formal binds
-    // directly to its lookup thunk via `set_local`, skipping a per-formal
+    // directly to its lookup thunk via `loc_set`, skipping a per-formal
     // binding-cell heap alloc plus a force-indirection on every param
     // access. This lands on the hot critical path (module application,
     // modules.nix:450). The check only walks DEFAULTS (tiny / absent),
@@ -385,10 +385,10 @@ fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, defa
     defer child.deinit();
 
     _ = try scope.addCapture(&child, "\x00args", .local, arg_slot);
-    try emit.emitOpU16(&child, .get_upvalue, 0);
+    try emit.emitOpU16(&child, .up_get, 0);
     if (default) |default_expr| {
         try thunks.compileThunk(&child, default_expr);
-        try emit.emitOp(&child, if (name_id > std.math.maxInt(u16)) .get_attr_path_or_long else .get_attr_path_or);
+        try emit.emitOp(&child, if (name_id > std.math.maxInt(u16)) .attr_get_path_or_w else .attr_get_path_or);
         try child.builder.writeByte(child.allocator, 1);
         try emit.writeInternId(&child, name_id, name_id > std.math.maxInt(u16));
     } else {

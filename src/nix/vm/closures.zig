@@ -118,18 +118,18 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
     defer prof.end(.make_bytecode_thunk, t);
     // Read the trivial classification + `body_is_substantial` from the
     // registry's dense slot — the Chunk itself is only dereferenced by
-    // the one arm that needs its code (`closure_captures`).
+    // the one arm that needs its code (`clos_cap`).
     const slot = self.registry.slot(chunk_id) orelse return error.InvalidChunk;
 
     // Trivial-body short-circuit: if the chunk's whole body is
-    // `get_upvalue_ret upvalue[N]; halt` or `constant_ret #idx; halt`,
+    // `up_get_ret upvalue[N]; halt` or `push_const_ret #idx; halt`,
     // we already know what forcing the thunk will produce — the
     // captured value, or the constant. Push it directly instead of
     // allocating a thunk, populating its upvalues, and (later)
     // running a 4-byte chunk through the dispatcher. Saves a heap
     // alloc, a markDemanded, a frame push/pop, and several dispatches
     // per occurrence — the dominant pattern that drives the
-    // `thunk_captures` op count (~15% of all ops on NixOS toplevel).
+    // `thk` op count (~15% of all ops on NixOS toplevel).
     switch (slot.trivial) {
         .identity_upvalue => |idx| {
             return shortCircuitIdentityUpvalue(self, descriptors, frame, idx);
@@ -193,7 +193,7 @@ pub fn calleeForcesArg(self: *VM, callee: Value) bool {
     return false;
 }
 
-/// Evaluate an `apply_arg` argument eagerly to a value (used when the
+/// Evaluate an `thk_arg` argument eagerly to a value (used when the
 /// callee forces it). Stages the captured upvalues onto the stack below
 /// a fresh frame, runs the argument chunk, then replaces the staged
 /// upvalues with the resulting value. No thunk is allocated.
@@ -304,7 +304,7 @@ inline fn shortCircuitClosureCaptures(
 
 
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
-/// urgent queue at creation time. Used by `thunk_captures_eager` —
+/// urgent queue at creation time. Used by `thk_eag` —
 /// the compiler emits that op when strictness analysis confirms the
 /// surrounding chunk's body forces this binding.
 ///
@@ -363,7 +363,7 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
 // ---- calls ----
 
 /// Per-call-site inline cache. Caches the (chunk_id → Chunk*) lookup
-/// at every `call`/`tail_call` site keyed by the caller's
+/// at every `call`/`call_tail` site keyed by the caller's
 /// (chunk_id, ip). On hit the registry hashtable lookup is skipped.
 ///
 /// Heap-token gated: chunk_ids aren't unique across Evaluator
@@ -526,7 +526,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
                 // Saturation here pushes a fresh frame (non-tail) rather
                 // than reusing the current one — rare (a PAP saturating in
                 // tail position via a single arg); direct multi-arg tail
-                // spines go through `tail_call_n`, which DOES reuse the
+                // spines go through `call_tail_n`, which DOES reuse the
                 // frame. Correctness preserved; depth grows by 1 here.
                 try applyToPartial(self, current, arg);
                 return;
@@ -659,7 +659,7 @@ pub fn doCallN(self: *VM, n: u16) !void {
     try stack.push(self, acc);
 }
 
-/// `tail_call_n`: tail-position `call_n`. The saturated closure case
+/// `call_tail_n`: tail-position `call_n`. The saturated closure case
 /// reuses the current frame (so deep multi-arg tail recursion doesn't
 /// grow the stack); everything else folds to a value (the following
 /// `ret` returns it).

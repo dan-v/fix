@@ -203,6 +203,14 @@ pub const Compiler = struct {
         return child;
     }
 
+    /// Arm the pending chunk name for the next child compiler: the first body
+    /// spun up (see `childCompiler`) claims `name_id` as its best-effort name.
+    /// A no-op unless `fix disasm` turned name capture on, so callers can arm
+    /// unconditionally without gating on the hot path.
+    pub fn armName(self: *Compiler, name_id: InternId) void {
+        if (self.registry.capture_names) self.name_hint = name_id;
+    }
+
     /// Qualify a segment name with this compiler's `name_prefix` into an interned
     /// `prefix$segment`. Returns the bare segment when there is no prefix (or the
     /// combined name would be pathologically long).

@@ -281,7 +281,7 @@ pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
         const gc_roots = vm_force.rootsBegin(self);
         defer vm_force.rootsEnd(self, gc_roots);
         vm_force.rootKeep(self, list);
-        // One apply-thunk per element: `genlist_apply` = `tail_call pred item`.
+        // One apply-thunk per element: `genlist_apply` = `call_tail pred item`.
         const preds = try self.allocator.alloc(Value, n);
         defer self.allocator.free(preds);
         const apply_chunk_id = self.registry.well_known.genlist_apply;
@@ -333,7 +333,7 @@ pub fn builtinMap(self: anytype, fn_arg: Value, list_arg: Value) !Value {
     const out = try self.allocator.alloc(Value, items.len);
     defer self.allocator.free(out);
 
-    // Reuse the genlist_apply chunk (`tail_call upvalues[0] upvalues[1]`).
+    // Reuse the genlist_apply chunk (`call_tail upvalues[0] upvalues[1]`).
     // The chunk doesn't care that the second upvalue is a list element
     // instead of an integer index — it just calls `func arg`. This swap
     // drops the per-element `BuiltinClosureObject` that the old

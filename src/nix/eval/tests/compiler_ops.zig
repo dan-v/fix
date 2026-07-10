@@ -77,10 +77,10 @@ test "compileBinary emits the runtime add opcode for non-literal operands" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();
     // Locals (lambda params), not literals, so the `+` can't constant-fold
-    // — the runtime `add_int` opcode must actually be emitted.
+    // — the runtime `int_add` opcode must actually be emitted.
     var d = try disassemble(&ev, "a: b: a + b");
     defer d.deinit(testing.allocator);
-    try testing.expect(d.contains("add_int"));
+    try testing.expect(d.contains("int_add"));
 }
 
 test "compileBinary emits the runtime sub/mul/div opcodes for non-literal operands" {
@@ -89,15 +89,15 @@ test "compileBinary emits the runtime sub/mul/div opcodes for non-literal operan
 
     var sub_d = try disassemble(&ev, "a: b: a - b");
     defer sub_d.deinit(testing.allocator);
-    try testing.expect(sub_d.contains("sub_int"));
+    try testing.expect(sub_d.contains("int_sub"));
 
     var mul_d = try disassemble(&ev, "a: b: a * b");
     defer mul_d.deinit(testing.allocator);
-    try testing.expect(mul_d.contains("mul_int"));
+    try testing.expect(mul_d.contains("int_mul"));
 
     var div_d = try disassemble(&ev, "a: b: a / b");
     defer div_d.deinit(testing.allocator);
-    try testing.expect(div_d.contains("div_int"));
+    try testing.expect(div_d.contains("int_div"));
 }
 
 test "compileBinary emits comparison opcodes for non-literal operands" {
@@ -106,11 +106,11 @@ test "compileBinary emits comparison opcodes for non-literal operands" {
 
     var lt_d = try disassemble(&ev, "a: b: a < b");
     defer lt_d.deinit(testing.allocator);
-    try testing.expect(lt_d.contains("lt"));
+    try testing.expect(lt_d.contains("cmp_lt"));
 
     var eq_d = try disassemble(&ev, "a: b: a == b");
     defer eq_d.deinit(testing.allocator);
-    try testing.expect(eq_d.contains("eq"));
+    try testing.expect(eq_d.contains("cmp_eq"));
 }
 
 test "compileBinary folds literal-on-literal arithmetic to a constant instead of emitting an opcode" {
@@ -118,23 +118,23 @@ test "compileBinary folds literal-on-literal arithmetic to a constant instead of
     defer ev.deinit();
     var d = try disassemble(&ev, "1 + 2");
     defer d.deinit(testing.allocator);
-    try testing.expect(!d.contains("add_int"));
-    try testing.expect(d.contains("constant") or d.contains("constant_ret"));
+    try testing.expect(!d.contains("int_add"));
+    try testing.expect(d.contains("push_const") or d.contains("push_const_ret"));
 }
 
 test "compileAnd emits a jump strictly between the two operand pushes" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();
-    // Uncurried two-param lambda: both `a` and `b` compile to `get_local`
+    // Uncurried two-param lambda: both `a` and `b` compile to `loc_get`
     // reads in one chunk, so the two occurrences bracket the jump.
     var d = try disassemble(&ev, "a: b: a && b");
     defer d.deinit(testing.allocator);
 
-    const jump_line = d.find("jump_if_false").?;
+    const jump_line = d.find("jump_false").?;
     var first_local: ?usize = null;
     var second_local: ?usize = null;
     for (d.lines) |line| {
-        if (!std.mem.eql(u8, line.name, "get_local")) continue;
+        if (!std.mem.eql(u8, line.name, "loc_get")) continue;
         if (first_local == null) {
             first_local = line.index;
         } else if (second_local == null) {
@@ -151,14 +151,14 @@ test "compileOr emits a jump strictly between the two operand pushes" {
     var d = try disassemble(&ev, "a: b: a || b");
     defer d.deinit(testing.allocator);
 
-    const false_jump_line = d.find("jump_if_false").?;
+    const false_jump_line = d.find("jump_false").?;
     const end_jump_line = d.find("jump").?;
     try testing.expect(false_jump_line < end_jump_line);
 
     var first_local: ?usize = null;
     var second_local: ?usize = null;
     for (d.lines) |line| {
-        if (!std.mem.eql(u8, line.name, "get_local")) continue;
+        if (!std.mem.eql(u8, line.name, "loc_get")) continue;
         if (first_local == null) {
             first_local = line.index;
         } else if (second_local == null) {
@@ -209,12 +209,12 @@ test "compileLambda and compileLambdaAttrs produce different chunk shapes" {
     defer attrs_lambda.deinit(testing.allocator);
 
     // Only the attrset-pattern lambda validates its argument shape.
-    try testing.expect(!value_lambda.contains("validate_attrs"));
-    try testing.expect(attrs_lambda.contains("validate_attrs"));
+    try testing.expect(!value_lambda.contains("attr_check"));
+    try testing.expect(attrs_lambda.contains("attr_check"));
 
     // Both compile to a top-level closure creation over a nested body chunk.
-    try testing.expect(value_lambda.contains("closure"));
-    try testing.expect(attrs_lambda.contains("closure"));
+    try testing.expect(value_lambda.contains("clos"));
+    try testing.expect(attrs_lambda.contains("clos"));
 }
 
 test "applying a non-callable value raises NotCallable instead of panicking" {

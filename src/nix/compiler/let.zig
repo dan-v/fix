@@ -46,7 +46,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
     //                        directly into the slot (no cell).
     //   .uncaptured        — non-literal RHS, no earlier binding in
     //                        this let references the name; we can skip
-    //                        the cell and just `set_local` the lazy
+    //                        the cell and just `loc_set` the lazy
     //                        thunk value in pass 2. The body and any
     //                        later binding's RHS will see the bound
     //                        thunk and force normally.
@@ -115,7 +115,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         switch (kind) {
             .literal => {
                 const leaf = singleLeafBinding(self, let_in.bindings, binding.path[0]).?;
-                if (self.registry.capture_names) self.name_hint = name_id;
+                self.armName(name_id);
                 try access.compileContainerValue(self, leaf.expr, .{});
                 try emit.emitSetLocal(self, slot);
             },
@@ -139,7 +139,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
             first_demanded != null and binding_name_ids[index] == first_demanded.?)
         {
             if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
-                if (self.registry.capture_names) self.name_hint = binding_name_ids[index];
+                self.armName(binding_name_ids[index]);
                 try self.compileNode(leaf.expr);
                 self.name_hint = null; // don't leak a nameless RHS onto the body
                 try emit.emitSetLocal(self, slot);
@@ -147,7 +147,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
             }
         }
 
-        if (self.registry.capture_names) self.name_hint = binding_name_ids[index];
+        self.armName(binding_name_ids[index]);
         try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index]);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),

@@ -134,7 +134,7 @@ pub const DeferredThunk = struct {
 /// name)` directly, with no frame push or bytecode dispatch. The
 /// overwhelmingly common `someUpvalue.attr` thunk shape (`config.foo`,
 /// `lib.bar`, attrset-pattern param lookups) would otherwise allocate a
-/// `bytecode` thunk over a 7-byte `get_upvalue_attr; ret` chunk and run a
+/// `bytecode` thunk over a 7-byte `up_get_attr; ret` chunk and run a
 /// whole isolated frame to force it — `run_isolated_frame` is the biggest
 /// machinery bucket on the serial critical path.
 pub const AttrAccess = struct {
@@ -269,7 +269,7 @@ pub const Thunk = struct {
     }
 
     /// A "cell" thunk: holds a Value to be forced lazily. Used by
-    /// `builtins.deepSeq`-style memoisation and by `make_cell` where
+    /// `builtins.deepSeq`-style memoisation and by `cell_new` where
     /// the wrapped value is known at construction time.
     pub fn initPassThrough(value: Value) Thunk {
         return .{ .future = Future.initFor(.pass_through), .payload = .{ .target = .{ .pass_through = value } } };
@@ -290,7 +290,7 @@ pub const Thunk = struct {
         return .{ .future = Future.initResolved(), .payload = .{ .result = value } };
     }
 
-    /// A "binding cell" thunk: created by `init_cell_slot` for
+    /// A "binding cell" thunk: created by `cell_init` for
     /// recursive let bindings, BEFORE the RHS is computed. The cell is
     /// born in `.evaluating` claimed by the creating fiber so any
     /// concurrent force attempt sees BUSY and parks on the waiter list

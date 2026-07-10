@@ -33,7 +33,7 @@ pub fn compileAttrPath(self: *Compiler, node: *const Node) !void {
     for (apath.segments) |seg| {
         if (attrs.attrSegmentHasInterpolation(self, seg)) {
             try literals.compileStringAtom(self, seg);
-            try emit.emitOp(self, .get_attr_dynamic);
+            try emit.emitOp(self, .attr_get_dyn);
         } else {
             const name_id = try attrs.attrSegmentNameId(self, seg);
             try emit.emitGetAttr(self, name_id);
@@ -45,7 +45,7 @@ pub fn compileAttrDynamic(self: *Compiler, node: *const Node) !void {
     const dynamic = node.data.attr_dynamic;
     try self.compileNode(dynamic.root);
     try self.compileNode(dynamic.name);
-    try emit.emitOp(self, .get_attr_dynamic);
+    try emit.emitOp(self, .attr_get_dyn);
 }
 
 pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
@@ -80,7 +80,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
         try self.compileNode(base);
         try thunks.compileThunk(self, attr_or.default);
         const wide = try emit.attrSegmentsWide(self, atoms.items);
-        try emit.emitOp(self, if (wide) .get_attr_path_or_long else .get_attr_path_or);
+        try emit.emitOp(self, if (wide) .attr_get_path_or_w else .attr_get_path_or);
         try emit.writeStaticAttrPathOperand(self, atoms.items, atom, wide);
         return;
     }
@@ -95,7 +95,7 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
         }
     }
     try thunks.compileThunk(self, attr_or.default);
-    try emit.emitOp(self, .get_attr_path_mixed_or);
+    try emit.emitOp(self, .attr_get_path_mix_or);
     try emit.writeHasAttrMixedOperand(self, segments.items, dynamic_count, atom);
 }
 
@@ -130,13 +130,13 @@ pub fn compileHasAttr(self: *Compiler, node: *const Node) !void {
                 dynamic_count += 1;
             }
         }
-        try emit.emitOp(self, .has_attr_path_mixed);
+        try emit.emitOp(self, .attr_has_path_mix);
         try emit.writeMixedAttrPathOperand(self, has_attr.segments, dynamic_count, hasAttrDiagnosticAtom(has_attr));
         return;
     }
 
     const wide = try emit.attrSegmentsWide(self, has_attr.segments);
-    try emit.emitOp(self, if (wide) .has_attr_path_long else .has_attr_path);
+    try emit.emitOp(self, if (wide) .attr_has_path_w else .attr_has_path);
     try emit.writeStaticAttrPathOperand(self, has_attr.segments, hasAttrDiagnosticAtom(has_attr), wide);
 }
 
@@ -159,7 +159,7 @@ pub fn compileHasAttrMixed(self: *Compiler, node: *const Node) !void {
         }
     }
 
-    try emit.emitOp(self, .has_attr_path_mixed);
+    try emit.emitOp(self, .attr_has_path_mix);
     try emit.writeHasAttrMixedOperand(self, has_attr.segments, dynamic_count, hasAttrMixedDiagnosticAtom(has_attr));
 }
 
@@ -175,7 +175,7 @@ pub fn compileList(self: *Compiler, node: *const Node) !void {
     for (list.items) |item| {
         try compileContainerValue(self, item, .{ .raw_identifier = true });
     }
-    try emit.emitOpU16(self, .build_list, try diagnostics.requireU16At(self, list.items.len, diagnosticAtom(node), "too many list items"));
+    try emit.emitOpU16(self, .list_new, try diagnostics.requireU16At(self, list.items.len, diagnosticAtom(node), "too many list items"));
 }
 
 pub fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {
@@ -224,7 +224,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // pending name so the element thunks don't claim the binding's name.
             self.name_hint = null;
             if (unwrapped.data.list.items.len == 0) {
-                try emit.emitOpU16(self, .build_list, 0);
+                try emit.emitOpU16(self, .list_new, 0);
             } else {
                 // Build the list shell in place, then wrap in a
                 // pre-resolved "lazy shell" thunk. Forcing it in the
@@ -233,7 +233,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
                 // consumer marks it demanded, matching the
                 // observable laziness of a true thunk-wrapped list.
                 try compileList(self, unwrapped);
-                try emit.emitOp(self, .make_lazy_shell);
+                try emit.emitOp(self, .thk_shell);
             }
         },
         .attr_set => {
@@ -250,15 +250,15 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             if (unwrapped.data.attr_set.recursive) return false;
             self.name_hint = null; // composite value: see the .list note above
             try attrs.compileAttrSet(self, unwrapped);
-            try emit.emitOp(self, .make_lazy_shell);
+            try emit.emitOp(self, .thk_shell);
         },
         .lambda => {
             try ops.compileLambda(self, unwrapped);
-            try emit.emitOp(self, .make_lazy_shell);
+            try emit.emitOp(self, .thk_shell);
         },
         .lambda_attrs => {
             try ops.compileLambdaAttrs(self, unwrapped);
-            try emit.emitOp(self, .make_lazy_shell);
+            try emit.emitOp(self, .thk_shell);
         },
         .identifier => {
             if (!options.raw_identifier) return false;
@@ -277,7 +277,7 @@ fn compileRawIdent(self: *Compiler, node: *const Node) !bool {
         return true;
     }
     if (try scope.resolveCaptureId(self, span, name_id)) |slot| {
-        try emit.emitOpU16(self, .capture_upvalue, slot);
+        try emit.emitOpU16(self, .up_grab, slot);
         return true;
     }
     return false;

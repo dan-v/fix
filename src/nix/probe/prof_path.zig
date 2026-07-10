@@ -25,13 +25,13 @@
 //! and its cycle total should track the measured w=32 wall.
 //!
 //! IMPORTANT attribution caveat. Spans nest on thunk *forces* only, not
-//! on direct closure calls (`do_call`/`tail_call` push a frame and keep
+//! on direct closure calls (`do_call`/`call_tail` push a frame and keep
 //! running in the same dispatch loop). So work done in a directly-called
 //! closure that does not itself force a thunk is charged to the *forcing*
 //! chunk's self-time, not to the callee. A driver chunk like the overlay
 //! fixpoint (`prev // overlay final prev`) therefore shows huge self-time
 //! that is really the overlays it calls — NOT the `//` merge (measured
-//! separately at ~250M cy via `-Dprof-main` `merge_attrs`). Read the flat
+//! separately at ~250M cy via `-Dprof-main` `attrs_merge`). Read the flat
 //! profile as "which forcing site drives the most call work", not "which
 //! operation is hot" — use `-Dprof-main` for operation-level truth. A
 //! future version could nest on frame push/pop to attribute calls too.

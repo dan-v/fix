@@ -50,7 +50,16 @@ pub const Options = struct {
 /// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
 /// byte, operand bytes, mnemonic, and interpretation all align), and longer
 /// records wrap onto continuation rows.
-const bytes_per_line = 4;
+const bytes_per_line = 8;
+
+/// Constant string/path snippets are truncated hard: the pool is a reference
+/// table, not a value dump, and colored index links tie a `#N` back to its row.
+/// Keeping entries short stops one long string from blowing out column widths.
+const snippet_max = 20;
+
+/// The constant pool table can afford longer values than inline references —
+/// it's the definitive listing, so truncate it only for very long strings.
+const table_snippet_max = 48;
 
 const Visited = std.AutoHashMapUnmanaged(ChunkId, void);
 
@@ -72,7 +81,11 @@ fn writeChunkAt(
     chunk: *const Chunk,
     symbols: Symbols,
     options: Options,
-    depth: u8,
+    // `usize`, not `u8`: `fix disasm` runs with `max_depth == 0` (unlimited,
+    // termination guaranteed by `visited`), so a deep reachable-chunk chain
+    // (e.g. hundreds of nested lambdas) recurses past 255 — a `u8` counter would
+    // overflow and panic.
+    depth: usize,
     visited: *Visited,
 ) anyerror!void {
     if (chunk_id) |id| try visited.put(std.heap.page_allocator, id, {});
@@ -82,11 +95,25 @@ fn writeChunkAt(
     try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, options.use_color);
     if (options.show_constants and chunk.constants.len > 0) {
         try writeGuide(writer, cc, options.use_color);
-        try writer.print("  constants ({d}):\n", .{chunk.constants.len});
+        try writer.writeAll("  constants:\n");
         for (chunk.constants, 0..) |c, i| {
             try writeGuide(writer, cc, options.use_color);
-            try writer.print("    #{d:0>4}  ", .{i});
-            try writeValueDigest(writer, c, symbols);
+            try writer.writeAll("    ");
+            // `#N` in the slot's identity color — the same hue a `push_const #N`
+            // reference carries, so a reference ties back to its row here.
+            var ibuf: [8]u8 = undefined;
+            const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{i}) catch "#?";
+            if (options.use_color) {
+                const ic = constColor(i);
+                try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ ic[0], ic[1], ic[2], istr });
+            } else {
+                try writer.writeAll(istr);
+            }
+            try writer.splatByteAll(' ', 6 -| istr.len);
+            // The value itself is secondary — dim, and hard-truncated.
+            if (options.use_color) try writer.writeAll("\x1b[2m");
+            try writeValueDigest(writer, c, symbols, table_snippet_max, true);
+            if (options.use_color) try writer.writeAll("\x1b[0m");
             try writer.writeByte('\n');
         }
     }
@@ -94,6 +121,19 @@ fn writeChunkAt(
     var ip: usize = 0;
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
     defer referenced_chunks.deinit(std.heap.page_allocator);
+
+    // Scratch for each instruction's compact operand decode. Growable (reset,
+    // capacity retained, per instruction) rather than a fixed buffer: a decode
+    // is normally a few dozen bytes, but a pathological attribute name or path
+    // (`x."<multi-KB string>"`) is unbounded, and overflowing a fixed buffer
+    // would abort the whole disassembly with a write error.
+    var op_scratch: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer op_scratch.deinit();
+
+    // Set once a multiline instruction's indented operand block has been drawn;
+    // the next iteration then draws a blank margin line before the next
+    // instruction, so its closing inner guides read as a group boundary.
+    var after_multiline = false;
 
     // Source filenames are hoisted onto their own comment line: one at the top
     // of the chunk (before any bytes) and again only if the file changes
@@ -109,6 +149,13 @@ fn writeChunkAt(
 
     while (ip < chunk.code.len) {
         const start = ip;
+        // The previous instruction's operand block just closed — one blank
+        // margin line separates it (regardless of how many inner guides ended).
+        if (after_multiline) {
+            try writeGuide(writer, cc, options.use_color);
+            try writer.writeByte('\n');
+            after_multiline = false;
+        }
         const op_byte = chunk.code[ip];
         // OpCode is a gapless `enum(u8)`, so anything ≥ the tag count is not a
         // valid opcode — a misaligned decode, or (under `--eval`) a registry
@@ -129,13 +176,12 @@ fn writeChunkAt(
         const op: OpCode = @enumFromInt(op_byte);
         ip += 1;
 
-        // Decode the operands into a scratch buffer first: we need the full
-        // instruction byte-range (to print the raw-byte column ahead of the
-        // mnemonic) before writing the line, and operand text is always short.
-        var opbuf: [2048]u8 = undefined;
-        var ow: std.Io.Writer = .fixed(&opbuf);
-        ip = try writeOperands(&ow, chunk, op, ip, symbols, &referenced_chunks);
-        const operand_text = opbuf[0..ow.end];
+        // Decode the operands into scratch first: we need the full instruction
+        // byte-range (to print the raw-byte column ahead of the mnemonic) before
+        // writing the line.
+        op_scratch.writer.end = 0;
+        ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, &referenced_chunks);
+        const operand_text = op_scratch.writer.buffered();
         const insn = chunk.code[start..ip];
 
         // Find the narrowest source span covering this instruction; hoist its
@@ -155,19 +201,25 @@ fn writeChunkAt(
         try writeOffset(writer, start, options.use_color);
         try writer.writeAll("  ");
         if (isMultiline(op)) {
-            // The header row carries only the opcode byte + mnemonic; each
-            // operand becomes an indented child row below.
-            if (options.show_bytes) try writeByteField(writer, insn[0..1], options.use_color);
-            try writer.writeByte(' '); // gap column between the bytes and the mnemonic
-            try writeMnemonic(writer, op, options.use_color);
-            if (span) |s| try writePosColumn(writer, s, options.use_color);
-            try writeOperandFields(writer, chunk, op, start + 1, ip, operand_text, symbols, cc, options.show_bytes, options.use_color);
+            // The mnemonic row carries the opcode + head operand (a chunk id, or
+            // attrset counts); list operands become indented child rows below.
+            var seq: usize = @intFromEnum(op) + 1;
+            var head = Line{};
+            const head_len = buildHead(&head, op, chunk.code, start, symbols);
+            try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, options.show_bytes, options.use_color);
+            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, cc, options.show_bytes, options.use_color);
             try writer.writeByte('\n');
+            after_multiline = true;
         } else {
             // Zero or one simple operand: keep it all on the mnemonic row. The
             // opcode byte + mnemonic share one color; the operand bytes and its
             // interpretation share another (linked), like the multi-row style.
-            const opcol = hueColor(@intFromEnum(op) + 1);
+            // A `push_const` takes its constant's identity color instead, so the
+            // reference and the pool row it names share a hue.
+            const opcol = switch (op) {
+                .push_const, .push_const_ret => if (insn.len >= 3) constColor(readU16(insn, 1)) else hueColor(@intFromEnum(op) + 1),
+                else => hueColor(@intFromEnum(op) + 1),
+            };
             if (options.show_bytes) {
                 var c: usize = 0;
                 while (c < bytes_per_line) : (c += 1) {
@@ -181,11 +233,8 @@ fn writeChunkAt(
             try writer.writeByte(' '); // gap column between the bytes and the mnemonic
             try writeMnemonic(writer, op, options.use_color);
             if (operand_text.len > 0) {
-                if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ opcol[0], opcol[1], opcol[2] });
-                try writer.writeAll(operand_text);
-                if (options.use_color) try writer.writeAll("\x1b[0m");
+                try writeInlineOperand(writer, operand_text, opcol, options.use_color);
             }
-            if (span) |s| try writePosColumn(writer, s, options.use_color);
             try writer.writeByte('\n');
             // Wrap any remaining instruction bytes onto continuation rows.
             if (options.show_bytes and insn.len > bytes_per_line) {
@@ -201,9 +250,14 @@ fn writeChunkAt(
         }
     }
 
+    // A blank line trails every chunk body, so a chunk boundary reads as a wider
+    // gap (two blank lines, with the leading break below) than the single-line
+    // breaks between an instruction's operand groups.
+    try writer.writeByte('\n');
+
     if (options.recurse) {
         const reg = symbols.registry orelse return;
-        if (options.max_depth != 0 and depth + 1 >= options.max_depth) return;
+        if (options.max_depth != 0 and depth + 1 >= @as(usize, options.max_depth)) return;
         var it = referenced_chunks.iterator();
         while (it.next()) |entry| {
             const child_id = entry.key_ptr.*;
@@ -297,7 +351,7 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
 }
 
 // ---------------------------------------------------------------------------
-// `--fields` mode: one line per operand field
+// Operand field rendering: one indented line per operand field
 // ---------------------------------------------------------------------------
 
 /// A legible color for sequence position `seq`. Consecutive values land a
@@ -307,6 +361,52 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
 fn hueColor(seq: usize) [3]u8 {
     const hue: f32 = @floatCast(@mod(@as(f64, @floatFromInt(seq)) * 137.508, 360.0));
     return hsvToRgb(hue, 0.62, 0.99);
+}
+
+/// Every chunk has an identity color derived from its id — the same hue is used
+/// for its header title and for every reference to it, so a `chunk[0xN]` operand
+/// visually points at the header it names.
+fn objColor(id: anytype) [3]u8 {
+    return hueColor(@intCast(id));
+}
+
+/// Fixed color for compiler-attributed chunk names, wherever they appear
+/// (header title and operand comments), so a name always reads as a name.
+const name_color: [3]u8 = .{ 0x83, 0xd6, 0x8f };
+
+/// A constant pool slot's identity color, shared by its `#N` references and its
+/// row in the pool table. Offset well past typical chunk ids so a `#N` constant
+/// and a `chunk[0xN]` never share a hue in the same listing.
+fn constColor(i: usize) [3]u8 {
+    return hueColor(i + 1000);
+}
+
+/// A darkened variant of `rgb` for the interpretive `; …` comment: same hue as
+/// the raw operand it annotates (so the two read as linked), just dimmer.
+fn dimRgb(rgb: [3]u8) [3]u8 {
+    return .{
+        @intFromFloat(@as(f32, @floatFromInt(rgb[0])) * 0.5),
+        @intFromFloat(@as(f32, @floatFromInt(rgb[1])) * 0.5),
+        @intFromFloat(@as(f32, @floatFromInt(rgb[2])) * 0.5),
+    };
+}
+
+/// Render a single instruction's inline operand text: everything before the
+/// first ` ; ` is the raw decoded value (in `col`, linked to its bytes); the
+/// ` ; …` interpretation that follows is the same hue, dimmed. Operands with no
+/// comment render entirely in `col`.
+fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, use_color: bool) !void {
+    if (!use_color) {
+        try writer.writeAll(text);
+        return;
+    }
+    const cut = std.mem.indexOf(u8, text, " ; ") orelse text.len;
+    try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ col[0], col[1], col[2], text[0..cut] });
+    if (cut < text.len) {
+        const d = dimRgb(col);
+        try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ d[0], d[1], d[2], text[cut..] });
+    }
+    try writer.writeAll("\x1b[0m");
 }
 
 fn writeByteCellColored(writer: *std.Io.Writer, b: u8, rgb: [3]u8, use_color: bool) !void {
@@ -321,7 +421,7 @@ fn writeByteCellColored(writer: *std.Io.Writer, b: u8, rgb: [3]u8, use_color: bo
 /// at `byte_off`, whose interpretation `text` takes that group's color) and dim
 /// structural glue (`len == 0`). Groups may be listed in display order even when
 /// that differs from byte order — the shared color is the link, not position.
-const Tok = struct { byte_off: u16 = 0, len: u16 = 0, text: []const u8, colored: bool = false, color: [3]u8 = .{ 0x9a, 0x9a, 0x9a } };
+const Tok = struct { byte_off: u16 = 0, len: u16 = 0, text: []const u8, colored: bool = false, pin: bool = false, color: [3]u8 = .{ 0x9a, 0x9a, 0x9a } };
 
 const Line = struct {
     toks: [24]Tok = undefined,
@@ -350,6 +450,25 @@ const Line = struct {
             self.n += 1;
         }
     }
+    /// Like `group`, but with an explicit identity `color` (its bytes take it
+    /// too) instead of the running-hue assignment — for a chunk id, whose color
+    /// is fixed to the chunk it names.
+    fn groupPinned(self: *Line, byte_off: u16, len: u16, color: [3]u8, comptime fmt: []const u8, args: anytype) void {
+        const s = self.store(fmt, args);
+        if (self.n < self.toks.len) {
+            self.toks[self.n] = .{ .byte_off = byte_off, .len = len, .text = s, .colored = true, .pin = true, .color = color };
+            self.n += 1;
+        }
+    }
+    /// Colored text that maps to no bytes — an interpretive comment fragment
+    /// (`chunk[0xN]`, a name) drawn in a fixed color rather than dim grey.
+    fn tint(self: *Line, color: [3]u8, comptime fmt: []const u8, args: anytype) void {
+        const s = self.store(fmt, args);
+        if (self.n < self.toks.len) {
+            self.toks[self.n] = .{ .text = s, .colored = true, .pin = true, .color = color };
+            self.n += 1;
+        }
+    }
     fn total(self: *const Line) u16 {
         var m: u16 = 0;
         for (self.toks[0..self.n]) |t| {
@@ -361,7 +480,7 @@ const Line = struct {
     /// groups differ sharply regardless of their byte values.
     fn paint(self: *Line, seq: *usize) void {
         for (self.toks[0..self.n]) |*t| {
-            if (t.colored and t.len > 0) {
+            if (t.colored and t.len > 0 and !t.pin) {
                 t.color = hueColor(seq.*);
                 seq.* += 1;
             }
@@ -402,6 +521,23 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, use_color
     }
 }
 
+/// A blank separator line inside an operand block: the byte column is empty, but
+/// `guides` (the levels that *continue* past this break) keep drawing their bars
+/// so their vertical stays unbroken. Emitted when a deeper sublist ends but a
+/// shallower group carries on (e.g. the captures list closing before a store
+/// target). Leads with `\n` to terminate the preceding operand line.
+fn emitGuideBreak(writer: *std.Io.Writer, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+    try writer.writeByte('\n');
+    try writeGuide(writer, cc, use_color); // chunk left margin
+    try writer.writeAll("        "); // blank offset column
+    if (show_bytes) {
+        var c: u16 = 0;
+        while (c < bytes_per_line) : (c += 1) try writer.writeAll("   ");
+    }
+    try writer.writeByte(' '); // gap column between the bytes and the gutter
+    for (guides) |gc| try writeTreeGuide(writer, gc, .vert, use_color);
+}
+
 /// Render one operand line at `off` under `guides` (ancestor colors), then
 /// advance `off` past its bytes. Bytes stay in their fixed column (aligned under
 /// the opcode byte); the hierarchy guides sit in the mnemonic gutter to the
@@ -409,7 +545,7 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, use_color
 /// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
-fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, ends_group: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     const base = off.*;
     const total = line.total();
     line.paint(seq);
@@ -427,25 +563,23 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
             }
         }
         try writer.writeByte(' '); // gap column between the bytes and the gutter
-        // Tree gutter (`last_mask` bit i = level i is its group's last member):
-        // this node's level gets ├/└ on its content row and │/blank on wrapped
-        // continuation rows; ancestor levels get │, or blank once their branch
-        // has closed — so a guide never dangles past the last line of a group.
-        for (guides, 0..) |gc, gi| {
-            // A level's bar covers all its members' content rows (r == 0); it
-            // only goes blank on the wrapped continuation rows once its subtree
-            // has ended (`last_mask` bit i set), so it never dangles.
-            const is_last = (last_mask >> @intCast(gi)) & 1 == 1;
-            const kind: GuideKind = if (r != 0 and is_last) .blank else .vert;
+        // Tree gutter: every ancestor level draws a vertical bar `│` down the
+        // gutter. A level's bar must not dangle past its last member, so on the
+        // wrapped continuation rows (r != 0) of the line that *ends* the group
+        // we blank all the bars. Only records that wrap (position lists) ever
+        // hit r != 0, and there both this level and its parent close together —
+        // one `ends_group` bool covers every case.
+        for (guides) |gc| {
+            const kind: GuideKind = if (r != 0 and ends_group) .blank else .vert;
             try writeTreeGuide(writer, gc, kind, use_color);
         }
         if (r != 0) continue; // continuation rows: bytes + gutter only
         for (line.toks[0..line.n]) |t| {
             if (use_color) {
-                if (t.colored and t.len > 0) {
+                if (t.colored) {
                     try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
                 } else {
-                    try writer.writeAll("\x1b[2m");
+                    try writer.writeAll("\x1b[2m"); // structural / comment text: dim
                 }
             }
             try writer.writeAll(t.text);
@@ -455,30 +589,96 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
     off.* += total;
 }
 
-/// `chunk 0x{id} [name]`, the id bytes and hex tinted together.
-fn emitChunkLine(writer: *std.Io.Writer, code: []const u8, off: *usize, id_len: u16, id: ChunkId, symbols: Symbols, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
-    var l = Line{};
-    l.glue("chunk ", .{});
-    l.group(0, id_len, "0x{x}", .{id});
-    if (chunkNameOf(symbols, id)) |name| l.glue(" {s}", .{name});
-    // The chunk id is always the first of several operands, never the last.
-    try emitLine(writer, code, off, &l, seq, guides, 0, cc, show_bytes, use_color);
+/// Whether a chunk-id-carrying op uses the wide (u32) id form.
+fn chunkIdWide(op: OpCode) bool {
+    return switch (op) {
+        .clos_w, .clos_cap_w, .thk_w, .thk_eag_w, .thk_arg => true,
+        else => false,
+    };
 }
 
-/// A `{count} {label}` line (count is a u16 at `off`). `last` = is this the
-/// instruction's last direct operand (→ `└` vs `├`).
-fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, last: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+/// Build the *head* operand — the scalar accessor(s) the mnemonic line carries
+/// (a chunk id, or an attrset's entry/position counts) — as a `Line` whose byte
+/// offsets are relative to the opcode byte (byte 0). Returns the number of
+/// operand bytes consumed (so the list tail starts at opcode + 1 + head_len).
+fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symbols) u16 {
+    switch (op) {
+        .clos, .clos_w, .clos_cap, .clos_cap_w, .thk, .thk_w, .thk_eag, .thk_eag_w, .thk_arg, .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
+            const wide = chunkIdWide(op);
+            const id_len: u16 = if (wide) 4 else 2;
+            const id: ChunkId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
+            l.groupPinned(1, id_len, objColor(id), "0x{x}", .{id});
+            l.glue(" ; ", .{});
+            l.tint(objColor(id), "chunk[0x{x}]", .{id});
+            if (chunkNameOf(symbols, id)) |name| l.tint(name_color, " {s}", .{name});
+            return id_len;
+        },
+        .attrs_new_pos, .attrs_new_pos_srt => {
+            const entries = readU16(code, start + 1);
+            const positions = readU16(code, start + 3);
+            l.group(1, 2, "#{d}", .{entries});
+            l.glue(" ", .{});
+            l.group(3, 2, "#{d}", .{positions});
+            l.glue(" ; {d} entries, {d} positions", .{ entries, positions });
+            return 4;
+        },
+        .thk_defer => {
+            const id = readU32(code, start + 1);
+            l.group(1, 4, "#{d}", .{id});
+            l.glue(" ; deferred", .{});
+            return 4;
+        },
+        else => return 0,
+    }
+}
+
+/// Render a multiline op's mnemonic row: byte column (opcode + head bytes,
+/// colored to match) then the mnemonic and the inline head operand. `head` is
+/// from `buildHead`; `head_len` its operand byte count.
+fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, show_bytes: bool, use_color: bool) !void {
+    head.paint(seq);
+    if (show_bytes) {
+        var c: u16 = 0;
+        while (c < bytes_per_line) : (c += 1) {
+            if (c == 0) {
+                try writeByteCellColored(writer, code[start], byteRgb(code[start]), use_color);
+            } else if (c <= head_len) {
+                try writeByteCellColored(writer, code[start + c], head.colorAt(c), use_color);
+            } else {
+                try writer.writeAll("   ");
+            }
+        }
+    }
+    try writer.writeByte(' '); // gap between bytes and the mnemonic
+    try writeMnemonic(writer, op, use_color);
+    for (head.toks[0..head.n]) |t| {
+        if (use_color) {
+            if (t.colored) {
+                try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
+            } else {
+                try writer.writeAll("\x1b[2m");
+            }
+        }
+        try writer.writeAll(t.text);
+    }
+    if (use_color) try writer.writeAll("\x1b[0m");
+    // No trailing newline: the first tail row's leading `\n` terminates this
+    // line (or the caller's final `\n` does, when there are no tail rows).
+}
+
+/// A `{count} {label}` line (count is a u16 at `off`). Fits one row — never
+/// wraps — so its guides never blank on a continuation.
+fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     var l = Line{};
     l.group(0, 2, "{d}", .{readU16(code, off.*)});
-    l.glue(" {s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, @intFromBool(last), cc, show_bytes, use_color);
+    l.glue(" ; {s}", .{label});
+    try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
 /// each a child line under `guides`, tinting `local`/`upvalue` with the kind
-/// byte and the index with its bytes. `parent_last` = whether the enclosing
-/// count line is the instruction's last operand (so the ancestor branch closes).
-fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, parent_last: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+/// byte and the index with its bytes. Each descriptor fits one row.
+fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     var k: usize = 0;
     while (k < n) : (k += 1) {
         var l = Line{};
@@ -486,8 +686,7 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         l.glue("[", .{});
         l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
         l.glue("]", .{});
-        const mask: u8 = @as(u8, @intFromBool(parent_last)) | (@as(u8, @intFromBool(k == n - 1)) << 1);
-        try emitLine(writer, code, off, &l, seq, guides, mask, cc, show_bytes, use_color);
+        try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
     }
 }
 
@@ -497,13 +696,14 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
 /// the fallback comment for opcodes without a bespoke breakdown and as a guard:
 /// any bytes a bespoke arm fails to consume are dumped as a trailing field so a
 /// miscount can never bleed into the next instruction.
-fn writeOperandFields(
+fn writeOperandTail(
     writer: *std.Io.Writer,
     chunk: *const Chunk,
     op: OpCode,
     ip: usize,
     end_ip: usize,
     operand_text: []const u8,
+    seq: *usize,
     symbols: Symbols,
     cc: [3]u8,
     show_bytes: bool,
@@ -511,107 +711,89 @@ fn writeOperandFields(
 ) !void {
     const code = chunk.code;
     var off = ip;
-    // Per-instruction color counter, seeded from the opcode so the mnemonic
-    // (byteRgb == hueColor of the opcode) and the operands form one golden-angle
-    // sequence — adjacent parts always differ.
-    var seq: usize = @intFromEnum(op) + 1;
-    // Ancestor guide colors: level 0 is the mnemonic, deeper levels are the
-    // count lines that a capture/position list hangs under. Direct operands use
-    // `g[0..1]`; list members use `g[0..2]` with the count's color at `g[1]`.
+    // Guide colors: level 0 is the mnemonic (byteRgb of the opcode); list
+    // members hang a level deeper under a count line whose color is g[1].
     var g: [3][3]u8 = undefined;
     g[0] = byteRgb(@intFromEnum(op));
     switch (op) {
-        .closure, .closure_long => {
-            const wide = op == .closure_long;
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitChunkLine(writer, code, &off, id_len, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
-            var l = Line{};
-            l.group(0, 2, "{d}", .{readU16(code, off)});
-            l.glue(" upvalues (from stack)", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color); // last operand
+        .clos, .clos_w => {
+            // The chunk id rode the mnemonic line; only the upvalue count remains.
+            try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], cc, show_bytes, use_color);
         },
-        .thunk_captures, .thunk_captures_eager, .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
-            const wide = op == .thunk_captures_long or op == .thunk_captures_eager_long or op == .apply_arg;
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitChunkLine(writer, code, &off, id_len, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
+        .thk, .thk_eag, .thk_w, .thk_eag_w, .thk_arg, .clos_cap, .clos_cap_w => {
             const n = readU16(code, off);
-            g[1] = hueColor(seq); // the "captures" count line's color
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], true, cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], true, cc, show_bytes, use_color);
+            g[1] = hueColor(seq.*); // the "captures" count line's color
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], cc, show_bytes, use_color);
         },
-        .closure_captures, .closure_captures_long => {
-            const wide = op == .closure_captures_long;
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitChunkLine(writer, code, &off, id_len, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
+        .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const n = readU16(code, off);
-            g[1] = hueColor(seq);
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], true, cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], true, cc, show_bytes, use_color);
-        },
-        .thunk_captures_store_local, .thunk_captures_store_cell_local, .thunk_captures_eager_store_local, .thunk_captures_eager_store_cell_local => {
-            const id: ChunkId = @intCast(readU16(code, off));
-            try emitChunkLine(writer, code, &off, 2, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
-            const n = readU16(code, off);
-            g[1] = hueColor(seq);
-            // The slot follows the captures, so the captures group is NOT last.
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], false, cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], false, cc, show_bytes, use_color);
+            g[1] = hueColor(seq.*);
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], cc, show_bytes, use_color);
+            // The captures sublist (depth 2) just ended; break before the store
+            // target, but keep the level-1 guide (g[0]) unbroken.
+            if (n > 0) try emitGuideBreak(writer, g[0..1], cc, show_bytes, use_color);
             var l = Line{};
             l.glue("→ local[", .{});
             l.group(0, 1, "{d}", .{code[off]});
             l.glue("]", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color); // last operand
+            try emitLine(writer, code, &off, &l, seq, g[0..1], false, cc, show_bytes, use_color);
         },
-        .build_attrs_with_pos, .build_attrs_with_pos_sorted => {
-            try emitCountLine(writer, code, &off, "entries", &seq, g[0..1], false, cc, show_bytes, use_color);
-            const pos_count = readU16(code, off);
-            g[1] = hueColor(seq); // the "positions" count line's color
-            try emitCountLine(writer, code, &off, "positions", &seq, g[0..1], true, cc, show_bytes, use_color);
+        .attrs_new_pos, .attrs_new_pos_srt => {
+            // Entry/position counts rode the mnemonic line; the positions count
+            // is the last 2 head bytes (`off - 2`). Each record hangs at level 1.
+            const pos_count = readU16(code, off - 2);
             var k: usize = 0;
             while (k < pos_count) : (k += 1) {
-                // 16-byte record: name id, file id, line, column (u32 LE each).
-                // Shown name / line:col / basename — each tinted by its bytes,
-                // so display order can differ from byte order (color is the link).
-                // Wrapped 4 bytes/row (one u32 field per row), comment on row 0.
+                // 16-byte record: name id, file id, line, col (u32 LE each). Each
+                // value shows uncommented in its own color (byte-linked), split
+                // across the record's two 8-byte rows: name+file, then line+col.
                 const nm: InternId = readU32(code, off);
                 const fl: InternId = readU32(code, off + 4);
                 const ln = readU32(code, off + 8);
                 const cl = readU32(code, off + 12);
-                var l = Line{};
-                l.glue("[{d}] ", .{k});
-                if (symbols.internName(nm)) |s| l.group(0, 4, "\"{s}\"", .{s}) else l.group(0, 4, "0x{x}", .{nm});
-                l.glue(" @ ", .{});
-                if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file 0x{x}", .{fl});
-                l.glue(":", .{});
-                l.group(8, 4, "{d}", .{ln});
-                l.glue(":", .{});
-                l.group(12, 4, "{d}", .{cl});
-                // Both the positions branch and the enclosing operand branch end
-                // at the last record, so their bars stop on its continuation rows.
-                const mask: u8 = if (k == pos_count - 1) 0b11 else 0;
-                try emitLine(writer, code, &off, &l, &seq, g[0..2], mask, cc, show_bytes, use_color);
+                // Row 1 — name id + file id, comment resolves the interned string.
+                var s1: [256]u8 = undefined;
+                var w1: std.Io.Writer = .fixed(&s1);
+                w1.print("heap[0x{x}] → ", .{nm}) catch {};
+                if (symbols.internName(nm)) |s| {
+                    w1.writeAll("str \"") catch {};
+                    writeEscapedSnippet(&w1, s, 24) catch {};
+                    w1.writeByte('"') catch {};
+                } else w1.writeByte('?') catch {};
+                var l1 = Line{};
+                l1.group(0, 4, "0x{x}", .{nm});
+                l1.glue(" ", .{});
+                l1.group(4, 4, "0x{x}", .{fl});
+                l1.glue(" ; {s}", .{s1[0..w1.end]});
+                try emitLine(writer, code, &off, &l1, seq, g[0..1], false, cc, show_bytes, use_color);
+                // Row 2 — line + col, comment is the source location.
+                var s2: [256]u8 = undefined;
+                var w2: std.Io.Writer = .fixed(&s2);
+                w2.writeAll("@ ") catch {};
+                if (symbols.internName(fl)) |f| w2.writeAll(std.fs.path.basename(f)) catch {} else w2.print("file[0x{x}]", .{fl}) catch {};
+                w2.print(":{d}:{d}", .{ ln, cl }) catch {};
+                var l2 = Line{};
+                l2.group(0, 4, "0x{x}", .{ln});
+                l2.glue(" ", .{});
+                l2.group(4, 4, "0x{x}", .{cl});
+                l2.glue(" ; {s}", .{s2[0..w2.end]});
+                try emitLine(writer, code, &off, &l2, seq, g[0..1], false, cc, show_bytes, use_color);
             }
         },
-        .defer_attr_value => {
-            var l = Line{};
-            l.glue("deferred #", .{});
-            l.group(0, 4, "{d}", .{readU32(code, off)});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], 0, cc, show_bytes, use_color); // env follows
+        .thk_defer => {
             const env = readU16(code, off);
-            g[1] = hueColor(seq);
-            try emitCountLine(writer, code, &off, "env", &seq, g[0..1], true, cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, env, &seq, g[0..2], true, cc, show_bytes, use_color);
+            g[1] = hueColor(seq.*);
+            try emitCountLine(writer, code, &off, "env", seq, g[0..1], cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, env, seq, g[0..2], cc, show_bytes, use_color);
         },
         else => {
-            // No bespoke breakdown: the whole operand is one group, labelled
-            // with the compact decode.
+            // No bespoke breakdown: dump the whole tail as one group.
             if (end_ip > off) {
                 var l = Line{};
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], true, cc, show_bytes, use_color);
             }
         },
     }
@@ -619,7 +801,7 @@ fn writeOperandFields(
     if (off < end_ip) {
         var l = Line{};
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color);
+        try emitLine(writer, code, &off, &l, seq, g[0..1], true, cc, show_bytes, use_color);
     }
 }
 
@@ -627,22 +809,22 @@ fn writeOperandFields(
 /// across multiple indented rows; everything else fits on one line.
 fn isMultiline(op: OpCode) bool {
     return switch (op) {
-        .closure,
-        .closure_long,
-        .thunk_captures,
-        .thunk_captures_eager,
-        .thunk_captures_long,
-        .thunk_captures_eager_long,
-        .apply_arg,
-        .closure_captures,
-        .closure_captures_long,
-        .thunk_captures_store_local,
-        .thunk_captures_store_cell_local,
-        .thunk_captures_eager_store_local,
-        .thunk_captures_eager_store_cell_local,
-        .build_attrs_with_pos,
-        .build_attrs_with_pos_sorted,
-        .defer_attr_value,
+        .clos,
+        .clos_w,
+        .thk,
+        .thk_eag,
+        .thk_w,
+        .thk_eag_w,
+        .thk_arg,
+        .clos_cap,
+        .clos_cap_w,
+        .thk_st,
+        .thk_st_cell,
+        .thk_eag_st,
+        .thk_eag_st_cell,
+        .attrs_new_pos,
+        .attrs_new_pos_srt,
+        .thk_defer,
         => true,
         else => false,
     };
@@ -651,7 +833,7 @@ fn isMultiline(op: OpCode) bool {
 fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
     if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ cc[0], cc[1], cc[2] });
     if (chunk_id) |id| {
-        try writer.print("chunk 0x{x}", .{id});
+        try writer.print("chunk[0x{x}]", .{id});
     } else {
         try writer.writeAll("chunk");
     }
@@ -659,14 +841,10 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     // Best-effort compiler-attributed name (the binding a lambda/thunk was
     // compiled for), when name capture was on. See ChunkRegistry.recordName.
     if (chunk_id) |id| {
-        if (symbols.registry) |reg| {
-            if (reg.nameOf(id)) |name_id| {
-                if (symbols.internName(name_id)) |name| {
-                    if (use_color) try writer.writeAll("\x1b[1;32m");
-                    try writer.print(" {s}", .{name});
-                    if (use_color) try writer.writeAll("\x1b[0m");
-                }
-            }
+        if (chunkNameOf(symbols, id)) |name| {
+            if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
+            try writer.print(" {s}", .{name});
+            if (use_color) try writer.writeAll("\x1b[0m");
         }
     }
     try writer.print(" ({d} bytes, {d} consts, {d} locals", .{
@@ -713,10 +891,10 @@ fn chunkNameOf(symbols: Symbols, id: ChunkId) ?[]const u8 {
     return symbols.internName(name_id);
 }
 
-/// `chunk 0x{id}` followed by its best-effort name when known, so a reference
-/// reads `chunk 0x62 fetchGit` rather than a bare id.
+/// `chunk[0x{id}]` followed by its best-effort name when known, so a reference
+/// reads `chunk[0x62] fetchGit` rather than a bare id.
 fn writeChunkRef(writer: *std.Io.Writer, id: ChunkId, symbols: Symbols) !void {
-    try writer.print("chunk 0x{x}", .{id});
+    try writer.print("chunk[0x{x}]", .{id});
     if (chunkNameOf(symbols, id)) |name| try writer.print(" {s}", .{name});
 }
 
@@ -731,47 +909,47 @@ fn writeOperands(
     var ip = ip_in;
     const code = chunk.code;
     switch (op) {
-        .constant, .constant_ret => {
+        .push_const, .push_const_ret => {
             const idx = readU16(code, ip);
             ip += 2;
             try writer.print("#{d}", .{idx});
             if (idx < chunk.constants.len) {
-                try writer.writeAll("  // ");
-                try writeValueDigest(writer, chunk.constants[idx], symbols);
+                try writer.writeAll(" ; ");
+                try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, false);
             }
         },
         .push_null, .push_true, .push_false, .pop => {},
 
-        .get_local, .set_local, .capture_local, .init_cell_slot, .get_local_ret => {
+        .loc_get, .loc_set, .loc_grab, .cell_init, .loc_get_ret => {
             const slot = code[ip];
             ip += 1;
-            try writer.print("local[{d}]", .{slot});
+            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
         },
-        .get_local_long, .set_local_long, .capture_local_long, .set_cell_local_long, .init_cell_slot_long, .get_local_ret_long => {
+        .loc_get_w, .loc_set_w, .loc_grab_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => {
             const slot = readU16(code, ip);
             ip += 2;
-            try writer.print("local[{d}]", .{slot});
+            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
         },
-        .set_cell_local => {
+        .cell_set => {
             const slot = code[ip];
             ip += 1;
-            try writer.print("local[{d}]", .{slot});
+            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
         },
-        .capture_upvalue, .get_upvalue, .get_upvalue_ret => {
+        .up_grab, .up_get, .up_get_ret => {
             const slot = readU16(code, ip);
             ip += 2;
-            try writer.print("upvalue[{d}]", .{slot});
+            try writer.print("#{d} ; upvalue[{d}]", .{ slot, slot });
         },
 
-        .add_int, .sub_int, .mul_int, .div_int, .negate_int,
-        .add_float, .sub_float, .mul_float, .div_float,
-        .eq, .neq, .eq_null, .neq_null, .lt, .lte, .gt, .gte, .not,
-        .fail_assertion, .push_builtins,
-        .merge_attrs, .merge_attrs_strict, .concat_lists,
-        .get_attr_dynamic,
-        .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
+        .int_add, .int_sub, .int_mul, .int_div, .int_neg,
+        .flt_add, .flt_sub, .flt_mul, .flt_div,
+        .cmp_eq, .cmp_ne, .cmp_eq_null, .cmp_ne_null, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge, .bool_not,
+        .fail, .push_builtins,
+        .attrs_merge, .attrs_merge_strict, .list_cat,
+        .attr_get_dyn,
+        .call, .call_tail, .cell_new, .thk_shell, .ret, .halt => {},
 
-        .call_n, .tail_call_n => {
+        .call_n, .call_tail_n => {
             const n = code[ip];
             ip += 1;
             try writer.print("{d} args", .{n});
@@ -780,20 +958,20 @@ fn writeOperands(
         .jump => {
             const off = readU32(code, ip);
             ip += 4;
-            try writer.print("+{d}  // -> {x:0>4}", .{ off, ip + off });
+            try writer.print("+{d} ; → {x:0>4}", .{ off, ip + off });
         },
-        .jump_if_false => {
+        .jump_false => {
             const off = readU32(code, ip);
             ip += 4;
-            try writer.print("+{d}  // -> {x:0>4}", .{ off, ip + off });
+            try writer.print("+{d} ; → {x:0>4}", .{ off, ip + off });
         },
 
-        .build_attrs, .build_attrs_sorted => {
+        .attrs_new, .attrs_new_srt => {
             const n = readU16(code, ip);
             ip += 2;
             try writer.print("{d} entries", .{n});
         },
-        .build_attrs_with_pos, .build_attrs_with_pos_sorted => {
+        .attrs_new_pos, .attrs_new_pos_srt => {
             const n = readU16(code, ip);
             ip += 2;
             const pos_count = readU16(code, ip);
@@ -801,31 +979,31 @@ fn writeOperands(
             try writer.print("{d} entries, {d} positions", .{ n, pos_count });
             ip += @as(usize, pos_count) * 16;
         },
-        .build_list => {
+        .list_new => {
             const n = readU16(code, ip);
             ip += 2;
             try writer.print("{d} items", .{n});
         },
-        .concat_strings => {
+        .str_cat => {
             const n = readU16(code, ip);
             ip += 2;
             try writer.print("{d} parts", .{n});
         },
 
-        .find_file => {
+        .file_find => {
             const id: InternId = @intCast(readU16(code, ip));
             ip += 2;
             try writeInternRef(writer, id, symbols);
         },
-        .find_file_long => {
+        .file_find_w => {
             const id: InternId = readU32(code, ip);
             ip += 4;
             try writeInternRef(writer, id, symbols);
         },
 
-        .closure => {
-            // `.closure` carries no inline capture descriptors (captures come
-            // off the stack); `.closure_captures`/`.thunk_captures*` do.
+        .clos => {
+            // `.clos` carries no inline capture descriptors (captures come
+            // off the stack); `.clos_cap`/`.thk*` do.
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -834,7 +1012,7 @@ fn writeOperands(
             try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thunk_captures, .thunk_captures_eager => {
+        .thk, .thk_eag => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -844,7 +1022,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thunk_captures_store_local, .thunk_captures_store_cell_local, .thunk_captures_eager_store_local, .thunk_captures_eager_store_cell_local => {
+        .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -857,7 +1035,7 @@ fn writeOperands(
             try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .closure_long => {
+        .clos_w => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -866,7 +1044,7 @@ fn writeOperands(
             try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
+        .thk_w, .thk_eag_w, .thk_arg => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -876,7 +1054,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .closure_captures => {
+        .clos_cap => {
             const id: ChunkId = @intCast(readU16(code, ip));
             ip += 2;
             const upvalues = readU16(code, ip);
@@ -886,7 +1064,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .closure_captures_long => {
+        .clos_cap_w => {
             const id: ChunkId = readU32(code, ip);
             ip += 4;
             const upvalues = readU16(code, ip);
@@ -896,7 +1074,7 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .defer_attr_value => {
+        .thk_defer => {
             // Operand: 4-byte deferred-table id, 2-byte env count, then
             // env_count capture descriptors. No chunk id (compiled lazily).
             const id: u32 = readU32(code, ip);
@@ -907,53 +1085,50 @@ fn writeOperands(
             ip += @as(usize, env_count) * 3;
         },
 
-        .get_attr => {
+        .attr_get => {
             const id: InternId = @intCast(readU16(code, ip));
             ip += 2;
             try writeInternRef(writer, id, symbols);
         },
-        .get_attr_long => {
+        .attr_get_w => {
             const id: InternId = readU32(code, ip);
             ip += 4;
             try writeInternRef(writer, id, symbols);
         },
-        .get_upvalue_attr => {
+        .up_get_attr => {
             const slot = readU16(code, ip);
             const id: InternId = @intCast(readU16(code, ip + 2));
             ip += 4;
-            try writer.print("upvalue[{d}].", .{slot});
-            try writeInternRef(writer, id, symbols);
+            try writeSlotAttr(writer, "upvalue", slot, id, symbols);
         },
-        .get_local_attr => {
+        .loc_get_attr => {
             const slot = code[ip];
             const id: InternId = @intCast(readU16(code, ip + 1));
             ip += 3;
-            try writer.print("local[{d}].", .{slot});
-            try writeInternRef(writer, id, symbols);
+            try writeSlotAttr(writer, "local", slot, id, symbols);
         },
-        .get_local_attr_long => {
+        .loc_get_attr_w => {
             const slot = readU16(code, ip);
             const id: InternId = @intCast(readU16(code, ip + 2));
             ip += 4;
-            try writer.print("local[{d}].", .{slot});
-            try writeInternRef(writer, id, symbols);
+            try writeSlotAttr(writer, "local", slot, id, symbols);
         },
-        .get_attr_dynamic_or => {
+        .attr_get_dyn_or => {
             try writer.writeAll("(dynamic, with default)");
         },
-        .get_attr_path_or, .get_attr_path_dynamic_or, .has_attr_path => {
+        .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => {
             const segments = code[ip];
             ip += 1;
             ip += @as(usize, segments) * 2;
             try writeAttrPath(writer, code, ip - @as(usize, segments) * 2, segments, false, symbols);
         },
-        .get_attr_path_or_long, .get_attr_path_dynamic_or_long, .has_attr_path_long => {
+        .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => {
             const segments = code[ip];
             ip += 1;
             ip += @as(usize, segments) * 4;
             try writeAttrPath(writer, code, ip - @as(usize, segments) * 4, segments, true, symbols);
         },
-        .get_attr_path_mixed_or, .has_attr_path_mixed => {
+        .attr_get_path_mix_or, .attr_has_path_mix => {
             const segments = code[ip];
             ip += 1;
             const dynamic = code[ip];
@@ -965,7 +1140,7 @@ fn writeOperands(
                 if (tag == 0) ip += 4;
             }
         },
-        .validate_attrs => {
+        .attr_check => {
             const allow = code[ip];
             ip += 1;
             const expected = readU16(code, ip);
@@ -973,7 +1148,7 @@ fn writeOperands(
             try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
             ip += @as(usize, expected) * 2;
         },
-        .validate_attrs_long => {
+        .attr_check_w => {
             const allow = code[ip];
             ip += 1;
             const expected = readU16(code, ip);
@@ -981,7 +1156,7 @@ fn writeOperands(
             try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
             ip += @as(usize, expected) * 4;
         },
-        .lookup_with => {
+        .with_lookup => {
             const id: InternId = @intCast(readU16(code, ip));
             ip += 2;
             const scopes = code[ip];
@@ -989,7 +1164,7 @@ fn writeOperands(
             try writeInternRef(writer, id, symbols);
             try writer.print(" ({d} scopes)", .{scopes});
         },
-        .lookup_with_long => {
+        .with_lookup_w => {
             const id: InternId = readU32(code, ip);
             ip += 4;
             const scopes = code[ip];
@@ -1031,11 +1206,22 @@ fn writeAttrPath(
     try writer.writeByte('"');
 }
 
+/// A fused slot-plus-attribute operand (`loc_get_attr`/`up_get_attr`): the two
+/// raw values (slot index, name id) as the value, with `role[slot]."name"` as
+/// the dimmed interpretation.
+fn writeSlotAttr(writer: *std.Io.Writer, role: []const u8, slot: u16, id: InternId, symbols: Symbols) !void {
+    if (symbols.internName(id)) |name| {
+        try writer.print("#{d} 0x{x} ; {s}[{d}].\"{s}\"", .{ slot, id, role, slot, name });
+    } else {
+        try writer.print("#{d} 0x{x} ; {s}[{d}]", .{ slot, id, role, slot });
+    }
+}
+
+/// An interned-name operand: the raw id as the value, the resolved text as the
+/// dimmed ` ; "name"` interpretation (or just the id when unresolved).
 fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void {
     if (symbols.internName(id)) |name| {
-        try writer.writeByte('"');
-        try writer.writeAll(name);
-        try writer.print("\" (0x{x})", .{id});
+        try writer.print("0x{x} ; \"{s}\"", .{ id, name });
     } else {
         try writer.print("0x{x}", .{id});
     }
@@ -1085,46 +1271,61 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_c
 
 /// The right-hand `; line:col+len` position annotation — the position within the
 /// current file (whose name is on its own hoisted line).
-fn writePosColumn(writer: *std.Io.Writer, span: Chunk.SourceSpan, use_color: bool) !void {
-    if (use_color) try writer.writeAll("\x1b[2m");
-    try writer.print("   ; {d}:{d}+{d}", .{ span.line, span.column, span.len });
-    if (use_color) try writer.writeAll("\x1b[0m");
-}
-
-fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols) !void {
+/// `type value` digest of a constant. `store` prepends the backing `heap[0xN]`
+/// accessor for interned strings/paths (used in the pool table, where the
+/// accessor matters); inline references leave it off. `max` caps string length.
+fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, store: bool) !void {
     switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
         .bool_false => try writer.writeAll("false"),
-        .int => try writer.print("{d}", .{value.asInt()}),
-        .float => try writer.print("{d}", .{value.asFloat()}),
-        .string => try writeStringRef(writer, "str", value.asInternId(), symbols),
-        .path => try writeStringRef(writer, "path", value.asInternId(), symbols),
-        .list => try writer.print("list 0x{x}", .{value.asObjectId()}),
-        .attrs => try writer.print("attrs 0x{x}", .{value.asObjectId()}),
-        .closure => try writer.print("closure 0x{x}", .{value.asObjectId()}),
-        .thunk => try writer.print("thunk 0x{x}", .{value.asObjectId()}),
-        .builtin => try writer.print("builtin 0x{x}", .{value.asBuiltinId()}),
-        .builtin_closure => try writer.print("builtin_closure 0x{x}", .{value.asObjectId()}),
-        .string_context => try writer.print("string_ctx 0x{x}", .{value.asObjectId()}),
-        .boxed_int => try writer.print("boxed_int 0x{x}", .{value.asObjectId()}),
-        .partial_app => try writer.print("partial_app 0x{x}", .{value.asObjectId()}),
+        .int => try writer.print("int {d}", .{value.asInt()}),
+        .float => try writer.print("float {d}", .{value.asFloat()}),
+        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, store),
+        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, store),
+        .list => try writer.print("list[0x{x}]", .{value.asObjectId()}),
+        .attrs => try writer.print("attrs[0x{x}]", .{value.asObjectId()}),
+        .closure => try writer.print("closure[0x{x}]", .{value.asObjectId()}),
+        .thunk => try writer.print("thunk[0x{x}]", .{value.asObjectId()}),
+        .builtin => try writer.print("builtin[0x{x}]", .{value.asBuiltinId()}),
+        .builtin_closure => try writer.print("builtin_closure[0x{x}]", .{value.asObjectId()}),
+        .string_context => try writer.print("string_ctx[0x{x}]", .{value.asObjectId()}),
+        .boxed_int => try writer.print("boxed_int[0x{x}]", .{value.asObjectId()}),
+        .partial_app => try writer.print("partial_app[0x{x}]", .{value.asObjectId()}),
     }
 }
 
-fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols) !void {
+fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, store: bool) !void {
+    if (store) try writer.print("heap[0x{x}] ", .{id});
     if (symbols.internName(id)) |text| {
         try writer.print("{s} \"", .{kind});
-        try writeEscapedSnippet(writer, text, 40);
-        try writer.print("\" (0x{x})", .{id});
-    } else {
+        try writeEscapedSnippet(writer, text, max);
+        try writer.writeByte('"');
+    } else if (!store) {
         try writer.print("{s} 0x{x}", .{ kind, id });
+    } else {
+        try writer.writeAll(kind);
     }
 }
 
+/// Escape a string for display, truncating in the MIDDLE (`head…tail`) when
+/// over `max_len` — a path or store key's ends are the informative parts, so
+/// keeping both beats a trailing `...`.
 fn writeEscapedSnippet(writer: *std.Io.Writer, text: []const u8, max_len: usize) !void {
-    const len = @min(text.len, max_len);
-    for (text[0..len]) |c| {
+    if (text.len <= max_len) {
+        try escapeRun(writer, text);
+        return;
+    }
+    const keep = if (max_len > 1) max_len - 1 else 1;
+    const head = (keep + 1) / 2;
+    const tail = keep - head;
+    try escapeRun(writer, text[0..head]);
+    try writer.writeAll("…");
+    if (tail > 0) try escapeRun(writer, text[text.len - tail ..]);
+}
+
+fn escapeRun(writer: *std.Io.Writer, text: []const u8) !void {
+    for (text) |c| {
         switch (c) {
             '\\' => try writer.writeAll("\\\\"),
             '"' => try writer.writeAll("\\\""),
@@ -1134,7 +1335,6 @@ fn writeEscapedSnippet(writer: *std.Io.Writer, text: []const u8, max_len: usize)
             else => try writer.writeByte(c),
         }
     }
-    if (text.len > max_len) try writer.writeAll("...");
 }
 
 fn readU16(code: []const u8, ip: usize) u16 {
@@ -1152,12 +1352,12 @@ test "disassembling a chunk prints arithmetic opcode names and jump targets" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    // get_local 0; get_local 1; add_int; jump +0; ret; halt
-    try builder.writeOp(allocator, .get_local);
+    // loc_get 0; loc_get 1; int_add; jump +0; ret; halt
+    try builder.writeOp(allocator, .loc_get);
     try builder.writeByte(allocator, 0);
-    try builder.writeOp(allocator, .get_local);
+    try builder.writeOp(allocator, .loc_get);
     try builder.writeByte(allocator, 1);
-    try builder.writeOp(allocator, .add_int);
+    try builder.writeOp(allocator, .int_add);
     try builder.writeOp(allocator, .jump);
     try builder.writeU32(allocator, 0);
     try builder.writeOp(allocator, .ret);
@@ -1172,9 +1372,9 @@ test "disassembling a chunk prints arithmetic opcode names and jump targets" {
     try writeChunk(&out.writer, 7, &chunk, .{}, .{});
     const text = out.written();
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "chunk 0x7") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "get_local") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "add_int") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "chunk[0x7]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "loc_get") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "int_add") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "local[0]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "local[1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "jump") != null);
@@ -1217,7 +1417,7 @@ test "disassembling resolves an interned attribute name via Symbols" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .get_attr);
+    try builder.writeOp(allocator, .attr_get);
     try builder.writeU16(allocator, @intCast(name_id));
     try builder.writeOp(allocator, .ret);
     try builder.writeOp(allocator, .halt);
@@ -1231,7 +1431,7 @@ test "disassembling resolves an interned attribute name via Symbols" {
     try writeChunk(&out.writer, null, &chunk, .{ .intern = &intern }, .{});
     const text = out.written();
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "get_attr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "attr_get") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"myAttr\"") != null);
 }
 

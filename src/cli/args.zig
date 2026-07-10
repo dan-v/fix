@@ -391,8 +391,8 @@ const specs = [_]Spec{
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
 
     // Disasm.
-    .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (follows imports and lazy attr bodies)", .show_in = &.{.disasm} },
-    .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk #N (default: all reachable)", .show_in = &.{.disasm} },
+    .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (imports + whatever evaluation forces)", .show_in = &.{.disasm} },
+    .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk N (decimal or 0x hex, as\nshown in chunk headers; default: all reachable)", .show_in = &.{.disasm} },
     .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
     .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
     .{ .id = .no_pager, .long = "--no-pager", .help = "do not pipe output to $PAGER", .show_in = &.{.disasm} },
@@ -713,7 +713,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
         error.InvalidWorkers => "expected --workers to be a non-negative integer",
         error.InvalidMaxMemory => "expected --max-memory to be a size like 4096, 512m, or 4g",
         error.InvalidTimelineFlows => "expected --timeline-flows to be off, all, or a non-negative integer",
-        error.InvalidChunkId => "expected --chunk to be a non-negative integer",
+        error.InvalidChunkId => "expected --chunk to be a chunk id (decimal, or 0x-prefixed hex)",
         error.UnknownOption => "unknown option",
         else => @errorName(err),
     };

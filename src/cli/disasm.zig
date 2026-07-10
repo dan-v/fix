@@ -159,9 +159,11 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         // A broken pipe means a downstream reader closed early — our own $PAGER,
         // or a manual `| less` / `| head`. That's a normal exit, not an error.
         // The interface collapses the real cause into `WriteFailed`; the actual
-        // errno is stashed on the file writer.
+        // errno is stashed on the file writer. Any other write failure (e.g. the
+        // operand scratch buffer overflowing, or a full disk) is a real error and
+        // must surface — don't blanket-swallow just because a pager was spawned.
         const broken_pipe = if (stream.err) |we| we == error.BrokenPipe else false;
-        if (broken_pipe or pager != null) return 0;
+        if (broken_pipe) return 0;
         return e;
     }
     return 0;

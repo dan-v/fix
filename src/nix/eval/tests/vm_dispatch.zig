@@ -119,7 +119,7 @@ test "runIsolatedFrame round-trips a minimal constant-returning chunk" {
 fn buildJumpIfFalseTaken(b: *ChunkBuilder, a: std.mem.Allocator) !void {
     // if (false) 1 else 2  -- compiled by hand:
     //   push_false
-    //   jump_if_false -> else_branch
+    //   jump_false -> else_branch
     //   constant 1
     //   jump -> end
     // else_branch:
@@ -127,7 +127,7 @@ fn buildJumpIfFalseTaken(b: *ChunkBuilder, a: std.mem.Allocator) !void {
     // end:
     //   ret
     try b.writeOp(a, .push_false);
-    try b.writeOp(a, .jump_if_false);
+    try b.writeOp(a, .jump_false);
     const jif_operand = b.code.items.len;
     try b.writeU32(a, 0); // placeholder
     try b.emitConstant(a, Value.int(1));
@@ -147,7 +147,7 @@ fn buildJumpIfFalseTaken(b: *ChunkBuilder, a: std.mem.Allocator) !void {
 fn buildJumpIfFalseNotTaken(b: *ChunkBuilder, a: std.mem.Allocator) !void {
     // if (true) 1 else 2
     try b.writeOp(a, .push_true);
-    try b.writeOp(a, .jump_if_false);
+    try b.writeOp(a, .jump_false);
     const jif_operand = b.code.items.len;
     try b.writeU32(a, 0);
     try b.emitConstant(a, Value.int(1));
@@ -168,7 +168,7 @@ fn patchU32(b: *ChunkBuilder, offset: usize, val: u32) void {
     std.mem.writeInt(u32, b.code.items[offset..][0..4], val, .little);
 }
 
-test "jump_if_false takes the branch on a false condition" {
+test "jump_false takes the branch on a false condition" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -177,7 +177,7 @@ test "jump_if_false takes the branch on a false condition" {
     try testing.expectEqual(@as(i64, 2), result.asInt());
 }
 
-test "jump_if_false falls through on a true condition" {
+test "jump_false falls through on a true condition" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -186,14 +186,14 @@ test "jump_if_false falls through on a true condition" {
     try testing.expectEqual(@as(i64, 1), result.asInt());
 }
 
-// ---- list / attr index access (access.zig via get_attr) ----
+// ---- list / attr index access (access.zig via attr_get) ----
 
-test "get_attr selects an attribute from a hand-built attrset" {
+test "attr_get selects an attribute from a hand-built attrset" {
     var h = try Harness.init();
     defer h.deinit();
 
     // { x = 1; y = 2; }.y
-    // build_attrs expects [name1, val1, name2, val2] pairs on the stack,
+    // attrs_new expects [name1, val1, name2, val2] pairs on the stack,
     // where each name is a string Value carrying the attribute's
     // InternId (see `heap.addAttrsFromStackPairs`).
     const x_id = try h.ev.intern.intern("x");
@@ -205,9 +205,9 @@ test "get_attr selects an attribute from a hand-built attrset" {
     try builder.emitConstant(testing.allocator, Value.int(1));
     try builder.emitConstant(testing.allocator, Value.string(y_id));
     try builder.emitConstant(testing.allocator, Value.int(2));
-    try builder.writeOp(testing.allocator, .build_attrs);
+    try builder.writeOp(testing.allocator, .attrs_new);
     try builder.writeU16(testing.allocator, 2);
-    try builder.writeOp(testing.allocator, .get_attr);
+    try builder.writeOp(testing.allocator, .attr_get);
     try builder.writeU16(testing.allocator, @intCast(y_id));
     try builder.writeOp(testing.allocator, .ret);
 
@@ -223,12 +223,12 @@ fn buildListIndexViaBuiltin(b: *ChunkBuilder, a: std.mem.Allocator) !void {
     try b.emitConstant(a, Value.int(10));
     try b.emitConstant(a, Value.int(20));
     try b.emitConstant(a, Value.int(30));
-    try b.writeOp(a, .build_list);
+    try b.writeOp(a, .list_new);
     try b.writeU16(a, 3);
     try b.writeOp(a, .ret);
 }
 
-test "build_list constructs a list value from stack items" {
+test "list_new constructs a list value from stack items" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -270,7 +270,7 @@ test "merge_attrs lets the right-hand side override a colliding key" {
     try testing.expectEqual(@as(i64, 3), y_val.asInt());
 }
 
-test "merge_attrs_strict rejects a colliding non-attrs key" {
+test "attrs_merge_strict rejects a colliding non-attrs key" {
     var h = try Harness.init();
     defer h.deinit();
 
@@ -283,7 +283,7 @@ test "merge_attrs_strict rejects a colliding non-attrs key" {
     try testing.expectError(error.DuplicateAttribute, objects_mod.mergeAttrsStrict(&h.vm, left, right));
 }
 
-test "concat_lists concatenates two lists in order" {
+test "list_cat concatenates two lists in order" {
     var h = try Harness.init();
     defer h.deinit();
 

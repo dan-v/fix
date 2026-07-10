@@ -86,7 +86,7 @@ pub const Evaluator = struct {
     vm_buffers: vm_mod.BufferPool,
     builtins_value: ?Value,
     /// Whether the final render observes lazy shells (only lazy-XML).
-    /// Propagated to every VM via `initVm`; gates `make_lazy_shell`.
+    /// Propagated to every VM via `initVm`; gates `thk_shell`.
     /// Default false — the CLI sets it true only for `--xml`.
     lazy_shells_visible: bool = false,
     /// Whether the `|>`/`<|` pipe operators are permitted. They always

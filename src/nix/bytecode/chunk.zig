@@ -46,7 +46,7 @@ pub const Chunk = struct {
     /// chunk's body unconditionally forces — the multi-param analogue of
     /// `scheduling.strict_param`. The saturated `call_n` path eagerly
     /// forces these arg positions before running the body, recovering the
-    /// eager-arg optimization the single-param path gets via `apply_arg`
+    /// eager-arg optimization the single-param path gets via `thk_arg`
     /// (and avoiding lazy-thunk-chain buildup in accumulator recursion).
     /// 0 for arity-1 chunks (handled by `strict_param`) and thunk bodies.
     strict_params: u8 = 0,
@@ -97,44 +97,44 @@ pub const ChunkStrictness = struct {
 
 /// Compile-time classification of trivial chunk shapes. When a
 /// chunk's entire body is a single value-load followed by ret, we can
-/// short-circuit `thunk_captures` and skip creating a thunk altogether
+/// short-circuit `thk` and skip creating a thunk altogether
 /// — just push the inlined value at the caller. Cuts a heap alloc, a
 /// future force, a frame push/pop, and 2 dispatches per occurrence.
 pub const TrivialBody = union(enum) {
     /// Not a trivial shape — full thunk creation required.
     none,
-    /// Body is `get_upvalue_ret upvalue[N]` (or `get_upvalue N; ret`).
-    /// At thunk_captures we know upvalue N's value from the descriptor,
+    /// Body is `up_get_ret upvalue[N]` (or `up_get N; ret`).
+    /// At thk we know upvalue N's value from the descriptor,
     /// so we push that value directly instead of allocating a thunk.
     identity_upvalue: u16,
-    /// Body is `closure CL, 0; ret; halt` (or `closure_long`). The
-    /// chunk wraps a zero-upvalue closure. At thunk_captures we
+    /// Body is `clos CL, 0; ret; halt` (or `clos_w`). The
+    /// chunk wraps a zero-upvalue closure. At thk we
     /// allocate the closure directly, skipping the thunk wrapper.
     /// Each invocation still gets a fresh closure ObjectId — same as
     /// running the body — but the thunk alloc + future force vanish.
     closure_zero: ChunkId,
-    /// Body is `closure_captures CL, K, descriptors; ret; halt` with
+    /// Body is `clos_cap CL, K, descriptors; ret; halt` with
     /// K >= 1 and every inner descriptor of kind=upvalue (which is
     /// guaranteed since thunk bodies have local_count == 0). At
-    /// `thunk_captures`, the closure's upvalue values can be resolved
+    /// `thk`, the closure's upvalue values can be resolved
     /// directly: inner_upvalue[i] = outer_descriptors[inner_idx[i]]
     /// evaluated against the outer frame. We compose the two
     /// descriptor layers and build the closure in place, skipping
     /// thunk creation entirely.
     closure_captures: ClosureCaptures,
     /// Body is `push_builtins; ret; halt` — the binding aliases the
-    /// evaluator's builtins attrset. At thunk_captures we push
+    /// evaluator's builtins attrset. At thk we push
     /// `vm.builtins` directly. Common via `with builtins;` blocks and
     /// `let lib = import ...; in ...` patterns where lib transitively
     /// embeds `builtins`.
     builtins,
-    /// Body returns a compile-time-known `Value` — `constant_ret #idx`
+    /// Body returns a compile-time-known `Value` — `push_const_ret #idx`
     /// (the constant is copied out of the pool at classify time, so the
     /// short-circuit never touches the Chunk) or one of
     /// `push_null|push_true|push_false; ret; halt`. Saves one heap
     /// alloc + one thunk force per binding.
     literal: Value,
-    /// Body is `get_upvalue_attr U N; ret; halt` (7 bytes) — the
+    /// Body is `up_get_attr U N; ret; halt` (7 bytes) — the
     /// pervasive `someUpvalue.attr` thunk (`config.foo`, `lib.bar`,
     /// attrset-pattern param lookups). At thunk creation we resolve
     /// upvalue `U` from the descriptor and build a frameless
@@ -296,7 +296,7 @@ pub const ChunkBuilder = struct {
     /// Emit a constant-loading instruction (op + 2-byte index).
     pub fn emitConstant(self: *ChunkBuilder, allocator: std.mem.Allocator, val: Value) !void {
         const idx = try self.addConstant(allocator, val);
-        try self.writeOp(allocator, .constant);
+        try self.writeOp(allocator, .push_const);
         try self.writeU16(allocator, idx);
     }
 
@@ -344,7 +344,7 @@ pub const ChunkBuilder = struct {
 };
 
 /// Classify the body of a freshly-built chunk as one of the trivial
-/// shapes that let `thunk_captures` skip thunk allocation entirely.
+/// shapes that let `thk` skip thunk allocation entirely.
 /// Run once at chunk-finish; result lives on the immutable Chunk so
 /// the hot path reads it without re-parsing the bytecode.
 fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: u16) TrivialBody {
@@ -352,30 +352,30 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
     // *thunk bodies*. Thunk bodies have local_count == 0 (no args,
     // no temporaries). Closure bodies (lambdas) have local_count >= 1
     // for the param and may have additional locals. We must not
-    // short-circuit those because `thunk_captures` against a chunk
+    // short-circuit those because `thk` against a chunk
     // assumes the chunk is a thunk body, not a lambda body.
     if (local_count != 0) return .none;
     if (code.len < 2) return .none;
     const first: OpCode = @enumFromInt(code[0]);
     switch (first) {
-        // `get_upvalue_ret upvalue[N]; halt`
+        // `up_get_ret upvalue[N]; halt`
         // Layout: 1 byte op, 2 bytes upvalue idx, 1 byte halt.
-        .get_upvalue_ret => {
+        .up_get_ret => {
             if (code.len != 4) return .none;
             if (@as(OpCode, @enumFromInt(code[3])) != .halt) return .none;
             const idx = readU16Inline(code, 1);
             return .{ .identity_upvalue = idx };
         },
-        // `constant_ret #idx; halt` — 1 byte op, 2 bytes idx, 1 byte halt.
-        .constant_ret => {
+        // `push_const_ret #idx; halt` — 1 byte op, 2 bytes idx, 1 byte halt.
+        .push_const_ret => {
             if (code.len != 4) return .none;
             if (@as(OpCode, @enumFromInt(code[3])) != .halt) return .none;
             const idx = readU16Inline(code, 1);
             if (idx >= constants.len) return .none;
             return .{ .literal = constants[idx] };
         },
-        // `get_upvalue_attr U N; ret; halt` — 1 + 2 + 2 + 1 + 1 = 7 bytes.
-        .get_upvalue_attr => {
+        // `up_get_attr U N; ret; halt` — 1 + 2 + 2 + 1 + 1 = 7 bytes.
+        .up_get_attr => {
             if (code.len != 7) return .none;
             if (@as(OpCode, @enumFromInt(code[5])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[6])) != .halt) return .none;
@@ -393,7 +393,7 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
         },
         // `push_null|push_true|push_false; ret; halt` — 3 bytes.
         // The compiler doesn't fuse these into a `_ret` super-op
-        // (only `constant`/`get_upvalue`/`get_local`/`get_local_long`
+        // (only `push_const`/`up_get`/`loc_get`/`loc_get_w`
         // are fused), so without the short-circuit each binding to
         // `null`/`true`/`false` allocates a thunk whose body trivially
         // returns the literal.
@@ -409,8 +409,8 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             };
             return .{ .literal = literal };
         },
-        // `closure CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
-        .closure => {
+        // `clos CL, 0; ret; halt` — 1 op + 2 chunk_id + 2 upvalue_count + 1 ret + 1 halt = 7 bytes.
+        .clos => {
             if (code.len != 7) return .none;
             if (@as(OpCode, @enumFromInt(code[5])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[6])) != .halt) return .none;
@@ -418,8 +418,8 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (upvalue_count != 0) return .none; // non-zero closure needs stack values
             return .{ .closure_zero = readU16Inline(code, 1) };
         },
-        // `closure_long CL(4), 0; ret; halt` — 1 + 4 + 2 + 1 + 1 = 9 bytes.
-        .closure_long => {
+        // `clos_w CL(4), 0; ret; halt` — 1 + 4 + 2 + 1 + 1 = 9 bytes.
+        .clos_w => {
             if (code.len != 9) return .none;
             if (@as(OpCode, @enumFromInt(code[7])) != .ret) return .none;
             if (@as(OpCode, @enumFromInt(code[8])) != .halt) return .none;
@@ -427,12 +427,12 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
             if (upvalue_count != 0) return .none;
             return .{ .closure_zero = readU32Inline(code, 1) };
         },
-        // `closure_captures CL, K, descriptors(3K); ret; halt`
+        // `clos_cap CL, K, descriptors(3K); ret; halt`
         // 1 op + 2 chunk_id + 2 K + 3K descriptors + 1 ret + 1 halt = 7 + 3K.
-        .closure_captures => {
+        .clos_cap => {
             if (code.len < 7) return .none;
             const k = readU16Inline(code, 3);
-            if (k == 0) return .none; // shouldn't happen — emit drops to .closure when K==0
+            if (k == 0) return .none; // shouldn't happen — emit drops to .clos when K==0
             const desc_len: usize = @as(usize, k) * 3;
             if (code.len != 7 + desc_len) return .none;
             if (@as(OpCode, @enumFromInt(code[5 + desc_len])) != .ret) return .none;
@@ -451,9 +451,9 @@ fn classifyTrivialBody(code: []const u8, constants: []const Value, local_count: 
                 .inner_descriptors_len = @intCast(desc_len),
             } };
         },
-        // `closure_captures_long CL(4), K, descriptors(3K); ret; halt`
+        // `clos_cap_w CL(4), K, descriptors(3K); ret; halt`
         // 1 + 4 + 2 + 3K + 1 + 1 = 9 + 3K.
-        .closure_captures_long => {
+        .clos_cap_w => {
             if (code.len < 9) return .none;
             const k = readU16Inline(code, 5);
             if (k == 0) return .none;
@@ -497,7 +497,7 @@ pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
 /// `genlist_apply` for the canonical example.
 pub const WellKnownChunks = struct {
     /// Stub chunk for `builtins.genList` element thunks. Body:
-    ///   `get_upvalue 0; get_upvalue 1; tail_call; ret; halt`
+    ///   `up_get 0; up_get 1; call_tail; ret; halt`
     /// Upvalues are `[func, index]`. Forcing the thunk calls
     /// `func index` and returns the result. Replaces the
     /// `builtin_closure(.mapValue, [func, index])` per element that
@@ -507,7 +507,7 @@ pub const WellKnownChunks = struct {
     /// item.
     genlist_apply: ChunkId,
     /// Stub chunk for `builtins.mapAttrs` element thunks. Body:
-    ///   `get_upvalue 0; get_upvalue 1; call; get_upvalue 2; tail_call;
+    ///   `up_get 0; up_get 1; call; up_get 2; call_tail;
     ///    ret; halt`
     /// Upvalues are `[func, name, value]`. Forcing the thunk calls
     /// `(func name) value` (partial application then tail call).
@@ -524,7 +524,7 @@ pub const WellKnownChunks = struct {
 ///   - `register(chunk)` serializes on the underlying segments' writer mutex.
 pub const ChunkRegistry = struct {
     /// Dense per-chunk slot: the Chunk pointer plus a copy of the hot
-    /// scheduling metadata. The thunk-creation path (`thunk_captures`,
+    /// scheduling metadata. The thunk-creation path (`thk`,
     /// ~6M executions per NixOS toplevel) and the speculation gates only
     /// need `trivial`/`body_is_substantial`; reading them through `ptr`
     /// is a cache-missing deref into a heap-scattered Chunk, while the
@@ -556,6 +556,10 @@ pub const ChunkRegistry = struct {
     /// nothing and the hot `Chunk` layout is untouched. Not concurrency-safe;
     /// only enabled for the single-threaded disasm compile.
     capture_names: bool = false,
+    /// The thread that first recorded into the sidecar, captured lazily. The
+    /// maps are not synchronized, so every `recordName`/`recordFile` must come
+    /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
+    sidecar_owner: ?std.Thread.Id = null,
     names: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
     /// Companion to `names`: the source file each chunk was compiled from
     /// (interned path id), so even chunks with no per-op source map get a file.
@@ -577,19 +581,19 @@ pub const ChunkRegistry = struct {
         var builder = try ChunkBuilder.init(self.allocator);
         defer builder.deinit(self.allocator);
 
-        // capture_upvalue 0 — push func, unforced. builtinMap/builtinGenList
+        // up_grab 0 — push func, unforced. builtinMap/builtinGenList
         // force fn_arg before storing it as upvalue 0, so it's already
         // callable.
-        try builder.writeOp(self.allocator, .capture_upvalue);
+        try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 0);
-        // capture_upvalue 1 — push index or item, *unforced*. Passing
+        // up_grab 1 — push index or item, *unforced*. Passing
         // unforced lets the user fn decide laziness — same reasoning as
         // the mapattrs_apply value upvalue (see registerMapAttrsApplyChunk).
-        try builder.writeOp(self.allocator, .capture_upvalue);
+        try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 1);
-        // tail_call      — call func with index/item
-        try builder.writeOp(self.allocator, .tail_call);
-        // ret            — return result (tail_call to a closure transfers
+        // call_tail      — call func with index/item
+        try builder.writeOp(self.allocator, .call_tail);
+        // ret            — return result (call_tail to a closure transfers
         //                  control; ret only runs when callee was a builtin)
         try builder.writeOp(self.allocator, .ret);
         // halt           — sentinel
@@ -603,27 +607,27 @@ pub const ChunkRegistry = struct {
         var builder = try ChunkBuilder.init(self.allocator);
         defer builder.deinit(self.allocator);
 
-        // capture_upvalue 0 — push func, unforced. mapAttrs only takes
+        // up_grab 0 — push func, unforced. mapAttrs only takes
         // this path when fn_arg is already callable; no force needed.
-        try builder.writeOp(self.allocator, .capture_upvalue);
+        try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 0);
-        // capture_upvalue 1 — push name. mapAttrs stores `Value.string`
+        // up_grab 1 — push name. mapAttrs stores `Value.string`
         // here, so force would be a no-op anyway.
-        try builder.writeOp(self.allocator, .capture_upvalue);
+        try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 1);
         // call           — partial = func name (result on stack)
         try builder.writeOp(self.allocator, .call);
-        // capture_upvalue 2 — push value *unforced*. `value` is whatever
+        // up_grab 2 — push value *unforced*. `value` is whatever
         // the source attrset stored, typically a thunk. Forcing it here
-        // (the old `get_upvalue`) eagerly evaluated entries that the
+        // (the old `up_get`) eagerly evaluated entries that the
         // user lambda would otherwise treat lazily — when the lambda
         // captures the parent recursive attrset (typical NixOS module
         // pattern), the eager force routes through that parent and
         // blackholes. Passing unforced lets the user lambda decide.
-        try builder.writeOp(self.allocator, .capture_upvalue);
+        try builder.writeOp(self.allocator, .up_grab);
         try builder.writeU16(self.allocator, 2);
-        // tail_call      — partial value
-        try builder.writeOp(self.allocator, .tail_call);
+        // call_tail      — partial value
+        try builder.writeOp(self.allocator, .call_tail);
         try builder.writeOp(self.allocator, .ret);
         try builder.writeOp(self.allocator, .halt);
 
@@ -644,10 +648,23 @@ pub const ChunkRegistry = struct {
         self.files.deinit(self.allocator);
     }
 
+    /// Assert the unsynchronized sidecar maps are only ever touched from a
+    /// single thread (the invariant that makes them safe without a lock). The
+    /// first caller claims ownership; later callers must match. Debug-only.
+    fn checkSingleThread(self: *ChunkRegistry) void {
+        const tid = std.Thread.getCurrentId();
+        if (self.sidecar_owner) |owner| {
+            std.debug.assert(owner == tid);
+        } else {
+            self.sidecar_owner = tid;
+        }
+    }
+
     /// Record a best-effort name for a chunk. No-op unless `capture_names` is
     /// on, so callers can hand names unconditionally.
     pub fn recordName(self: *ChunkRegistry, id: ChunkId, name: types.InternId) !void {
         if (!self.capture_names) return;
+        self.checkSingleThread();
         try self.names.put(self.allocator, id, name);
     }
 
@@ -655,6 +672,7 @@ pub const ChunkRegistry = struct {
     /// `capture_names` is on.
     pub fn recordFile(self: *ChunkRegistry, id: ChunkId, file: types.InternId) !void {
         if (!self.capture_names) return;
+        self.checkSingleThread();
         try self.files.put(self.allocator, id, file);
     }
 
@@ -803,7 +821,7 @@ test "chunk builder emits opcodes and operands into the code stream" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .get_local);
+    try builder.writeOp(allocator, .loc_get);
     try builder.writeByte(allocator, 3);
     try builder.writeOp(allocator, .jump);
     try builder.writeU32(allocator, 10);
@@ -812,7 +830,7 @@ test "chunk builder emits opcodes and operands into the code stream" {
     defer chunk.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 7), chunk.code.len);
-    try std.testing.expectEqual(@intFromEnum(OpCode.get_local), chunk.code[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.loc_get), chunk.code[0]);
     try std.testing.expectEqual(@as(u8, 3), chunk.code[1]);
     try std.testing.expectEqual(@intFromEnum(OpCode.jump), chunk.code[2]);
     try std.testing.expectEqual(@as(u32, 10), readU32Inline(chunk.code, 3));
@@ -823,7 +841,7 @@ test "chunk builder patches a forward jump offset after emission" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .jump_if_false);
+    try builder.writeOp(allocator, .jump_false);
     const patch_at = builder.code.items.len;
     try builder.writeU32(allocator, 0); // placeholder, patched below
     try builder.writeOp(allocator, .push_null);
@@ -867,16 +885,16 @@ test "emitConstant writes a constant op referencing the new pool index" {
 
     try std.testing.expectEqual(@as(usize, 1), chunk.constants.len);
     try std.testing.expectEqual(@as(i64, 99), chunk.constants[0].asInt());
-    try std.testing.expectEqual(@intFromEnum(OpCode.constant), chunk.code[0]);
+    try std.testing.expectEqual(@intFromEnum(OpCode.push_const), chunk.code[0]);
     try std.testing.expectEqual(@as(u16, 0), readU16Inline(chunk.code, 1));
 }
 
-test "classifyTrivialBody recognizes a get_upvalue_ret-only thunk body" {
+test "classifyTrivialBody recognizes a up_get_ret-only thunk body" {
     const allocator = std.testing.allocator;
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .get_upvalue_ret);
+    try builder.writeOp(allocator, .up_get_ret);
     try builder.writeU16(allocator, 4);
     try builder.writeOp(allocator, .halt);
 
@@ -890,16 +908,16 @@ test "classifyTrivialBody recognizes a get_upvalue_ret-only thunk body" {
     }
 }
 
-test "classifyTrivialBody recognizes a constant_ret-only thunk body" {
+test "classifyTrivialBody recognizes a push_const_ret-only thunk body" {
     const allocator = std.testing.allocator;
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
     try builder.emitConstant(allocator, Value.int(5));
-    // emitConstant writes a plain `constant` op; fuse it into
-    // `constant_ret` by hand the way the compiler's emit.zig would,
+    // emitConstant writes a plain `push_const` op; fuse it into
+    // `push_const_ret` by hand the way the compiler's emit.zig would,
     // then append halt so the shape matches the classifier's expectation.
-    builder.code.items[0] = @intFromEnum(OpCode.constant_ret);
+    builder.code.items[0] = @intFromEnum(OpCode.push_const_ret);
     try builder.writeOp(allocator, .halt);
 
     var chunk = try builder.finish(allocator, 0);
@@ -916,11 +934,11 @@ test "classifyTrivialBody classifies a multi-instruction body as non-trivial" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .get_upvalue);
+    try builder.writeOp(allocator, .up_get);
     try builder.writeU16(allocator, 0);
-    try builder.writeOp(allocator, .get_upvalue);
+    try builder.writeOp(allocator, .up_get);
     try builder.writeU16(allocator, 1);
-    try builder.writeOp(allocator, .add_int);
+    try builder.writeOp(allocator, .int_add);
     try builder.writeOp(allocator, .ret);
     try builder.writeOp(allocator, .halt);
 
@@ -935,13 +953,13 @@ test "classifyTrivialBody never fires for chunks with locals (lambda bodies)" {
     var builder = try ChunkBuilder.init(allocator);
     defer builder.deinit(allocator);
 
-    try builder.writeOp(allocator, .get_upvalue_ret);
+    try builder.writeOp(allocator, .up_get_ret);
     try builder.writeU16(allocator, 0);
     try builder.writeOp(allocator, .halt);
 
     // local_count == 1 means this is a lambda body, not a thunk body,
     // so the short-circuit must not apply even though the bytes match
-    // the get_upvalue_ret shape exactly.
+    // the up_get_ret shape exactly.
     var chunk = try builder.finish(allocator, 1);
     defer chunk.deinit(allocator);
 

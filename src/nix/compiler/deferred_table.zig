@@ -201,7 +201,7 @@ pub const Table = struct {
     }
 
     /// Register a deferred body and return its id (the operand the
-    /// `defer_attr_value` op carries). `entry.scope` must be table-owned
+    /// `thk_defer` op carries). `entry.scope` must be table-owned
     /// (from `adoptScope`) and the path strings table-owned (from
     /// `internPath`); registration itself is just an entry append.
     pub fn register(self: *Table, entry: Entry) !u32 {

@@ -1,5 +1,5 @@
 //! Lowers leaf and near-leaf expressions: integer/float/string/path
-//! literals (with `${…}` interpolation and `concat_strings` assembly),
+//! literals (with `${…}` interpolation and `str_cat` assembly),
 //! search paths, identifier resolution (locals/upvalues/`with`/ambient
 //! builtins/`__curPos`), and materialization of parser-elided bodies.
 
@@ -63,7 +63,7 @@ pub fn compileString(self: *Compiler, node: *const Node) !void {
     try compileStringAtom(self, node.data.atom);
 }
 
-/// Cap on operands accumulated for one `concat_strings`. Keeps the
+/// Cap on operands accumulated for one `str_cat`. Keeps the
 /// operand count in the opcode's u16 and bounds transient VM stack
 /// growth for pathological many-part literals; when the cap is hit the
 /// accumulated parts are folded into one operand and assembly continues.
@@ -77,8 +77,8 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     const parsed = try string_syntax.parseLiteral(self.allocator, self.source, literal);
     defer parsed.deinit();
 
-    // Push every part, then assemble with ONE `concat_strings` — the
-    // old `add_int` fold interned every intermediate prefix (hash +
+    // Push every part, then assemble with ONE `str_cat` — the
+    // old `int_add` fold interned every intermediate prefix (hash +
     // copy + permanent intern-table bytes per `${}` boundary).
     var parts: u16 = 0;
     var total_parts: u32 = 0;
@@ -104,7 +104,7 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
             },
         }
         if (parts == max_concat_parts) {
-            try emit.emitOpU16(self, .concat_strings, parts);
+            try emit.emitOpU16(self, .str_cat, parts);
             ops_emitted += 1;
             parts = 1;
         }
@@ -114,13 +114,13 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
         0 => try self.builder.emitConstant(self.allocator, Value.string(try self.intern.intern(""))),
         // A lone text part is already a string constant. A lone
         // interpolation still needs the string coercion (`"${x}"`);
-        // `concat_strings 1` coerces without re-interning the text.
+        // `str_cat 1` coerces without re-interning the text.
         1 => if (!single_is_text) {
-            try emit.emitOpU16(self, .concat_strings, 1);
+            try emit.emitOpU16(self, .str_cat, 1);
             ops_emitted += 1;
         },
         else => {
-            try emit.emitOpU16(self, .concat_strings, parts);
+            try emit.emitOpU16(self, .str_cat, parts);
             ops_emitted += 1;
         },
     }
@@ -128,11 +128,11 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     // Perceived-weight compensation: speculation admission
     // (`body_is_substantial`) is keyed on encoded size, and its tuning
     // "lives at a sharp cliff" (see `ChunkBuilder.fusion_savings`). The
-    // old encoding spent `total_parts - 1` add_int bytes (plus a 3-byte
+    // old encoding spent `total_parts - 1` int_add bytes (plus a 3-byte
     // empty-string constant and one more add when the literal starts
     // with an interpolation); the new one spends 3 bytes per concat op.
     // Add the (saturating) difference back so many-part literals keep
-    // the scheduling weight they had under the add_int fold — dropping
+    // the scheduling weight they had under the int_add fold — dropping
     // hot generated-config chunks below the cliff measurably starves
     // the speculation avalanche at w>=8.
     if (ops_emitted != 0) {
@@ -147,7 +147,7 @@ pub fn emitStringPart(self: *Compiler, part: []const u8, have_value: *bool) !voi
 
     const id = try self.intern.intern(part);
     try self.builder.emitConstant(self.allocator, Value.string(id));
-    if (have_value.*) try emit.emitOp(self, .add_int);
+    if (have_value.*) try emit.emitOp(self, .int_add);
     have_value.* = true;
 }
 
@@ -224,7 +224,7 @@ pub fn compileInterpolatedPath(self: *Compiler, span: []const u8, source_offset:
         const expr_start = interp_start + 2;
         const expr_end = string_syntax.findInterpolationEnd(span, expr_start) orelse return error.InvalidPathLiteral;
         try compileInterpolatedExpr(self, span[expr_start..expr_end], source_offset + @as(u32, @intCast(expr_start)));
-        if (have_value) try emit.emitOp(self, .add_int);
+        if (have_value) try emit.emitOp(self, .int_add);
         have_value = true;
         cursor = expr_end + 1;
     }
@@ -251,7 +251,7 @@ pub fn compileSearchPath(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (span.len < 2) return error.InvalidSearchPath;
     const id = try self.intern.intern(span[1 .. span.len - 1]);
-    try emit.emitInternOp(self, .find_file, .find_file_long, id);
+    try emit.emitInternOp(self, .file_find, .file_find_w, id);
 }
 
 pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
@@ -293,7 +293,7 @@ pub fn compileIdent(self: *Compiler, node: *const Node) !void {
     if (scope.resolveLocalId(self, name_id)) |slot| {
         try emit.emitGetLocal(self, slot);
     } else if (try scope.resolveCaptureId(self, span, name_id)) |slot| {
-        try emit.emitOpU16(self, .get_upvalue, slot);
+        try emit.emitOpU16(self, .up_get, slot);
     } else if (std.mem.eql(u8, span, "builtins")) {
         try emit.emitOp(self, .push_builtins);
     } else if (try emitAmbientBuiltin(self, span)) {
@@ -326,7 +326,7 @@ pub fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
     try self.builder.emitConstant(self.allocator, Value.int(position.line));
     try attrs.emitAttrNameId(self, column_id);
     try self.builder.emitConstant(self.allocator, Value.int(position.column));
-    try emit.emitOpU16(self, .build_attrs, 3);
+    try emit.emitOpU16(self, .attrs_new, 3);
 }
 
 pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {

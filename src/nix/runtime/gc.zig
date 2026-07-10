@@ -31,7 +31,7 @@ const FutureState = thunk_mod.FutureState;
 
 pub const enabled: bool = build_options.gc;
 
-/// A `merge_attrs` whose `flattened` memo equals this has no flattened
+/// A `attrs_merge` whose `flattened` memo equals this has no flattened
 /// object to follow. Single source of truth in `heap.zig`.
 const NO_FLAT: ObjectId = heap_mod.NO_FLAT;
 

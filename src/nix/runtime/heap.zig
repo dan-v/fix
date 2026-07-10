@@ -161,7 +161,7 @@ pub const AttrsObject = struct {
 };
 
 /// A lazy, layered `//` (update) result: `base // overlay`, both attrset
-/// objects (either may itself be a `merge_attrs`, forming a chain). The
+/// objects (either may itself be a `attrs_merge`, forming a chain). The
 /// NixOS module/overlay fixpoints build a massive attrset by `//`-ing an
 /// accumulator thousands of times; materializing each step copies the
 /// whole accumulator (O(N) per merge → O(N·K) total, and ~18M of the
@@ -941,7 +941,7 @@ pub const ObjectHeap = struct {
     /// Demand-sibling prefetch admission (`FIX_SIBLING`): true iff `id`
     /// is a plain attrset with entry count in `[min, max)` that has not
     /// been swept yet — and marks it swept. Racy-benign (see
-    /// `AttrsObject.sibling_swept`). `merge_attrs` layers are excluded:
+    /// `AttrsObject.sibling_swept`). `attrs_merge` layers are excluded:
     /// sweeping them would force a flatten on the demand path.
     pub fn trySiblingSweep(self: *ObjectHeap, id: ObjectId, min: u32, max: u32) bool {
         switch (self.objects.getMut(id).*) {
@@ -1503,7 +1503,7 @@ pub const ObjectHeap = struct {
         return items[index];
     }
 
-    /// Full attr entries. A `merge_attrs` (layered `//`) is flattened to a
+    /// Full attr entries. A `attrs_merge` (layered `//`) is flattened to a
     /// real attrs object on first call (memoized), so value-iterating
     /// callers (deep force, `==`, JSON/XML, `attrNames`) see a normal
     /// sorted entry slice. Non-const because flattening allocates.
@@ -1520,7 +1520,7 @@ pub const ObjectHeap = struct {
     }
 
     /// Right-biased attr lookup returning null for a missing key. Walks a
-    /// `merge_attrs` chain overlay-first without flattening (read-only, so
+    /// `attrs_merge` chain overlay-first without flattening (read-only, so
     /// it stays const and feeds the hot inline cache). Once a node has
     /// been flattened it delegates to the flat object's binary search.
     pub fn getAttrValueOpt(self: *const ObjectHeap, id: ObjectId, name: InternId) anyerror!?Value {
@@ -1561,7 +1561,7 @@ pub const ObjectHeap = struct {
     }
 
     /// `left // right` as a (possibly layered) attrset. Large left
-    /// operands are wrapped in a `merge_attrs` node instead of copied;
+    /// operands are wrapped in a `attrs_merge` node instead of copied;
     /// small ones and over-deep chains fall back to the eager flat merge.
     pub fn mergeAttrsLayered(self: *ObjectHeap, left_id: ObjectId, right_id: ObjectId) !ObjectId {
         // `{} // x = x` / `x // {} = x`: an empty operand contributes nothing
@@ -1588,7 +1588,7 @@ pub const ObjectHeap = struct {
         } });
     }
 
-    /// Materialize (memoized) a `merge_attrs` chain into a flat attrs
+    /// Materialize (memoized) a `attrs_merge` chain into a flat attrs
     /// object and return its id. Collects the whole chain's leaves in
     /// precedence order and does ONE k-way right-biased merge — avoiding
     /// the O(depth·N) intermediate attrs objects a recursive pairwise
@@ -1609,7 +1609,7 @@ pub const ObjectHeap = struct {
         return prev orelse flat;
     }
 
-    /// Append the plain-attrs leaves of a `merge_attrs` subtree to `out`
+    /// Append the plain-attrs leaves of a `attrs_merge` subtree to `out`
     /// in left-to-right (oldest-base → newest-overlay) precedence order.
     /// An already-flattened node contributes its cached flat leaf.
     fn collectMergeLeaves(self: *ObjectHeap, id: ObjectId, out: *std.ArrayListUnmanaged(ObjectId)) anyerror!void {
@@ -1941,7 +1941,7 @@ pub const ObjectHeap = struct {
         return self.addAttrsFromStackPairsImpl(pairs, positions, false);
     }
 
-    /// `build_attrs_sorted` fast path: the compiler guarantees the pairs
+    /// `attrs_new_srt` fast path: the compiler guarantees the pairs
     /// are already in ascending interned-name order with no duplicates
     /// (static attrset literals are grouped — duplicates rejected — and
     /// emitted name-sorted at compile time), so the per-construction

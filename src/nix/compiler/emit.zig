@@ -50,14 +50,14 @@ pub fn emitBuildAttrsSorted(self: *Compiler, count: u16, positions: []const heap
 
 fn emitBuildAttrsImpl(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry, comptime presorted: bool) !void {
     if (positions.len == 0) {
-        try emitOpU16(self, if (presorted) .build_attrs_sorted else .build_attrs, count);
+        try emitOpU16(self, if (presorted) .attrs_new_srt else .attrs_new, count);
         return;
     }
 
     // Bake the positions pre-sorted by name. `findAttrPos` binary-
     // searches by name and the attrs themselves are sorted by name at
     // build time, so a name-sorted position block stays consistent —
-    // and the runtime `build_attrs_with_pos` op can then skip a sort it
+    // and the runtime `attrs_new_pos` op can then skip a sort it
     // would otherwise pay on every execution (≈1.6% of all opcodes).
     // Presorted call sites appended their positions in emit order, which
     // IS name order — no dupe+sort needed.
@@ -71,7 +71,7 @@ fn emitBuildAttrsImpl(self: *Compiler, count: u16, positions: []const heap_mod.A
     };
     defer if (!presorted) self.allocator.free(@constCast(sorted));
 
-    try emitOpU16(self, if (presorted) .build_attrs_with_pos_sorted else .build_attrs_with_pos, count);
+    try emitOpU16(self, if (presorted) .attrs_new_pos_srt else .attrs_new_pos, count);
     try self.builder.writeU16(self.allocator, try u16Count(sorted.len));
     for (sorted) |position| {
         try self.builder.writeU32(self.allocator, position.name);
@@ -99,33 +99,33 @@ pub fn emitLocalOp(self: *Compiler, short_op: OpCode, long_op: OpCode, slot: u16
 }
 
 pub fn emitGetLocal(self: *Compiler, slot: u16) !void {
-    try emitLocalOp(self, .get_local, .get_local_long, slot);
+    try emitLocalOp(self, .loc_get, .loc_get_w, slot);
 }
 
 pub fn emitCaptureLocal(self: *Compiler, slot: u16) !void {
-    try emitLocalOp(self, .capture_local, .capture_local_long, slot);
+    try emitLocalOp(self, .loc_grab, .loc_grab_w, slot);
 }
 
 pub fn emitSetLocal(self: *Compiler, slot: u16) !void {
     if (try fuseStoreToSlot(self, slot, .narrow_local)) return;
-    try emitLocalOp(self, .set_local, .set_local_long, slot);
+    try emitLocalOp(self, .loc_set, .loc_set_w, slot);
 }
 
 pub fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
     if (try fuseStoreToSlot(self, slot, .narrow_cell)) return;
-    try emitLocalOp(self, .set_cell_local, .set_cell_local_long, slot);
+    try emitLocalOp(self, .cell_set, .cell_set_w, slot);
 }
 
 const StoreTarget = enum { narrow_local, narrow_cell };
 
-/// Rewrite a just-emitted `thunk_captures` / `thunk_captures_eager` op
+/// Rewrite a just-emitted `thk` / `thk_eag` op
 /// into the fused `*_store_local` / `*_store_cell_local` variant by
 /// appending the destination slot byte. Saves the push/pop of the
 /// new thunk reference plus one dispatch.
 ///
-/// Only fuses for 1-byte slots (`set_local`/`set_cell_local`, not
+/// Only fuses for 1-byte slots (`loc_set`/`cell_set`, not
 /// the `_long` forms); ~all let-bindings fit. Only the short-chunk-id
-/// variants of `thunk_captures` are fused — `_long` is rare and
+/// variants of `thk` are fused — `_long` is rare and
 /// adding it would double the opcode count without a meaningful win.
 fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     if (slot > std.math.maxInt(u8)) return false;
@@ -134,31 +134,31 @@ fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     if (offset >= code.len) return false;
     const last_op: OpCode = @enumFromInt(code[offset]);
     const fused: OpCode = switch (last_op) {
-        .thunk_captures => switch (target) {
-            .narrow_local => .thunk_captures_store_local,
-            .narrow_cell => .thunk_captures_store_cell_local,
+        .thk => switch (target) {
+            .narrow_local => .thk_st,
+            .narrow_cell => .thk_st_cell,
         },
-        .thunk_captures_eager => switch (target) {
-            .narrow_local => .thunk_captures_eager_store_local,
-            .narrow_cell => .thunk_captures_eager_store_cell_local,
+        .thk_eag => switch (target) {
+            .narrow_local => .thk_eag_st,
+            .narrow_cell => .thk_eag_st_cell,
         },
         else => return false,
     };
     code[offset] = @intFromEnum(fused);
     try self.builder.writeByte(self.allocator, @intCast(slot));
     self.builder.last_op_offset = null;
-    // Unfused: extra `set_local` op (1 byte) + slot byte. Fused: just
+    // Unfused: extra `loc_set` op (1 byte) + slot byte. Fused: just
     // the slot byte appended. Net 1 byte saved.
     self.builder.fusion_savings += 1;
     return true;
 }
 
 pub fn emitInitCellSlot(self: *Compiler, slot: u16) !void {
-    try emitLocalOp(self, .init_cell_slot, .init_cell_slot_long, slot);
+    try emitLocalOp(self, .cell_init, .cell_init_w, slot);
 }
 
 pub fn emitGetLocalRet(self: *Compiler, slot: u16) !void {
-    try emitLocalOp(self, .get_local_ret, .get_local_ret_long, slot);
+    try emitLocalOp(self, .loc_get_ret, .loc_get_ret_w, slot);
 }
 
 /// Emit a `ret`, fusing it into the immediately-preceding value-producing
@@ -171,23 +171,23 @@ pub fn emitRet(self: *Compiler) !void {
         if (offset < code.len) {
             const last_op: OpCode = @enumFromInt(code[offset]);
             switch (last_op) {
-                .constant => {
-                    code[offset] = @intFromEnum(OpCode.constant_ret);
+                .push_const => {
+                    code[offset] = @intFromEnum(OpCode.push_const_ret);
                     self.builder.last_op_offset = null;
                     return;
                 },
-                .get_upvalue => {
-                    code[offset] = @intFromEnum(OpCode.get_upvalue_ret);
+                .up_get => {
+                    code[offset] = @intFromEnum(OpCode.up_get_ret);
                     self.builder.last_op_offset = null;
                     return;
                 },
-                .get_local => {
-                    code[offset] = @intFromEnum(OpCode.get_local_ret);
+                .loc_get => {
+                    code[offset] = @intFromEnum(OpCode.loc_get_ret);
                     self.builder.last_op_offset = null;
                     return;
                 },
-                .get_local_long => {
-                    code[offset] = @intFromEnum(OpCode.get_local_ret_long);
+                .loc_get_w => {
+                    code[offset] = @intFromEnum(OpCode.loc_get_ret_w);
                     self.builder.last_op_offset = null;
                     return;
                 },
@@ -207,9 +207,9 @@ pub fn emitInternOp(self: *Compiler, short_op: OpCode, long_op: OpCode, id: Inte
     }
 }
 
-/// Emit `get_attr name`, fusing with an immediately-preceding source
-/// op into a compound super-op (`get_upvalue_attr`, `get_local_attr`,
-/// `get_local_attr_long`). Only fuses when the attr name InternId
+/// Emit `attr_get name`, fusing with an immediately-preceding source
+/// op into a compound super-op (`up_get_attr`, `loc_get_attr`,
+/// `loc_get_attr_w`). Only fuses when the attr name InternId
 /// fits in u16; there's no long-name form yet.
 pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
     if (id <= std.math.maxInt(u16)) {
@@ -218,9 +218,9 @@ pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
             if (offset < code.len) {
                 const last_op: OpCode = @enumFromInt(code[offset]);
                 const fused: ?OpCode = switch (last_op) {
-                    .get_upvalue => .get_upvalue_attr,
-                    .get_local => .get_local_attr,
-                    .get_local_long => .get_local_attr_long,
+                    .up_get => .up_get_attr,
+                    .loc_get => .loc_get_attr,
+                    .loc_get_w => .loc_get_attr_w,
                     else => null,
                 };
                 if (fused) |op| {
@@ -228,14 +228,14 @@ pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
                     try self.builder.writeU16(self.allocator, @intCast(id));
                     self.builder.last_op_offset = null;
                     // The unfused encoding would have been 3 bytes
-                    // (get_attr op + 2-byte name); we wrote 2 bytes.
+                    // (attr_get op + 2-byte name); we wrote 2 bytes.
                     self.builder.fusion_savings += 1;
                     return;
                 }
             }
         }
     }
-    try emitInternOp(self, .get_attr, .get_attr_long, id);
+    try emitInternOp(self, .attr_get, .attr_get_w, id);
 }
 
 pub fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
@@ -244,9 +244,9 @@ pub fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
 
 pub fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u16) !void {
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .closure, @intCast(chunk_id));
+        try emitOpU16(self, .clos, @intCast(chunk_id));
     } else {
-        try emitOp(self, .closure_long);
+        try emitOp(self, .clos_w);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);
@@ -257,9 +257,9 @@ pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, capture
     const upvalue_count = try captureCount(captures.len);
 
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .closure_captures, @intCast(chunk_id));
+        try emitOpU16(self, .clos_cap, @intCast(chunk_id));
     } else {
-        try emitOp(self, .closure_captures_long);
+        try emitOp(self, .clos_cap_w);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);
@@ -270,7 +270,7 @@ pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures:
     return emitThunkWithCapturesImpl(self, chunk_id, captures, false);
 }
 
-/// Same as `emitThunkWithCaptures` but emits the `thunk_captures_eager`
+/// Same as `emitThunkWithCaptures` but emits the `thk_eag`
 /// variant — runtime will submit the thunk to the urgent scheduler
 /// queue at creation. Called by `compileThunk` when the surrounding
 /// chunk's strictness signature says this binding will be forced.
@@ -282,10 +282,10 @@ fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures:
     const upvalue_count = try captureCount(captures.len);
 
     if (chunk_id <= std.math.maxInt(u16)) {
-        const op: bytecode.OpCode = if (eager) .thunk_captures_eager else .thunk_captures;
+        const op: bytecode.OpCode = if (eager) .thk_eag else .thk;
         try emitOpU16(self, op, @intCast(chunk_id));
     } else {
-        const op: bytecode.OpCode = if (eager) .thunk_captures_eager_long else .thunk_captures_long;
+        const op: bytecode.OpCode = if (eager) .thk_eag_w else .thk_w;
         try emitOp(self, op);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
@@ -293,23 +293,23 @@ fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures:
     try emitCaptureDescriptors(self, captures);
 }
 
-/// Emit `apply_arg` — a function argument whose laziness is decided at
+/// Emit `thk_arg` — a function argument whose laziness is decided at
 /// runtime from the callee's strictness. Always wide chunk-id (the 2
 /// extra operand bytes are negligible vs. avoiding a second opcode).
 pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
     const upvalue_count = try captureCount(captures.len);
-    try emitOp(self, .apply_arg);
+    try emitOp(self, .thk_arg);
     try self.builder.writeU32(self.allocator, chunk_id);
     try self.builder.writeU16(self.allocator, upvalue_count);
     try emitCaptureDescriptors(self, captures);
 }
 
-/// Emit `defer_attr_value` (lazy per-attr compilation): a deferred-table
+/// Emit `thk_defer` (lazy per-attr compilation): a deferred-table
 /// id plus the enclosing-scope snapshot as capture descriptors. Mirrors
 /// `emitApplyArg`'s always-wide-id layout.
 pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capture) !void {
     const env_count = try captureCount(scope.len);
-    try emitOp(self, .defer_attr_value);
+    try emitOp(self, .thk_defer);
     try self.builder.writeU32(self.allocator, deferred_id);
     try self.builder.writeU16(self.allocator, env_count);
     try emitCaptureDescriptors(self, scope);

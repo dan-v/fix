@@ -434,7 +434,7 @@ pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
 /// so this is the only owner — see docs/plans/gc-plan.md. Thunk *spilled*
 /// upvalue/env storage is a bare slice (no segment/offset to recover),
 /// so it is not reclaimed yet (thunks with >2 upvalues — a minority);
-/// `merge_attrs`/`boxed_int` own no ranges.
+/// `attrs_merge`/`boxed_int` own no ranges.
 pub fn freeObjectRanges(heap: *ObjectHeap, local: *HeapLocal, obj: *const Object) void {
     // Detector: poison the freed range so a dangling raw `getList`/`getAttrs`
     // slice (owner swept while a Zig local held the slice — the class the
@@ -476,7 +476,7 @@ pub fn freeObjectRanges(heap: *ObjectHeap, local: *HeapLocal, obj: *const Object
         // .thunk's spilled storage). Freeing the range while a frame
         // runs would dangle it. Reclaiming these needs the frame to
         // root its executing closure/thunk (a follow-up RSS opt);
-        // until then their ranges leak. `merge_attrs`/`boxed_int` own
+        // until then their ranges leak. `attrs_merge`/`boxed_int` own
         // no reclaimable range.
         .closure, .thunk, .merge_attrs, .boxed_int => {},
     }

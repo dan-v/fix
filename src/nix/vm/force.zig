@@ -1122,7 +1122,7 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
         .pass_through => forceValueImpl(self, target.pass_through, true),
         // Frameless `someUpvalue.attr`: skip the isolated frame +
         // bytecode dispatch and go straight to the attr lookup, exactly
-        // as the `get_upvalue_attr; ret` body would (getAttrValue forces
+        // as the `up_get_attr; ret` body would (getAttrValue forces
         // the attrs operand and the result).
         .attr_access => access.getAttrValue(self, target.attr_access.base, target.attr_access.name),
         // Lazy per-attr compilation: compile the body now (or reuse the
@@ -1200,7 +1200,7 @@ pub fn makeCell(self: *VM, val: Value) !Value {
 
 /// Allocate a recursive-let binding cell. The cell is born claimed by
 /// the calling fiber so concurrent forces see BUSY and park instead
-/// of CAS-claiming the placeholder. The corresponding `set_cell_local`
+/// of CAS-claiming the placeholder. The corresponding `cell_set`
 /// op publishes the real binding via `thunk.publishCellBinding`, which
 /// installs `pass_through(val)`, transitions back to `.unresolved`,
 /// and wakes parked waiters.

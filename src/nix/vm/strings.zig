@@ -1,5 +1,5 @@
 //! String and path machinery for the language: coercion to language strings
-//! (`__toString` / outPath), `+` and `concat_strings` concatenation, and
+//! (`__toString` / outPath), `+` and `str_cat` concatenation, and
 //! string-context (store-path dependency set) accumulation and merging.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
@@ -131,7 +131,7 @@ pub fn concatStringLike(self: *VM, left: Value, right: Value) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
-/// `concat_strings` opcode body: coerce the top `count` stack operands
+/// `str_cat` opcode body: coerce the top `count` stack operands
 /// to language strings IN PLACE (each stays in its slot — a precise GC
 /// root — across the later parts' coercions), then assemble the result
 /// text in one pass and intern it once. The caller pops the operands

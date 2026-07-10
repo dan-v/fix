@@ -2,7 +2,7 @@ const std = @import("std");
 const Evaluator = @import("../../eval.zig").Evaluator;
 
 test "a lambda body returning a bare local evaluates correctly" {
-    // Exercises the get_local/get_local_ret fusion in emitRet.
+    // Exercises the loc_get/loc_get_ret fusion in emitRet.
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
@@ -11,7 +11,7 @@ test "a lambda body returning a bare local evaluates correctly" {
 }
 
 test "a lambda body returning a captured upvalue evaluates correctly" {
-    // Exercises the get_upvalue/get_upvalue_ret fusion in emitRet.
+    // Exercises the up_get/up_get_ret fusion in emitRet.
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
@@ -20,7 +20,7 @@ test "a lambda body returning a captured upvalue evaluates correctly" {
 }
 
 test "chained attribute access through an upvalue evaluates correctly" {
-    // Exercises the get_upvalue/get_upvalue_attr fusion in emitGetAttr.
+    // Exercises the up_get/up_get_attr fusion in emitGetAttr.
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
