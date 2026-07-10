@@ -575,6 +575,15 @@ pub const ChunkRegistry = struct {
 
     const Store = stable.StableSegments(ChunkSlot, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
+    const dedup_shard_count = 64;
+    /// One shard of the content-addressed dedup map. `align(cache_line)` on
+    /// the shard lock keeps neighboring shards out of each other's cache
+    /// lines (each shard is padded to a full line).
+    const DedupShard = struct {
+        mu: sync.SpinMutex align(std.atomic.cache_line) = .{},
+        map: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty,
+    };
+
     allocator: std.mem.Allocator,
     chunks: Store,
     well_known: WellKnownChunks,
@@ -598,13 +607,15 @@ pub const ChunkRegistry = struct {
     /// How many chunks already claimed each base name, so `recordName` callers
     /// can uniquify duplicates with a `~N` suffix.
     name_uses: std.AutoHashMapUnmanaged(types.InternId, u32) = .empty,
-    /// Content-addressed dedup of metadata-free parametric chunks (no locals,
-    /// no constants, no source map/positions): byte-identical code is
-    /// semantically interchangeable, so re-registrations reuse the first id
-    /// (the generalization of the hand-picked WellKnownChunks). Guarded by its
-    /// own mutex — deferred-body compiles register from worker fibers.
-    dedup_mu: sync.SpinMutex = .{},
-    dedup: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty,
+    /// Content-addressed dedup of chunk registrations: structurally identical
+    /// chunks are semantically interchangeable, so re-registrations reuse the
+    /// first id (the generalization of the hand-picked WellKnownChunks).
+    /// Sharded by hash bits (see `DedupShard`): registrations come from every
+    /// compiling worker (deferred bodies + speculative compiles, ~264K at
+    /// w=8), and one global lock held across the full structural memcmp
+    /// burned ~3-4% of all w=8 cycles in spin. Each shard carries its own
+    /// lock, and the memcmp runs OUTSIDE it (see `registerDeduped`).
+    dedup_shards: [dedup_shard_count]DedupShard = [_]DedupShard{.{}} ** dedup_shard_count,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -691,7 +702,7 @@ pub const ChunkRegistry = struct {
         while (it.next()) |v| self.allocator.free(v.*);
         self.upvalue_names.deinit(self.allocator);
         self.name_uses.deinit(self.allocator);
-        self.dedup.deinit(self.allocator);
+        for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
     }
 
     /// Assert the unsynchronized sidecar maps are only ever touched from a
@@ -843,23 +854,50 @@ pub const ChunkRegistry = struct {
 
     pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk) !struct { id: ChunkId, reused: bool } {
         const h = contentHash(&chunk);
-        {
-            self.dedup_mu.lock();
-            defer self.dedup_mu.unlock();
-            if (self.dedup.get(h)) |existing| {
-                const st = self.get(existing).?;
-                if (contentEql(st, &chunk)) {
-                    return .{ .id = existing, .reused = true };
-                }
+        const shard = &self.dedup_shards[@as(usize, @intCast(h >> 58))];
+
+        // Snapshot the candidate id under the shard lock; run the full
+        // structural memcmp OUTSIDE it. Registered chunks are immutable and
+        // ids are never removed, so a snapshot can't go stale — the lock only
+        // has to protect the map itself.
+        shard.mu.lock();
+        const candidate = shard.map.get(h);
+        shard.mu.unlock();
+
+        if (candidate) |existing| {
+            if (contentEql(self.get(existing).?, &chunk)) {
+                return .{ .id = existing, .reused = true };
             }
+            // Hash collision with different content. `h`'s map entry is
+            // permanent (first writer wins, entries are never replaced), so
+            // there is nothing to insert: register plain, as before.
+            return .{ .id = try self.register(chunk), .reused = false };
         }
+
         const id = try self.register(chunk);
-        self.dedup_mu.lock();
-        defer self.dedup_mu.unlock();
-        // First writer wins; a concurrent racer's extra copy stays registered
-        // but unreferenced by future lookups (benign).
-        const gop = try self.dedup.getOrPut(self.allocator, h);
-        if (!gop.found_existing) gop.value_ptr.* = id;
+        shard.mu.lock();
+        const inserted = blk: {
+            const gop = shard.map.getOrPut(self.allocator, h) catch |err| {
+                shard.mu.unlock();
+                return err;
+            };
+            if (gop.found_existing) break :blk gop.value_ptr.*;
+            gop.value_ptr.* = id;
+            break :blk null;
+        };
+        shard.mu.unlock();
+        const winner = inserted orelse return .{ .id = id, .reused = false };
+
+        // A concurrent registration won the insert race for this hash while
+        // we were registering. When it is content-equal (the common case: the
+        // same body compiled speculatively on two workers), converge on the
+        // winner id so equal registrations always resolve to one id. Our copy
+        // is already owned by the registry — report reused=false so the
+        // caller doesn't deinit it; it stays registered but unreferenced
+        // (benign). A mere hash collision keeps our own id.
+        if (contentEql(self.get(winner).?, self.get(id).?)) {
+            return .{ .id = winner, .reused = false };
+        }
         return .{ .id = id, .reused = false };
     }
 
