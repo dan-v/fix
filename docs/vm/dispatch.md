@@ -60,7 +60,7 @@ An equivalent monolithic ~70-arm `switch` compiles to a single ~32 KB function. 
 
 `pushFrame(ch, chunk_id, arg_count, upvalues)`: the top `arg_count` operands are the frame's first locals (they stay on the stack; `frame_base = sp - arg_count`), the remaining `local_count - arg_count` slots are reserved and `@memset` to `null`, `ip = 0`. Overflow is checked on both frame count (`FrameOverflow`) and slot reservation (`StackOverflow`); `arg_count > local_count` is `InvalidCallFrame`. Locals live *in the operand stack* at `[frame_base .. frame_base + local_count)` — there is no separate locals array.
 
-Local access is force-vs-capture split, matching the recursive-`let` cell discipline (see [runtime/thunks.md](../runtime/thunks.md)): `get_local` forces the slot on read; `capture_local` / `capture_upvalue` read it raw (so an unresolved cell can be captured without triggering evaluation).
+Local access is force-vs-capture split, matching the recursive-`let` cell discipline (see [runtime/thunks.md](../runtime/thunks.md)): `loc_get` forces the slot on read; `loc_grab` / `up_grab` read it raw (so an unresolved cell can be captured without triggering evaluation).
 
 ### The stop-depth watermark
 
@@ -78,7 +78,7 @@ This is what makes the interpreter **re-entrant**. `runIsolatedFrame(ch, chunk_i
 
 - 1-byte opcode + **0…N operand bytes**, opcode-dependent. There is **no uniform instruction width**; each handler knows its own operand layout and advances `ip` accordingly.
 - Multi-byte operands are **little-endian**: `u8`, `u16`, `u32`, `InternId` (2- or 4-byte "wide" variants where a narrow id might overflow), and repeated 3-byte capture descriptors `(kind:1, index:2)`.
-- Many opcodes come in narrow/`_long` pairs (2- vs 4-byte id) and in **fused super-op** forms that collapse common pairs into one dispatch — e.g. `get_upvalue_attr`, `get_local_attr`, and the value-returning `constant_ret` / `get_local_ret` / `get_upvalue_ret` (see [access.md](access.md), [calls.md](calls.md)). Fusion is an emit-time decision in the [compiler](../compiler/pipeline.md); the `fusion_savings` counter keeps fusion from perturbing the speculation size threshold.
+- Many opcodes come in narrow/`_w` pairs (2- vs 4-byte id) and in **fused super-op** forms that collapse common pairs into one dispatch — e.g. `up_get_attr`, `loc_get_attr`, and the value-returning `push_const_ret` / `loc_get_ret` / `up_get_ret` (see [access.md](access.md), [calls.md](calls.md)). Fusion is an emit-time decision in the [compiler](../compiler/pipeline.md); the `fusion_savings` counter keeps fusion from perturbing the speculation size threshold.
 
 ## Chunk and registry
 

@@ -10,15 +10,15 @@ Attrsets are stored as arrays of `(InternId, Value)` entries kept **sorted by na
 
 | op | stack / operand | behavior |
 |---|---|---|
-| `get_attr` (`_long`) | `[attrs]`, name id operand | force attrs, binary-search name, force + push the value. |
-| `get_attr_dynamic` | `[attrs, name]` | name is a runtime string; force it to an `InternId`, then as `get_attr`. |
-| `get_attr_dynamic_or` | `[attrs, name, default]` | dynamic select with a lazy default if missing / non-attrs. |
-| `get_attr_path_or` (`_long`) | `[attrs, default]`, N static ids | walk N segments; any missing segment ⇒ force+return the default. |
-| `get_attr_path_dynamic_or` (`_long`) | `[attrs, name, default]` | static prefix + one trailing runtime-string segment. |
-| `get_attr_path_mixed_or` | `[attrs, dyn…, default]` | mixed static/runtime path; a per-segment tag byte says static (inline id) or dynamic (next stack value). |
-| `has_attr_path` (`_long`) / `has_attr_path_mixed` | `[attrs, …]` | existence test (`?`) **without forcing** the final value; a single-segment `has_attr_path` covers the plain `attrs ? name` case. |
-| `validate_attrs` (`_long`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
-| `lookup_with` (`_long`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
+| `attr_get` (`_w`) | `[attrs]`, name id operand | force attrs, binary-search name, force + push the value. |
+| `attr_get_dyn` | `[attrs, name]` | name is a runtime string; force it to an `InternId`, then as `attr_get`. |
+| `attr_get_dyn_or` | `[attrs, name, default]` | dynamic select with a lazy default if missing / non-attrs. |
+| `attr_get_path_or` (`_w`) | `[attrs, default]`, N static ids | walk N segments; any missing segment ⇒ force+return the default. |
+| `attr_get_path_dyn_or` (`_w`) | `[attrs, name, default]` | static prefix + one trailing runtime-string segment. |
+| `attr_get_path_mix_or` | `[attrs, dyn…, default]` | mixed static/runtime path; a per-segment tag byte says static (inline id) or dynamic (next stack value). |
+| `attr_has_path` (`_w`) / `attr_has_path_mix` | `[attrs, …]` | existence test (`?`) **without forcing** the final value; a single-segment `attr_has_path` covers the plain `attrs ? name` case. |
+| `attr_check` (`_w`) | `[attrs]`, expected ids | attrset-pattern arg check; `allow_extra` flag governs `UnexpectedAttribute`. |
+| `with_lookup` (`_w`) | `[scope1…scopeN]`, name id | resolve a name through active `with`-scopes, nearest first; `UndefinedVariable` if none has it. |
 
 Each path walk keeps the root attrs value (and the default) on the operand stack for the whole helper (`getAttrPathOrValue` and siblings); intermediate path nodes are not separately rooted — they are transitively reachable from that on-stack root (attr thunks memoise in place), which is what keeps the walk correct under [-Dgc](../gc.md). The walk itself goes through `cachedAttrLookup`, not the forcing `getAttrValue` wrapper: it forces each intermediate node explicitly between segments.
 
@@ -32,9 +32,9 @@ A cache **miss** is also the trigger point for the **demand-sibling prefetch** (
 
 The compiler collapses pervasive read chains into single opcodes, saving a dispatch and the intermediate push/pop (fusion is chosen at emit time; see [compiler/pipeline.md](../compiler/pipeline.md)):
 
-- **`get_upvalue_attr`** (upvalue idx + name): force upvalue, select attr, push. Profiling puts `get_upvalue` at 10% of all executed ops and `get_attr` at 3%, much of the latter being the same upvalue→attr chain (`lib.foo`, `config.bar`).
-- **`get_local_attr`** / **`get_local_attr_long`**: same for a local slot (narrow / wide).
-- **Value-returning `_ret` fusions** — `constant_ret`, `get_local_ret` (`_long`), `get_upvalue_ret`: load-and-return in one op, collapsing the two dispatches that dominate per-thunk overhead. These also drive the trivial-body thunk short-circuit (see [runtime/thunks.md](../runtime/thunks.md)).
+- **`up_get_attr`** (upvalue idx + name): force upvalue, select attr, push. Profiling puts `up_get` at 10% of all executed ops and `attr_get` at 3%, much of the latter being the same upvalue→attr chain (`lib.foo`, `config.bar`).
+- **`loc_get_attr`** / **`loc_get_attr_w`**: same for a local slot (narrow / wide).
+- **Value-returning `_ret` fusions** — `push_const_ret`, `loc_get_ret` (`_w`), `up_get_ret`: load-and-return in one op, collapsing the two dispatches that dominate per-thunk overhead. These also drive the trivial-body thunk short-circuit (see [runtime/thunks.md](../runtime/thunks.md)).
 
 **Well-known stub chunks** are the same idea at the builtin level: `genlist_apply` (`[func, index]` → `func index`) and `mapattrs_apply` (`[func, name, value]` → `(func name) value`) are shared 1-/2-arg-application bodies reused by `genList`/`map`/`mapAttrs` instead of allocating a per-element closure object. They call the user function on their captured element value **unforced** so the function decides laziness — forcing eagerly here would blackhole when the lambda captures the surrounding recursive attrset (the typical module pattern). `mapAttrs` uses `mapattrs_apply` only when its function argument is already callable; when the function is itself still a thunk it falls back to a per-key `mapAttrValue` builtin thunk (see [builtins.md](builtins.md)).
 
@@ -42,16 +42,16 @@ The compiler collapses pervasive read chains into single opcodes, saving a dispa
 
 Both ops take `[left, right] → [merged]`. The operands arrive in WHNF (whatever produced them forced them; the helpers only `isAttrs`-check, they do not re-force) and stay on the operand stack across the call because the merge **allocates** a heap object — a GC safepoint — with both operands dropped only after. They use **different strategies** for two different sources of `//`:
 
-- **`merge_attrs`** — runtime `//` (`a // b` where either side is dynamic). It does *not* eagerly merge: it builds a **lazy layered node** (`heap.mergeAttrsLayered`), a `base // overlay` structure whose lookups consult the overlay first, so **RHS wins**. Deferring the merge is what keeps the NixOS fixpoint's thousands of stacked `//`s cheap; the layered-node representation, its k-way flatten, and the depth cap that stops the stack from degenerating are a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
-- **`merge_attrs_strict`** — merging the sorted sub-groups of a *single* attrset literal (e.g. `{ a.b = 1; a.c = 2; }`). It performs an eager **reserve-then-flush sorted merge** (`mergeAttrLiteralObjects`): reserve the worst-case union directly in heap attr storage, then walk both sorted, deduped entry arrays in lockstep (O(n+m)), writing entries in place. Because both inputs are sorted+unique, the output is too, by construction. A name present on only one side copies through; on a **name collision** the two values are **recursively merged** iff both are attrsets (`mergeAttrLiteralValue`) — otherwise it raises `DuplicateAttribute`. A leaf collision inside a single literal is rejected, unlike runtime `//`'s silent override.
+- **`attrs_merge`** — runtime `//` (`a // b` where either side is dynamic). It does *not* eagerly merge: it builds a **lazy layered node** (`heap.mergeAttrsLayered`), a `base // overlay` structure whose lookups consult the overlay first, so **RHS wins**. Deferring the merge is what keeps the NixOS fixpoint's thousands of stacked `//`s cheap; the layered-node representation, its k-way flatten, and the depth cap that stops the stack from degenerating are a data-structure concern documented in [runtime/heap.md](../runtime/heap.md).
+- **`attrs_merge_strict`** — merging the sorted sub-groups of a *single* attrset literal (e.g. `{ a.b = 1; a.c = 2; }`). It performs an eager **reserve-then-flush sorted merge** (`mergeAttrLiteralObjects`): reserve the worst-case union directly in heap attr storage, then walk both sorted, deduped entry arrays in lockstep (O(n+m)), writing entries in place. Because both inputs are sorted+unique, the output is too, by construction. A name present on only one side copies through; on a **name collision** the two values are **recursively merged** iff both are attrsets (`mergeAttrLiteralValue`) — otherwise it raises `DuplicateAttribute`. A leaf collision inside a single literal is rejected, unlike runtime `//`'s silent override.
 
 ## List concatenation
 
-`concat_lists` (`[left, right] → [result]`, from `++`) type-checks both operands as lists (they arrive forced) and allocates the concatenation (`heap.addConcatenatedLists`), keeping both on the stack as roots across the allocation. Elements are carried across unforced — `++` does not force list contents.
+`list_cat` (`[left, right] → [result]`, from `++`) type-checks both operands as lists (they arrive forced) and allocates the concatenation (`heap.addConcatenatedLists`), keeping both on the stack as roots across the allocation. Elements are carried across unforced — `++` does not force list contents.
 
 ## Deep equality
 
-`==`/`!=` compile to `eq`/`neq`, which run a recursive, **cycle-tracking** structural comparison (`valuesEqual`). When exactly one side is a literal `null` the compiler instead emits the monomorphic `eq_null`/`neq_null`, which force the single operand and test `kind() == .null` directly — bypassing `valuesEqual` entirely. The structural comparison:
+`==`/`!=` compile to `cmp_eq`/`cmp_ne`, which run a recursive, **cycle-tracking** structural comparison (`valuesEqual`). When exactly one side is a literal `null` the compiler instead emits the monomorphic `cmp_eq_null`/`cmp_ne_null`, which force the single operand and test `kind() == .null` directly — bypassing `valuesEqual` entirely. The structural comparison:
 
 - **Numeric coercion**: two ints compare as ints; any int/float mix compares as floats (`int ↔ float`).
 - **String-like coercion**: `string`, `path`, and `string_context` are mutually comparable **by their text** (interned id), ignoring context.

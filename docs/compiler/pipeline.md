@@ -14,10 +14,10 @@ A `Compiler` instance compiles **one chunk** (one function body / thunk body / f
 
 | Node family | Module | Lowers |
 | --- | --- | --- |
-| int / float / string / path / search-path / identifier | `literals` | immediates, interpolation (`concat_strings`), path resolution, `id → local`/`upvalue`/`with` |
+| int / float / string / path / search-path / identifier | `literals` | immediates, interpolation (`str_cat`), path resolution, `id → local`/`upvalue`/`with` |
 | bool / null | (inline) | a single `push_true`/`push_false`/`push_null` op |
 | binary / unary | `fold` (via `ops`) | operators; compile-time constant folding |
-| apply / lambda / lambda_attrs | `lambda` (via `ops`) | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`tail_call_n` spine flattening |
+| apply / lambda / lambda_attrs | `lambda` (via `ops`) | calls, value-lambda uncurrying, attrset-pattern lambdas, `call_n`/`call_tail_n` spine flattening |
 | let | `let` (via `ops`) | `let` binding classification, cell elision, eager elision |
 | if / assert / with | `control` | branch/join, assertion guard, dynamic-scope push |
 | attrset (static/dynamic/rec/inherit) | `attrs` | attr construction, merge, `inherit`, deferred-set gating |
@@ -45,7 +45,7 @@ The strictness stamp (`strictness.stampOnBuilder`) runs at the **end of body com
 
 At **finish** (`ChunkBuilder.finish`), in one pass, the builder freezes into an immutable **Chunk**:
 
-1. **body_is_substantial** — `code.len + fusion_savings ≥ SPECULATION_MIN_CODE_BYTES` (256), gating [speculation](../parallel/speculation.md).
+1. **body_is_substantial** — `code.len + fusion_savings + sideTableWeight() ≥ SPECULATION_MIN_CODE_BYTES` (256), gating [speculation](../parallel/speculation.md); `sideTableWeight` re-adds the bytes the attr-name/position side tables moved out of the code stream, mirroring their old inline encodings.
 2. **Trivial-body classify** — the finished body is classified once into a `TrivialBody` variant, else `none` (see [lazy-compile.md](lazy-compile.md) and [runtime/thunks.md](../runtime/thunks.md)); safe because thunk bodies have `local_count == 0`.
 3. The strictness masks, `strict_param`, `strict_via_upvalue`, `arity`, and `strict_params` are copied through into the Chunk.
 
@@ -62,26 +62,26 @@ ChunkBuilder (mutable, arena)                 Chunk (immutable, persistent)
 
 ## Constant folding & call_n flattening
 
-- **Constant folding** (`fold.zig`) — arithmetic, comparison, and unary (`!`, negation) operators over fully-literal operands are evaluated at compile time, emitting a single `constant` instead of the op sequence; nested `&&`/`||`/`->` fold too when both sides are literal, but a top-level `&&`/`||`/`->` compiles to short-circuit branch code. Division and any i64-overflowing arithmetic are never folded: `{ x = 1/0; }` is valid Nix and must throw only when `.x` is forced, so folding stays conservative.
-- **`call_n` flattening** (`lambda.zig`) — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). For `K ≥ 2` the spine is flattened to a single `call_n K`: the callee is compiled, then K args pushed, then `call_n K`. When the callee is an **arity-matched uncurried (merged) lambda** the body runs in **one frame** with no intermediate closure/PAP allocation; a non-matching callee folds one arg at a time (same result). Each spine argument compiles as an immediate container value or a plain lazy thunk (not the runtime-adaptive `apply_arg`, whose callee probe is only valid for the first arg); the saturated `call_n` path then eagerly forces the argument positions the callee's `strict_params` mark must-force. `K == 1` keeps the single-arg path (eager-strict-arg + tail-call frame reuse).
+- **Constant folding** (`fold.zig`) — arithmetic, comparison, and unary (`!`, negation) operators over fully-literal operands are evaluated at compile time, emitting a single `push_const` instead of the op sequence; nested `&&`/`||`/`->` fold too when both sides are literal, but a top-level `&&`/`||`/`->` compiles to short-circuit branch code. Division and any i64-overflowing arithmetic are never folded: `{ x = 1/0; }` is valid Nix and must throw only when `.x` is forced, so folding stays conservative.
+- **`call_n` flattening** (`lambda.zig`) — a curried application spine `f a b c` normally lowers to nested `call`s (one frame per argument). For `K ≥ 2` the spine is flattened to a single `call_n K`: the callee is compiled, then K args pushed, then `call_n K`. When the callee is an **arity-matched uncurried (merged) lambda** the body runs in **one frame** with no intermediate closure/PAP allocation; a non-matching callee folds one arg at a time (same result). Each spine argument compiles as an immediate container value or a plain lazy thunk (not the runtime-adaptive `thunk_arg`, whose callee probe is only valid for the first arg); the saturated `call_n` path then eagerly forces the argument positions the callee's `strict_params` mark must-force. `K == 1` keeps the single-arg path (eager-strict-arg + tail-call frame reuse).
 
 ## Super-op fusion (in `emit`)
 
 Fusion rewrites the *last emitted op in place* when the next emission completes a known pattern — no peephole pass. It is byte-for-byte behavior-preserving; the fused op is a single [dispatch](../vm/dispatch.md) instead of two.
 
-- `<op> + ret` → `<op>_ret` (`constant_ret`, `get_upvalue_ret`, `get_local_ret`, `get_local_ret_long`) — the value-producing op returns directly, skipping a standalone `ret`.
-- `get_upvalue + get_attr` → `get_upvalue_attr`; `get_local + get_attr` → `get_local_attr` / `get_local_attr_long` — fuses only when the attr name is a static InternId that fits in `u16`.
-- `thunk_captures(_eager) + set_local` → `*_store_local` / `*_store_cell_local` — fused thunk-create-and-store, for 1-byte (narrow) slots and short chunk ids only.
+- `<op> + ret` → `<op>_ret` (`push_const_ret`, `up_get_ret`, `loc_get_ret`, `loc_get_ret_w`) — the value-producing op returns directly, skipping a standalone `ret`.
+- `up_get + attr_get` → `up_get_attr`; `loc_get + attr_get` → `loc_get_attr` / `loc_get_attr_w` — fuses only when the attr name is a static InternId that fits in `u16`.
+- `thunk(_eag)(_w) + loc_set`/`cell_set` → `*_st` / `*_st_cell` — fused thunk-create-and-store (the destination slot byte is appended at the end of the operand). Fuses for 1-byte (narrow) slots only, but for **both** chunk-id widths — past 65,536 registered chunks the wide encoding is the dominant form.
 
 A branch fixup (`patchJump`) that lands at the current write position drops the `last_op_offset` fusion hint, so a multi-predecessor join never fuses across control flow.
 
-The `get_*_attr` and `*_store_local` rewrites each add their one saved byte to **`fusion_savings`** (the `<op>_ret` rewrite does not); `fusion_savings` is added back to `code.len` when deciding `body_is_substantial`, so the [speculation](../parallel/speculation.md) size threshold measures the pre-fusion body size. String-interpolation lowering (`literals.zig`) also adjusts `fusion_savings` so a `concat_strings` body keeps the scheduling weight of its unfused encoding.
+The `*_get_attr` and `*_st(_cell)` rewrites each add their one saved byte to **`fusion_savings`** (the `<op>_ret` rewrite does not); `fusion_savings` is added back to `code.len` when deciding `body_is_substantial`, so the [speculation](../parallel/speculation.md) size threshold measures the pre-fusion body size. String-interpolation lowering (`literals.zig`) also adjusts `fusion_savings` so a `str_cat` body keeps the scheduling weight of its unfused encoding.
 
 ## Tail-position lowering
 
-`compileTailExpression` compiles an expression in tail position: instead of computing a value and returning, terminal calls emit **`tail_call`** (reuse the current frame). It routes the terminal branch of each control form to a `_tail` variant so tail position propagates through them:
+`compileTailExpression` compiles an expression in tail position: instead of computing a value and returning, terminal calls emit **`call_tail`** (reuse the current frame). It routes the terminal branch of each control form to a `_tail` variant so tail position propagates through them:
 
-- `apply` → `tail_call` (or `tail_call_n` for a flattened saturated spine).
+- `apply` → `call_tail` (or `call_tail_n` for a flattened saturated spine).
 - `if` → `compileIfElseTail` (both branches tail).
 - `let` → body compiled in tail position.
 - `assert` → `compileAssertTail` (body tail, guard unchanged).
@@ -91,13 +91,13 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 
 ## Lowering notes by family
 
-**attrs** — static keys build the attrset directly (`build_attrs` / `build_attrs_with_pos`, `_sorted` variants when the entries were emitted in ascending interned-name order so the runtime skips a sort + dedup); dynamic/interpolated keys emit dynamic construction; `rec` sets self-reference via cells so bindings see each other; `inherit` (plain and `inherit (e)`) copies named attrs from the current scope or a source expression. Large file-scope generated sets may defer per-attr compilation — see [lazy-compile.md](lazy-compile.md).
+**attrs** — static keys build the attrset directly, with entries emitted in ascending interned-name order so the runtime skips the sort + dedup: the attr names (plus source positions when the unit is file-attributed) ride the chunk's side tables rather than the code stream (`attrs_new_named_srt` / `attrs_new_named_pos_srt`; the empty literal is a bare `attrs_new_srt 0`); dynamic/interpolated keys emit runtime construction (`attrs_new`); `rec` sets self-reference via cells so bindings see each other; `inherit` (plain and `inherit (e)`) copies named attrs from the current scope or a source expression. Large file-scope generated sets may defer per-attr compilation — see [lazy-compile.md](lazy-compile.md).
 
-**access** — a static dotted path `a.b.c` compiles the root then emits one `get_attr` per segment (the first fusing into `get_local_attr` / `get_upvalue_attr`); an interpolated segment emits `get_attr_dynamic`. `or`-defaults use packed segment super-ops carrying the fallback as a thunk: `get_attr_path_or` (all-static path), `get_attr_path_mixed_or` (interpolated), `get_attr_dynamic_or` / `get_attr_path_dynamic_or` (dynamic key). `?` has-attr mirrors the split with `has_attr_path` / `has_attr_path_mixed` over a packed segment operand. Lists build via `build_list`.
+**access** — a static dotted path `a.b.c` compiles the root then emits one `attr_get` per segment (the first fusing into `loc_get_attr` / `up_get_attr`); an interpolated segment emits `attr_get_dyn`. `or`-defaults use packed segment super-ops carrying the fallback as a thunk: `attr_get_path_or` (all-static path), `attr_get_path_mix_or` (interpolated), `attr_get_dyn_or` / `attr_get_path_dyn_or` (dynamic key). `?` has-attr mirrors the split with `attr_has_path` / `attr_has_path_mix` over a packed segment operand. Lists build via `list_new`.
 
-**control** — `if` emits `jump_if_false` + a forward `jump` patched at join; `assert` compiles the condition then `jump_if_false` over the body to a `fail_assertion` tail, falling through to the body when the condition holds; `with` compiles the scope subject as a thunk bound to an anonymous frame-local slot, registers that slot on the `with_scopes` chain, compiles the body, then pops the scope.
+**control** — `if` emits `jump_false` + a forward `jump` patched at join; `assert` compiles the condition then `jump_false` over the body to a `fail` tail, falling through to the body when the condition holds; `with` compiles the scope subject as a thunk bound to an anonymous frame-local slot, registers that slot on the `with_scopes` chain, compiles the body, then pops the scope.
 
-**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates via `concat_strings`; path literals resolve against the compiler's `base_path` at compile time (absolute paths via `std.fs.path.resolve`, relative paths joined onto `base_path`); `__curPos` lowers to a `{ file; line; column; }` attrset built at the current source position (or `push_null` when the unit has no `source_path`). An identifier resolves in order **local slot → upvalue capture → the literal `builtins` → ambient builtin → `with` lookup**, emitting `get_local` / `get_upvalue` / `push_builtins` / (a `builtin` constant or `push_builtins` + `get_attr`) / `lookup_with`; an unresolved name is a compile error (see [scopes.md](scopes.md)).
+**literals** — ints box to inline i48 or a `boxed_int` constant; floats route through canonical-NaN `float()`; string interpolation lowers each part (literal chunk vs interpolated sub-expr thunk) and concatenates via `str_cat`; path literals resolve against the compiler's `base_path` at compile time (absolute paths via `std.fs.path.resolve`, relative paths joined onto `base_path`); `__curPos` lowers to a `{ file; line; column; }` attrset built at the current source position (or `push_null` when the unit has no `source_path`). An identifier resolves in order **local slot → upvalue capture → the literal `builtins` → ambient builtin → `with` lookup**, emitting `loc_get` / `up_get` / `push_builtins` / (a `builtin` constant or `push_builtins` + `attr_get`) / `with_lookup`; an unresolved name is a compile error (see [scopes.md](scopes.md)).
 
 ## Diagnostics
 
@@ -114,5 +114,3 @@ Lambda bodies (`compileLambda` / `compileLambdaAttrs`) enter `compileTailExpress
 Out of scope: how opcodes execute → [vm/dispatch.md](../vm/dispatch.md); name resolution → [scopes.md](scopes.md); strictness masks → [strictness.md](strictness.md); deferral/trivial short-circuits → [lazy-compile.md](lazy-compile.md).
 
 Code: `src/nix/compiler/`
-</content>
-</invoke>

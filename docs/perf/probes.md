@@ -14,7 +14,7 @@ The governing philosophy: **measure headroom before building.** Every dead-end i
 | `-Dprof-path` | What is the **force-call critical path** (per-chunk attribution), and what is the `w=∞` floor? | force-call tree + per-chunk self/span time, via `--print-sched-stats` |
 | `-Dtimeline` | Per-worker **wall-clock timeline** — parse/compile/import phases, fiber-run quanta, idle parks, GC pauses | Perfetto JSON, written via `--timeline[=path]` |
 | `-Dvm-opcode-profile` | Which **VM opcodes** execute most (raw dispatch counts) | per-opcode count table, sorted with each opcode's % of total, printed after evaluation |
-| `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/errored/blackhole), written via `--thunks-log[=path]`; two logs are compared with `fix thunks diff`, which reports the creator source locations whose resolve/errored/reset outcome multisets differ (keyed by creator location, which is stable across runs) |
+| `-Dthunks-log` | What value did each thunk resolve to, and **where was it created** — for cross-run comparison | per-thunk lifecycle event log (create/claim/resolve/reset/errored/blackhole), written via `--thunks-log PATH`; two logs are compared with `fix thunks diff`, which reports the creator source locations whose resolve/errored/reset outcome multisets differ (keyed by creator location, which is stable across runs) |
 | `-Dfiber-stack-probe` | **Peak fiber stack depth** — how much of each fiber's reserved stack is actually touched | sentinel-fills every fiber stack so `maxStackUsedBytes` can scan for the high-water mark |
 
 ### `-Dprof-main` and its piggyback censuses
@@ -33,7 +33,7 @@ This is the probe that settled the floor question. At `--workers=32` main parks 
 
 `-Dprof-main` tells you which routines burn cycles, but not which *Nix source* the eval spends its time in, and nothing about the **critical path** — the longest chain of dependent thunk forces, the floor no worker count can beat. `-Dprof-path` runs at `--workers=1`, where forcing is cleanly nested (one fiber, LIFO on the C stack): every `forceThunkImpl` is a span containing exactly the spans of the thunks it forced, keyed by body chunk (≈ a Nix source location). Per span it computes `total` (subtree wall cycles), `self = total − Σ child totals`, and `span = self + max(child span)`. Using `max` (not `sum`) over children models the multi-worker floor — independent siblings would run in parallel — so the root `span` estimates what `w=∞` cannot beat. That floor lands ~0.43s vs. the ~1.7s w=32 wall: the gap is discovery-serialization, not throughput, and the top self-time bodies are module-system drivers (irreducible).
 
-Attribution caveat: spans nest on thunk *forces* only, not on direct closure calls (`do_call`/`tail_call` keep running in the same dispatch loop). Work in a directly-called closure that forces no thunk is charged to the *forcing* chunk's self-time. Read the flat profile as "which forcing site drives the most call work", and use `-Dprof-main` for operation-level truth.
+Attribution caveat: spans nest on thunk *forces* only, not on direct closure calls (`do_call`/`do_tail_call` keep running in the same dispatch loop). Work in a directly-called closure that forces no thunk is charged to the *forcing* chunk's self-time. Read the flat profile as "which forcing site drives the most call work", and use `-Dprof-main` for operation-level truth.
 
 ## `--print-sched-stats`
 

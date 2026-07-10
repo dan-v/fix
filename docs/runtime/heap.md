@@ -46,7 +46,7 @@ Source positions live inside the `attrs` variant rather than in a field on every
 
 ## Attrsets: sorted, binary-searched, dup-rejecting
 
-An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup (`getAttrValueOpt` → `binarySearchAttr`) is a binary search over the entry slice; construction (`prepareAttrsRange`) sorts with `std.mem.sort` and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's `build_attrs_sorted` literals).
+An `AttrsObject` holds its `AttrEntry`s **sorted by `InternId`** (name). Lookup (`getAttrValueOpt` → `binarySearchAttr`) is a binary search over the entry slice; construction (`prepareAttrsRange`) sorts with `std.mem.sort` and **rejects duplicate names** (`rejectDuplicateAttrs`). This ordering is an invariant relied on everywhere — producers that emit already-sorted-unique output take `addAttrsSorted` / `addAttrsFromStackPairsSorted`, which skip the re-sort and dup-check (the k-way flatten, `intersectAttrs`, and the compiler's sorted attrset literals (`attrs_new_srt` / `attrs_new_named*`)).
 
 ## Layered merge (`merge_attrs`) for `//`
 

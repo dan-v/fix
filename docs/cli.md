@@ -14,11 +14,16 @@ A subcommand is **required** (there is no default command). POSIX conventions: `
 
 ## Subcommands
 
-Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compiler/VM and the standard evaluate-and-render path; the rest are introspection tools that bypass it.
+Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compiler/VM and the standard evaluate-and-render path; `instantiate`/`build`/`run`/`shell` evaluate the same way but then realize the resulting derivation to the store through the nix-daemon worker protocol; the rest are introspection tools.
 
 | Subcommand | Purpose | Link |
 |---|---|---|
 | `eval` | evaluate an expression/file/flake output → render value (the `-e`/`--file`/`--flake` flags live here) | — |
+| `instantiate` | evaluate to a derivation and add its `.drv` closure to the store (à la `nix-instantiate`) | [derivation/model.md](derivation/model.md) |
+| `build` | evaluate to a derivation, build its outputs via the nix-daemon, and link `./result` | [derivation/model.md](derivation/model.md) |
+| `run` | build a derivation and run a program from its output | — |
+| `shell` | build a derivation and open a shell with its `bin/` on `PATH` (`-p NAMES...` pulls packages from `<nixpkgs>`) | — |
+| `store` | query the nix-daemon directly (protocol version, path validity) | — |
 | `repl` | interactive read-eval loop | — |
 | `disasm` | decompile bytecode per-chunk with source-span + constant annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `inspect` | post-eval heap size / intern stats / chunk count; `--top N` longest interned strings | [runtime/interning.md](runtime/interning.md) |
@@ -29,13 +34,25 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 ## Key flags
 
-Parsed in `src/cli/args.zig` (shared by `eval`/`repl`). Defaults shown; `[=X]` means the value is optional.
+The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it drives parsing *and* per-command `--help` visibility (each spec lists the subcommands it applies to). Defaults shown; `[=X]` means the value is optional.
+
+### Source selection (`eval`/`instantiate`/`build`/`run`/`shell`/`disasm`)
 
 | Flag | Meaning |
 |---|---|
+| `PATH` (positional) | evaluate a file; without any source, `./default.nix` (or the flake `.` under `--flake`) |
 | `-e, --expr EXPR` | evaluate expression text |
-| `--file PATH` | evaluate a file (mutually exclusive with `-e`) |
-| `--flake INSTALLABLE` | evaluate a flake output `<flakeref>[#<attrpath>]`; lowered to `(builtins.getFlake "<ref>").<attrpath>`. `.`/relative refs resolve against cwd; `github:`/`path:`/… pass through. Requires the `flakes` feature. |
+| `--file PATH` | evaluate a file (same as a bare PATH; mutually exclusive with `-e`) |
+| `--flake [INSTALLABLE]` | evaluate a flake output `<flakeref>[#<attrpath>]` (default flakeref `.`); lowered to `(builtins.getFlake "<ref>").<attrpath>`. `.`/relative refs resolve against cwd; `github:`/`path:`/… pass through. Requires the `flakes` feature. |
+| `-A, --attr ATTR` | select attribute path ATTR from the result |
+| `--arg NAME EXPR` / `--argstr NAME STR` | pass an expression / a string as top-level function argument NAME |
+| `-I, --include PATH` | prepend a search-path entry (as in `NIX_PATH`; `prefix=path` form allowed). Repeatable. |
+| `--option NAME VALUE` | override a nix.conf setting |
+
+### Evaluation / output
+
+| Flag | Meaning |
+|---|---|
 | `--json` / `--xml` | render the value as JSON / XML instead of Nix |
 | `--strict` | recursively force attr values + list items before writing |
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
@@ -49,6 +66,21 @@ Parsed in `src/cli/args.zig` (shared by `eval`/`repl`). Defaults shown; `[=X]` m
 | `--debug-derivation-name NAME` | only the derivation with exactly NAME |
 | `--debug-derivation-drv PATH` | only the derivation with exactly PATH |
 
+### Store links & realization (`instantiate`/`build`/`run`/`shell`)
+
+| Flag | Meaning |
+|---|---|
+| `-o, --out-link NAME` | name of the result symlink (`build`; default `result`); `--no-out-link` (alias `--no-link`) skips it |
+| `--drv-link NAME` / `--add-drv-link` | name of / also create the `.drv` symlink (`build`/`instantiate`; default `derivation`) |
+| `--add-root PATH` / `--indirect` | create the link at PATH and register it as a (optionally indirect) GC root (`build`/`instantiate`) |
+| `--check` / `--repair` | rebuild and verify outputs are unchanged / repair corrupted store paths |
+| `-j, --max-jobs N\|auto` / `--cores N` | daemon build parallelism (folded into `--option` overrides, applied via the worker protocol) |
+| `--fallback` | build from source if a substitute fails |
+| `-K, --keep-failed` | keep the build tree of failed builds |
+| `--max-silent-time SECS` / `--timeout SECS` | abort builds silent/running too long (`0` = no limit) |
+| `-v, --verbose` | increase daemon build verbosity (repeatable) |
+| `-p, --packages NAMES...` | (`shell`) packages (attr paths) from `<nixpkgs>`, e.g. `-p ripgrep jq` |
+
 ### Introspection / trace flags
 
 | Flag | Meaning |
@@ -57,7 +89,7 @@ Parsed in `src/cli/args.zig` (shared by `eval`/`repl`). Defaults shown; `[=X]` m
 | `--vm-trace-format text\|binary` | trace encoding (default `text`) |
 | `--vm-trace-max-events N` | cap recorded events (default `0` = unlimited) |
 | `--vm-trace-main-only` | record only the main thread's fiber |
-| `--thunks-log=PATH` | per-thunk lifecycle log (PATH required, no bare form; needs a `-Dthunks-log` build) |
+| `--thunks-log PATH` | per-thunk lifecycle log (PATH required — `--thunks-log PATH` or `=PATH`; needs a `-Dthunks-log` build) |
 | `--timeline[=PATH]` | Perfetto wall-clock timeline (default `fix-timeline.json`); needs a `-Dtimeline` build |
 | `--print-sched-stats` | after eval, print scheduler / chunk-registry / deferred-table / speculation-census counters, plus worker busy/idle time summed across all workers and the resulting average utilisation, plus any `-Dprof-main` / `-Dprof-path` reports |
 
@@ -76,7 +108,7 @@ Use the disable toggles to isolate whether a wrong parallel result (or a hang) c
 
 ## Using the debug tools
 
-- **`disasm`** — read what the compiler emitted per chunk, with source spans and constant-pool annotation. The first stop when a bytecode-level bug is suspected; pair with [compiler/pipeline.md](compiler/pipeline.md) to map source→ops and [vm/dispatch.md](vm/dispatch.md) to map ops→handlers.
+- **`disasm`** — read what the compiler emitted per chunk, with source spans and constant-pool annotation. The first stop when a bytecode-level bug is suspected; pair with [compiler/pipeline.md](compiler/pipeline.md) to map source→ops and [vm/dispatch.md](vm/dispatch.md) to map ops→handlers. Flags: `--eval` (evaluate first, then disassemble every chunk that compiled), `--stats` (corpus statistics instead of a listing), `--chunk N`, `--no-recurse`, `--no-source`, `--no-constants`, `--no-bytes`, `--no-pager`.
 - **`inspect`** — post-eval heap/intern census; `--top N` lists the N longest interned strings (string-table bloat).
 - **`--vm-trace` + `trace`** — capture a VM event stream (`--vm-trace-format binary` for volume, `--vm-trace-main-only` to drop helper noise), then inspect it with the `trace` subcommand: `trace dump` pretty-prints the binary trace as text, `trace diff` walks two binary traces to the first divergent event. The `trace` subcommand reads the binary format only.
 - **`--thunks-log` + `fix thunks diff`** — the divergence workflow. When a `--workers=N` run gives a wrong answer a `--workers=1` run doesn't, record `--thunks-log` for both, then `fix thunks diff A B`. It keys thunk outcomes by the joint `(creator, target)` source-location pair — each a `(file, line, col)` triple, stable across runs even though chunk/thunk ids are not; creator alone collides across let-bindings sharing an outer span and target alone collides at synthetic `?:0:0` spans, so the pair is unique per thunk-creation site — and reports the earliest locations whose resolve/errored/reset outcome multisets differ. Filters narrow it further: `--asymmetric` (one side produced an outcome the other never did — the speculation-race smoking gun), `--novel-in b` (only where B forced something A never reached), `--by-kind` (compare by kind+discriminant, ignoring value contents, to suppress iteration-order noise), `--max-divergences N` (default 30), `--max-outcomes N` (default 5). See [runtime/thunks.md](runtime/thunks.md).
