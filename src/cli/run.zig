@@ -30,6 +30,7 @@ pub fn evaluateAndWrite(
     debug_options: derivation_debug.Options,
     ev: *Evaluator,
     source: []const u8,
+    source_path: ?[]const u8,
     label: []const u8,
 ) !bool {
     // Bracket the whole run (evaluate + force + render) so the progress bar
@@ -41,7 +42,7 @@ pub fn evaluateAndWrite(
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluate(source) catch |err| {
+    const result = ev.evaluatePath(source, source_path) catch |err| {
         try render.evalFailure(io, use_color, show_trace, ev, source, err);
         return false;
     };
@@ -74,6 +75,17 @@ pub const Source = struct {
     /// lowering and/or `-A`/`--arg` wrapping); the caller must free it.
     owned: bool = false,
 };
+
+/// The real file path behind a source, when the text is the file's own
+/// content (not `--flake`/`-A`/`--arg`-synthesized wrapping) — so evaluation
+/// attributes spans and attr positions to the file, like Nix does. Positions
+/// only make sense against the original text, hence the `owned` guard.
+pub fn sourcePathOf(source: SourceArg, loaded: Source) ?[]const u8 {
+    return switch (source) {
+        .file => |p| if (loaded.owned) null else p,
+        else => null,
+    };
+}
 
 /// A short human label for the progress "evaluating <label>" node.
 pub fn sourceLabel(source: SourceArg) []const u8 {

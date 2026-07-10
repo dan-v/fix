@@ -64,7 +64,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.startProgressSampler();
     defer ev.stopProgressSampler();
 
-    const result = ev.evaluate(source.text) catch |err| {
+    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
 

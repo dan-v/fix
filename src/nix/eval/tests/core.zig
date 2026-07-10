@@ -496,3 +496,30 @@ test "evaluate deepSeq builtin" {
     defer ev.deinit();
     try std.testing.expectError(error.DivisionByZero, ev.evaluate("builtins.deepSeq [ (1 / 0) ] 2"));
 }
+
+test "unsafeGetAttrPos reports file positions for file-attributed sources" {
+    // Constant attrset: the closed-literal fold materializes it at compile
+    // time — positions must be carried onto the folded object.
+    const folded = try helpers.renderPathForTest(
+        "builtins.unsafeGetAttrPos \"email\" { name = \"n\"; email = \"e\"; }",
+        "/test/pos.nix",
+    );
+    defer std.testing.allocator.free(folded);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "file = \"/test/pos.nix\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "line = 1") != null);
+
+    // Non-constant entry: the attrset builds at runtime via attrs_new_pos —
+    // positions must flow through that path too.
+    const built = try helpers.renderPathForTest(
+        "builtins.unsafeGetAttrPos \"email\" { name = toString 1; email = \"e\"; }",
+        "/test/pos.nix",
+    );
+    defer std.testing.allocator.free(built);
+    try std.testing.expect(std.mem.indexOf(u8, built, "file = \"/test/pos.nix\"") != null);
+
+    // No source path (bare expression): null, matching Nix's `-E` behavior.
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    const v = try ev.evaluate("builtins.unsafeGetAttrPos \"email\" { email = \"e\"; }");
+    try std.testing.expect(v.kind() == .null);
+}

@@ -19,6 +19,23 @@ pub fn renderForTest(source: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Like `renderForTest`, but attributing the source to `source_path` — for
+/// tests that need file-attributed spans/attr positions (like Nix evaluating
+/// a real file).
+pub fn renderPathForTest(source: []const u8, source_path: []const u8) ![]u8 {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+
+    const result = try ev.evaluatePath(source, source_path);
+    try ev.forceDeep(result);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
 pub fn renderStrictForTest(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();

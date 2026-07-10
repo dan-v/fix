@@ -353,7 +353,7 @@ pub fn run_loop(allocator: std.mem.Allocator, io: std.Io, options: Options, use_
             continue;
         }
 
-        _ = try run.evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source, "input");
+        _ = try run.evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source, null, "input");
     }
 }
 

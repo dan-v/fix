@@ -133,7 +133,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     };
     defer if (source.owned) ev.allocator.free(source.text);
 
-    const result = ev.evaluate(source.text) catch |err| {
+    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();
         return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
     };

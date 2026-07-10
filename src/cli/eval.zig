@@ -89,7 +89,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         .expr => "expression",
         .flake => |inst| inst,
     };
-    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), term.use_color, options.show_trace, options.derivation_debug, &ev, source.text, eval_label);
+    const ok = try run.evaluateAndWrite(init.io, options.evaluationMode(), term.use_color, options.show_trace, options.derivation_debug, &ev, source.text, run.sourcePathOf(source_arg, source), eval_label);
     progress.deinit(ok);
 
     if (timeline_path) |p| timeline.dump(init.io, p, worker_count);
