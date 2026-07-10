@@ -9,6 +9,7 @@ const encoding = @import("encoding.zig");
 const OpCode = @import("opcode.zig").OpCode;
 const Value = @import("runtime").value.Value;
 const AttrEntry = @import("runtime").heap.AttrEntry;
+const AttrPosEntry = @import("runtime").heap.AttrPosEntry;
 const stable = @import("base").segments;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
@@ -60,6 +61,11 @@ pub const Chunk = struct {
     scheduling: SchedulingHints = .{},
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
+    /// Attr-position records referenced by `attrs_new_pos*` ops. Kept OUT of
+    /// the dispatched code stream (they were 16 bytes/entry inline — ~38% of
+    /// all emitted bytecode on a NixOS eval, cold data read only by
+    /// `unsafeGetAttrPos`/diagnostics). Ops carry a (start, count) reference.
+    attr_pos: []const AttrPosEntry = &.{},
     /// Source span ranges for cold-path error traces.
     source_map: []const SourceMapEntry = &.{},
     /// The span of the whole body node this chunk was compiled from — a
@@ -73,6 +79,7 @@ pub const Chunk = struct {
         allocator.free(self.code);
         allocator.free(self.constants);
         allocator.free(self.function_args);
+        allocator.free(self.attr_pos);
         allocator.free(self.source_map);
     }
 };
@@ -194,6 +201,9 @@ pub const ChunkBuilder = struct {
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
+    /// Attr-position records collected by emitBuildAttrs — carried onto
+    /// `Chunk.attr_pos` at finish (see that field's doc).
+    attr_pos: std.ArrayListUnmanaged(AttrPosEntry) = .empty,
     /// The body node's span (see `Chunk.body_span`). Set by `stampOnBuilder`.
     body_span: ?Chunk.SourceSpan = null,
     /// Byte offset of the start of the most recently written opcode.
@@ -246,6 +256,7 @@ pub const ChunkBuilder = struct {
         self.constants.deinit(allocator);
         self.function_args.deinit(allocator);
         self.source_map.deinit(allocator);
+        self.attr_pos.deinit(allocator);
     }
 
     /// Restore the freshly-initialized state, keeping buffer capacity —
@@ -254,6 +265,7 @@ pub const ChunkBuilder = struct {
         self.code.clearRetainingCapacity();
         self.constants.clearRetainingCapacity();
         self.function_args.clearRetainingCapacity();
+        self.attr_pos.clearRetainingCapacity();
         self.source_map.clearRetainingCapacity();
         self.body_span = null;
         self.last_op_offset = null;
@@ -322,6 +334,8 @@ pub const ChunkBuilder = struct {
         errdefer allocator.free(constants);
         const function_args = try allocator.dupe(AttrEntry, self.function_args.items);
         errdefer allocator.free(function_args);
+        const attr_pos = try allocator.dupe(AttrPosEntry, self.attr_pos.items);
+        errdefer allocator.free(attr_pos);
         const source_map = try allocator.dupe(Chunk.SourceMapEntry, self.source_map.items);
         return Chunk{
             .code = code,
@@ -330,13 +344,14 @@ pub const ChunkBuilder = struct {
             .arity = self.arity,
             .strict_params = self.strict_params,
             .scheduling = .{
-                .body_is_substantial = self.code.items.len + self.fusion_savings >= SPECULATION_MIN_CODE_BYTES,
+                .body_is_substantial = self.code.items.len + self.fusion_savings + self.attr_pos.items.len * 16 >= SPECULATION_MIN_CODE_BYTES,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,
                 .strict_via_upvalue = if (local_count == 1) self.strict_via_upvalue else null,
             },
             .function_args = function_args,
+            .attr_pos = attr_pos,
             .source_map = source_map,
             .body_span = self.body_span,
         };

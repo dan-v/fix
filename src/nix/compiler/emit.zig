@@ -71,14 +71,15 @@ fn emitBuildAttrsImpl(self: *Compiler, count: u16, positions: []const heap_mod.A
     };
     defer if (!presorted) self.allocator.free(@constCast(sorted));
 
+    // The records live in the chunk's side table (`Chunk.attr_pos`), NOT the
+    // code stream — the op carries a (start, count) reference. Inline records
+    // were 16 bytes/entry of cold data on the dispatch path (~38% of all
+    // emitted bytecode on a NixOS eval).
+    const pos_start: u32 = @intCast(self.builder.attr_pos.items.len);
+    try self.builder.attr_pos.appendSlice(self.allocator, sorted);
     try emitOpU16(self, if (presorted) .attrs_new_pos_srt else .attrs_new_pos, count);
     try self.builder.writeU16(self.allocator, try u16Count(sorted.len));
-    for (sorted) |position| {
-        try self.builder.writeU32(self.allocator, position.name);
-        try self.builder.writeU32(self.allocator, position.pos.file);
-        try self.builder.writeU32(self.allocator, position.pos.line);
-        try self.builder.writeU32(self.allocator, position.pos.column);
-    }
+    try self.builder.writeU32(self.allocator, pos_start);
 }
 
 fn posNameLessThan(_: void, a: heap_mod.AttrPosEntry, b: heap_mod.AttrPosEntry) bool {

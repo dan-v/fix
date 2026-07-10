@@ -893,7 +893,8 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue(" entries, ", .{});
             l.tint(c_p, "{d}", .{positions});
             l.glue(" positions", .{});
-            return 4;
+            l.groupPinned(5, 4, comment_color, "", .{}); // side-table start index bytes
+            return 8;
         },
         .thunk_defer => {
             const id = readU32(code, start + 1);
@@ -1250,63 +1251,35 @@ fn writeOperandTail(
             try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
-            // Entry/position counts rode the mnemonic line; the positions count
-            // is the last 2 head bytes (`off - 2`). Each record hangs at level 1.
-            const pos_count = readU16(code, off - 2);
+            // Entry/position counts + side-table start rode the mnemonic line
+            // (`off` points past them). Records live in the chunk's attr_pos
+            // side table, not the code stream — one row per record, no byte
+            // column, name/file/line/col in identity colors.
+            const pos_count = readU16(code, off - 6);
+            const pos_start = readU32(code, off - 4);
+            const table = chunk.attr_pos;
             var k: usize = 0;
             while (k < pos_count) : (k += 1) {
-                // 16-byte record: name id, file id, line, col (u32 LE each).
-                // Bytes split 8+8 across the two rows, but the text puts the
-                // name id alone on row 1 (with its `str[…] → "text"` chain) and
-                // the file/line/col trio on row 2 — pinned colors keep every
-                // value tied to its bytes even across the row split.
-                const nm: InternId = readU32(code, off);
-                const fl: InternId = readU32(code, off + 4);
-                const ln = readU32(code, off + 8);
-                const cl = readU32(code, off + 12);
-                const c_nm = internColor(nm);
-                const c_fl = internColor(fl);
-                const c_ln = hueColor(seq.*);
-                const c_cl = hueColor(seq.* + 1);
-                seq.* += 2;
-                // Row 1 — name id; its bytes and the `str[…]` chain share the
-                // intern id's identity color. The file id's bytes (this row's
-                // second half) take the file color via a text-less group.
+                if (pos_start + k >= table.len) break;
+                const rec = table[pos_start + k];
+                const c_nm = internColor(rec.name);
+                const c_fl = internColor(rec.pos.file);
                 var esc: [128]u8 = undefined;
                 var ew: std.Io.Writer = .fixed(&esc);
-                if (symbols.internName(nm)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l1 = Line{};
-                l1.groupPinned(0, 4, c_nm, "0x{x}", .{nm});
-                l1.groupPinned(4, 4, c_fl, "", .{}); // file id bytes; value shown on row 2
-                l1.comment();
-                l1.storeRef("str", c_nm, "0x{x}", .{nm});
-                l1.glue(" → ", .{});
-                // The resolved text is the name id's value — same identity color.
-                l1.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
-                // Row 2 — file, line, col; the location comment's parts reuse
-                // their raw values' colors (filename ← file id, line, col).
-                var l2 = Line{};
-                l2.tint(c_fl, "0x{x}", .{fl}); // value for row 1's second half
-                l2.glue(" ", .{});
-                l2.groupPinned(0, 4, c_ln, "0x{x}", .{ln});
-                l2.glue(" ", .{});
-                l2.groupPinned(4, 4, c_cl, "0x{x}", .{cl});
-                l2.comment();
-                l2.glue("@ ", .{});
-                if (symbols.internName(fl)) |f| {
-                    l2.tint(c_fl, "{s}", .{std.fs.path.basename(f)});
+                if (symbols.internName(rec.name)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
+                var l = Line{};
+                l.storeRef("str", c_nm, "0x{x}", .{rec.name});
+                l.glue(" → ", .{});
+                l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
+                l.comment();
+                l.glue("@ ", .{});
+                if (symbols.internName(rec.pos.file)) |f| {
+                    l.tint(c_fl, "{s}", .{std.fs.path.basename(f)});
                 } else {
-                    l2.storeRef("file", c_fl, "0x{x}", .{fl});
+                    l.storeRef("file", c_fl, "0x{x}", .{rec.pos.file});
                 }
-                l2.glue(":", .{});
-                l2.tint(c_ln, "{d}", .{ln});
-                l2.glue(":", .{});
-                l2.tint(c_cl, "{d}", .{cl});
-                // The whole 2-row record is ONE stripe unit, so the zebra
-                // alternates per entry, not per line.
-                const bg = takeBg(stripe, env.use_color);
-                try emitLine(writer, code, &off, &l1, seq, g[0..1], 0, bg, env);
-                try emitLine(writer, code, &off, &l2, seq, g[0..1], if (k == pos_count - 1) 0b01 else 0, bg, env);
+                l.glue(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == pos_count - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
             }
         },
         .thunk_defer => {
@@ -1593,8 +1566,8 @@ fn writeOperands(
             ip += 2;
             const pos_count = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} entries, {d} positions", .{ n, pos_count });
-            ip += @as(usize, pos_count) * 16;
+            ip += 4; // side-table start index
+            try writer.print("#{d} #{d} ; {d} entries, {d} positions", .{ n, pos_count, n, pos_count });
         },
         .list_new => {
             const n = readU16(code, ip);
@@ -2097,6 +2070,8 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
         total.add(code.len);
         const_count += chunk.constants.len;
         source_map_entries += chunk.source_map.len;
+        pos_entries += chunk.attr_pos.len;
+        pos_bytes += @as(u64, chunk.attr_pos.len) * 16;
         for (bucket_lims, 0..) |lim, i| {
             if (code.len <= lim) {
                 buckets[i].add(code.len);
@@ -2142,12 +2117,7 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
             if (isAggregateOp(op)) has_agg = true;
             if (isThunkFamilyOp(op)) has_thunk = true;
             switch (op) {
-                .attrs_new_pos, .attrs_new_pos_srt => {
-                    const pc = readU16(code, start + 3);
-                    pos_sites += 1;
-                    pos_entries += pc;
-                    pos_bytes += @as(u64, pc) * 16;
-                },
+                .attrs_new_pos, .attrs_new_pos_srt => pos_sites += 1,
                 .attrs_new, .attrs_new_srt => {
                     if (code.len == 5 and readU16(code, start + 1) == 0) empty_attrs_chunks += 1;
                 },
@@ -2205,7 +2175,7 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
     }
 
     if (total.bytes > 0) {
-        try writer.print("\nposition tables: sites {d}   entries {d}   bytes {d} ({d}.{d:0>1}% of code)\n", .{ pos_sites, pos_entries, pos_bytes, pos_bytes * 100 / total.bytes, (pos_bytes * 1000 / total.bytes) % 10 });
+        try writer.print("\nposition side-table (external to code): sites {d}   entries {d}   bytes {d}\n", .{ pos_sites, pos_entries, pos_bytes });
     }
 
     // Duplicate summaries.

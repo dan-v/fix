@@ -480,33 +480,18 @@ fn opBuildAttrsWithPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize
 inline fn buildAttrsWithPosImpl(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize, comptime presorted: bool) anyerror!void {
     frame.ip = ip;
     const count = readU16(code, ip);
-    var cur_ip = ip + 2;
-    const pos_count = readU16(code, cur_ip);
-    cur_ip += 2;
-
-    var stack_positions: [32]heap_mod.AttrPosEntry = undefined;
-    const positions = if (pos_count <= stack_positions.len)
-        stack_positions[0..pos_count]
-    else
-        try vm.allocator.alloc(heap_mod.AttrPosEntry, pos_count);
-    defer if (positions.ptr != stack_positions[0..].ptr) vm.allocator.free(positions);
-
-    for (positions) |*position| {
-        position.* = .{
-            .name = readU32(code, cur_ip),
-            .pos = .{
-                .file = readU32(code, cur_ip + 4),
-                .line = readU32(code, cur_ip + 8),
-                .column = readU32(code, cur_ip + 12),
-            },
-        };
-        cur_ip += 16;
-    }
+    const pos_count = readU16(code, ip + 2);
+    const pos_start = readU32(code, ip + 4);
+    // Records live in the chunk's side table — passed through as a slice, no
+    // per-record decode from the code stream.
+    const table = frame.chunk_ptr.attr_pos;
+    if (pos_start + pos_count > table.len) return error.InvalidBytecode;
+    const positions = table[pos_start .. pos_start + pos_count];
     if (comptime presorted)
         try objects.buildAttrsSorted(vm, count, positions)
     else
         try objects.buildAttrsWithPositions(vm, count, positions);
-    return dispatch(vm, frame, code, cur_ip, stop_depth);
+    return dispatch(vm, frame, code, ip + 8, stop_depth);
 }
 
 fn opBuildList(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
