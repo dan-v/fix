@@ -13,6 +13,7 @@ const int_ops = @import("runtime").int;
 const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
 const attrs_mod = @import("attrs.zig");
+const literals_mod = @import("literals.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -105,6 +106,15 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
         .bool_false => return Value.boolVal(false),
         .null => return Value.null_val,
         .string => return tryFoldString(self, n),
+        .path => {
+            // Non-interpolated path literals resolve at compile time already
+            // (against base_path) — same Value the emit path would produce.
+            const span = self.source[n.data.atom.offset .. n.data.atom.offset + n.data.atom.len];
+            if (std.mem.indexOf(u8, span, "${") != null) return null;
+            const path = try literals_mod.resolvePathLiteral(self, span);
+            defer if (path.owned) self.allocator.free(path.text);
+            return Value.path(try self.intern.intern(path.text));
+        },
         .attr_set => return tryFoldAttrSet(self, n),
         .list => return tryFoldList(self, n),
         .binary_op => {
