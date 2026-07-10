@@ -29,7 +29,7 @@ pub fn finishCompiledChild(child: *Compiler, child_builder: *ChunkBuilder, expr:
     try emit.emitRet(child);
     try emit.emitOp(child, .halt);
     const child_chunk = try child_builder.finish(child.persistent, child.slot_count);
-    return try child.registry.register(child_chunk);
+    return try child.registerChunk(child_chunk);
 }
 
 pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
@@ -82,7 +82,7 @@ pub fn compileApplyArgThunk(self: *Compiler, expr: *const Node) !void {
 
     const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
     const trivial = child_chunk.scheduling.trivial != .none;
-    const child_id = try self.registry.register(child_chunk);
+    const child_id = try child.registerChunk(child_chunk);
     if (trivial) {
         try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
     } else {

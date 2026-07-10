@@ -124,6 +124,13 @@ pub const Compiler = struct {
     /// eager parse would have built). Force-time deferred compiles run
     /// concurrently over the shared retained AST and must never write to it.
     elide_mutable: bool = false,
+    /// Best-effort chunk naming (`fix disasm`, gated on `registry.capture_names`).
+    /// `name_hint` is set by let/attr-set compilation just before a bound value
+    /// is compiled; the first child compiler spun up for that value consumes it
+    /// into its own `chunk_name`, which is recorded against the chunk id at
+    /// registration. Both are null (and cost nothing) when naming is off.
+    name_hint: ?InternId = null,
+    chunk_name: ?InternId = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -180,7 +187,23 @@ pub const Compiler = struct {
         child.base_path = self.base_path;
         child.source_path = self.source_path;
         child.source_file_id = self.source_file_id;
+        // Best-effort naming: the first child spun up for a named bound value
+        // claims the pending name (nested bodies then see none). Costs a single
+        // branch — `name_hint` is null unless naming is on.
+        if (self.name_hint) |name| {
+            child.chunk_name = name;
+            self.name_hint = null;
+        }
         return child;
+    }
+
+    /// Register `ch` and, when this compiler is building a named value chunk
+    /// (`fix disasm` naming), attribute its `chunk_name` to the id. `recordName`
+    /// is a no-op unless naming is on, so this stays free on the hot path.
+    pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
+        const id = try self.registry.register(ch);
+        if (self.chunk_name) |name| try self.registry.recordName(id, name);
+        return id;
     }
 
     pub fn deinit(self: *Compiler) void {

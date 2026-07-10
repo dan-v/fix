@@ -611,6 +611,14 @@ pub const Evaluator = struct {
         return &self.registry;
     }
 
+    /// Enable best-effort chunk naming: the compiler records the attr/let
+    /// binding name behind each lambda/thunk chunk into a registry sidecar, for
+    /// `fix disasm` to display. Off by default (hot compiles pay nothing); only
+    /// safe to enable for a single-threaded compile. Set before compiling.
+    pub fn setCaptureChunkNames(self: *Evaluator, on: bool) void {
+        self.registry.capture_names = on;
+    }
+
     pub fn heapStats(self: *const Evaluator) ObjectHeap.Stats {
         return self.heap.stats();
     }

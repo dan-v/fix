@@ -80,7 +80,7 @@ fn writeChunkAt(
     visited: *Visited,
 ) anyerror!void {
     if (chunk_id) |id| try visited.put(std.heap.page_allocator, id, {});
-    try writeChunkHeader(writer, chunk_id, chunk, options.use_color);
+    try writeChunkHeader(writer, chunk_id, chunk, symbols, options.use_color);
     if (options.show_constants and chunk.constants.len > 0) {
         try writer.print("  constants ({d}):\n", .{chunk.constants.len});
         for (chunk.constants, 0..) |c, i| {
@@ -404,7 +404,7 @@ fn writeOperandFields(
     if (off < end_ip) try emitFieldRaw(writer, code, &off, end_ip - off, show_bytes, use_color, "…");
 }
 
-fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, use_color: bool) !void {
+fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, use_color: bool) !void {
     if (use_color) try writer.writeAll("\x1b[1;35m");
     if (chunk_id) |id| {
         try writer.print("chunk #{d}", .{id});
@@ -412,6 +412,19 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         try writer.writeAll("chunk");
     }
     if (use_color) try writer.writeAll("\x1b[0m");
+    // Best-effort compiler-attributed name (the binding a lambda/thunk was
+    // compiled for), when name capture was on. See ChunkRegistry.recordName.
+    if (chunk_id) |id| {
+        if (symbols.registry) |reg| {
+            if (reg.nameOf(id)) |name_id| {
+                if (symbols.internName(name_id)) |name| {
+                    if (use_color) try writer.writeAll("\x1b[1;32m");
+                    try writer.print(" {s}", .{name});
+                    if (use_color) try writer.writeAll("\x1b[0m");
+                }
+            }
+        }
+    }
     try writer.print(" ({d} bytes, {d} consts, {d} locals", .{
         chunk.code.len,
         chunk.constants.len,

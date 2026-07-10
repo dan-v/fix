@@ -550,6 +550,13 @@ pub const ChunkRegistry = struct {
     allocator: std.mem.Allocator,
     chunks: Store,
     well_known: WellKnownChunks,
+    /// Best-effort chunk-name sidecar for `fix disasm`: maps a chunk id to the
+    /// attr/let binding name a lambda or thunk was compiled for. Populated only
+    /// while `capture_names` is set — off by default so ordinary compiles pay
+    /// nothing and the hot `Chunk` layout is untouched. Not concurrency-safe;
+    /// only enabled for the single-threaded disasm compile.
+    capture_names: bool = false,
+    names: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -630,6 +637,19 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
+        self.names.deinit(self.allocator);
+    }
+
+    /// Record a best-effort name for a chunk. No-op unless `capture_names` is
+    /// on, so callers can hand names unconditionally.
+    pub fn recordName(self: *ChunkRegistry, id: ChunkId, name: types.InternId) !void {
+        if (!self.capture_names) return;
+        try self.names.put(self.allocator, id, name);
+    }
+
+    /// The best-effort name attributed to `id`, if any.
+    pub fn nameOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
+        return self.names.get(id);
     }
 
     /// Optional import-prefetch discovery sink (`FIX_IMPORT_PREFETCH`): when

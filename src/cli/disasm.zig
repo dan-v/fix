@@ -56,6 +56,10 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // bytecode, not a progress bar.
     _ = try setup.configure(&ev, init, options);
     if (options.disasm_eval) ev.setParallelismToggles(true, true);
+    // Best-effort chunk naming: attribute each lambda/thunk chunk to the attr
+    // or let binding it was compiled for, so the disassembly headers read like
+    // `chunk #42 fetchGit`. Safe here — disasm compiles single-threaded.
+    ev.setCaptureChunkNames(true);
 
     if (source_arg == .flake and !ev.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });

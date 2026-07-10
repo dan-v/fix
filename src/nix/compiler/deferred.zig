@@ -103,6 +103,7 @@ pub fn compile(
     child.base_path = entry.base_path;
     child.source_path = entry.source_path;
     child.source_file_id = entry.source_file_id;
+    child.chunk_name = entry.name; // best-effort naming (fix disasm)
     defer child.deinit();
     for (entry.scope, 0..) |cap, i| {
         try child.captures.append(child.allocator, .{

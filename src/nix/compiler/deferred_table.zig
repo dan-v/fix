@@ -100,6 +100,9 @@ pub const Entry = struct {
     /// once via CAS on the force path; concurrent racers converge on one
     /// canonical ChunkId (the loser's chunk is orphaned-but-correct).
     compiled: std.atomic.Value(u32) = .init(0),
+    /// Best-effort binding name for `fix disasm` chunk naming; null unless
+    /// name capture was on at compile time. See `ChunkRegistry.recordName`.
+    name: ?InternId = null,
 };
 
 pub const Table = struct {

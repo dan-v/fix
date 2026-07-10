@@ -179,6 +179,11 @@ pub fn compileList(self: *Compiler, node: *const Node) !void {
 }
 
 pub fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {
+    // Best-effort naming: the caller may have armed `name_hint` for this value.
+    // Its representative chunk (the immediate lambda, or the wrapping thunk)
+    // claims it at child creation; clear any residue so a nameless value (a bare
+    // literal) can't leak the name onto a later sibling or the enclosing body.
+    defer self.name_hint = null;
     if (try compileImmediateContainerValue(self, node, options)) return;
     try thunks.compileThunkEager(self, node, options.eager);
 }
@@ -215,6 +220,9 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
         .bool_false => try emit.emitOp(self, .push_false),
         .null => try emit.emitOp(self, .push_null),
         .list => {
+            // A composite value has no single representative chunk; drop any
+            // pending name so the element thunks don't claim the binding's name.
+            self.name_hint = null;
             if (unwrapped.data.list.items.len == 0) {
                 try emit.emitOpU16(self, .build_list, 0);
             } else {
@@ -240,6 +248,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // fix-point race.
             if (!options.eager) return false;
             if (unwrapped.data.attr_set.recursive) return false;
+            self.name_hint = null; // composite value: see the .list note above
             try attrs.compileAttrSet(self, unwrapped);
             try emit.emitOp(self, .make_lazy_shell);
         },

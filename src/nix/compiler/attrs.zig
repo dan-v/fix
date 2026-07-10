@@ -186,7 +186,7 @@ fn compileNodeAttrEntriesThunk(self: *Compiler, entries: []const Node.AttrSetEnt
     // the first entry for the timeline. See Chunk.body_span.
     if (entries.len > 0) child_builder.body_span = diagnostics.sourceSpanForNode(&child, entries[0].expr) catch null;
     const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
-    const child_id = try self.registry.register(child_chunk);
+    const child_id = try child.registerChunk(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
@@ -441,8 +441,10 @@ const DeferScope = struct {
     source_path: ?[]const u8,
 };
 
-/// Register a deferred value body and emit `defer_attr_value`.
-fn deferLeaf(self: *Compiler, body: *const Node, snapshot: DeferScope) !void {
+/// Register a deferred value body and emit `defer_attr_value`. `name` is the
+/// attr the body is bound to, carried through for best-effort chunk naming
+/// (`fix disasm`); null / ignored when naming is off.
+fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: DeferScope) !void {
     const root = rootCompiler(self);
     const table = root.deferred_table.?;
     const id = try table.register(.{
@@ -453,6 +455,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, snapshot: DeferScope) !void {
         .base_path = snapshot.base_path,
         .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
+        .name = if (self.registry.capture_names) name else null,
     });
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;
@@ -572,7 +575,7 @@ fn compilePlainAttrGroup(
     if (defer_scope) |dscope| {
         if (leafDeferrable(leaf.?)) {
             try emitAttrNameId(self, group.name_id);
-            try deferLeaf(self, leaf.?.expr, dscope);
+            try deferLeaf(self, leaf.?.expr, group.name_id, dscope);
             try appendAttrPosition(self, positions, group.first, group.name_id);
             return;
         }
@@ -584,6 +587,7 @@ fn compilePlainAttrGroup(
     var body = leaf.?.expr;
     if (body.tag == .elided) body = try literals.materializeElided(self, body);
     try emitAttrNameId(self, group.name_id);
+    if (self.registry.capture_names) self.name_hint = group.name_id;
     try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
 }
@@ -617,6 +621,7 @@ fn compileRecursiveAttrCells(self: *Compiler, groups: []const AttrEntryGroup) an
         }
         const previous_skip = self.skip_local_slot;
         if (leaf.?.inherit_outer) self.skip_local_slot = slot;
+        if (self.registry.capture_names) self.name_hint = group.name_id;
         const compile_result = access.compileContainerValue(self, leaf.?.expr, .{});
         self.skip_local_slot = previous_skip;
         try compile_result;
@@ -711,7 +716,7 @@ pub fn compileAttrEntriesThunk(self: *Compiler, entries: []const AttrEntryView, 
     // the first entry for the timeline. See Chunk.body_span.
     if (entries.len > 0) child_builder.body_span = diagnostics.sourceSpanForNode(&child, entries[0].expr) catch null;
     const child_chunk = try child_builder.finish(self.persistent, child.slot_count);
-    const child_id = try self.registry.register(child_chunk);
+    const child_id = try child.registerChunk(child_chunk);
     try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
 }
 
