@@ -254,7 +254,7 @@ fn writeChunkAt(
             try writer.writeAll("  ");
             if (options.show_bytes) try writeByteCellColored(writer, op_byte, byteRgb(op_byte), bg, options.use_color);
             if (options.show_bytes) try writer.splatByteAll(' ', (bytes_per_line - 1) * 3 + 1);
-            if (options.use_color) try writer.writeAll("\x1b[2m");
+            try setCommentFg(writer, options.use_color);
             try writer.print(".byte 0x{x:0>2}", .{op_byte});
             try sgrReset(writer, bg, options.use_color);
             try endRow(writer, bg, env.prefixWidth() + 10, env);
@@ -555,22 +555,19 @@ fn visibleWidth(text: []const u8) u16 {
     return w;
 }
 
-/// A darkened variant of `rgb` for the interpretive `; …` comment: same hue as
-/// the raw operand it annotates (so the two read as linked), just dimmer.
-fn dimRgb(rgb: [3]u8) [3]u8 {
-    return .{
-        @intFromFloat(@as(f32, @floatFromInt(rgb[0])) * 0.68),
-        @intFromFloat(@as(f32, @floatFromInt(rgb[1])) * 0.68),
-        @intFromFloat(@as(f32, @floatFromInt(rgb[2])) * 0.68),
-    };
+/// Set the foreground for comment/structural text — the one grey used for
+/// every `;` comment, bracket, and annotation, so nothing reads fainter than
+/// the rest regardless of hue or the zebra background underneath.
+fn setCommentFg(writer: *std.Io.Writer, use_color: bool) !void {
+    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
 }
 
 /// Render a single instruction's inline operand text: everything before the
 /// first ` ; ` is the raw decoded value (in `col`, linked to its bytes); the
-/// ` ; …` interpretation that follows is the same hue, dimmed, and padded out
-/// to the shared mnemonic-line comment column. `start_w` is the width already
-/// written on the line from the mnemonic's first character; returns the width
-/// after the operand.
+/// ` ; …` interpretation that follows takes the shared comment grey and is
+/// padded out to the mnemonic-line comment column. `start_w` is the width
+/// already written on the line from the mnemonic's first character; returns
+/// the width after the operand.
 fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, start_w: u16, bg: ?[3]u8, use_color: bool) !u16 {
     const cut = std.mem.indexOf(u8, text, " ; ") orelse text.len;
     if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
@@ -582,10 +579,7 @@ fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, star
             try writer.splatByteAll(' ', mnem_comment_col - w);
             w = mnem_comment_col;
         }
-        if (use_color) {
-            const d = dimRgb(col);
-            try writer.print("\x1b[38;2;{d};{d};{d}m", .{ d[0], d[1], d[2] });
-        }
+        try setCommentFg(writer, use_color);
         try writer.writeAll(text[cut..]);
         w += visibleWidth(text[cut..]);
     }
@@ -1113,11 +1107,13 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         // is the definition the references point at).
         if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
         try writer.writeAll("chunk");
-        if (use_color) try writer.writeAll("\x1b[0;2m");
+        if (use_color) try writer.writeAll("\x1b[0m");
+        try setCommentFg(writer, use_color);
         try writer.writeByte('[');
         if (use_color) try writer.print("\x1b[0;1;38;2;{d};{d};{d}m", .{ cc[0], cc[1], cc[2] });
         try writer.print("0x{x}", .{id});
-        if (use_color) try writer.writeAll("\x1b[0;2m");
+        if (use_color) try writer.writeAll("\x1b[0m");
+        try setCommentFg(writer, use_color);
         try writer.writeByte(']');
         if (use_color) try writer.writeAll("\x1b[0m");
     } else {
@@ -1574,7 +1570,7 @@ fn bestSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
 /// A standalone `; <filename>` comment line marking that subsequent instructions
 /// come from this file (emitted only when the file changes).
 fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_color: bool) !void {
-    if (use_color) try writer.writeAll("\x1b[2m");
+    try setCommentFg(writer, use_color);
     try writer.writeAll("  ; ");
     if (symbols.internName(file)) |name| {
         try writer.writeAll(name);
@@ -1588,15 +1584,17 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_c
 /// The right-hand `; line:col+len` position annotation — the position within the
 /// current file (whose name is on its own hoisted line).
 /// A `store[accessor]` reference written directly (outside the `Line` token
-/// model): keyword in the store color, brackets dim, accessor in `id_color`.
+/// model): keyword in the store color, brackets comment-grey, accessor in `id_color`.
 fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, use_color: bool) !void {
     if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
     try writer.writeAll(kw);
-    if (use_color) try writer.writeAll("\x1b[0;2m");
+    if (use_color) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, use_color);
     try writer.writeByte('[');
     if (use_color) try writer.print("\x1b[0;38;2;{d};{d};{d}m", .{ id_color[0], id_color[1], id_color[2] });
     try writer.print("0x{x}", .{id});
-    if (use_color) try writer.writeAll("\x1b[0;2m");
+    if (use_color) try writer.writeAll("\x1b[0m");
+    try setCommentFg(writer, use_color);
     try writer.writeByte(']');
     if (use_color) try writer.writeAll("\x1b[0m");
 }
@@ -1629,7 +1627,7 @@ fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max:
 fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, use_color: bool) !void {
     try writeStoreRefText(writer, kind, id, internColor(id), use_color);
     if (symbols.internName(id)) |text| {
-        if (use_color) try writer.writeAll("\x1b[2m");
+        try setCommentFg(writer, use_color);
         try writer.writeAll(" → \"");
         try writeEscapedSnippet(writer, text, max);
         try writer.writeByte('"');
