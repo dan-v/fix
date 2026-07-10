@@ -17,6 +17,7 @@ pub const sync = @import("sync.zig");
 pub const segments = @import("segments.zig");
 pub const vma = @import("vma.zig");
 pub const block_cache = @import("block_cache.zig");
+pub const hugetlb = @import("hugetlb.zig");
 pub const regex = @import("regex.zig");
 pub const toml = @import("toml.zig");
 pub const worker_id = @import("worker_id.zig");
@@ -35,6 +36,7 @@ test {
     _ = segments;
     _ = vma;
     _ = block_cache;
+    _ = hugetlb;
     _ = regex;
     _ = toml;
     _ = worker_id;
