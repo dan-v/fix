@@ -386,23 +386,22 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     }
 }
 
-/// Like `writeGuide` but a column wider — used for the operand-hierarchy guides
-/// so each nesting level is clearly indented (the chunk left margin stays thin).
-fn writeGuideWide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
-    if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m│\x1b[0m  ", .{ rgb[0], rgb[1], rgb[2] });
+/// One operand-hierarchy gutter cell, `kind` chosen by the tree position:
+/// `.vert` (`│`) an ancestor branch that continues, `.tee` (`├`) this node with
+/// more siblings, `.corner` (`└`) this node as the last sibling, `.blank` a
+/// closed ancestor branch. Each is a column wider than the thin chunk margin.
+const GuideKind = enum { vert, tee, corner, blank };
+fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, use_color: bool) !void {
+    const glyph: []const u8 = switch (kind) {
+        .vert => "│  ",
+        .tee => "├─ ",
+        .corner => "└─ ",
+        .blank => "   ",
+    };
+    if (use_color and kind != .blank) {
+        try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ rgb[0], rgb[1], rgb[2], glyph });
     } else {
-        try writer.writeAll("│  ");
-    }
-}
-
-/// The closing corner drawn for a group's last member — `⌊` (a full-height
-/// vertical with the foot at the bottom), so the gutter reads as ending.
-fn writeGuideCorner(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
-    if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m⌊\x1b[0m  ", .{ rgb[0], rgb[1], rgb[2] });
-    } else {
-        try writer.writeAll("⌊  ");
+        try writer.writeAll(glyph);
     }
 }
 
@@ -413,7 +412,7 @@ fn writeGuideCorner(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
 /// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
-fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_in_group: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     const base = off.*;
     const total = line.total();
     line.paint(seq);
@@ -431,19 +430,20 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
             }
         }
         try writer.writeByte(' '); // gap column between the bytes and the gutter
-        // The hierarchy gutter: the last member closes with `└` on its content
-        // row and drops the guide on its wrapped continuation rows (a guide
-        // shouldn't dangle past the last actual line).
-        if (r > 0 and last_in_group) {
-            for (guides) |_| try writer.writeAll("   ");
-        } else {
-            for (guides, 0..) |gc, gi| {
-                if (r == 0 and last_in_group and gi + 1 == guides.len) {
-                    try writeGuideCorner(writer, gc, use_color);
-                } else {
-                    try writeGuideWide(writer, gc, use_color);
-                }
-            }
+        // Tree gutter (`last_mask` bit i = level i is its group's last member):
+        // this node's level gets ├/└ on its content row and │/blank on wrapped
+        // continuation rows; ancestor levels get │, or blank once their branch
+        // has closed — so a guide never dangles past the last line of a group.
+        for (guides, 0..) |gc, gi| {
+            const is_last = (last_mask >> @intCast(gi)) & 1 == 1;
+            const innermost = gi + 1 == guides.len;
+            const kind: GuideKind = if (!innermost)
+                (if (is_last) .blank else .vert)
+            else if (r != 0)
+                (if (is_last) .blank else .vert)
+            else
+                (if (is_last) .corner else .tee);
+            try writeTreeGuide(writer, gc, kind, use_color);
         }
         if (r != 0) continue; // continuation rows: bytes + gutter only
         for (line.toks[0..line.n]) |t| {
@@ -467,21 +467,24 @@ fn emitChunkLine(writer: *std.Io.Writer, code: []const u8, off: *usize, id_len: 
     l.glue("chunk ", .{});
     l.group(0, id_len, "0x{x}", .{id});
     if (chunkNameOf(symbols, id)) |name| l.glue(" {s}", .{name});
-    try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
+    // The chunk id is always the first of several operands, never the last.
+    try emitLine(writer, code, off, &l, seq, guides, 0, cc, show_bytes, use_color);
 }
 
-/// A `{count} {label}` line (count is a u16 at `off`).
-fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+/// A `{count} {label}` line (count is a u16 at `off`). `last` = is this the
+/// instruction's last direct operand (→ `└` vs `├`).
+fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, last: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     var l = Line{};
     l.group(0, 2, "{d}", .{readU16(code, off.*)});
     l.glue(" {s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
+    try emitLine(writer, code, off, &l, seq, guides, @intFromBool(last), cc, show_bytes, use_color);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
 /// each a child line under `guides`, tinting `local`/`upvalue` with the kind
-/// byte and the index with its bytes.
-fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+/// byte and the index with its bytes. `parent_last` = whether the enclosing
+/// count line is the instruction's last operand (so the ancestor branch closes).
+fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, parent_last: bool, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     var k: usize = 0;
     while (k < n) : (k += 1) {
         var l = Line{};
@@ -489,7 +492,8 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         l.glue("[", .{});
         l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
         l.glue("]", .{});
-        try emitLine(writer, code, off, &l, seq, guides, k == n - 1, cc, show_bytes, use_color);
+        const mask: u8 = @as(u8, @intFromBool(parent_last)) | (@as(u8, @intFromBool(k == n - 1)) << 1);
+        try emitLine(writer, code, off, &l, seq, guides, mask, cc, show_bytes, use_color);
     }
 }
 
@@ -531,7 +535,7 @@ fn writeOperandFields(
             var l = Line{};
             l.group(0, 2, "{d}", .{readU16(code, off)});
             l.glue(" upvalues (from stack)", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color); // last operand
         },
         .thunk_captures, .thunk_captures_eager, .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
             const wide = op == .thunk_captures_long or op == .thunk_captures_eager_long or op == .apply_arg;
@@ -540,8 +544,8 @@ fn writeOperandFields(
             try emitChunkLine(writer, code, &off, id_len, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
             const n = readU16(code, off);
             g[1] = hueColor(seq); // the "captures" count line's color
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], true, cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], true, cc, show_bytes, use_color);
         },
         .closure_captures, .closure_captures_long => {
             const wide = op == .closure_captures_long;
@@ -550,27 +554,28 @@ fn writeOperandFields(
             try emitChunkLine(writer, code, &off, id_len, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
             const n = readU16(code, off);
             g[1] = hueColor(seq);
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], true, cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], true, cc, show_bytes, use_color);
         },
         .thunk_captures_store_local, .thunk_captures_store_cell_local, .thunk_captures_eager_store_local, .thunk_captures_eager_store_cell_local => {
             const id: ChunkId = @intCast(readU16(code, off));
             try emitChunkLine(writer, code, &off, 2, id, symbols, &seq, g[0..1], cc, show_bytes, use_color);
             const n = readU16(code, off);
             g[1] = hueColor(seq);
-            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], cc, show_bytes, use_color);
+            // The slot follows the captures, so the captures group is NOT last.
+            try emitCountLine(writer, code, &off, "captures", &seq, g[0..1], false, cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, n, &seq, g[0..2], false, cc, show_bytes, use_color);
             var l = Line{};
             l.glue("→ local[", .{});
             l.group(0, 1, "{d}", .{code[off]});
             l.glue("]", .{});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color); // last operand
         },
         .build_attrs_with_pos, .build_attrs_with_pos_sorted => {
-            try emitCountLine(writer, code, &off, "entries", &seq, g[0..1], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "entries", &seq, g[0..1], false, cc, show_bytes, use_color);
             const pos_count = readU16(code, off);
             g[1] = hueColor(seq); // the "positions" count line's color
-            try emitCountLine(writer, code, &off, "positions", &seq, g[0..1], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "positions", &seq, g[0..1], true, cc, show_bytes, use_color);
             var k: usize = 0;
             while (k < pos_count) : (k += 1) {
                 // 16-byte record: name id, file id, line, column (u32 LE each).
@@ -590,18 +595,20 @@ fn writeOperandFields(
                 l.group(8, 4, "{d}", .{ln});
                 l.glue(":", .{});
                 l.group(12, 4, "{d}", .{cl});
-                try emitLine(writer, code, &off, &l, &seq, g[0..2], k == pos_count - 1, cc, show_bytes, use_color);
+                // positions is the last operand (bit 0); this record is last iff k is (bit 1).
+                const mask: u8 = 1 | (@as(u8, @intFromBool(k == pos_count - 1)) << 1);
+                try emitLine(writer, code, &off, &l, &seq, g[0..2], mask, cc, show_bytes, use_color);
             }
         },
         .defer_attr_value => {
             var l = Line{};
             l.glue("deferred #", .{});
             l.group(0, 4, "{d}", .{readU32(code, off)});
-            try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, &seq, g[0..1], 0, cc, show_bytes, use_color); // env follows
             const env = readU16(code, off);
             g[1] = hueColor(seq);
-            try emitCountLine(writer, code, &off, "env", &seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, env, &seq, g[0..2], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "env", &seq, g[0..1], true, cc, show_bytes, use_color);
+            try emitCaptureDescriptors(writer, code, &off, env, &seq, g[0..2], true, cc, show_bytes, use_color);
         },
         else => {
             // No bespoke breakdown: the whole operand is one group, labelled
@@ -609,7 +616,7 @@ fn writeOperandFields(
             if (end_ip > off) {
                 var l = Line{};
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
+                try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color);
             }
         },
     }
@@ -617,7 +624,7 @@ fn writeOperandFields(
     if (off < end_ip) {
         var l = Line{};
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, &seq, g[0..1], false, cc, show_bytes, use_color);
+        try emitLine(writer, code, &off, &l, &seq, g[0..1], 1, cc, show_bytes, use_color);
     }
 }
 
