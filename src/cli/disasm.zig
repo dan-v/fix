@@ -134,6 +134,9 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         .use_color = use_color,
         .max_depth = 0, // unlimited: the visited set guarantees termination.
         .refs = if (ref_graph) |*g| g else null,
+        // Queried before any pager spawns (stdout is still the terminal), so
+        // the zebra row background can extend across the full line.
+        .line_width = terminalWidth() orelse 100,
     };
 
     // Pipe to $PAGER when interactive; fall back to stdout on any spawn failure.
@@ -173,6 +176,15 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
         return e;
     }
     return 0;
+}
+
+/// The terminal's column count (from stdout), or null when stdout isn't a
+/// terminal / the query fails.
+fn terminalWidth() ?u16 {
+    var ws: std.posix.winsize = undefined;
+    const rc = std.os.linux.ioctl(1, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (rc != 0) return null;
+    return if (ws.col > 0) ws.col else null;
 }
 
 /// A `$PAGER` child process fed the disassembly on its stdin.

@@ -48,6 +48,9 @@ pub const Options = struct {
     /// Optional cross-reference graph; when set, each chunk header lists its
     /// incoming and outgoing chunk references.
     refs: ?*const RefGraph = null,
+    /// Terminal width, for extending the zebra row background across the whole
+    /// line. 0 disables the extension (background stops at the content).
+    line_width: u16 = 0,
 };
 
 /// Chunk cross-reference graph over the whole registry: for each chunk, which
@@ -166,12 +169,12 @@ fn writeChunkAt(
     const cc: [3]u8 = if (chunk_id) |id| hueColor(id) else .{ 0x9a, 0x9a, 0x9a };
     try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, options.use_color);
     if (options.show_constants and chunk.constants.len > 0) {
-        try writeGuide(writer, cc, options.use_color);
+        try writeGuide(writer, cc, null, options.use_color);
         try writer.writeAll("  constants:\n");
         for (chunk.constants, 0..) |c, i| {
             // Table rows sit under their own colored `│` gutter, like operand
             // groups do under their count line.
-            try writeGuide(writer, cc, options.use_color);
+            try writeGuide(writer, cc, null, options.use_color);
             try writer.writeAll("  ");
             try writeTreeGuide(writer, sec_constants_color, .vert, null, options.use_color);
             // `#N` in the slot's identity color — the same hue a `push_const #N`
@@ -195,7 +198,7 @@ fn writeChunkAt(
         const inc = graph.incoming(id);
         const out = graph.outgoing(id);
         if (inc.len > 0 or out.len > 0) {
-            try writeGuide(writer, cc, options.use_color);
+            try writeGuide(writer, cc, null, options.use_color);
             try writer.writeAll("  references:\n");
             try writeRefList(writer, "incoming", sec_incoming_color, inc, symbols, cc, options.use_color);
             try writeRefList(writer, "outgoing", sec_outgoing_color, out, symbols, cc, options.use_color);
@@ -214,18 +217,22 @@ fn writeChunkAt(
     var op_scratch: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer op_scratch.deinit();
 
-    // Set once a multiline instruction's indented operand block has been drawn;
-    // the next iteration then draws a blank margin line before the next
-    // instruction, so its closing inner guides read as a group boundary.
-    var after_multiline = false;
+    const env = Env{
+        .cc = cc,
+        .show_bytes = options.show_bytes,
+        .use_color = options.use_color,
+        .line_width = options.line_width,
+    };
+    // Zebra stripe unit counter for the body rows (see takeBg).
+    var stripe: usize = 0;
 
     // Source filenames are hoisted onto their own comment line: one at the top
     // of the chunk (before any bytes) and again only if the file changes
-    // mid-chunk. Instruction lines then carry just the `line:col+len` position.
+    // mid-chunk. File lines are not striped and don't advance the stripe.
     var last_file: ?InternId = null;
     if (options.show_source) {
         if (chunkPrimaryFile(chunk, chunk_id, symbols)) |f| {
-            try writeGuide(writer, cc, options.use_color);
+            try writeGuide(writer, cc, null, options.use_color);
             try writeFileLine(writer, f, symbols, options.use_color);
             last_file = f;
         }
@@ -233,13 +240,6 @@ fn writeChunkAt(
 
     while (ip < chunk.code.len) {
         const start = ip;
-        // The previous instruction's operand block just closed — one blank
-        // margin line separates it (regardless of how many inner guides ended).
-        if (after_multiline) {
-            try writeGuide(writer, cc, options.use_color);
-            try writer.writeByte('\n');
-            after_multiline = false;
-        }
         const op_byte = chunk.code[ip];
         // OpCode is a gapless `enum(u8)`, so anything ≥ the tag count is not a
         // valid opcode — a misaligned decode, or (under `--eval`) a registry
@@ -247,14 +247,17 @@ fn writeChunkAt(
         // forward instead of crashing on `@enumFromInt`.
         if (op_byte >= opcode_mod.count) {
             ip += 1;
-            try writeGuide(writer, cc, options.use_color);
-            try writeOffset(writer, start, options.use_color);
+            const bg = takeBg(&stripe, options.use_color);
+            try beginRow(writer, bg, options.use_color);
+            try writeGuide(writer, cc, bg, options.use_color);
+            try writeOffset(writer, start, bg, options.use_color);
             try writer.writeAll("  ");
-            if (options.show_bytes) try writeByteField(writer, chunk.code[start..ip], options.use_color);
+            if (options.show_bytes) try writeByteCellColored(writer, op_byte, byteRgb(op_byte), bg, options.use_color);
+            if (options.show_bytes) try writer.splatByteAll(' ', (bytes_per_line - 1) * 3 + 1);
             if (options.use_color) try writer.writeAll("\x1b[2m");
             try writer.print(".byte 0x{x:0>2}", .{op_byte});
-            if (options.use_color) try writer.writeAll("\x1b[0m");
-            try writer.writeByte('\n');
+            try sgrReset(writer, bg, options.use_color);
+            try endRow(writer, bg, env.prefixWidth() + 10, env);
             continue;
         }
         const op: OpCode = @enumFromInt(op_byte);
@@ -274,26 +277,27 @@ fn writeChunkAt(
         if (span) |s| {
             if (s.file) |f| {
                 if (last_file == null or last_file.? != f) {
-                    try writeGuide(writer, cc, options.use_color);
+                    try writeGuide(writer, cc, null, options.use_color);
                     try writeFileLine(writer, f, symbols, options.use_color);
                     last_file = f;
                 }
             }
         }
 
-        try writeGuide(writer, cc, options.use_color);
-        try writeOffset(writer, start, options.use_color);
+        const bg = takeBg(&stripe, options.use_color);
+        try beginRow(writer, bg, options.use_color);
+        try writeGuide(writer, cc, bg, options.use_color);
+        try writeOffset(writer, start, bg, options.use_color);
         try writer.writeAll("  ");
         if (isMultiline(op)) {
             // The mnemonic row carries the opcode + head operand (a chunk id, or
-            // attrset counts); list operands become indented child rows below.
+            // attrset counts); list operands become indented child rows below,
+            // each its own stripe unit.
             var seq: usize = @intFromEnum(op) + 1;
             var head = Line{};
             const head_len = buildHead(&head, op, chunk.code, start, symbols);
-            try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, options.show_bytes, options.use_color);
-            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, cc, options.show_bytes, options.use_color);
-            try writer.writeByte('\n');
-            after_multiline = true;
+            try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
+            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, &stripe, env);
         } else {
             // Zero or one simple operand: keep it all on the mnemonic row. The
             // opcode byte + mnemonic share one color; the operand bytes and its
@@ -310,34 +314,32 @@ fn writeChunkAt(
                     if (c >= insn.len) {
                         try writer.writeAll("   ");
                     } else {
-                        try writeByteCellColored(writer, insn[c], if (c == 0) byteRgb(op_byte) else opcol, null, options.use_color);
+                        try writeByteCellColored(writer, insn[c], if (c == 0) byteRgb(op_byte) else opcol, bg, options.use_color);
                     }
                 }
             }
             try writer.writeByte(' '); // gap column between the bytes and the mnemonic
-            try writeMnemonic(writer, op, options.use_color);
+            try writeMnemonic(writer, op, bg, options.use_color);
+            var w: u16 = @intCast(@tagName(op).len + 1);
             if (operand_text.len > 0) {
-                try writeInlineOperand(writer, operand_text, opcol, @intCast(@tagName(op).len + 1), options.use_color);
+                w = try writeInlineOperand(writer, operand_text, opcol, w, bg, options.use_color);
             }
-            try writer.writeByte('\n');
-            // Wrap any remaining instruction bytes onto continuation rows.
+            try endRow(writer, bg, env.prefixWidth() + w, env);
+            // Wrap any remaining instruction bytes onto continuation rows (the
+            // same stripe unit as the instruction).
             if (options.show_bytes and insn.len > bytes_per_line) {
                 var o: usize = bytes_per_line;
                 while (o < insn.len) : (o += bytes_per_line) {
-                    try writeGuide(writer, cc, options.use_color);
+                    try beginRow(writer, bg, options.use_color);
+                    try writeGuide(writer, cc, bg, options.use_color);
                     try writer.writeAll("        ");
                     var c: usize = o;
-                    while (c < o + bytes_per_line and c < insn.len) : (c += 1) try writeByteCellColored(writer, insn[c], opcol, null, options.use_color);
-                    try writer.writeByte('\n');
+                    while (c < o + bytes_per_line and c < insn.len) : (c += 1) try writeByteCellColored(writer, insn[c], opcol, bg, options.use_color);
+                    try endRow(writer, bg, @intCast(10 + 3 * (@min(o + bytes_per_line, insn.len) - o)), env);
                 }
             }
         }
     }
-
-    // A blank line trails every chunk body, so a chunk boundary reads as a wider
-    // gap (two blank lines, with the leading break below) than the single-line
-    // breaks between an instruction's operand groups.
-    try writer.writeByte('\n');
 
     if (options.recurse) {
         const reg = symbols.registry orelse return;
@@ -413,21 +415,22 @@ fn hsvToRgb(h: f32, s: f32, v: f32) [3]u8 {
     };
 }
 
-fn writeOffset(writer: *std.Io.Writer, off: usize, use_color: bool) !void {
+fn writeOffset(writer: *std.Io.Writer, off: usize, bg: ?[3]u8, use_color: bool) !void {
     try writer.writeAll("  ");
     if (use_color) try writer.writeAll("\x1b[2m");
     try writer.print("{x:0>4}", .{off});
-    if (use_color) try writer.writeAll("\x1b[0m");
+    try sgrReset(writer, bg, use_color);
 }
 
 /// Write the mnemonic followed by a single space. When colored, it takes the
 /// same per-value color as its opcode byte, so the mnemonic and its leading hex
 /// cell visually match.
-fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
+fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, bg: ?[3]u8, use_color: bool) !void {
     const name = @tagName(op);
     if (use_color) {
         const rgb = byteRgb(@intFromEnum(op));
-        try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ rgb[0], rgb[1], rgb[2], name });
+        try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ rgb[0], rgb[1], rgb[2], name });
+        try sgrReset(writer, bg, use_color);
     } else {
         try writer.writeAll(name);
     }
@@ -495,13 +498,53 @@ const sec_references_color: [3]u8 = .{ 0x5c, 0xb8, 0xa6 };
 const sec_incoming_color: [3]u8 = .{ 0xa6, 0x5c, 0xb8 };
 const sec_outgoing_color: [3]u8 = .{ 0x5c, 0x8a, 0xb8 };
 
-/// Column (within the token area, after the gutter) where field-row `;`
-/// comments start, so the semicolons align down an operand block.
-const field_comment_col = 16;
-
 /// Column (from the mnemonic's first character) where instruction-line `;`
-/// comments start — shared by the inline path and multiline mnemonic heads.
+/// comments start. Field rows compute their pad from this too (minus their
+/// guide indentation), so every `;` in a chunk body lands in one column.
 const mnem_comment_col = 28;
+
+/// Comment/structural text color — a readable grey, brighter than terminal-dim.
+const comment_color: [3]u8 = .{ 0xb2, 0xb2, 0xb2 };
+
+/// Shared rendering environment for the chunk-body emitters.
+const Env = struct {
+    /// Chunk guide color (the left margin `│`).
+    cc: [3]u8,
+    show_bytes: bool,
+    use_color: bool,
+    /// Terminal width the zebra background extends to (0 = no extension).
+    line_width: u16,
+
+    /// Width of the fixed row prefix: guide + offset column + byte field + gap.
+    fn prefixWidth(self: Env) u16 {
+        return if (self.show_bytes) 35 else 11;
+    }
+};
+
+/// Zebra striping: every other body row gets the background tint, where a
+/// multi-row record (position entries) counts as ONE stripe unit. Returns the
+/// current unit's background and advances the stripe.
+fn takeBg(stripe: *usize, use_color: bool) ?[3]u8 {
+    const bg: ?[3]u8 = if (use_color and stripe.* % 2 == 1) row_bg else null;
+    stripe.* += 1;
+    return bg;
+}
+
+/// Start a body row: establish its background (if striped) from column 0, so
+/// the tint covers the whole line including the left margin.
+fn beginRow(writer: *std.Io.Writer, bg: ?[3]u8, use_color: bool) !void {
+    if (use_color) if (bg) |b| try writer.print("\x1b[48;2;{d};{d};{d}m", .{ b[0], b[1], b[2] });
+}
+
+/// Finish a body row at absolute column `abs_w`: extend a striped row's tint to
+/// the full terminal width, reset, newline.
+fn endRow(writer: *std.Io.Writer, bg: ?[3]u8, abs_w: u16, env: Env) !void {
+    if (env.use_color and bg != null and env.line_width > abs_w) {
+        try writer.splatByteAll(' ', env.line_width - abs_w);
+    }
+    if (env.use_color) try writer.writeAll("\x1b[0m");
+    try writer.writeByte('\n');
+}
 
 /// Visible width of UTF-8 text (codepoints; `→`/`…`/`│` count 1).
 fn visibleWidth(text: []const u8) u16 {
@@ -516,9 +559,9 @@ fn visibleWidth(text: []const u8) u16 {
 /// the raw operand it annotates (so the two read as linked), just dimmer.
 fn dimRgb(rgb: [3]u8) [3]u8 {
     return .{
-        @intFromFloat(@as(f32, @floatFromInt(rgb[0])) * 0.5),
-        @intFromFloat(@as(f32, @floatFromInt(rgb[1])) * 0.5),
-        @intFromFloat(@as(f32, @floatFromInt(rgb[2])) * 0.5),
+        @intFromFloat(@as(f32, @floatFromInt(rgb[0])) * 0.68),
+        @intFromFloat(@as(f32, @floatFromInt(rgb[1])) * 0.68),
+        @intFromFloat(@as(f32, @floatFromInt(rgb[2])) * 0.68),
     };
 }
 
@@ -526,22 +569,28 @@ fn dimRgb(rgb: [3]u8) [3]u8 {
 /// first ` ; ` is the raw decoded value (in `col`, linked to its bytes); the
 /// ` ; …` interpretation that follows is the same hue, dimmed, and padded out
 /// to the shared mnemonic-line comment column. `start_w` is the width already
-/// written on the line from the mnemonic's first character.
-fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, start_w: u16, use_color: bool) !void {
+/// written on the line from the mnemonic's first character; returns the width
+/// after the operand.
+fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, start_w: u16, bg: ?[3]u8, use_color: bool) !u16 {
     const cut = std.mem.indexOf(u8, text, " ; ") orelse text.len;
     if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
     try writer.writeAll(text[0..cut]);
+    var w = start_w + visibleWidth(text[0..cut]);
     if (cut < text.len) {
-        if (use_color) try writer.writeAll("\x1b[0m");
-        const w = start_w + visibleWidth(text[0..cut]);
-        if (w < mnem_comment_col) try writer.splatByteAll(' ', mnem_comment_col - w);
+        try sgrReset(writer, bg, use_color);
+        if (w < mnem_comment_col) {
+            try writer.splatByteAll(' ', mnem_comment_col - w);
+            w = mnem_comment_col;
+        }
         if (use_color) {
             const d = dimRgb(col);
             try writer.print("\x1b[38;2;{d};{d};{d}m", .{ d[0], d[1], d[2] });
         }
         try writer.writeAll(text[cut..]);
+        w += visibleWidth(text[cut..]);
     }
-    if (use_color) try writer.writeAll("\x1b[0m");
+    try sgrReset(writer, bg, use_color);
+    return w;
 }
 
 /// Reset the foreground (and any attributes), then — inside a background-tinted
@@ -655,25 +704,16 @@ const Line = struct {
         }
         return .{ 0x9a, 0x9a, 0x9a }; // ungrouped byte
     }
-    /// Rendered display width of the token text (UTF-8 codepoints; `→`/`…`
-    /// count as 1), including the comment-column padding the renderer inserts —
-    /// used to pad a background-tinted row to a common rectangle width.
-    fn tokWidth(self: *const Line) u16 {
-        var w: u16 = 0;
-        for (self.toks[0..self.n], 0..) |t, i| {
-            if (self.comment_tok != null and i == self.comment_tok.? and w < field_comment_col) w = field_comment_col;
-            w += visibleWidth(t.text);
-        }
-        return w;
-    }
 };
 
 /// One hierarchy indent guide, drawn once per ancestor group and colored by
 /// that group's title — a background block in color mode, `│` otherwise. This
 /// is what nests capture/position lists under their count line.
-fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
+fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, bg: ?[3]u8, use_color: bool) !void {
     if (use_color) {
-        try writer.print("\x1b[38;2;{d};{d};{d}m│\x1b[0m ", .{ rgb[0], rgb[1], rgb[2] });
+        try writer.print("\x1b[38;2;{d};{d};{d}m│", .{ rgb[0], rgb[1], rgb[2] });
+        try sgrReset(writer, bg, use_color);
+        try writer.writeByte(' ');
     } else {
         try writer.writeAll("│ ");
     }
@@ -696,23 +736,6 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u
     }
 }
 
-/// A blank separator line inside an operand block: the byte column is empty, but
-/// `guides` (the levels that *continue* past this break) keep drawing their bars
-/// so their vertical stays unbroken. Emitted when a deeper sublist ends but a
-/// shallower group carries on (e.g. the captures list closing before a store
-/// target). Leads with `\n` to terminate the preceding operand line.
-fn emitGuideBreak(writer: *std.Io.Writer, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
-    try writer.writeByte('\n');
-    try writeGuide(writer, cc, use_color); // chunk left margin
-    try writer.writeAll("        "); // blank offset column
-    if (show_bytes) {
-        var c: u16 = 0;
-        while (c < bytes_per_line) : (c += 1) try writer.writeAll("   ");
-    }
-    try writer.writeByte(' '); // gap column between the bytes and the gutter
-    for (guides) |gc| try writeTreeGuide(writer, gc, .vert, null, use_color);
-}
-
 /// Render one operand line at `off` under `guides` (ancestor colors), then
 /// advance `off` past its bytes. Bytes stay in their fixed column (aligned under
 /// the opcode byte); the hierarchy guides sit in the mnemonic gutter to the
@@ -720,24 +743,25 @@ fn emitGuideBreak(writer: *std.Io.Writer, guides: []const [3]u8, cc: [3]u8, show
 /// mnemonic. Long records wrap at `bytes_per_line`, guides repeating on each
 /// row (a continuous gutter) but the interpretation only on the first. `seq` is
 /// the running per-instruction color counter (shared with the mnemonic).
-fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, ends_group: bool, cc: [3]u8, bg: ?[3]u8, pad_to: u16, show_bytes: bool, use_color: bool) !void {
+fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, ends_group: bool, bg: ?[3]u8, env: Env) !void {
     const base = off.*;
     const total = line.total();
     line.paint(seq);
-    const rows: u16 = if (!show_bytes or total == 0) 1 else (total + bytes_per_line - 1) / bytes_per_line;
+    const depth: u16 = @intCast(guides.len);
+    // Field-row comment column, relative to the token area: absolute alignment
+    // with the mnemonic-line comments, minus this row's guide indentation.
+    const comment_col = mnem_comment_col -| 3 * depth;
+    const rows: u16 = if (!env.show_bytes or total == 0) 1 else (total + bytes_per_line - 1) / bytes_per_line;
     var r: u16 = 0;
     while (r < rows) : (r += 1) {
-        try writer.writeByte('\n');
-        try writeGuide(writer, cc, use_color); // chunk left margin (never tinted)
-        // The optional row background starts at the offset column and runs to
-        // `pad_to`, so alternating records read as clean rectangles.
-        if (use_color) if (bg) |b| try writer.print("\x1b[48;2;{d};{d};{d}m", .{ b[0], b[1], b[2] });
+        try beginRow(writer, bg, env.use_color);
+        try writeGuide(writer, env.cc, bg, env.use_color);
         try writer.writeAll("        "); // blank offset column
-        if (show_bytes) {
+        if (env.show_bytes) {
             var c: u16 = 0;
             while (c < bytes_per_line) : (c += 1) {
                 const pos = r * bytes_per_line + c;
-                if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), bg, use_color) else try writer.writeAll("   ");
+                if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), bg, env.use_color) else try writer.writeAll("   ");
             }
         }
         try writer.writeByte(' '); // gap column between the bytes and the gutter
@@ -747,39 +771,37 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         // we blank all the bars.
         for (guides) |gc| {
             const kind: GuideKind = if (r != 0 and ends_group) .blank else .vert;
-            try writeTreeGuide(writer, gc, kind, bg, use_color);
+            try writeTreeGuide(writer, gc, kind, bg, env.use_color);
         }
+        var w: u16 = 0;
         if (r == 0) {
-            var w: u16 = 0;
+            // One space so a level-1 value aligns with the mnemonic line's
+            // operand (which sits one space after the mnemonic).
+            try writer.writeByte(' ');
+            w += 1;
             for (line.toks[0..line.n], 0..) |t, i| {
                 // Align the `;` comments down the block: pad the raw-value
-                // region out to a fixed column before the comment starts.
-                if (line.comment_tok != null and i == line.comment_tok.? and w < field_comment_col) {
-                    try sgrReset(writer, bg, use_color);
-                    try writer.splatByteAll(' ', field_comment_col - w);
-                    w = field_comment_col;
+                // region out to the shared column before the comment starts.
+                if (line.comment_tok != null and i == line.comment_tok.? and w < comment_col) {
+                    try sgrReset(writer, bg, env.use_color);
+                    try writer.splatByteAll(' ', comment_col - w);
+                    w = comment_col;
                 }
-                if (use_color) {
+                if (env.use_color) {
                     if (t.colored) {
                         try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
                     } else {
-                        // Structural / comment text: dim grey — reset first so
-                        // it doesn't inherit the previous token's hue.
-                        try sgrReset(writer, bg, use_color);
-                        try writer.writeAll("\x1b[2m");
+                        // Structural / comment text: grey — reset first so it
+                        // doesn't inherit the previous token's hue.
+                        try sgrReset(writer, bg, env.use_color);
+                        try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
                     }
                 }
                 try writer.writeAll(t.text);
                 w += visibleWidth(t.text);
             }
-            // Pad the tinted region out to the record's widest row (`w` is the
-            // rendered width so far, including comment-column padding).
-            if (bg != null) {
-                try sgrReset(writer, bg, use_color);
-                if (pad_to > w) try writer.splatByteAll(' ', pad_to - w);
-            }
         }
-        if (use_color) try writer.writeAll("\x1b[0m");
+        try endRow(writer, bg, env.prefixWidth() + 3 * depth + w, env);
     }
     off.* += total;
 }
@@ -832,59 +854,58 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
 /// Render a multiline op's mnemonic row: byte column (opcode + head bytes,
 /// colored to match) then the mnemonic and the inline head operand. `head` is
 /// from `buildHead`; `head_len` its operand byte count.
-fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, show_bytes: bool, use_color: bool) !void {
+fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, bg: ?[3]u8, env: Env) !void {
     head.paint(seq);
-    if (show_bytes) {
+    if (env.show_bytes) {
         var c: u16 = 0;
         while (c < bytes_per_line) : (c += 1) {
             if (c == 0) {
-                try writeByteCellColored(writer, code[start], byteRgb(code[start]), null, use_color);
+                try writeByteCellColored(writer, code[start], byteRgb(code[start]), bg, env.use_color);
             } else if (c <= head_len) {
-                try writeByteCellColored(writer, code[start + c], head.colorAt(c), null, use_color);
+                try writeByteCellColored(writer, code[start + c], head.colorAt(c), bg, env.use_color);
             } else {
                 try writer.writeAll("   ");
             }
         }
     }
     try writer.writeByte(' '); // gap between bytes and the mnemonic
-    try writeMnemonic(writer, op, use_color);
+    try writeMnemonic(writer, op, bg, env.use_color);
     // Width from the mnemonic's first character, for the shared comment column.
     var w: u16 = @intCast(@tagName(op).len + 1);
     for (head.toks[0..head.n], 0..) |t, i| {
         if (head.comment_tok != null and i == head.comment_tok.? and w < mnem_comment_col) {
-            if (use_color) try writer.writeAll("\x1b[0m");
+            try sgrReset(writer, bg, env.use_color);
             try writer.splatByteAll(' ', mnem_comment_col - w);
             w = mnem_comment_col;
         }
-        if (use_color) {
+        if (env.use_color) {
             if (t.colored) {
                 try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
             } else {
-                try writer.writeAll("\x1b[0;2m"); // dim grey, not the previous hue
+                try sgrReset(writer, bg, env.use_color);
+                try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
             }
         }
         try writer.writeAll(t.text);
         w += visibleWidth(t.text);
     }
-    if (use_color) try writer.writeAll("\x1b[0m");
-    // No trailing newline: the first tail row's leading `\n` terminates this
-    // line (or the caller's final `\n` does, when there are no tail rows).
+    try endRow(writer, bg, env.prefixWidth() + w, env);
 }
 
-/// A `{count} {label}` line (count is a u16 at `off`). Fits one row — never
+/// A `#{count} ; {label}` line (count is a u16 at `off`). Fits one row — never
 /// wraps — so its guides never blank on a continuation.
-fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, stripe: *usize, env: Env) !void {
     var l = Line{};
     l.group(0, 2, "#{d}", .{readU16(code, off.*)});
     l.comment();
     l.glue("{s}", .{label});
-    try emitLine(writer, code, off, &l, seq, guides, false, cc, null, 0, show_bytes, use_color);
+    try emitLine(writer, code, off, &l, seq, guides, false, takeBg(stripe, env.use_color), env);
 }
 
 /// The `n` inline capture descriptors (3 bytes each: kind byte + u16 index),
 /// each a child line under `guides`, tinting `local`/`upvalue` with the kind
 /// byte and the index with its bytes. Each descriptor fits one row.
-fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
+fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, seq: *usize, guides: []const [3]u8, stripe: *usize, env: Env) !void {
     var k: usize = 0;
     while (k < n) : (k += 1) {
         var l = Line{};
@@ -892,7 +913,7 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         l.glue("[", .{});
         l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
         l.glue("]", .{});
-        try emitLine(writer, code, off, &l, seq, guides, false, cc, null, 0, show_bytes, use_color);
+        try emitLine(writer, code, off, &l, seq, guides, false, takeBg(stripe, env.use_color), env);
     }
 }
 
@@ -911,9 +932,8 @@ fn writeOperandTail(
     operand_text: []const u8,
     seq: *usize,
     symbols: Symbols,
-    cc: [3]u8,
-    show_bytes: bool,
-    use_color: bool,
+    stripe: *usize,
+    env: Env,
 ) !void {
     const code = chunk.code;
     var off = ip;
@@ -924,27 +944,24 @@ fn writeOperandTail(
     switch (op) {
         .clos, .clos_w => {
             // The chunk id rode the mnemonic line; only the upvalue count remains.
-            try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "upvalues (from stack)", seq, g[0..1], stripe, env);
         },
         .thk, .thk_eag, .thk_w, .thk_eag_w, .thk_arg, .clos_cap, .clos_cap_w => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*); // the "captures" count line's color
-            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], stripe, env);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
         },
         .thk_st, .thk_st_cell, .thk_eag_st, .thk_eag_st_cell => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
-            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], cc, show_bytes, use_color);
-            // The captures sublist (depth 2) just ended; break before the store
-            // target, but keep the level-1 guide (g[0]) unbroken.
-            if (n > 0) try emitGuideBreak(writer, g[0..1], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "captures", seq, g[0..1], stripe, env);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
             var l = Line{};
             l.glue("→ local[", .{});
             l.group(0, 1, "{d}", .{code[off]});
             l.glue("]", .{});
-            try emitLine(writer, code, &off, &l, seq, g[0..1], false, cc, null, 0, show_bytes, use_color);
+            try emitLine(writer, code, &off, &l, seq, g[0..1], false, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
             // Entry/position counts rode the mnemonic line; the positions count
@@ -992,26 +1009,25 @@ fn writeOperandTail(
                 l2.groupPinned(4, 4, c_cl, "0x{x}", .{cl});
                 l2.comment();
                 l2.glue("{s}", .{loc[0..lw.end]});
-                // Alternate the background per record; pad both rows to the wider
-                // one so the tint forms a clean rectangle.
-                const bg: ?[3]u8 = if (k % 2 == 1) row_bg else null;
-                const pad = @max(l1.tokWidth(), l2.tokWidth());
-                try emitLine(writer, code, &off, &l1, seq, g[0..1], false, cc, bg, pad, show_bytes, use_color);
-                try emitLine(writer, code, &off, &l2, seq, g[0..1], false, cc, bg, pad, show_bytes, use_color);
+                // The whole 2-row record is ONE stripe unit, so the zebra
+                // alternates per entry, not per line.
+                const bg = takeBg(stripe, env.use_color);
+                try emitLine(writer, code, &off, &l1, seq, g[0..1], false, bg, env);
+                try emitLine(writer, code, &off, &l2, seq, g[0..1], false, bg, env);
             }
         },
         .thk_defer => {
-            const env = readU16(code, off);
+            const n = readU16(code, off);
             g[1] = hueColor(seq.*);
-            try emitCountLine(writer, code, &off, "env", seq, g[0..1], cc, show_bytes, use_color);
-            try emitCaptureDescriptors(writer, code, &off, env, seq, g[0..2], cc, show_bytes, use_color);
+            try emitCountLine(writer, code, &off, "env", seq, g[0..1], stripe, env);
+            try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
         },
         else => {
             // No bespoke breakdown: dump the whole tail as one group.
             if (end_ip > off) {
                 var l = Line{};
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], true, cc, null, 0, show_bytes, use_color);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], true, takeBg(stripe, env.use_color), env);
             }
         },
     }
@@ -1019,7 +1035,7 @@ fn writeOperandTail(
     if (off < end_ip) {
         var l = Line{};
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
-        try emitLine(writer, code, &off, &l, seq, g[0..1], true, cc, null, 0, show_bytes, use_color);
+        try emitLine(writer, code, &off, &l, seq, g[0..1], true, takeBg(stripe, env.use_color), env);
     }
 }
 
@@ -1089,7 +1105,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     }
     try writer.writeAll(")\n");
     if (chunk.scheduling.strictness.forced_upvalues != 0) {
-        try writeGuide(writer, cc, use_color);
+        try writeGuide(writer, cc, null, use_color);
         try writer.writeAll("  strict upvalues:");
         var mask = chunk.scheduling.strictness.forced_upvalues;
         while (mask != 0) {
@@ -1101,7 +1117,7 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
     }
     const deep_extra = chunk.scheduling.strictness.deep_upvalues & ~chunk.scheduling.strictness.forced_upvalues;
     if (deep_extra != 0) {
-        try writeGuide(writer, cc, use_color);
+        try writeGuide(writer, cc, null, use_color);
         try writer.writeAll("  deep upvalues:");
         var mask = deep_extra;
         while (mask != 0) {
@@ -1119,12 +1135,12 @@ fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids
     if (ids.len == 0) return;
     // Sub-section header under the references gutter, then one row per chunk
     // under the sub-section's own gutter.
-    try writeGuide(writer, cc, use_color);
+    try writeGuide(writer, cc, null, use_color);
     try writer.writeAll("  ");
     try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
     try writer.print("{s}:\n", .{label});
     for (ids) |id| {
-        try writeGuide(writer, cc, use_color);
+        try writeGuide(writer, cc, null, use_color);
         try writer.writeAll("  ");
         try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
         try writeTreeGuide(writer, sub_color, .vert, null, use_color);
