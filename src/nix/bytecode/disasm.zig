@@ -775,10 +775,6 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         }
         var w: u16 = 0;
         if (r == 0) {
-            // One space so a level-1 value aligns with the mnemonic line's
-            // operand (which sits one space after the mnemonic).
-            try writer.writeByte(' ');
-            w += 1;
             for (line.toks[0..line.n], 0..) |t, i| {
                 // Align the `;` comments down the block: pad the raw-value
                 // region out to the shared column before the comment starts.
