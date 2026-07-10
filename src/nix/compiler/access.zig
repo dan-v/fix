@@ -86,6 +86,34 @@ pub fn compileAttrOr(self: *Compiler, node: *const Node) !void {
         return;
     }
 
+    // Re-specialize the dominant dynamic shapes to the fused ops. Both fused
+    // handlers cover the WHOLE path with the default (missing static prefix
+    // segment -> default), so this keeps the flatten fix's semantics while
+    // restoring the slimmer pre-flatten encodings (the generic mix_or operand
+    // pushed hot chunks over the speculation-eligibility size cliff):
+    //   x.${b} or d            -> attr_get_dyn_or   (no operand)
+    //   x.a.b.${c} or d        -> attr_get_path_dyn_or[_w]
+    // dynamic_count==1 with a trailing .dynamic implies every prefix segment
+    // is a pure (non-interpolated) static.
+    if (dynamic_count == 1 and segments.items[segments.items.len - 1] == .dynamic) {
+        const dyn_name = segments.items[segments.items.len - 1].dynamic;
+        const prefix = segments.items[0 .. segments.items.len - 1];
+        try self.compileNode(base);
+        try thunks.compileThunk(self, dyn_name);
+        try thunks.compileThunk(self, attr_or.default);
+        if (prefix.len == 0) {
+            try emit.emitOp(self, .attr_get_dyn_or);
+        } else {
+            var atoms: std.ArrayListUnmanaged(Node.Atom) = .empty;
+            defer atoms.deinit(self.allocator);
+            for (prefix) |segment| try atoms.append(self.allocator, segment.static);
+            const wide = try emit.attrSegmentsWide(self, atoms.items);
+            try emit.emitOp(self, if (wide) .attr_get_path_dyn_or_w else .attr_get_path_dyn_or);
+            try emit.writeStaticAttrPathOperand(self, atoms.items, atom, wide);
+        }
+        return;
+    }
+
     // Mixed static/dynamic path: push root, then each dynamic segment's name
     // thunk in path order, then the default thunk.
     try self.compileNode(base);
