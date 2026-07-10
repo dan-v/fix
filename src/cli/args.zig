@@ -582,7 +582,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
 
         .packages => unreachable, // handled in the parse loop
 
-        .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 10) catch return error.InvalidChunkId,
+        // Accept decimal or `0x` hex (disasm prints ids in hex).
+        .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 0) catch return error.InvalidChunkId,
         .no_recurse => options.disasm_no_recurse = true,
         .no_source => options.disasm_no_source = true,
         .no_constants => options.disasm_no_constants = true,
