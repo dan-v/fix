@@ -261,7 +261,12 @@ pub const EvalProgress = struct {
                 .root_name = "",
                 .disable_printing = !enabled,
                 .initial_delay_ns = .fromMilliseconds(180),
-                .refresh_rate_ns = .fromMilliseconds(100),
+                // Paired with the evaluator's live-counter sample period
+                // (`Evaluator.sample_period_ms`) — redrawing slower than the
+                // sampler would hide samples; both are 50ms (20 Hz). The
+                // redraw runs on std.Progress's own render thread, so like
+                // the sampler it costs the eval path nothing.
+                .refresh_rate_ns = .fromMilliseconds(50),
             }),
         };
     }
@@ -291,11 +296,13 @@ pub const EvalProgress = struct {
 
     pub fn sink(self: *EvalProgress) eval_progress.Sink {
         return .{
-            .context = self,
-            .emit_fn = emit,
-            .begin_span_fn = beginSpan,
-            .end_span_fn = endSpan,
-            .update_span_fn = updateSpan,
+            .stage = .{ .context = self, .emit_fn = emit },
+            .spans = .{
+                .context = self,
+                .begin_span_fn = beginSpan,
+                .end_span_fn = endSpan,
+                .update_span_fn = updateSpan,
+            },
         };
     }
 

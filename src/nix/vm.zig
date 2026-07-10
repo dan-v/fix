@@ -190,8 +190,21 @@ pub const VM = struct {
     scheduler: *Scheduler,
     /// Evaluator-owned error trace collector.
     trace: ?*eval_trace.Trace,
-    /// Evaluator-owned progress sink.
-    progress: ?eval_progress.Sink,
+    /// The thread-safe concurrent-span half of the progress protocol
+    /// (fetches, store writes, source copies). Installed on EVERY VM — it is
+    /// the only progress channel available off the demand fiber. Null when
+    /// progress isn't drawn.
+    progress_spans: ?eval_progress.SpanSink,
+    /// The demand-only stage-stack half of the progress protocol. Non-null
+    /// ONLY on the demand fiber's VMs: the worker installs it on the top
+    /// fiber's VM alongside `is_demand` (see `Worker.runTopLevel`) and nested
+    /// VMs inherit it from their fiber (see `Evaluator.initVm`) — so a
+    /// helper-fiber stage emit has no handle to call through. The stage stack
+    /// is a single-writer LIFO owned by the demand path; a stray off-demand
+    /// begin/end corrupts it (the historical TTY-only --workers>1
+    /// SIGSEGV/hang). Don't add a bypass; off-demand work reports via
+    /// `progress_spans`.
+    progress_stage: ?eval_progress.StageSink = null,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
     /// Optional per-thunk lifecycle event log (see `probe/thunk_trace.zig`).
@@ -336,7 +349,7 @@ pub const VM = struct {
         derivations: *DerivationStore,
         scheduler: *Scheduler,
         trace_sink: ?*eval_trace.Trace,
-        progress: ?eval_progress.Sink,
+        progress_spans: ?eval_progress.SpanSink,
         vm_trace: ?*VmTrace,
         thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
         import_host: ?ImportHost,
@@ -362,7 +375,7 @@ pub const VM = struct {
             .derivations = derivations,
             .scheduler = scheduler,
             .trace = trace_sink,
-            .progress = progress,
+            .progress_spans = progress_spans,
             .vm_trace = vm_trace,
             .thunk_trace = thunk_trace,
             .import_host = import_host,
@@ -411,13 +424,14 @@ pub const VM = struct {
         }
     }
 
-    /// Report `[completed/total]` on the current render/stage node. Demand path
-    /// only (speculative walks stay invisible), and free unless progress is
-    /// drawn (`progress == null`). Cheap: a field check + one atomic store in
-    /// the sink → node. See `vm/force.zig` `forceDeepCounted`.
+    /// Report `[completed/total]` on the current render/stage node. Demand
+    /// path only by construction: `progress_stage` exists solely on the
+    /// demand fiber's VMs (helpers hold null), so speculative walks stay
+    /// invisible and this is free unless progress is drawn. Cheap: a field
+    /// check + one atomic store in the sink → node. See `vm/force.zig`
+    /// `forceDeepCounted`.
     pub fn progressCount(self: *VM, completed: usize, total: usize) void {
-        if (self.in_speculation) return;
-        if (self.progress) |sink| sink.count(completed, total);
+        if (self.progress_stage) |stage| stage.count(completed, total);
     }
 
     /// Open a concurrent "copying <subject> to store" span around a source
@@ -426,12 +440,12 @@ pub const VM = struct {
     /// the thread-safe concurrent-span channel, not the demand stage stack.
     /// Null (no-op `end`) when progress isn't drawn.
     pub fn storeCopySpanBegin(self: *VM, subject: []const u8) ?eval_progress.Span {
-        const progress = self.progress orelse return null;
-        return progress.beginSpan(.source, subject);
+        const spans = self.progress_spans orelse return null;
+        return spans.beginSpan(.source, subject);
     }
 
     pub fn storeCopySpanEnd(self: *VM, span: ?eval_progress.Span) void {
-        if (span) |sp| if (self.progress) |progress| progress.endSpan(sp);
+        if (span) |sp| if (self.progress_spans) |spans| spans.endSpan(sp);
     }
 
     pub fn deinit(self: *VM) void {

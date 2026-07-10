@@ -50,6 +50,7 @@ const worker_id_mod = @import("base").worker_id;
 const mem_tag = @import("runtime").mem_tag;
 const gc = @import("runtime").gc;
 const eval_trace = @import("observ").trace;
+const eval_progress = @import("observ").progress;
 const prof = @import("probe").prof;
 const timeline = @import("probe").timeline;
 // Used only by the test fixture below.
@@ -249,6 +250,13 @@ pub const Worker = struct {
     /// global totals on park and at drain-loop exit.
     census: if (census_on) prof.FiberLocal else void = if (census_on) prof.FiberLocal{} else {},
 
+    /// The demand-only stage-stack progress handle `runTopLevel` installs on
+    /// the top fiber's VM (paired with `is_demand`; cleared together when the
+    /// fiber recycles). Set by the Evaluator on the main worker only, and only
+    /// when progress is drawn — helpers never carry one, which is what makes
+    /// an off-demand stage emit inexpressible (see `VM.progress_stage`).
+    demand_stage: ?eval_progress.StageSink = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
@@ -397,6 +405,7 @@ pub const Worker = struct {
         const top = try self.acquireFreeFiber();
         top.current_task = null;
         top.vm.is_demand = true; // its blocking waits are the critical path
+        top.vm.progress_stage = self.demand_stage; // stage handle exists only on the demand VM
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -712,6 +721,7 @@ pub const Worker = struct {
                 // its `runTopLevel` loop observes the completion (it
                 // may be parked waiting on this very fiber).
                 f.vm.is_demand = false; // clear before recycle (else a reused fiber mislabels)
+                f.vm.progress_stage = null; // paired with is_demand: no demand, no stage handle
                 if (comptime census_on) {
                     self.census.finished += 1;
                     if (f.census_suspends > 0) {
