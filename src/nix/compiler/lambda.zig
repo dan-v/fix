@@ -74,7 +74,11 @@ fn compileTailNodeImpl(self: *Compiler, node: *const Node) anyerror!void {
 /// arg positions the callee chunk marks must-force (`strict_params`),
 /// recovering eager-arg behavior with the callee actually known.
 fn compileSpineArg(self: *Compiler, arg: *const Node) !void {
-    if (try access.compileImmediateContainerValue(self, arg, .{})) return;
+    // `raw_identifier`: a bare local/upvalue argument is already a lazy value in
+    // its slot — push it directly (`capture_local`/`capture_upvalue`) instead of
+    // wrapping it in a forwarding thunk that would just return it. Same laziness,
+    // one fewer chunk + allocation each (as attr-set values already do).
+    if (try access.compileImmediateContainerValue(self, arg, .{ .raw_identifier = true })) return;
     try thunks.compileThunk(self, arg);
 }
 
@@ -120,8 +124,10 @@ fn compileApplyWithOp(self: *Compiler, node: *const Node, op: OpCode) !void {
     if (let.isEagerEvalShape(ap.arg) and try directlyAppliedStrictLambda(self, ap.func)) {
         // Statically-known strict callee: eager arg, no runtime check.
         try self.compileNode(ap.arg);
-    } else if (try access.compileImmediateContainerValue(self, ap.arg, .{})) {
-        // Immediate value (literal/empty list/...): already thunk-free.
+    } else if (try access.compileImmediateContainerValue(self, ap.arg, .{ .raw_identifier = true })) {
+        // Immediate value (literal/empty list/...) or a bare local/upvalue
+        // reference: already a lazy value, so pass it directly rather than
+        // wrapping it in a forwarding thunk (see `compileSpineArg`).
     } else {
         // Dynamically-dispatched call: defer the thunk-vs-eager decision
         // to runtime via `apply_arg`, which reads the callee's strictness.
