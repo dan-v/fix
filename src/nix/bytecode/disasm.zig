@@ -843,6 +843,16 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
             l.glue("deferred", .{});
             return 4;
         },
+        .attr_check, .attr_check_w => {
+            const allow = code[start + 1];
+            const expected = readU16(code, start + 2);
+            l.group(1, 1, "#{d}", .{allow});
+            l.glue(" ", .{});
+            l.group(2, 2, "#{d}", .{expected});
+            l.comment();
+            l.glue("{d} expected, extra {s}", .{ expected, if (allow != 0) "allowed" else "rejected" });
+            return 3;
+        },
         else => return 0,
     }
 }
@@ -1027,6 +1037,31 @@ fn writeOperandTail(
             try emitCountLine(writer, code, &off, "env", seq, g[0..1], stripe, env);
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], stripe, env);
         },
+        .attr_check, .attr_check_w => {
+            // The flag + count rode the mnemonic line (count = its last 2 head
+            // bytes); one row per expected attribute name, each with its
+            // `str[…] → "name"` chain in the intern id's identity color.
+            const wide = op == .attr_check_w;
+            const id_len: u16 = if (wide) 4 else 2;
+            const expected = readU16(code, off - 2);
+            var k: usize = 0;
+            while (k < expected) : (k += 1) {
+                const id: InternId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
+                const c = internColor(id);
+                var esc: [128]u8 = undefined;
+                var ew: std.Io.Writer = .fixed(&esc);
+                if (symbols.internName(id)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
+                var l = Line{};
+                l.groupPinned(0, id_len, c, "0x{x}", .{id});
+                l.comment();
+                l.storeRef("str", c, "0x{x}", .{id});
+                if (ew.end > 0) {
+                    l.glue(" → ", .{});
+                    l.tint(c, "\"{s}\"", .{esc[0..ew.end]});
+                }
+                try emitLine(writer, code, &off, &l, seq, g[0..1], false, takeBg(stripe, env.use_color), env);
+            }
+        },
         else => {
             // No bespoke breakdown: dump the whole tail as one group.
             if (end_ip > off) {
@@ -1064,6 +1099,8 @@ fn isMultiline(op: OpCode) bool {
         .attrs_new_pos,
         .attrs_new_pos_srt,
         .thk_defer,
+        .attr_check,
+        .attr_check_w,
         => true,
         else => false,
     };
