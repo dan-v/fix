@@ -190,6 +190,14 @@ pub const OpCode = enum(u8) {
     thunk_eag_w_st_cell,
     /// Fused `thunk_eag_w + loc_set`.
     thunk_eag_w_st,
+    /// Create a frameless attr-access thunk directly: resolve ONE capture
+    /// descriptor (kind:1 + index:2) to a base value and wrap it in an
+    /// attr-access thunk over the 2-byte attr name. The compile-time twin of
+    /// the `attr_access` trivial-body short-circuit — emitted instead of a
+    /// whole `up_get_attr; ret; halt` wrapper chunk (the single most common
+    /// chunk shape on a NixOS eval), which the runtime never dispatched
+    /// anyway. Operand: kind:1 + index:2 + name:2.
+    thunk_attr,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.

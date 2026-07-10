@@ -705,6 +705,17 @@ fn opThunkCapturesEagerLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize,
     return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
 }
 
+/// `thunk_attr`: one capture descriptor resolves the attr-access base; the
+/// frameless thunk is created without any wrapper chunk.
+fn opThunkAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    if (ip + 5 > code.len) return error.InvalidBytecode;
+    const descriptors = code[ip .. ip + 3];
+    const name = readU16(code, ip + 3);
+    try closures.makeAttrAccessThunk(vm, descriptors, name, frame);
+    return dispatch(vm, frame, code, ip + 5, stop_depth);
+}
+
 /// Shared implementation of the fused thunk+store family: create the thunk
 /// from the (narrow or wide) chunk id + inline descriptors, then bind the
 /// popped value into the slot — directly (`loc_set`) or by publishing into
@@ -1233,6 +1244,7 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.loc_get_attr_w)] = opGetLocalAttrLong;
     table[@intFromEnum(OpCode.cell_new)] = opMakeCell;
     table[@intFromEnum(OpCode.thunk_shell)] = opMakeLazyShell;
+    table[@intFromEnum(OpCode.thunk_attr)] = opThunkAttr;
     table[@intFromEnum(OpCode.cell_init)] = opInitCellSlot;
     table[@intFromEnum(OpCode.cell_init_w)] = opInitCellSlotLong;
     table[@intFromEnum(OpCode.attr_get)] = opGetAttr;

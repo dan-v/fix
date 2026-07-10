@@ -332,6 +332,15 @@ pub fn emitCaptureDescriptors(self: *Compiler, captures: []const Capture) !void 
     }
 }
 
+/// Emit `thunk_attr`: a frameless attr-access thunk over the value of one
+/// capture descriptor — the elided form of an `up_get_attr; ret; halt`
+/// wrapper chunk.
+pub fn emitThunkAttr(self: *Compiler, base: Capture, name: u16) !void {
+    try emitOp(self, .thunk_attr);
+    try emitCaptureDescriptors(self, &.{base});
+    try self.builder.writeU16(self.allocator, name);
+}
+
 pub fn attrSegmentsWide(self: *Compiler, segments: []const Node.Atom) !bool {
     var wide = false;
     for (segments) |seg| {

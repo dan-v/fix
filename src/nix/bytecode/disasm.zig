@@ -1549,6 +1549,14 @@ fn writeOperands(
             try writer.print("#{d} ; upvalue[{d}]", .{ slot, slot });
             if (upvalueName(up_names, symbols, slot)) |nm| try writer.print(" {s}", .{nm});
         },
+        .thunk_attr => {
+            // One capture descriptor (kind:1 + index:2) + 2-byte attr name.
+            const kind = code[ip];
+            const idx = readU16(code, ip + 1);
+            const id: InternId = @intCast(readU16(code, ip + 3));
+            ip += 5;
+            try writeSlotAttr(writer, if (kind == 0) "local" else "upvalue", idx, id, symbols);
+        },
 
         .int_add, .int_sub, .int_mul, .int_div, .int_neg,
         .flt_add, .flt_sub, .flt_mul, .flt_div,
@@ -2032,7 +2040,7 @@ fn isAggregateOp(op: OpCode) bool {
 
 fn isThunkFamilyOp(op: OpCode) bool {
     return switch (op) {
-        .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
+        .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_attr, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
         else => false,
     };
 }
