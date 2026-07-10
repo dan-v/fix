@@ -386,14 +386,13 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     }
 }
 
-/// One operand-hierarchy gutter cell: a plain vertical `│` runs straight down
-/// every level, closing with the L-shaped `└` on a group's last member; a
-/// closed branch is `.blank`. Each is a column wider than the thin chunk margin.
-const GuideKind = enum { vert, corner, blank };
+/// One operand-hierarchy gutter cell: a plain vertical `│` that descends through
+/// every one of the group's members and their descendants, going `.blank` only
+/// once the whole subtree has ended. A column wider than the thin chunk margin.
+const GuideKind = enum { vert, blank };
 fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, use_color: bool) !void {
     const glyph: []const u8 = switch (kind) {
         .vert => "│  ",
-        .corner => "└  ",
         .blank => "   ",
     };
     if (use_color and kind != .blank) {
@@ -433,17 +432,11 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
         // continuation rows; ancestor levels get │, or blank once their branch
         // has closed — so a guide never dangles past the last line of a group.
         for (guides, 0..) |gc, gi| {
+            // A level's bar covers all its members' content rows (r == 0); it
+            // only goes blank on the wrapped continuation rows once its subtree
+            // has ended (`last_mask` bit i set), so it never dangles.
             const is_last = (last_mask >> @intCast(gi)) & 1 == 1;
-            const innermost = gi + 1 == guides.len;
-            // Vertical everywhere, except the last member closes with `└` on its
-            // content row and its branch is blank thereafter (and up any ancestor
-            // branch that has already closed).
-            const kind: GuideKind = if (!is_last)
-                .vert
-            else if (innermost and r == 0)
-                .corner
-            else
-                .blank;
+            const kind: GuideKind = if (r != 0 and is_last) .blank else .vert;
             try writeTreeGuide(writer, gc, kind, use_color);
         }
         if (r != 0) continue; // continuation rows: bytes + gutter only
@@ -596,8 +589,9 @@ fn writeOperandFields(
                 l.group(8, 4, "{d}", .{ln});
                 l.glue(":", .{});
                 l.group(12, 4, "{d}", .{cl});
-                // positions is the last operand (bit 0); this record is last iff k is (bit 1).
-                const mask: u8 = 1 | (@as(u8, @intFromBool(k == pos_count - 1)) << 1);
+                // Both the positions branch and the enclosing operand branch end
+                // at the last record, so their bars stop on its continuation rows.
+                const mask: u8 = if (k == pos_count - 1) 0b11 else 0;
                 try emitLine(writer, code, &off, &l, &seq, g[0..2], mask, cc, show_bytes, use_color);
             }
         },
