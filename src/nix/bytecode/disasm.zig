@@ -893,8 +893,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue(" entries, ", .{});
             l.tint(c_p, "{d}", .{positions});
             l.glue(" positions", .{});
-            l.groupPinned(5, 4, comment_color, "", .{}); // side-table start index bytes
-            return 8;
+            return 4;
         },
         .thunk_defer => {
             const id = readU32(code, start + 1);
@@ -1251,12 +1250,24 @@ fn writeOperandTail(
             try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
-            // Entry/position counts + side-table start rode the mnemonic line
-            // (`off` points past them). Records live in the chunk's attr_pos
-            // side table, not the code stream — one row per record, no byte
-            // column, name/file/line/col in identity colors.
-            const pos_count = readU16(code, off - 6);
-            const pos_start = readU32(code, off - 4);
+            // Entry/position counts rode the mnemonic line; the side-table
+            // start u32 is this op's one remaining operand row. The records
+            // themselves live in the chunk's attr_pos side table, not the
+            // code stream — one row per record, no byte column, name/file/
+            // line/col in identity colors.
+            const pos_count = readU16(code, off - 2);
+            const pos_start = readU32(code, off);
+            {
+                const c = hueColor(seq.*);
+                seq.* += 1;
+                var l = Line{};
+                l.groupPinned(0, 4, c, "#{d}", .{pos_start});
+                l.comment();
+                l.glue("records[", .{});
+                l.tint(c, "{d}..{d}", .{ pos_start, pos_start + pos_count });
+                l.glue("]", .{});
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
+            }
             const table = chunk.attr_pos;
             var k: usize = 0;
             while (k < pos_count) : (k += 1) {
