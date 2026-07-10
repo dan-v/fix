@@ -1,19 +1,55 @@
-//! Interactive REPL: the raw-mode line editor and the read-eval-print loop.
+//! `fix repl` — the interactive read-eval-print loop.
+//!
+//! Two strictly separated modes:
+//!
+//! - **Interactive** (stdin AND stdout are a tty, and `--bare` not given): a
+//!   hand-rolled raw-mode line editor (`repl/editor.zig` + `repl/render.zig`)
+//!   with history, completion, smart-enter multiline, and the `:disasm`
+//!   pager. Raw mode is restored on every exit path, including panics and
+//!   fatal signals (`repl/term.zig`).
+//! - **Bare** (`--bare`, or any non-tty end): a plain read-a-line loop — no
+//!   escape sequences, no raw mode, no redraw tricks. Lines are accumulated
+//!   until they form a complete expression, so multiline input pipes work.
+//!
+//! Both modes share the same command set (`repl/commands.zig`) and the same
+//! evaluation core: expressions evaluate inside an ambient scope attrset
+//! holding the repl bindings (`name = expr`, `:l`, and `it`), which is also
+//! registered as a GC root; a collection runs between inputs so memory does
+//! not accrete across evaluations.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
-const run = @import("run.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
-const Options = @import("args.zig").Options;
-const Evaluator = @import("fix").Evaluator;
+const render_err = @import("render.zig");
+const fix = @import("fix");
+const runtime_value = @import("runtime").value;
+const thunk_mod = @import("runtime").thunk;
+const types = @import("runtime").types;
+
+const commands = @import("repl/commands.zig");
+const check = @import("repl/check.zig");
+const history_mod = @import("repl/history.zig");
+const editor_mod = @import("repl/editor.zig");
+const keys_mod = @import("repl/keys.zig");
+const render_mod = @import("repl/render.zig");
+const term_mod = @import("repl/term.zig");
+const complete_mod = @import("repl/complete.zig");
+const pager_mod = @import("repl/pager.zig");
+
+const Options = args.Options;
+const Evaluator = fix.Evaluator;
+const Value = fix.Value;
 
 pub const synopsis =
     \\usage: fix repl [options]
     \\
     \\start an interactive read-eval-print loop.
 ;
+
+const prompt_main = "fix> ";
+const prompt_cont = "...> ";
 
 /// `fix repl` subcommand entry point.
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -33,6 +69,13 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         return 2;
     }
 
+    // THE MODE GATE. Interactive only when both ends are a terminal and
+    // --bare wasn't given; everything else is the plain loop. Decided once,
+    // up front — nothing downstream re-tests tty-ness.
+    const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
+    const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
+    const interactive = stdin_tty and stdout_tty and !options.bare and builtin.os.tag == .linux;
+
     const worker_count = try setup.workerCount(options);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
@@ -42,363 +85,752 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     var repl_ok = false;
     defer progress.deinit(repl_ok);
     if (term.show_progress) ev.setProgressSink(progress.sink());
-    try run_loop(allocator, init.io, options, term.use_color, &ev);
+
+    var repl = Repl.init(allocator, init, options, &ev, term.use_color and interactive, interactive);
+    defer repl.deinit();
+
+    if (interactive) {
+        try repl.runInteractive();
+    } else {
+        try repl.runBare(stdin_tty);
+    }
     repl_ok = true;
     return 0;
 }
 
-pub const History = struct {
+const Repl = struct {
     allocator: std.mem.Allocator,
-    items: std.ArrayListUnmanaged([]u8) = .empty,
-    max_items: usize = 100,
-
-    pub fn init(allocator: std.mem.Allocator) History {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *History) void {
-        for (self.items.items) |item| self.allocator.free(item);
-        self.items.deinit(self.allocator);
-    }
-
-    pub fn add(self: *History, line: []const u8) !void {
-        if (line.len == 0) return;
-        if (self.items.items.len != 0 and std.mem.eql(u8, self.items.items[self.items.items.len - 1], line)) return;
-
-        if (self.items.items.len >= self.max_items) {
-            self.allocator.free(self.items.items[0]);
-            std.mem.copyForwards([]u8, self.items.items[0 .. self.items.items.len - 1], self.items.items[1..]);
-            _ = self.items.pop();
-        }
-        try self.items.append(self.allocator, try self.allocator.dupe(u8, line));
-    }
-};
-
-pub const ReadError = error{
-    EndOfStream,
-    UnsupportedTerminal,
-    StreamTooLong,
-    OutOfMemory,
-    ReadFailed,
-    WriteFailed,
-    NotATerminal,
-    ProcessOrphaned,
-    Unexpected,
-};
-
-pub fn readInteractiveAlloc(
-    allocator: std.mem.Allocator,
+    proc_init: std.process.Init,
     io: std.Io,
-    prompt: []const u8,
-    use_color: bool,
-    history: *History,
-) !?[]u8 {
-    var raw = RawMode.enable() catch |err| switch (err) {
-        error.UnsupportedTerminal => return error.UnsupportedTerminal,
-        else => return err,
-    };
-    defer raw.disable();
-
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    const writer = &stdout.interface;
-
-    var editor = Editor{
-        .allocator = allocator,
-        .io = io,
-        .writer = writer,
-        .prompt = prompt,
-        .use_color = use_color,
-        .history = history,
-        .history_pos = history.items.items.len,
-    };
-    defer editor.deinit();
-
-    try editor.render();
-    const result = try editor.read();
-    try writer.flush();
-    return result;
-}
-
-const RawMode = struct {
-    original: std.posix.termios,
-    enabled: bool = false,
-
-    fn enable() ReadError!RawMode {
-        if (builtin.os.tag != .linux) return error.UnsupportedTerminal;
-
-        const fd = std.posix.STDIN_FILENO;
-        const original = try std.posix.tcgetattr(fd);
-        var raw = original;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.IEXTEN = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        try std.posix.tcsetattr(fd, .FLUSH, raw);
-        return .{ .original = original, .enabled = true };
-    }
-
-    fn disable(self: *RawMode) void {
-        if (!self.enabled) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
-        self.enabled = false;
-    }
-};
-
-const Editor = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    writer: *std.Io.Writer,
-    prompt: []const u8,
-    use_color: bool,
-    history: *History,
-    buffer: std.ArrayListUnmanaged(u8) = .empty,
-    saved: std.ArrayListUnmanaged(u8) = .empty,
-    cursor: usize = 0,
-    history_pos: usize,
-
-    fn deinit(self: *Editor) void {
-        self.buffer.deinit(self.allocator);
-        self.saved.deinit(self.allocator);
-    }
-
-    fn read(self: *Editor) !?[]u8 {
-        while (true) {
-            const byte = try readByte();
-            switch (byte) {
-                '\r', '\n' => {
-                    try self.writer.writeAll("\r\n");
-                    const line = try self.allocator.dupe(u8, self.buffer.items);
-                    try self.history.add(line);
-                    return line;
-                },
-                1 => self.cursor = 0, // Ctrl-A
-                5 => self.cursor = self.buffer.items.len, // Ctrl-E
-                4 => if (self.buffer.items.len == 0) { // Ctrl-D
-                    try self.writer.writeAll("\r\n");
-                    return null;
-                },
-                11 => self.buffer.shrinkRetainingCapacity(self.cursor), // Ctrl-K
-                12 => { // Ctrl-L
-                    try self.writer.writeAll("\x1b[H\x1b[2J");
-                },
-                21 => { // Ctrl-U
-                    self.buffer.clearRetainingCapacity();
-                    self.cursor = 0;
-                },
-                8, 127 => try self.backspace(),
-                27 => try self.escape(),
-                else => {
-                    if (byte >= 32 and byte != 127) try self.insertByte(byte);
-                },
-            }
-            try self.render();
-        }
-    }
-
-    fn escape(self: *Editor) !void {
-        const first = readByte() catch return;
-        if (first != '[') return;
-        const second = readByte() catch return;
-        switch (second) {
-            'A' => try self.historyUp(),
-            'B' => try self.historyDown(),
-            'C' => {
-                if (self.cursor < self.buffer.items.len) self.cursor += 1;
-            },
-            'D' => {
-                if (self.cursor > 0) self.cursor -= 1;
-            },
-            'H' => self.cursor = 0,
-            'F' => self.cursor = self.buffer.items.len,
-            '1', '7' => {
-                const terminator = readByte() catch return;
-                if (terminator == '~') self.cursor = 0;
-            },
-            '4', '8' => {
-                const terminator = readByte() catch return;
-                if (terminator == '~') self.cursor = self.buffer.items.len;
-            },
-            '3' => {
-                const terminator = readByte() catch return;
-                if (terminator == '~') try self.deleteAtCursor();
-            },
-            else => {},
-        }
-    }
-
-    fn insertByte(self: *Editor, byte: u8) !void {
-        try self.buffer.insert(self.allocator, self.cursor, byte);
-        self.cursor += 1;
-    }
-
-    fn backspace(self: *Editor) !void {
-        if (self.cursor == 0) return;
-        _ = self.buffer.orderedRemove(self.cursor - 1);
-        self.cursor -= 1;
-    }
-
-    fn deleteAtCursor(self: *Editor) !void {
-        if (self.cursor >= self.buffer.items.len) return;
-        _ = self.buffer.orderedRemove(self.cursor);
-    }
-
-    fn historyUp(self: *Editor) !void {
-        if (self.history.items.items.len == 0 or self.history_pos == 0) return;
-        if (self.history_pos == self.history.items.items.len) try self.saveCurrent();
-        self.history_pos -= 1;
-        try self.loadText(self.history.items.items[self.history_pos]);
-    }
-
-    fn historyDown(self: *Editor) !void {
-        if (self.history_pos >= self.history.items.items.len) return;
-        self.history_pos += 1;
-        if (self.history_pos == self.history.items.items.len) {
-            try self.loadText(self.saved.items);
-        } else {
-            try self.loadText(self.history.items.items[self.history_pos]);
-        }
-    }
-
-    fn saveCurrent(self: *Editor) !void {
-        self.saved.clearRetainingCapacity();
-        try self.saved.appendSlice(self.allocator, self.buffer.items);
-    }
-
-    fn loadText(self: *Editor, text: []const u8) !void {
-        self.buffer.clearRetainingCapacity();
-        try self.buffer.appendSlice(self.allocator, text);
-        self.cursor = self.buffer.items.len;
-    }
-
-    fn render(self: *Editor) !void {
-        try self.writer.writeAll("\r\x1b[2K");
-        try cli.style(self.writer, self.use_color, .trace_label);
-        try self.writer.writeAll(self.prompt);
-        try cli.reset(self.writer, self.use_color);
-        try self.writer.writeAll(self.buffer.items);
-        if (self.buffer.items.len > self.cursor) {
-            try self.writer.print("\x1b[{}D", .{self.buffer.items.len - self.cursor});
-        }
-        try self.writer.flush();
-    }
-};
-
-fn readByte() !u8 {
-    var buf: [1]u8 = undefined;
-    while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        if (n == 0) return error.EndOfStream;
-        return buf[0];
-    }
-}
-
-/// The read-eval-print loop. Uses the raw-mode editor when stdin/stdout are a
-/// TTY, falling back to canonical line reads otherwise.
-pub fn run_loop(allocator: std.mem.Allocator, io: std.Io, options: Options, use_color: bool, ev: *Evaluator) !void {
-    const interactive = (std.Io.File.stdin().isTty(io) catch false) and (std.Io.File.stdout().isTty(io) catch false);
-
-    var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-
-    if (interactive) {
-        try stdout.interface.writeAll("fix repl\n");
-        try stdout.interface.flush();
-    }
-
-    var history = History.init(allocator);
-    defer history.deinit();
-    var raw_editor = interactive;
-
-    while (true) {
-        var owned_line: ?[]u8 = null;
-        const line = if (raw_editor) line: {
-            const maybe_line = readInteractiveAlloc(allocator, io, "fix> ", use_color, &history) catch |err| switch (err) {
-                error.UnsupportedTerminal => {
-                    raw_editor = false;
-                    break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
-                },
-                else => return err,
-            };
-            owned_line = maybe_line orelse break;
-            break :line owned_line.?;
-        } else line: {
-            break :line try readCanonicalReplLine(io, use_color, interactive, &stdin.interface, &stdout.interface) orelse break;
-        };
-        defer if (owned_line) |owned| allocator.free(owned);
-
-        const source = std.mem.trim(u8, line, " \t\r");
-        if (source.len == 0) continue;
-
-        if (!raw_editor) {
-            try history.add(source);
-        }
-
-        if (std.mem.eql(u8, source, ":q") or
-            std.mem.eql(u8, source, ":quit") or
-            std.mem.eql(u8, source, ":exit"))
-        {
-            break;
-        }
-        if (std.mem.eql(u8, source, ":help")) {
-            try writeReplHelp(&stdout.interface);
-            try stdout.interface.flush();
-            continue;
-        }
-
-        _ = try run.evaluateAndWrite(io, options.evaluationMode(), use_color, options.show_trace, options.derivation_debug, ev, source, "input");
-    }
-}
-
-fn readCanonicalReplLine(
-    io: std.Io,
+    options: Options,
+    ev: *Evaluator,
     use_color: bool,
     interactive: bool,
-    stdin: *std.Io.Reader,
-    stdout: *std.Io.Writer,
-) !?[]const u8 {
-    if (interactive) {
-        try cli.style(stdout, use_color, .trace_label);
-        try stdout.writeAll("fix> ");
-        try cli.reset(stdout, use_color);
-        try stdout.flush();
+
+    /// Scope bindings, insertion-ordered. Keys are owned; values are heap
+    /// Values kept alive via `gc_extra_roots` + the scope attrset.
+    bindings: std.StringArrayHashMapUnmanaged(Value) = .empty,
+    /// The bindings as one attrset value, rebuilt when bindings change.
+    /// Compiled into every input chunk as its ambient scope.
+    scope: ?Value = null,
+    /// Files loaded with :l, in order, for :r. Owned.
+    loaded: std.ArrayListUnmanaged([]u8) = .empty,
+    history: history_mod.History,
+    quit: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        proc_init: std.process.Init,
+        options: Options,
+        ev: *Evaluator,
+        use_color: bool,
+        interactive: bool,
+    ) Repl {
+        return .{
+            .allocator = allocator,
+            .proc_init = proc_init,
+            .io = proc_init.io,
+            .options = options,
+            .ev = ev,
+            .use_color = use_color,
+            .interactive = interactive,
+            .history = history_mod.History.init(allocator),
+        };
     }
 
-    const raw_line = stdin.takeDelimiter('\n') catch |err| switch (err) {
-        error.StreamTooLong => {
-            try writeReplInputError(io, use_color, "input line is too long");
-            _ = stdin.discardDelimiterInclusive('\n') catch {};
-            return "";
-        },
-        else => return err,
-    };
-    return raw_line;
+    fn deinit(self: *Repl) void {
+        var it = self.bindings.iterator();
+        while (it.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.bindings.deinit(self.allocator);
+        for (self.loaded.items) |p| self.allocator.free(p);
+        self.loaded.deinit(self.allocator);
+        self.history.deinit();
+    }
+
+    // -- bare mode -----------------------------------------------------------
+
+    /// The plain loop: read lines, accumulate until the input parses as a
+    /// complete expression, process. No escape sequences anywhere; a prompt
+    /// is written only when stdin is a terminal (`--bare` at a terminal).
+    fn runBare(self: *Repl, show_prompt: bool) !void {
+        var stdin_buffer: [64 * 1024]u8 = undefined;
+        var stdin = std.Io.File.stdin().readerStreaming(self.io, &stdin_buffer);
+
+        var pending: std.ArrayListUnmanaged(u8) = .empty;
+        defer pending.deinit(self.allocator);
+
+        while (!self.quit) {
+            if (show_prompt) {
+                var out = self.stdout();
+                defer out.interface.flush() catch {};
+                out.interface.writeAll(if (pending.items.len == 0) prompt_main else prompt_cont) catch {};
+            }
+            const line = stdin.interface.takeDelimiter('\n') catch |err| switch (err) {
+                error.StreamTooLong => {
+                    try self.printError("input line is too long", .{});
+                    _ = stdin.interface.discardDelimiterInclusive('\n') catch {};
+                    pending.clearRetainingCapacity();
+                    continue;
+                },
+                else => return err,
+            } orelse {
+                // EOF: process whatever is pending so a piped script's last
+                // (unterminated) expression still runs.
+                if (std.mem.trim(u8, pending.items, " \t\r\n").len > 0) {
+                    try self.processInput(pending.items);
+                }
+                break;
+            };
+
+            if (pending.items.len == 0) {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0) continue;
+                // Commands never continue across lines.
+                if (trimmed[0] == ':') {
+                    try self.processInput(trimmed);
+                    continue;
+                }
+            }
+            try pending.appendSlice(self.allocator, line);
+            if (check.isComplete(self.allocator, pending.items)) {
+                try self.processInput(pending.items);
+                pending.clearRetainingCapacity();
+            } else {
+                try pending.append(self.allocator, '\n');
+            }
+        }
+    }
+
+    // -- interactive mode ------------------------------------------------------
+
+    fn runInteractive(self: *Repl) !void {
+        const env = self.proc_init.environ_map;
+        const hint_off = env.get("FIX_REPL_NO_HINT") != null;
+        if (!hint_off) {
+            var out = self.stdout();
+            defer out.interface.flush() catch {};
+            try cli.style(&out.interface, self.use_color, .dim);
+            try out.interface.writeAll("fix repl — :? for help, :q or Ctrl-D to quit\n");
+            try cli.reset(&out.interface, self.use_color);
+        }
+
+        self.history.open(self.io, env);
+
+        var completer_ctx = complete_mod.Ctx{
+            .ev = self.ev,
+            .io = self.io,
+            .bindings = &self.bindings,
+        };
+        var editor = editor_mod.Editor.init(
+            self.allocator,
+            &self.history,
+            complete_mod.completer(&completer_ctx),
+            .{ .ctx = self, .isCompleteFn = isCompleteThunk },
+        );
+        defer editor.deinit();
+
+        while (!self.quit) {
+            const line = self.readLine(&editor) catch |err| switch (err) {
+                error.NotATerminal => return self.runBare(false),
+                else => return err,
+            } orelse break;
+            defer self.allocator.free(line);
+
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            try self.history.add(trimmed);
+            try self.processInput(trimmed);
+        }
+    }
+
+    fn isCompleteThunk(ctx: *anyopaque, text: []const u8) bool {
+        const self: *Repl = @ptrCast(@alignCast(ctx));
+        return check.isComplete(self.allocator, text);
+    }
+
+    /// Read one (possibly multiline) input with the raw-mode editor.
+    /// Returns null on EOF (Ctrl-D at an empty prompt).
+    fn readLine(self: *Repl, editor: *editor_mod.Editor) !?[]u8 {
+        var raw = term_mod.RawMode.enable() catch return error.NotATerminal;
+        defer raw.disable();
+
+        var stdout_buffer: [8 * 1024]u8 = undefined;
+        var stdout_w = std.Io.File.stdout().writerStreaming(self.io, &stdout_buffer);
+        const w = &stdout_w.interface;
+
+        // Bracketed paste on for the duration of the edit.
+        try w.writeAll("\x1b[?2004h");
+        defer {
+            w.writeAll("\x1b[?2004l") catch {};
+            w.flush() catch {};
+        }
+
+        var renderer = render_mod.Renderer.init(
+            self.allocator,
+            term_mod.size().cols,
+            self.use_color,
+            cli.styleCode(true, .trace_label),
+        );
+        defer renderer.deinit();
+
+        editor.reset();
+        var decoder = keys_mod.Decoder{};
+        var events: keys_mod.Decoder.List = .empty;
+        defer events.deinit(self.allocator);
+        var overlay_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer overlay_arena.deinit();
+
+        var read_buf: [512]u8 = undefined;
+        while (true) {
+            // Draw the current editor state (row diffing makes repeated
+            // draws cheap; unchanged frames emit nothing).
+            _ = overlay_arena.reset(.retain_capacity);
+            try renderer.draw(w, try self.buildView(editor, overlay_arena.allocator()));
+            try w.flush();
+
+            const result = term_mod.readInput(&read_buf, if (decoder.wantsMore()) 40 else -1);
+            events.clearRetainingCapacity();
+            switch (result) {
+                .timeout => try decoder.idleFlush(self.allocator, &events),
+                .winch => {
+                    renderer.setWidth(term_mod.size().cols);
+                    renderer.invalidate();
+                    // The terminal reflowed our frame unpredictably; start
+                    // this row fresh and repaint everything below.
+                    try w.writeAll("\r\x1b[J");
+                    continue;
+                },
+                .eof => {
+                    try renderer.finish(w);
+                    return null;
+                },
+                .data => |n| for (read_buf[0..n]) |b| try decoder.feed(self.allocator, b, &events),
+            }
+
+            for (events.items) |key| {
+                switch (try editor.handleKey(key)) {
+                    .none => {},
+                    .bell => try w.writeAll("\x07"),
+                    .submit => {
+                        try closeFrame(&renderer, w, editor.text());
+                        try w.flush();
+                        return try editor.takeText();
+                    },
+                    .eof => {
+                        try closeFrame(&renderer, w, editor.text());
+                        try w.flush();
+                        return null;
+                    },
+                    .cancel => {
+                        try closeFrame(&renderer, w, editor.text());
+                        editor.reset();
+                    },
+                    .clear_screen => {
+                        try w.writeAll("\x1b[H\x1b[2J");
+                        renderer.invalidate();
+                    },
+                    .suspend_process => {
+                        try closeFrame(&renderer, w, editor.text());
+                        try w.flush();
+                        raw.suspendProcess();
+                        renderer.setWidth(term_mod.size().cols);
+                        renderer.invalidate();
+                    },
+                }
+            }
+        }
+    }
+
+    /// Leave the edit frame cleanly: one last overlay-free draw with the
+    /// cursor at the end of the text, then `finish` (clears anything below
+    /// and emits the newline). Used on submit/cancel/eof/suspend.
+    fn closeFrame(renderer: *render_mod.Renderer, w: *std.Io.Writer, text: []const u8) !void {
+        try renderer.draw(w, .{
+            .prompt = prompt_main,
+            .cont_prompt = prompt_cont,
+            .text = text,
+            .cursor = text.len,
+        });
+        try renderer.finish(w);
+    }
+
+    fn buildView(self: *Repl, editor: *editor_mod.Editor, arena: std.mem.Allocator) !render_mod.View {
+        _ = self;
+        var view: render_mod.View = .{
+            .prompt = prompt_main,
+            .cont_prompt = prompt_cont,
+            .text = editor.text(),
+            .cursor = editor.cursor,
+        };
+        var sp_buf: [96]u8 = undefined;
+        if (editor.searchPrompt(&sp_buf)) |sp| {
+            view.prompt = try arena.dupe(u8, sp);
+            view.cont_prompt = view.prompt;
+        }
+        const menu = editor.menuLines();
+        if (menu.len > 0) {
+            view.overlay = try render_mod.formatColumns(arena, menu, term_mod.size().cols, 8);
+        }
+        return view;
+    }
+
+    // -- input processing (shared by both modes) -------------------------------
+
+    fn processInput(self: *Repl, input: []const u8) !void {
+        const trimmed = std.mem.trim(u8, input, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (trimmed[0] == ':') {
+            try self.runCommand(trimmed);
+            return;
+        }
+        if (parseBinding(trimmed)) |b| {
+            if (try self.evalExpr(b.expr)) |value| {
+                try self.bind(b.name, value);
+                try self.collectBetweenInputs();
+            }
+            return;
+        }
+        if (try self.evalExpr(trimmed)) |value| {
+            // Root the result as `it` BEFORE printing forces anything else,
+            // and before the between-inputs collection.
+            try self.bind("it", value);
+            try self.printResult(value, trimmed);
+            try self.collectBetweenInputs();
+        }
+    }
+
+    fn runCommand(self: *Repl, input: []const u8) !void {
+        const word_end = std.mem.indexOfAny(u8, input, " \t") orelse input.len;
+        const word = input[0..word_end];
+        const rest = std.mem.trim(u8, input[word_end..], " \t");
+
+        const cmd = commands.find(word) orelse {
+            try self.printError("unknown command `{s}` — :? lists commands", .{word});
+            return;
+        };
+        switch (cmd.arg) {
+            .expr, .path => if (rest.len == 0) {
+                try self.printError("{s} needs {s} — :? for details", .{ word, cmd.metavar });
+                return;
+            },
+            .none => if (rest.len != 0) {
+                try self.printError("{s} takes no argument", .{word});
+                return;
+            },
+            .opt_expr => {},
+        }
+
+        switch (cmd.id) {
+            .help => {
+                var out = self.stdout();
+                defer out.interface.flush() catch {};
+                try commands.writeHelp(&out.interface);
+            },
+            .quit => self.quit = true,
+            .load => {
+                if (try self.loadFile(rest)) {
+                    try self.loaded.append(self.allocator, try self.allocator.dupe(u8, rest));
+                    try self.collectBetweenInputs();
+                }
+            },
+            .reload => {
+                for (self.loaded.items) |path| {
+                    if (!try self.loadFile(path)) break;
+                }
+                try self.collectBetweenInputs();
+            },
+            .type_of => {
+                if (try self.evalExpr(rest)) |v| {
+                    const forced = self.ev.forceValue(v) catch v;
+                    try self.bind("it", forced);
+                    var out = self.stdout();
+                    defer out.interface.flush() catch {};
+                    try self.describeType(&out.interface, forced);
+                    try out.interface.writeByte('\n');
+                    try self.collectBetweenInputs();
+                }
+            },
+            .print => {
+                if (try self.evalExpr(rest)) |v| {
+                    try self.bind("it", v);
+                    self.ev.forceDeep(v) catch |err| {
+                        try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, rest, err);
+                        return;
+                    };
+                    try self.printResult(v, rest);
+                    try self.collectBetweenInputs();
+                }
+            },
+            .inspect => {
+                if (try self.evalExpr(rest)) |v| {
+                    try self.bind("it", v);
+                    var out = self.stdout();
+                    defer out.interface.flush() catch {};
+                    try self.inspectValue(&out.interface, v);
+                    try self.collectBetweenInputs();
+                }
+            },
+            .disasm => try self.disasm(rest),
+            .env => {
+                var out = self.stdout();
+                defer out.interface.flush() catch {};
+                if (self.bindings.count() == 0) {
+                    try out.interface.writeAll("no bindings — `name = expr` creates one\n");
+                } else {
+                    var it = self.bindings.iterator();
+                    while (it.next()) |e| {
+                        try cli.style(&out.interface, self.use_color, .name);
+                        try out.interface.writeAll(e.key_ptr.*);
+                        try cli.reset(&out.interface, self.use_color);
+                        try out.interface.writeAll(" : ");
+                        try self.describeType(&out.interface, e.value_ptr.*);
+                        try out.interface.writeByte('\n');
+                    }
+                }
+            },
+            .gc => {
+                const r = self.ev.collectNow();
+                var out = self.stdout();
+                defer out.interface.flush() catch {};
+                if (!r.ran) {
+                    try out.interface.writeAll("gc: collector inactive (non-gc build, --max-memory=0, or nothing evaluated yet)\n");
+                } else {
+                    try out.interface.print("gc: heap reserved {d:.1} MiB -> {d:.1} MiB\n", .{
+                        @as(f64, @floatFromInt(r.reserved_before)) / (1 << 20),
+                        @as(f64, @floatFromInt(r.reserved_after)) / (1 << 20),
+                    });
+                }
+            },
+        }
+    }
+
+    // -- evaluation ------------------------------------------------------------
+
+    /// Evaluate an expression in the repl scope. Failures render to stderr
+    /// and yield null.
+    fn evalExpr(self: *Repl, source: []const u8) !?Value {
+        self.ev.progressSessionBegin("input");
+        defer self.ev.progressSessionEnd();
+        self.ev.startProgressSampler();
+        defer self.ev.stopProgressSampler();
+
+        const value = self.ev.evaluateWithScope(source, self.scope) catch |err| {
+            try render_err.evalFailure(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+            return null;
+        };
+        return value;
+    }
+
+    fn printResult(self: *Repl, value: Value, source: []const u8) !void {
+        const mode = self.options.evaluationMode();
+        if (mode.strict) {
+            self.ev.forceDeep(value) catch |err| {
+                try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+                return;
+            };
+        }
+        var out = self.stdout();
+        defer out.interface.flush() catch {};
+        const w = &out.interface;
+        const write_err: ?anyerror = blk: {
+            switch (mode.output) {
+                .nix => self.ev.writeValue(w, value) catch |err| break :blk err,
+                .json => self.ev.writeJsonValue(w, value) catch |err| break :blk err,
+                .xml => self.ev.writeXmlValue(w, value) catch |err| break :blk err,
+            }
+            break :blk null;
+        };
+        if (write_err) |err| {
+            if (err == error.WriteFailed) return err;
+            w.flush() catch {};
+            try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, source, err);
+            return;
+        }
+        if (mode.output != .xml) try w.writeByte('\n');
+    }
+
+    /// `:l PATH` — evaluate a file (auto-calling a top-level function with
+    /// `{}`, as nix repl does) and merge its attrset into the scope.
+    fn loadFile(self: *Repl, path: []const u8) !bool {
+        var expr: std.ArrayListUnmanaged(u8) = .empty;
+        defer expr.deinit(self.allocator);
+        try expr.appendSlice(self.allocator, "let __fix_l = import (");
+        if (path.len > 0 and path[0] == '<') {
+            try expr.appendSlice(self.allocator, path);
+        } else if (path.len > 0 and (path[0] == '/' or path[0] == '.' or path[0] == '~')) {
+            try expr.appendSlice(self.allocator, path);
+        } else {
+            try expr.appendSlice(self.allocator, "./");
+            try expr.appendSlice(self.allocator, path);
+        }
+        try expr.appendSlice(self.allocator, "); in if builtins.isFunction __fix_l then __fix_l {} else __fix_l");
+
+        const value = (try self.evalExpr(expr.items)) orelse return false;
+        const forced = self.ev.forceValue(value) catch |err| {
+            try render_err.evaluationError(self.io, self.use_color, self.options.show_trace, self.ev, path, err);
+            return false;
+        };
+        if (!forced.isAttrs()) {
+            try self.printError("{s} did not evaluate to an attrset", .{path});
+            return false;
+        }
+        const entries = self.ev.heap.getAttrs(forced.asObjectId()) catch return false;
+        var added: usize = 0;
+        for (entries) |entry| {
+            const name = self.ev.intern.get(entry.name);
+            try self.bindNoRebuild(name, entry.value);
+            added += 1;
+        }
+        // One scope rebuild for the whole file, not one per attribute.
+        try self.rebuildScope();
+        var out = self.stdout();
+        defer out.interface.flush() catch {};
+        try out.interface.print("added {d} bindings\n", .{added});
+        return true;
+    }
+
+    // -- bindings & GC ----------------------------------------------------------
+
+    /// Bind `name` to `value` and rebuild the scope attrset + GC roots.
+    fn bind(self: *Repl, name: []const u8, value: Value) !void {
+        try self.bindNoRebuild(name, value);
+        try self.rebuildScope();
+    }
+
+    fn bindNoRebuild(self: *Repl, name: []const u8, value: Value) !void {
+        const gop = try self.bindings.getOrPut(self.allocator, name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, name);
+        }
+        gop.value_ptr.* = value;
+    }
+
+    /// Rebuild the scope attrset from the bindings and re-register the GC
+    /// external roots (every bound value + the attrset itself, so nothing
+    /// is ever reachable only through a swept object).
+    fn rebuildScope(self: *Repl) !void {
+        var entries: std.ArrayListUnmanaged(@import("runtime").heap.AttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        var roots: std.ArrayListUnmanaged(Value) = .empty;
+        defer roots.deinit(self.allocator);
+
+        var it = self.bindings.iterator();
+        while (it.next()) |e| {
+            const name_id = try self.ev.intern.intern(e.key_ptr.*);
+            try entries.append(self.allocator, .{ .name = name_id, .value = e.value_ptr.* });
+            try roots.append(self.allocator, e.value_ptr.*);
+        }
+        const id = try self.ev.heap.addAttrs(entries.items);
+        self.scope = runtime_value.Value.attrs(id);
+        try roots.append(self.allocator, self.scope.?);
+        try self.ev.gcSetExternalRoots(roots.items);
+    }
+
+    /// The between-inputs collection: reclaim the last evaluation's garbage
+    /// so repl memory tracks the live bindings, not the session's history.
+    /// The first call arms tracking (cheap); later calls run real minors.
+    fn collectBetweenInputs(self: *Repl) !void {
+        _ = self.ev.collectNow();
+    }
+
+    // -- introspection ----------------------------------------------------------
+
+    fn describeType(self: *Repl, w: *std.Io.Writer, value: Value) !void {
+        switch (value.kind()) {
+            .null => try w.writeAll("null"),
+            .bool_true, .bool_false => try w.writeAll("a boolean"),
+            .int, .boxed_int => try w.writeAll("an integer"),
+            .float => try w.writeAll("a float"),
+            .string, .string_context => try w.writeAll("a string"),
+            .path => try w.writeAll("a path"),
+            .list => {
+                const n = self.ev.heap.getListLen(value.asObjectId()) catch 0;
+                try w.print("a list ({d} item{s})", .{ n, if (n == 1) "" else "s" });
+            },
+            .attrs => {
+                const entries = self.ev.heap.getAttrs(value.asObjectId()) catch &.{};
+                try w.print("a set ({d} attr{s})", .{ entries.len, if (entries.len == 1) "" else "s" });
+            },
+            .closure, .builtin, .builtin_closure, .partial_app => try w.writeAll("a function"),
+            .thunk => try w.writeAll("a thunk (unforced)"),
+        }
+    }
+
+    /// `:i` — one value, inspected without forcing: kind, thunk state and
+    /// backing chunk, closure chunk/arity, container sizes.
+    fn inspectValue(self: *Repl, w: *std.Io.Writer, value: Value) !void {
+        switch (value.kind()) {
+            .thunk => {
+                const id = value.asObjectId();
+                const thunk = self.ev.heap.getThunk(id) catch {
+                    try w.writeAll("thunk (unreadable)\n");
+                    return;
+                };
+                const state: thunk_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+                try w.print("thunk #{d}: {s}", .{ id, @tagName(state) });
+                switch (state) {
+                    .resolved => {
+                        try w.writeAll(" -> ");
+                        try self.describeType(w, thunk.payload.result);
+                        try w.writeByte('\n');
+                    },
+                    .errored => try w.writeAll(" (cached failure)\n"),
+                    else => {
+                        switch (thunk.targetKind()) {
+                            .bytecode => try w.print(" (bytecode, chunk #{d} — :d it)\n", .{thunk.payload.target.bytecode.chunk_id}),
+                            .closure => try w.writeAll(" (closure application)\n"),
+                            .pass_through => try w.writeAll(" (pass-through cell)\n"),
+                            .attr_access => try w.writeAll(" (attribute access)\n"),
+                            .deferred => try w.writeAll(" (deferred compile — forced on first use)\n"),
+                        }
+                    },
+                }
+            },
+            .closure => {
+                const closure = self.ev.heap.getClosure(value.asObjectId()) catch {
+                    try w.writeAll("closure (unreadable)\n");
+                    return;
+                };
+                var arity: usize = 1;
+                if (self.ev.getChunk(closure.chunk_id)) |chunk| arity = chunk.arity;
+                try w.print("closure: chunk #{d}, arity {d}, {d} upvalue{s} — :d it\n", .{
+                    closure.chunk_id,
+                    arity,
+                    closure.upvalues.len,
+                    if (closure.upvalues.len == 1) "" else "s",
+                });
+            },
+            else => {
+                try self.describeType(w, value);
+                try w.writeByte('\n');
+            },
+        }
+    }
+
+    /// `:d EXPR` — find the chunk behind the expression: a closure or
+    /// unforced bytecode thunk exposes its own chunk; anything else
+    /// disassembles the expression's compiled top chunk.
+    fn disasm(self: *Repl, expr: []const u8) !void {
+        var chunk_id: ?types.ChunkId = null;
+
+        // Value-first: `:d f` on a function should show f's body, not the
+        // trivial lookup chunk.
+        if (try self.evalExpr(expr)) |value| {
+            switch (value.kind()) {
+                .closure => {
+                    if (self.ev.heap.getClosure(value.asObjectId())) |c| {
+                        chunk_id = c.chunk_id;
+                    } else |_| {}
+                },
+                .thunk => {
+                    if (self.ev.heap.getThunk(value.asObjectId())) |t| {
+                        if (t.targetKind() == .bytecode) chunk_id = t.payload.target.bytecode.chunk_id;
+                    } else |_| {}
+                },
+                else => {},
+            }
+            try self.bind("it", value);
+        } else return; // evaluation failed; error already rendered
+
+        if (chunk_id == null) {
+            chunk_id = self.ev.compileSourceScoped(expr, self.scope) catch |err| {
+                try self.printError("compilation failed: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+
+        if (self.interactive) {
+            try pager_mod.browse(self.allocator, self.io, self.ev, chunk_id.?, self.use_color);
+        } else {
+            var out = self.stdout();
+            defer out.interface.flush() catch {};
+            try pager_mod.writePlain(self.allocator, &out.interface, self.ev, chunk_id.?);
+        }
+        try self.collectBetweenInputs();
+    }
+
+    // -- small output helpers ----------------------------------------------------
+
+    fn stdout(self: *Repl) std.Io.File.Writer {
+        // A fresh short-lived buffered writer per print keeps interleaving
+        // with the engine's own stdout writes (writeValue) safe.
+        return std.Io.File.stdout().writerStreaming(self.io, &stdout_scratch);
+    }
+
+    fn printError(self: *Repl, comptime fmt: []const u8, fmt_args: anytype) !void {
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr = try cli.lockStderr(self.io, &stderr_buffer);
+        defer stderr.deinit();
+        const w = stderr.writer();
+        try cli.style(w, self.use_color, .error_label);
+        try w.writeAll("error");
+        try cli.reset(w, self.use_color);
+        try w.print(": " ++ fmt ++ "\n", fmt_args);
+        try stderr.flush();
+    }
+};
+
+/// Shared scratch for the repl's short-lived stdout writers (single-threaded).
+var stdout_scratch: [8 * 1024]u8 = undefined;
+
+// -- `name = expr` binding detection -----------------------------------------
+
+const Binding = struct { name: []const u8, expr: []const u8 };
+
+const nix_keywords = [_][]const u8{
+    "let", "in", "if", "then", "else", "with", "rec", "inherit", "assert", "or",
+};
+
+/// Recognize a top-level `name = expr` binding (nix-repl style). The name
+/// must be a plain identifier (not a keyword), the `=` must not begin `==`,
+/// and the right side must be non-empty.
+fn parseBinding(input: []const u8) ?Binding {
+    var i: usize = 0;
+    if (i >= input.len) return null;
+    const first = input[0];
+    if (!(std.ascii.isAlphabetic(first) or first == '_')) return null;
+    while (i < input.len and (std.ascii.isAlphanumeric(input[i]) or
+        input[i] == '_' or input[i] == '\'' or input[i] == '-')) : (i += 1)
+    {}
+    const name = input[0..i];
+    for (nix_keywords) |kw| {
+        if (std.mem.eql(u8, name, kw)) return null;
+    }
+    while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
+    if (i >= input.len or input[i] != '=') return null;
+    i += 1;
+    if (i < input.len and input[i] == '=') return null; // `a == b`
+    const expr = std.mem.trim(u8, input[i..], " \t\r\n");
+    if (expr.len == 0) return null;
+    return .{ .name = name, .expr = expr };
 }
 
-fn writeReplHelp(writer: *std.Io.Writer) !void {
-    try writer.writeAll(
-        \\:help   show commands
-        \\:q      exit
-        \\:quit   exit
-        \\
-    );
+test {
+    _ = @import("repl/keys.zig");
+    _ = @import("repl/width.zig");
+    _ = @import("repl/editor.zig");
+    _ = @import("repl/render.zig");
+    _ = @import("repl/history.zig");
+    _ = @import("repl/check.zig");
+    _ = @import("repl/commands.zig");
+    _ = @import("repl/complete.zig");
+    _ = @import("repl/pager.zig");
 }
 
-fn writeReplInputError(io: std.Io, use_color: bool, message: []const u8) !void {
-    var stderr_buffer: [1024]u8 = undefined;
-    var stderr = try cli.lockStderr(io, &stderr_buffer);
-    defer stderr.deinit();
-    const writer = stderr.writer();
-    try cli.style(writer, use_color, .error_label);
-    try writer.writeAll("error");
-    try cli.reset(writer, use_color);
-    try writer.print(": {s}\n", .{message});
-    try stderr.flush();
+const testing = std.testing;
+
+test "parseBinding recognizes bindings, rejects comparisons and keywords" {
+    const b = parseBinding("x = 1 + 2").?;
+    try testing.expectEqualStrings("x", b.name);
+    try testing.expectEqualStrings("1 + 2", b.expr);
+
+    const c = parseBinding("foo-bar' = { }").?;
+    try testing.expectEqualStrings("foo-bar'", c.name);
+
+    try testing.expect(parseBinding("x == 1") == null);
+    try testing.expect(parseBinding("let = 1") == null);
+    try testing.expect(parseBinding("1 = 2") == null);
+    try testing.expect(parseBinding("x =") == null);
+    try testing.expect(parseBinding("{ a = 1; }") == null);
+    try testing.expect(parseBinding("x.y = 1") == null); // attr path: not a plain binding
 }
