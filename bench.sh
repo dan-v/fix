@@ -7,7 +7,7 @@ file=test/nixos_toplevel.nix
 times=()
 for i in $(seq 1 "$runs"); do
   start=$(date +%s.%N)
-  "$bin" --file "$file" --workers="$workers" >/dev/null 2>&1
+  "$bin" eval --file "$file" --workers="$workers" >/dev/null 2>&1
   end=$(date +%s.%N)
   times+=("$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.4f", b-a}')")
 done
