@@ -821,22 +821,24 @@ pub const ChunkRegistry = struct {
     /// is. Optionals/structs are fed field-by-field (never as raw bytes) so
     /// undefined padding can't perturb the hash.
     fn contentHash(chunk: *const Chunk) u64 {
+        // The hash is only a bucket key — collisions fall through to
+        // `contentEql`, which stays FULL. Instead of per-entry
+        // attr_pos/source_map walks (the +512M instr/eval cost measured at
+        // 77befca), mix in a cheap positional fingerprint: lens + first/last
+        // source-map span line. Position-divergent clones collide into one
+        // bucket and the loser registers normally via `contentEql`, so the
+        // dedup rate is unchanged.
         var h = std.hash.Wyhash.init(0);
         h.update(chunk.code);
         h.update(std.mem.sliceAsBytes(chunk.constants));
         h.update(std.mem.sliceAsBytes(chunk.attr_names));
-        for (chunk.attr_pos) |p| {
-            h.update(std.mem.asBytes(&p.name));
-            h.update(std.mem.asBytes(&p.pos.file));
-            h.update(std.mem.asBytes(&p.pos.line));
-            h.update(std.mem.asBytes(&p.pos.column));
-        }
         h.update(std.mem.sliceAsBytes(chunk.function_args));
-        for (chunk.source_map) |e| {
-            h.update(std.mem.asBytes(&e.start));
-            h.update(std.mem.asBytes(&e.end));
-            hashSpan(&h, e.span);
+        var fp: [4]u32 = .{ @intCast(chunk.attr_pos.len), @intCast(chunk.source_map.len), 0, 0 };
+        if (chunk.source_map.len > 0) {
+            fp[2] = chunk.source_map[0].span.line;
+            fp[3] = chunk.source_map[chunk.source_map.len - 1].span.line;
         }
+        h.update(std.mem.sliceAsBytes(&fp));
         if (chunk.body_span) |bs| hashSpan(&h, bs);
         h.update(std.mem.asBytes(&chunk.local_count));
         h.update(std.mem.asBytes(&chunk.arity));
