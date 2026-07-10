@@ -13,6 +13,7 @@ const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const literals = @import("literals.zig");
 const ops = @import("ops.zig");
+const fold = @import("fold.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -225,6 +226,13 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             self.name_hint = null;
             if (unwrapped.data.list.items.len == 0) {
                 try emit.emitOpU16(self, .list_new, 0);
+            } else if (try fold.tryFoldConstant(self, unwrapped)) |v| {
+                // Closed constant list: materialized once at compile time into
+                // the constant pool (a permanent GC root) — no chunk, no thunk,
+                // no per-eval construction. Equality is structural, so sharing
+                // the object is unobservable.
+                try self.builder.emitConstant(self.allocator, v);
+                try emit.emitOp(self, .thunk_shell); // XML-lazy parity, like the built path
             } else {
                 // Build the list shell in place, then wrap in a
                 // pre-resolved "lazy shell" thunk. Forcing it in the
@@ -243,6 +251,13 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             // to build `{}`.)
             if (unwrapped.data.attr_set.entries.len == 0 and !unwrapped.data.attr_set.recursive) {
                 try emit.emitOpU16(self, .attrs_new, 0);
+                return true;
+            }
+            // Closed constant attrset: same treatment as the constant list
+            // below-left — no scope references means no fix-point hazard.
+            if (try fold.tryFoldConstant(self, unwrapped)) |v| {
+                try self.builder.emitConstant(self.allocator, v);
+                try emit.emitOp(self, .thunk_shell); // XML-lazy parity, like the built path
                 return true;
             }
             // Only inline in eager let-binding context (set by

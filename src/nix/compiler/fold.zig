@@ -10,6 +10,9 @@ const ast = @import("syntax").ast;
 const Value = @import("runtime").value.Value;
 const emit = @import("emit.zig");
 const int_ops = @import("runtime").int;
+const heap_mod = @import("runtime").heap;
+const string_syntax = @import("syntax").string_syntax;
+const attrs_mod = @import("attrs.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -80,6 +83,11 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
 /// `{x = 1/0;}.x` is supposed to throw. So we MUST NOT fold any
 /// operation that could trap — division, modulo, anything that could
 /// throw. Folding is purely conservative: when in doubt, don't fold.
+/// Public entry for container-literal folding (access.zig immediate values).
+pub fn tryFoldConstant(self: *Compiler, node: *const Node) anyerror!?Value {
+    return tryFoldNode(self, node);
+}
+
 fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
     const n = unwrapParens(node);
     switch (n.tag) {
@@ -96,6 +104,9 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
         .bool_true => return Value.boolVal(true),
         .bool_false => return Value.boolVal(false),
         .null => return Value.null_val,
+        .string => return tryFoldString(self, n),
+        .attr_set => return tryFoldAttrSet(self, n),
+        .list => return tryFoldList(self, n),
         .binary_op => {
             const bin = n.data.binary;
             return tryFoldBinaryOp(self, bin.op, bin.left, bin.right);
@@ -106,6 +117,76 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
         },
         else => return null,
     }
+}
+
+/// Compile-time value of a non-interpolated string literal, or null.
+fn tryFoldString(self: *Compiler, n: *const Node) anyerror!?Value {
+    const atom = n.data.atom;
+    const parsed = try string_syntax.parseLiteral(self.allocator, self.source, .{
+        .start = atom.offset,
+        .end = atom.offset + atom.len,
+    });
+    defer parsed.deinit();
+    var total: usize = 0;
+    for (parsed.parts) |part| switch (part) {
+        .text => |t| total += t.bytes.len,
+        .interpolation => return null,
+    };
+    // Common case: one text part interns directly; multi-part (escapes split
+    // the literal) assembles into a scratch buffer first.
+    if (parsed.parts.len == 1) {
+        return Value.string(try self.intern.intern(parsed.parts[0].text.bytes));
+    }
+    const buf = try self.allocator.alloc(u8, total);
+    defer self.allocator.free(buf);
+    var off: usize = 0;
+    for (parsed.parts) |part| {
+        const t = part.text.bytes;
+        @memcpy(buf[off .. off + t.len], t);
+        off += t.len;
+    }
+    return Value.string(try self.intern.intern(buf));
+}
+
+/// Fold a CLOSED constant list — every item itself foldable — into a
+/// materialized heap Value. Safe to share: list equality is structural, and
+/// the value becomes a chunk constant (a permanent GC root).
+fn tryFoldList(self: *Compiler, n: *const Node) anyerror!?Value {
+    const items = n.data.list.items;
+    const vals = try self.allocator.alloc(Value, items.len);
+    defer self.allocator.free(vals);
+    for (items, vals) |item, *v| {
+        v.* = (try tryFoldNode(self, item)) orelse return null;
+    }
+    return Value.list(try self.heap.addList(vals));
+}
+
+/// Fold a CLOSED constant attrset literal — non-recursive, static single-
+/// segment names, every value itself foldable — into a materialized heap
+/// Value, positions included (so `unsafeGetAttrPos` parity holds). Duplicate
+/// names bail to the normal path, which owns the diagnostics.
+fn tryFoldAttrSet(self: *Compiler, n: *const Node) anyerror!?Value {
+    const aset = n.data.attr_set;
+    if (aset.recursive) return null;
+    var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer entries.deinit(self.allocator);
+    var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+    defer positions.deinit(self.allocator);
+    for (aset.entries) |entry| {
+        if (entry.dynamic_name != null) return null;
+        if (entry.path.len != 1) return null; // nested paths carry grouping semantics
+        if (entry.inherit_outer) return null;
+        if (attrs_mod.attrSegmentHasInterpolation(self, entry.path[0])) return null;
+        const name_id = try attrs_mod.attrSegmentNameId(self, entry.path[0]);
+        const v = (try tryFoldNode(self, entry.expr)) orelse return null;
+        try entries.append(self.allocator, .{ .name = name_id, .value = v });
+        try attrs_mod.appendAttrPosition(self, &positions, entry.path[0], name_id);
+    }
+    const id = self.heap.addAttrsWithPositions(entries.items, positions.items) catch |err| switch (err) {
+        error.DuplicateAttribute => return null,
+        else => return err,
+    };
+    return Value.attrs(id);
 }
 
 fn tryFoldBinaryOp(self: *Compiler, op: BinaryOp, left_node: *const Node, right_node: *const Node) anyerror!?Value {
@@ -122,8 +203,8 @@ fn tryFoldBinaryOp(self: *Compiler, op: BinaryOp, left_node: *const Node, right_
         .sub => foldArith(self, left, right, .sub),
         .mul => foldArith(self, left, right, .mul),
         // .div / .modulo intentionally omitted (could trap on /0).
-        .eq => Value.boolVal(literalsEqual(left, right)),
-        .neq => Value.boolVal(!literalsEqual(left, right)),
+        .eq => if (foldEq(self, left, right)) |b| Value.boolVal(b) else null,
+        .neq => if (foldEq(self, left, right)) |b| Value.boolVal(!b) else null,
         .lt => foldCompare(left, right, .lt),
         .lte => foldCompare(left, right, .lte),
         .gt => foldCompare(left, right, .gt),
@@ -225,23 +306,25 @@ fn foldCompare(a: Value, b: Value, op: CmpOp) ?Value {
     return null;
 }
 
-fn literalsEqual(a: Value, b: Value) bool {
-    const a_kind = a.kind();
-    const b_kind = b.kind();
-    // Nix: different types of value compare unequal (no implicit
-    // conversion between int and bool, etc.).
-    if (a_kind == .null and b_kind == .null) return true;
+/// Compile-time `==` over folded values. Returns null (do not fold) for any
+/// kind the comparison cannot decide by value here: heap aggregates compare
+/// structurally at runtime (two folded lists are distinct objects), and
+/// unknown kinds stay conservative. Strings decide by intern id (interning is
+/// canonical); boxed ints resolve through the heap.
+fn foldEq(self: *Compiler, a: Value, b: Value) ?bool {
+    // Numeric (incl. boxed): resolve then compare; int/float mix promotes.
+    const ai = toInt(self, a);
+    const bi = toInt(self, b);
+    if (ai != null and bi != null) return ai.? == bi.?;
+    const a_num: ?f64 = if (ai) |i| @floatFromInt(i) else if (a.kind() == .float) a.asFloat() else null;
+    const b_num: ?f64 = if (bi) |i| @floatFromInt(i) else if (b.kind() == .float) b.asFloat() else null;
+    if (a_num != null and b_num != null) return a_num.? == b_num.?;
+    if (a_num != null or b_num != null) return if (a.kind() == .null or b.kind() == .null or a.isBool() or b.isBool() or a.kind() == .string or b.kind() == .string) false else null;
+    if (a.kind() == .null or b.kind() == .null) return a.kind() == b.kind();
     if (a.isBool() and b.isBool()) return a.asBool() == b.asBool();
-    const a_is_int = a_kind == .int;
-    const b_is_int = b_kind == .int;
-    if (a_is_int and b_is_int) return a.asInt() == b.asInt();
-    if ((a_is_int or a_kind == .float) and (b_is_int or b_kind == .float)) {
-        const af: f64 = if (a_kind == .float) a.asFloat() else @floatFromInt(a.asInt());
-        const bf: f64 = if (b_kind == .float) b.asFloat() else @floatFromInt(b.asInt());
-        return af == bf;
-    }
-    // Cross-type compare → false (matches Nix runtime semantics).
-    return false;
+    if (a.kind() == .string and b.kind() == .string) return a.asInternId() == b.asInternId();
+    if (a.isBool() != b.isBool()) return false;
+    return null; // aggregates / paths / anything else: fold nothing
 }
 
 fn toInt(self: *Compiler, v: Value) ?i64 {
