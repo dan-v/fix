@@ -42,16 +42,13 @@ pub const Options = struct {
     recurse: bool = false,
     /// Colorize headers, mnemonics, operands, and the per-byte hex column.
     use_color: bool = false,
-    /// Break each instruction into per-operand lines, each with its own bytes
-    /// and an interpreting comment (chunk id, count, per-capture, per-position).
-    fielded: bool = false,
     /// Recursion cap when `recurse` is true; 0 = unlimited (a visited set still
     /// guarantees termination). The trace pretty-printer bounds this.
     max_depth: u8 = 4,
 };
 
-/// Raw bytes shown per row; instructions longer than this wrap onto indented
-/// continuation rows so the mnemonic column stays aligned.
+/// Width (in bytes) the hex column pads to, so mnemonics/comments align across
+/// the header row and the per-operand field lines.
 const bytes_per_row = 6;
 /// Left-justified width of the mnemonic column.
 const mnemonic_width = 28;
@@ -147,36 +144,15 @@ fn writeChunkAt(
             }
         }
 
+        // The header row carries the opcode byte + mnemonic; every operand
+        // field then gets its own indented, color-linked line below.
         try writeOffset(writer, start, options.use_color);
         try writer.writeAll("  ");
-        if (options.fielded) {
-            // Header carries just the opcode byte + mnemonic; each operand field
-            // gets its own line below.
-            if (options.show_bytes) try writeByteField(writer, insn[0..1], options.use_color);
-            try writeMnemonic(writer, op, options.use_color);
-            if (span) |s| try writePosColumn(writer, s, options.use_color);
-            try writeOperandFields(writer, chunk, op, start + 1, ip, operand_text, symbols, options.show_bytes, options.use_color);
-            try writer.writeByte('\n');
-            continue;
-        }
-        if (options.show_bytes) {
-            const head = insn[0..@min(insn.len, bytes_per_row)];
-            try writeByteField(writer, head, options.use_color);
-        }
+        if (options.show_bytes) try writeByteField(writer, insn[0..1], options.use_color);
         try writeMnemonic(writer, op, options.use_color);
-        try writer.writeAll(operand_text);
         if (span) |s| try writePosColumn(writer, s, options.use_color);
+        try writeOperandFields(writer, chunk, op, start + 1, ip, operand_text, symbols, options.show_bytes, options.use_color);
         try writer.writeByte('\n');
-
-        // Wrap the remaining bytes of a long instruction onto continuation rows.
-        if (options.show_bytes and insn.len > bytes_per_row) {
-            var off: usize = bytes_per_row;
-            while (off < insn.len) : (off += bytes_per_row) {
-                try writer.writeAll("        "); // 4-wide offset gap + 2 + 2
-                try writeByteField(writer, insn[off..@min(off + bytes_per_row, insn.len)], options.use_color);
-                try writer.writeByte('\n');
-            }
-        }
     }
 
     if (options.recurse) {
@@ -486,13 +462,13 @@ fn writeOperandFields(
                 const cl = readU32(code, off + 12);
                 var l = Line{};
                 l.glue("[{d}] ", .{k});
-                if (symbols.internName(nm)) |s| l.group(0, 4, "\"{s}\"", .{s}) else l.group(0, 4, "#{d}", .{nm});
+                if (symbols.internName(nm)) |s| l.group(0, 4, "\"{s}\"", .{s}) else l.group(0, 4, "#0x{x}", .{nm});
                 l.glue(" @ ", .{});
                 l.group(8, 4, "{d}", .{ln});
                 l.glue(":", .{});
                 l.group(12, 4, "{d}", .{cl});
                 l.glue(" ", .{});
-                if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file#{d}", .{fl});
+                if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file#0x{x}", .{fl});
                 try emitLine(writer, code, &off, &l, show_bytes, use_color);
             }
         },
@@ -898,7 +874,7 @@ fn writeAttrPath(
         if (symbols.internName(id)) |name| {
             try writer.writeAll(name);
         } else {
-            try writer.print("#{d}", .{id});
+            try writer.print("#0x{x}", .{id});
         }
     }
     try writer.writeByte('"');
@@ -908,9 +884,9 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
     if (symbols.internName(id)) |name| {
         try writer.writeByte('"');
         try writer.writeAll(name);
-        try writer.print("\" (#{d})", .{id});
+        try writer.print("\" (#0x{x})", .{id});
     } else {
-        try writer.print("#{d}", .{id});
+        try writer.print("#0x{x}", .{id});
     }
 }
 
@@ -950,7 +926,7 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_c
     if (symbols.internName(file)) |name| {
         try writer.writeAll(name);
     } else {
-        try writer.print("file#{d}", .{file});
+        try writer.print("file#0x{x}", .{file});
     }
     if (use_color) try writer.writeAll("\x1b[0m");
     try writer.writeByte('\n');
@@ -989,9 +965,9 @@ fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbol
     if (symbols.internName(id)) |text| {
         try writer.print("{s} \"", .{kind});
         try writeEscapedSnippet(writer, text, 40);
-        try writer.print("\" (#{d})", .{id});
+        try writer.print("\" (#0x{x})", .{id});
     } else {
-        try writer.print("{s} #{d}", .{ kind, id });
+        try writer.print("{s} #0x{x}", .{ kind, id });
     }
 }
 

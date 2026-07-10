@@ -152,9 +152,6 @@ pub const Options = struct {
     disasm_no_constants: bool = false,
     /// `fix disasm --no-bytes`: omit the raw-bytecode hex column.
     disasm_no_bytes: bool = false,
-    /// `fix disasm --fields`: put each operand field on its own line with its
-    /// bytes and an interpreting comment.
-    disasm_fields: bool = false,
     /// `fix disasm --no-pager`: never pipe output to `$PAGER`.
     disasm_no_pager: bool = false,
     /// `fix disasm --eval`: evaluate first, then disassemble every chunk that
@@ -276,7 +273,6 @@ const Opt = enum {
     no_source,
     no_constants,
     no_bytes,
-    fields,
     no_pager,
     disasm_eval,
     // Internal perf/trace knobs (hidden from help, still parsed everywhere).
@@ -399,7 +395,6 @@ const specs = [_]Spec{
     .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk #N (default: all reachable)", .show_in = &.{.disasm} },
     .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
     .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
-    .{ .id = .fields, .long = "--fields", .help = "break each instruction into per-operand lines,\nwith bytes and an interpreting comment", .show_in = &.{.disasm} },
     .{ .id = .no_pager, .long = "--no-pager", .help = "do not pipe output to $PAGER", .show_in = &.{.disasm} },
     .{ .id = .no_source, .long = "--no-source", .help = "omit source-span annotations", .show_in = &.{.disasm} },
     .{ .id = .no_constants, .long = "--no-constants", .help = "omit the constant pool listing", .show_in = &.{.disasm} },
@@ -588,7 +583,6 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .no_source => options.disasm_no_source = true,
         .no_constants => options.disasm_no_constants = true,
         .no_bytes => options.disasm_no_bytes = true,
-        .fields => options.disasm_fields = true,
         .no_pager => options.disasm_no_pager = true,
         .disasm_eval => options.disasm_eval = true,
 
