@@ -94,10 +94,16 @@ fn writeChunkAt(
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
     defer referenced_chunks.deinit(std.heap.page_allocator);
 
-    // Source filenames are hoisted onto their own comment line whenever the file
-    // changes (so at least one per chunk), and instruction lines then carry only
-    // the `line:col+len` position within that file — no repeated filename.
+    // Source filenames are hoisted onto their own comment line: one at the top
+    // of the chunk (before any bytes) and again only if the file changes
+    // mid-chunk. Instruction lines then carry just the `line:col+len` position.
     var last_file: ?InternId = null;
+    if (options.show_source) {
+        if (chunkPrimaryFile(chunk)) |f| {
+            try writeFileLine(writer, f, symbols, options.use_color);
+            last_file = f;
+        }
+    }
 
     while (ip < chunk.code.len) {
         const start = ip;
@@ -266,7 +272,9 @@ fn writeMnemonic(writer: *std.Io.Writer, op: OpCode, use_color: bool) !void {
     } else {
         try writer.writeAll(name);
     }
-    if (name.len < mnemonic_width) try writer.splatByteAll(' ', mnemonic_width - name.len);
+    // Pad to the column, but always leave at least one space so an
+    // over-wide mnemonic doesn't abut its operands.
+    if (name.len < mnemonic_width) try writer.splatByteAll(' ', mnemonic_width - name.len) else try writer.writeByte(' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +316,14 @@ fn emitFieldRaw(writer: *std.Io.Writer, code: []const u8, off: *usize, len: usiz
     off.* += len;
 }
 
+/// Emit a chunk-id operand field, commented `chunk #{id} [name]`.
+fn emitChunkField(writer: *std.Io.Writer, code: []const u8, off: *usize, len: usize, show_bytes: bool, use_color: bool, id: ChunkId, symbols: Symbols) !void {
+    try fieldPrefix(writer, code, off.*, len, show_bytes, use_color);
+    try writeChunkRef(writer, id, symbols);
+    try fieldSuffix(writer, use_color);
+    off.* += len;
+}
+
 /// Emit the `n` inline capture descriptors (3 bytes each: kind + u16 index).
 fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize, n: u16, show_bytes: bool, use_color: bool) !void {
     var k: usize = 0;
@@ -341,13 +357,13 @@ fn writeOperandFields(
         .closure, .closure_long => {
             const wide = op == .closure_long;
             const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, "chunk #{d}", .{id});
+            try emitChunkField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, id, symbols);
             try emitField(writer, code, &off, 2, show_bytes, use_color, "{d} upvalues (from stack)", .{readU16(code, off)});
         },
         .thunk_captures, .thunk_captures_eager, .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
             const wide = op == .thunk_captures_long or op == .thunk_captures_eager_long or op == .apply_arg;
             const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, "chunk #{d}", .{id});
+            try emitChunkField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, id, symbols);
             const n = readU16(code, off);
             try emitField(writer, code, &off, 2, show_bytes, use_color, "{d} captures", .{n});
             try emitCaptureDescriptors(writer, code, &off, n, show_bytes, use_color);
@@ -355,14 +371,14 @@ fn writeOperandFields(
         .closure_captures, .closure_captures_long => {
             const wide = op == .closure_captures_long;
             const id: ChunkId = if (wide) readU32(code, off) else @intCast(readU16(code, off));
-            try emitField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, "chunk #{d}", .{id});
+            try emitChunkField(writer, code, &off, if (wide) 4 else 2, show_bytes, use_color, id, symbols);
             const n = readU16(code, off);
             try emitField(writer, code, &off, 2, show_bytes, use_color, "{d} captures", .{n});
             try emitCaptureDescriptors(writer, code, &off, n, show_bytes, use_color);
         },
         .thunk_captures_store_local, .thunk_captures_store_cell_local, .thunk_captures_eager_store_local, .thunk_captures_eager_store_cell_local => {
             const id: ChunkId = @intCast(readU16(code, off));
-            try emitField(writer, code, &off, 2, show_bytes, use_color, "chunk #{d}", .{id});
+            try emitChunkField(writer, code, &off, 2, show_bytes, use_color, id, symbols);
             const n = readU16(code, off);
             try emitField(writer, code, &off, 2, show_bytes, use_color, "{d} captures", .{n});
             try emitCaptureDescriptors(writer, code, &off, n, show_bytes, use_color);
@@ -378,12 +394,14 @@ fn writeOperandFields(
                 const fl: InternId = readU32(code, off + 4);
                 const ln = readU32(code, off + 8);
                 const cl = readU32(code, off + 12);
+                // One 16-byte record per attr: name id, file id, line, column
+                // (all u32 LE). Show name and line:col first — the file is often
+                // the (long) hoisted chunk path, so keep it last and short.
                 try fieldPrefix(writer, code, off, 16, show_bytes, use_color);
                 try writer.print("[{d}] ", .{k});
                 if (symbols.internName(nm)) |s| try writer.print("\"{s}\"", .{s}) else try writer.print("#{d}", .{nm});
-                try writer.writeAll(" @ ");
-                if (symbols.internName(fl)) |s| try writer.print("{s}:", .{s}) else try writer.print("file#{d}:", .{fl});
-                try writer.print("{d}:{d}", .{ ln, cl });
+                try writer.print(" @ {d}:{d}", .{ ln, cl });
+                if (symbols.internName(fl)) |s| try writer.print(" {s}", .{std.fs.path.basename(s)}) else try writer.print(" file#{d}", .{fl});
                 try fieldSuffix(writer, use_color);
                 off += 16;
             }
@@ -458,6 +476,20 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
         }
         try writer.writeByte('\n');
     }
+}
+
+/// The best-effort name attributed to chunk `id`, resolved to text.
+fn chunkNameOf(symbols: Symbols, id: ChunkId) ?[]const u8 {
+    const reg = symbols.registry orelse return null;
+    const name_id = reg.nameOf(id) orelse return null;
+    return symbols.internName(name_id);
+}
+
+/// `chunk #{id}` followed by its best-effort name when known, so a reference
+/// reads `chunk #98 fetchGit` rather than a bare id.
+fn writeChunkRef(writer: *std.Io.Writer, id: ChunkId, symbols: Symbols) !void {
+    try writer.print("chunk #{d}", .{id});
+    if (chunkNameOf(symbols, id)) |name| try writer.print(" {s}", .{name});
 }
 
 fn writeOperands(
@@ -570,7 +602,8 @@ fn writeOperands(
             ip += 2;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} upvalues", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
         .thunk_captures, .thunk_captures_eager => {
@@ -578,7 +611,8 @@ fn writeOperands(
             ip += 2;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} captures", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
@@ -591,7 +625,8 @@ fn writeOperands(
             ip += desc_len;
             const slot = code[ip];
             ip += 1;
-            try writer.print("chunk #{d}, {d} captures → local[{d}]", .{ id, upvalues, slot });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
         .closure_long => {
@@ -599,7 +634,8 @@ fn writeOperands(
             ip += 4;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} upvalues", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} upvalues", .{upvalues});
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
         .thunk_captures_long, .thunk_captures_eager_long, .apply_arg => {
@@ -607,7 +643,8 @@ fn writeOperands(
             ip += 4;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} captures", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
@@ -616,7 +653,8 @@ fn writeOperands(
             ip += 2;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} captures", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
@@ -625,7 +663,8 @@ fn writeOperands(
             ip += 4;
             const upvalues = readU16(code, ip);
             ip += 2;
-            try writer.print("chunk #{d}, {d} captures", .{ id, upvalues });
+            try writeChunkRef(writer, id, symbols);
+            try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
@@ -772,6 +811,15 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
     } else {
         try writer.print("#{d}", .{id});
     }
+}
+
+/// The chunk's file, from the first source-map entry that carries one. Used to
+/// print a filename header before the chunk's bytes.
+fn chunkPrimaryFile(chunk: *const Chunk) ?InternId {
+    for (chunk.source_map) |entry| {
+        if (entry.span.file) |f| return f;
+    }
+    return null;
 }
 
 /// The narrowest source span covering `ip`, or null if none. Narrowest wins so

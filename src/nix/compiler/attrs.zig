@@ -541,7 +541,10 @@ fn compilePlainAttrGroup(
 ) anyerror!void {
     const leaf = group.leaf;
     if (leaf == null) {
+        // Tail-only group (`a.b = …`): the value is the `{ b = … }` thunk,
+        // which the binding name `a` describes.
         try emitAttrNameId(self, group.name_id);
+        if (self.registry.capture_names) self.name_hint = group.name_id;
         try compileAttrEntriesThunk(self, group.tails, false);
         try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
@@ -561,6 +564,7 @@ fn compilePlainAttrGroup(
             return error.DuplicateAttribute;
         }
         try emitAttrNameId(self, group.name_id);
+        if (self.registry.capture_names) self.name_hint = group.name_id;
         try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
         try appendAttrPosition(self, positions, group.first, group.name_id);
         return;
