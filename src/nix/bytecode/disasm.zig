@@ -62,7 +62,7 @@ pub const RefGraph = struct {
     inc: []std.ArrayListUnmanaged(ChunkId),
 
     pub fn build(registry: *const ChunkRegistry, symbols: Symbols) !RefGraph {
-        const a = std.heap.page_allocator;
+        const a = std.heap.smp_allocator;
         const n = registry.count();
         const out = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
         const inc = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
@@ -70,11 +70,14 @@ pub const RefGraph = struct {
         for (inc) |*l| l.* = .empty;
         var scratch: std.Io.Writer.Allocating = .init(a);
         defer scratch.deinit();
+        // One refs set reused across all chunks (cleared, capacity retained):
+        // a fresh map per chunk is an alloc+free pair per chunk, pure overhead.
+        var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
+        defer refs.deinit(a);
         var id: ChunkId = 0;
         while (id < n) : (id += 1) {
             const chunk = registry.get(id) orelse continue;
-            var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-            defer refs.deinit(a);
+            refs.clearRetainingCapacity();
             collectRefs(chunk, symbols, &refs, &scratch) catch continue;
             var it = refs.iterator();
             while (it.next()) |e| {
@@ -89,7 +92,7 @@ pub const RefGraph = struct {
     }
 
     pub fn deinit(self: *RefGraph) void {
-        const a = std.heap.page_allocator;
+        const a = std.heap.smp_allocator;
         for (self.out) |*l| l.deinit(a);
         for (self.inc) |*l| l.deinit(a);
         a.free(self.out);
@@ -146,7 +149,7 @@ pub fn writeChunk(
     options: Options,
 ) !void {
     var visited: Visited = .empty;
-    defer visited.deinit(std.heap.page_allocator);
+    defer visited.deinit(std.heap.smp_allocator);
     try writeChunkAt(writer, chunk_id, chunk, symbols, options, 0, &visited);
 }
 
@@ -163,7 +166,10 @@ fn writeChunkAt(
     depth: usize,
     visited: *Visited,
 ) anyerror!void {
-    if (chunk_id) |id| try visited.put(std.heap.page_allocator, id, {});
+    // The visited set only matters when recursing (`dumpAll`'s registry walk
+    // passes recurse=false and visits each chunk exactly once) — skip the
+    // per-call hashmap allocation entirely otherwise.
+    if (options.recurse) if (chunk_id) |id| try visited.put(std.heap.smp_allocator, id, {});
     // Each chunk is a top-level group: a colored header and a left-margin guide
     // (in the chunk's own color) down every line of its body.
     const cc: [3]u8 = if (chunk_id) |id| hueColor(id) else .{ 0x9a, 0x9a, 0x9a };
@@ -259,14 +265,14 @@ fn writeChunkAt(
 
     var ip: usize = 0;
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer referenced_chunks.deinit(std.heap.page_allocator);
+    defer referenced_chunks.deinit(std.heap.smp_allocator);
 
     // Scratch for each instruction's compact operand decode. Growable (reset,
     // capacity retained, per instruction) rather than a fixed buffer: a decode
     // is normally a few dozen bytes, but a pathological attribute name or path
     // (`x."<multi-KB string>"`) is unbounded, and overflowing a fixed buffer
     // would abort the whole disassembly with a write error.
-    var op_scratch: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    var op_scratch: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
     defer op_scratch.deinit();
 
     const env = Env{
@@ -344,7 +350,8 @@ fn writeChunkAt(
         try writeOffset(writer, start, bg, options.use_color);
         try writer.writeAll("  ");
         var seq: usize = @intFromEnum(op) + 1;
-        var head = Line{};
+        var head: Line = undefined;
+        head.reset();
         const head_len = buildHead(&head, op, chunk, start, symbols, up_names, operand_text, ip, &seq);
         try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
         if (isMultiline(op)) {
@@ -616,6 +623,16 @@ const Line = struct {
     /// tokens before it out to `field_comment_col` so comment semicolons align.
     comment_tok: ?usize = null,
 
+    /// Reset without touching `toks`/`buf`: the `Line{}` literal lowers to a
+    /// ~2KB memset of the undefined arrays, which at one Line per rendered row
+    /// (millions per `--eval` dump) dominates the render loop. Declare the Line
+    /// `undefined` and reset the three live scalars instead.
+    inline fn reset(self: *Line) void {
+        self.n = 0;
+        self.used = 0;
+        self.comment_tok = null;
+    }
+
     fn store(self: *Line, comptime fmt: []const u8, args: anytype) []const u8 {
         const s = std.fmt.bufPrint(self.buf[self.used..], fmt, args) catch self.buf[self.used..self.used];
         self.used += s.len;
@@ -678,11 +695,13 @@ const Line = struct {
         return m;
     }
     /// Assign each group the next hue from the running counter, so adjacent
-    /// groups differ sharply regardless of their byte values.
-    fn paint(self: *Line, seq: *usize) void {
+    /// groups differ sharply regardless of their byte values. The HSV math is
+    /// skipped when not coloring (nothing reads the colors then), but `seq`
+    /// still advances so hue assignment is identical either way.
+    fn paint(self: *Line, seq: *usize, use_color: bool) void {
         for (self.toks[0..self.n]) |*t| {
             if (t.colored and t.len > 0 and !t.pin) {
-                t.color = hueColor(seq.*);
+                if (use_color) t.color = hueColor(seq.*);
                 seq.* += 1;
             }
         }
@@ -736,7 +755,7 @@ fn writeTreeGuide(writer: *std.Io.Writer, rgb: [3]u8, kind: GuideKind, bg: ?[3]u
 fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, seq: *usize, guides: []const [3]u8, last_mask: u8, bg: ?[3]u8, env: Env) !void {
     const base = off.*;
     const total = line.total();
-    line.paint(seq);
+    line.paint(seq, env.use_color);
     const depth: u16 = @intCast(guides.len);
     // Field-row comment column, relative to the token area: absolute alignment
     // with the mnemonic-line comments, minus this row's guide indentation.
@@ -1099,7 +1118,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
 /// colored to match) then the mnemonic and the inline head operand. `head` is
 /// from `buildHead`; `head_len` its operand byte count.
 fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: OpCode, head: *Line, head_len: u16, seq: *usize, bg: ?[3]u8, env: Env) !void {
-    head.paint(seq);
+    head.paint(seq, env.use_color);
     if (env.show_bytes) {
         var c: u16 = 0;
         while (c < bytes_per_line) : (c += 1) {
@@ -1156,7 +1175,8 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
 /// A `#{count} ; {label}` line (count is a u16 at `off`). Fits one row — never
 /// wraps — so its guides never blank on a continuation.
 fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, last_mask: u8, stripe: *usize, env: Env) !void {
-    var l = Line{};
+    var l: Line = undefined;
+    l.reset();
     l.group(0, 2, "#{d}", .{readU16(code, off.*)});
     l.comment();
     l.glue("{s}", .{label});
@@ -1174,7 +1194,8 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
     while (k < n) : (k += 1) {
         const is_upvalue = code[off.*] != 0;
         const idx = readU16(code, off.* + 1);
-        var l = Line{};
+        var l: Line = undefined;
+        l.reset();
         l.group(0, 1, "{s}", .{if (is_upvalue) "upvalue" else "local"});
         l.glue("[", .{});
         // An upvalue index reads the enclosing chunk's slot — give it that
@@ -1251,7 +1272,8 @@ fn writeOperandTail(
             // store-target interpretation (same color) as its comment.
             const c_slot = hueColor(seq.*);
             seq.* += 1;
-            var l = Line{};
+            var l: Line = undefined;
+            l.reset();
             l.groupPinned(0, 1, c_slot, "#{d}", .{code[off]});
             l.comment();
             l.glue("→ local[", .{});
@@ -1268,7 +1290,8 @@ fn writeOperandTail(
             {
                 const c = hueColor(seq.*);
                 seq.* += 1;
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.groupPinned(0, 4, c, "#{d}", .{names_start});
                 l.comment();
                 l.glue("names[", .{});
@@ -1282,7 +1305,8 @@ fn writeOperandTail(
                 const pos_start = readU32(code, off + 2);
                 const c = hueColor(seq.*);
                 seq.* += 1;
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.group(0, 2, "#{d}", .{pos_count});
                 l.glue(" ", .{});
                 l.groupPinned(2, 4, c, "#{d}", .{pos_start});
@@ -1302,7 +1326,8 @@ fn writeOperandTail(
                 var esc: [128]u8 = undefined;
                 var ew: std.Io.Writer = .fixed(&esc);
                 if (symbols.internName(nm)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.storeRef("str", c_nm, "0x{x}", .{nm});
                 l.glue(" → ", .{});
                 l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
@@ -1333,7 +1358,8 @@ fn writeOperandTail(
             {
                 const c = hueColor(seq.*);
                 seq.* += 1;
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.groupPinned(0, 4, c, "#{d}", .{pos_start});
                 l.comment();
                 l.glue("records[", .{});
@@ -1351,7 +1377,8 @@ fn writeOperandTail(
                 var esc: [128]u8 = undefined;
                 var ew: std.Io.Writer = .fixed(&esc);
                 if (symbols.internName(rec.name)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.storeRef("str", c_nm, "0x{x}", .{rec.name});
                 l.glue(" → ", .{});
                 l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
@@ -1386,7 +1413,8 @@ fn writeOperandTail(
                 var esc: [128]u8 = undefined;
                 var ew: std.Io.Writer = .fixed(&esc);
                 if (symbols.internName(id)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.groupPinned(0, id_len, c, "0x{x}", .{id});
                 l.comment();
                 l.storeRef("str", c, "0x{x}", .{id});
@@ -1400,7 +1428,8 @@ fn writeOperandTail(
         else => {
             // No bespoke breakdown: dump the whole tail as one group.
             if (end_ip > off) {
-                var l = Line{};
+                var l: Line = undefined;
+                l.reset();
                 l.group(0, @intCast(end_ip - off), "{s}", .{operand_text});
                 try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
             }
@@ -1408,7 +1437,8 @@ fn writeOperandTail(
     }
     // Guard: dump any bytes a bespoke arm under-counted as a trailing field.
     if (off < end_ip) {
-        var l = Line{};
+        var l: Line = undefined;
+        l.reset();
         l.group(0, @intCast(end_ip - off), "{s}", .{"…"});
         try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
     }
@@ -1697,7 +1727,7 @@ fn writeOperands(
             ip += 2;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} upvalues", .{upvalues});
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .thunk, .thunk_eag => {
             const id: ChunkId = @intCast(readU16(code, ip));
@@ -1707,7 +1737,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
             const wide = chunkIdWide(op);
@@ -1721,7 +1751,7 @@ fn writeOperands(
             ip += 1;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .closure_w => {
             const id: ChunkId = readU32(code, ip);
@@ -1730,7 +1760,7 @@ fn writeOperands(
             ip += 2;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} upvalues", .{upvalues});
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .thunk_w, .thunk_eag_w, .thunk_arg => {
             const id: ChunkId = readU32(code, ip);
@@ -1740,7 +1770,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .closure_cap => {
             const id: ChunkId = @intCast(readU16(code, ip));
@@ -1750,7 +1780,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .closure_cap_w => {
             const id: ChunkId = readU32(code, ip);
@@ -1760,7 +1790,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
-            try referenced_chunks.put(std.heap.page_allocator, id, {});
+            try referenced_chunks.put(std.heap.smp_allocator, id, {});
         },
         .thunk_defer => {
             // Operand: 4-byte deferred-table id, 2-byte env count, then
@@ -2120,7 +2150,7 @@ fn isThunkFamilyOp(op: OpCode) bool {
 /// and deflate compressibility of the concatenated code — the measurement
 /// harness for codegen-size work.
 pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbols: Symbols) !void {
-    const a = std.heap.page_allocator;
+    const a = std.heap.smp_allocator;
     const n = registry.count();
 
     var total = StatRow{};
@@ -2194,7 +2224,7 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
         var has_agg = false;
         var has_thunk = false;
         var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-        defer refs.deinit(std.heap.page_allocator);
+        defer refs.deinit(std.heap.smp_allocator);
         var ip: usize = 0;
         while (ip < code.len) {
             const op_byte = code[ip];
