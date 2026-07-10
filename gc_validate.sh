@@ -9,7 +9,7 @@ golden=42da4061f3a0bc74975d023290df880ccb96d528fadfabb98fa2ee865baefe15
 
 out=$(mktemp); err=$(mktemp)
 start=$(date +%s.%N)
-"$bin" --file "$file" --workers="$workers" >"$out" 2>"$err"
+"$bin" eval --file "$file" --workers="$workers" >"$out" 2>"$err"
 code=$?
 end=$(date +%s.%N)
 got=$(sha256sum "$out" | cut -d' ' -f1)

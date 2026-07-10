@@ -9,13 +9,13 @@ file=test/nixos_toplevel.nix
 for i in $(seq 1 "$rounds"); do
   for b in "$@"; do
     if [ "$b" = "nongc" ]; then
-      out=$($TIME -f "%e %M" ./zig-out-nongc/bin/fix --file "$file" --workers="$w" 2>&1 >/dev/null | tail -1)
+      out=$($TIME -f "%e %M" ./zig-out-nongc/bin/fix eval --file "$file" --workers="$w" 2>&1 >/dev/null | tail -1)
       echo "$b $out 0"
     else
       flag=()
       [ "$b" != "default" ] && flag=(--max-memory="$b")
       err=$(mktemp)
-      out=$($TIME -f "%e %M" ./zig-out/bin/fix --file "$file" --workers="$w" "${flag[@]}" 2>"$err" >/dev/null; tail -1 "$err")
+      out=$($TIME -f "%e %M" ./zig-out/bin/fix eval --file "$file" --workers="$w" "${flag[@]}" 2>"$err" >/dev/null; tail -1 "$err")
       cols=$(grep -oP 'collections: \K\d+' "$err" || echo "?")
       echo "$b $out $cols"
       rm -f "$err"

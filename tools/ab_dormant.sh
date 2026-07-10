@@ -15,7 +15,7 @@ run() { # name env... -- bin
   shift
   local bin="$1"
   local out
-  out=$(env "${envs[@]}" $TIME -f "%e %M" "$bin" --file "$file" --workers="$w" 2>&1 >/dev/null | tail -1)
+  out=$(env "${envs[@]}" $TIME -f "%e %M" "$bin" eval --file "$file" --workers="$w" 2>&1 >/dev/null | tail -1)
   echo "$name $out"
 }
 
