@@ -994,13 +994,11 @@ fn writeOperandTail(
                 l1.groupPinned(4, 4, c_fl, "", .{}); // file id bytes; value shown on row 2
                 l1.comment();
                 l1.storeRef("str", c_nm, "0x{x}", .{nm});
-                l1.glue(" → \"{s}\"", .{esc[0..ew.end]});
-                // Row 2 — file, line, col; comment is the resolved location.
-                var loc: [256]u8 = undefined;
-                var lw: std.Io.Writer = .fixed(&loc);
-                lw.writeAll("@ ") catch {};
-                if (symbols.internName(fl)) |f| lw.writeAll(std.fs.path.basename(f)) catch {} else lw.print("file[0x{x}]", .{fl}) catch {};
-                lw.print(":{d}:{d}", .{ ln, cl }) catch {};
+                l1.glue(" → ", .{});
+                // The resolved text is the name id's value — same identity color.
+                l1.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
+                // Row 2 — file, line, col; the location comment's parts reuse
+                // their raw values' colors (filename ← file id, line, col).
                 var l2 = Line{};
                 l2.tint(c_fl, "0x{x}", .{fl}); // value for row 1's second half
                 l2.glue(" ", .{});
@@ -1008,7 +1006,16 @@ fn writeOperandTail(
                 l2.glue(" ", .{});
                 l2.groupPinned(4, 4, c_cl, "0x{x}", .{cl});
                 l2.comment();
-                l2.glue("{s}", .{loc[0..lw.end]});
+                l2.glue("@ ", .{});
+                if (symbols.internName(fl)) |f| {
+                    l2.tint(c_fl, "{s}", .{std.fs.path.basename(f)});
+                } else {
+                    l2.storeRef("file", c_fl, "0x{x}", .{fl});
+                }
+                l2.glue(":", .{});
+                l2.tint(c_ln, "{d}", .{ln});
+                l2.glue(":", .{});
+                l2.tint(c_cl, "{d}", .{cl});
                 // The whole 2-row record is ONE stripe unit, so the zebra
                 // alternates per entry, not per line.
                 const bg = takeBg(stripe, env.use_color);
