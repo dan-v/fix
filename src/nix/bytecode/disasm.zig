@@ -169,8 +169,11 @@ fn writeChunkAt(
         try writeGuide(writer, cc, options.use_color);
         try writer.writeAll("  constants:\n");
         for (chunk.constants, 0..) |c, i| {
+            // Table rows sit under their own colored `│` gutter, like operand
+            // groups do under their count line.
             try writeGuide(writer, cc, options.use_color);
-            try writer.writeAll("    ");
+            try writer.writeAll("  ");
+            try writeTreeGuide(writer, sec_constants_color, .vert, null, options.use_color);
             // `#N` in the slot's identity color — the same hue a `push_const #N`
             // reference carries, so a reference ties back to its row here.
             var ibuf: [8]u8 = undefined;
@@ -182,10 +185,7 @@ fn writeChunkAt(
                 try writer.writeAll(istr);
             }
             try writer.splatByteAll(' ', 6 -| istr.len);
-            // The value itself is secondary — dim, and hard-truncated.
-            if (options.use_color) try writer.writeAll("\x1b[2m");
-            try writeValueDigest(writer, c, symbols, table_snippet_max, true);
-            if (options.use_color) try writer.writeAll("\x1b[0m");
+            try writeValueDigest(writer, c, symbols, table_snippet_max, options.use_color);
             try writer.writeByte('\n');
         }
     }
@@ -197,8 +197,8 @@ fn writeChunkAt(
         if (inc.len > 0 or out.len > 0) {
             try writeGuide(writer, cc, options.use_color);
             try writer.writeAll("  references:\n");
-            try writeRefList(writer, "incoming", inc, symbols, cc, options.use_color);
-            try writeRefList(writer, "outgoing", out, symbols, cc, options.use_color);
+            try writeRefList(writer, "incoming", sec_incoming_color, inc, symbols, cc, options.use_color);
+            try writeRefList(writer, "outgoing", sec_outgoing_color, out, symbols, cc, options.use_color);
         }
     };
 
@@ -317,7 +317,7 @@ fn writeChunkAt(
             try writer.writeByte(' '); // gap column between the bytes and the mnemonic
             try writeMnemonic(writer, op, options.use_color);
             if (operand_text.len > 0) {
-                try writeInlineOperand(writer, operand_text, opcol, options.use_color);
+                try writeInlineOperand(writer, operand_text, opcol, @intCast(@tagName(op).len + 1), options.use_color);
             }
             try writer.writeByte('\n');
             // Wrap any remaining instruction bytes onto continuation rows.
@@ -469,6 +469,49 @@ fn constColor(i: usize) [3]u8 {
     return hueColor(i + 1000);
 }
 
+/// Identity color for an interned string/path id: the same hue everywhere the
+/// id appears — as a raw operand, inside a `str[0xN]` comment, and on its
+/// constant-pool row — so occurrences of one id link up visually. Offset past
+/// the chunk-id and constant-slot seeds.
+fn internColor(id: anytype) [3]u8 {
+    return hueColor(@as(usize, @intCast(id)) + 5000);
+}
+
+/// Identity color for a heap object id (closures/thunks/lists in constant
+/// digests). Own seed range, like chunks/constants/interns.
+fn heapColor(id: anytype) [3]u8 {
+    return hueColor(@as(usize, @intCast(id)) + 9000);
+}
+
+/// Fixed keyword color for the store name in a `store[accessor]` reference
+/// (`chunk[…]`, `str[…]`, …): the store reads as a keyword, the accessor
+/// carries the identity color, and the brackets stay dim.
+const store_kw_color: [3]u8 = .{ 0x7f, 0xbf, 0xd8 };
+
+/// Section guide colors (constants / references and its subsections), so each
+/// indented table gets its own `│` gutter like operand groups do.
+const sec_constants_color: [3]u8 = .{ 0xb8, 0xa6, 0x5c };
+const sec_references_color: [3]u8 = .{ 0x5c, 0xb8, 0xa6 };
+const sec_incoming_color: [3]u8 = .{ 0xa6, 0x5c, 0xb8 };
+const sec_outgoing_color: [3]u8 = .{ 0x5c, 0x8a, 0xb8 };
+
+/// Column (within the token area, after the gutter) where field-row `;`
+/// comments start, so the semicolons align down an operand block.
+const field_comment_col = 16;
+
+/// Column (from the mnemonic's first character) where instruction-line `;`
+/// comments start — shared by the inline path and multiline mnemonic heads.
+const mnem_comment_col = 28;
+
+/// Visible width of UTF-8 text (codepoints; `→`/`…`/`│` count 1).
+fn visibleWidth(text: []const u8) u16 {
+    var w: u16 = 0;
+    for (text) |ch| {
+        if ((ch & 0xC0) != 0x80) w += 1;
+    }
+    return w;
+}
+
 /// A darkened variant of `rgb` for the interpretive `; …` comment: same hue as
 /// the raw operand it annotates (so the two read as linked), just dimmer.
 fn dimRgb(rgb: [3]u8) [3]u8 {
@@ -481,20 +524,24 @@ fn dimRgb(rgb: [3]u8) [3]u8 {
 
 /// Render a single instruction's inline operand text: everything before the
 /// first ` ; ` is the raw decoded value (in `col`, linked to its bytes); the
-/// ` ; …` interpretation that follows is the same hue, dimmed. Operands with no
-/// comment render entirely in `col`.
-fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, use_color: bool) !void {
-    if (!use_color) {
-        try writer.writeAll(text);
-        return;
-    }
+/// ` ; …` interpretation that follows is the same hue, dimmed, and padded out
+/// to the shared mnemonic-line comment column. `start_w` is the width already
+/// written on the line from the mnemonic's first character.
+fn writeInlineOperand(writer: *std.Io.Writer, text: []const u8, col: [3]u8, start_w: u16, use_color: bool) !void {
     const cut = std.mem.indexOf(u8, text, " ; ") orelse text.len;
-    try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ col[0], col[1], col[2], text[0..cut] });
+    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
+    try writer.writeAll(text[0..cut]);
     if (cut < text.len) {
-        const d = dimRgb(col);
-        try writer.print("\x1b[38;2;{d};{d};{d}m{s}", .{ d[0], d[1], d[2], text[cut..] });
+        if (use_color) try writer.writeAll("\x1b[0m");
+        const w = start_w + visibleWidth(text[0..cut]);
+        if (w < mnem_comment_col) try writer.splatByteAll(' ', mnem_comment_col - w);
+        if (use_color) {
+            const d = dimRgb(col);
+            try writer.print("\x1b[38;2;{d};{d};{d}m", .{ d[0], d[1], d[2] });
+        }
+        try writer.writeAll(text[cut..]);
     }
-    try writer.writeAll("\x1b[0m");
+    if (use_color) try writer.writeAll("\x1b[0m");
 }
 
 /// Reset the foreground (and any attributes), then — inside a background-tinted
@@ -527,6 +574,9 @@ const Line = struct {
     n: usize = 0,
     buf: [1024]u8 = undefined,
     used: usize = 0,
+    /// Token index where the `;` comment starts, if any. The renderer pads the
+    /// tokens before it out to `field_comment_col` so comment semicolons align.
+    comment_tok: ?usize = null,
 
     fn store(self: *Line, comptime fmt: []const u8, args: anytype) []const u8 {
         const s = std.fmt.bufPrint(self.buf[self.used..], fmt, args) catch self.buf[self.used..self.used];
@@ -568,6 +618,20 @@ const Line = struct {
             self.n += 1;
         }
     }
+    /// Begin the `;` comment: marks the alignment point, then writes ` ; `.
+    fn comment(self: *Line) void {
+        if (self.comment_tok == null) self.comment_tok = self.n;
+        self.glue(" ; ", .{});
+    }
+    /// A `store[accessor]` reference: keyword in the fixed store color, brackets
+    /// dim, accessor in the object's identity color. The uniform shape for every
+    /// cross-reference (`chunk[0xN]`, `str[0xN]`, …).
+    fn storeRef(self: *Line, kw: []const u8, id_color: [3]u8, comptime id_fmt: []const u8, id_args: anytype) void {
+        self.tint(store_kw_color, "{s}", .{kw});
+        self.glue("[", .{});
+        self.tint(id_color, id_fmt, id_args);
+        self.glue("]", .{});
+    }
     fn total(self: *const Line) u16 {
         var m: u16 = 0;
         for (self.toks[0..self.n]) |t| {
@@ -591,14 +655,14 @@ const Line = struct {
         }
         return .{ 0x9a, 0x9a, 0x9a }; // ungrouped byte
     }
-    /// Display width of the token text (UTF-8 codepoints; `→`/`…` count as 1),
-    /// for padding a background-tinted row to a common rectangle width.
+    /// Rendered display width of the token text (UTF-8 codepoints; `→`/`…`
+    /// count as 1), including the comment-column padding the renderer inserts —
+    /// used to pad a background-tinted row to a common rectangle width.
     fn tokWidth(self: *const Line) u16 {
         var w: u16 = 0;
-        for (self.toks[0..self.n]) |t| {
-            for (t.text) |ch| {
-                if ((ch & 0xC0) != 0x80) w += 1;
-            }
+        for (self.toks[0..self.n], 0..) |t, i| {
+            if (self.comment_tok != null and i == self.comment_tok.? and w < field_comment_col) w = field_comment_col;
+            w += visibleWidth(t.text);
         }
         return w;
     }
@@ -686,20 +750,32 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
             try writeTreeGuide(writer, gc, kind, bg, use_color);
         }
         if (r == 0) {
-            for (line.toks[0..line.n]) |t| {
+            var w: u16 = 0;
+            for (line.toks[0..line.n], 0..) |t, i| {
+                // Align the `;` comments down the block: pad the raw-value
+                // region out to a fixed column before the comment starts.
+                if (line.comment_tok != null and i == line.comment_tok.? and w < field_comment_col) {
+                    try sgrReset(writer, bg, use_color);
+                    try writer.splatByteAll(' ', field_comment_col - w);
+                    w = field_comment_col;
+                }
                 if (use_color) {
                     if (t.colored) {
                         try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
                     } else {
-                        try writer.writeAll("\x1b[2m"); // structural / comment text: dim
+                        // Structural / comment text: dim grey — reset first so
+                        // it doesn't inherit the previous token's hue.
+                        try sgrReset(writer, bg, use_color);
+                        try writer.writeAll("\x1b[2m");
                     }
                 }
                 try writer.writeAll(t.text);
+                w += visibleWidth(t.text);
             }
-            // Pad the tinted region out to the record's widest row.
+            // Pad the tinted region out to the record's widest row (`w` is the
+            // rendered width so far, including comment-column padding).
             if (bg != null) {
                 try sgrReset(writer, bg, use_color);
-                const w = line.tokWidth();
                 if (pad_to > w) try writer.splatByteAll(' ', pad_to - w);
             }
         }
@@ -727,8 +803,8 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
             const id_len: u16 = if (wide) 4 else 2;
             const id: ChunkId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
             l.groupPinned(1, id_len, objColor(id), "0x{x}", .{id});
-            l.glue(" ; ", .{});
-            l.tint(objColor(id), "chunk[0x{x}]", .{id});
+            l.comment();
+            l.storeRef("chunk", objColor(id), "0x{x}", .{id});
             if (chunkNameOf(symbols, id)) |name| l.tint(name_color, " {s}", .{name});
             return id_len;
         },
@@ -738,13 +814,15 @@ fn buildHead(l: *Line, op: OpCode, code: []const u8, start: usize, symbols: Symb
             l.group(1, 2, "#{d}", .{entries});
             l.glue(" ", .{});
             l.group(3, 2, "#{d}", .{positions});
-            l.glue(" ; {d} entries, {d} positions", .{ entries, positions });
+            l.comment();
+            l.glue("{d} entries, {d} positions", .{ entries, positions });
             return 4;
         },
         .thk_defer => {
             const id = readU32(code, start + 1);
             l.group(1, 4, "#{d}", .{id});
-            l.glue(" ; deferred", .{});
+            l.comment();
+            l.glue("deferred", .{});
             return 4;
         },
         else => return 0,
@@ -770,15 +848,23 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
     }
     try writer.writeByte(' '); // gap between bytes and the mnemonic
     try writeMnemonic(writer, op, use_color);
-    for (head.toks[0..head.n]) |t| {
+    // Width from the mnemonic's first character, for the shared comment column.
+    var w: u16 = @intCast(@tagName(op).len + 1);
+    for (head.toks[0..head.n], 0..) |t, i| {
+        if (head.comment_tok != null and i == head.comment_tok.? and w < mnem_comment_col) {
+            if (use_color) try writer.writeAll("\x1b[0m");
+            try writer.splatByteAll(' ', mnem_comment_col - w);
+            w = mnem_comment_col;
+        }
         if (use_color) {
             if (t.colored) {
                 try writer.print("\x1b[38;2;{d};{d};{d}m", .{ t.color[0], t.color[1], t.color[2] });
             } else {
-                try writer.writeAll("\x1b[2m");
+                try writer.writeAll("\x1b[0;2m"); // dim grey, not the previous hue
             }
         }
         try writer.writeAll(t.text);
+        w += visibleWidth(t.text);
     }
     if (use_color) try writer.writeAll("\x1b[0m");
     // No trailing newline: the first tail row's leading `\n` terminates this
@@ -789,8 +875,9 @@ fn emitMnemonicHead(writer: *std.Io.Writer, code: []const u8, start: usize, op: 
 /// wraps — so its guides never blank on a continuation.
 fn emitCountLine(writer: *std.Io.Writer, code: []const u8, off: *usize, label: []const u8, seq: *usize, guides: []const [3]u8, cc: [3]u8, show_bytes: bool, use_color: bool) !void {
     var l = Line{};
-    l.group(0, 2, "{d}", .{readU16(code, off.*)});
-    l.glue(" ; {s}", .{label});
+    l.group(0, 2, "#{d}", .{readU16(code, off.*)});
+    l.comment();
+    l.glue("{s}", .{label});
     try emitLine(writer, code, off, &l, seq, guides, false, cc, null, 0, show_bytes, use_color);
 }
 
@@ -865,38 +952,46 @@ fn writeOperandTail(
             const pos_count = readU16(code, off - 2);
             var k: usize = 0;
             while (k < pos_count) : (k += 1) {
-                // 16-byte record: name id, file id, line, col (u32 LE each). Each
-                // value shows uncommented in its own color (byte-linked), split
-                // across the record's two 8-byte rows: name+file, then line+col.
+                // 16-byte record: name id, file id, line, col (u32 LE each).
+                // Bytes split 8+8 across the two rows, but the text puts the
+                // name id alone on row 1 (with its `str[…] → "text"` chain) and
+                // the file/line/col trio on row 2 — pinned colors keep every
+                // value tied to its bytes even across the row split.
                 const nm: InternId = readU32(code, off);
                 const fl: InternId = readU32(code, off + 4);
                 const ln = readU32(code, off + 8);
                 const cl = readU32(code, off + 12);
-                // Row 1 — name id + file id, comment resolves the interned string.
-                var s1: [256]u8 = undefined;
-                var w1: std.Io.Writer = .fixed(&s1);
-                w1.print("heap[0x{x}] → ", .{nm}) catch {};
-                if (symbols.internName(nm)) |s| {
-                    w1.writeAll("str \"") catch {};
-                    writeEscapedSnippet(&w1, s, 24) catch {};
-                    w1.writeByte('"') catch {};
-                } else w1.writeByte('?') catch {};
+                const c_nm = internColor(nm);
+                const c_fl = internColor(fl);
+                const c_ln = hueColor(seq.*);
+                const c_cl = hueColor(seq.* + 1);
+                seq.* += 2;
+                // Row 1 — name id; its bytes and the `str[…]` chain share the
+                // intern id's identity color. The file id's bytes (this row's
+                // second half) take the file color via a text-less group.
+                var esc: [128]u8 = undefined;
+                var ew: std.Io.Writer = .fixed(&esc);
+                if (symbols.internName(nm)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
                 var l1 = Line{};
-                l1.group(0, 4, "0x{x}", .{nm});
-                l1.glue(" ", .{});
-                l1.group(4, 4, "0x{x}", .{fl});
-                l1.glue(" ; {s}", .{s1[0..w1.end]});
-                // Row 2 — line + col, comment is the source location.
-                var s2: [256]u8 = undefined;
-                var w2: std.Io.Writer = .fixed(&s2);
-                w2.writeAll("@ ") catch {};
-                if (symbols.internName(fl)) |f| w2.writeAll(std.fs.path.basename(f)) catch {} else w2.print("file[0x{x}]", .{fl}) catch {};
-                w2.print(":{d}:{d}", .{ ln, cl }) catch {};
+                l1.groupPinned(0, 4, c_nm, "0x{x}", .{nm});
+                l1.groupPinned(4, 4, c_fl, "", .{}); // file id bytes; value shown on row 2
+                l1.comment();
+                l1.storeRef("str", c_nm, "0x{x}", .{nm});
+                l1.glue(" → \"{s}\"", .{esc[0..ew.end]});
+                // Row 2 — file, line, col; comment is the resolved location.
+                var loc: [256]u8 = undefined;
+                var lw: std.Io.Writer = .fixed(&loc);
+                lw.writeAll("@ ") catch {};
+                if (symbols.internName(fl)) |f| lw.writeAll(std.fs.path.basename(f)) catch {} else lw.print("file[0x{x}]", .{fl}) catch {};
+                lw.print(":{d}:{d}", .{ ln, cl }) catch {};
                 var l2 = Line{};
-                l2.group(0, 4, "0x{x}", .{ln});
+                l2.tint(c_fl, "0x{x}", .{fl}); // value for row 1's second half
                 l2.glue(" ", .{});
-                l2.group(4, 4, "0x{x}", .{cl});
-                l2.glue(" ; {s}", .{s2[0..w2.end]});
+                l2.groupPinned(0, 4, c_ln, "0x{x}", .{ln});
+                l2.glue(" ", .{});
+                l2.groupPinned(4, 4, c_cl, "0x{x}", .{cl});
+                l2.comment();
+                l2.glue("{s}", .{loc[0..lw.end]});
                 // Alternate the background per record; pad both rows to the wider
                 // one so the tint forms a clean rectangle.
                 const bg: ?[3]u8 = if (k % 2 == 1) row_bg else null;
@@ -954,13 +1049,24 @@ fn isMultiline(op: OpCode) bool {
 }
 
 fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Chunk, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
-    if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ cc[0], cc[1], cc[2] });
     if (chunk_id) |id| {
-        try writer.print("chunk[0x{x}]", .{id});
-    } else {
+        // Same `store[accessor]` coloring as every reference to this chunk —
+        // keyword, dim brackets, id in the chunk's identity color (bold: this
+        // is the definition the references point at).
+        if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
         try writer.writeAll("chunk");
+        if (use_color) try writer.writeAll("\x1b[0;2m");
+        try writer.writeByte('[');
+        if (use_color) try writer.print("\x1b[0;1;38;2;{d};{d};{d}m", .{ cc[0], cc[1], cc[2] });
+        try writer.print("0x{x}", .{id});
+        if (use_color) try writer.writeAll("\x1b[0;2m");
+        try writer.writeByte(']');
+        if (use_color) try writer.writeAll("\x1b[0m");
+    } else {
+        if (use_color) try writer.print("\x1b[1;38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
+        try writer.writeAll("chunk");
+        if (use_color) try writer.writeAll("\x1b[0m");
     }
-    if (use_color) try writer.writeAll("\x1b[0m");
     // Best-effort compiler-attributed name (the binding a lambda/thunk was
     // compiled for), when name capture was on. See ChunkRegistry.recordName.
     if (chunk_id) |id| {
@@ -1009,17 +1115,20 @@ fn writeChunkHeader(writer: *std.Io.Writer, chunk_id: ?ChunkId, chunk: *const Ch
 
 /// A `references:` sub-section (`incoming`/`outgoing`): one `chunk[0xN] name`
 /// per referenced chunk, each in that chunk's identity color. No-op when empty.
-fn writeRefList(writer: *std.Io.Writer, label: []const u8, ids: []const ChunkId, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
+fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids: []const ChunkId, symbols: Symbols, cc: [3]u8, use_color: bool) !void {
     if (ids.len == 0) return;
+    // Sub-section header under the references gutter, then one row per chunk
+    // under the sub-section's own gutter.
     try writeGuide(writer, cc, use_color);
-    try writer.print("    {s}:\n", .{label});
+    try writer.writeAll("  ");
+    try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
+    try writer.print("{s}:\n", .{label});
     for (ids) |id| {
         try writeGuide(writer, cc, use_color);
-        try writer.writeAll("      ");
-        const col = objColor(id);
-        if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ col[0], col[1], col[2] });
-        try writer.print("chunk[0x{x}]", .{id});
-        if (use_color) try writer.writeAll("\x1b[0m");
+        try writer.writeAll("  ");
+        try writeTreeGuide(writer, sec_references_color, .vert, null, use_color);
+        try writeTreeGuide(writer, sub_color, .vert, null, use_color);
+        try writeStoreRefText(writer, "chunk", id, objColor(id), use_color);
         if (chunkNameOf(symbols, id)) |name| {
             if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ name_color[0], name_color[1], name_color[2] });
             try writer.print(" {s}", .{name});
@@ -1060,6 +1169,7 @@ fn writeOperands(
             try writer.print("#{d}", .{idx});
             if (idx < chunk.constants.len) {
                 try writer.writeAll(" ; ");
+                // Plain text: the inline path colors the whole comment dim.
                 try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, false);
             }
         },
@@ -1097,7 +1207,7 @@ fn writeOperands(
         .call_n, .call_tail_n => {
             const n = code[ip];
             ip += 1;
-            try writer.print("{d} args", .{n});
+            try writer.print("#{d} ; {d} args", .{ n, n });
         },
 
         .jump => {
@@ -1114,7 +1224,7 @@ fn writeOperands(
         .attrs_new, .attrs_new_srt => {
             const n = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} entries", .{n});
+            try writer.print("#{d} ; {d} entries", .{ n, n });
         },
         .attrs_new_pos, .attrs_new_pos_srt => {
             const n = readU16(code, ip);
@@ -1127,12 +1237,12 @@ fn writeOperands(
         .list_new => {
             const n = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} items", .{n});
+            try writer.print("#{d} ; {d} items", .{ n, n });
         },
         .str_cat => {
             const n = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} parts", .{n});
+            try writer.print("#{d} ; {d} parts", .{ n, n });
         },
 
         .file_find => {
@@ -1278,7 +1388,7 @@ fn writeOperands(
             ip += 1;
             const dynamic = code[ip];
             ip += 1;
-            try writer.print("{d} segments ({d} dynamic)", .{ segments, dynamic });
+            try writer.print("#{d} #{d} ; {d} segments ({d} dynamic)", .{ segments, dynamic, segments, dynamic });
             for (0..segments) |_| {
                 const tag = code[ip];
                 ip += 1;
@@ -1290,7 +1400,7 @@ fn writeOperands(
             ip += 1;
             const expected = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
+            try writer.print("#{d} ; {d} expected (allow_extra={s})", .{ expected, expected, if (allow != 0) "true" else "false" });
             ip += @as(usize, expected) * 2;
         },
         .attr_check_w => {
@@ -1298,7 +1408,7 @@ fn writeOperands(
             ip += 1;
             const expected = readU16(code, ip);
             ip += 2;
-            try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
+            try writer.print("#{d} ; {d} expected (allow_extra={s})", .{ expected, expected, if (allow != 0) "true" else "false" });
             ip += @as(usize, expected) * 4;
         },
         .with_lookup => {
@@ -1362,13 +1472,16 @@ fn writeSlotAttr(writer: *std.Io.Writer, role: []const u8, slot: u16, id: Intern
     }
 }
 
-/// An interned-name operand: the raw id as the value, the resolved text as the
-/// dimmed ` ; "name"` interpretation (or just the id when unresolved).
+/// An interned-name operand: the raw id as the value, then the full lookup
+/// chain — `str[0xN] → "text"` — as the interpretation, so the intern id is
+/// explicit in the comment and matches the constant-pool rendering.
 fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void {
     if (symbols.internName(id)) |name| {
-        try writer.print("0x{x} ; \"{s}\"", .{ id, name });
+        try writer.print("0x{x} ; str[0x{x}] → \"", .{ id, id });
+        try writeEscapedSnippet(writer, name, snippet_max);
+        try writer.writeByte('"');
     } else {
-        try writer.print("0x{x}", .{id});
+        try writer.print("0x{x} ; str[0x{x}]", .{ id, id });
     }
 }
 
@@ -1416,40 +1529,53 @@ fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_c
 
 /// The right-hand `; line:col+len` position annotation — the position within the
 /// current file (whose name is on its own hoisted line).
-/// `type value` digest of a constant. `store` prepends the backing `heap[0xN]`
-/// accessor for interned strings/paths (used in the pool table, where the
-/// accessor matters); inline references leave it off. `max` caps string length.
-fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, store: bool) !void {
+/// A `store[accessor]` reference written directly (outside the `Line` token
+/// model): keyword in the store color, brackets dim, accessor in `id_color`.
+fn writeStoreRefText(writer: *std.Io.Writer, kw: []const u8, id: u64, id_color: [3]u8, use_color: bool) !void {
+    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ store_kw_color[0], store_kw_color[1], store_kw_color[2] });
+    try writer.writeAll(kw);
+    if (use_color) try writer.writeAll("\x1b[0;2m");
+    try writer.writeByte('[');
+    if (use_color) try writer.print("\x1b[0;38;2;{d};{d};{d}m", .{ id_color[0], id_color[1], id_color[2] });
+    try writer.print("0x{x}", .{id});
+    if (use_color) try writer.writeAll("\x1b[0;2m");
+    try writer.writeByte(']');
+    if (use_color) try writer.writeAll("\x1b[0m");
+}
+
+/// `type[accessor] → value` digest of a constant. Interned strings/paths render
+/// the full lookup chain — `str[0xN] → "text"` — with the intern id in its
+/// identity color (matching every other occurrence of that id) when `use_color`.
+/// `max` caps string length.
+fn writeValueDigest(writer: *std.Io.Writer, value: Value, symbols: Symbols, max: usize, use_color: bool) !void {
     switch (value.kind()) {
         .null => try writer.writeAll("null"),
         .bool_true => try writer.writeAll("true"),
         .bool_false => try writer.writeAll("false"),
         .int => try writer.print("int {d}", .{value.asInt()}),
         .float => try writer.print("float {d}", .{value.asFloat()}),
-        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, store),
-        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, store),
-        .list => try writer.print("list[0x{x}]", .{value.asObjectId()}),
-        .attrs => try writer.print("attrs[0x{x}]", .{value.asObjectId()}),
-        .closure => try writer.print("closure[0x{x}]", .{value.asObjectId()}),
-        .thunk => try writer.print("thunk[0x{x}]", .{value.asObjectId()}),
-        .builtin => try writer.print("builtin[0x{x}]", .{value.asBuiltinId()}),
-        .builtin_closure => try writer.print("builtin_closure[0x{x}]", .{value.asObjectId()}),
-        .string_context => try writer.print("string_ctx[0x{x}]", .{value.asObjectId()}),
-        .boxed_int => try writer.print("boxed_int[0x{x}]", .{value.asObjectId()}),
-        .partial_app => try writer.print("partial_app[0x{x}]", .{value.asObjectId()}),
+        .string => try writeStringRef(writer, "str", value.asInternId(), symbols, max, use_color),
+        .path => try writeStringRef(writer, "path", value.asInternId(), symbols, max, use_color),
+        .list => try writeStoreRefText(writer, "list", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .attrs => try writeStoreRefText(writer, "attrs", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .closure => try writeStoreRefText(writer, "closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .thunk => try writeStoreRefText(writer, "thunk", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .builtin => try writeStoreRefText(writer, "builtin", value.asBuiltinId(), heapColor(value.asBuiltinId()), use_color),
+        .builtin_closure => try writeStoreRefText(writer, "builtin_closure", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .string_context => try writeStoreRefText(writer, "string_ctx", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .boxed_int => try writeStoreRefText(writer, "boxed_int", value.asObjectId(), heapColor(value.asObjectId()), use_color),
+        .partial_app => try writeStoreRefText(writer, "partial_app", value.asObjectId(), heapColor(value.asObjectId()), use_color),
     }
 }
 
-fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, store: bool) !void {
-    if (store) try writer.print("heap[0x{x}] ", .{id});
+fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbols: Symbols, max: usize, use_color: bool) !void {
+    try writeStoreRefText(writer, kind, id, internColor(id), use_color);
     if (symbols.internName(id)) |text| {
-        try writer.print("{s} \"", .{kind});
+        if (use_color) try writer.writeAll("\x1b[2m");
+        try writer.writeAll(" → \"");
         try writeEscapedSnippet(writer, text, max);
         try writer.writeByte('"');
-    } else if (!store) {
-        try writer.print("{s} 0x{x}", .{ kind, id });
-    } else {
-        try writer.writeAll(kind);
+        if (use_color) try writer.writeAll("\x1b[0m");
     }
 }
 
