@@ -41,6 +41,7 @@ Parsed in `src/cli/args.zig` (shared by `eval`/`repl`). Defaults shown; `[=X]` m
 | `--experimental-features FEATS` / `--extra-experimental-features FEATS` | space-separated experimental features to enable (replace / append), Nix-style. Available: `pipe-operators` — the `\|>` / `<\|` pipe operators (sugar for application) → [syntax/nix-syntax.md](syntax/nix-syntax.md); `fetch-tree` — gates a direct `builtins.fetchTree` call; `flakes` — gates the flake builtins (`getFlake`, `parseFlakeRef`, `flakeRefToString`) and the `--flake` installable, and implies `fetch-tree`. All off by default; a disabled builtin raises a hard (tryEval-uncatchable) error. |
 | `--workers N` | worker threads; default `min(8, cpu_count)` (1 if single-threaded) → [parallel/workers.md](parallel/workers.md) |
 | `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`). Effective only on a `-Dgc` build → [gc.md](gc.md) |
+| `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). `FIX_HUGETLB` env is the fallback when the flag is absent. Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
 | `--progress[=auto\|always\|never]` / `--no-progress` | eval progress on stderr |
