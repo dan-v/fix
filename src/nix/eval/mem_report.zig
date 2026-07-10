@@ -15,6 +15,7 @@ const gc = @import("runtime").gc;
 const mem_tag = @import("runtime").mem_tag;
 const vma_mod = mem_tag.vma;
 const block_cache = @import("base").block_cache;
+const base_hugetlb = @import("base").hugetlb;
 const bytecode = @import("bytecode");
 const ast = @import("syntax").ast;
 
@@ -61,6 +62,11 @@ pub fn report(
 
     const accounted = stores_b + intern_b + code_b + arena_b;
     const rss = gc.peakRssBytes();
+    // Hugetlb pages are invisible to VmHWM/statm — with `--hugetlb` most of
+    // the heap moves off-RSS, so the comparison base is RSS + the tracked
+    // hugetlb high-water (see base/hugetlb.zig).
+    const huge_peak = base_hugetlb.peakMappedBytes();
+    const footprint = rss + huge_peak;
 
     p("\n=== MEM REPORT (FIX_MEM_REPORT) — peak RSS attribution ===\n", .{});
     p("  object store:   {d:>8.1} MB  ({d} objs)\n", .{ mb(obj_b), heap.objects.count() });
@@ -73,7 +79,11 @@ pub fn report(
     p("  retained AST:   {d:>8.1} MB  ({d} arenas)\n", .{ mb(arena_b), retained_arenas.len });
     p("  == accounted:   {d:>8.1} MB\n", .{mb(accounted)});
     p("  peak RSS (VmHWM):{d:>7.1} MB\n", .{mb(rss)});
-    if (rss > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(rss - accounted)});
+    if (huge_peak > 0) {
+        p("  hugetlb (peak): {d:>8.1} MB  (2 MB pages; invisible to RSS)\n", .{mb(huge_peak)});
+        p("  == footprint:   {d:>8.1} MB  (peak RSS + hugetlb peak)\n", .{mb(footprint)});
+    }
+    if (footprint > accounted) p("  UNACCOUNTED:    {d:>8.1} MB  (fiber stacks, GC bitmaps, allocator overhead, misc)\n", .{mb(footprint - accounted)});
 
     // Second table: kernel-truth attribution. Every big mapping the
     // process creates is registered (runtime/vma.zig), so asking
@@ -89,7 +99,7 @@ pub fn report(
     for (res.rss_bytes) |b| tracked_total += b;
     const cur_rss = gc.currentRssBytes();
     const retained_blocks = block_cache.retained_bytes.load(.monotonic);
-    p("  -- mapping residency (mincore; current RSS {d:.1} MB) --\n", .{mb(cur_rss)});
+    p("  -- mapping residency (mincore; current RSS {d:.1} MB + hugetlb {d:.1} MB) --\n", .{ mb(cur_rss), mb(base_hugetlb.mappedBytes()) });
     inline for (0..vma_mod.tag_count) |ti| {
         const tag: vma_mod.Tag = @enumFromInt(ti);
         p("  {s:<16}{d:>8.1} MB  ({d} regions, {d:.0} MB reserved)\n", .{
@@ -97,8 +107,13 @@ pub fn report(
         });
     }
     p("  {s:<16}{d:>8.1} MB  (of fix:bigblock; parked on free stacks)\n", .{ "block-cache", mb(retained_blocks) });
-    if (cur_rss > tracked_total)
-        p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_rss - tracked_total) });
+    // The tracked regions' mincore residency includes hugetlb-backed pages
+    // (the kernel's hugetlb walker reports them), while statm RSS excludes
+    // them — compare against the combined footprint so "untracked" doesn't
+    // underflow on a hugetlb run.
+    const cur_foot = cur_rss + base_hugetlb.mappedBytes();
+    if (cur_foot > tracked_total)
+        p("  {s:<16}{d:>8.1} MB  (small-alloc slabs, thread stacks, binary)\n", .{ "untracked", mb(cur_foot - tracked_total) });
     if (res.dropped > 0)
         p("  WARNING: {d} region registrations dropped (table full) — undercount\n", .{res.dropped});
     const dump = if (env) |em| em.get("FIX_MEM_REPORT") else null;
@@ -127,6 +142,7 @@ fn smapsDecompose(tracked_anon: u64) void {
     var stack_rss: u64 = 0;
     var anon_rss: u64 = 0;
     var heap_rss: u64 = 0;
+    var hugetlb_kb: u64 = 0;
     // Track whether the current mapping is file-backed / [stack] /
     // [heap] / anonymous by its header line, then attribute each
     // "Rss:" line to that category. Read in chunks, reassembling lines
@@ -149,7 +165,7 @@ fn smapsDecompose(tracked_anon: u64) void {
                 line = carry[0 .. carry_len + take];
                 carry_len = 0;
             }
-            classifySmapsLine(line, &current, &file_rss, &stack_rss, &heap_rss, &anon_rss);
+            classifySmapsLine(line, &current, &file_rss, &stack_rss, &heap_rss, &anon_rss, &hugetlb_kb);
             data = data[nl + 1 ..];
         }
         // Stash any trailing partial line.
@@ -168,6 +184,11 @@ fn smapsDecompose(tracked_anon: u64) void {
     p("  main [stack]    {d:>8.1} MB\n", .{mb(stack_rss)});
     p("  [heap] brk      {d:>8.1} MB\n", .{mb(heap_rss)});
     p("  anon total      {d:>8.1} MB\n", .{mb(anon_rss)});
+    // Kernel-truth *faulted* hugetlb (smaps `Private/Shared_Hugetlb`; their
+    // VMAs report `Rss: 0`). Compare with the tracked mapped figure above —
+    // the delta is the flat store's reserved-but-untouched grow-ahead.
+    if (hugetlb_kb > 0)
+        p("  hugetlb faulted {d:>8.1} MB  (smaps *_Hugetlb; not in anon/RSS)\n", .{mb(hugetlb_kb)});
     const tracked_mb = @as(f64, @floatFromInt(tracked_anon)) / (1024.0 * 1024.0);
     p("  anon tracked    {d:>8.1} MB  (registered big regions)\n", .{tracked_mb});
     p("  anon UNTRACKED  {d:>8.1} MB  (SmpAllocator small slabs + worker stacks + misc)\n", .{mb(anon_rss) - tracked_mb});
@@ -180,6 +201,7 @@ fn classifySmapsLine(
     stack_rss: *u64,
     heap_rss: *u64,
     anon_rss: *u64,
+    hugetlb_kb: *u64,
 ) void {
     const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
     const tok0 = line[0..first_space];
@@ -202,6 +224,14 @@ fn classifySmapsLine(
             .heap => heap_rss.* += kb,
             .anon => anon_rss.* += kb,
         }
+        return;
+    }
+    // Hugetlb VMAs report `Rss: 0`; the faulted amount lives in these two
+    // fields instead (private for our anonymous mappings).
+    if (std.mem.startsWith(u8, line, "Private_Hugetlb:") or
+        std.mem.startsWith(u8, line, "Shared_Hugetlb:"))
+    {
+        hugetlb_kb.* += parseKb(line);
     }
 }
 

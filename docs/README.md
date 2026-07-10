@@ -47,6 +47,7 @@
 **Performance** — [`perf/`](perf/)
 - [model](perf/model.md) — **cost model, critical-path floor, measured dead-ends**
 - [probes](perf/probes.md) — the `-D` headroom-measurement suite
+- [hugetlb](perf/hugetlb.md) — 2 MB huge-page heap backing (`--hugetlb`, w=1 −8.3%)
 
 **Memory** — the interpreter stays canonical
 - [gc](gc.md) — optional `-Dgc` non-moving generational collector that bounds RSS; never changes output

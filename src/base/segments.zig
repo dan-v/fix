@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const SpinMutex = @import("sync.zig").SpinMutex;
+const hugetlb = @import("hugetlb.zig");
 
 /// `StableSegments` parameters, generic over the injected `Vma`
 /// instantiation so `vma_tag` can name the app's attribution enum without
@@ -469,6 +470,12 @@ pub fn FlatParams(comptime Vma: type) type {
         /// RSS-attribution tag for the reservation (see `Params.vma_tag`);
         /// registered at init since the flat store owns its mmap directly.
         vma_tag: ?Vma.Tag = null,
+        /// Hugetlb grow-ahead granularity (see `extendHugeFrontier`): the
+        /// reserved huge-page prefix grows in chunks of this many bytes.
+        /// Small enough that a run only over-reserves one chunk of pool,
+        /// big enough that extension mmaps stay rare. Tests shrink it to
+        /// exercise many frontier crossings on a small store.
+        huge_chunk: usize = 128 << 20,
     };
 }
 
@@ -486,12 +493,19 @@ pub fn FlatParams(comptime Vma: type) type {
 ///   - `reserve` bumps `cursor` under `write_mu`; concurrent readers only
 ///     ever touch ids already published through the value/state release
 ///     that made them reachable, which happens-after the slot was filled.
+///
+/// Huge pages: when hugetlb backing is engaged (base/hugetlb.zig), the low
+/// bytes of the reservation are overlaid with *reserved* (non-NORESERVE)
+/// 2 MB pages, grown chunk-wise ahead of the cursor under `write_mu` — see
+/// `extendHugeFrontier` for the no-SIGBUS/no-data-loss invariants. Any
+/// failure degrades that store's tail to ordinary pages.
 pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: type) type {
     // See `StableSegments`: copy the anonymous literal into a typed
     // `FlatParams(Vma)` so `vma_tag` resolves against the injected `Vma.Tag`.
     const params: FlatParams(Vma) = blk: {
         var p: FlatParams(Vma) = .{ .max_slots = params_in.max_slots };
         if (@hasField(@TypeOf(params_in), "vma_tag")) p.vma_tag = params_in.vma_tag;
+        if (@hasField(@TypeOf(params_in), "huge_chunk")) p.huge_chunk = params_in.huge_chunk;
         break :blk p;
     };
     comptime {
@@ -519,10 +533,52 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         /// `count()` so an opportunistic reader doesn't tear.
         cursor: std.atomic.Value(u32),
         write_mu: SpinMutex,
+        /// Hugetlb prefix frontier: bytes `[0, huge_frontier)` of the
+        /// reservation are backed by *reserved* (non-NORESERVE) huge pages,
+        /// so faults there are kernel-guaranteed — pool exhaustion can only
+        /// fail a frontier *extension* (an mmap, handled), never SIGBUS a
+        /// touch. Always a 2 MB multiple; mutated only under `write_mu`.
+        huge_frontier: usize,
+        /// Set when the prefix can't grow further (mode off, pool exhausted,
+        /// or the overlayable range is used up): the rest of the store stays
+        /// on ordinary 4 KB pages, permanently — which also upholds the
+        /// overlay-never-covers-data invariant (see `extendHugeFrontier`).
+        huge_grow_off: bool,
 
         const BYTES: usize = @as(usize, params.max_slots) * @sizeOf(T);
+        /// Only whole huge pages can be overlaid; a sub-2 MB tail stays normal.
+        const HUGE_LIMIT: usize = std.mem.alignBackward(usize, BYTES, hugetlb.HUGE_PAGE);
+        const HUGE_CHUNK: usize = params.huge_chunk;
 
         pub fn init() !Self {
+            var self: Self = .{
+                .base = undefined,
+                .cursor = .init(0),
+                .write_mu = .{},
+                .huge_frontier = 0,
+                .huge_grow_off = true,
+            };
+            const use_huge = comptime_linux and HUGE_LIMIT >= hugetlb.HUGE_PAGE and
+                BYTES % page_size_min == 0 and hugetlb.wanted();
+            const mem: [*]align(page_size_min) u8 = if (use_huge) blk: {
+                // A hugetlb overlay (MAP_FIXED) needs a 2 MB-aligned target,
+                // so over-reserve by one huge page and trim to an aligned
+                // window. Failure of the aligned dance falls through to the
+                // plain mapping (`huge_grow_off` stays set).
+                if (initAligned()) |ptr| {
+                    self.huge_grow_off = false;
+                    break :blk ptr;
+                }
+                break :blk try plainMap();
+            } else try plainMap();
+            if (comptime params.vma_tag) |tag| Vma.registerRegion(mem, BYTES, tag);
+            self.base = @ptrCast(@alignCast(mem));
+            return self;
+        }
+
+        const comptime_linux = builtin.os.tag == .linux;
+
+        fn plainMap() ![*]align(page_size_min) u8 {
             const mem = std.posix.mmap(
                 null,
                 BYTES,
@@ -531,12 +587,34 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
                 -1,
                 0,
             ) catch return error.OutOfMemory;
-            if (comptime params.vma_tag) |tag| Vma.registerRegion(mem.ptr, BYTES, tag);
-            return .{
-                .base = @ptrCast(@alignCast(mem.ptr)),
-                .cursor = .init(0),
-                .write_mu = .{},
-            };
+            return mem.ptr;
+        }
+
+        /// Reserve `BYTES` of ordinary NORESERVE address space whose base is
+        /// 2 MB-aligned: map one huge page extra, trim the misaligned head
+        /// and the surplus tail. Null on mmap failure (caller falls back).
+        fn initAligned() ?[*]align(page_size_min) u8 {
+            const mem = std.posix.mmap(
+                null,
+                BYTES + hugetlb.HUGE_PAGE,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
+                -1,
+                0,
+            ) catch return null;
+            const raw = @intFromPtr(mem.ptr);
+            const base = std.mem.alignForward(usize, raw, hugetlb.HUGE_PAGE);
+            if (base > raw) {
+                const head: [*]align(page_size_min) u8 = @ptrFromInt(raw);
+                std.posix.munmap(head[0 .. base - raw]);
+            }
+            const tail_start = base + BYTES;
+            const tail_end = raw + BYTES + hugetlb.HUGE_PAGE;
+            if (tail_end > tail_start) {
+                const tail: [*]align(page_size_min) u8 = @ptrFromInt(tail_start);
+                std.posix.munmap(tail[0 .. tail_end - tail_start]);
+            }
+            return @ptrFromInt(base);
         }
 
         /// `allocator` is accepted for API parity with `StableSegments`
@@ -546,7 +624,13 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             _ = allocator;
             if (comptime params.vma_tag != null) Vma.unregisterRegion(self.base);
             const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
+            // One munmap covers the mixed hugetlb-prefix + normal-tail VMAs
+            // (both are whole VMAs within the range); only the accounting
+            // needs to know how much of it was hugetlb.
             std.posix.munmap(bytes[0..BYTES]);
+            if (self.huge_frontier > 0) hugetlb.noteUnmapped(self.huge_frontier);
+            self.huge_frontier = 0;
+            self.huge_grow_off = true;
             self.cursor.store(0, .monotonic);
         }
 
@@ -560,8 +644,47 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             defer self.write_mu.unlock();
             const start = self.cursor.load(.monotonic);
             if (start > params.max_slots - len) return error.OutOfMemory;
+            if (comptime comptime_linux) {
+                if (!self.huge_grow_off) {
+                    const end_bytes = @as(usize, start + len) * @sizeOf(T);
+                    if (end_bytes > self.huge_frontier) self.extendHugeFrontier(end_bytes);
+                }
+            }
             self.cursor.store(start + len, .release);
             return .{ .segment = 0, .offset = start, .len = len };
+        }
+
+        /// Grow the reserved huge-page prefix to cover at least `need_bytes`
+        /// (plus a chunk of lookahead) by overlaying `[huge_frontier,
+        /// target)` with MAP_FIXED hugetlb. Called under `write_mu` *before*
+        /// the cursor moves, which is what makes the overlay safe: while
+        /// growth is on, every previously handed-out byte lies below
+        /// `huge_frontier` (inductive — each reserve either fit under the
+        /// frontier or extended it first), so the replaced range holds no
+        /// data. The background pre-toucher (`populateRange`) may have
+        /// populated pages above the frontier, but only with kernel zeroes —
+        /// discarding them is harmless. Any failure (or running past
+        /// `HUGE_LIMIT`) permanently stops growth so the invariant can never
+        /// be violated later; the store's tail then lives on normal pages
+        /// exactly like a non-hugetlb run.
+        fn extendHugeFrontier(self: *Self, need_bytes: usize) void {
+            const want = @max(need_bytes, self.huge_frontier +| HUGE_CHUNK);
+            const target = @min(std.mem.alignForward(usize, want, hugetlb.HUGE_PAGE), HUGE_LIMIT);
+            if (target <= self.huge_frontier or target < need_bytes) {
+                // Out of overlayable range (the ≥HUGE_LIMIT tail): stop for good.
+                self.huge_grow_off = true;
+                return;
+            }
+            const basep: [*]u8 = @ptrCast(self.base);
+            if (hugetlb.overlayFixed(basep + self.huge_frontier, target - self.huge_frontier)) {
+                self.huge_frontier = target;
+                if (target == HUGE_LIMIT) self.huge_grow_off = true;
+            } else {
+                // Pool exhausted (or shrank): the tail continues on normal
+                // pages. Data below the frontier stays on reserved huge
+                // pages — still guaranteed by the kernel.
+                self.huge_grow_off = true;
+            }
         }
 
         pub fn get(self: *const Self, id: u32) *const T {
@@ -792,6 +915,44 @@ test "flat store: reserve past capacity errors without relocating" {
     // The successfully-reserved slots remain addressable after the failure.
     store.getMut(7).* = 0xDEAD;
     try std.testing.expectEqual(@as(u32, 0xDEAD), store.get(7).*);
+}
+
+test "flat store: hugetlb prefix — data intact across many frontier crossings" {
+    if (comptime builtin.os.tag != .linux) return;
+    // Force hugetlb on with a tiny 2 MB grow-ahead chunk over an 8 MB store,
+    // so reserves cross the frontier several times. Whether the pool serves
+    // the overlays (this box) or every extension fails (no pool: first
+    // extension falls back, store behaves plainly), the data written before,
+    // at, and after each crossing must round-trip — this is the invariant
+    // that the MAP_FIXED overlay never covers handed-out slots.
+    const saved = hugetlb.getMode();
+    hugetlb.setMode(.on);
+    defer hugetlb.setMode(saved orelse .off);
+
+    const Store = FlatStore(u64, .{ .max_slots = 1 << 20, .huge_chunk = 2 << 20 }, TestVma);
+    var store = try Store.init();
+    defer store.deinit(std.testing.allocator);
+
+    // Mixed-size reservations so range ends land on both sides of 2 MB lines.
+    var next: u32 = 0;
+    const lens = [_]u32{ 1, 7, 4093, 262144, 3, 262143, 65536 };
+    var li: usize = 0;
+    while (next < (1 << 20) - 262145) {
+        const len = lens[li % lens.len];
+        li += 1;
+        const r = try store.reserve(std.testing.allocator, len);
+        try std.testing.expectEqual(next, r.offset);
+        const s = r.offset;
+        var i: u32 = 0;
+        while (i < len) : (i += 1) {
+            store.getMut(s + i).* = @as(u64, s + i) *% 0x9E3779B97F4A7C15;
+        }
+        next += len;
+    }
+    var id: u32 = 0;
+    while (id < next) : (id += 1) {
+        try std.testing.expectEqual(@as(u64, id) *% 0x9E3779B97F4A7C15, store.get(id).*);
+    }
 }
 
 test "flat store: concurrent reserves are race-free" {

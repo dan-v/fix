@@ -33,7 +33,9 @@ pub const Metrics = struct {
     values: u64 = 0,
     attrs: u64 = 0,
     reserved_bytes: u64 = 0,
-    /// Resident set size (current), read from /proc.
+    /// Current memory footprint: resident set (/proc statm) plus
+    /// hugetlb-backed bytes, which the kernel keeps out of RSS (see
+    /// `runtime/gc.zig:currentFootprintBytes`).
     rss_bytes: u64 = 0,
     // Scheduler activity.
     pending: u64 = 0,
