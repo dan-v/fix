@@ -779,16 +779,76 @@ pub const ChunkRegistry = struct {
     /// Register `chunk`, reusing an existing byte-identical registration when
     /// possible (see `dedup`). Returns the id and whether it was reused — a
     /// reused id means the caller must deinit its own copy of `chunk`.
+    /// Deterministic content hash over everything that makes a chunk what it
+    /// is. Optionals/structs are fed field-by-field (never as raw bytes) so
+    /// undefined padding can't perturb the hash.
+    fn contentHash(chunk: *const Chunk) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(chunk.code);
+        h.update(std.mem.sliceAsBytes(chunk.constants));
+        h.update(std.mem.sliceAsBytes(chunk.attr_names));
+        for (chunk.attr_pos) |p| {
+            h.update(std.mem.asBytes(&p.name));
+            h.update(std.mem.asBytes(&p.pos.file));
+            h.update(std.mem.asBytes(&p.pos.line));
+            h.update(std.mem.asBytes(&p.pos.column));
+        }
+        h.update(std.mem.sliceAsBytes(chunk.function_args));
+        for (chunk.source_map) |e| {
+            h.update(std.mem.asBytes(&e.start));
+            h.update(std.mem.asBytes(&e.end));
+            hashSpan(&h, e.span);
+        }
+        if (chunk.body_span) |bs| hashSpan(&h, bs);
+        h.update(std.mem.asBytes(&chunk.local_count));
+        h.update(std.mem.asBytes(&chunk.arity));
+        h.update(std.mem.asBytes(&chunk.strict_params));
+        return h.final();
+    }
+
+    fn hashSpan(h: *std.hash.Wyhash, span: Chunk.SourceSpan) void {
+        const file: types.InternId = span.file orelse 0xFFFF_FFFF;
+        h.update(std.mem.asBytes(&file));
+        h.update(std.mem.asBytes(&span.offset));
+        h.update(std.mem.asBytes(&span.len));
+        h.update(std.mem.asBytes(&span.line));
+        h.update(std.mem.asBytes(&span.column));
+    }
+
+    fn spanEql(a: Chunk.SourceSpan, b: Chunk.SourceSpan) bool {
+        return std.meta.eql(a.file, b.file) and a.offset == b.offset and a.len == b.len and a.line == b.line and a.column == b.column;
+    }
+
+    /// Full structural equality — byte/field-equal chunks are indistinguishable
+    /// (identical semantics AND identical diagnostics/positions), so sharing
+    /// one registration is observation-free.
+    fn contentEql(a: *const Chunk, b: *const Chunk) bool {
+        if (a.local_count != b.local_count or a.arity != b.arity or a.strict_params != b.strict_params) return false;
+        if (!std.mem.eql(u8, a.code, b.code)) return false;
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(a.constants), std.mem.sliceAsBytes(b.constants))) return false;
+        if (!std.mem.eql(types.InternId, a.attr_names, b.attr_names)) return false;
+        if (a.attr_pos.len != b.attr_pos.len) return false;
+        for (a.attr_pos, b.attr_pos) |x, y| {
+            if (x.name != y.name or x.pos.file != y.pos.file or x.pos.line != y.pos.line or x.pos.column != y.pos.column) return false;
+        }
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(a.function_args), std.mem.sliceAsBytes(b.function_args))) return false;
+        if (a.source_map.len != b.source_map.len) return false;
+        for (a.source_map, b.source_map) |x, y| {
+            if (x.start != y.start or x.end != y.end or !spanEql(x.span, y.span)) return false;
+        }
+        if ((a.body_span == null) != (b.body_span == null)) return false;
+        if (a.body_span) |ba| if (!spanEql(ba, b.body_span.?)) return false;
+        return true;
+    }
+
     pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk) !struct { id: ChunkId, reused: bool } {
-        const h = std.hash.Wyhash.hash(0, chunk.code);
+        const h = contentHash(&chunk);
         {
             self.dedup_mu.lock();
             defer self.dedup_mu.unlock();
             if (self.dedup.get(h)) |existing| {
                 const st = self.get(existing).?;
-                // Full behavioral key: code bytes + call-shape fields. (A hash
-                // collision or shape mismatch just registers normally.)
-                if (std.mem.eql(u8, st.code, chunk.code) and st.arity == chunk.arity and st.strict_params == chunk.strict_params and st.local_count == chunk.local_count) {
+                if (contentEql(st, &chunk)) {
                     return .{ .id = existing, .reused = true };
                 }
             }

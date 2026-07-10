@@ -277,26 +277,19 @@ pub const Compiler = struct {
     /// (`fix disasm` naming), attribute its `chunk_name` to the id. `recordName`
     /// is a no-op unless naming is on, so this stays free on the hot path.
     pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
-        // Content-addressed dedup, but ONLY for chunks with no observable
-        // metadata: no locals/constants (fully parametric via upvalues, so
-        // byte-identical code is interchangeable) and no source map/positions/
-        // body span (so no error message or unsafeGetAttrPos result can point
-        // at a "wrong" but identical-looking occurrence).
-        if (ch.local_count == 0 and ch.constants.len == 0 and ch.function_args.len == 0 and
-            ch.attr_pos.len == 0 and ch.source_map.len == 0 and ch.body_span == null)
-        {
-            const r = try self.registry.registerDeduped(ch);
-            if (r.reused) {
-                var copy = ch;
-                copy.deinit(self.persistent);
-                return r.id; // first registration keeps its name/upvalue sidecar
-            }
-            try self.recordChunkSidecar(r.id, &ch);
-            return r.id;
+        // Content-addressed dedup over FULL structural equality (code, constant
+        // bits, side tables, source map, spans): field-equal chunks carry
+        // identical semantics AND identical diagnostics, so sharing one
+        // registration is observation-free. Folded-constant chunks self-exclude
+        // (their pool Values hold per-fold ObjectIds that never bit-match).
+        const r = try self.registry.registerDeduped(ch);
+        if (r.reused) {
+            var copy = ch;
+            copy.deinit(self.persistent);
+            return r.id; // first registration keeps its name/upvalue sidecar
         }
-        const id = try self.registry.register(ch);
-        try self.recordChunkSidecar(id, &ch);
-        return id;
+        try self.recordChunkSidecar(r.id, &ch);
+        return r.id;
     }
 
     /// The disasm-only naming/upvalue sidecar recording split out of
