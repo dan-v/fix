@@ -49,7 +49,7 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 **Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:d`/`:disasm EXPR`, `:env`, `:gc`.
 
-**`:d` — the disassembly browser.** Finds the chunk behind an expression (a closure or unforced thunk exposes its own chunk; otherwise the expression's compiled chunk) and opens it in an alternate-screen pager where every `chunk #N` mention is a link: Tab/Shift-Tab select, Enter follows, `b`/`f` walk the visit history, `r` shows a references page (outgoing + incoming, from a lazily built whole-registry reverse index), `/` + `n`/`N` search, `?` help. In bare mode `:d` prints the listing plus an outgoing-references footer.
+**`:d` — the disassembly browser.** Finds the chunk behind an expression (a closure or unforced thunk exposes its own chunk; otherwise the expression's compiled chunk) and opens it in an alternate-screen pager where every chunk mention (`chunk[0xN]` in listings, `chunk #N` on references pages) is a link: Tab/Shift-Tab select, Enter follows, `b`/`f` walk the visit history, `r` shows a references page (outgoing + incoming, from a lazily built whole-registry reverse index), `/` + `n`/`N` search, `?` help. In bare mode `:d` prints the listing plus an outgoing-references footer.
 
 ## Key flags
 
