@@ -121,8 +121,8 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     };
     // Cross-reference graph over the whole registry, so each chunk header can
     // list its incoming/outgoing chunk references. Best-effort: on failure we
-    // simply omit the section.
-    var ref_graph: ?bytecode.disasm.RefGraph = bytecode.disasm.RefGraph.build(ev.chunkRegistry(), symbols) catch null;
+    // simply omit the section. `--stats` never renders references.
+    var ref_graph: ?bytecode.disasm.RefGraph = if (options.disasm_stats) null else bytecode.disasm.RefGraph.build(ev.chunkRegistry(), symbols) catch null;
     defer if (ref_graph) |*g| g.deinit();
     const opts = bytecode.disasm.Options{
         .show_constants = !options.disasm_no_constants,
@@ -153,7 +153,9 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     const writer = &stream.interface;
 
     const write_err: ?anyerror = blk: {
-        if (options.disasm_eval and options.disasm_chunk == null) {
+        if (options.disasm_stats) {
+            bytecode.disasm.writeStats(writer, ev.chunkRegistry(), symbols) catch |e| break :blk e;
+        } else if (options.disasm_eval and options.disasm_chunk == null) {
             dumpAll(writer, &ev, symbols, opts) catch |e| break :blk e;
         } else {
             bytecode.disasm.writeChunk(writer, target_id, target_chunk.?, symbols, opts) catch |e| break :blk e;

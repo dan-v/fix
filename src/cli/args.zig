@@ -158,6 +158,8 @@ pub const Options = struct {
     /// compiled (follows imports and lazy attr bodies), instead of statically
     /// compiling the top expression only.
     disasm_eval: bool = false,
+    /// `fix disasm --stats`: print corpus statistics instead of a listing.
+    disasm_stats: bool = false,
     source: ?SourceArg = null,
     vm_trace_path: ?[:0]const u8 = null,
     vm_trace_format: enum { text, binary } = .text,
@@ -275,6 +277,7 @@ const Opt = enum {
     no_bytes,
     no_pager,
     disasm_eval,
+    disasm_stats,
     // Internal perf/trace knobs (hidden from help, still parsed everywhere).
     workers,
     vm_trace,
@@ -392,6 +395,7 @@ const specs = [_]Spec{
 
     // Disasm.
     .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (imports + whatever evaluation forces)", .show_in = &.{.disasm} },
+    .{ .id = .disasm_stats, .long = "--stats", .help = "print corpus statistics (sizes, categories, reuse,\ncompressibility) instead of a disassembly", .show_in = &.{.disasm} },
     .{ .id = .chunk, .long = "--chunk", .arg = .req, .metavar = "N", .help = "disassemble only chunk N (decimal or 0x hex, as\nshown in chunk headers; default: all reachable)", .show_in = &.{.disasm} },
     .{ .id = .no_recurse, .long = "--no-recurse", .help = "only show the top chunk", .show_in = &.{.disasm} },
     .{ .id = .no_bytes, .long = "--no-bytes", .help = "omit the raw bytecode hex column", .show_in = &.{.disasm} },
@@ -585,6 +589,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .no_bytes => options.disasm_no_bytes = true,
         .no_pager => options.disasm_no_pager = true,
         .disasm_eval => options.disasm_eval = true,
+        .disasm_stats => options.disasm_stats = true,
 
         .workers => options.workers = std.fmt.parseInt(u8, v0.?, 10) catch return error.InvalidWorkers,
         .vm_trace => options.vm_trace_path = v0 orelse "-",
