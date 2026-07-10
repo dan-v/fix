@@ -118,15 +118,14 @@ pub fn emitSetCellLocal(self: *Compiler, slot: u16) !void {
 
 const StoreTarget = enum { narrow_local, narrow_cell };
 
-/// Rewrite a just-emitted `thunk` / `thunk_eag` op
-/// into the fused `*_store_local` / `*_store_cell_local` variant by
-/// appending the destination slot byte. Saves the push/pop of the
+/// Rewrite a just-emitted `thunk`-family op into the fused `*_st`/`*_st_cell`
+/// variant by appending the destination slot byte. Saves the push/pop of the
 /// new thunk reference plus one dispatch.
 ///
-/// Only fuses for 1-byte slots (`loc_set`/`cell_set`, not
-/// the `_long` forms); ~all let-bindings fit. Only the short-chunk-id
-/// variants of `thunk` are fused — `_long` is rare and
-/// adding it would double the opcode count without a meaningful win.
+/// Only fuses for 1-byte slots (`loc_set`/`cell_set`, not the `_w` forms);
+/// ~all let-bindings fit. Both chunk-id widths fuse: past 65,536 registered
+/// chunks (any real NixOS eval) the wide encoding is the DOMINANT form, not
+/// the rare one.
 fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
     if (slot > std.math.maxInt(u8)) return false;
     const offset = self.builder.last_op_offset orelse return false;
@@ -141,6 +140,14 @@ fn fuseStoreToSlot(self: *Compiler, slot: u16, target: StoreTarget) !bool {
         .thunk_eag => switch (target) {
             .narrow_local => .thunk_eag_st,
             .narrow_cell => .thunk_eag_st_cell,
+        },
+        .thunk_w => switch (target) {
+            .narrow_local => .thunk_w_st,
+            .narrow_cell => .thunk_w_st_cell,
+        },
+        .thunk_eag_w => switch (target) {
+            .narrow_local => .thunk_eag_w_st,
+            .narrow_cell => .thunk_eag_w_st_cell,
         },
         else => return false,
     };

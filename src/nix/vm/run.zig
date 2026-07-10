@@ -705,74 +705,41 @@ fn opThunkCapturesEagerLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize,
     return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
 }
 
-fn opThunkCapturesStoreCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-    // Slot byte is at end of operand. Pop value just pushed, publish
-    // into cell at slot.
-    const slot_offset = descriptors_start + descriptor_len;
-    const slot = code[slot_offset];
-    const val = stack.pop(vm);
-    const cell_val = vm.stack[frame.frame_base + slot];
-    if (!cell_val.isThunk()) return error.TypeError;
-    vm.heap.getThunkAssumeValid(cell_val.asObjectId()).publishCellBinding(val);
-    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
-    return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
-}
-
-fn opThunkCapturesStoreLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-    const slot_offset = descriptors_start + descriptor_len;
-    const slot = code[slot_offset];
-    stack.setStack(vm, frame.frame_base + slot, stack.pop(vm));
-    return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
-}
-
-fn opThunkCapturesEagerStoreCellLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
-    const slot_offset = descriptors_start + descriptor_len;
-    const slot = code[slot_offset];
-    const val = stack.pop(vm);
-    const cell_val = vm.stack[frame.frame_base + slot];
-    if (!cell_val.isThunk()) return error.TypeError;
-    vm.heap.getThunkAssumeValid(cell_val.asObjectId()).publishCellBinding(val);
-    vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
-    return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
-}
-
-fn opThunkCapturesEagerStoreLocal(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
-    const slot_offset = descriptors_start + descriptor_len;
-    const slot = code[slot_offset];
-    stack.setStack(vm, frame.frame_base + slot, stack.pop(vm));
-    return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
+/// Shared implementation of the fused thunk+store family: create the thunk
+/// from the (narrow or wide) chunk id + inline descriptors, then bind the
+/// popped value into the slot — directly (`loc_set`) or by publishing into
+/// the slot's cell (`cell_set`).
+fn thunkStoreOp(comptime wide: bool, comptime eager: bool, comptime cell: bool) fn (*VM, *Frame, []const u8, usize, usize) anyerror!void {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const id_len: usize = if (wide) 4 else 2;
+            const ch_id: u32 = if (wide) readU32(code, ip) else readU16(code, ip);
+            const upvalue_count = readU16(code, ip + id_len);
+            const descriptors_start = ip + id_len + 2;
+            const descriptor_len = @as(usize, upvalue_count) * 3;
+            if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+            const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+            if (eager) {
+                try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
+            } else {
+                try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
+            }
+            // Slot byte is at the end of the operand; bind the just-pushed thunk.
+            const slot_offset = descriptors_start + descriptor_len;
+            const slot = code[slot_offset];
+            const val = stack.pop(vm);
+            if (cell) {
+                const cell_val = vm.stack[frame.frame_base + slot];
+                if (!cell_val.isThunk()) return error.TypeError;
+                vm.heap.getThunkAssumeValid(cell_val.asObjectId()).publishCellBinding(val);
+                vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
+            } else {
+                stack.setStack(vm, frame.frame_base + slot, val);
+            }
+            return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
+        }
+    }.op;
 }
 
 // ---- handlers: calls ----
@@ -1245,10 +1212,14 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.thunk_w)] = opThunkCapturesLong;
     table[@intFromEnum(OpCode.thunk_eag)] = opThunkCapturesEager;
     table[@intFromEnum(OpCode.thunk_eag_w)] = opThunkCapturesEagerLong;
-    table[@intFromEnum(OpCode.thunk_st_cell)] = opThunkCapturesStoreCellLocal;
-    table[@intFromEnum(OpCode.thunk_st)] = opThunkCapturesStoreLocal;
-    table[@intFromEnum(OpCode.thunk_eag_st_cell)] = opThunkCapturesEagerStoreCellLocal;
-    table[@intFromEnum(OpCode.thunk_eag_st)] = opThunkCapturesEagerStoreLocal;
+    table[@intFromEnum(OpCode.thunk_st_cell)] = thunkStoreOp(false, false, true);
+    table[@intFromEnum(OpCode.thunk_st)] = thunkStoreOp(false, false, false);
+    table[@intFromEnum(OpCode.thunk_eag_st_cell)] = thunkStoreOp(false, true, true);
+    table[@intFromEnum(OpCode.thunk_eag_st)] = thunkStoreOp(false, true, false);
+    table[@intFromEnum(OpCode.thunk_w_st_cell)] = thunkStoreOp(true, false, true);
+    table[@intFromEnum(OpCode.thunk_w_st)] = thunkStoreOp(true, false, false);
+    table[@intFromEnum(OpCode.thunk_eag_w_st_cell)] = thunkStoreOp(true, true, true);
+    table[@intFromEnum(OpCode.thunk_eag_w_st)] = thunkStoreOp(true, true, false);
     table[@intFromEnum(OpCode.call)] = opCall;
     table[@intFromEnum(OpCode.call_tail)] = opTailCall;
     table[@intFromEnum(OpCode.call_n)] = opCallN;

@@ -179,6 +179,17 @@ pub const OpCode = enum(u8) {
     thunk_eag_st_cell,
     /// Fused `thunk_eag + loc_set`.
     thunk_eag_st,
+    /// Wide-chunk-id forms of the fused thunk+store family. Past 65,536
+    /// registered chunks (any real NixOS eval) every later chunk reference
+    /// uses the wide encoding, so these carry the fusion win to the dominant
+    /// form. Operand: chunk_id:4 + K:2 + 3K descriptors + slot:1.
+    thunk_w_st_cell,
+    /// Fused `thunk_w + loc_set`.
+    thunk_w_st,
+    /// Fused `thunk_eag_w + cell_set`.
+    thunk_eag_w_st_cell,
+    /// Fused `thunk_eag_w + loc_set`.
+    thunk_eag_w_st,
 
     // ---- calls ----
     /// Call the top-of-stack closure with the value below it as argument.

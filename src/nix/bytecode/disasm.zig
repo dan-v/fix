@@ -795,7 +795,7 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
 /// Whether a chunk-id-carrying op uses the wide (u32) id form.
 fn chunkIdWide(op: OpCode) bool {
     return switch (op) {
-        .closure_w, .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg => true,
+        .closure_w, .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => true,
         else => false,
     };
 }
@@ -868,7 +868,7 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
 fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
     const code = chunk.code;
     switch (op) {
-        .closure, .closure_w, .closure_cap, .closure_cap_w, .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
+        .closure, .closure_w, .closure_cap, .closure_cap_w, .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
             const wide = chunkIdWide(op);
             const id_len: u16 = if (wide) 4 else 2;
             const id: ChunkId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
@@ -1230,7 +1230,7 @@ fn writeOperandTail(
             // The last descriptor closes both the list (level 1) and the block.
             try emitCaptureDescriptors(writer, code, &off, n, seq, g[0..2], 0b11, up_names, symbols, stripe, env);
         },
-        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
+        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
             try emitCountLine(writer, code, &off, "captures", seq, g[0..1], 0, stripe, env);
@@ -1374,6 +1374,10 @@ fn isMultiline(op: OpCode) bool {
         .thunk_st_cell,
         .thunk_eag_st,
         .thunk_eag_st_cell,
+        .thunk_w_st,
+        .thunk_w_st_cell,
+        .thunk_eag_w_st,
+        .thunk_eag_w_st_cell,
         .attrs_new_pos,
         .attrs_new_pos_srt,
         .thunk_defer,
@@ -1627,9 +1631,10 @@ fn writeOperands(
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
             try referenced_chunks.put(std.heap.page_allocator, id, {});
         },
-        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => {
-            const id: ChunkId = @intCast(readU16(code, ip));
-            ip += 2;
+        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
+            const wide = chunkIdWide(op);
+            const id: ChunkId = if (wide) readU32(code, ip) else @intCast(readU16(code, ip));
+            ip += if (wide) @as(usize, 4) else 2;
             const upvalues = readU16(code, ip);
             ip += 2;
             const desc_len = @as(usize, upvalues) * 3;
@@ -2027,7 +2032,7 @@ fn isAggregateOp(op: OpCode) bool {
 
 fn isThunkFamilyOp(op: OpCode) bool {
     return switch (op) {
-        .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
+        .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_shell, .thunk_defer, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell, .closure, .closure_w, .closure_cap, .closure_cap_w => true,
         else => false,
     };
 }
