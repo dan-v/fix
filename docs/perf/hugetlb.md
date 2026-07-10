@@ -32,8 +32,11 @@ sudo sysctl vm.nr_hugepages=2048        # 4 GB pool of 2 MB pages
 ```
 
 (Persist in `/etc/sysctl.d/`; allocate early after boot — a fragmented
-machine may not be able to assemble the pages later.) ~2 GB comfortably
-covers a NixOS-toplevel eval's hugetlb take (~1.6 GB peak, ~85% of heap).
+machine may not be able to assemble the pages later.) A NixOS-toplevel
+eval reserves ~2.1 GB of pool at peak (~1.6 GB actually faulted — the rest
+is block-cache class-size rounding plus one flat-store grow-ahead chunk),
+so a 4 GB pool (`2048`) leaves comfortable headroom; undersizing is safe
+(overflow falls back to normal pages) but gives up part of the win.
 
 ## Modes
 
