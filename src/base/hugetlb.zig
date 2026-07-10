@@ -190,30 +190,51 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
     return mem.ptr;
 }
 
-/// Overlay `[addr, addr+len)` — 2 MB-aligned, a 2 MB multiple — with reserved
-/// hugetlb pages (MAP_FIXED atomically replaces the existing mapping there).
-/// The flat store uses this to grow its huge prefix ahead of the bump cursor;
-/// the caller must guarantee the range holds no live data (a replaced
-/// mapping's contents are discarded). Returns false (existing mapping left
-/// intact — a failed MAP_FIXED mmap changes nothing) when the pool can't
-/// serve the reservation.
-pub fn mapFixed(addr: [*]u8, len: usize) bool {
+/// Overlay `[target, target+len)` — 2 MB-aligned, a 2 MB multiple — with
+/// reserved hugetlb pages. The flat store uses this to grow its huge prefix
+/// ahead of the bump cursor; the caller must guarantee the range holds no
+/// live data (the replaced mapping's contents are discarded).
+///
+/// Two-step on purpose — the obvious single `mmap(MAP_FIXED|MAP_HUGETLB)`
+/// is NOT atomic on failure: the kernel unmaps the target range *before*
+/// attempting the hugetlb reservation, so pool exhaustion leaves a hole,
+/// and even repairing the hole immediately is racy — between the failed
+/// mmap and the repair, a concurrent thread's plain `mmap(NULL, ...)` (the
+/// backing page allocator) can be placed *inside* the hole; the repair then
+/// clobbers that foreign block and its later munmap blows a hole in the
+/// caller's region (observed as a mid-run SIGSEGV under pool drain).
+/// Instead:
+///   1. `map(len)` at a kernel-chosen address — pool exhaustion fails HERE,
+///      with zero side effects on any existing mapping;
+///   2. `mremap(MAYMOVE|FIXED)` the fresh mapping onto the target — a
+///      single syscall under mmap_lock, so no userspace-visible window
+///      where the target is unmapped.
+/// On any failure the target range is left exactly as it was (best-effort
+/// re-assert on the vanishingly-rare post-unmap mremap failure) and false
+/// is returned.
+pub fn overlayFixed(target: [*]u8, len: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
-    std.debug.assert(@intFromPtr(addr) % HUGE_PAGE == 0 and len % HUGE_PAGE == 0 and len > 0);
-    const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(addr);
+    std.debug.assert(@intFromPtr(target) % HUGE_PAGE == 0 and len % HUGE_PAGE == 0 and len > 0);
+    const src = map(len) orelse return false; // sole failure mode under pool exhaustion
+    const rc = std.os.linux.mremap(src, len, len, .{ .MAYMOVE = true, .FIXED = true }, target);
+    if (std.os.linux.errno(rc) == .SUCCESS and rc == @intFromPtr(target)) return true;
+    // mremap failed (kernel VMA bookkeeping ENOMEM — not pool pressure).
+    // Give the reservation back and make sure the target is a mapping, not
+    // a hole: MREMAP_FIXED unmaps the target before moving, and a failure
+    // after that point would leave it unmapped. Re-asserting a plain
+    // NORESERVE mapping is idempotent when the target is still intact
+    // (no live data by the caller's contract).
+    unmap(src, len);
+    const aligned: [*]align(std.heap.page_size_min) u8 = @alignCast(target);
     _ = std.posix.mmap(
         aligned,
         len,
         .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .HUGETLB = true, .FIXED = true },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true, .FIXED = true },
         -1,
         0,
-    ) catch {
-        noteFallback();
-        return false;
-    };
-    noteMapped(len);
-    return true;
+    ) catch @panic("hugetlb: cannot restore mapping after failed overlay move");
+    return false;
 }
 
 /// Unmap a region obtained from `map` (`rounded_len` = the 2 MB-rounded

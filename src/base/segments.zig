@@ -676,7 +676,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
                 return;
             }
             const basep: [*]u8 = @ptrCast(self.base);
-            if (hugetlb.mapFixed(basep + self.huge_frontier, target - self.huge_frontier)) {
+            if (hugetlb.overlayFixed(basep + self.huge_frontier, target - self.huge_frontier)) {
                 self.huge_frontier = target;
                 if (target == HUGE_LIMIT) self.huge_grow_off = true;
             } else {
