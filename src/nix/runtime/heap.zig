@@ -1933,19 +1933,6 @@ pub const ObjectHeap = struct {
         return self.addAttrsFromStackPairsImpl(pairs, &.{}, false);
     }
 
-    pub fn addAttrsFromStackPairsWithPositions(
-        self: *ObjectHeap,
-        pairs: []const Value,
-        positions: []const AttrPosEntry,
-    ) !ObjectId {
-        return self.addAttrsFromStackPairsImpl(pairs, positions, false);
-    }
-
-    /// `attrs_new_srt` fast path: the compiler guarantees the pairs
-    /// are already in ascending interned-name order with no duplicates
-    /// (static attrset literals are grouped — duplicates rejected — and
-    /// emitted name-sorted at compile time), so the per-construction
-    /// sort + duplicate scan is skipped. Debug builds re-verify.
     /// Build an attrset from parallel (names, values): names are compile-time
     /// interned ids in ascending order with no duplicates (the attrs_new_named*
     /// contract); values are the N stack slots. Positions arrive pre-sorted.
@@ -1967,6 +1954,11 @@ pub const ObjectHeap = struct {
         return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
     }
 
+    /// `attrs_new_srt` fast path: the compiler guarantees the pairs
+    /// are already in ascending interned-name order with no duplicates
+    /// (static attrset literals are grouped — duplicates rejected — and
+    /// emitted name-sorted at compile time), so the per-construction
+    /// sort + duplicate scan is skipped. Debug builds re-verify.
     pub fn addAttrsFromStackPairsSorted(
         self: *ObjectHeap,
         pairs: []const Value,

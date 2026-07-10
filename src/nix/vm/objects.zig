@@ -23,17 +23,9 @@ pub fn buildAttrs(self: *VM, count: u16) !void {
     try stack.push(self, Value.attrs(id));
 }
 
-pub fn buildAttrsWithPositions(self: *VM, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
-    const value_count: u32 = @as(u32, count) * 2;
-    const start = self.sp - value_count;
-    const id = try self.heap.addAttrsFromStackPairsWithPositions(self.stack[start..self.sp], positions);
-    self.sp = start;
-    try stack.push(self, Value.attrs(id));
-}
-
-/// `attrs_new_srt(_with_pos)`: pairs are compile-time sorted by
-/// interned name and duplicate-free — skip the construction sort.
-/// `attrs_new_named*`: names from the chunk side table, values on the stack.
+/// `attrs_new_named*`: entries are compile-time sorted by interned name and
+/// duplicate-free — skip the construction sort. Names come from the chunk
+/// side table, values are the top `count` stack slots.
 pub fn buildAttrsNamedSorted(self: *VM, names: []const u32, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
     const start = self.sp - count;
     const id = try self.heap.addAttrsFromValuesSorted(names, self.stack[start..self.sp], positions);

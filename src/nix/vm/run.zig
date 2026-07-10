@@ -462,36 +462,11 @@ fn opBuildAttrs(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth:
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
-fn opBuildAttrsWithPos(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    return buildAttrsWithPosImpl(vm, frame, code, ip, stop_depth, false);
-}
-
 fn opBuildAttrsSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const count = readU16(code, ip);
     try objects.buildAttrsSorted(vm, count, &.{});
     return dispatch(vm, frame, code, ip + 2, stop_depth);
-}
-
-fn opBuildAttrsWithPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    return buildAttrsWithPosImpl(vm, frame, code, ip, stop_depth, true);
-}
-
-inline fn buildAttrsWithPosImpl(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize, comptime presorted: bool) anyerror!void {
-    frame.ip = ip;
-    const count = readU16(code, ip);
-    const pos_count = readU16(code, ip + 2);
-    const pos_start = readU32(code, ip + 4);
-    // Records live in the chunk's side table — passed through as a slice, no
-    // per-record decode from the code stream.
-    const table = frame.chunk_ptr.attr_pos;
-    if (pos_start + pos_count > table.len) return error.InvalidBytecode;
-    const positions = table[pos_start .. pos_start + pos_count];
-    if (comptime presorted)
-        try objects.buildAttrsSorted(vm, count, positions)
-    else
-        try objects.buildAttrsWithPositions(vm, count, positions);
-    return dispatch(vm, frame, code, ip + 8, stop_depth);
 }
 
 fn opBuildAttrsNamedSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -1217,9 +1192,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .jump_false => opJumpIfFalse,
         .fail => opFailAssertion,
         .attrs_new => opBuildAttrs,
-        .attrs_new_pos => opBuildAttrsWithPos,
         .attrs_new_srt => opBuildAttrsSorted,
-        .attrs_new_pos_srt => opBuildAttrsWithPosSorted,
         .attrs_new_named_srt => opBuildAttrsNamedSorted,
         .attrs_new_named_pos_srt => opBuildAttrsNamedPosSorted,
         .list_new => opBuildList,

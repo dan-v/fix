@@ -897,23 +897,6 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             if (chunkNameOf(symbols, id)) |name| l.tint(name_color, " {s}", .{name});
             return id_len;
         },
-        .attrs_new_pos, .attrs_new_pos_srt => {
-            // Each raw count and its mention in the comment share a color.
-            const entries = readU16(code, start + 1);
-            const positions = readU16(code, start + 3);
-            const c_e = hueColor(seq.*);
-            const c_p = hueColor(seq.* + 1);
-            seq.* += 2;
-            l.groupPinned(1, 2, c_e, "#{d}", .{entries});
-            l.glue(" ", .{});
-            l.groupPinned(3, 2, c_p, "#{d}", .{positions});
-            l.comment();
-            l.tint(c_e, "{d}", .{entries});
-            l.glue(" entries, ", .{});
-            l.tint(c_p, "{d}", .{positions});
-            l.glue(" positions", .{});
-            return 4;
-        },
         .attrs_new_named_srt, .attrs_new_named_pos_srt => {
             const entries = readU16(code, start + 1);
             const c_e = hueColor(seq.*);
@@ -1347,52 +1330,6 @@ fn writeOperandTail(
                 try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == count - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
             }
         },
-        .attrs_new_pos, .attrs_new_pos_srt => {
-            // Entry/position counts rode the mnemonic line; the side-table
-            // start u32 is this op's one remaining operand row. The records
-            // themselves live in the chunk's attr_pos side table, not the
-            // code stream — one row per record, no byte column, name/file/
-            // line/col in identity colors.
-            const pos_count = readU16(code, off - 2);
-            const pos_start = readU32(code, off);
-            {
-                const c = hueColor(seq.*);
-                seq.* += 1;
-                var l: Line = undefined;
-                l.reset();
-                l.groupPinned(0, 4, c, "#{d}", .{pos_start});
-                l.comment();
-                l.glue("records[", .{});
-                l.tint(c, "{d}..{d}", .{ pos_start, pos_start + pos_count });
-                l.glue("]", .{});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
-            }
-            const table = chunk.attr_pos;
-            var k: usize = 0;
-            while (k < pos_count) : (k += 1) {
-                if (pos_start + k >= table.len) break;
-                const rec = table[pos_start + k];
-                const c_nm = internColor(rec.name);
-                const c_fl = internColor(rec.pos.file);
-                var esc: [128]u8 = undefined;
-                var ew: std.Io.Writer = .fixed(&esc);
-                if (symbols.internName(rec.name)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l: Line = undefined;
-                l.reset();
-                l.storeRef("str", c_nm, "0x{x}", .{rec.name});
-                l.glue(" → ", .{});
-                l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
-                l.comment();
-                l.glue("@ ", .{});
-                if (symbols.internName(rec.pos.file)) |f| {
-                    l.tint(c_fl, "{s}", .{std.fs.path.basename(f)});
-                } else {
-                    l.storeRef("file", c_fl, "0x{x}", .{rec.pos.file});
-                }
-                l.glue(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
-                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == pos_count - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
-            }
-        },
         .thunk_defer => {
             const n = readU16(code, off);
             g[1] = hueColor(seq.*);
@@ -1465,8 +1402,6 @@ fn isMultiline(op: OpCode) bool {
         .thunk_w_st_cell,
         .thunk_eag_w_st,
         .thunk_eag_w_st_cell,
-        .attrs_new_pos,
-        .attrs_new_pos_srt,
         .attrs_new_named_srt,
         .attrs_new_named_pos_srt,
         .thunk_defer,
@@ -1676,14 +1611,6 @@ fn writeOperands(
             const n = readU16(code, ip);
             ip += 2;
             try writer.print("#{d} ; {d} entries", .{ n, n });
-        },
-        .attrs_new_pos, .attrs_new_pos_srt => {
-            const n = readU16(code, ip);
-            ip += 2;
-            const pos_count = readU16(code, ip);
-            ip += 2;
-            ip += 4; // side-table start index
-            try writer.print("#{d} #{d} ; {d} entries, {d} positions", .{ n, pos_count, n, pos_count });
         },
         .attrs_new_named_srt => {
             const n = readU16(code, ip);
@@ -2133,7 +2060,7 @@ fn isConstOp(op: OpCode) bool {
 
 fn isAggregateOp(op: OpCode) bool {
     return switch (op) {
-        .attrs_new, .attrs_new_srt, .attrs_new_pos, .attrs_new_pos_srt, .attrs_new_named_srt, .attrs_new_named_pos_srt, .list_new => true,
+        .attrs_new, .attrs_new_srt, .attrs_new_named_srt, .attrs_new_named_pos_srt, .list_new => true,
         else => false,
     };
 }
@@ -2244,7 +2171,7 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
             if (isAggregateOp(op)) has_agg = true;
             if (isThunkFamilyOp(op)) has_thunk = true;
             switch (op) {
-                .attrs_new_pos, .attrs_new_pos_srt => pos_sites += 1,
+                .attrs_new_named_pos_srt => pos_sites += 1,
                 .attrs_new, .attrs_new_srt => {
                     if (code.len == 5 and readU16(code, start + 1) == 0) empty_attrs_chunks += 1;
                 },

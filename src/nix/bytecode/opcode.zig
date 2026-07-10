@@ -81,19 +81,12 @@ pub const OpCode = enum(u8) {
     /// Operand: 2-byte count of entries.
     /// Stack layout from lower to higher indexes: [name1, val1, ..., nameN, valN].
     attrs_new,
-    /// Build an attribute set from pairs on the stack and attach source positions.
-    /// Operand: 2-byte count, 2-byte source-position count, then repeated
-    /// 4-byte name InternId, 4-byte file InternId, 4-byte line, 4-byte column.
-    attrs_new_pos,
     /// `attrs_new`, but the compiler guarantees the pairs are already on
     /// the stack in ascending interned-name order with no duplicates —
     /// static attrset literals are grouped (duplicates rejected at compile
     /// time) and emitted name-sorted, so the runtime skips the
     /// per-construction sort + duplicate scan. Operand: 2-byte count.
     attrs_new_srt,
-    /// `attrs_new_pos` with the same compile-time sorted+unique
-    /// guarantee as `attrs_new_srt`. Operands as `attrs_new_pos`.
-    attrs_new_pos_srt,
     /// `attrs_new_srt` with the attr NAMES in the chunk's side table instead
     /// of pushed as string constants: the stack carries only the N values,
     /// and names come from `Chunk.attr_names[names_start..names_start+N]`
