@@ -277,13 +277,37 @@ pub const Compiler = struct {
     /// (`fix disasm` naming), attribute its `chunk_name` to the id. `recordName`
     /// is a no-op unless naming is on, so this stays free on the hot path.
     pub fn registerChunk(self: *Compiler, ch: chunk.Chunk) !types.ChunkId {
+        // Content-addressed dedup, but ONLY for chunks with no observable
+        // metadata: no locals/constants (fully parametric via upvalues, so
+        // byte-identical code is interchangeable) and no source map/positions/
+        // body span (so no error message or unsafeGetAttrPos result can point
+        // at a "wrong" but identical-looking occurrence).
+        if (ch.local_count == 0 and ch.constants.len == 0 and ch.function_args.len == 0 and
+            ch.attr_pos.len == 0 and ch.source_map.len == 0 and ch.body_span == null)
+        {
+            const r = try self.registry.registerDeduped(ch);
+            if (r.reused) {
+                var copy = ch;
+                copy.deinit(self.persistent);
+                return r.id; // first registration keeps its name/upvalue sidecar
+            }
+            try self.recordChunkSidecar(r.id, &ch);
+            return r.id;
+        }
         const id = try self.registry.register(ch);
+        try self.recordChunkSidecar(id, &ch);
+        return id;
+    }
+
+    /// The disasm-only naming/upvalue sidecar recording split out of
+    /// `registerChunk` so both the deduped and plain paths share it.
+    fn recordChunkSidecar(self: *Compiler, id: types.ChunkId, ch: *const chunk.Chunk) !void {
         if (self.registry.capture_names) {
             var name = self.chunk_name;
             // Pure forwarders (`foo = <up>foo` module-arg plumbing) read as
             // `name→up` — the arrow marks "returns that upvalue" without
             // implying an attr path. Nameless forwarders become `→up`.
-            if (forwarderSlot(&ch)) |slot| {
+            if (forwarderSlot(ch)) |slot| {
                 if (slot < self.captures.items.len) {
                     const raw = self.intern.get(self.captures.items[slot].name_id);
                     const up_txt = if (raw.len > 0 and raw[0] == 0) raw[1..] else raw;
@@ -320,7 +344,6 @@ pub const Compiler = struct {
             for (self.captures.items, names) |cap, *n| n.* = cap.name_id;
             try self.registry.recordUpvalueNames(id, names);
         }
-        return id;
     }
 
     pub fn deinit(self: *Compiler) void {

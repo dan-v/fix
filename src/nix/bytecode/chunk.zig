@@ -11,6 +11,7 @@ const Value = @import("runtime").value.Value;
 const AttrEntry = @import("runtime").heap.AttrEntry;
 const AttrPosEntry = @import("runtime").heap.AttrPosEntry;
 const stable = @import("base").segments;
+const sync = @import("base").sync;
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -585,6 +586,13 @@ pub const ChunkRegistry = struct {
     /// How many chunks already claimed each base name, so `recordName` callers
     /// can uniquify duplicates with a `~N` suffix.
     name_uses: std.AutoHashMapUnmanaged(types.InternId, u32) = .empty,
+    /// Content-addressed dedup of metadata-free parametric chunks (no locals,
+    /// no constants, no source map/positions): byte-identical code is
+    /// semantically interchangeable, so re-registrations reuse the first id
+    /// (the generalization of the hand-picked WellKnownChunks). Guarded by its
+    /// own mutex — deferred-body compiles register from worker fibers.
+    dedup_mu: sync.SpinMutex = .{},
+    dedup: std.AutoHashMapUnmanaged(u64, ChunkId) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -671,6 +679,7 @@ pub const ChunkRegistry = struct {
         while (it.next()) |v| self.allocator.free(v.*);
         self.upvalue_names.deinit(self.allocator);
         self.name_uses.deinit(self.allocator);
+        self.dedup.deinit(self.allocator);
     }
 
     /// Assert the unsynchronized sidecar maps are only ever touched from a
@@ -754,6 +763,33 @@ pub const ChunkRegistry = struct {
         call: *const fn (ctx: *anyopaque, path_id: types.InternId) void,
     };
     pub var path_const_sink: ?PathConstSink = null;
+
+    /// Register `chunk`, reusing an existing byte-identical registration when
+    /// possible (see `dedup`). Returns the id and whether it was reused — a
+    /// reused id means the caller must deinit its own copy of `chunk`.
+    pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk) !struct { id: ChunkId, reused: bool } {
+        const h = std.hash.Wyhash.hash(0, chunk.code);
+        {
+            self.dedup_mu.lock();
+            defer self.dedup_mu.unlock();
+            if (self.dedup.get(h)) |existing| {
+                const st = self.get(existing).?;
+                // Full behavioral key: code bytes + call-shape fields. (A hash
+                // collision or shape mismatch just registers normally.)
+                if (std.mem.eql(u8, st.code, chunk.code) and st.arity == chunk.arity and st.strict_params == chunk.strict_params and st.local_count == chunk.local_count) {
+                    return .{ .id = existing, .reused = true };
+                }
+            }
+        }
+        const id = try self.register(chunk);
+        self.dedup_mu.lock();
+        defer self.dedup_mu.unlock();
+        // First writer wins; a concurrent racer's extra copy stays registered
+        // but unreferenced by future lookups (benign).
+        const gop = try self.dedup.getOrPut(self.allocator, h);
+        if (!gop.found_existing) gop.value_ptr.* = id;
+        return .{ .id = id, .reused = false };
+    }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
         const stored = try self.allocator.create(Chunk);
