@@ -53,7 +53,9 @@ fn disassemble(ev: *Evaluator, source: []const u8) !Disassembly {
     errdefer lines.deinit(testing.allocator);
     var it = std.mem.splitScalar(u8, text, '\n');
     var idx: usize = 0;
-    while (it.next()) |line| : (idx += 1) {
+    while (it.next()) |raw_line| : (idx += 1) {
+        // Every body line starts with the chunk left-margin guide "│ "; strip it.
+        const line = if (std.mem.startsWith(u8, raw_line, "│ ")) raw_line["│ ".len..] else raw_line;
         // Instruction lines are "  xxxx  opname<spaces...>operands"; every
         // other line (headers, constants, blanks) starts differently.
         if (line.len < 8 or line[0] != ' ' or line[1] != ' ') continue;
