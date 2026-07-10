@@ -272,6 +272,9 @@ test "parseMemorySize accepts bare-MiB and k/m/g suffixes, rejects junk" {
 /// Mark all GC roots into `tr` (without draining). See docs/plans/gc-plan.md.
 pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     if (ev.builtins_value) |b| tr.markValue(&ev.heap, b);
+    // Caller-held external roots (repl scope bindings / last results —
+    // values alive between evaluations with no VM holding them).
+    for (ev.gc_extra_roots.items) |v| tr.markValue(&ev.heap, v);
     // Every worker's fibers' VM stack/frames/upvalues. At a stop-the-
     // world every live worker is parked at a safepoint, so its fiber
     // list is stable and its fibers' VMs hold that worker's roots. The

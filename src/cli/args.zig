@@ -104,6 +104,10 @@ pub const Options = struct {
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
     color: cli.When = .auto,
     progress: cli.When = .auto,
+    /// `fix repl --bare`: plain line-based input (no raw mode, no escape
+    /// sequences), regardless of whether stdin/stdout are a terminal. The
+    /// non-tty repl path is always bare; this forces it for automation.
+    bare: bool = false,
     show_trace: bool = false,
     derivation_debug: derivation_debug.Options = .{},
     /// `fix build --no-link`/`--no-out-link`: skip creating the result symlink.
@@ -267,6 +271,8 @@ const Opt = enum {
     debug_derivation_drv,
     max_memory,
     help,
+    // Repl.
+    bare,
     // Shell.
     packages,
     // Disasm.
@@ -390,6 +396,8 @@ const specs = [_]Spec{
     .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = derivation_debug_cmds },
     .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only.", .show_in = eval_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
+
+    .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
 
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
 
@@ -578,6 +586,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .debug_derivation_drv => options.derivation_debug.drv_path = v0.?,
         .max_memory => options.max_memory = eval_gc.parseMemorySize(v0.?) orelse return error.InvalidMaxMemory,
         .help => return error.Help,
+
+        .bare => options.bare = true,
 
         .packages => unreachable, // handled in the parse loop
 

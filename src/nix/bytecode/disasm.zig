@@ -78,7 +78,7 @@ pub const RefGraph = struct {
         while (id < n) : (id += 1) {
             const chunk = registry.get(id) orelse continue;
             refs.clearRetainingCapacity();
-            collectRefs(chunk, symbols, &refs, &scratch) catch continue;
+            collectRefsInto(chunk, symbols, &refs, &scratch) catch continue;
             var it = refs.iterator();
             while (it.next()) |e| {
                 const t = e.key_ptr.*;
@@ -110,7 +110,7 @@ pub const RefGraph = struct {
 /// Walk a chunk's bytecode, collecting every chunk id it references. Reuses
 /// `writeOperands` (into a throwaway buffer) so the operand-length and
 /// chunk-extraction logic lives in exactly one place.
-fn collectRefs(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHashMapUnmanaged(ChunkId, void), scratch: *std.Io.Writer.Allocating) !void {
+fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHashMapUnmanaged(ChunkId, void), scratch: *std.Io.Writer.Allocating) !void {
     var ip: usize = 0;
     while (ip < chunk.code.len) {
         const op_byte = chunk.code[ip];
@@ -151,6 +151,26 @@ pub fn writeChunk(
     var visited: Visited = .empty;
     defer visited.deinit(std.heap.smp_allocator);
     try writeChunkAt(writer, chunk_id, chunk, symbols, options, 0, &visited);
+}
+
+/// Collect the chunk ids this chunk references (closure/thunk/apply
+/// operands), in first-appearance order, deduplicated. Thin adapter over
+/// `collectRefsInto` (the operand decoder run with a throwaway buffer) so
+/// the decode logic exists once. Used by the repl's disasm browser to build
+/// the reference graph.
+pub fn collectRefs(
+    allocator: std.mem.Allocator,
+    chunk: *const Chunk,
+    out: *std.ArrayListUnmanaged(ChunkId),
+) !void {
+    const a = std.heap.smp_allocator;
+    var referenced: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
+    defer referenced.deinit(a);
+    var scratch: std.Io.Writer.Allocating = .init(a);
+    defer scratch.deinit();
+    try collectRefsInto(chunk, .{}, &referenced, &scratch);
+    try out.ensureUnusedCapacity(allocator, referenced.count());
+    for (referenced.keys()) |id| out.appendAssumeCapacity(id);
 }
 
 fn writeChunkAt(

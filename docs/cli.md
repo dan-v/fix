@@ -32,6 +32,25 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compile
 
 Note: `derivation-debug` is **not** a subcommand — derivation records are filtered/rendered inline via the `--debug-derivation*` flags below. See [derivation/model.md](derivation/model.md).
 
+## The repl
+
+`fix repl` (`src/cli/repl.zig` + `src/cli/repl/`) has two strictly separated modes, decided once at startup:
+
+- **Interactive** — stdin *and* stdout are a tty and `--bare` was not given. A hand-rolled raw-mode line editor: emacs-style editing (C-a/C-e/C-k/C-u/C-w/C-y + kill ring, M-b/M-f word motion), persistent history (`$XDG_STATE_HOME/fix/repl-history`, multiline entries round-trip) with C-r incremental search, Tab completion, bracketed paste (pasted text never triggers completion or submission), SIGWINCH-aware minimal-repaint rendering, and C-z suspend/resume. Raw mode is restored on **every** exit path — orderly return, panic (SIGABRT), fatal signal — via a saved-termios global + chained signal handlers (`repl/term.zig`).
+- **Bare** — `--bare`, or any non-tty end: a plain read-a-line loop with zero escape sequences (prompts only when stdin is a tty), for pipes and expect-style automation. Lines still accumulate until they parse as a complete expression, so multiline scripts pipe fine.
+
+**Smart-enter.** Enter submits only when the input parses as a complete expression (the real parser decides: an error at EOF means "more is coming"); otherwise it opens a continuation line (`...>` prompt). Alt-Enter submits as-is; C-o inserts a newline. Multiline history entries recall as multiline; Up/Down move within lines before browsing history.
+
+**Completion (Tab).** Readline model: common prefix first, candidate menu on the second Tab. Sources by context: `:` commands; scope bindings + keywords + globally-visible builtins for bare identifiers; attribute paths (`foo.ba<TAB>`) resolved through **already-forced** values only — the completer never starts evaluation; file paths inside string/path literals.
+
+**Scope.** `name = expr` binds; the last printed value is `it`; `:l PATH` merges a file's attrset into scope (auto-calling a top-level function with `{}`); `:r` reloads. Inputs compile inside an ambient scope attrset (the `scopedImport` mechanism), so bound values are *shared*, never re-evaluated.
+
+**GC.** On a `-Dgc` build, a collection runs between inputs (`Evaluator.collectNow`: the standard STW barrier driven from outside an evaluation), so session memory tracks the live bindings rather than accreting. Repl-held values are precise GC roots (`Evaluator.gcSetExternalRoots` → `gc_extra_roots` in the root set). `:gc` collects on demand and reports reserved bytes.
+
+**Commands** (`:?` shows this table in-repl): `:?`/`:help`, `:q`/`:quit`/`:exit`, `:l`/`:load PATH`, `:r`/`:reload`, `:t`/`:type EXPR`, `:p`/`:print EXPR` (deep-force), `:i`/`:inspect EXPR` (kind, thunk state + backing chunk, closure chunk/arity), `:d`/`:disasm EXPR`, `:env`, `:gc`.
+
+**`:d` — the disassembly browser.** Finds the chunk behind an expression (a closure or unforced thunk exposes its own chunk; otherwise the expression's compiled chunk) and opens it in an alternate-screen pager where every `chunk #N` mention is a link: Tab/Shift-Tab select, Enter follows, `b`/`f` walk the visit history, `r` shows a references page (outgoing + incoming, from a lazily built whole-registry reverse index), `/` + `n`/`N` search, `?` help. In bare mode `:d` prints the listing plus an outgoing-references footer.
+
 ## Key flags
 
 The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it drives parsing *and* per-command `--help` visibility (each spec lists the subcommands it applies to). Defaults shown; `[=X]` means the value is optional.
@@ -65,6 +84,7 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--debug-derivation-filter TEXT` | only derivations whose name/path/input mentions TEXT |
 | `--debug-derivation-name NAME` | only the derivation with exactly NAME |
 | `--debug-derivation-drv PATH` | only the derivation with exactly PATH |
+| `--bare` (repl) | plain line-based input: no editor, no escape sequences — for pipes and expect-style automation |
 
 ### Store links & realization (`instantiate`/`build`/`run`/`shell`)
 

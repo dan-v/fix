@@ -174,6 +174,11 @@ pub const Evaluator = struct {
     /// `eval/gc.zig:memoryBudget`. Set by the CLI before evaluation;
     /// ignored by non-`-Dgc` builds.
     max_memory_bytes: ?u64 = null,
+    /// GC (`-Dgc`): caller-held root values (the repl's scope bindings and
+    /// last results live outside any VM between evaluations). Marked by
+    /// `markRoots`; replaced wholesale via `gcSetExternalRoots`.
+    gc_extra_roots: if (gc.enabled) std.ArrayListUnmanaged(Value) else void =
+        if (gc.enabled) .empty else {},
     /// Speculative import prefetch state (`FIX_IMPORT_PREFETCH`).
     prefetch: Prefetch = .{},
 
@@ -202,7 +207,6 @@ pub const Evaluator = struct {
 
         var registry = try ChunkRegistry.init(allocator);
         errdefer registry.deinit();
-
 
         const gc_workers = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
@@ -294,6 +298,7 @@ pub const Evaluator = struct {
         if (comptime gc.enabled) {
             self.gc_tracer.deinit();
             self.gc_import_vms.deinit(self.allocator);
+            self.gc_extra_roots.deinit(self.allocator);
             self.allocator.free(self.gc_workers);
         }
         if (self.base_path) |path| self.allocator.free(path);
@@ -466,6 +471,13 @@ pub const Evaluator = struct {
         return self.parseAndCompile(source, self.base_path, source_path, null);
     }
 
+    /// `compileSource` with an ambient scope attrset (see
+    /// `evaluateWithScope`). The repl's `:disasm` compiles expressions that
+    /// reference repl bindings through this.
+    pub fn compileSourceScoped(self: *Evaluator, source: []const u8, scope: ?Value) !ChunkId {
+        return self.parseAndCompile(source, self.base_path, null, scope);
+    }
+
     /// Parse + compile + register, returning the compiled chunk id.
     /// Shared by `compileSource` (public, no eval) and `evaluateSource`
     /// (the internal eval entrypoint that runs the chunk afterwards).
@@ -629,6 +641,12 @@ pub const Evaluator = struct {
         return &self.intern;
     }
 
+    /// The `builtins` attrset, built on first use. Single-threaded callers
+    /// only (the repl's completer wants it before the first evaluation).
+    pub fn builtinsValue(self: *Evaluator) !Value {
+        return self.ensureBuiltins();
+    }
+
     /// Read-only access to the chunk registry for tools.
     pub fn chunkRegistry(self: *const Evaluator) *const ChunkRegistry {
         return &self.registry;
@@ -670,13 +688,26 @@ pub const Evaluator = struct {
     /// Compile source text into bytecode and evaluate it.
     /// This is the main public API.
     pub fn evaluate(self: *Evaluator, source: []const u8) !Value {
-        return self.evaluatePath(source, null);
+        return self.evaluateTop(source, null, null);
     }
 
     /// `evaluate`, attributing the top-level source to `source_path` — source
     /// spans and the disasm file sidecar then carry the entry file's name, the
     /// same way imported files do. Used by `fix disasm --eval`.
     pub fn evaluatePath(self: *Evaluator, source: []const u8, source_path: ?[]const u8) !Value {
+        return self.evaluateTop(source, source_path, null);
+    }
+
+    /// Like `evaluate`, but compiles the source inside an ambient scope
+    /// attrset (identifiers not otherwise bound resolve from `scope`, the
+    /// same mechanism as `builtins.scopedImport`). The repl uses this to
+    /// make its bindings visible. `scope` is baked into the compiled
+    /// chunk's constants, which are GC roots.
+    pub fn evaluateWithScope(self: *Evaluator, source: []const u8, scope: ?Value) !Value {
+        return self.evaluateTop(source, null, scope);
+    }
+
+    fn evaluateTop(self: *Evaluator, source: []const u8, source_path: ?[]const u8, scope: ?Value) !Value {
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only
@@ -743,8 +774,10 @@ pub const Evaluator = struct {
         // Not routed through `evaluateSource`: its top-level detection is
         // `source_path == null`, so passing the path there would send the
         // top-level eval down the nested-import path (wrong fiber). Attribute
-        // the source at compile time, then run on the main worker as usual.
-        const chunk_id = try self.parseAndCompile(source, self.base_path, source_path, null);
+        // the source at compile time (and bake `scope` into the chunk's
+        // constants, the repl's ambient-scope mechanism), then run on the
+        // main worker as usual.
+        const chunk_id = try self.parseAndCompile(source, self.base_path, source_path, scope);
         const subject = source_path orelse "expression";
         self.progressBegin(.evaluate, subject);
         defer self.progressEnd(.evaluate, subject);
@@ -769,13 +802,14 @@ pub const Evaluator = struct {
         self.progressBegin(.evaluate, subject);
         defer self.progressEnd(.evaluate, subject);
         timeline.instant(.evaluate, subject);
-        // Only the top-level eval (no scope, no source_path) goes
-        // through a main-thread fiber so the main thread can yield on
-        // a `.busy` thunk; nested invocations (imports, scoped
-        // imports) run synchronously on the existing fiber's stack —
-        // they share the outer VM's claim identity via the default
-        // placeholder claimer that `initVm` hands out.
-        if (scope == null and source_path == null) {
+        // Only a top-level eval (no source_path — a plain or repl-scoped
+        // entry) goes through a main-thread fiber so the main thread can
+        // yield on a `.busy` thunk; nested invocations (imports, scoped
+        // imports — which always carry the imported file's path) run
+        // synchronously on the existing fiber's stack — they share the
+        // outer VM's claim identity via the default placeholder claimer
+        // that `initVm` hands out.
+        if (source_path == null) {
             return self.runChunkOnMainWorker(chunk_id);
         }
         // Per-import scratch arena: the nested VM's run-path allocations
@@ -1130,6 +1164,61 @@ pub const Evaluator = struct {
     fn gcCollectThunk(ctx: *anyopaque, collector_id: u8) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         eval_gc.collect(self, collector_id);
+    }
+
+    /// GC (`-Dgc`): replace the caller-held external root set (see
+    /// `gc_extra_roots`). The repl passes its scope attrset + loose values
+    /// here whenever they change; they stay rooted until replaced. No-op
+    /// (and no allocation) in non-gc builds.
+    pub fn gcSetExternalRoots(self: *Evaluator, roots: []const Value) !void {
+        if (comptime !gc.enabled) return;
+        self.gc_extra_roots.clearRetainingCapacity();
+        try self.gc_extra_roots.appendSlice(self.allocator, roots);
+    }
+
+    pub const CollectNowResult = struct {
+        /// False when the collector is compiled out, disabled by policy
+        /// (`--max-memory=0` / `FIX_GC_OFF`), or nothing has run yet.
+        ran: bool,
+        reserved_before: u64,
+        reserved_after: u64,
+    };
+
+    /// GC (`-Dgc`): run a stop-the-world collection right now, from outside
+    /// any evaluation — the repl's between-inputs reclaim. Drives the same
+    /// barrier + hook sequence as the in-eval safepoint (vm/force.zig): win
+    /// the collector race, park every worker, collect, release. The first
+    /// call arms reclaim tracking (`armLazy` — everything already allocated
+    /// becomes the untracked old floor); later calls run real minors.
+    ///
+    /// Callable only between evaluations (no fiber may be mid-flight on the
+    /// calling thread); helpers park at their safepoints as in any STW.
+    pub fn collectNow(self: *Evaluator) CollectNowResult {
+        var result: CollectNowResult = .{
+            .ran = false,
+            .reserved_before = self.heap.totalReservedBytes(),
+            .reserved_after = self.heap.totalReservedBytes(),
+        };
+        if (comptime !gc.enabled) return result;
+        // No hook yet (nothing evaluated) or reclaim disabled by policy
+        // (threshold never armed): nothing to do.
+        if (self.main_worker == null) return result;
+        if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
+        if (!self.scheduler.gcTryBeginCollection()) return result;
+        self.scheduler.gcWaitAllParked(0);
+        // Invalidate the token-keyed thread-local caches (thunk memo, attr
+        // IC) BEFORE marking: they root the previous evaluation's hottest
+        // values (markRoots must treat current-token entries as live), but
+        // between evaluations they are semantically dead — without this the
+        // last input's whole result graph gets promoted instead of freed.
+        // Safe here: the world is stopped. In-eval collections instead bump
+        // the token after the sweep (`afterCollect`).
+        self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
+        heap_gc.runCollect(&self.heap, 0);
+        self.scheduler.gcEndCollection(0);
+        result.ran = true;
+        result.reserved_after = self.heap.totalReservedBytes();
+        return result;
     }
 
     /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
