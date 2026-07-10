@@ -1,6 +1,40 @@
 const std = @import("std");
 const std_testing = std.testing;
 const renderForTest = @import("../test_helpers.zig").renderForTest;
+const Evaluator = @import("../../eval.zig").Evaluator;
+
+/// Evaluate `source` as if it lived at `file_path` (relative path literals
+/// resolve against the file's dir, like Nix), deep-force, render.
+fn renderResolvedForTest(ev: *Evaluator, source: []const u8) ![]u8 {
+    const result = try ev.evaluatePath(source, "/test/fold.nix");
+    try ev.forceDeep(result);
+    var out: std.Io.Writer.Allocating = .init(std_testing.allocator);
+    defer out.deinit();
+    try ev.writeValue(&out.writer, result);
+    return out.toOwnedSlice();
+}
+
+test "non-interpolated path literals fold inside closed attrset and list literals" {
+    // A path literal resolves at compile time (against the base path), so
+    // path-bearing attrset/list literals are closed constants and fold
+    // whole. The folded values must match what runtime construction would
+    // produce.
+    var ev = try Evaluator.init(std_testing.allocator, 0);
+    defer ev.deinit();
+    try ev.setBasePathToFileDir("/test/fold.nix");
+
+    const folded = try renderResolvedForTest(&ev, "{ rel = ./sub/file.nix; abs = /abs/dir; all = [ ./a.nix /b ]; }");
+    defer std_testing.allocator.free(folded);
+    try std_testing.expect(std.mem.indexOf(u8, folded, "rel = /test/sub/file.nix") != null);
+    try std_testing.expect(std.mem.indexOf(u8, folded, "abs = /abs/dir") != null);
+    try std_testing.expect(std.mem.indexOf(u8, folded, "all = [ /test/a.nix /b ]") != null);
+
+    // Interpolated path literals are excluded from the fold but must still
+    // resolve to the same path at runtime.
+    const dynamic = try renderResolvedForTest(&ev, "let d = \"sub\"; in [ ./${d}/file.nix ]");
+    defer std_testing.allocator.free(dynamic);
+    try std_testing.expectEqualStrings("[ /test/sub/file.nix ]", dynamic);
+}
 
 test "baseNameOf and dirOf reject non-path non-string arguments" {
     try std_testing.expectError(error.TypeError, renderForTest("builtins.baseNameOf 1"));

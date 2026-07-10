@@ -1237,3 +1237,103 @@ test "chunk registry get returns null for an out-of-range id" {
 
     try std.testing.expect(registry.get(std.math.maxInt(ChunkId)) == null);
 }
+
+/// Small chunk for the dedup tests: `push_const <const_val>; ret; halt` with
+/// a body span on `line`, so a test can vary exactly one semantic ingredient
+/// (constant bits / span) at a time.
+fn buildDedupTestChunk(allocator: std.mem.Allocator, const_val: i64, line: u32) !Chunk {
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    try builder.emitConstant(allocator, Value.int(const_val));
+    try builder.writeOp(allocator, .ret);
+    try builder.writeOp(allocator, .halt);
+    builder.body_span = .{ .file = null, .offset = 0, .len = 5, .line = line, .column = 1 };
+    return builder.finish(allocator, 0);
+}
+
+test "chunk dedup: structurally identical registrations share one id" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1));
+    try std.testing.expect(!first.reused);
+
+    var copy = try buildDedupTestChunk(allocator, 7, 1);
+    const second = try registry.registerDeduped(copy);
+    try std.testing.expect(second.reused);
+    try std.testing.expectEqual(first.id, second.id);
+    // reused=true ⇒ the registry kept the first registration; the caller
+    // still owns (and must free) its own copy.
+    copy.deinit(allocator);
+}
+
+test "chunk dedup: a differing constant or span is a distinct registration" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    const base = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1));
+    const other_const = try registry.registerDeduped(try buildDedupTestChunk(allocator, 8, 1));
+    const other_span = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 2));
+
+    try std.testing.expect(!other_const.reused);
+    try std.testing.expect(!other_span.reused);
+    try std.testing.expect(base.id != other_const.id);
+    try std.testing.expect(base.id != other_span.id);
+    try std.testing.expect(other_const.id != other_span.id);
+}
+
+test "chunk dedup: concurrent registrations converge (equal) and stay distinct (unique)" {
+    const allocator = std.testing.allocator;
+    var registry = try ChunkRegistry.init(allocator);
+    defer registry.deinit();
+
+    const thread_count = 8;
+    const iterations = 64;
+
+    var equal_ids: [thread_count][iterations]ChunkId = undefined;
+    var distinct_ids: [thread_count][iterations]ChunkId = undefined;
+
+    const Worker = struct {
+        fn run(reg: *ChunkRegistry, alloc: std.mem.Allocator, t_idx: usize, equal_out: []ChunkId, distinct_out: []ChunkId) void {
+            for (equal_out, distinct_out, 0..) |*e, *d, i| {
+                // Same content on every thread and iteration: every
+                // registration must resolve to ONE converged id, whichever
+                // thread's shard-map insert won the race (`registerDeduped`
+                // returns the winner even for the losing racer).
+                var equal = buildDedupTestChunk(alloc, 4242, 1) catch @panic("chunk build failed");
+                const re = reg.registerDeduped(equal) catch @panic("registerDeduped failed");
+                if (re.reused) equal.deinit(alloc);
+                e.* = re.id;
+
+                // Per-(thread, iteration) unique constant: never merged.
+                var distinct = buildDedupTestChunk(alloc, @intCast(t_idx * 100_000 + i), 1) catch @panic("chunk build failed");
+                const rd = reg.registerDeduped(distinct) catch @panic("registerDeduped failed");
+                if (rd.reused) distinct.deinit(alloc);
+                d.* = rd.id;
+            }
+        }
+    };
+
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &registry, allocator, i, &equal_ids[i], &distinct_ids[i] });
+    }
+    for (&threads) |t| t.join();
+
+    const converged = equal_ids[0][0];
+    for (equal_ids) |row| {
+        for (row) |id| try std.testing.expectEqual(converged, id);
+    }
+
+    var seen: std.AutoHashMapUnmanaged(ChunkId, void) = .empty;
+    defer seen.deinit(allocator);
+    for (distinct_ids) |row| {
+        for (row) |id| {
+            try std.testing.expect(id != converged);
+            const gop = try seen.getOrPut(allocator, id);
+            try std.testing.expect(!gop.found_existing);
+        }
+    }
+}

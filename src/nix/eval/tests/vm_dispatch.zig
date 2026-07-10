@@ -407,6 +407,92 @@ test "pushFrame surfaces StackOverflow when locals exceed remaining capacity" {
     try testing.expectError(error.StackOverflow, stack.pushFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null));
 }
 
+// ---- fused thunk+store super-ops (thunkStoreOp) ----
+//
+// The compiler only reaches the wide (`thunk_w_*`) forms past 65,536
+// registered chunks, so eval-level tests can't exercise them; hand-built
+// bytecode can — the wide encoding is legal for any chunk id.
+
+test "thunk_w_st creates a thunk from a wide chunk id and stores it into a local slot" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Body: upvalue[0] + 2 — deliberately NOT a trivial shape, so a real
+    // thunk is created and the fused op exercises the wide-id decode, the
+    // capture-descriptor walk, and the local store.
+    var body = try ChunkBuilder.init(testing.allocator);
+    defer body.deinit(testing.allocator);
+    try body.writeOp(testing.allocator, .up_get);
+    try body.writeU16(testing.allocator, 0);
+    try body.emitConstant(testing.allocator, Value.int(2));
+    try body.writeOp(testing.allocator, .int_add);
+    try body.writeOp(testing.allocator, .ret);
+    try body.writeOp(testing.allocator, .halt);
+    const body_id = try h.ev.registry.register(try body.finish(testing.allocator, 0));
+
+    // Main (locals: [thunk_dst, captured_int]):
+    //   push_const 40; loc_set 1
+    //   thunk_w_st body_id:4 K=1 (kind=local, idx=1) slot=0
+    //   loc_get 0   -- forces the stored thunk
+    //   ret
+    var main_b = try ChunkBuilder.init(testing.allocator);
+    defer main_b.deinit(testing.allocator);
+    try main_b.emitConstant(testing.allocator, Value.int(40));
+    try main_b.writeOp(testing.allocator, .loc_set);
+    try main_b.writeByte(testing.allocator, 1);
+    try main_b.writeOp(testing.allocator, .thunk_w_st);
+    try main_b.writeU32(testing.allocator, body_id);
+    try main_b.writeU16(testing.allocator, 1);
+    try main_b.writeByte(testing.allocator, 0); // descriptor kind: local
+    try main_b.writeU16(testing.allocator, 1); // descriptor index
+    try main_b.writeByte(testing.allocator, 0); // destination slot (trailing byte)
+    try main_b.writeOp(testing.allocator, .loc_get);
+    try main_b.writeByte(testing.allocator, 0);
+    try main_b.writeOp(testing.allocator, .ret);
+    const ch = try main_b.finish(testing.allocator, 2);
+    const chunk_id = try h.ev.registry.register(ch);
+
+    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null);
+    try testing.expect(result.isInt());
+    try testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
+test "thunk_w_st_cell publishes the thunk into a cell-initialized slot" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Body: 21 * 2 — non-trivial, no captures.
+    var body = try ChunkBuilder.init(testing.allocator);
+    defer body.deinit(testing.allocator);
+    try body.emitConstant(testing.allocator, Value.int(21));
+    try body.emitConstant(testing.allocator, Value.int(2));
+    try body.writeOp(testing.allocator, .int_mul);
+    try body.writeOp(testing.allocator, .ret);
+    try body.writeOp(testing.allocator, .halt);
+    const body_id = try h.ev.registry.register(try body.finish(testing.allocator, 0));
+
+    // Main: cell_init 0; thunk_w_st_cell body_id:4 K=0 slot=0; loc_get 0; ret
+    // — the fused op must publish through the cell binding (publishCellBinding),
+    // and forcing the cell must yield the body's value.
+    var main_b = try ChunkBuilder.init(testing.allocator);
+    defer main_b.deinit(testing.allocator);
+    try main_b.writeOp(testing.allocator, .cell_init);
+    try main_b.writeByte(testing.allocator, 0);
+    try main_b.writeOp(testing.allocator, .thunk_w_st_cell);
+    try main_b.writeU32(testing.allocator, body_id);
+    try main_b.writeU16(testing.allocator, 0);
+    try main_b.writeByte(testing.allocator, 0); // destination slot (trailing byte)
+    try main_b.writeOp(testing.allocator, .loc_get);
+    try main_b.writeByte(testing.allocator, 0);
+    try main_b.writeOp(testing.allocator, .ret);
+    const ch = try main_b.finish(testing.allocator, 1);
+    const chunk_id = try h.ev.registry.register(ch);
+
+    const result = try closures.runIsolatedFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null);
+    try testing.expect(result.isInt());
+    try testing.expectEqual(@as(i64, 42), result.asInt());
+}
+
 // ---- strings.zig: real logic (interned-string concatenation) ----
 
 const strings_mod = @import("vm").strings;

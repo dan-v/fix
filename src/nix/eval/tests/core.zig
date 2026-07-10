@@ -523,3 +523,26 @@ test "unsafeGetAttrPos reports file positions for file-attributed sources" {
     const v = try ev.evaluate("builtins.unsafeGetAttrPos \"email\" { email = \"e\"; }");
     try std.testing.expect(v.kind() == .null);
 }
+
+test "unsafeGetAttrPos reads positions from the attrs_new_named_pos_srt side table" {
+    // Multi-entry runtime-built attrset (non-constant values defeat the
+    // closed-literal fold): the names AND positions ride the chunk's
+    // attr_names/attr_pos side tables, not the code stream — each key's
+    // recorded position must round-trip through the (start, count) operand
+    // references.
+    const src =
+        "let mk = v: {\n" ++
+        "  alpha = toString v;\n" ++
+        "  beta = toString v;\n" ++
+        "  gamma = toString v;\n" ++
+        "}; in [\n" ++
+        "  (builtins.unsafeGetAttrPos \"alpha\" (mk 1))\n" ++
+        "  (builtins.unsafeGetAttrPos \"gamma\" (mk 2))\n" ++
+        "]";
+    const out = try helpers.renderPathForTest(src, "/test/side_table.nix");
+    defer std.testing.allocator.free(out);
+    // alpha is declared on line 2 and gamma on line 4 of the attrset body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "line = 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "line = 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file = \"/test/side_table.nix\"") != null);
+}
