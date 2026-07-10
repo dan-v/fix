@@ -51,6 +51,30 @@ pub fn writeChunk(
     try writeChunkAt(writer, chunk_id, chunk, symbols, options, 0);
 }
 
+/// Collect the chunk ids this chunk references (closure/thunk/apply
+/// operands), in first-appearance order, deduplicated. Reuses the operand
+/// decoder with a discarding writer so the decode logic exists once. Used
+/// by the repl's disasm browser to build the reference graph.
+pub fn collectRefs(
+    allocator: std.mem.Allocator,
+    chunk: *const Chunk,
+    out: *std.ArrayListUnmanaged(ChunkId),
+) !void {
+    var discard_buffer: [64]u8 = undefined;
+    var discard = std.Io.Writer.Discarding.init(&discard_buffer);
+    var referenced: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
+    defer referenced.deinit(std.heap.page_allocator);
+
+    var ip: usize = 0;
+    while (ip < chunk.code.len) {
+        const op: OpCode = @enumFromInt(chunk.code[ip]);
+        ip += 1;
+        ip = try writeOperands(&discard.writer, chunk, op, ip, .{}, &referenced);
+    }
+    var it = referenced.iterator();
+    while (it.next()) |entry| try out.append(allocator, entry.key_ptr.*);
+}
+
 fn writeChunkAt(
     writer: *std.Io.Writer,
     chunk_id: ?ChunkId,
@@ -186,13 +210,7 @@ fn writeOperands(
             try writer.print("upvalue[{d}]", .{slot});
         },
 
-        .add_int, .sub_int, .mul_int, .div_int, .negate_int,
-        .add_float, .sub_float, .mul_float, .div_float,
-        .eq, .neq, .eq_null, .neq_null, .lt, .lte, .gt, .gte, .not,
-        .fail_assertion, .push_builtins,
-        .merge_attrs, .merge_attrs_strict, .concat_lists,
-        .get_attr_dynamic,
-        .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
+        .add_int, .sub_int, .mul_int, .div_int, .negate_int, .add_float, .sub_float, .mul_float, .div_float, .eq, .neq, .eq_null, .neq_null, .lt, .lte, .gt, .gte, .not, .fail_assertion, .push_builtins, .merge_attrs, .merge_attrs_strict, .concat_lists, .get_attr_dynamic, .call, .tail_call, .make_cell, .make_lazy_shell, .ret, .halt => {},
 
         .call_n, .tail_call_n => {
             const n = code[ip];
