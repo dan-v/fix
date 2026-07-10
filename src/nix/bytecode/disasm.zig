@@ -158,6 +158,7 @@ fn writeChunkAt(
             // The header row carries only the opcode byte + mnemonic; each
             // operand becomes an indented child row below.
             if (options.show_bytes) try writeByteField(writer, insn[0..1], options.use_color);
+            try writer.writeByte(' '); // gap column between the bytes and the mnemonic
             try writeMnemonic(writer, op, options.use_color);
             if (span) |s| try writePosColumn(writer, s, options.use_color);
             try writeOperandFields(writer, chunk, op, start + 1, ip, operand_text, symbols, cc, options.show_bytes, options.use_color);
@@ -177,6 +178,7 @@ fn writeChunkAt(
                     }
                 }
             }
+            try writer.writeByte(' '); // gap column between the bytes and the mnemonic
             try writeMnemonic(writer, op, options.use_color);
             if (operand_text.len > 0) {
                 if (options.use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ opcol[0], opcol[1], opcol[2] });
@@ -384,6 +386,26 @@ fn writeGuide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
     }
 }
 
+/// Like `writeGuide` but a column wider — used for the operand-hierarchy guides
+/// so each nesting level is clearly indented (the chunk left margin stays thin).
+fn writeGuideWide(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
+    if (use_color) {
+        try writer.print("\x1b[38;2;{d};{d};{d}m│\x1b[0m  ", .{ rgb[0], rgb[1], rgb[2] });
+    } else {
+        try writer.writeAll("│  ");
+    }
+}
+
+/// The closing corner drawn for a group's last member — `⌊` (a full-height
+/// vertical with the foot at the bottom), so the gutter reads as ending.
+fn writeGuideCorner(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
+    if (use_color) {
+        try writer.print("\x1b[38;2;{d};{d};{d}m⌊\x1b[0m  ", .{ rgb[0], rgb[1], rgb[2] });
+    } else {
+        try writer.writeAll("⌊  ");
+    }
+}
+
 /// Render one operand line at `off` under `guides` (ancestor colors), then
 /// advance `off` past its bytes. Bytes stay in their fixed column (aligned under
 /// the opcode byte); the hierarchy guides sit in the mnemonic gutter to the
@@ -408,13 +430,20 @@ fn emitLine(writer: *std.Io.Writer, code: []const u8, off: *usize, line: *Line, 
                 if (pos < total) try writeByteCellColored(writer, code[base + pos], line.colorAt(pos), use_color) else try writer.writeAll("   ");
             }
         }
-        // The hierarchy gutter runs down every row EXCEPT the wrapped
-        // continuation rows of the group's last member — a guide shouldn't
-        // dangle past the last actual line just because a record has more bytes.
-        if (r == 0 or !last_in_group) {
-            for (guides) |gc| try writeGuide(writer, gc, use_color);
+        try writer.writeByte(' '); // gap column between the bytes and the gutter
+        // The hierarchy gutter: the last member closes with `└` on its content
+        // row and drops the guide on its wrapped continuation rows (a guide
+        // shouldn't dangle past the last actual line).
+        if (r > 0 and last_in_group) {
+            for (guides) |_| try writer.writeAll("   ");
         } else {
-            for (guides) |_| try writer.writeAll("  ");
+            for (guides, 0..) |gc, gi| {
+                if (r == 0 and last_in_group and gi + 1 == guides.len) {
+                    try writeGuideCorner(writer, gc, use_color);
+                } else {
+                    try writeGuideWide(writer, gc, use_color);
+                }
+            }
         }
         if (r != 0) continue; // continuation rows: bytes + gutter only
         for (line.toks[0..line.n]) |t| {
@@ -460,7 +489,7 @@ fn emitCaptureDescriptors(writer: *std.Io.Writer, code: []const u8, off: *usize,
         l.glue("[", .{});
         l.group(1, 2, "{d}", .{readU16(code, off.* + 1)});
         l.glue("]", .{});
-        try emitLine(writer, code, off, &l, seq, guides, false, cc, show_bytes, use_color);
+        try emitLine(writer, code, off, &l, seq, guides, k == n - 1, cc, show_bytes, use_color);
     }
 }
 
@@ -556,11 +585,11 @@ fn writeOperandFields(
                 l.glue("[{d}] ", .{k});
                 if (symbols.internName(nm)) |s| l.group(0, 4, "\"{s}\"", .{s}) else l.group(0, 4, "0x{x}", .{nm});
                 l.glue(" @ ", .{});
+                if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file 0x{x}", .{fl});
+                l.glue(":", .{});
                 l.group(8, 4, "{d}", .{ln});
                 l.glue(":", .{});
                 l.group(12, 4, "{d}", .{cl});
-                l.glue(" ", .{});
-                if (symbols.internName(fl)) |s| l.group(4, 4, "{s}", .{std.fs.path.basename(s)}) else l.group(4, 4, "file 0x{x}", .{fl});
                 try emitLine(writer, code, &off, &l, &seq, g[0..2], k == pos_count - 1, cc, show_bytes, use_color);
             }
         },
