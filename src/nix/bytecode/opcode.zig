@@ -94,6 +94,17 @@ pub const OpCode = enum(u8) {
     /// `attrs_new_pos` with the same compile-time sorted+unique
     /// guarantee as `attrs_new_srt`. Operands as `attrs_new_pos`.
     attrs_new_pos_srt,
+    /// `attrs_new_srt` with the attr NAMES in the chunk's side table instead
+    /// of pushed as string constants: the stack carries only the N values,
+    /// and names come from `Chunk.attr_names[names_start..names_start+N]`
+    /// (compile-time interned, sorted, unique). Saves a `push_const` op +
+    /// dispatch + constant-pool slot per entry — attr-name pushes were ~55%
+    /// of all push_const executions on a NixOS eval.
+    /// Operand: count:u16 + names_start:u32.
+    attrs_new_named_srt,
+    /// `attrs_new_named_srt` carrying source positions too.
+    /// Operand: count:u16 + names_start:u32 + pos_count:u16 + pos_start:u32.
+    attrs_new_named_pos_srt,
     /// Build a list from items on the stack.
     /// Operand: 2-byte count of items.
     list_new,

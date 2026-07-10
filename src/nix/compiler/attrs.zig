@@ -500,12 +500,15 @@ fn compilePlainAttrEntries(self: *Compiler, entries: []const AttrEntryView) anye
         }
     }
 
+    var names: std.ArrayListUnmanaged(InternId) = .empty;
+    defer names.deinit(self.allocator);
     for (order) |group_idx| {
+        try names.append(self.allocator, grouped.groups[group_idx].name_id);
         try compilePlainAttrGroup(self, &positions, grouped.groups[group_idx], defer_scope);
     }
 
     const count = try diagnostics.requireU16At(self, grouped.groups.len, attrEntriesDiagnosticAtom(entries), "too many attributes in set");
-    try emit.emitBuildAttrsSorted(self, count, positions.items);
+    try emit.emitBuildAttrsSorted(self, count, names.items, positions.items);
 }
 
 /// Index permutation of `groups` in ascending `name_id` order. Groups are
@@ -544,7 +547,6 @@ fn compilePlainAttrGroup(
     if (leaf == null) {
         // Tail-only group (`a.b = …`): the value is the `{ b = … }` thunk,
         // which the binding name `a` describes.
-        try emitAttrNameId(self, group.name_id);
         self.armName(group.name_id);
         try compileAttrEntriesThunk(self, group.tails, false);
         try appendAttrPosition(self, positions, group.first, group.name_id);
@@ -564,7 +566,6 @@ fn compilePlainAttrGroup(
             try reportDuplicateAttribute(self, entry.path[0], lead.path[0]);
             return error.DuplicateAttribute;
         }
-        try emitAttrNameId(self, group.name_id);
         self.armName(group.name_id);
         try compileExtendedAttrSetLiteralThunk(self, group.leaves, group.tails);
         try appendAttrPosition(self, positions, group.first, group.name_id);
@@ -579,7 +580,6 @@ fn compilePlainAttrGroup(
     // returns true for `.elided` via its else branch).
     if (defer_scope) |dscope| {
         if (leafDeferrable(leaf.?)) {
-            try emitAttrNameId(self, group.name_id);
             try deferLeaf(self, leaf.?.expr, group.name_id, dscope);
             try appendAttrPosition(self, positions, group.first, group.name_id);
             return;
@@ -591,7 +591,6 @@ fn compilePlainAttrGroup(
     // the eager parse would have produced.
     var body = leaf.?.expr;
     if (body.tag == .elided) body = try literals.materializeElided(self, body);
-    try emitAttrNameId(self, group.name_id);
     self.armName(group.name_id);
     try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
@@ -638,16 +637,18 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
     var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
     defer positions.deinit(self.allocator);
 
-    // Emit the (name, loc_grab) pairs in ascending interned-name
-    // order for `attrs_new_srt` — the cells were already declared
-    // and filled in source order above; this loop only reads locals, so
-    // its order is not observable.
+    // Emit the cell reads in ascending interned-name order for
+    // `attrs_new_named_srt` (names ride the side table) — the cells were
+    // already declared and filled in source order above; this loop only
+    // reads locals, so its order is not observable.
     const order = try sortedGroupOrder(self, groups);
     defer self.allocator.free(order);
 
+    var names: std.ArrayListUnmanaged(InternId) = .empty;
+    defer names.deinit(self.allocator);
     for (order) |group_idx| {
         const group = groups[group_idx];
-        try emitAttrNameId(self, group.name_id);
+        try names.append(self.allocator, group.name_id);
 
         const slot = scope.resolveLocalId(self, group.name_id) orelse return error.UndefinedVariable;
         try emit.emitCaptureLocal(self, slot);
@@ -655,7 +656,7 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
     }
 
     const count = try diagnostics.requireU16At(self, groups.len, attrGroupsDiagnosticAtom(groups), "too many attributes in set");
-    try emit.emitBuildAttrsSorted(self, count, positions.items);
+    try emit.emitBuildAttrsSorted(self, count, names.items, positions.items);
 }
 
 pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {

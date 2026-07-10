@@ -320,13 +320,16 @@ pub fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
     const source_path_id = try attrs.sourceFileId(self);
     const position = try diagnostics.sourcePositionForOffset(self, atom.offset);
 
-    try attrs.emitAttrNameId(self, file_id);
-    try self.builder.emitConstant(self.allocator, Value.string(source_path_id));
-    try attrs.emitAttrNameId(self, line_id);
-    try self.builder.emitConstant(self.allocator, Value.int(position.line));
-    try attrs.emitAttrNameId(self, column_id);
-    try self.builder.emitConstant(self.allocator, Value.int(position.column));
-    try emit.emitOpU16(self, .attrs_new, 3);
+    // Fully compile-time-known: materialize the { file, line, column } attrset
+    // once as a constant (chunk constants are permanent GC roots) instead of
+    // building it at every execution.
+    const entries = [_]heap_mod.AttrEntry{
+        .{ .name = column_id, .value = Value.int(@intCast(position.column)) },
+        .{ .name = file_id, .value = Value.string(source_path_id) },
+        .{ .name = line_id, .value = Value.int(@intCast(position.line)) },
+    };
+    const id = try self.heap.addAttrs(&entries);
+    try self.builder.emitConstant(self.allocator, Value.attrs(id));
 }
 
 pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {

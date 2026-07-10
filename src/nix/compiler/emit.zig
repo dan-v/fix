@@ -36,49 +36,28 @@ pub fn emitOpU32(self: *Compiler, op: OpCode, val: u32) !void {
     try self.builder.writeU32(self.allocator, val);
 }
 
-pub fn emitBuildAttrs(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
-    return emitBuildAttrsImpl(self, count, positions, false);
-}
-
-/// `emitBuildAttrs` for call sites that emitted their entry pairs in
-/// ascending interned-name order with compile-time duplicate rejection —
-/// emits the `_sorted` opcode variants so the runtime skips the
-/// per-construction sort + duplicate scan.
-pub fn emitBuildAttrsSorted(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry) !void {
-    return emitBuildAttrsImpl(self, count, positions, true);
-}
-
-fn emitBuildAttrsImpl(self: *Compiler, count: u16, positions: []const heap_mod.AttrPosEntry, comptime presorted: bool) !void {
+/// Build-attrs emission for STATIC sorted+unique literals: the attr names go
+/// to the chunk's side table (`attrs_new_named*`) and the stack carries only
+/// the N values — no per-entry `push_const` of the name, no pool slot.
+/// Positions (when present) ride the side table too.
+pub fn emitBuildAttrsSorted(self: *Compiler, count: u16, names: []const types.InternId, positions: []const heap_mod.AttrPosEntry) !void {
+    std.debug.assert(names.len == count);
+    if (count == 0) return emitOpU16(self, .attrs_new_srt, 0);
+    const names_start: u32 = @intCast(self.builder.attr_names.items.len);
+    try self.builder.attr_names.appendSlice(self.allocator, names);
     if (positions.len == 0) {
-        try emitOpU16(self, if (presorted) .attrs_new_srt else .attrs_new, count);
+        try emitOpU16(self, .attrs_new_named_srt, count);
+        try self.builder.writeU32(self.allocator, names_start);
         return;
     }
-
-    // Bake the positions pre-sorted by name. `findAttrPos` binary-
-    // searches by name and the attrs themselves are sorted by name at
-    // build time, so a name-sorted position block stays consistent —
-    // and the runtime `attrs_new_pos` op can then skip a sort it
-    // would otherwise pay on every execution (≈1.6% of all opcodes).
-    // Presorted call sites appended their positions in emit order, which
-    // IS name order — no dupe+sort needed.
-    const sorted = if (presorted) blk: {
-        std.debug.assert(std.sort.isSorted(heap_mod.AttrPosEntry, positions, {}, posNameLessThan));
-        break :blk positions;
-    } else blk: {
-        const dup = try self.allocator.dupe(heap_mod.AttrPosEntry, positions);
-        std.mem.sort(heap_mod.AttrPosEntry, dup, {}, posNameLessThan);
-        break :blk dup;
-    };
-    defer if (!presorted) self.allocator.free(@constCast(sorted));
-
-    // The records live in the chunk's side table (`Chunk.attr_pos`), NOT the
-    // code stream — the op carries a (start, count) reference. Inline records
-    // were 16 bytes/entry of cold data on the dispatch path (~38% of all
-    // emitted bytecode on a NixOS eval).
+    // Positions bake pre-sorted by name (presorted call sites append them in
+    // emit order, which IS name order); `findAttrPos` binary-searches.
+    std.debug.assert(std.sort.isSorted(heap_mod.AttrPosEntry, positions, {}, posNameLessThan));
     const pos_start: u32 = @intCast(self.builder.attr_pos.items.len);
-    try self.builder.attr_pos.appendSlice(self.allocator, sorted);
-    try emitOpU16(self, if (presorted) .attrs_new_pos_srt else .attrs_new_pos, count);
-    try self.builder.writeU16(self.allocator, try u16Count(sorted.len));
+    try self.builder.attr_pos.appendSlice(self.allocator, positions);
+    try emitOpU16(self, .attrs_new_named_pos_srt, count);
+    try self.builder.writeU32(self.allocator, names_start);
+    try self.builder.writeU16(self.allocator, try u16Count(positions.len));
     try self.builder.writeU32(self.allocator, pos_start);
 }
 

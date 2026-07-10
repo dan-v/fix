@@ -494,6 +494,29 @@ inline fn buildAttrsWithPosImpl(vm: *VM, frame: *Frame, code: []const u8, ip: us
     return dispatch(vm, frame, code, ip + 8, stop_depth);
 }
 
+fn opBuildAttrsNamedSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    const names_start = readU32(code, ip + 2);
+    const names = frame.chunk_ptr.attr_names;
+    if (names_start + count > names.len) return error.InvalidBytecode;
+    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, &.{});
+    return dispatch(vm, frame, code, ip + 6, stop_depth);
+}
+
+fn opBuildAttrsNamedPosSorted(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    const names_start = readU32(code, ip + 2);
+    const pos_count = readU16(code, ip + 6);
+    const pos_start = readU32(code, ip + 8);
+    const names = frame.chunk_ptr.attr_names;
+    const table = frame.chunk_ptr.attr_pos;
+    if (names_start + count > names.len or pos_start + pos_count > table.len) return error.InvalidBytecode;
+    try objects.buildAttrsNamedSorted(vm, names[names_start .. names_start + count], count, table[pos_start .. pos_start + pos_count]);
+    return dispatch(vm, frame, code, ip + 12, stop_depth);
+}
+
 fn opBuildList(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const count = readU16(code, ip);
@@ -1191,6 +1214,8 @@ const handlers: [opcode.count]HandlerFn = blk: {
     table[@intFromEnum(OpCode.attrs_new_pos)] = opBuildAttrsWithPos;
     table[@intFromEnum(OpCode.attrs_new_srt)] = opBuildAttrsSorted;
     table[@intFromEnum(OpCode.attrs_new_pos_srt)] = opBuildAttrsWithPosSorted;
+    table[@intFromEnum(OpCode.attrs_new_named_srt)] = opBuildAttrsNamedSorted;
+    table[@intFromEnum(OpCode.attrs_new_named_pos_srt)] = opBuildAttrsNamedPosSorted;
     table[@intFromEnum(OpCode.list_new)] = opBuildList;
     table[@intFromEnum(OpCode.attrs_merge_strict)] = opMergeAttrsStrict;
     table[@intFromEnum(OpCode.attrs_merge)] = opMergeAttrs;

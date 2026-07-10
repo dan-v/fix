@@ -895,6 +895,16 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue(" positions", .{});
             return 4;
         },
+        .attrs_new_named_srt, .attrs_new_named_pos_srt => {
+            const entries = readU16(code, start + 1);
+            const c_e = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 2, c_e, "#{d}", .{entries});
+            l.comment();
+            l.tint(c_e, "{d}", .{entries});
+            l.glue(" entries (named)", .{});
+            return 2;
+        },
         .thunk_defer => {
             const id = readU32(code, start + 1);
             l.group(1, 4, "#{d}", .{id});
@@ -1249,6 +1259,69 @@ fn writeOperandTail(
             l.glue("]", .{});
             try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
         },
+        .attrs_new_named_srt, .attrs_new_named_pos_srt => {
+            // Head took the count; remaining operands are the names start
+            // (u32) and, for the pos variant, pos_count:u16 + pos_start:u32.
+            const count = readU16(code, off - 2);
+            const names_start = readU32(code, off);
+            const has_pos = op == .attrs_new_named_pos_srt;
+            {
+                const c = hueColor(seq.*);
+                seq.* += 1;
+                var l = Line{};
+                l.groupPinned(0, 4, c, "#{d}", .{names_start});
+                l.comment();
+                l.glue("names[", .{});
+                l.tint(c, "{d}..{d}", .{ names_start, names_start + count });
+                l.glue("]", .{});
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
+            }
+            var pos_slice: []const @import("runtime").heap.AttrPosEntry = &.{};
+            if (has_pos) {
+                const pos_count = readU16(code, off);
+                const pos_start = readU32(code, off + 2);
+                const c = hueColor(seq.*);
+                seq.* += 1;
+                var l = Line{};
+                l.group(0, 2, "#{d}", .{pos_count});
+                l.glue(" ", .{});
+                l.groupPinned(2, 4, c, "#{d}", .{pos_start});
+                l.comment();
+                l.glue("positions[", .{});
+                l.tint(c, "{d}..{d}", .{ pos_start, pos_start + pos_count });
+                l.glue("]", .{});
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
+                if (pos_start + pos_count <= chunk.attr_pos.len) pos_slice = chunk.attr_pos[pos_start .. pos_start + pos_count];
+            }
+            const names = chunk.attr_names;
+            var k: usize = 0;
+            while (k < count) : (k += 1) {
+                if (names_start + k >= names.len) break;
+                const nm = names[names_start + k];
+                const c_nm = internColor(nm);
+                var esc: [128]u8 = undefined;
+                var ew: std.Io.Writer = .fixed(&esc);
+                if (symbols.internName(nm)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
+                var l = Line{};
+                l.storeRef("str", c_nm, "0x{x}", .{nm});
+                l.glue(" → ", .{});
+                l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
+                // Positions are name-sorted like the names — attach when present.
+                for (pos_slice) |rec| {
+                    if (rec.name != nm) continue;
+                    l.comment();
+                    l.glue("@ ", .{});
+                    if (symbols.internName(rec.pos.file)) |f| {
+                        l.tint(internColor(rec.pos.file), "{s}", .{std.fs.path.basename(f)});
+                    } else {
+                        l.storeRef("file", internColor(rec.pos.file), "0x{x}", .{rec.pos.file});
+                    }
+                    l.glue(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
+                    break;
+                }
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == count - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
+            }
+        },
         .attrs_new_pos, .attrs_new_pos_srt => {
             // Entry/position counts rode the mnemonic line; the side-table
             // start u32 is this op's one remaining operand row. The records
@@ -1364,6 +1437,8 @@ fn isMultiline(op: OpCode) bool {
         .thunk_eag_w_st_cell,
         .attrs_new_pos,
         .attrs_new_pos_srt,
+        .attrs_new_named_srt,
+        .attrs_new_named_pos_srt,
         .thunk_defer,
         .attr_check,
         .attr_check_w,
@@ -1579,6 +1654,17 @@ fn writeOperands(
             ip += 2;
             ip += 4; // side-table start index
             try writer.print("#{d} #{d} ; {d} entries, {d} positions", .{ n, pos_count, n, pos_count });
+        },
+        .attrs_new_named_srt => {
+            const n = readU16(code, ip);
+            ip += 6;
+            try writer.print("#{d} ; {d} entries (named)", .{ n, n });
+        },
+        .attrs_new_named_pos_srt => {
+            const n = readU16(code, ip);
+            const pc = readU16(code, ip + 6);
+            ip += 12;
+            try writer.print("#{d} #{d} ; {d} entries, {d} positions (named)", .{ n, pc, n, pc });
         },
         .list_new => {
             const n = readU16(code, ip);
@@ -2017,7 +2103,7 @@ fn isConstOp(op: OpCode) bool {
 
 fn isAggregateOp(op: OpCode) bool {
     return switch (op) {
-        .attrs_new, .attrs_new_srt, .attrs_new_pos, .attrs_new_pos_srt, .list_new => true,
+        .attrs_new, .attrs_new_srt, .attrs_new_pos, .attrs_new_pos_srt, .attrs_new_named_srt, .attrs_new_named_pos_srt, .list_new => true,
         else => false,
     };
 }

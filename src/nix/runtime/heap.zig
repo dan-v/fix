@@ -1946,6 +1946,27 @@ pub const ObjectHeap = struct {
     /// (static attrset literals are grouped — duplicates rejected — and
     /// emitted name-sorted at compile time), so the per-construction
     /// sort + duplicate scan is skipped. Debug builds re-verify.
+    /// Build an attrset from parallel (names, values): names are compile-time
+    /// interned ids in ascending order with no duplicates (the attrs_new_named*
+    /// contract); values are the N stack slots. Positions arrive pre-sorted.
+    pub fn addAttrsFromValuesSorted(
+        self: *ObjectHeap,
+        names: []const InternId,
+        values: []const Value,
+        positions: []const AttrPosEntry,
+    ) !ObjectId {
+        std.debug.assert(names.len == values.len);
+        const range = try self.reserveAttrsLocal(@intCast(names.len));
+        const entries = self.attrs.sliceMut(range);
+        for (entries, names, values) |*e, n, v| e.* = .{ .name = n, .value = v };
+        std.debug.assert(attrEntriesSortedUnique(entries));
+        if (positions.len == 0) return self.add(.{ .attrs = .{ .range = range } });
+        std.debug.assert(positionsSortedByName(positions));
+        const pos_range = try self.appendAttrPositions(positions);
+        errdefer self.attr_positions.rollback(pos_range);
+        return self.add(.{ .attrs = .{ .range = range, .positions = pos_range } });
+    }
+
     pub fn addAttrsFromStackPairsSorted(
         self: *ObjectHeap,
         pairs: []const Value,
