@@ -130,6 +130,19 @@ pub const DebugSession = struct {
         return self.frame(self.vm.frames_len - 1);
     }
 
+    /// The source text for frame `i` — the file it runs (from the FileCache),
+    /// or the entry `-e` source. Null if neither is available. The frame's span
+    /// (`frame(i).span`) offsets into this text. Used to show a code snippet at
+    /// the pause.
+    pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
+        const f = &self.vm.frames[i];
+        const span = bytecode.disasm.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debug_source;
+        if (span.file) |fid| {
+            return self.ev.files.readFile(self.ev.intern.get(fid)) catch self.ev.debug_source;
+        }
+        return self.ev.debug_source;
+    }
+
     /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).
     /// Names are not tracked per local, so callers index by slot.
     pub fn localCount(self: *const DebugSession, i: usize) usize {

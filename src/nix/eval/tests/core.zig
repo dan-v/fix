@@ -10,6 +10,23 @@ const renderStrictForTest = helpers.renderStrictForTest;
 const renderForTestFromCurrentPath = helpers.renderForTestFromCurrentPath;
 const renderXmlForTest = helpers.renderXmlForTest;
 
+test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.value_color = true;
+    const result = try ev.evaluate("{ n = 1; s = \"x\"; b = true; }");
+    try ev.forceDeep(result);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try ev.writeValue(&out.writer, result);
+    const text = out.written();
+    // Attr names cyan (36), numbers yellow (33), strings green (32), true magenta (35).
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[36mn\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[33m1\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[32m\"x\"\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[35mtrue\x1b[0m") != null);
+}
+
 test "writeValue prints lazy containers without forcing contents" {
     const list_output = try renderForTest("[ 1 (1 / 0) \"x\" ]");
     defer std.testing.allocator.free(list_output);

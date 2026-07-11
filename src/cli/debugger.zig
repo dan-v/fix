@@ -14,9 +14,17 @@
 const std = @import("std");
 const fix = @import("fix");
 const cli = @import("cli.zig");
+const syntax = @import("syntax");
 
 const DebugSession = fix.DebugSession;
 const Value = fix.Value;
+const TokenType = syntax.token.TokenType;
+
+// Syntax-highlight palette (matches the value-render palette in eval/print.zig).
+const col_keyword = "\x1b[35m"; // if/let/with/true/… — magenta
+const col_string = "\x1b[32m"; // strings, paths — green
+const col_number = "\x1b[33m"; // ints, floats — yellow
+const col_reset = "\x1b[0m";
 
 /// Returned from the console to unwind and abort the whole evaluation (`:q`).
 pub const AbortError = error.DebuggerAbort;
@@ -185,7 +193,10 @@ pub const Console = struct {
         try w.print("\n-- debugger ({s}) --", .{reason});
         try cli.reset(w, self.use_color);
         try w.writeByte('\n');
-        if (s.currentFrame()) |f| try self.writeFrameLine(w, s, 0, f, true);
+        if (s.currentFrame()) |f| {
+            try self.writeFrameLine(w, s, 0, f, true);
+            try self.sourceSnippet(w, s, f);
+        }
         // Only break/error carry a meaningful value; a line/step stop doesn't.
         if (s.reason == .break_builtin or s.reason == .eval_error) {
             try w.writeAll("value: ");
@@ -193,6 +204,73 @@ pub const Console = struct {
             try w.writeByte('\n');
         }
         try w.writeAll("type `help` for commands, `c` to continue.\n");
+    }
+
+    /// Print the source line at the current frame's span, syntax-highlighted,
+    /// with a caret underlining the span. One line of context each side. A
+    /// no-op when the source or span is unavailable (e.g. a spanless thunk).
+    fn sourceSnippet(self: *Console, w: *std.Io.Writer, s: *DebugSession, f: fix.DebugFrame) !void {
+        const span = f.span orelse return;
+        const text = s.frameSourceText(s.frameCount() - 1) orelse return;
+        if (span.offset >= text.len) return;
+
+        const cur = lineBounds(text, span.offset);
+        // A line of context before and after, when present.
+        const before: ?Bounds = if (cur.start > 0) lineBounds(text, cur.start - 1) else null;
+        const after: ?Bounds = if (cur.end < text.len) lineBounds(text, cur.end + 1) else null;
+
+        if (before) |b| try self.snippetLine(w, text[b.start..b.end], f.line - 1, false);
+        try self.snippetLine(w, text[cur.start..cur.end], f.line, true);
+        // Caret under the span within the current line.
+        const col: usize = span.offset - cur.start;
+        const len: usize = @min(@as(usize, @max(span.len, 1)), (cur.end - cur.start) -| col);
+        try w.writeAll("      ┆ ");
+        try self.style(w, .dim);
+        var i: usize = 0;
+        while (i < col) : (i += 1) try w.writeByte(' ');
+        try cli.reset(w, self.use_color);
+        try self.style(w, .note_label);
+        i = 0;
+        while (i < len) : (i += 1) try w.writeByte('^');
+        try cli.reset(w, self.use_color);
+        try w.writeByte('\n');
+        if (after) |a| try self.snippetLine(w, text[a.start..a.end], f.line + 1, false);
+    }
+
+    fn snippetLine(self: *Console, w: *std.Io.Writer, line: []const u8, line_no: u32, current: bool) !void {
+        try self.style(w, .dim);
+        try w.print("{d: >5} {s} ", .{ line_no, if (current) "▶" else "┆" });
+        try cli.reset(w, self.use_color);
+        try self.highlightLine(w, line);
+        try w.writeByte('\n');
+    }
+
+    /// Emit `line` with per-token color (best-effort: a line that's part of a
+    /// multi-line string/comment may mis-tokenize, which only affects color).
+    fn highlightLine(self: *Console, w: *std.Io.Writer, line: []const u8) !void {
+        if (!self.use_color) {
+            try w.writeAll(line);
+            return;
+        }
+        var sc = syntax.scanner.Scanner.init(line);
+        var last: usize = 0;
+        while (true) {
+            const tok = sc.next();
+            if (tok.type == .eof) break;
+            const end = @min(tok.offset + tok.len, line.len);
+            if (end <= last) break; // no progress → stop (malformed tail)
+            if (tok.offset > last) try w.writeAll(line[last..tok.offset]); // gap
+            const body = line[tok.offset..end];
+            if (tokenColor(tok.type)) |code| {
+                try w.writeAll(code);
+                try w.writeAll(body);
+                try w.writeAll(col_reset);
+            } else {
+                try w.writeAll(body);
+            }
+            last = end;
+        }
+        if (last < line.len) try w.writeAll(line[last..]);
     }
 
     fn backtrace(self: *Console, s: *DebugSession) !void {
@@ -425,6 +503,28 @@ pub const Console = struct {
 fn isWord(word: []const u8, aliases: []const []const u8) bool {
     for (aliases) |a| if (std.mem.eql(u8, word, a)) return true;
     return false;
+}
+
+const Bounds = struct { start: usize, end: usize };
+
+/// The [start,end) of the line containing byte `offset` (excluding the newline).
+fn lineBounds(text: []const u8, offset: usize) Bounds {
+    const off = @min(offset, text.len);
+    var start = off;
+    while (start > 0 and text[start - 1] != '\n') start -= 1;
+    var end = off;
+    while (end < text.len and text[end] != '\n') end += 1;
+    return .{ .start = start, .end = end };
+}
+
+/// The highlight color for a token kind, or null to leave it default.
+fn tokenColor(t: TokenType) ?[]const u8 {
+    return switch (t) {
+        .kw_if, .kw_then, .kw_else, .kw_assert, .kw_with, .kw_let, .kw_in, .kw_rec, .kw_inherit, .kw_or, .kw_true, .kw_false, .kw_null => col_keyword,
+        .string, .path, .search_path => col_string,
+        .integer, .float_val => col_number,
+        else => null,
+    };
 }
 
 fn firstWord(s: []const u8) []const u8 {
