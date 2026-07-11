@@ -454,6 +454,13 @@ pub const Evaluator = struct {
     /// null with no debugger. Its address is stable (the Evaluator is used by
     /// pointer), so the registry sink and each VM point at it directly.
     breakpoints: ?bytecode.BreakpointTable = null,
+    /// Colorize `writeValue` output (strings/numbers/keywords/attr names). Set
+    /// by the CLI from its terminal-color decision; default off (plain text for
+    /// pipes, tests, JSON/XML paths). See `eval/print.zig`.
+    value_color: bool = false,
+    /// The entry source text, for the debugger to show a snippet at a pause in
+    /// a `-e` expression (files come from the FileCache). Set by the CLI.
+    debug_source: ?[]const u8 = null,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,

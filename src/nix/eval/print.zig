@@ -5,11 +5,21 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const FutureState = @import("runtime").thunk.FutureState;
 
+// Value-coloring palette (SGR), applied when `ev.value_color` is set. Chosen to
+// match the CLI's own styles (green paths, yellow hashes/numbers, magenta
+// keywords, cyan labels) — see `src/cli/cli.zig`.
+const col_string = "\x1b[32m"; // strings, paths — green
+const col_number = "\x1b[33m"; // ints, floats — yellow
+const col_keyword = "\x1b[35m"; // true/false/null — magenta
+const col_name = "\x1b[36m"; // attribute names — cyan
+const col_reset = "\x1b[0m";
+
 pub fn writeValue(ev: anytype, writer: *std.Io.Writer, value: Value) !void {
     var printer = ValuePrinter(@TypeOf(ev)){
         .ev = ev,
         .writer = writer,
         .seen = .empty,
+        .use_color = ev.value_color,
     };
     defer printer.seen.deinit(ev.allocator);
 
@@ -37,6 +47,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
 
         ev: EvaluatorPtr,
         writer: *std.Io.Writer,
+        use_color: bool,
         seen: std.ArrayListUnmanaged(SeenObject),
         /// Recursion depth, so top-level (`depth == 0`) list/attrs walks can
         /// report `[i/N]` item progress on the render node without every nested
@@ -50,19 +61,50 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             id: types.ObjectId,
         };
 
+        /// Emit an SGR code (or nothing when color is off).
+        fn on(self: *Self, code: []const u8) !void {
+            if (self.use_color) try self.writer.writeAll(code);
+        }
+        fn off(self: *Self) !void {
+            if (self.use_color) try self.writer.writeAll(col_reset);
+        }
+        /// Write `text` wrapped in `code`…reset.
+        fn leaf(self: *Self, code: []const u8, text: []const u8) !void {
+            try self.on(code);
+            try self.writer.writeAll(text);
+            try self.off();
+        }
+        fn quotedString(self: *Self, s: []const u8) !void {
+            try self.on(col_string);
+            try writeQuotedString(self.writer, s);
+            try self.off();
+        }
+
         fn write(self: *Self, value: Value) anyerror!void {
             switch (value.kind()) {
-                .null => try self.writer.writeAll("null"),
-                .bool_false => try self.writer.writeAll("false"),
-                .bool_true => try self.writer.writeAll("true"),
-                .int => try self.writer.print("{}", .{value.asInt()}),
-                .boxed_int => try self.writer.print("{}", .{try self.ev.heap.getBoxedInt(value.asObjectId())}),
-                .float => try self.writer.print("{d}", .{value.asFloat()}),
-                .string => try writeQuotedString(self.writer, self.ev.intern.get(value.asInternId())),
-                .path => try self.writer.writeAll(self.ev.intern.get(value.asInternId())),
+                .null => try self.leaf(col_keyword, "null"),
+                .bool_false => try self.leaf(col_keyword, "false"),
+                .bool_true => try self.leaf(col_keyword, "true"),
+                .int => {
+                    try self.on(col_number);
+                    try self.writer.print("{}", .{value.asInt()});
+                    try self.off();
+                },
+                .boxed_int => {
+                    try self.on(col_number);
+                    try self.writer.print("{}", .{try self.ev.heap.getBoxedInt(value.asObjectId())});
+                    try self.off();
+                },
+                .float => {
+                    try self.on(col_number);
+                    try self.writer.print("{d}", .{value.asFloat()});
+                    try self.off();
+                },
+                .string => try self.quotedString(self.ev.intern.get(value.asInternId())),
+                .path => try self.leaf(col_string, self.ev.intern.get(value.asInternId())),
                 .string_context => {
                     const string = try self.ev.heap.getContextString(value.asObjectId());
-                    try writeQuotedString(self.writer, self.ev.intern.get(string.text));
+                    try self.quotedString(self.ev.intern.get(string.text));
                 },
                 .list => try self.writeList(value.asObjectId()),
                 .attrs => try self.writeAttrs(value.asObjectId()),
@@ -186,11 +228,13 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         }
 
         fn writeAttrName(self: *Self, name: []const u8) !void {
+            try self.on(col_name);
             if (isBareAttrName(name)) {
                 try self.writer.writeAll(name);
             } else {
                 try writeQuotedString(self.writer, name);
             }
+            try self.off();
         }
 
         fn enter(self: *Self, kind: SeenKind, id: types.ObjectId) !bool {

@@ -67,6 +67,9 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // `ev.allocator`; plain expr/file text is borrowed (argv) or owned by the
     // evaluator's file cache.
     defer if (source.owned) ev.allocator.free(source.text);
+    // Let the debugger show a source snippet for a `-e` expression (files it
+    // reads from the FileCache).
+    if (options.debugger) ev.debug_source = source.text;
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);

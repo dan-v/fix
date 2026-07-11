@@ -98,6 +98,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     defer progress.deinit(repl_ok);
     if (term.show_progress) ev.setProgressSink(progress.sink());
 
+    ev.value_color = term.use_color and interactive;
     var repl = Repl.init(allocator, init, options, &ev, term.use_color and interactive, interactive);
     defer repl.deinit();
     if (options.debugger) repl.debug_console = &console;
