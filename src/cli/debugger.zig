@@ -28,6 +28,10 @@ pub const Console = struct {
     /// Persistent stdin reader so type-ahead survives across successive breaks.
     stdin_buf: [16 * 1024]u8 = undefined,
     reader: ?std.Io.File.Reader = null,
+    /// When set, read console input through this reader instead of our own —
+    /// used by the bare repl, whose own buffered reader would otherwise swallow
+    /// the shared stdin pipe. Null everywhere else (eval, interactive repl).
+    ext_reader: ?*std.Io.File.Reader = null,
     /// How many times we've paused (for the banner).
     hits: usize = 0,
 
@@ -36,12 +40,20 @@ pub const Console = struct {
         ev.setDebugUi(self, runCallback);
     }
 
+    /// Read console input from `r` (a shared reader) rather than our own — the
+    /// bare repl calls this so its line reader and the console don't fight over
+    /// the stdin pipe's buffer.
+    pub fn attachReader(self: *Console, r: *std.Io.File.Reader) void {
+        self.ext_reader = r;
+    }
+
     fn runCallback(ctx: *anyopaque, session: *DebugSession) anyerror!void {
         const self: *Console = @ptrCast(@alignCast(ctx));
         return self.drive(session);
     }
 
     fn reader_(self: *Console) *std.Io.File.Reader {
+        if (self.ext_reader) |r| return r;
         if (self.reader == null) {
             self.reader = std.Io.File.stdin().readerStreaming(self.io, &self.stdin_buf);
         }

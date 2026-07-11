@@ -397,7 +397,7 @@ const specs = [_]Spec{
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
-    .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{.eval} },
+    .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{ .eval, .repl } },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
     .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never", .show_in = eval_cmds },

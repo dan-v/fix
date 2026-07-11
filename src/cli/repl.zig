@@ -22,6 +22,7 @@ const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
+const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
 const fix = @import("fix");
 const runtime_value = @import("runtime").value;
@@ -76,11 +77,21 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
     const interactive = stdin_tty and stdout_tty and !options.bare and builtin.os.tag == .linux;
 
-    const worker_count = try setup.workerCount(options);
+    // The debugger needs a deterministic pause point: one worker, no
+    // speculation. Same posture as `fix eval --debugger`.
+    const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb, init);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
+
+    var console: debugger.Console = undefined;
+    if (options.debugger) {
+        ev.setParallelismToggles(true, true);
+        ev.setCaptureChunkNames(true);
+        console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
+        console.install(&ev);
+    }
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     var repl_ok = false;
@@ -89,6 +100,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     var repl = Repl.init(allocator, init, options, &ev, term.use_color and interactive, interactive);
     defer repl.deinit();
+    if (options.debugger) repl.debug_console = &console;
 
     if (interactive) {
         try repl.runInteractive();
@@ -107,6 +119,9 @@ const Repl = struct {
     ev: *Evaluator,
     use_color: bool,
     interactive: bool,
+    /// The debug console when `--debugger` is set, so the bare loop can share
+    /// its stdin reader (see `runBare`). Null otherwise.
+    debug_console: ?*debugger.Console = null,
 
     /// Scope bindings, insertion-ordered. Keys are owned; values are heap
     /// Values kept alive via `gc_extra_roots` + the scope attrset.
@@ -156,6 +171,9 @@ const Repl = struct {
     fn runBare(self: *Repl, show_prompt: bool) !void {
         var stdin_buffer: [64 * 1024]u8 = undefined;
         var stdin = std.Io.File.stdin().readerStreaming(self.io, &stdin_buffer);
+        // Share this reader with the debug console so a break mid-evaluation
+        // reads its commands from the same buffered pipe instead of racing it.
+        if (self.debug_console) |c| c.attachReader(&stdin);
 
         var pending: std.ArrayListUnmanaged(u8) = .empty;
         defer pending.deinit(self.allocator);
