@@ -7,6 +7,7 @@ const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
+const debugger = @import("debugger.zig");
 const trace_setup = @import("trace_setup.zig");
 const stats = @import("stats.zig");
 const timeline = fix.probe.timeline;
@@ -36,11 +37,22 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     const source_arg = options.source orelse options.defaultSource();
 
-    const worker_count = try setup.workerCount(options);
+    // The debugger needs a deterministic pause point: one worker, no
+    // speculative forcing racing ahead of the break.
+    const worker_count = if (options.debugger) 1 else try setup.workerCount(options);
     setup.applyMemoryBacking(options.hugetlb, init);
     var ev = try Evaluator.init(allocator, worker_count);
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options);
+
+    var console: debugger.Console = undefined;
+    if (options.debugger) {
+        ev.setParallelismToggles(true, true);
+        // Named chunks make the backtrace read like `pkgs.hello (chunk #42)`.
+        ev.setCaptureChunkNames(true);
+        console = .{ .allocator = allocator, .io = init.io, .use_color = term.use_color };
+        console.install(&ev);
+    }
 
     if (source_arg == .flake and !ev.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });

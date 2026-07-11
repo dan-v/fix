@@ -110,6 +110,10 @@ pub const Options = struct {
     /// non-tty repl path is always bare; this forces it for automation.
     bare: bool = false,
     show_trace: bool = false,
+    /// Drop into the interactive debug console at `builtins.break` (and, later,
+    /// on evaluation errors). Forces single-worker, speculation-free evaluation
+    /// so the pause point is deterministic.
+    debugger: bool = false,
     derivation_debug: derivation_debug.Options = .{},
     /// `fix build --no-link`/`--no-out-link`: skip creating the result symlink.
     no_link: bool = false,
@@ -266,6 +270,7 @@ const Opt = enum {
     verbose,
     // Diagnostics.
     show_trace,
+    debugger,
     color,
     no_color,
     progress,
@@ -392,6 +397,7 @@ const specs = [_]Spec{
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
 
     .{ .id = .show_trace, .long = "--show-trace", .help = "show full evaluation traces on error", .show_in = eval_cmds },
+    .{ .id = .debugger, .long = "--debugger", .help = "pause into an interactive debugger at builtins.break\n(forces --workers=1)", .show_in = &[_]Cmd{.eval} },
     .{ .id = .color, .long = "--color", .arg = .opt, .metavar = "WHEN", .help = "color diagnostics: auto, always, never" },
     .{ .id = .no_color, .long = "--no-color", .help = "disable color diagnostics" },
     .{ .id = .progress, .long = "--progress", .arg = .opt, .metavar = "WHEN", .help = "show evaluation progress: auto, always, never", .show_in = eval_cmds },
@@ -580,6 +586,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .verbose => options.verbose +|= 1,
 
         .show_trace => options.show_trace = true,
+        .debugger => options.debugger = true,
         .color => options.color = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidColorMode) else .always,
         .no_color => options.color = .never,
         .progress => options.progress = if (v0) |v| (cli.parseWhen(v) orelse return error.InvalidProgressMode) else .always,
