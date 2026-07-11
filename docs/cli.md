@@ -53,21 +53,21 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 ## The debugger
 
-`fix eval --debugger` pauses evaluation into an interactive console — Nix's `--debugger` model — at three points:
+`fix eval --debugger` (and `fix repl --debugger`) pauses evaluation into an interactive console — Nix's `--debugger` model — at three points:
 
 - **`builtins.break x`** — a break in the source. `break` is otherwise the identity on `x`, so it can be dropped anywhere: `let y = builtins.break (f a); in ...`.
 - **a source-line breakpoint** — `break FILE:LINE` from the console. See [Source-line breakpoints](#source-line-breakpoints).
 - **an evaluation error** — an uncaught `throw`, `abort`, or failed `assert` pauses at the origin (call frames still live) *before* the error unwinds and prints. Errors caught by `builtins.tryEval` do **not** pause.
 
-`--debugger` forces `--workers=1` and disables speculation so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. The console reads commands from stdin and writes to stderr, so a redirected stdout still receives only the final value.
+`--debugger` forces `--workers=1` and disables speculation so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. The console reads commands from stdin and writes to stderr, so a redirected stdout still receives only the final value. Under `fix repl` the console runs in-line during each input's evaluation, then returns you to the prompt.
 
-**Console commands** (a leading `:` is optional; a bare line is an expression):
+**Console commands.** A bare line is a **Nix expression** evaluated in the pause's scope; a command word alone runs the command (so `n + base` evaluates but `n` steps), and a leading `:` forces command interpretation.
 
 | command | effect |
 |---|---|
-| `<expr>` / `p EXPR` | evaluate an expression; the break value is bound as `it` |
+| `<expr>` | evaluate an expression in the breakpoint's scope (see below) |
 | `bt` / `backtrace` | the call stack, innermost first, with `file:line:col`, chunk name, and `#chunk` id |
-| `l` / `locals` | the current frame's local slots and upvalues (forced, by index) |
+| `l` / `locals` | in-scope named locals and upvalues, grouped per frame |
 | `v` / `value` | the value passed to `builtins.break` (or the error subject) |
 | `break FILE:LINE` | set a source-line breakpoint |
 | `breakpoints` / `delete N` | list / remove breakpoints |
@@ -79,6 +79,8 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 | `help` | command list |
 
 Frames show names when chunk-name capture is on (`--debugger` enables it), so a backtrace reads like `pkgs/hello.nix:12:3 hello (chunk #42)`. Console expressions run on a fresh nested VM sharing the registry, heap, and intern table, so inspecting a value never disturbs the pause point.
+
+**Scope-accurate evaluation.** A console expression resolves the breakpoint's lexical bindings — `let` bindings, lambda params, and captured upvalues — not just globals. The compiler records a slot→name table per chunk (gated on the same capture flag, so normal builds pay nothing), and the console reconstructs an ambient scope from the frame stack's named locals and upvalues (inner frames shadow outer), plus `it` = the break value. Because a break often lands in a small argument thunk whose own frame has no locals, the scope merges *all* live frames, so `base`, a param `n`, or an outer `pkgs` all resolve. `with`-scopes aren't reconstructed yet.
 
 ### Source-line breakpoints
 
@@ -124,7 +126,7 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`). Effective only on a `-Dgc` build → [gc.md](gc.md) |
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). `FIX_HUGETLB` env is the fallback when the flag is absent. Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
-| `--debugger` (eval) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
+| `--debugger` (eval, repl) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
 | `--progress[=auto\|always\|never]` / `--no-progress` | eval progress on stderr |
 | `--debug-derivations[=summary\|full]` | write derivation debug records to stderr |
