@@ -456,7 +456,9 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
         .base_path = snapshot.base_path,
         .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
-        .name = if (self.registry.capture_names) (self.combinedName(name, ".") catch name) else null,
+        // Qualified name of the deferred body: this compiler's name, extended
+        // by the attr it binds. Always on (real binding), like eager bodies.
+        .name_id = self.registry.childName(self.name_id, name, false) catch self.name_id,
     });
     try emit.emitDeferAttrValue(self, id, snapshot.caps);
     root.deferred_count += 1;

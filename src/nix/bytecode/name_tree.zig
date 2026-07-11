@@ -29,6 +29,9 @@ pub const NameTree = struct {
     const Node = struct {
         parent: NameId,
         segment: types.InternId,
+        /// A synthetic segment (λ, `(apply)`, node-tag) joins with `·` so the
+        /// path never reads as a false attr path; a real binding joins with `.`.
+        synthetic: bool,
     };
     const Store = stable.StableSegments(Node, .{ .first_segment_size = 64 }, @import("runtime").mem_tag.vma);
 
@@ -39,8 +42,8 @@ pub const NameTree = struct {
     }
 
     /// Intern a child name `parent`/`segment`. Returns its `NameId`. Lock-free.
-    pub fn child(self: *NameTree, allocator: std.mem.Allocator, parent: NameId, segment: types.InternId) !NameId {
-        const idx = try self.nodes.appendAtomic(allocator, .{ .parent = parent, .segment = segment });
+    pub fn child(self: *NameTree, allocator: std.mem.Allocator, parent: NameId, segment: types.InternId, synthetic: bool) !NameId {
+        const idx = try self.nodes.appendAtomic(allocator, .{ .parent = parent, .segment = segment, .synthetic = synthetic });
         return idx + 1; // bias: index 0 → NameId 1, keeping NameId 0 = root
     }
 
@@ -48,18 +51,20 @@ pub const NameTree = struct {
         return id == NAME_ROOT;
     }
 
-    /// Write the fully-qualified dotted path for `id` (nothing for the root).
+    /// Write the fully-qualified path for `id` (nothing for the root). Segments
+    /// join with `.` (real) or `·` (synthetic), matching the old string naming.
     pub fn writeQualified(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
-        try self.writeNode(w, id, intern, true);
+        try self.writeNode(w, id, intern);
     }
 
-    fn writeNode(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable, last: bool) !void {
+    fn writeNode(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
         if (id == NAME_ROOT) return;
         if (id - 1 >= self.nodes.count()) return;
         const node = self.nodes.get(id - 1).*;
-        try self.writeNode(w, node.parent, intern, false); // ancestors first
+        try self.writeNode(w, node.parent, intern); // ancestors first
+        // A leading separator before every segment except the root-most one.
+        if (node.parent != NAME_ROOT) try w.writeAll(if (node.synthetic) "·" else ".");
         try w.writeAll(intern.get(node.segment));
-        if (!last) try w.writeByte('.');
     }
 
     /// Whether `id` names anything (has at least one segment).
@@ -75,10 +80,10 @@ test "name tree renders qualified paths and shares prefixes" {
     var tree: NameTree = .{};
     defer tree.deinit(testing.allocator);
 
-    const pkgs = try tree.child(testing.allocator, NAME_ROOT, try intern.intern("pkgs"));
-    const hello = try tree.child(testing.allocator, pkgs, try intern.intern("hello"));
-    const world = try tree.child(testing.allocator, pkgs, try intern.intern("world"));
-    const over = try tree.child(testing.allocator, hello, try intern.intern("override"));
+    const pkgs = try tree.child(testing.allocator, NAME_ROOT, try intern.intern("pkgs"), false);
+    const hello = try tree.child(testing.allocator, pkgs, try intern.intern("hello"), false);
+    const world = try tree.child(testing.allocator, pkgs, try intern.intern("world"), false);
+    const over = try tree.child(testing.allocator, hello, try intern.intern("override"), false);
 
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

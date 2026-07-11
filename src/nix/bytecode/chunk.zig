@@ -654,21 +654,16 @@ pub const ChunkRegistry = struct {
     /// maps are not synchronized, so every `recordName`/`recordFile` must come
     /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
     sidecar_owner: ?std.Thread.Id = null,
-    names: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
-    /// Companion to `names`: the source file each chunk was compiled from
-    /// (interned path id), so even chunks with no per-op source map get a file.
+    /// The source file each chunk was compiled from (interned path id), so even
+    /// chunks with no per-op source map get a file. Populated under name capture.
     files: std.AutoHashMapUnmanaged(ChunkId, types.InternId) = .empty,
-    /// Companion to `names`: per-chunk upvalue binding names (slot order), from
-    /// the compiler's capture list. Slices owned by `allocator`.
+    /// Per-chunk upvalue binding names (slot order), from the compiler's capture
+    /// list. Slices owned by `allocator`. Chunk *names* live in `name_tree`.
     upvalue_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
-    /// Companion to `names`: per-chunk LOCAL binding names indexed by stack slot
-    /// (let bindings + lambda params). Slots are monotonic per chunk, so this is
-    /// a flat slot→name array. Used by the debugger to resolve breakpoint-scope
-    /// identifiers. Slices owned by `allocator`.
+    /// Per-chunk LOCAL binding names indexed by stack slot (let bindings + lambda
+    /// params). Slots are monotonic per chunk, so this is a flat slot→name array.
+    /// Used by the debugger to resolve breakpoint-scope identifiers.
     local_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
-    /// How many chunks already claimed each base name, so `recordName` callers
-    /// can uniquify duplicates with a `~N` suffix.
-    name_uses: std.AutoHashMapUnmanaged(types.InternId, u32) = .empty,
     /// Content-addressed dedup of chunk registrations: structurally identical
     /// chunks are semantically interchangeable, so re-registrations reuse the
     /// first id (the generalization of the hand-picked WellKnownChunks).
@@ -765,7 +760,6 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(chunk);
         }
         self.chunks.deinit(self.allocator);
-        self.names.deinit(self.allocator);
         self.files.deinit(self.allocator);
         var it = self.upvalue_names.valueIterator();
         while (it.next()) |v| self.allocator.free(v.*);
@@ -773,7 +767,6 @@ pub const ChunkRegistry = struct {
         var lit = self.local_names.valueIterator();
         while (lit.next()) |v| self.allocator.free(v.*);
         self.local_names.deinit(self.allocator);
-        self.name_uses.deinit(self.allocator);
         self.name_tree.deinit(self.allocator);
         for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
     }
@@ -790,32 +783,12 @@ pub const ChunkRegistry = struct {
         }
     }
 
-    /// Record a best-effort name for a chunk. No-op unless `capture_names` is
-    /// on, so callers can hand names unconditionally.
-    pub fn recordName(self: *ChunkRegistry, id: ChunkId, name: types.InternId) !void {
-        if (!self.capture_names) return;
-        self.checkSingleThread();
-        try self.names.put(self.allocator, id, name);
-    }
-
     /// Record the source file a chunk was compiled from. No-op unless
     /// `capture_names` is on.
     pub fn recordFile(self: *ChunkRegistry, id: ChunkId, file: types.InternId) !void {
         if (!self.capture_names) return;
         self.checkSingleThread();
         try self.files.put(self.allocator, id, file);
-    }
-
-    /// Claim one use of base name `id`, returning the total claim count (1 for
-    /// the first user). Callers uniquify names claimed more than once. Always
-    /// returns 1 when name capture is off.
-    pub fn bumpNameUse(self: *ChunkRegistry, id: types.InternId) !u32 {
-        if (!self.capture_names) return 1;
-        self.checkSingleThread();
-        const gop = try self.name_uses.getOrPut(self.allocator, id);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-        return gop.value_ptr.*;
     }
 
     /// Record the chunk's upvalue binding names (slot order). No-op unless
@@ -852,11 +825,6 @@ pub const ChunkRegistry = struct {
         return self.local_names.get(id);
     }
 
-    /// The best-effort name attributed to `id`, if any.
-    pub fn nameOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
-        return self.names.get(id);
-    }
-
     /// Write `id`'s always-on qualified name (`pkgs.hello`) into `w`, or nothing
     /// if the chunk is anonymous. Reads the `name_tree`; no allocation, no flag.
     pub fn writeQualifiedName(self: *const ChunkRegistry, w: *std.Io.Writer, id: ChunkId, intern: *const @import("runtime").intern.InternTable) !void {
@@ -871,9 +839,9 @@ pub const ChunkRegistry = struct {
     }
 
     /// Intern a child name under `parent` for `segment` (compiler use, during
-    /// its top-down descent).
-    pub fn childName(self: *ChunkRegistry, parent: name_tree_mod.NameId, segment: types.InternId) !name_tree_mod.NameId {
-        return self.name_tree.child(self.allocator, parent, segment);
+    /// its top-down descent). `synthetic` selects the `·` joiner.
+    pub fn childName(self: *ChunkRegistry, parent: name_tree_mod.NameId, segment: types.InternId, synthetic: bool) !name_tree_mod.NameId {
+        return self.name_tree.child(self.allocator, parent, segment, synthetic);
     }
 
     /// The source file recorded for `id`, if any.

@@ -1551,16 +1551,22 @@ fn writeRefList(writer: *std.Io.Writer, label: []const u8, sub_color: [3]u8, ids
 }
 
 /// The best-effort name attributed to chunk `id`, resolved to text.
+/// The chunk's qualified name, rendered from the always-on name tree into a
+/// scratch buffer. Disasm is single-threaded (name capture forces `--eval`
+/// single-worker), and callers use the slice immediately, so the shared buffer
+/// is safe.
+var chunk_name_buf: [1024]u8 = undefined;
 fn chunkNameOf(symbols: Symbols, id: ChunkId) ?[]const u8 {
     const reg = symbols.registry orelse return null;
-    if (reg.nameOf(id)) |name_id| {
-        if (symbols.internName(name_id)) |n| return n;
-    }
-    // The two registry-synthesized apply trampolines register before name
-    // capture can be enabled — name them statically.
+    // The two registry-synthesized apply trampolines register before any
+    // compiler names them — name them statically.
     if (id == reg.well_known.genlist_apply) return "builtin·genlist_apply";
     if (id == reg.well_known.mapattrs_apply) return "builtin·mapattrs_apply";
-    return null;
+    const intern = symbols.intern orelse return null;
+    if (!reg.hasQualifiedName(id)) return null;
+    var w: std.Io.Writer = .fixed(&chunk_name_buf);
+    reg.writeQualifiedName(&w, id, intern) catch return null;
+    return chunk_name_buf[0..w.end];
 }
 
 /// `chunk[0x{id}]` followed by its best-effort name when known, so a reference

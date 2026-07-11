@@ -82,9 +82,6 @@ pub const DebugFrame = struct {
     column: u32,
     /// The best (narrowest) source span covering the frame's live ip, if any.
     span: ?bytecode.chunk.Chunk.SourceSpan,
-    /// The chunk's recorded name (attr/let binding it backs), when chunk-name
-    /// capture is on — else null.
-    name: ?[]const u8,
 };
 
 /// A live handle to a paused evaluation, handed to the debugger UI. It exposes
@@ -120,7 +117,6 @@ pub const DebugSession = struct {
             .line = if (span) |s| s.line else 0,
             .column = if (span) |s| s.column else 0,
             .span = span,
-            .name = if (self.ev.registry.nameOf(f.chunk_id)) |nid| self.ev.intern.get(nid) else null,
         };
     }
 
@@ -1022,24 +1018,18 @@ pub const Evaluator = struct {
         }
 
         const chunk = try builder.finish(self.allocator, compiler.slot_count);
-        const chunk_id = try self.registry.register(chunk);
-        // The top-level chunk registers outside registerChunk; record its file
-        // in the disasm sidecar too (no-op unless name capture is on).
+        // The top-level chunk registers outside `registerChunk`; name it after
+        // the file (a useful `while evaluating 'configuration.nix'`). A bare
+        // `-e` expression stays anonymous so its trace reads plain. disasm adds
+        // its own `(top)` tag for pathless chunks.
+        const top_name: bytecode.NameId = if (source_path) |p|
+            (self.registry.childName(bytecode.NAME_ROOT, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.NAME_ROOT)
+        else if (self.registry.capture_names)
+            (self.registry.childName(bytecode.NAME_ROOT, try self.intern.intern("(top)"), true) catch bytecode.NAME_ROOT)
+        else
+            bytecode.NAME_ROOT;
+        const chunk_id = try self.registry.registerNamed(chunk, top_name);
         if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
-        // Name a file's top-level chunk after its basename (uniquified with
-        // `~N` for repeated basenames), or `(top)` for pathless expressions.
-        if (self.registry.capture_names) {
-            const base_txt: []const u8 = if (source_path) |p| std.fs.path.basename(p) else "(top)";
-            var name_id = try self.intern.intern(base_txt);
-            const uses = try self.registry.bumpNameUse(name_id);
-            if (uses > 1) {
-                var nbuf: [256]u8 = undefined;
-                if (std.fmt.bufPrint(&nbuf, "{s}~{d}", .{ base_txt, uses })) |t| {
-                    name_id = try self.intern.intern(t);
-                } else |_| {}
-            }
-            try self.registry.recordName(chunk_id, name_id);
-        }
         // Local binding names for the top chunk (child chunks get theirs in
         // `registerChunk`); lets the debugger and disasm name top-level locals.
         if (self.registry.capture_names) try self.registry.recordLocalNames(chunk_id, compiler.local_names.items);

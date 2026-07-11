@@ -307,17 +307,11 @@ pub const Console = struct {
         }
         try cli.reset(w, self.use_color);
         if (f.line != 0) try w.print(":{d}:{d}", .{ f.line, f.column });
-        // Always-on qualified name (`pkgs.hello`); falls back to the gated
-        // detailed sidecar name when the tree has nothing.
+        // Always-on qualified name (`pkgs.hello`), from the name tree.
         if (s.hasFrameName(frame_idx)) {
             try w.writeAll(" ");
             try self.style(w, .name);
             try s.writeFrameName(w, frame_idx);
-            try cli.reset(w, self.use_color);
-        } else if (f.name) |name| {
-            try w.writeAll(" ");
-            try self.style(w, .name);
-            try w.print("{s}", .{name});
             try cli.reset(w, self.use_color);
         }
         try w.print("  (chunk #{d})\n", .{f.chunk_id});
@@ -373,7 +367,9 @@ pub const Console = struct {
 
     fn localsHeader(self: *Console, w: *std.Io.Writer, s: *DebugSession, idx: usize, depth: usize) !void {
         try self.style(w, .dim);
-        try w.print("#{d} {s}:\n", .{ depth, if (s.frame(idx).name) |nm| nm else "<anon>" });
+        try w.print("#{d} ", .{depth});
+        if (s.hasFrameName(idx)) try s.writeFrameName(w, idx) else try w.writeAll("<anon>");
+        try w.writeAll(":\n");
         try cli.reset(w, self.use_color);
     }
 

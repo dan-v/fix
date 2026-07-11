@@ -24,6 +24,8 @@ const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
 
 const InternId = types.InternId;
+const NameId = @import("bytecode").NameId;
+const NAME_ROOT = @import("bytecode").NAME_ROOT;
 
 /// Gate tunables for lazy per-attr compilation (see `compiler/attrs.zig`).
 ///
@@ -100,9 +102,8 @@ pub const Entry = struct {
     /// once via CAS on the force path; concurrent racers converge on one
     /// canonical ChunkId (the loser's chunk is orphaned-but-correct).
     compiled: std.atomic.Value(u32) = .init(0),
-    /// Best-effort binding name for `fix disasm` chunk naming; null unless
-    /// name capture was on at compile time. See `ChunkRegistry.recordName`.
-    name: ?InternId = null,
+    /// Always-on qualified-name node for the deferred body (see `name_tree`).
+    name_id: NameId = NAME_ROOT,
 };
 
 pub const Table = struct {
