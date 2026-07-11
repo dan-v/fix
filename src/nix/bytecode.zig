@@ -9,6 +9,10 @@ pub const chunk = @import("bytecode/chunk.zig");
 pub const disasm = @import("bytecode/disasm.zig");
 pub const breakpoints = @import("bytecode/breakpoints.zig");
 pub const BreakpointTable = breakpoints.BreakpointTable;
+pub const name_tree = @import("bytecode/name_tree.zig");
+pub const NameTree = name_tree.NameTree;
+pub const NameId = name_tree.NameId;
+pub const NAME_ROOT = name_tree.NAME_ROOT;
 
 // Flat re-exports of the public surface.
 pub const OpCode = opcode.OpCode;

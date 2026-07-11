@@ -133,6 +133,27 @@ test "scopeAttrs resolves with-scope bindings, inner with shadowing outer" {
     try std.testing.expectEqualStrings("\"hi2\"", probe.evalResult());
 }
 
+test "qualified chunk names are populated always-on, without capture_names" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    // Deliberately do NOT setCaptureChunkNames — the name tree is always on.
+    _ = try ev.evaluate("let myFunc = x: x + 1; in myFunc 5");
+
+    const reg = ev.chunkRegistry();
+    var found = false;
+    var id: u32 = 0;
+    while (id < reg.count()) : (id += 1) {
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        reg.writeQualifiedName(&w, id, ev.internTable()) catch continue;
+        if (std.mem.eql(u8, buf[0..w.end], "myFunc")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "no debug UI installed leaves builtins.break as a plain identity" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();

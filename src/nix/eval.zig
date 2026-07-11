@@ -154,6 +154,16 @@ pub const DebugSession = struct {
         return self.vm.stack[f.frame_base + slot];
     }
 
+    /// Write frame `i`'s always-on qualified name (`pkgs.hello`) to `w`, or
+    /// nothing if anonymous. Available in every run — no `capture_names` flag.
+    pub fn writeFrameName(self: *const DebugSession, w: *std.Io.Writer, i: usize) !void {
+        try self.ev.registry.writeQualifiedName(w, self.vm.frames[i].chunk_id, &self.ev.intern);
+    }
+
+    pub fn hasFrameName(self: *const DebugSession, i: usize) bool {
+        return self.ev.registry.hasQualifiedName(self.vm.frames[i].chunk_id);
+    }
+
     /// The source name of local `slot` in frame `i`, if the compiler recorded
     /// one (requires chunk-name capture, which `--debugger` enables). Internal
     /// (`\x00`-prefixed) names are hidden.

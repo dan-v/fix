@@ -142,6 +142,12 @@ pub const Compiler = struct {
     name_hint_synthetic: bool = false,
     chunk_name: ?InternId = null,
     name_prefix: ?[]const u8 = null,
+    /// Always-on qualified-name node for the chunk this compiler emits (see
+    /// `bytecode/name_tree.zig`). Threaded down the compiler chain: a named
+    /// child extends it, an anonymous child inherits it. Unlike the `·`/`.`
+    /// string naming above (gated on `capture_names`), this is always built —
+    /// cheaply, one small node per bound chunk.
+    name_id: bytecode.NameId = bytecode.NAME_ROOT,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -204,11 +210,21 @@ pub const Compiler = struct {
         // full `a$b$c` path — and becomes the prefix for its own nested bodies.
         // Unnamed children inherit the prefix unchanged. One branch when off.
         child.name_prefix = self.name_prefix;
+        child.name_id = self.name_id;
         if (self.name_hint) |seg| {
-            const sep: []const u8 = if (self.name_hint_synthetic) "·" else ".";
-            const full = self.combinedName(seg, sep) catch seg;
-            child.chunk_name = full;
-            child.name_prefix = self.intern.get(full);
+            // Always-on qualified-name tree: extend by real binding segments
+            // only (synthetic λ/tag names stay in the gated string path below,
+            // so traces read `pkgs.hello`, not `pkgs.hello.(apply)`).
+            if (!self.name_hint_synthetic) {
+                child.name_id = self.registry.childName(self.name_id, seg) catch self.name_id;
+            }
+            // Gated detailed string naming (disasm): synthetic + uniquified.
+            if (self.registry.capture_names) {
+                const sep: []const u8 = if (self.name_hint_synthetic) "·" else ".";
+                const full = self.combinedName(seg, sep) catch seg;
+                child.chunk_name = full;
+                child.name_prefix = self.intern.get(full);
+            }
             self.name_hint = null;
             self.name_hint_synthetic = false;
         }
@@ -220,7 +236,10 @@ pub const Compiler = struct {
     /// A no-op unless `fix disasm` turned name capture on, so callers can arm
     /// unconditionally without gating on the hot path.
     pub fn armName(self: *Compiler, name_id: InternId) void {
-        if (!self.registry.capture_names) return;
+        // Always on now: the qualified-name tree needs real binding segments in
+        // every run (traces/errors), and setting a pending `InternId` is cheap.
+        // `armSyntheticName`/`armNodeTagName` stay gated — synthetic detail is
+        // disasm-only. See `initChild`.
         self.name_hint = name_id;
         self.name_hint_synthetic = false;
     }
@@ -287,7 +306,7 @@ pub const Compiler = struct {
         // identical semantics AND identical diagnostics, so sharing one
         // registration is observation-free. Folded-constant chunks self-exclude
         // (their pool Values hold per-fold ObjectIds that never bit-match).
-        const r = try self.registry.registerDeduped(ch);
+        const r = try self.registry.registerDeduped(ch, self.name_id);
         if (r.reused) {
             var copy = ch;
             copy.deinit(self.persistent);

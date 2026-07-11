@@ -194,7 +194,7 @@ pub const Console = struct {
         try cli.reset(w, self.use_color);
         try w.writeByte('\n');
         if (s.currentFrame()) |f| {
-            try self.writeFrameLine(w, s, 0, f, true);
+            try self.writeFrameLine(w, s, 0, s.frameCount() - 1, true);
             try self.sourceSnippet(w, s, f);
         }
         // Only break/error carry a meaningful value; a line/step stop doesn't.
@@ -287,12 +287,12 @@ pub const Console = struct {
         var depth: usize = 0;
         while (idx > 0) : (depth += 1) {
             idx -= 1;
-            try self.writeFrameLine(w, s, depth, s.frame(idx), false);
+            try self.writeFrameLine(w, s, depth, idx, false);
         }
     }
 
-    fn writeFrameLine(self: *Console, w: *std.Io.Writer, s: *DebugSession, depth: usize, f: fix.DebugFrame, current: bool) !void {
-        _ = s;
+    fn writeFrameLine(self: *Console, w: *std.Io.Writer, s: *DebugSession, depth: usize, frame_idx: usize, current: bool) !void {
+        const f = s.frame(frame_idx);
         try w.print("#{d} ", .{depth});
         if (current) {
             try self.style(w, .note_label);
@@ -307,7 +307,14 @@ pub const Console = struct {
         }
         try cli.reset(w, self.use_color);
         if (f.line != 0) try w.print(":{d}:{d}", .{ f.line, f.column });
-        if (f.name) |name| {
+        // Always-on qualified name (`pkgs.hello`); falls back to the gated
+        // detailed sidecar name when the tree has nothing.
+        if (s.hasFrameName(frame_idx)) {
+            try w.writeAll(" ");
+            try self.style(w, .name);
+            try s.writeFrameName(w, frame_idx);
+            try cli.reset(w, self.use_color);
+        } else if (f.name) |name| {
             try w.writeAll(" ");
             try self.style(w, .name);
             try w.print("{s}", .{name});

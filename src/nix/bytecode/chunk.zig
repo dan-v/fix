@@ -12,6 +12,7 @@ const AttrEntry = @import("runtime").heap.AttrEntry;
 const AttrPosEntry = @import("runtime").heap.AttrPosEntry;
 const stable = @import("base").segments;
 const sync = @import("base").sync;
+const name_tree_mod = @import("name_tree.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
@@ -600,6 +601,10 @@ pub const ChunkRegistry = struct {
     /// dereferenced by paths that need the code/constants themselves.
     pub const ChunkSlot = struct {
         ptr: *Chunk,
+        /// Qualified-name node in `name_tree` (0 = anonymous). Always populated
+        /// (not gated), cheap, thread-safe — this is what traces/errors/disasm
+        /// read for a chunk's `pkgs.hello`-style name.
+        name: name_tree_mod.NameId = name_tree_mod.NAME_ROOT,
         trivial: TrivialBody,
         body_is_substantial: bool,
         /// Untrusted-band bit (see `SchedulingHints.spec_band_small`):
@@ -631,6 +636,11 @@ pub const ChunkRegistry = struct {
     allocator: std.mem.Allocator,
     chunks: Store,
     well_known: WellKnownChunks,
+    /// Always-on qualified-name tree (see `name_tree.zig`). The compiler
+    /// populates it; each `ChunkSlot.name` indexes into it. Unlike the
+    /// `capture_names` sidecar below, this is cheap and thread-safe, so names
+    /// are available in every run for traces/errors — not just under disasm.
+    name_tree: name_tree_mod.NameTree = .{},
     /// Best-effort chunk-name sidecar for `fix disasm`: maps a chunk id to the
     /// attr/let binding name a lambda or thunk was compiled for. Populated only
     /// while `capture_names` is set — off by default so ordinary compiles pay
@@ -764,6 +774,7 @@ pub const ChunkRegistry = struct {
         while (lit.next()) |v| self.allocator.free(v.*);
         self.local_names.deinit(self.allocator);
         self.name_uses.deinit(self.allocator);
+        self.name_tree.deinit(self.allocator);
         for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
     }
 
@@ -844,6 +855,25 @@ pub const ChunkRegistry = struct {
     /// The best-effort name attributed to `id`, if any.
     pub fn nameOf(self: *const ChunkRegistry, id: ChunkId) ?types.InternId {
         return self.names.get(id);
+    }
+
+    /// Write `id`'s always-on qualified name (`pkgs.hello`) into `w`, or nothing
+    /// if the chunk is anonymous. Reads the `name_tree`; no allocation, no flag.
+    pub fn writeQualifiedName(self: *const ChunkRegistry, w: *std.Io.Writer, id: ChunkId, intern: *const @import("runtime").intern.InternTable) !void {
+        const s = self.slot(id) orelse return;
+        try self.name_tree.writeQualified(w, s.name, intern);
+    }
+
+    /// Whether `id` has an always-on qualified name.
+    pub fn hasQualifiedName(self: *const ChunkRegistry, id: ChunkId) bool {
+        const s = self.slot(id) orelse return false;
+        return self.name_tree.named(s.name);
+    }
+
+    /// Intern a child name under `parent` for `segment` (compiler use, during
+    /// its top-down descent).
+    pub fn childName(self: *ChunkRegistry, parent: name_tree_mod.NameId, segment: types.InternId) !name_tree_mod.NameId {
+        return self.name_tree.child(self.allocator, parent, segment);
     }
 
     /// The source file recorded for `id`, if any.
@@ -958,7 +988,7 @@ pub const ChunkRegistry = struct {
     /// registration when possible (see `dedup_shards`). Returns the id and
     /// whether it was reused — reused=true means the caller still owns (and
     /// must deinit) its own copy of `chunk`.
-    pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk) !struct { id: ChunkId, reused: bool } {
+    pub fn registerDeduped(self: *ChunkRegistry, chunk: Chunk, name: name_tree_mod.NameId) !struct { id: ChunkId, reused: bool } {
         const h = contentHash(&chunk);
         const shard = &self.dedup_shards[@as(usize, @intCast(h >> 58))];
 
@@ -977,10 +1007,10 @@ pub const ChunkRegistry = struct {
             // Hash collision with different content. `h`'s map entry is
             // permanent (first writer wins, entries are never replaced), so
             // there is nothing to insert: register plain, as before.
-            return .{ .id = try self.register(chunk), .reused = false };
+            return .{ .id = try self.registerNamed(chunk, name), .reused = false };
         }
 
-        const id = try self.register(chunk);
+        const id = try self.registerNamed(chunk, name);
         if (!self.solo) shard.mu.lock();
         const inserted = blk: {
             const gop = shard.map.getOrPut(self.allocator, h) catch |err| {
@@ -1008,6 +1038,12 @@ pub const ChunkRegistry = struct {
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
+        return self.registerNamed(chunk, name_tree_mod.NAME_ROOT);
+    }
+
+    /// `register`, tagging the chunk with its qualified-name node (see
+    /// `name_tree`). The compiler passes the name it built while descending.
+    pub fn registerNamed(self: *ChunkRegistry, chunk: Chunk, name: name_tree_mod.NameId) !ChunkId {
         const stored = try self.allocator.create(Chunk);
         errdefer {
             stored.deinit(self.allocator);
@@ -1025,6 +1061,7 @@ pub const ChunkRegistry = struct {
         // solo mode (single-worker evaluator) the serial append drops the CAS.
         const new_slot: ChunkSlot = .{
             .ptr = stored,
+            .name = name,
             .trivial = stored.scheduling.trivial,
             .body_is_substantial = stored.scheduling.body_is_substantial,
             .spec_band_small = stored.scheduling.spec_band_small,
