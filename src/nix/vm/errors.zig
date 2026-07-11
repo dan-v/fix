@@ -32,6 +32,11 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
             if (sameSourceSpan(prev, span)) continue;
         }
         previous = span;
+        // Attribute the frame to its qualified name when we have one, so the
+        // trace reads `while evaluating 'pkgs.hello'` — always available now
+        // via the name tree, no flag. Falls back to the bare note otherwise.
+        var name_buf: [512]u8 = undefined;
+        const message = frameMessage(self, frame.chunk_id, &name_buf);
         const diag_frame = diagnostic.Diagnostic{
             .severity = .note,
             .kind = .compile,
@@ -40,12 +45,23 @@ pub fn captureErrorTrace(self: *VM, err: anyerror) !void {
             .offset = span.offset,
             .len = span.len,
             .token_type = null,
-            .message = "while evaluating",
+            .message = message,
         };
         const source_path = if (span.file) |file| self.intern.get(file) else null;
         try trace.pushDiagnosticFrame(source_path, diag_frame);
     }
     trace.markCapturedStack();
+}
+
+/// The `while evaluating [<name>]` note for a frame, rendering the chunk's
+/// qualified name into `buf` when it has one (else the bare note). Cold path.
+fn frameMessage(self: *VM, chunk_id: @import("runtime").types.ChunkId, buf: []u8) []const u8 {
+    if (!self.registry.hasQualifiedName(chunk_id)) return "while evaluating";
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("while evaluating '") catch return "while evaluating";
+    self.registry.writeQualifiedName(&w, chunk_id, self.intern) catch return "while evaluating";
+    w.writeByte('\'') catch return "while evaluating";
+    return buf[0..w.end];
 }
 
 pub fn sourceSpanForFrame(frame: Frame) ?chunk.Chunk.SourceSpan {
