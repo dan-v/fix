@@ -25,7 +25,7 @@ Each is a self-contained tool with its own `-h`. `eval`/`repl` share the compile
 | `shell` | build a derivation and open a shell with its `bin/` on `PATH` (`-p NAMES...` pulls packages from `<nixpkgs>`) | — |
 | `store` | query the nix-daemon directly (protocol version, path validity) | — |
 | `repl` | interactive read-eval loop | — |
-| `disasm` | decompile bytecode per-chunk with source-span + constant annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
+| `disasm` | decompile bytecode per-chunk with source-span, constant, and local/upvalue-name annotation | [compiler/pipeline.md](compiler/pipeline.md), [vm/dispatch.md](vm/dispatch.md) |
 | `inspect` | post-eval heap size / intern stats / chunk count; `--top N` longest interned strings | [runtime/interning.md](runtime/interning.md) |
 | `trace dump PATH` / `trace diff A B` | read binary VM-execution trace files: `dump` pretty-prints one as text; `diff` walks two in lockstep to the first divergent event | [vm/dispatch.md](vm/dispatch.md) |
 | `thunks diff A B` | diff two thunk-resolution logs → first divergence by source location | below |
@@ -80,7 +80,7 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 Frames show names when chunk-name capture is on (`--debugger` enables it), so a backtrace reads like `pkgs/hello.nix:12:3 hello (chunk #42)`. Console expressions run on a fresh nested VM sharing the registry, heap, and intern table, so inspecting a value never disturbs the pause point.
 
-**Scope-accurate evaluation.** A console expression resolves the breakpoint's lexical bindings — `let` bindings, lambda params, and captured upvalues — not just globals. The compiler records a slot→name table per chunk (gated on the same capture flag, so normal builds pay nothing), and the console reconstructs an ambient scope from the frame stack's named locals and upvalues (inner frames shadow outer), plus `it` = the break value. Because a break often lands in a small argument thunk whose own frame has no locals, the scope merges *all* live frames, so `base`, a param `n`, or an outer `pkgs` all resolve. `with`-scopes aren't reconstructed yet.
+**Scope-accurate evaluation.** A console expression resolves the breakpoint's lexical bindings — `let` bindings, lambda params, captured upvalues, and `with`-scopes — not just globals. The compiler records a slot→name table per chunk (gated on the same capture flag, so normal builds pay nothing), and the console reconstructs an ambient scope from the frame stack: named locals and upvalues (inner frames shadow outer), plus each in-effect `with` attrset merged at lowest precedence (a `with` subject is a nameless local slot or a `"\x00with"` upvalue; lexical bindings shadow it, inner `with` shadows outer), plus `it` = the break value. Because a break often lands in a small argument thunk whose own frame has no locals, the scope merges *all* live frames, so `base`, a param `n`, or an attr `hello` from `with pkgs;` all resolve.
 
 ### Source-line breakpoints
 
