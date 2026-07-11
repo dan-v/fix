@@ -50,7 +50,7 @@ const Probe = struct {
         self.value_len = vw.end;
 
         if (self.eval_expr) |expr| {
-            const scope = try s.bindValueScope("it");
+            const scope = try s.scopeAttrs();
             const result = try s.eval(expr, scope);
             var ew: std.Io.Writer = .fixed(&self.eval_text);
             s.writeValue(&ew, try s.force(result)) catch {};
@@ -90,6 +90,28 @@ test "debug session evaluates expressions with the break value bound as it" {
     _ = try ev.evaluate("builtins.break { a = 40; b = 2; }");
     try std.testing.expectEqual(@as(usize, 1), probe.hits);
     try std.testing.expectEqualStrings("42", probe.evalResult());
+}
+
+test "scopeAttrs resolves breakpoint-scope locals and upvalues by name" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    ev.setCaptureChunkNames(true); // --debugger enables this; needed for names
+    var probe: Probe = .{ .eval_expr = "base * factor + n" };
+    probe.install(&ev);
+
+    // `factor` is an upvalue of `scale`, `n` a param, `base` a let-binding; the
+    // break lands in the argument thunk, so scopeAttrs must merge outer frames.
+    const src =
+        \\let
+        \\  factor = 3;
+        \\  scale = n:
+        \\    let base = n + 1;
+        \\    in builtins.seq (builtins.break "x") (base * factor);
+        \\in scale 10
+    ;
+    _ = try ev.evaluatePath(src, "scope.nix");
+    // base=11, factor=3, n=10 -> 11*3 + 10 = 43
+    try std.testing.expectEqualStrings("43", probe.evalResult());
 }
 
 test "no debug UI installed leaves builtins.break as a plain identity" {

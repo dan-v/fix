@@ -651,6 +651,11 @@ pub const ChunkRegistry = struct {
     /// Companion to `names`: per-chunk upvalue binding names (slot order), from
     /// the compiler's capture list. Slices owned by `allocator`.
     upvalue_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
+    /// Companion to `names`: per-chunk LOCAL binding names indexed by stack slot
+    /// (let bindings + lambda params). Slots are monotonic per chunk, so this is
+    /// a flat slot→name array. Used by the debugger to resolve breakpoint-scope
+    /// identifiers. Slices owned by `allocator`.
+    local_names: std.AutoHashMapUnmanaged(ChunkId, []types.InternId) = .empty,
     /// How many chunks already claimed each base name, so `recordName` callers
     /// can uniquify duplicates with a `~N` suffix.
     name_uses: std.AutoHashMapUnmanaged(types.InternId, u32) = .empty,
@@ -755,6 +760,9 @@ pub const ChunkRegistry = struct {
         var it = self.upvalue_names.valueIterator();
         while (it.next()) |v| self.allocator.free(v.*);
         self.upvalue_names.deinit(self.allocator);
+        var lit = self.local_names.valueIterator();
+        while (lit.next()) |v| self.allocator.free(v.*);
+        self.local_names.deinit(self.allocator);
         self.name_uses.deinit(self.allocator);
         for (&self.dedup_shards) |*shard| shard.map.deinit(self.allocator);
     }
@@ -814,6 +822,23 @@ pub const ChunkRegistry = struct {
     /// The chunk's recorded upvalue names (slot order), if any.
     pub fn upvalueNamesOf(self: *const ChunkRegistry, id: ChunkId) ?[]const types.InternId {
         return self.upvalue_names.get(id);
+    }
+
+    /// Record the chunk's local binding names indexed by stack slot. No-op
+    /// unless `capture_names` is on; the slice is duped into the registry.
+    pub fn recordLocalNames(self: *ChunkRegistry, id: ChunkId, names_in: []const types.InternId) !void {
+        if (!self.capture_names or names_in.len == 0) return;
+        self.checkSingleThread();
+        const copy = try self.allocator.dupe(types.InternId, names_in);
+        errdefer self.allocator.free(copy);
+        const gop = try self.local_names.getOrPut(self.allocator, id);
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = copy;
+    }
+
+    /// The chunk's recorded local names (slot order), if any.
+    pub fn localNamesOf(self: *const ChunkRegistry, id: ChunkId) ?[]const types.InternId {
+        return self.local_names.get(id);
     }
 
     /// The best-effort name attributed to `id`, if any.

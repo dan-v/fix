@@ -38,6 +38,10 @@ pub fn declareLocal(self: *Compiler, name: []const u8, name_id: InternId) !u16 {
         .depth = self.scope_depth,
         .slot = slot,
     });
+    // Debug-only slot→name record (`capture_names`): slots are monotonic per
+    // chunk, so appending in declaration order keeps `local_names[slot]` aligned
+    // with `slot`. See `ChunkRegistry.recordLocalNames`.
+    if (self.registry.capture_names) try self.local_names.append(self.allocator, name_id);
     return slot;
 }
 

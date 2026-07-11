@@ -141,6 +141,22 @@ pub const DebugSession = struct {
         return self.vm.stack[f.frame_base + slot];
     }
 
+    /// The source name of local `slot` in frame `i`, if the compiler recorded
+    /// one (requires chunk-name capture, which `--debugger` enables). Internal
+    /// (`\x00`-prefixed) names are hidden.
+    pub fn localName(self: *const DebugSession, i: usize, slot: usize) ?[]const u8 {
+        const names = self.ev.registry.localNamesOf(self.vm.frames[i].chunk_id) orelse return null;
+        if (slot >= names.len) return null;
+        return displayName(self.ev.intern.get(names[slot]));
+    }
+
+    /// The source name of upvalue `idx` in frame `i`, if recorded.
+    pub fn upvalueName(self: *const DebugSession, i: usize, idx: usize) ?[]const u8 {
+        const names = self.ev.registry.upvalueNamesOf(self.vm.frames[i].chunk_id) orelse return null;
+        if (idx >= names.len) return null;
+        return displayName(self.ev.intern.get(names[idx]));
+    }
+
     pub fn upvalueCount(self: *const DebugSession, i: usize) usize {
         return if (self.vm.frames[i].upvalues) |ups| ups.len else 0;
     }
@@ -264,7 +280,66 @@ pub const DebugSession = struct {
         }};
         return Value.attrs(try self.ev.heap.addAttrs(&entries));
     }
+
+    /// The lexical scope at the pause: an ambient attrset of the current frame's
+    /// named locals and upvalues (locals shadow upvalues), plus `it` = the break
+    /// value. Console expressions compile against this, so `let`/`param`
+    /// bindings visible at the breakpoint resolve as free identifiers. Requires
+    /// recorded names (`--debugger` turns capture on); with no frame or no names
+    /// it degrades to just `it`.
+    pub fn scopeAttrs(self: *DebugSession) !Value {
+        if (self.vm.frames_len == 0) return self.bindValueScope("it");
+
+        var map: std.AutoArrayHashMapUnmanaged(types.InternId, Value) = .empty;
+        defer map.deinit(self.ev.allocator);
+
+        // Walk the frame stack outermost→innermost so nearer frames shadow
+        // farther ones. A break often lands in a small argument thunk whose own
+        // frame has no locals — the enclosing frame carries the `let`/param
+        // bindings the user means, so all frames contribute.
+        var fi: usize = 0;
+        while (fi < self.vm.frames_len) : (fi += 1) {
+            try self.collectFrameBindings(&map, fi);
+        }
+        // `it` = the break value, overriding any same-named binding.
+        try map.put(self.ev.allocator, try self.ev.intern.intern("it"), self.value);
+
+        var entries: std.ArrayListUnmanaged(runtime.heap.AttrEntry) = .empty;
+        defer entries.deinit(self.ev.allocator);
+        var mit = map.iterator();
+        while (mit.next()) |e| try entries.append(self.ev.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
+        return Value.attrs(try self.ev.heap.addAttrs(entries.items));
+    }
+
+    /// Add frame `i`'s named upvalues then locals (locals shadow upvalues) into
+    /// `map`. Later frames overwrite earlier — call outermost→innermost.
+    fn collectFrameBindings(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
+        const f = &self.vm.frames[i];
+        if (self.ev.registry.upvalueNamesOf(f.chunk_id)) |names| {
+            if (f.upvalues) |ups| {
+                for (names, 0..) |nid, idx| {
+                    if (idx >= ups.len) break;
+                    if (displayName(self.ev.intern.get(nid)) != null) try map.put(self.ev.allocator, nid, ups[idx]);
+                }
+            }
+        }
+        if (self.ev.registry.localNamesOf(f.chunk_id)) |names| {
+            for (names, 0..) |nid, slot| {
+                if (slot >= f.local_count) break;
+                if (displayName(self.ev.intern.get(nid)) != null) {
+                    try map.put(self.ev.allocator, nid, self.vm.stack[f.frame_base + slot]);
+                }
+            }
+        }
+    }
 };
+
+/// Hide compiler-internal binding names (`\x00`-prefixed sentinels like the
+/// `with`-capture marker) from debugger scope/locals views.
+fn displayName(text: []const u8) ?[]const u8 {
+    if (text.len == 0 or text[0] == 0) return null;
+    return text;
+}
 
 /// The earliest source-mapped code offset in a chunk — a callee's "first line"
 /// entry point for step-into. Null if the chunk carries no source map.

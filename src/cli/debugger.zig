@@ -56,8 +56,9 @@ pub const Console = struct {
         self.hits += 1;
         // Whatever step brought us here (if any) is complete — disarm its temps.
         s.clearStep();
-        // The break value is exposed to console expressions as `it`.
-        const scope = s.bindValueScope("it") catch null;
+        // Console expressions resolve against the pause's lexical scope (named
+        // locals + upvalues), with the break value bound as `it`.
+        const scope = s.scopeAttrs() catch s.bindValueScope("it") catch null;
 
         {
             var out = self.stderr();
@@ -88,65 +89,70 @@ pub const Console = struct {
     }
 
     /// Handle one console line. Returns true when evaluation should resume.
+    ///
+    /// Commands and Nix expressions share the prompt, so a bare line is an
+    /// expression unless it is *exactly* a no-arg command word (`n`, `bt`, …) —
+    /// that way `n + base` evaluates instead of stepping. A leading `:` forces
+    /// command interpretation. Arg commands (`break`, `delete`) match on their
+    /// first word, which is never a valid expression prefix.
     fn dispatch(self: *Console, s: *DebugSession, line: []const u8, scope: ?Value) !bool {
         if (line.len == 0) return false;
-
-        // A leading ':' is optional on commands (`:bt` == `bt`).
-        const cmd = if (line[0] == ':') line[1..] else line;
+        const explicit = line[0] == ':';
+        const cmd = if (explicit) std.mem.trim(u8, line[1..], " \t") else line;
+        if (cmd.len == 0) return false;
         const word = firstWord(cmd);
         const rest = std.mem.trim(u8, cmd[word.len..], " \t");
+        const bare = rest.len == 0; // no trailing content → unambiguous command
 
-        if (eq(word, "c") or eq(word, "cont") or eq(word, "continue")) return true;
-        if (eq(word, "q") or eq(word, "quit") or eq(word, "abort")) return AbortError;
-        // Stepping: arm the step, then resume (the next pause is the landing).
-        if (eq(word, "n") or eq(word, "next")) {
-            try self.armStep(s, .over);
-            return true;
+        // No-arg commands: only when the line is exactly the word (or `:`-forced).
+        if (bare or explicit) {
+            if (isWord(word, &.{ "c", "cont", "continue" })) return true;
+            if (isWord(word, &.{ "q", "quit", "abort" })) return AbortError;
+            if (isWord(word, &.{ "n", "next" })) {
+                try self.armStep(s, .over);
+                return true;
+            }
+            if (isWord(word, &.{ "s", "step" })) {
+                try self.armStep(s, .into);
+                return true;
+            }
+            if (isWord(word, &.{ "finish", "fin", "out" })) {
+                try self.armStep(s, .out);
+                return true;
+            }
+            if (isWord(word, &.{ "bt", "backtrace", "where", "w" })) {
+                try self.backtrace(s);
+                return false;
+            }
+            if (isWord(word, &.{ "l", "locals" })) {
+                try self.locals(s);
+                return false;
+            }
+            if (isWord(word, &.{ "v", "value" })) {
+                try self.printValue(s, s.value);
+                return false;
+            }
+            if (isWord(word, &.{ "breakpoints", "info" })) {
+                try self.listBreakpoints(s);
+                return false;
+            }
+            if (isWord(word, &.{ "help", "h", "?" })) {
+                try self.help();
+                return false;
+            }
         }
-        if (eq(word, "s") or eq(word, "step")) {
-            try self.armStep(s, .into);
-            return true;
-        }
-        if (eq(word, "finish") or eq(word, "fin") or eq(word, "o") or eq(word, "out")) {
-            try self.armStep(s, .out);
-            return true;
-        }
-        if (eq(word, "help") or eq(word, "?") or eq(word, "h")) {
-            try self.help();
-            return false;
-        }
-        if (eq(word, "bt") or eq(word, "backtrace") or eq(word, "where") or eq(word, "w")) {
-            try self.backtrace(s);
-            return false;
-        }
-        if (eq(word, "l") or eq(word, "locals")) {
-            try self.locals(s);
-            return false;
-        }
-        if (eq(word, "v") or eq(word, "value")) {
-            try self.printValue(s, s.value);
-            return false;
-        }
-        if (eq(word, "break") or eq(word, "b")) {
+        // Arg commands: `break`/`delete` aren't valid expression prefixes.
+        if (isWord(word, &.{"break"})) {
             try self.addBreakpoint(s, rest);
             return false;
         }
-        if (eq(word, "breakpoints") or eq(word, "info")) {
-            try self.listBreakpoints(s);
-            return false;
-        }
-        if (eq(word, "delete") or eq(word, "d")) {
+        if (isWord(word, &.{"delete"})) {
             try self.deleteBreakpoint(s, rest);
             return false;
         }
 
-        // `p <expr>` prints an expression; a bare expression does the same.
-        const expr = if (eq(word, "p") or eq(word, "print") or eq(word, "e") or eq(word, "eval")) rest else line;
-        if (expr.len == 0) {
-            try self.reportErr("empty expression", .{});
-            return false;
-        }
-        const result = s.eval(expr, scope) catch |e| {
+        // Everything else is a Nix expression evaluated in the pause scope.
+        const result = s.eval(line, scope) catch |e| {
             try self.reportErr("{s}", .{@errorName(e)});
             return false;
         };
@@ -229,25 +235,49 @@ pub const Console = struct {
             try w.writeAll("(no frames)\n");
             return;
         }
-        const i = n - 1;
-        const lc = s.localCount(i);
-        const uc = s.upvalueCount(i);
-        if (lc == 0 and uc == 0) {
-            try w.writeAll("(no locals in scope)\n");
-            return;
+        // Walk frames innermost-first; a break often lands in a small argument
+        // thunk with no locals, so show every frame that carries named bindings.
+        var shown = false;
+        var idx: usize = n;
+        var depth: usize = 0;
+        while (idx > 0) : (depth += 1) {
+            idx -= 1;
+            if (try self.frameLocals(w, s, idx, depth)) shown = true;
         }
+        if (!shown) try w.writeAll("(no named locals in scope)\n");
+    }
+
+    /// Print frame `idx`'s named locals and upvalues (with a header). Returns
+    /// true if it printed anything.
+    fn frameLocals(self: *Console, w: *std.Io.Writer, s: *DebugSession, idx: usize, depth: usize) !bool {
+        const lc = s.localCount(idx);
+        const uc = s.upvalueCount(idx);
+        var any = false;
         var slot: usize = 0;
         while (slot < lc) : (slot += 1) {
-            try w.print("  local[{d}] = ", .{slot});
-            self.renderTo(w, s, s.localValue(i, slot)) catch try w.writeAll("<error>");
+            const name = s.localName(idx, slot) orelse continue;
+            if (!any) try self.localsHeader(w, s, idx, depth);
+            any = true;
+            try w.print("  {s} = ", .{name});
+            self.renderTo(w, s, s.localValue(idx, slot)) catch try w.writeAll("<error>");
             try w.writeByte('\n');
         }
         var up: usize = 0;
         while (up < uc) : (up += 1) {
-            try w.print("  upvalue[{d}] = ", .{up});
-            self.renderTo(w, s, s.upvalueValue(i, up)) catch try w.writeAll("<error>");
+            const name = s.upvalueName(idx, up) orelse continue;
+            if (!any) try self.localsHeader(w, s, idx, depth);
+            any = true;
+            try w.print("  {s} = ", .{name});
+            self.renderTo(w, s, s.upvalueValue(idx, up)) catch try w.writeAll("<error>");
             try w.writeByte('\n');
         }
+        return any;
+    }
+
+    fn localsHeader(self: *Console, w: *std.Io.Writer, s: *DebugSession, idx: usize, depth: usize) !void {
+        try self.style(w, .dim);
+        try w.print("#{d} {s}:\n", .{ depth, if (s.frame(idx).name) |nm| nm else "<anon>" });
+        try cli.reset(w, self.use_color);
     }
 
     fn armStep(self: *Console, s: *DebugSession, kind: DebugSession.StepKind) !void {
@@ -338,11 +368,11 @@ pub const Console = struct {
         defer out.interface.flush() catch {};
         const w = &out.interface;
         try w.writeAll(
-            \\debugger commands:
-            \\  <expr>            evaluate an expression (`it` is the break value)
-            \\  p / print EXPR    same, explicit
+            \\debugger commands (a bare line is a Nix expression in scope; `it` is
+            \\the break value). A command word alone runs the command; type an
+            \\expression like `n + 1` to evaluate — or `:n` to force the command.
             \\  bt / backtrace    show the call stack with source locations
-            \\  l / locals        show the current frame's locals and upvalues
+            \\  l / locals        show in-scope locals and upvalues, per frame
             \\  v / value         print the value passed to builtins.break
             \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
             \\  breakpoints       list breakpoints
@@ -380,8 +410,9 @@ pub const Console = struct {
     }
 };
 
-fn eq(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
+fn isWord(word: []const u8, aliases: []const []const u8) bool {
+    for (aliases) |a| if (std.mem.eql(u8, word, a)) return true;
+    return false;
 }
 
 fn firstWord(s: []const u8) []const u8 {

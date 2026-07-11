@@ -77,6 +77,10 @@ pub const Compiler = struct {
     source_file_id: ?InternId,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
+    /// Debug-only slot→name record (parallel to slot allocation). Populated in
+    /// `declareLocal` when `registry.capture_names` is on; handed to the
+    /// registry's `local_names` sidecar at finalize. Empty otherwise.
+    local_names: std.ArrayListUnmanaged(InternId),
     with_scopes: std.ArrayListUnmanaged(WithScope),
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
     owned_diagnostic_messages: std.ArrayListUnmanaged([]u8),
@@ -161,6 +165,7 @@ pub const Compiler = struct {
             .source_file_id = null,
             .locals = .empty,
             .captures = .empty,
+            .local_names = .empty,
             .with_scopes = .empty,
             .diagnostics = .empty,
             .owned_diagnostic_messages = .empty,
@@ -337,6 +342,11 @@ pub const Compiler = struct {
             for (self.captures.items, names) |cap, *n| n.* = cap.name_id;
             try self.registry.recordUpvalueNames(id, names);
         }
+        // Local binding names (slot order) — the debugger resolves
+        // breakpoint-scope identifiers through this.
+        if (self.registry.capture_names and self.local_names.items.len > 0) {
+            try self.registry.recordLocalNames(id, self.local_names.items);
+        }
     }
 
     pub fn deinit(self: *Compiler) void {
@@ -349,6 +359,7 @@ pub const Compiler = struct {
         self.with_scopes.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.locals.deinit(self.allocator);
+        self.local_names.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
         if (self.parent == null and self.line_index_ready) {
             self.line_index.deinit(self.allocator);
