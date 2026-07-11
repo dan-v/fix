@@ -1924,6 +1924,24 @@ pub fn bestSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
     return if (best) |e| e.span else null;
 }
 
+/// Source span for a live call frame's `ip`. Like `bestSpan` but with an
+/// **inclusive** end, because a caller frame's `ip` points *past* the call it's
+/// suspended on — i.e. exactly at the covering span's exclusive end — so
+/// `bestSpan` would miss it and the frame would show no location. Falls back to
+/// the chunk's representative `body_span` when no entry covers `ip` (thunk
+/// bodies with a sparse map). This is the backtrace/step location function.
+pub fn frameSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
+    var best: ?Chunk.SourceMapEntry = null;
+    for (chunk.source_map) |entry| {
+        if (ip < entry.start or ip > entry.end) continue;
+        if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
+            best = entry;
+        }
+    }
+    if (best) |e| return e.span;
+    return chunk.body_span;
+}
+
 /// A standalone `; <filename>` comment line marking that subsequent instructions
 /// come from this file (emitted only when the file changes).
 fn writeFileLine(writer: *std.Io.Writer, file: InternId, symbols: Symbols, use_color: bool) !void {

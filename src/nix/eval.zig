@@ -109,7 +109,10 @@ pub const DebugSession = struct {
     pub fn frame(self: *const DebugSession, i: usize) DebugFrame {
         const f = &self.vm.frames[i];
         const symbols: bytecode.disasm.Symbols = .{ .intern = &self.ev.intern, .registry = &self.ev.registry };
-        const span = bytecode.disasm.bestSpan(f.chunk_ptr, f.ip);
+        // `frameSpan` (inclusive end + body_span fallback) so a caller frame,
+        // whose ip sits past the call it's suspended on, still resolves to a
+        // source location instead of showing nothing.
+        const span = bytecode.disasm.frameSpan(f.chunk_ptr, f.ip);
         const file_id = if (span) |s| s.file else bytecode.disasm.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols);
         return .{
             .chunk_id = f.chunk_id,
