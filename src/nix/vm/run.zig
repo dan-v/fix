@@ -453,14 +453,18 @@ fn opJumpIfFalse(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
 fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     const off: u32 = @intCast(ip - 1);
     frame.ip = ip;
-    const original: u8 = if (vm.breakpoints) |bps|
-        (bps.originalFor(frame.chunk_id, off) orelse @intFromEnum(OpCode.halt))
+    const Hit = bytecode_mod.breakpoints.BreakpointTable.Hit;
+    const h: Hit = if (vm.breakpoints) |bps|
+        bps.hit(frame.chunk_id, off, vm.frames_len)
     else
-        @intFromEnum(OpCode.halt);
-    if (vm.break_sink) |sink| {
-        sink.fire(sink.ctx, vm, Value.null_val, .line_breakpoint) catch |e| return e;
+        .{ .original = @intFromEnum(OpCode.halt), .pause = false, .kind = .none };
+    if (h.pause) {
+        if (vm.break_sink) |sink| {
+            const reason: vm_mod.BreakReason = if (h.kind == .step) .step else .line_breakpoint;
+            sink.fire(sink.ctx, vm, Value.null_val, reason) catch |e| return e;
+        }
     }
-    return @call(.always_tail, handlers[original], .{ vm, frame, code, ip, stop_depth });
+    return @call(.always_tail, handlers[h.original], .{ vm, frame, code, ip, stop_depth });
 }
 
 fn opFailAssertion(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {

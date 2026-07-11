@@ -174,6 +174,67 @@ test "deleting a source-line breakpoint stops it firing" {
     try std.testing.expectEqual(@as(usize, 0), local.hits_line);
 }
 
+test "stepping pauses again and preserves the result" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    // On the initial break, arm a step-into; count the resulting step pauses.
+    // Mirrors the console: clear the prior step at each pause entry.
+    const Ctl = struct {
+        steps: usize = 0,
+        armed: bool = false,
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            s.clearStep();
+            if (s.reason == .step) {
+                self.steps += 1;
+                return; // stop stepping; run to completion
+            }
+            if (!self.armed) {
+                self.armed = true;
+                try s.step(.into);
+            }
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const src = "let double = x: x * 2; in builtins.seq (builtins.break 0) (double 21)";
+    const result = try ev.evaluatePath(src, "s.nix");
+    try std.testing.expect(ctl.steps >= 1);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
+}
+
+test "clearStep after a step leaves no patched bytecode behind" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    // Arm a step-over on the break, immediately clear it, and continue: the
+    // program must run to completion with the correct result and no stray
+    // pauses (a leftover patched byte would corrupt or re-trap execution).
+    const Ctl = struct {
+        extra_pauses: usize = 0,
+        armed: bool = false,
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.armed) {
+                self.extra_pauses += 1;
+                return;
+            }
+            self.armed = true;
+            try s.step(.over);
+            s.clearStep();
+        }
+    };
+    var ctl: Ctl = .{};
+    ev.setDebugUi(&ctl, Ctl.run);
+
+    const src = "let double = x: x * 2; in builtins.seq (builtins.break 0) (double 21)";
+    const result = try ev.evaluatePath(src, "s.nix");
+    try std.testing.expectEqual(@as(usize, 0), ctl.extra_pauses);
+    try std.testing.expectEqual(@as(i64, 42), (try ev.forceValue(result)).asInt());
+}
+
 test "console abort error propagates out of evaluation" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();

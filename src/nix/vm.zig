@@ -153,8 +153,9 @@ pub const ImportHost = struct {
 
 /// Why evaluation paused into the debugger. `break_builtin` is a
 /// `builtins.break x` call; `line_breakpoint` is a patched source-line
-/// breakpoint; `eval_error` is an evaluation error caught with `--debugger`.
-pub const BreakReason = enum { break_builtin, line_breakpoint, eval_error };
+/// breakpoint; `step` is a completed single-step; `eval_error` is an
+/// evaluation error caught with `--debugger`.
+pub const BreakReason = enum { break_builtin, line_breakpoint, step, eval_error };
 
 /// A debugger attachment. Installed on every VM by `Evaluator.initVm` when a
 /// debugger is active; null (the default) means "no debugger" and the break

@@ -34,6 +34,21 @@ pub const BreakpointTable = struct {
     requests: std.ArrayListUnmanaged(Request) = .empty,
     placements: std.ArrayListUnmanaged(Placement) = .empty,
     next_id: u32 = 1,
+    /// Temporary patches for the in-progress step (cleared on the next pause).
+    step_temps: std.ArrayListUnmanaged(Placement) = .empty,
+    /// A step stops only when the frame depth is ≤ this (so a step-over doesn't
+    /// stop inside a deeper recursion of the same chunk). `maxInt` = any depth.
+    step_max_depth: u32 = 0,
+
+    /// `req_id` sentinel marking a step temp rather than a user breakpoint.
+    pub const STEP_REQ: u32 = 0;
+
+    /// A candidate step-stop location.
+    pub const Site = struct { chunk_id: ChunkId, offset: u32 };
+
+    /// What the `breakpoint` handler should do at a patched site.
+    pub const HitKind = enum { none, breakpoint, step };
+    pub const Hit = struct { original: u8, pause: bool, kind: HitKind };
 
     /// A user request: "break on FILE:LINE". `line` is the resolved line (the
     /// nearest line at/after the requested one that carries code).
@@ -67,6 +82,7 @@ pub const BreakpointTable = struct {
         for (self.requests.items) |r| self.gpa.free(r.file);
         self.requests.deinit(self.gpa);
         self.placements.deinit(self.gpa);
+        self.step_temps.deinit(self.gpa);
     }
 
     /// The registration hook handed to `ChunkRegistry.breakpoint_sink`.
@@ -130,13 +146,57 @@ pub const BreakpointTable = struct {
         return found;
     }
 
-    /// The saved original opcode byte at a patched site (for the handler to
-    /// chain to). Null if the site isn't ours.
-    pub fn originalFor(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) ?u8 {
+    /// Decide what the `breakpoint` handler does at `(chunk_id, offset)`: the
+    /// saved original opcode to chain to, and whether to pause. A permanent
+    /// breakpoint always pauses; a step temp pauses only at the target depth.
+    pub fn hit(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32, frames_len: u32) Hit {
         for (self.placements.items) |p| {
-            if (p.chunk_id == chunk_id and p.offset == offset) return p.original;
+            if (p.chunk_id == chunk_id and p.offset == offset)
+                return .{ .original = p.original, .pause = true, .kind = .breakpoint };
         }
-        return null;
+        for (self.step_temps.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset)
+                return .{ .original = p.original, .pause = frames_len <= self.step_max_depth, .kind = .step };
+        }
+        return .{ .original = @intFromEnum(opcode.OpCode.halt), .pause = false, .kind = .none };
+    }
+
+    /// Arm a step: patch each site (unless a permanent breakpoint already sits
+    /// there), and stop only at depth ≤ `max_depth`. Replaces any prior step.
+    pub fn armStep(self: *BreakpointTable, registry: *ChunkRegistry, sites: []const Site, max_depth: u32) !void {
+        self.clearStep(registry);
+        self.step_max_depth = max_depth;
+        for (sites) |site| {
+            const c = registry.get(site.chunk_id) orelse continue;
+            if (site.offset >= c.code.len) continue;
+            if (c.code[site.offset] == breakpoint_byte) continue; // already patched (perm or dup)
+            if (self.placedAt(site.chunk_id, site.offset)) continue;
+            try self.step_temps.append(self.gpa, .{
+                .req_id = STEP_REQ,
+                .chunk_id = site.chunk_id,
+                .offset = site.offset,
+                .original = c.code[site.offset],
+            });
+            c.code[site.offset] = breakpoint_byte;
+        }
+    }
+
+    /// Restore every step-temp byte and disarm the step.
+    pub fn clearStep(self: *BreakpointTable, registry: *ChunkRegistry) void {
+        for (self.step_temps.items) |p| {
+            if (registry.get(p.chunk_id)) |c| {
+                if (p.offset < c.code.len and c.code[p.offset] == breakpoint_byte) c.code[p.offset] = p.original;
+            }
+        }
+        self.step_temps.clearRetainingCapacity();
+        self.step_max_depth = 0;
+    }
+
+    fn placedAt(self: *const BreakpointTable, chunk_id: ChunkId, offset: u32) bool {
+        for (self.placements.items) |p| {
+            if (p.chunk_id == chunk_id and p.offset == offset) return true;
+        }
+        return false;
     }
 
     pub fn list(self: *const BreakpointTable) []const Request {

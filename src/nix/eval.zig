@@ -192,6 +192,69 @@ pub const DebugSession = struct {
         return false;
     }
 
+    pub const StepKind = enum {
+        /// Stop at the next line in this frame, or when it returns.
+        over,
+        /// Like `over`, but also stop on entry to a function it calls.
+        into,
+        /// Run until the current frame returns.
+        out,
+    };
+
+    /// Arm a single step. It takes effect once the console resumes; the next
+    /// pause is the step's landing point. See `clearStep`.
+    pub fn step(self: *DebugSession, kind: StepKind) !void {
+        if (self.ev.breakpoints == null) return;
+        const depth = self.vm.frames_len;
+        if (depth == 0) return;
+        const cur = &self.vm.frames[depth - 1];
+
+        var sites: std.ArrayListUnmanaged(bytecode.BreakpointTable.Site) = .empty;
+        defer sites.deinit(self.ev.allocator);
+
+        const max_depth: u32 = switch (kind) {
+            .out => if (depth >= 1) depth - 1 else 0,
+            .over => depth,
+            .into => std.math.maxInt(u32),
+        };
+
+        // Next-line sites in the current chunk (not for a pure step-out).
+        if (kind != .out) {
+            const cur_line: u32 = if (bytecode.disasm.frameSpan(cur.chunk_ptr, cur.ip)) |s| s.line else 0;
+            for (cur.chunk_ptr.source_map) |entry| {
+                if (entry.span.line == cur_line) continue;
+                try sites.append(self.ev.allocator, .{ .chunk_id = cur.chunk_id, .offset = entry.start });
+            }
+        }
+        // The frame's return point (the caller's resume ip): catches "step past
+        // the last line" and realizes step-out.
+        if (depth >= 2) {
+            const caller = &self.vm.frames[depth - 2];
+            try sites.append(self.ev.allocator, .{ .chunk_id = caller.chunk_id, .offset = @intCast(caller.ip) });
+        }
+        // Step-into also arms the entry of every chunk this one may call/force,
+        // so entering one stops at its first line. Over-arms (all potential
+        // callees) — cleaned up on the next pause.
+        if (kind == .into) {
+            var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
+            defer refs.deinit(self.ev.allocator);
+            bytecode.disasm.collectRefs(self.ev.allocator, cur.chunk_ptr, &refs) catch {};
+            for (refs.items) |rid| {
+                const rc = self.ev.registry.get(rid) orelse continue;
+                if (firstMappedOffset(rc)) |off| {
+                    try sites.append(self.ev.allocator, .{ .chunk_id = rid, .offset = off });
+                }
+            }
+        }
+
+        if (self.ev.breakpoints) |*bp| try bp.armStep(&self.ev.registry, sites.items, max_depth);
+    }
+
+    /// Disarm any in-progress step (called at each pause before prompting).
+    pub fn clearStep(self: *DebugSession) void {
+        if (self.ev.breakpoints) |*bp| bp.clearStep(&self.ev.registry);
+    }
+
     /// Build a one-entry scope attrset binding `name` to `self.value` — handy
     /// for the console to expose the break value as an identifier.
     pub fn bindValueScope(self: *DebugSession, name: []const u8) !Value {
@@ -202,6 +265,16 @@ pub const DebugSession = struct {
         return Value.attrs(try self.ev.heap.addAttrs(&entries));
     }
 };
+
+/// The earliest source-mapped code offset in a chunk — a callee's "first line"
+/// entry point for step-into. Null if the chunk carries no source map.
+fn firstMappedOffset(chunk: *const bytecode.chunk.Chunk) ?u32 {
+    var best: ?u32 = null;
+    for (chunk.source_map) |entry| {
+        if (best == null or entry.start < best.?) best = entry.start;
+    }
+    return best;
+}
 
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,

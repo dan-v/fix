@@ -54,6 +54,8 @@ pub const Console = struct {
 
     fn drive(self: *Console, s: *DebugSession) !void {
         self.hits += 1;
+        // Whatever step brought us here (if any) is complete — disarm its temps.
+        s.clearStep();
         // The break value is exposed to console expressions as `it`.
         const scope = s.bindValueScope("it") catch null;
 
@@ -96,6 +98,19 @@ pub const Console = struct {
 
         if (eq(word, "c") or eq(word, "cont") or eq(word, "continue")) return true;
         if (eq(word, "q") or eq(word, "quit") or eq(word, "abort")) return AbortError;
+        // Stepping: arm the step, then resume (the next pause is the landing).
+        if (eq(word, "n") or eq(word, "next")) {
+            try self.armStep(s, .over);
+            return true;
+        }
+        if (eq(word, "s") or eq(word, "step")) {
+            try self.armStep(s, .into);
+            return true;
+        }
+        if (eq(word, "finish") or eq(word, "fin") or eq(word, "o") or eq(word, "out")) {
+            try self.armStep(s, .out);
+            return true;
+        }
         if (eq(word, "help") or eq(word, "?") or eq(word, "h")) {
             try self.help();
             return false;
@@ -146,14 +161,15 @@ pub const Console = struct {
         const reason = switch (s.reason) {
             .break_builtin => "break",
             .line_breakpoint => "breakpoint",
+            .step => "step",
             .eval_error => "error",
         };
         try w.print("\n-- debugger ({s}) --", .{reason});
         try cli.reset(w, self.use_color);
         try w.writeByte('\n');
         if (s.currentFrame()) |f| try self.writeFrameLine(w, s, 0, f, true);
-        // A line breakpoint carries no meaningful value; break/error do.
-        if (s.reason != .line_breakpoint) {
+        // Only break/error carry a meaningful value; a line/step stop doesn't.
+        if (s.reason == .break_builtin or s.reason == .eval_error) {
             try w.writeAll("value: ");
             self.renderTo(w, s, s.value) catch try w.writeAll("<unavailable>");
             try w.writeByte('\n');
@@ -232,6 +248,10 @@ pub const Console = struct {
             self.renderTo(w, s, s.upvalueValue(i, up)) catch try w.writeAll("<error>");
             try w.writeByte('\n');
         }
+    }
+
+    fn armStep(self: *Console, s: *DebugSession, kind: DebugSession.StepKind) !void {
+        s.step(kind) catch |e| try self.reportErr("{s}", .{@errorName(e)});
     }
 
     /// `break FILE:LINE` — set a source-line breakpoint.
@@ -327,6 +347,9 @@ pub const Console = struct {
             \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
             \\  breakpoints       list breakpoints
             \\  delete N          remove breakpoint N
+            \\  n / next          step to the next line (over calls)
+            \\  s / step          step to the next line (into calls)
+            \\  finish            run until the current frame returns
             \\  c / continue      resume evaluation
             \\  q / quit          abort evaluation
             \\  help              this help
