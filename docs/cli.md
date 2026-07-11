@@ -51,6 +51,31 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 **`:d` — the disassembly browser.** Finds the chunk behind an expression (a closure or unforced thunk exposes its own chunk; otherwise the expression's compiled chunk) and opens it in an alternate-screen pager where every chunk mention (`chunk[0xN]` in listings, `chunk #N` on references pages) is a link: Tab/Shift-Tab select, Enter follows, `b`/`f` walk the visit history, `r` shows a references page (outgoing + incoming, from a lazily built whole-registry reverse index), `/` + `n`/`N` search, `?` help. In bare mode `:d` prints the listing plus an outgoing-references footer.
 
+## The debugger
+
+`fix eval --debugger` pauses evaluation into an interactive console — Nix's `--debugger` model — at two points:
+
+- **`builtins.break x`** — a break in the source. `break` is otherwise the identity on `x`, so it can be dropped anywhere: `let y = builtins.break (f a); in ...`.
+- **an evaluation error** — an uncaught `throw`, `abort`, or failed `assert` pauses at the origin (call frames still live) *before* the error unwinds and prints. Errors caught by `builtins.tryEval` do **not** pause.
+
+`--debugger` forces `--workers=1` and disables speculation so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. The console reads commands from stdin and writes to stderr, so a redirected stdout still receives only the final value.
+
+**Console commands** (a leading `:` is optional; a bare line is an expression):
+
+| command | effect |
+|---|---|
+| `<expr>` / `p EXPR` | evaluate an expression; the break value is bound as `it` |
+| `bt` / `backtrace` | the call stack, innermost first, with `file:line:col`, chunk name, and `#chunk` id |
+| `l` / `locals` | the current frame's local slots and upvalues (forced, by index) |
+| `v` / `value` | the value passed to `builtins.break` (or the error subject) |
+| `c` / `continue` | resume evaluation |
+| `q` / `quit` | abort evaluation |
+| `help` | command list |
+
+Frames show names when chunk-name capture is on (`--debugger` enables it), so a backtrace reads like `pkgs/hello.nix:12:3 hello (chunk #42)`. Console expressions run on a fresh nested VM sharing the registry, heap, and intern table, so inspecting a value never disturbs the pause point.
+
+**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), a `fix.DebugSession` facade over the paused VM (backtrace, scope, evaluate-in-place, value rendering), and `Evaluator.setDebugUi`. The `cli` layer supplies the console (`src/cli/debugger.zig`) through that facade and never names a `vm` type. Source locations come from the same `disasm.bestSpan` (ip → narrowest source span) that annotates `fix disasm`.
+
 ## Key flags
 
 The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it drives parsing *and* per-command `--help` visibility (each spec lists the subcommands it applies to). Defaults shown; `[=X]` means the value is optional.
@@ -79,6 +104,7 @@ The data-driven `Spec` table in `src/cli/args.zig` is the source of truth: it dr
 | `--max-memory SIZE` | GC budget before collection kicks in (MiB, or a `k`/`m`/`g` suffix; `0` = never collect; default half of `MemAvailable`). Effective only on a `-Dgc` build → [gc.md](gc.md) |
 | `--hugetlb auto\|on\|off` | back the evaluation heap with explicit 2 MB huge pages (default `auto`: only when the kernel pool has ≥256 MB unreserved capacity). `FIX_HUGETLB` env is the fallback when the flag is absent. Provision the pool with `sysctl vm.nr_hugepages=N` → [perf/hugetlb.md](perf/hugetlb.md) |
 | `--show-trace` | full evaluation traces on error |
+| `--debugger` (eval) | pause into the interactive debug console at `builtins.break` and on evaluation errors; forces `--workers=1`. See [The debugger](#the-debugger). |
 | `--color[=auto\|always\|never]` / `--no-color` | color diagnostics |
 | `--progress[=auto\|always\|never]` / `--no-progress` | eval progress on stderr |
 | `--debug-derivations[=summary\|full]` | write derivation debug records to stderr |
