@@ -776,6 +776,24 @@ pub noinline fn logSpawn(self: *VM, thunk_id: ObjectId, accepted: bool) void {
     });
 }
 
+/// Claim dispatch: the solo (plain load/store) protocol at `--workers=1`,
+/// the atomic CAS one otherwise. `VM.solo` is fixed at construction, so
+/// this is a single predictable branch on the claim path at w>1.
+inline fn tryForceDispatch(self: *VM, thunk: *Thunk) thunk_mod.ForceOutcome {
+    return if (self.solo)
+        thunk.tryForceSolo(self.ctx.claimer_id)
+    else
+        thunk.tryForce(self.ctx.claimer_id);
+}
+
+/// Resolve dispatch, symmetric with `tryForceDispatch` (the solo publish
+/// skips the waiter-list mutex when no fiber ever enrolled). Failure paths
+/// (`reset`/`markErrored`) stay on the atomic variants — cold, and plain +
+/// atomic accesses on one thread are ordered by program order anyway.
+inline fn resolveDispatch(self: *VM, thunk: *Thunk, value: Value) void {
+    if (self.solo) thunk.resolveSolo(value) else thunk.resolve(value);
+}
+
 pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value {
     // GC safepoint (`-Dgc`, --workers=1). forceThunk is a clean unit
     // boundary; collect here, never mid-allocation. The value being forced
@@ -823,7 +841,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     const thunk = self.heap.getThunkAssumeValid(thunk_id);
 
     while (true) {
-        switch (thunk.tryForce(self.ctx.claimer_id)) {
+        switch (tryForceDispatch(self, thunk)) {
             .already_resolved => |v| {
                 if (demand) thunk.markDemanded();
                 return v;
@@ -918,7 +936,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         if (comptime prof.enabled) {
                             if (self.workerId() == 0) prof_census.memo_hits += 1;
                         }
-                        thunk.resolve(s.value);
+                        resolveDispatch(self, thunk, s.value);
                         self.heap.gcRecordEdge(thunk_id, s.value); // old→young barrier
                         recordResolve(self, thunk_id, s.value);
                         if (demand) thunk.markDemanded();
@@ -997,7 +1015,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 {
                     scav_hot_chunks[scav_chunk] = 1;
                 }
-                thunk.resolve(result);
+                resolveDispatch(self, thunk, result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
                 if (memo_key) |k| thunk_memo[k.idx] = .{
                     .token = self.heap.token,

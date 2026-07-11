@@ -279,6 +279,46 @@ pub const Future = struct {
         }
     }
 
+    /// `tryClaim` for a single-worker process (`--workers=1`): exactly one
+    /// OS thread touches thunk futures, so the claim CAS — a full fence +
+    /// serialized RMW on x86, paid once per claimed force — degenerates to a
+    /// plain load/store pair. Fibers on that one thread interleave only at
+    /// yield points, never inside this function, so the read-check-write is
+    /// atomic with respect to every other future user. Blackhole detection
+    /// (same-claimer re-entry) is unchanged. The caller owns the solo-ness
+    /// proof (`VM.solo`, derived from `Scheduler.worker_count == 1` before
+    /// any helper could exist); mixing solo and atomic calls on one thread
+    /// is fine — plain and atomic accesses to the same word are ordered by
+    /// program order there.
+    pub fn tryClaimSolo(self: *Future, claimer: ClaimerId) ClaimResult {
+        // `.monotonic` compiles to plain mov on x86 — the win is dropping
+        // the CAS, not the atomic qualifier. Staying atomic keeps any
+        // overlooked cross-thread observer (a future sampler, a debug
+        // walker) merely stale instead of racy.
+        switch (@as(FutureState, @enumFromInt(self.state.load(.monotonic)))) {
+            .resolved => return .already_resolved,
+            .blackhole => return .blackhole,
+            .errored => return .errored,
+            .unresolved => {
+                self.state.store(@intFromEnum(FutureState.evaluating), .monotonic);
+                self.claimer.store(claimer, .monotonic);
+                return .claimed;
+            },
+            .evaluating => return if (self.claimer.load(.monotonic) == claimer) .blackhole else .busy,
+        }
+    }
+
+    /// `publish` for a single-worker process: plain stores, and the waiter
+    /// drain skips the `waiters_mu` RMW when nobody ever enrolled (the
+    /// overwhelmingly common case — enrollment means some same-thread fiber
+    /// observed `.busy` and parked, and its list push is plainly visible
+    /// here). Same solo-ness contract as `tryClaimSolo`.
+    pub fn publishSolo(self: *Future) void {
+        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.state.store(@intFromEnum(FutureState.resolved), .monotonic);
+        if (self.waiters_head != null) self.wakeFiberWaiters();
+    }
+
     /// Enroll a fiber waiter on this future. Returns true if the waiter
     /// was added to the list (caller should yield and wait for `wake_fn`).
     /// Returns false if the future left `.evaluating` between the caller's
