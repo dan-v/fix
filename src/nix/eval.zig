@@ -208,6 +208,16 @@ pub const Evaluator = struct {
         var registry = try ChunkRegistry.init(allocator);
         errdefer registry.deinit();
 
+        // Single-worker mode: the evaluator owns these tables and no helper
+        // thread will ever exist, so their internal locking (intern shard
+        // mutexes, chunk-dedup shard mutexes, the registration CAS) is pure
+        // tax — mark them solo before anything runs. See InternTable.solo /
+        // ChunkRegistry.solo for the contract.
+        if (worker_count == 1) {
+            intern.solo = true;
+            registry.solo = true;
+        }
+
         const gc_workers = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
             for (ws) |*w| w.* = .init(null);

@@ -348,6 +348,13 @@ pub const Thunk = struct {
         self.future.reset();
     }
 
+    /// `publishCellBinding` on the single-worker path (skips the waiter
+    /// mutex when nobody parked on the cell). See `Future.resetSolo`.
+    pub fn publishCellBindingSolo(self: *Thunk, value: Value) void {
+        self.payload = .{ .target = .{ .pass_through = value } };
+        self.future.resetSolo();
+    }
+
     // Delegators to the embedded Future. The hot ones are `inline` so
     // the force path has no extra call frame. The value-carrying ones
     // (`tryForce`, `resolve`, `markErrored`) read/write the local

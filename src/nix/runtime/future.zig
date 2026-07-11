@@ -319,6 +319,15 @@ pub const Future = struct {
         if (self.waiters_head != null) self.wakeFiberWaiters();
     }
 
+    /// `reset` for a single-worker process — see `publishSolo` for the
+    /// contract. Used by the binding-cell publish (`cell_set` runs once per
+    /// recursive let binding, which pays the waiter-mutex RMW otherwise).
+    pub fn resetSolo(self: *Future) void {
+        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.state.store(@intFromEnum(FutureState.unresolved), .monotonic);
+        if (self.waiters_head != null) self.wakeFiberWaiters();
+    }
+
     /// Enroll a fiber waiter on this future. Returns true if the waiter
     /// was added to the list (caller should yield and wait for `wake_fn`).
     /// Returns false if the future left `.evaluating` between the caller's

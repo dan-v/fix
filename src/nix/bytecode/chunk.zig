@@ -632,6 +632,13 @@ pub const ChunkRegistry = struct {
     /// burned ~3-4% of all w=8 cycles in spin. Each shard carries its own
     /// lock, and the memcmp runs OUTSIDE it (see `registerDeduped`).
     dedup_shards: [dedup_shard_count]DedupShard = [_]DedupShard{.{}} ** dedup_shard_count,
+    /// Single-threaded mode: when the owner guarantees exactly one thread
+    /// ever registers chunks (a `--workers=1` evaluator; set before anything
+    /// runs), `registerDeduped` skips the dedup shard mutexes and `register`
+    /// takes the serial (CAS-free) slot append. ~2 lock RMWs + 1 CAS per
+    /// registration elided (~213K registrations per NixOS-toplevel eval).
+    /// Reads (`get`) were always lock-free. Default off.
+    solo: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkRegistry {
         var self: ChunkRegistry = .{
@@ -893,9 +900,9 @@ pub const ChunkRegistry = struct {
         // structural memcmp OUTSIDE it. Registered chunks are immutable and
         // ids are never removed, so a snapshot can't go stale — the lock only
         // has to protect the map itself.
-        shard.mu.lock();
+        if (!self.solo) shard.mu.lock();
         const candidate = shard.map.get(h);
-        shard.mu.unlock();
+        if (!self.solo) shard.mu.unlock();
 
         if (candidate) |existing| {
             if (contentEql(self.get(existing).?, &chunk)) {
@@ -908,17 +915,17 @@ pub const ChunkRegistry = struct {
         }
 
         const id = try self.register(chunk);
-        shard.mu.lock();
+        if (!self.solo) shard.mu.lock();
         const inserted = blk: {
             const gop = shard.map.getOrPut(self.allocator, h) catch |err| {
-                shard.mu.unlock();
+                if (!self.solo) shard.mu.unlock();
                 return err;
             };
             if (gop.found_existing) break :blk gop.value_ptr.*;
             gop.value_ptr.* = id;
             break :blk null;
         };
-        shard.mu.unlock();
+        if (!self.solo) shard.mu.unlock();
         const winner = inserted orelse return .{ .id = id, .reused = false };
 
         // A concurrent registration won the insert race for this hash while
@@ -948,14 +955,19 @@ pub const ChunkRegistry = struct {
         }
         // Lock-free registration: many workers compile (deferred bodies +
         // speculative imports) concurrently; the writer-mutex append serialized
-        // them per-chunk. `appendAtomic` CAS-bumps the cursor instead.
-        return try self.chunks.appendAtomic(self.allocator, .{
+        // them per-chunk. `appendAtomic` CAS-bumps the cursor instead. In
+        // solo mode (single-worker evaluator) the serial append drops the CAS.
+        const new_slot: ChunkSlot = .{
             .ptr = stored,
             .trivial = stored.scheduling.trivial,
             .body_is_substantial = stored.scheduling.body_is_substantial,
             .strict_param = stored.scheduling.strict_param,
             .strict_via_upvalue = stored.scheduling.strict_via_upvalue,
-        });
+        };
+        return if (self.solo)
+            try self.chunks.appendSerial(self.allocator, new_slot)
+        else
+            try self.chunks.appendAtomic(self.allocator, new_slot);
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {
