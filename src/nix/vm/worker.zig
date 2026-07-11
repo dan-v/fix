@@ -84,6 +84,10 @@ pub const prewarm_fiber_count: u8 = 4;
 /// before workers spawn (eval.zig `evaluate`).
 pub var stack_release_lazy: bool = true;
 
+/// `FIX_SPIN_ITERS`: pre-park spin duration in `parkAndAccount`, in
+/// spin-loop iterations (probe knob; default 1024 = the historical value).
+pub var spin_iterations: u32 = 1024;
+
 /// Fiber cost/benefit census (piggybacks on `-Dprof-main`; see
 /// `prof.FiberLocal`). Comptime-gated so the default build's structs
 /// and hot paths are untouched.
@@ -797,7 +801,7 @@ pub const Worker = struct {
     /// contention destroys cache coherence across 32 workers; reading
     /// one shared counter is much cheaper.
     fn parkAndAccount(self: *Worker) void {
-        const SPIN_ITERATIONS: u32 = 1024;
+        const SPIN_ITERATIONS: u32 = spin_iterations;
         // Cap the concurrent idle spinners: at high worker counts the
         // spin-and-rescan churn from every idle helper (O(N) queue
         // probes per rescan) burns the SMT siblings of busy workers.
@@ -813,7 +817,7 @@ pub const Worker = struct {
                 // tail), the queued backlog won't be pulled — don't treat it as
                 // available work and busy-spin on it.
                 if (!self.scheduler.backgroundSuppressed() and
-                    (self.scheduler.pending_tasks.v.load(.monotonic) > 0 or self.scheduler.contPending() > 0)) return;
+                    self.scheduler.takableWork(self.worker_id)) return;
                 // Un-scanned scavengeable ring backlog counts as available
                 // work for a scavenging helper (see scavengeStep's cap).
                 if (self.worker_id != 0 and self.worker_id <= self.scheduler.scav_workers and self.scheduler.scavengeEnabled() and
