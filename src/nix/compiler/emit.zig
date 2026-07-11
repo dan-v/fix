@@ -291,15 +291,36 @@ pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const 
     try emitCaptureDescriptors(self, captures);
 }
 
-/// Emit `thunk_defer` (lazy per-attr compilation): a deferred-table
-/// id plus the enclosing-scope snapshot as capture descriptors. Mirrors
-/// `emitApplyArg`'s always-wide-id layout.
+/// Emit `thunk_defer` (lazy per-attr compilation): a deferred-table id plus a
+/// `(start, count)` reference into the chunk's deduped capture-list side table.
+/// An attrset's deferred values all snapshot the same enclosing scope, so the
+/// descriptor list — previously re-emitted inline per value — is interned once.
 pub fn emitDeferAttrValue(self: *Compiler, deferred_id: u32, scope: []const Capture) !void {
     const env_count = try captureCount(scope.len);
+    const cap_start = try internCaptureList(self, scope);
     try emitOp(self, .thunk_defer);
     try self.builder.writeU32(self.allocator, deferred_id);
+    try self.builder.writeU32(self.allocator, cap_start);
     try self.builder.writeU16(self.allocator, env_count);
-    try emitCaptureDescriptors(self, scope);
+    // The descriptors left the code stream for the side table — compensate the
+    // speculation-size threshold (see ChunkBuilder.sideTableWeight).
+    self.builder.capture_inline_weight += @as(usize, scope.len) * 3;
+}
+
+/// Encode `captures` as `(kind:1, index:2-LE)*` and intern the list into the
+/// builder's capture side table, returning its start offset.
+fn internCaptureList(self: *Compiler, captures: []const Capture) !u32 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    for (captures) |capture| {
+        try buf.append(self.allocator, switch (capture.kind) {
+            .local => 0,
+            .upvalue => 1,
+        });
+        try buf.append(self.allocator, @intCast(capture.index & 0xff));
+        try buf.append(self.allocator, @intCast(capture.index >> 8));
+    }
+    return self.builder.internCaptureList(self.allocator, buf.items);
 }
 
 pub fn emitCaptureDescriptors(self: *Compiler, captures: []const Capture) !void {

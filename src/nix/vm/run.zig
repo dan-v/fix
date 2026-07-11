@@ -680,13 +680,13 @@ fn opThunkCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop
 fn opDeferAttrValue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const deferred_id: u32 = readU32(code, ip);
-    const env_count = readU16(code, ip + 4);
-    const descriptors_start = ip + 6;
-    const descriptor_len = @as(usize, env_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+    // The capture list is interned in the chunk's side table (deduped across an
+    // attrset's values); the op carries a (start, count) reference.
+    const cap_start = readU32(code, ip + 4);
+    const cap_count = readU16(code, ip + 8);
+    const descriptors = frame.chunk_ptr.captureList(cap_start, cap_count);
     try closures.makeDeferredThunkFromCaptures(vm, deferred_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+    return dispatch(vm, frame, code, ip + 10, stop_depth);
 }
 
 fn opThunkCapturesEager(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {

@@ -73,6 +73,13 @@ pub const Chunk = struct {
     /// per site) — like `attr_pos`, kept out of the code stream; each op
     /// carries a (start, count) reference.
     attr_names: []const types.InternId = &.{},
+    /// Capture-descriptor lists referenced by `thunk_defer` (and, later, the
+    /// thunk family) — kept OUT of the code stream and DEDUPED, like `attr_pos`.
+    /// An attrset's deferred values all snapshot the same enclosing scope, so
+    /// the same `(kind:1, index:2)*` list was re-emitted inline per value (~12%
+    /// of all code). Ops now carry a `(start, count)` reference; identical lists
+    /// share one range here. Read via `captureList`.
+    capture_bytes: []const u8 = &.{},
     /// Source span ranges for cold-path error traces.
     source_map: []const SourceMapEntry = &.{},
     /// The span of the whole body node this chunk was compiled from — a
@@ -82,12 +89,19 @@ pub const Chunk = struct {
     /// wait. Set at `stampOnBuilder`; null for chunks that skip it.
     body_span: ?SourceSpan = null,
 
+    /// The capture-descriptor bytes for a `(start, count)` reference: `count`
+    /// `(kind:1, index:2)` triples starting at `start` in `capture_bytes`.
+    pub fn captureList(self: *const Chunk, start: u32, count: u16) []const u8 {
+        return self.capture_bytes[start .. start + @as(usize, count) * 3];
+    }
+
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.constants);
         allocator.free(self.function_args);
         allocator.free(self.attr_pos);
         allocator.free(self.attr_names);
+        allocator.free(self.capture_bytes);
         allocator.free(self.source_map);
     }
 };
@@ -220,6 +234,9 @@ pub const SchedulingHints = struct {
 
 /// A mutable builder for constructing chunks.
 pub const ChunkBuilder = struct {
+    /// A distinct capture list's range in `capture_bytes` (for dedup scanning).
+    pub const CaptureRange = struct { start: u32, len: u32 };
+
     code: std.ArrayListUnmanaged(u8),
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
@@ -229,6 +246,17 @@ pub const ChunkBuilder = struct {
     attr_pos: std.ArrayListUnmanaged(AttrPosEntry) = .empty,
     /// Attr names for `attrs_new_named*` — carried onto `Chunk.attr_names`.
     attr_names: std.ArrayListUnmanaged(types.InternId) = .empty,
+    /// Deduped capture-descriptor bytes for `thunk_defer` — carried onto
+    /// `Chunk.capture_bytes`. `capture_index` records each distinct list's
+    /// range so `internCaptureList` can coalesce identical lists (an attrset's
+    /// shared scope snapshot) by a linear scan — a chunk has only a handful of
+    /// distinct lists even when it emits thousands of ops, so no map is needed.
+    capture_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    capture_index: std.ArrayListUnmanaged(CaptureRange) = .empty,
+    /// Total descriptor bytes that USED to be inline in code (summed per op,
+    /// before dedup) — added to `sideTableWeight` so extracting them doesn't
+    /// shrink the chunk's perceived size past the speculation cliff.
+    capture_inline_weight: usize = 0,
     /// The body node's span (see `Chunk.body_span`). Set by `stampOnBuilder`.
     body_span: ?Chunk.SourceSpan = null,
     /// Byte offset of the start of the most recently written opcode.
@@ -283,6 +311,8 @@ pub const ChunkBuilder = struct {
         self.source_map.deinit(allocator);
         self.attr_pos.deinit(allocator);
         self.attr_names.deinit(allocator);
+        self.capture_bytes.deinit(allocator);
+        self.capture_index.deinit(allocator);
     }
 
     /// Restore the freshly-initialized state, keeping buffer capacity —
@@ -293,6 +323,9 @@ pub const ChunkBuilder = struct {
         self.function_args.clearRetainingCapacity();
         self.attr_pos.clearRetainingCapacity();
         self.attr_names.clearRetainingCapacity();
+        self.capture_bytes.clearRetainingCapacity();
+        self.capture_index.clearRetainingCapacity();
+        self.capture_inline_weight = 0;
         self.source_map.clearRetainingCapacity();
         self.body_span = null;
         self.last_op_offset = null;
@@ -302,6 +335,22 @@ pub const ChunkBuilder = struct {
         self.strict_via_upvalue = null;
         self.arity = 1;
         self.strict_params = 0;
+    }
+
+    /// Intern a capture-descriptor list (`descriptors` = `(kind:1, index:2)*`),
+    /// returning its start offset in `capture_bytes`. Identical lists coalesce
+    /// (an attrset's deferred values share one scope snapshot). A rare hash
+    /// collision with different content just appends a non-shared copy.
+    pub fn internCaptureList(self: *ChunkBuilder, allocator: std.mem.Allocator, descriptors: []const u8) !u32 {
+        for (self.capture_index.items) |r| {
+            if (r.len == descriptors.len and
+                std.mem.eql(u8, self.capture_bytes.items[r.start .. r.start + r.len], descriptors))
+                return r.start;
+        }
+        const start: u32 = @intCast(self.capture_bytes.items.len);
+        try self.capture_bytes.appendSlice(allocator, descriptors);
+        try self.capture_index.append(allocator, .{ .start = start, .len = @intCast(descriptors.len) });
+        return start;
     }
 
     /// Write a single opcode byte.
@@ -365,7 +414,7 @@ pub const ChunkBuilder = struct {
     /// extraction of code bytes into a side table MUST add its own
     /// compensation here (same rule as `fusion_savings`).
     fn sideTableWeight(self: *const ChunkBuilder) usize {
-        return self.attr_pos.items.len * 16 + self.attr_names.items.len * 3;
+        return self.attr_pos.items.len * 16 + self.attr_names.items.len * 3 + self.capture_inline_weight;
     }
 
     /// Finalize into an immutable Chunk.
@@ -380,10 +429,13 @@ pub const ChunkBuilder = struct {
         errdefer allocator.free(attr_pos);
         const attr_names = try allocator.dupe(types.InternId, self.attr_names.items);
         errdefer allocator.free(attr_names);
+        const capture_bytes = try allocator.dupe(u8, self.capture_bytes.items);
+        errdefer allocator.free(capture_bytes);
         const source_map = try allocator.dupe(Chunk.SourceMapEntry, self.source_map.items);
         return Chunk{
             .code = code,
             .constants = constants,
+            .capture_bytes = capture_bytes,
             .local_count = local_count,
             .arity = self.arity,
             .strict_params = self.strict_params,
@@ -883,7 +935,7 @@ pub const ChunkRegistry = struct {
     // maps instead — those are keyed by id after registration and never
     // perturb dedup.
     comptime {
-        const chunk_field_count = 11;
+        const chunk_field_count = 12;
         if (std.meta.fields(Chunk).len != chunk_field_count)
             @compileError("Chunk changed shape: update contentHash + contentEql (or route diagnostic-only metadata through the registry sidecar), then adjust chunk_field_count.");
     }
@@ -903,6 +955,7 @@ pub const ChunkRegistry = struct {
         h.update(chunk.code);
         h.update(std.mem.sliceAsBytes(chunk.constants));
         h.update(std.mem.sliceAsBytes(chunk.attr_names));
+        h.update(chunk.capture_bytes);
         h.update(std.mem.sliceAsBytes(chunk.function_args));
         var fp: [4]u32 = .{ @intCast(chunk.attr_pos.len), @intCast(chunk.source_map.len), 0, 0 };
         if (chunk.source_map.len > 0) {
@@ -943,6 +996,7 @@ pub const ChunkRegistry = struct {
             if (x.name != y.name or x.pos.file != y.pos.file or x.pos.line != y.pos.line or x.pos.column != y.pos.column) return false;
         }
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(a.function_args), std.mem.sliceAsBytes(b.function_args))) return false;
+        if (!std.mem.eql(u8, a.capture_bytes, b.capture_bytes)) return false;
         if (a.source_map.len != b.source_map.len) return false;
         for (a.source_map, b.source_map) |x, y| {
             if (x.start != y.start or x.end != y.end or !spanEql(x.span, y.span)) return false;

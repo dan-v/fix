@@ -156,10 +156,12 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols:
         }
         const op: OpCode = @enumFromInt(op_byte);
         ip += 1;
-        // Byte offset of the capture list (past the op's chunk/deferred id).
+        // Byte offset of the INLINE capture list (past the op's chunk id).
+        // `thunk_defer` is excluded — its captures are now interned in the side
+        // table, so it carries no inline list to measure.
         const list_start: ?usize = switch (op) {
             .thunk, .thunk_eag, .closure_cap => ip + 2, // u16 id
-            .thunk_w, .thunk_eag_w, .closure_cap_w, .thunk_arg, .thunk_defer => ip + 4, // u32 id
+            .thunk_w, .thunk_eag_w, .closure_cap_w, .thunk_arg => ip + 4, // u32 id
             else => null,
         };
         scratch.writer.end = 0;
@@ -997,11 +999,15 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             return 2;
         },
         .thunk_defer => {
+            // deferred id (4) + capture-list start (4) + env count (2). Captures
+            // are interned in the chunk side table, not inline — single line.
             const id = readU32(code, start + 1);
-            l.group(1, 4, "#{d}", .{id});
+            const cap_start = readU32(code, start + 5);
+            const cap_count = readU16(code, start + 9);
+            l.group(1, 10, "#{d}", .{id});
             l.comment();
-            l.glue("deferred", .{});
-            return 4;
+            l.glue("deferred #{d}, {d} env @cap[{d}]", .{ id, cap_count, cap_start });
+            return 10;
         },
         .attr_check, .attr_check_w => {
             const allow = code[start + 1];
@@ -1508,7 +1514,8 @@ fn isMultiline(op: OpCode) bool {
         .thunk_eag_w_st_cell,
         .attrs_new_named_srt,
         .attrs_new_named_pos_srt,
-        .thunk_defer,
+        // .thunk_defer is now single-line: its captures are interned in the
+        // chunk side table, no inline descriptor child rows.
         .attr_check,
         .attr_check_w,
         => true,
@@ -1844,14 +1851,16 @@ fn writeOperands(
             try addRef(referenced_chunks, id);
         },
         .thunk_defer => {
-            // Operand: 4-byte deferred-table id, 2-byte env count, then
-            // env_count capture descriptors. No chunk id (compiled lazily).
+            // Operand: 4-byte deferred-table id, 4-byte capture-list start, and
+            // 2-byte env count. The capture descriptors live in the chunk's
+            // deduped side table (see Chunk.capture_bytes), not inline.
             const id: u32 = readU32(code, ip);
+            ip += 4;
+            const cap_start = readU32(code, ip);
             ip += 4;
             const env_count = readU16(code, ip);
             ip += 2;
-            try writer.print("deferred #{d}, {d} env", .{ id, env_count });
-            ip += @as(usize, env_count) * 3;
+            try writer.print("deferred #{d}, {d} env @cap[{d}]", .{ id, env_count, cap_start });
         },
 
         .attr_get => {
