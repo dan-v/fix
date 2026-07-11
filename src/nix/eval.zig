@@ -441,11 +441,10 @@ pub const Evaluator = struct {
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
         self.progress = progress;
-        // Keep the main worker's demand-only stage handle in step (it is
-        // normally installed in `ensureMainWorker`, but the sink may be
-        // (re)set after the worker already exists, e.g. across REPL runs).
-        if (self.main_worker) |w|
-            w.demand_stage = if (progress) |p| p.stage else null;
+        // Nothing to sync on the worker: the demand-only handles are passed
+        // per top-level entry (`runWithVm` → `runTopLevel`), so a sink
+        // (re)set between runs — e.g. across REPL inputs — takes effect on
+        // the next entry automatically.
     }
 
     pub fn setNixPath(self: *Evaluator, nix_path: []const u8) !void {
@@ -812,8 +811,8 @@ pub const Evaluator = struct {
         // yield on a `.busy` thunk; nested invocations (imports, scoped
         // imports — which always carry the imported file's path) run
         // synchronously on the existing fiber's stack — they share the
-        // outer VM's claim identity via the default placeholder claimer
-        // that `initVm` hands out.
+        // surrounding fiber's execution identity via the ctx pointer
+        // `initVm` copies.
         if (source_path == null) {
             return self.runChunkOnMainWorker(chunk_id);
         }
@@ -887,10 +886,10 @@ pub const Evaluator = struct {
             // protocol (`beginSpan`/`endSpan` — store writes, fetches), whose
             // std.Progress nodes are independent and lock-free-safe from any
             // thread. The single-writer LIFO stage stack stays
-            // demand-fiber-only structurally: its `StageSink` handle
-            // (`vm.progress_stage`) is installed only on the demand VM (see
-            // `Worker.runTopLevel` and the fiber-inherit block below), so a
-            // helper has no way to touch `active[]`.
+            // demand-fiber-only structurally: its `StageSink` handle lives on
+            // the demand fiber's ExecutionContext (installed by
+            // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
+            // below), so a helper has no way to touch `active[]`.
             if (self.progress) |p| p.spans else null,
             if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
@@ -902,35 +901,27 @@ pub const Evaluator = struct {
             try self.ensureBuiltins(),
             if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
         );
-        // Inherit the surrounding fiber's claim identity if we're inside
-        // one. This covers nested VMs that get created mid-evaluation
-        // (e.g. import bodies, top-level entry's own VM): they must
-        // share the outer fiber's identity so any thunk they claim is
-        // attributed to the fiber, not to the default (worker_id, 0)
-        // which would collide with pool fiber #0's pre-allocated VM
-        // and cause spurious blackholes when fiber #0 runs a task.
+        // A nested VM runs on the surrounding fiber, so it borrows that
+        // fiber's execution identity wholesale: claim id (any thunk it
+        // claims is attributed to the fiber, not to a default that would
+        // collide with pool fiber #0 and cause spurious blackholes),
+        // demand flag, and the demand-only progress handles (stage stack,
+        // "waiting on" record). One pointer copy — nested VMs (imports,
+        // render/force bodies) CANNOT diverge from their fiber, so
+        // stage/count/wait emission stays alive across them on the demand
+        // fiber while a helper fiber's nested VMs stay structurally silent.
+        // No current fiber (pool-VM construction on the worker thread,
+        // single-threaded setup) keeps the neutral static default; the
+        // Worker then binds pool VMs to their own fiber's ctx.
         if (fiber_mod.currentFiber()) |inner| {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-            vm.claimer_id = wf.vm.claimer_id;
-            // A nested VM runs on the surrounding fiber, so it is demand iff
-            // that fiber is: inherit the flag and the demand-only stage
-            // handle the same way as the claim identity. This keeps
-            // stage/count/wait emission alive across nested VMs (imports,
-            // render/force bodies) on the demand fiber, while a helper
-            // fiber's nested VMs inherit null — stage emission stays
-            // inexpressible off-demand.
-            vm.is_demand = wf.vm.is_demand;
-            vm.progress_stage = wf.vm.progress_stage;
+            vm.ctx = &wf.ctx;
         }
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.fetch_tree_enabled = self.fetch_tree_enabled;
         vm.flakes_enabled = self.flakes_enabled;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
-        // Only worker-0 VMs (the demand path) publish their block subject, and
-        // only when progress is drawn — keeps the busy-safepoint write out of
-        // helper and non-interactive paths entirely.
-        if (worker_id == 0 and self.progress != null) vm.progress_wait = &self.progress_wait;
         return vm;
     }
 
@@ -1102,7 +1093,15 @@ pub const Evaluator = struct {
         };
         var ctx: Ctx = .{ .ev = self, .body_args = args };
         const worker = try self.ensureMainWorker();
-        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx));
+        // Demand-role handles for the top fiber's execution context, read
+        // fresh per entry (a progress sink (re)installed between runs — the
+        // repl — is picked up here with no worker-side bookkeeping). Both
+        // stay null when progress isn't drawn, so the demand fiber's
+        // stage/wait writes remain structurally free in benchmark/piped runs.
+        try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx), .{
+            .progress_stage = if (self.progress) |p| p.stage else null,
+            .progress_wait = if (self.progress != null) &self.progress_wait else null,
+        });
         if (ctx.err) |e| return e;
         return ctx.result;
     }
@@ -1116,11 +1115,6 @@ pub const Evaluator = struct {
             self,
             initVmForWorkerSlot,
         );
-        // The main worker launches the demand fiber, so it (alone) carries
-        // the demand-only stage handle `runTopLevel` installs on that
-        // fiber's VM. Helpers never get one — off-demand stage emission
-        // stays inexpressible.
-        w.demand_stage = if (self.progress) |p| p.stage else null;
         self.main_worker = w;
         // GC (`-Dgc`): register the collect callback now that `self` is at
         // its final address (init returns by value), and enable reclaim. The
@@ -1328,10 +1322,11 @@ pub const Evaluator = struct {
     /// begin/end pairs into the one std `Progress` tree (whose `active[]`
     /// stack is not thread-safe) → the `Progress.Node.init` "slot reuse"
     /// assert / a torn stack. So the stage handle is structural, not a flag
-    /// check: only the demand fiber's VM carries a `progress_stage` (exactly
-    /// one fiber, emitting sequentially even across a steal — see
-    /// `Worker.runTopLevel`); every other fiber holds null and this returns
-    /// null. NB: `!in_speculation` would NOT be a sufficient gate — a
+    /// check: only the demand fiber's ExecutionContext carries a
+    /// `progress_stage` (exactly one fiber, emitting sequentially even across
+    /// a steal — see `Worker.runTopLevel`); every other fiber's ctx holds
+    /// null and this returns null. NB: `!in_speculation` would NOT be a
+    /// sufficient gate — a
     /// prefetch task fiber has `in_speculation == false` yet must stay
     /// silent. begin and end share this gate (the handle is stable across a
     /// fiber's life), so pairs stay balanced. No current fiber =
@@ -1341,7 +1336,7 @@ pub const Evaluator = struct {
         const progress = self.progress orelse return null;
         const inner = fiber_mod.currentFiber() orelse return progress.stage;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-        return wf.vm.progress_stage;
+        return wf.ctx.progress_stage;
     }
 
     pub fn progressBegin(self: *Evaluator, stage: eval_progress.Stage, subject: []const u8) void {

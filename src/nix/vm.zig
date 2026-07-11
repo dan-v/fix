@@ -31,10 +31,12 @@ const DerivationStore = @import("derivation").DerivationStore;
 const eval_trace = @import("observ").trace;
 const eval_progress = @import("observ").progress;
 const VmTrace = @import("vm/trace_log.zig").VmTrace;
-const thunk_mod = @import("runtime").thunk;
 const worker_id_mod = @import("base").worker_id;
 const DeferredTable = @import("compiler").deferred_table.Table;
 const ThunkTrace = @import("probe").thunk_trace.ThunkTrace;
+
+pub const exec_context = @import("vm/exec_context.zig");
+pub const ExecutionContext = exec_context.ExecutionContext;
 
 pub const builtins = @import("vm/builtins.zig");
 pub const run = @import("vm/run.zig");
@@ -170,12 +172,6 @@ pub const VM = struct {
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*PatternCache = null,
-    /// Shared "what is the demand path blocked on" record for the progress
-    /// indicator. Non-null only on worker 0's VMs when progress is being
-    /// drawn; the demand fiber writes its blocking source loc here at a busy
-    /// safepoint and the progress sampler reads it. Null (and thus free) in
-    /// every non-interactive build path. Set post-init by `Evaluator.initVm`.
-    progress_wait: ?*eval_progress.ProgressWait = null,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
@@ -195,16 +191,15 @@ pub const VM = struct {
     /// the only progress channel available off the demand fiber. Null when
     /// progress isn't drawn.
     progress_spans: ?eval_progress.SpanSink,
-    /// The demand-only stage-stack half of the progress protocol. Non-null
-    /// ONLY on the demand fiber's VMs: the worker installs it on the top
-    /// fiber's VM alongside `is_demand` (see `Worker.runTopLevel`) and nested
-    /// VMs inherit it from their fiber (see `Evaluator.initVm`) — so a
-    /// helper-fiber stage emit has no handle to call through. The stage stack
-    /// is a single-writer LIFO owned by the demand path; a stray off-demand
-    /// begin/end corrupts it (the historical TTY-only --workers>1
-    /// SIGSEGV/hang). Don't add a bypass; off-demand work reports via
-    /// `progress_spans`.
-    progress_stage: ?eval_progress.StageSink = null,
+    /// Fiber-scoped execution identity: claim id, demand role, and the
+    /// demand-only progress handles (stage stack + "waiting on" record).
+    /// Points at the owning `WorkerFiber`'s context; nested VMs created on
+    /// that fiber share the pointer (see `Evaluator.initVm`), so they cannot
+    /// diverge from their fiber's identity. Standalone test VMs (no fiber)
+    /// point at the static neutral default. Read-only from the VM's side —
+    /// only the fiber's driving worker dresses/resets it, between resumes.
+    /// See `vm/exec_context.zig`.
+    ctx: *const ExecutionContext = &ExecutionContext.default_instance,
     /// Optional VM execution tracer.
     vm_trace: ?*VmTrace,
     /// Optional per-thunk lifecycle event log (see `probe/thunk_trace.zig`).
@@ -216,10 +211,6 @@ pub const VM = struct {
     import_host: ?ImportHost,
     /// Cached evaluator-owned builtins attrset.
     builtins: Value,
-    /// Globally-unique fiber id this VM is bound to. Used as the
-    /// `ClaimerId` for thunk forces. Worker patches this when binding
-    /// the VM to a fiber.
-    claimer_id: thunk_mod.ClaimerId,
     /// GC native-builtin call depth (`-Dgc`): incremented
     /// around each native builtin, so `native_depth == 0` marks a clean
     /// safepoint where no builtin holds un-rooted Zig locals. On the VM (not a
@@ -255,15 +246,11 @@ pub const VM = struct {
     /// speculation. That single rule bounds the cascade: a helper that
     /// picks up a speculative task does at most one layer of work before
     /// its descendants fall back to lazy. Set/cleared around speculative
-    /// entry points (see `vm/force.zig`).
+    /// entry points (see `vm/force.zig`). Deliberately NOT on `ctx`:
+    /// `forceValueSpeculative` flips it save/restore-style for a sub-scope
+    /// of one VM's execution, so it is per-VM mutable state, not
+    /// fiber-lifetime identity.
     in_speculation: bool,
-
-    /// Timeline/profiling (`-Dprof-main`): true only on the top-level DEMAND
-    /// fiber's VM. Its blocking waits on busy thunks are the serial critical
-    /// path, recorded on the dedicated crit track (see `vm/force.zig`). The
-    /// worker sets it when it launches the top fiber and clears it before the
-    /// fiber recycles. Default false — every helper/speculative VM.
-    is_demand: bool = false,
 
     /// Bounded speculation (`FIX_SIBLING`): remaining claimed-force budget
     /// for the current speculative task. `NO_SPEC_BUDGET` (the default)
@@ -380,9 +367,11 @@ pub const VM = struct {
             .thunk_trace = thunk_trace,
             .import_host = import_host,
             .builtins = builtins_value,
-            // Placeholder; overwritten by Worker.allocateFiber with the
-            // fiber's globally-allocated id before the VM runs anything.
-            .claimer_id = thunk_mod.INVALID_CLAIMER,
+            // `ctx` keeps its neutral default here; Worker.allocateFiber
+            // repoints it at the fiber's own context (with the fiber's
+            // claim id baked in) before the VM runs anything, and
+            // Evaluator.initVm repoints nested VMs at the surrounding
+            // fiber's context.
             .buffer_pool = buffer_pool,
             .stack = value_stack,
             .sp = 0,
@@ -392,7 +381,6 @@ pub const VM = struct {
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
-            .is_demand = false,
             .spec_budget = NO_SPEC_BUDGET,
             .spec_create_limit = NO_SPEC_BUDGET,
             .spec_create_worker = 0,
@@ -426,12 +414,12 @@ pub const VM = struct {
 
     /// Report `[completed/total]` on the current render/stage node. Demand
     /// path only by construction: `progress_stage` exists solely on the
-    /// demand fiber's VMs (helpers hold null), so speculative walks stay
-    /// invisible and this is free unless progress is drawn. Cheap: a field
-    /// check + one atomic store in the sink → node. See `vm/force.zig`
-    /// `forceDeepCounted`.
+    /// demand fiber's ExecutionContext (helper fibers hold null), so
+    /// speculative walks stay invisible and this is free unless progress is
+    /// drawn. Cheap: a field check + one atomic store in the sink → node.
+    /// See `vm/force.zig` `forceDeepCounted`.
     pub fn progressCount(self: *VM, completed: usize, total: usize) void {
-        if (self.progress_stage) |stage| stage.count(completed, total);
+        if (self.ctx.progress_stage) |stage| stage.count(completed, total);
     }
 
     /// Open a concurrent "copying <subject> to store" span around a source
