@@ -200,6 +200,13 @@ fn writeChunkAt(
         const reg = symbols.registry orelse break :blk null;
         break :blk reg.upvalueNamesOf(id);
     };
+    // The chunk's recorded local names (slot order), used to annotate
+    // `local[N]` operand comments with the source binding name.
+    const local_names: ?[]const InternId = blk: {
+        const id = chunk_id orelse break :blk null;
+        const reg = symbols.registry orelse break :blk null;
+        break :blk reg.localNamesOf(id);
+    };
     // The strict/deep flags fold into the upvalues table when it renders;
     // otherwise the header prints its fallback flag lines.
     try writeChunkHeader(writer, chunk_id, chunk, symbols, cc, up_names != null, options.use_color);
@@ -372,10 +379,10 @@ fn writeChunkAt(
         var seq: usize = @intFromEnum(op) + 1;
         var head: Line = undefined;
         head.reset();
-        const head_len = buildHead(&head, op, chunk, start, symbols, up_names, operand_text, ip, &seq);
+        const head_len = buildHead(&head, op, chunk, start, symbols, up_names, local_names, operand_text, ip, &seq);
         try emitMnemonicHead(writer, chunk.code, start, op, &head, head_len, &seq, bg, env);
         if (isMultiline(op)) {
-            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, up_names, &stripe, env);
+            try writeOperandTail(writer, chunk, op, start + 1 + head_len, ip, operand_text, &seq, symbols, up_names, local_names, &stripe, env);
         }
     }
 
@@ -904,7 +911,7 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
 /// with the interpretation as a colored token comment. Ops without a bespoke
 /// arm fall back to the compact `operand_text` decode. Returns the number of
 /// operand bytes the head covers.
-fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
+fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, local_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
     const code = chunk.code;
     switch (op) {
         .closure, .closure_w, .closure_cap, .closure_cap_w, .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
@@ -969,6 +976,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue("local[", .{});
             l.tint(c, "{d}", .{slot});
             l.glue("]", .{});
+            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
             return 1;
         },
         .loc_get_w, .loc_set_w, .loc_grab_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => {
@@ -980,6 +988,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.glue("local[", .{});
             l.tint(c, "{d}", .{slot});
             l.glue("]", .{});
+            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
             return 2;
         },
         .up_grab, .up_get, .up_get_ret => {
@@ -1035,6 +1044,7 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             } else {
                 l.tint(ci, "0x{x}", .{id});
             }
+            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " ({s})", .{nm});
             return 2 + slot_len;
         },
         .call_n, .call_tail_n => {
@@ -1226,6 +1236,16 @@ fn upvalueName(up_names: ?[]const InternId, symbols: Symbols, idx: usize) ?[]con
     return if (name.len > 0 and name[0] == 0) name[1..] else name;
 }
 
+/// The source name of local `slot` (from the chunk's `local_names` sidecar),
+/// or null. Internal (`\x00`-prefixed) names are hidden.
+fn localName(local_names: ?[]const InternId, symbols: Symbols, slot: usize) ?[]const u8 {
+    const list = local_names orelse return null;
+    if (slot >= list.len) return null;
+    const name = symbols.internName(list[slot]) orelse return null;
+    if (name.len == 0 or name[0] == 0) return null;
+    return name;
+}
+
 /// Render an instruction's operands as one line per field. `ip` is the byte
 /// offset just past the opcode; `end_ip` is the authoritative instruction end
 /// (from `writeOperands`), and `operand_text` its compact decode — used both as
@@ -1242,6 +1262,7 @@ fn writeOperandTail(
     seq: *usize,
     symbols: Symbols,
     up_names: ?[]const InternId,
+    local_names: ?[]const InternId,
     stripe: *usize,
     env: Env,
 ) !void {
@@ -1282,6 +1303,7 @@ fn writeOperandTail(
             l.glue("→ local[", .{});
             l.tint(c_slot, "{d}", .{code[off]});
             l.glue("]", .{});
+            if (localName(local_names, symbols, code[off])) |nm| l.tint(name_color, " {s}", .{nm});
             try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
         },
         .attrs_new_named_srt, .attrs_new_named_pos_srt => {

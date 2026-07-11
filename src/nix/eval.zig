@@ -967,6 +967,9 @@ pub const Evaluator = struct {
             }
             try self.registry.recordName(chunk_id, name_id);
         }
+        // Local binding names for the top chunk (child chunks get theirs in
+        // `registerChunk`); lets the debugger and disasm name top-level locals.
+        if (self.registry.capture_names) try self.registry.recordLocalNames(chunk_id, compiler.local_names.items);
         // `chunk` now owns persistent copies of its bytecode; `scratch`
         // (incl. `builder`'s buffers) is freed by the defers above.
 
