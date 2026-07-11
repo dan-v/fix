@@ -151,6 +151,26 @@ pub const ImportHost = struct {
     get_env: *const fn (*anyopaque, []const u8) anyerror![]const u8,
 };
 
+/// Why evaluation paused into the debugger. `break_builtin` is a
+/// `builtins.break x` call; `eval_error` is an evaluation error caught at
+/// the top level with `--debugger` active.
+pub const BreakReason = enum { break_builtin, eval_error };
+
+/// A debugger attachment. Installed on every VM by `Evaluator.initVm` when a
+/// debugger is active; null (the default) means "no debugger" and the break
+/// path is a plain identity — so this costs nothing in normal evaluation.
+///
+/// `fire` is an upcall into the owning layer (the `fix` Evaluator, then the
+/// `cli` debug console): it runs the interactive session synchronously on the
+/// *current* demand fiber, then returns so evaluation continues. `ctx` is the
+/// owner's opaque self-pointer. The callback may re-enter the evaluator to
+/// force/render `value` and to evaluate console expressions — that nesting is
+/// safe because forcing already re-enters the VM (`runIsolatedFrame`).
+pub const BreakSink = struct {
+    ctx: *anyopaque,
+    fire: *const fn (ctx: *anyopaque, vm: *VM, value: Value, reason: BreakReason) anyerror!void,
+};
+
 /// Per-thread VM state. Each worker thread has one of these.
 /// Sentinel for `VM.spec_budget`: no bound on speculative work. (Never
 /// reachable by decrement — 2^64 claimed forces don't happen.)
@@ -172,6 +192,10 @@ pub const VM = struct {
     /// `Evaluator.initVm`; null in standalone test VMs, which fall back
     /// to compiling per call.
     regexes: ?*PatternCache = null,
+    /// Optional debugger attachment. Set post-init by `Evaluator.initVm` only
+    /// when a debugger is active; null (the default, in every normal run)
+    /// makes `builtins.break` a plain identity. See `BreakSink`.
+    break_sink: ?BreakSink = null,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.

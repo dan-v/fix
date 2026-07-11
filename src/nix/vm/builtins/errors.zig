@@ -41,6 +41,17 @@ pub fn builtinAddErrorContext(self: anytype, message_arg: Value, value_arg: Valu
     };
 }
 
+/// `builtins.break x` — identity on `x`, but when a debugger is attached it
+/// first pauses into the interactive debug session (Nix's `--debugger`
+/// behaviour). With no debugger (`break_sink == null`, the normal case) this
+/// is a plain forced identity, so it costs nothing off the debug path.
+pub fn builtinBreak(self: anytype, arg: Value) !Value {
+    if (self.break_sink) |sink| {
+        try sink.fire(sink.ctx, self, arg, .break_builtin);
+    }
+    return vm_force.forceValue(self, arg);
+}
+
 pub fn builtinTrace(self: anytype, message_arg: Value, value_arg: Value) !Value {
     _ = try vm_force.forceValue(self, message_arg);
     return vm_force.forceValue(self, value_arg);

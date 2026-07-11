@@ -1898,7 +1898,7 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
 
 /// The chunk's file, from the first source-map entry that carries one. Used to
 /// print a filename header before the chunk's bytes.
-fn chunkPrimaryFile(chunk: *const Chunk, chunk_id: ?ChunkId, symbols: Symbols) ?InternId {
+pub fn chunkPrimaryFile(chunk: *const Chunk, chunk_id: ?ChunkId, symbols: Symbols) ?InternId {
     for (chunk.source_map) |entry| {
         if (entry.span.file) |f| return f;
     }
@@ -1913,7 +1913,7 @@ fn chunkPrimaryFile(chunk: *const Chunk, chunk_id: ?ChunkId, symbols: Symbols) ?
 
 /// The narrowest source span covering `ip`, or null if none. Narrowest wins so
 /// the annotation points at the tightest sub-expression, not an enclosing one.
-fn bestSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
+pub fn bestSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
     var best: ?Chunk.SourceMapEntry = null;
     for (chunk.source_map) |entry| {
         if (ip < entry.start or ip >= entry.end) continue;

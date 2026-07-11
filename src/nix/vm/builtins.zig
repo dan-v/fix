@@ -139,7 +139,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .unsafeDiscardOutputDependency => string_context.builtinUnsafeDiscardOutputDependency(self, args[0]),
         .addDrvOutputDependencies => string_context.builtinAddDrvOutputDependencies(self, args[0]),
         .appendContext => string_context.builtinAppendContext(self, args[0], args[1]),
-        .break_ => vm_force.forceValue(self, args[0]),
+        .break_ => errors.builtinBreak(self, args[0]),
         .getContext => string_context.builtinGetContext(self, args[0]),
         .hasContext => string_context.builtinHasContext(self, args[0]),
         .toPath => fetch.builtinToPath(self, args[0]),

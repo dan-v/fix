@@ -32,6 +32,9 @@ pub const diagnostic = @import("syntax").diagnostic;
 
 pub const Evaluator = eval.Evaluator;
 pub const Value = value.Value;
+pub const DebugSession = eval.DebugSession;
+pub const DebugFrame = eval.DebugFrame;
+pub const BreakReason = eval.BreakReason;
 
 test {
     _ = @import("root/tests.zig");

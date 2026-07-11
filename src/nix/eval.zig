@@ -62,6 +62,124 @@ const worker_id_mod = @import("base").worker_id;
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const EvalTrace = eval_trace.Trace;
 
+/// Why the debugger was entered (re-exported from the VM layer so the CLI can
+/// switch on it without reaching into `vm`).
+pub const BreakReason = vm_mod.BreakReason;
+
+/// The CLI-supplied debugger console. `run` drives one interactive pause.
+pub const DebugUi = struct {
+    ctx: *anyopaque,
+    run: *const fn (*anyopaque, *DebugSession) anyerror!void,
+};
+
+/// One rendered backtrace frame: the running chunk and its source anchor.
+/// `line`/`column` are 1-based; `file`/all fields are 0 when unavailable.
+pub const DebugFrame = struct {
+    chunk_id: ChunkId,
+    /// Source file path, or null when the chunk carries no file.
+    file: ?[]const u8,
+    line: u32,
+    column: u32,
+    /// The best (narrowest) source span covering the frame's live ip, if any.
+    span: ?bytecode.chunk.Chunk.SourceSpan,
+    /// The chunk's recorded name (attr/let binding it backs), when chunk-name
+    /// capture is on — else null.
+    name: ?[]const u8,
+};
+
+/// A live handle to a paused evaluation, handed to the debugger UI. It exposes
+/// only facade-level operations (backtrace, scope inspection, evaluate-in-place,
+/// value rendering) so the `cli` layer never touches raw VM types. All methods
+/// run on the paused demand fiber; `eval` re-enters the evaluator, which is
+/// safe because forcing already nests VM frames (`runIsolatedFrame`).
+pub const DebugSession = struct {
+    ev: *Evaluator,
+    vm: *VM,
+    /// The value passed to `builtins.break` (may be an unforced thunk), or the
+    /// value under evaluation at an error. Inspect via `writeValue`/`force`.
+    value: Value,
+    reason: BreakReason,
+
+    /// Number of active call frames (top of stack last).
+    pub fn frameCount(self: *const DebugSession) usize {
+        return self.vm.frames_len;
+    }
+
+    /// Frame `i` (0 = outermost, `frameCount()-1` = innermost/current).
+    pub fn frame(self: *const DebugSession, i: usize) DebugFrame {
+        const f = &self.vm.frames[i];
+        const symbols: bytecode.disasm.Symbols = .{ .intern = &self.ev.intern, .registry = &self.ev.registry };
+        const span = bytecode.disasm.bestSpan(f.chunk_ptr, f.ip);
+        const file_id = if (span) |s| s.file else bytecode.disasm.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols);
+        return .{
+            .chunk_id = f.chunk_id,
+            .file = if (file_id) |fid| self.ev.intern.get(fid) else null,
+            .line = if (span) |s| s.line else 0,
+            .column = if (span) |s| s.column else 0,
+            .span = span,
+            .name = if (self.ev.registry.nameOf(f.chunk_id)) |nid| self.ev.intern.get(nid) else null,
+        };
+    }
+
+    /// The current (innermost) frame, or null if the stack is empty.
+    pub fn currentFrame(self: *const DebugSession) ?DebugFrame {
+        if (self.vm.frames_len == 0) return null;
+        return self.frame(self.vm.frames_len - 1);
+    }
+
+    /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).
+    /// Names are not tracked per local, so callers index by slot.
+    pub fn localCount(self: *const DebugSession, i: usize) usize {
+        return self.vm.frames[i].local_count;
+    }
+
+    pub fn localValue(self: *const DebugSession, i: usize, slot: usize) Value {
+        const f = &self.vm.frames[i];
+        return self.vm.stack[f.frame_base + slot];
+    }
+
+    pub fn upvalueCount(self: *const DebugSession, i: usize) usize {
+        return if (self.vm.frames[i].upvalues) |ups| ups.len else 0;
+    }
+
+    pub fn upvalueValue(self: *const DebugSession, i: usize, idx: usize) Value {
+        return self.vm.frames[i].upvalues.?[idx];
+    }
+
+    /// Force `v` (shallow) on the paused fiber and return the result.
+    pub fn force(self: *DebugSession, v: Value) !Value {
+        return vm_force.forceValue(self.vm, v);
+    }
+
+    /// Render `v` for display (forces thunks as needed), same formatting as the
+    /// repl. Runs on the paused fiber's VM.
+    pub fn writeValue(self: *DebugSession, writer: *std.Io.Writer, v: Value) !void {
+        return eval_print.writeValue(self.ev, writer, v);
+    }
+
+    /// Look up interned text (e.g. a source file id).
+    pub fn internText(self: *const DebugSession, id: types.InternId) []const u8 {
+        return self.ev.intern.get(id);
+    }
+
+    /// Compile and evaluate `source` against `scope` (an ambient attrset whose
+    /// members resolve as free identifiers, like the repl's bindings), reusing
+    /// the paused evaluator. Returns the resulting (unforced) value.
+    pub fn eval(self: *DebugSession, source: []const u8, scope: ?Value) !Value {
+        return self.ev.debugEvalScoped(self.vm, source, scope);
+    }
+
+    /// Build a one-entry scope attrset binding `name` to `self.value` — handy
+    /// for the console to expose the break value as an identifier.
+    pub fn bindValueScope(self: *DebugSession, name: []const u8) !Value {
+        const entries = [_]runtime.heap.AttrEntry{.{
+            .name = try self.ev.intern.intern(name),
+            .value = self.value,
+        }};
+        return Value.attrs(try self.ev.heap.addAttrs(&entries));
+    }
+};
+
 pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     intern: InternTable,
@@ -110,6 +228,10 @@ pub const Evaluator = struct {
     /// true for `--extra-experimental-features flakes` (which also implies
     /// `fetch-tree`). Propagated to each VM in `initVm`. Default false.
     flakes_enabled: bool = false,
+    /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
+    /// default) means no debugger: `builtins.break` is a plain identity and the
+    /// break sink is never installed on VMs. See `DebugSession`.
+    debug_ui: ?DebugUi = null,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -711,6 +833,39 @@ pub const Evaluator = struct {
         self.registry.capture_names = on;
     }
 
+    /// Install (or clear) the interactive debugger. `run` is called on the
+    /// demand fiber each time evaluation pauses (a `builtins.break`, or — with
+    /// `enterDebuggerOnError` — an evaluation error); it drives the console and
+    /// returns to resume. `ctx` is the UI's opaque self-pointer. The CLI owns
+    /// the UI implementation (terminal I/O lives in `cli`); the engine only
+    /// upcalls through this seam, so the layering stays down-only.
+    pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
+        self.debug_ui = .{ .ctx = ctx, .run = run };
+    }
+
+    /// `vm_mod.BreakSink.fire` trampoline: build a `DebugSession` over the
+    /// paused VM and hand it to the installed UI. Runs synchronously on the
+    /// current demand fiber, so the console can re-enter the evaluator.
+    fn fireBreak(ctx: *anyopaque, vm: *VM, value: Value, reason: vm_mod.BreakReason) anyerror!void {
+        const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        const ui = self.debug_ui orelse return;
+        var session: DebugSession = .{ .ev = self, .vm = vm, .value = value, .reason = reason };
+        try ui.run(ui.ctx, &session);
+    }
+
+    /// Console-expression evaluation from a debug pause: compile `source` in an
+    /// ambient `scope` and run it on a fresh nested VM (sharing the registry,
+    /// heap, and intern table). The nested VM leaves the paused VM's stack and
+    /// frames untouched, so inspecting a value can't corrupt the pause point.
+    fn debugEvalScoped(self: *Evaluator, _: *VM, source: []const u8, scope: ?Value) !Value {
+        const chunk_id = try self.compileSourceScoped(source, scope);
+        return self.runWithVm(debugRunBody, .{chunk_id});
+    }
+
+    fn debugRunBody(vm: *VM, chunk_id: ChunkId) !Value {
+        return vm.eval(chunk_id);
+    }
+
     pub fn heapStats(self: *const Evaluator) ObjectHeap.Stats {
         return self.heap.stats();
     }
@@ -973,6 +1128,9 @@ pub const Evaluator = struct {
         vm.flakes_enabled = self.flakes_enabled;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
+        // Attach the debugger only when the CLI installed a UI: every VM (main
+        // and nested) then routes `builtins.break` through `fireBreak`.
+        if (self.debug_ui != null) vm.break_sink = .{ .ctx = self, .fire = fireBreak };
         return vm;
     }
 
