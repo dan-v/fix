@@ -109,6 +109,11 @@ pub const InternTable = struct {
     /// avoid stale-hit races when an InternTable is recreated at the
     /// same heap address.
     token: u64,
+    /// Single-threaded mode: when the owner guarantees exactly one thread
+    /// ever interns (a `--workers=1` evaluator; set before anything runs),
+    /// `intern()` skips the shard mutex — one lock RMW per uncached intern
+    /// elided. `get()` was always lock-free. Default off.
+    solo: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) !InternTable {
         var table: InternTable = .{
@@ -160,8 +165,8 @@ pub const InternTable = struct {
 
         const shard = &self.shards[h & SHARD_MASK];
 
-        shard.mu.lock();
-        defer shard.mu.unlock();
+        if (!self.solo) shard.mu.lock();
+        defer if (!self.solo) shard.mu.unlock();
 
         const adapter = StringAdapter{ .table = self, .precomputed_hash = h };
         const ctx = IdContext{ .table = self };

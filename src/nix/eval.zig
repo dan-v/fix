@@ -208,6 +208,16 @@ pub const Evaluator = struct {
         var registry = try ChunkRegistry.init(allocator);
         errdefer registry.deinit();
 
+        // Single-worker mode: the evaluator owns these tables and no helper
+        // thread will ever exist, so their internal locking (intern shard
+        // mutexes, chunk-dedup shard mutexes, the registration CAS) is pure
+        // tax — mark them solo before anything runs. See InternTable.solo /
+        // ChunkRegistry.solo for the contract.
+        if (worker_count == 1) {
+            intern.solo = true;
+            registry.solo = true;
+        }
+
         const gc_workers = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(?*worker_mod.Worker), worker_count);
             for (ws) |*w| w.* = .init(null);
@@ -553,7 +563,7 @@ pub const Evaluator = struct {
         // the long-lived allocator (at `builder.finish`). The AST arena above
         // is separate — it may be retained for deferred bodies; this one never
         // is, since nothing persistent points into it.
-        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        var scratch = @import("base").arena.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         const scratch_alloc = scratch.allocator();
 
@@ -819,7 +829,7 @@ pub const Evaluator = struct {
         // Per-import scratch arena: the nested VM's run-path allocations
         // (drv hashing, builtin temp buffers) are freed wholesale when the
         // import returns instead of accreting for the evaluator's lifetime.
-        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        var scratch = @import("base").arena.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
         var vm = try self.initVm(0, scratch.allocator());
         defer vm.deinit();
@@ -1057,7 +1067,7 @@ pub const Evaluator = struct {
     /// inferred from its return signature; void payloads work too.
     fn runWithVm(self: *Evaluator, comptime body: anytype, args: anytype) !ReturnPayload(@TypeOf(body)) {
         if (fiber_mod.currentFiber() != null) {
-            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            var scratch = @import("base").arena.ArenaAllocator.init(self.allocator);
             defer scratch.deinit();
             var vm = try self.initVm(0, scratch.allocator());
             defer vm.deinit();
@@ -1075,7 +1085,7 @@ pub const Evaluator = struct {
 
             fn entry(arg: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(arg));
-                var scratch = std.heap.ArenaAllocator.init(ctx.ev.allocator);
+                var scratch = @import("base").arena.ArenaAllocator.init(ctx.ev.allocator);
                 defer scratch.deinit();
                 var vm = ctx.ev.initVm(0, scratch.allocator()) catch |e| {
                     ctx.err = e;

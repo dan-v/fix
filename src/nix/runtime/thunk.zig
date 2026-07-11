@@ -348,6 +348,13 @@ pub const Thunk = struct {
         self.future.reset();
     }
 
+    /// `publishCellBinding` on the single-worker path (skips the waiter
+    /// mutex when nobody parked on the cell). See `Future.resetSolo`.
+    pub fn publishCellBindingSolo(self: *Thunk, value: Value) void {
+        self.payload = .{ .target = .{ .pass_through = value } };
+        self.future.resetSolo();
+    }
+
     // Delegators to the embedded Future. The hot ones are `inline` so
     // the force path has no extra call frame. The value-carrying ones
     // (`tryForce`, `resolve`, `markErrored`) read/write the local
@@ -366,6 +373,19 @@ pub const Thunk = struct {
         };
     }
 
+    /// `tryForce` on the single-worker (`--workers=1`) claim path: plain
+    /// load/store claim instead of the CAS. See `Future.tryClaimSolo` for
+    /// the solo-ness contract.
+    pub inline fn tryForceSolo(self: *Thunk, claimer: ClaimerId) ForceOutcome {
+        return switch (self.future.tryClaimSolo(claimer)) {
+            .already_resolved => .{ .already_resolved = self.payload.result },
+            .errored => .{ .errored = self.cachedErrorInfo() },
+            .claimed => .claimed,
+            .busy => .busy,
+            .blackhole => .blackhole,
+        };
+    }
+
     pub inline fn enrollWaiter(self: *Thunk, waiter: *Waiter) bool {
         return self.future.enrollWaiter(waiter);
     }
@@ -375,6 +395,13 @@ pub const Thunk = struct {
     pub inline fn resolve(self: *Thunk, value: Value) void {
         self.payload = .{ .result = value };
         self.future.publish();
+    }
+
+    /// `resolve` on the single-worker publish path (skips the waiter-list
+    /// mutex when nobody enrolled). See `Future.publishSolo`.
+    pub inline fn resolveSolo(self: *Thunk, value: Value) void {
+        self.payload = .{ .result = value };
+        self.future.publishSolo();
     }
 
     pub fn reset(self: *Thunk) void {

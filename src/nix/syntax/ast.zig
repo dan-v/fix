@@ -252,10 +252,12 @@ pub const Node = struct {
 /// variants; drop the optional on `span`), which is an AST-wide change touching
 /// the compiler and evaluator — a deliberate, separate decision.
 pub const AstArena = struct {
-    inner: std.heap.ArenaAllocator,
+    // Plain (non-atomic) arena: a parse runs on one fiber, so the std arena's
+    // per-alloc atomics are pure tax here — see src/base/arena.zig.
+    inner: @import("base").arena.ArenaAllocator,
 
     pub fn init(parent_allocator: std.mem.Allocator) AstArena {
-        return .{ .inner = std.heap.ArenaAllocator.init(parent_allocator) };
+        return .{ .inner = @import("base").arena.ArenaAllocator.init(parent_allocator) };
     }
 
     pub fn deinit(self: *AstArena) void {

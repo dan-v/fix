@@ -34,9 +34,11 @@ const module_dirs = [_][]const u8{ "syntax", "runtime", "base", "scheduler", "de
 const ModuleLevel = struct { name: []const u8, level: u8 };
 const module_levels = [_]ModuleLevel{
     .{ .name = "base", .level = 0 },
-    .{ .name = "syntax", .level = 0 },
+    // syntax → base (the parser's AST arena is base's plain arena), so
+    // syntax sits one above base; observ → syntax pushes observ to 2.
+    .{ .name = "syntax", .level = 1 },
     .{ .name = "runtime", .level = 1 },
-    .{ .name = "observ", .level = 1 },
+    .{ .name = "observ", .level = 2 },
     .{ .name = "scheduler", .level = 2 },
     .{ .name = "derivation", .level = 2 },
     .{ .name = "bytecode", .level = 2 },

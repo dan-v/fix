@@ -30,7 +30,7 @@ pub const Value = union(enum) {
 };
 
 pub const Parsed = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: @import("arena.zig").ArenaAllocator,
     root: *Table,
 
     pub fn deinit(self: *Parsed) void {
@@ -39,7 +39,7 @@ pub const Parsed = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, text: []const u8) !Parsed {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    var arena = @import("arena.zig").ArenaAllocator.init(allocator);
     errdefer arena.deinit();
 
     var parser = Parser{

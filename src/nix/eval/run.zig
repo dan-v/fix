@@ -23,7 +23,7 @@ pub const Run = struct {
     allocator: std.mem.Allocator,
     /// Arena backing diagnostic message + source_path strings. Reset on
     /// each `clear()`.
-    string_arena: std.heap.ArenaAllocator,
+    string_arena: @import("base").arena.ArenaAllocator,
     diagnostics: std.ArrayListUnmanaged(Diagnostic),
     trace: Trace,
     mu: stable.SpinMutex,
@@ -31,7 +31,7 @@ pub const Run = struct {
     pub fn init(allocator: std.mem.Allocator) Run {
         return .{
             .allocator = allocator,
-            .string_arena = std.heap.ArenaAllocator.init(allocator),
+            .string_arena = @import("base").arena.ArenaAllocator.init(allocator),
             .diagnostics = .empty,
             .trace = Trace.init(allocator),
             .mu = .{},

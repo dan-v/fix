@@ -252,6 +252,15 @@ pub const VM = struct {
     /// fiber-lifetime identity.
     in_speculation: bool,
 
+    /// Single-worker mode (`Scheduler.worker_count == 1`, captured at VM
+    /// construction — before any helper thread can exist). When set, the
+    /// thunk force protocol takes the plain-load/store claim + publish
+    /// variants (`Thunk.tryForceSolo`/`resolveSolo`) instead of the CAS +
+    /// waiter-mutex ones: with one OS thread, fibers interleave only at
+    /// yield points, so the atomic RMWs are pure tax (~1% of w=1 cycles).
+    /// One predictable branch on the claim path at w>1.
+    solo: bool,
+
     /// Bounded speculation (`FIX_SIBLING`): remaining claimed-force budget
     /// for the current speculative task. `NO_SPEC_BUDGET` (the default)
     /// disables the bound; a sibling-sweep task arms it per member force
@@ -381,6 +390,7 @@ pub const VM = struct {
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
             .opcode_profile_sink = opcode_profile_sink,
             .in_speculation = false,
+            .solo = scheduler.worker_count == 1,
             .spec_budget = NO_SPEC_BUDGET,
             .spec_create_limit = NO_SPEC_BUDGET,
             .spec_create_worker = 0,
