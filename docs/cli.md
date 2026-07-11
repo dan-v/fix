@@ -53,9 +53,10 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 
 ## The debugger
 
-`fix eval --debugger` pauses evaluation into an interactive console — Nix's `--debugger` model — at two points:
+`fix eval --debugger` pauses evaluation into an interactive console — Nix's `--debugger` model — at three points:
 
 - **`builtins.break x`** — a break in the source. `break` is otherwise the identity on `x`, so it can be dropped anywhere: `let y = builtins.break (f a); in ...`.
+- **a source-line breakpoint** — `break FILE:LINE` from the console. See [Source-line breakpoints](#source-line-breakpoints).
 - **an evaluation error** — an uncaught `throw`, `abort`, or failed `assert` pauses at the origin (call frames still live) *before* the error unwinds and prints. Errors caught by `builtins.tryEval` do **not** pause.
 
 `--debugger` forces `--workers=1` and disables speculation so the pause point is deterministic — a single demand fiber, no helper racing ahead of the break. The console reads commands from stdin and writes to stderr, so a redirected stdout still receives only the final value.
@@ -68,13 +69,21 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 | `bt` / `backtrace` | the call stack, innermost first, with `file:line:col`, chunk name, and `#chunk` id |
 | `l` / `locals` | the current frame's local slots and upvalues (forced, by index) |
 | `v` / `value` | the value passed to `builtins.break` (or the error subject) |
+| `break FILE:LINE` | set a source-line breakpoint |
+| `breakpoints` / `delete N` | list / remove breakpoints |
 | `c` / `continue` | resume evaluation |
 | `q` / `quit` | abort evaluation |
 | `help` | command list |
 
 Frames show names when chunk-name capture is on (`--debugger` enables it), so a backtrace reads like `pkgs/hello.nix:12:3 hello (chunk #42)`. Console expressions run on a fresh nested VM sharing the registry, heap, and intern table, so inspecting a value never disturbs the pause point.
 
-**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), a `fix.DebugSession` facade over the paused VM (backtrace, scope, evaluate-in-place, value rendering), and `Evaluator.setDebugUi`. The `cli` layer supplies the console (`src/cli/debugger.zig`) through that facade and never names a `vm` type. Source locations come from the same `disasm.bestSpan` (ip → narrowest source span) that annotates `fix disasm`.
+### Source-line breakpoints
+
+`break FILE:LINE` pauses whenever execution reaches that line — set it during any pause (drop a `builtins.break` near the entry to get an initial one). It's implemented by **patching the bytecode**, not by a per-instruction check: the opcode byte at the line's first instruction is overwritten with a dedicated `breakpoint` opcode that pauses the debugger and then chains to the saved original opcode (its operands are untouched). The hot dispatch loop is byte-for-byte unchanged and pays nothing until a patched instruction actually runs — so this ships in the default binary with no build flag. `delete N` restores the original bytes. Because bodies compile lazily (imports, deferred attrs register mid-evaluation), a per-registry hook re-patches pending breakpoints onto each newly registered chunk.
+
+Two caveats: the requested line resolves to the nearest line **carrying a source-map entry** (tail `apply`/`if`/`let`/`assert`/`with` — the constructs the compiler maps), reported when it differs; and one source line can compile into several chunks (e.g. a call and its argument thunk), so a breakpoint may report multiple sites and pause at each. Breakpoints force `--workers=1`, so patched bytecode is never shared across threads.
+
+**Architecture.** The engine exposes a neutral break seam so the layering stays down-only: `vm.BreakSink` on the VM (null in every normal run — `builtins.break` is then a plain identity, zero cost off the debug path), the `breakpoint` opcode + `bytecode.BreakpointTable` (patch/restore, lazy re-patch via `ChunkRegistry.breakpoint_sink`), a `fix.DebugSession` facade over the paused VM (backtrace, scope, evaluate-in-place, value rendering, breakpoint set/list/delete), and `Evaluator.setDebugUi`. The `cli` layer supplies the console (`src/cli/debugger.zig`) through that facade and never names a `vm` type. Source locations come from the same `disasm.bestSpan` (ip → narrowest source span) that annotates `fix disasm`.
 
 ## Key flags
 
