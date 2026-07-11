@@ -71,6 +71,10 @@ pub fn main(init: std.process.Init) !void {
     // w=1 wall in fault handling). See runtime/block_cache.zig.
     var big_blocks = block_cache.BlockCacheAllocator(mem_tag.vma).init(init.gpa);
     defer big_blocks.deinit();
+    // Let the evaluator's build-phase release flush the parked blocks
+    // (block_cache.trimGlobal) — it only holds a plain Allocator. Debug
+    // builds don't route through the cache, so trimming it is a no-op.
+    big_blocks.registerGlobalTrim();
     const allocator = if (comptime builtin.mode == .Debug) debug_gpa.allocator() else big_blocks.allocator();
 
     var args_iter = try init.minimal.args.iterateAllocator(allocator);

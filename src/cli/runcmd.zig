@@ -75,8 +75,8 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
     };
-    const out_path = (try ev.derivationOutPath(result)) orelse drv_path;
-    const program = (try ev.derivationProgram(result)) orelse {
+    const out_path_borrowed = (try ev.derivationOutPath(result)) orelse drv_path;
+    const program_borrowed = (try ev.derivationProgram(result)) orelse {
         ev.stopProgressSampler();
         ev.progressSessionEnd();
         std.debug.print("error: could not determine a program name to run\n", .{});
@@ -87,12 +87,24 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
+    // `out_path`/`program` borrow the intern table, which the release below
+    // frees — copy them into plain memory first.
+    const out_path = try allocator.dupe(u8, out_path_borrowed);
+    defer allocator.free(out_path);
+    const program = try allocator.dupe(u8, program_borrowed);
+    defer allocator.free(program);
+
+    // Evaluation is done and its results are copied out: drop the language
+    // heap before the build phase (see build.zig), which can run for minutes
+    // and needs only the daemon connection.
+    ev.releaseEvalState();
+
     var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
     const build_sink = if (term.show_progress) build_progress.sink() else null;
     ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
         build_progress.deinit();
         ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+        return run.buildFailure(&ev, err);
     };
     // Tear the progress bar down before the program takes over the terminal.
     build_progress.deinit();

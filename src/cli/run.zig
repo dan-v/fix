@@ -108,6 +108,20 @@ pub fn storeOrEvalFailure(io: std.Io, use_color: bool, show_trace: bool, ev: *Ev
     return 1;
 }
 
+/// `storeOrEvalFailure` for after `Evaluator.releaseEvalState`: the language
+/// heap (diagnostics, trace, intern table) is gone, so a build failure can
+/// only render store-side state. Evaluation already succeeded by the time a
+/// build runs — there are no eval diagnostics to lose — and the daemon's own
+/// message (still owned by the surviving DerivationStore) is the useful part.
+pub fn buildFailure(ev: *Evaluator, err: anyerror) u8 {
+    switch (err) {
+        error.DaemonError => std.debug.print("error: daemon: {s}\n", .{ev.lastStoreError() orelse "unknown"}),
+        error.StoreUnavailable => std.debug.print("error: cannot reach the nix-daemon (is it running?)\n", .{}),
+        else => std.debug.print("error: build failed: {s}\n", .{@errorName(err)}),
+    }
+    return 1;
+}
+
 pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Source {
     // Load the base source text (borrowed for expr/file, owned for flake).
     const base: Source = switch (source) {

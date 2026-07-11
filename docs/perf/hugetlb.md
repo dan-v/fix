@@ -9,10 +9,14 @@ With `--hugetlb` engaged, the two structures that dominate the eval's memory
 traffic are backed by explicit `MAP_HUGETLB` mappings instead of 4 KB pages:
 
 - the **flat object store** (`base/segments.zig FlatStore`) — a reserved
-  huge-page *prefix* grown chunk-wise (128 MB) ahead of the bump cursor;
+  huge-page *prefix* grown chunk-wise (32 MB) ahead of the bump cursor;
+- the **value/attr/attr-pos segment stores** — their ≥64 MB doubling-tail
+  segments are self-mapped with the same chunk-grown prefix scheme
+  (`StableSegments` `huge_overlay_min`), so a mostly-empty 128–256 MB tail
+  segment no longer bills its full size against the pool up front;
 - **block-cache blocks of ≥2 MB** (`base/block_cache.zig`) — the 2–64 MB
-  class blocks and >64 MB pass-throughs that back the value/attr segment
-  stores, parse/compile arenas, and retained ASTs.
+  class blocks and >64 MB pass-throughs that back the smaller segments,
+  parse/compile arenas, and retained ASTs.
 
 One 2 MB TLB entry replaces 512 4 KB entries and first-touch faults drop
 512×. Measured on `test/nixos_toplevel.nix` (ReleaseFast): **w=1 −8.3%**
@@ -33,10 +37,11 @@ sudo sysctl vm.nr_hugepages=2048        # 4 GB pool of 2 MB pages
 
 (Persist in `/etc/sysctl.d/`; allocate early after boot — a fragmented
 machine may not be able to assemble the pages later.) A NixOS-toplevel
-eval reserves ~2.1 GB of pool at peak (~1.6 GB actually faulted — the rest
-is block-cache class-size rounding plus one flat-store grow-ahead chunk),
-so a 4 GB pool (`2048`) leaves comfortable headroom; undersizing is safe
-(overflow falls back to normal pages) but gives up part of the win.
+eval reserves ~1.65 GB of pool at peak (nearly all of it faulted — the
+chunk-grown prefixes keep mapped-but-untouched slack to one 32 MB chunk
+per active store), so a 4 GB pool (`2048`) leaves comfortable headroom;
+undersizing is safe (overflow falls back to normal pages) but gives up
+part of the win.
 
 ## Modes
 

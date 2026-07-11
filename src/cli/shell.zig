@@ -60,9 +60,14 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionBegin(label);
     ev.startProgressSampler();
 
-    // Collect the output paths whose bin/ dirs go on PATH.
+    // Collect the output paths whose bin/ dirs go on PATH. Owned copies —
+    // they must survive the evaluator's build-phase memory release (which
+    // frees the intern table the raw attr strings borrow).
     var out_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer out_paths.deinit(allocator);
+    defer {
+        for (out_paths.items) |p| allocator.free(p);
+        out_paths.deinit(allocator);
+    }
 
     const failed = if (options.packages.items.len > 0)
         try realizePackages(allocator, init, &ev, term, options, build_sink, &out_paths)
@@ -110,13 +115,17 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
             std.debug.print("error: '{s}' is not a derivation\n", .{name});
             return 1;
         };
-        try out_paths.append(allocator, (try ev.derivationOutPath(drv)) orelse drv_path);
+        try out_paths.append(allocator, try allocator.dupe(u8, (try ev.derivationOutPath(drv)) orelse drv_path));
         try derived.append(allocator, try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path}));
     }
 
     ev.stopProgressSampler();
+    // Evaluation is done and its results are copied out: drop the language
+    // heap before the build phase (see build.zig), which can run for minutes
+    // and needs only the daemon connection.
+    ev.releaseEvalState();
     ev.buildDerivations(derived.items, sink, run.buildMode(options)) catch |err| {
-        return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, "packages", err);
+        return run.buildFailure(ev, err);
     };
     return null;
 }
@@ -146,13 +155,16 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
     };
-    try out_paths.append(allocator, (try ev.derivationOutPath(result)) orelse drv_path);
+    try out_paths.append(allocator, try allocator.dupe(u8, (try ev.derivationOutPath(result)) orelse drv_path));
 
     ev.stopProgressSampler();
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
+    // See realizePackages: results are copied out, so free the language heap
+    // for the build phase.
+    ev.releaseEvalState();
     ev.buildDerivations(&.{derived}, sink, run.buildMode(options)) catch |err| {
-        return try run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, ev, source.text, err);
+        return run.buildFailure(ev, err);
     };
     return null;
 }

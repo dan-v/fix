@@ -23,6 +23,7 @@ const heap_gc = @import("runtime").heap.heap_gc;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const regex_mod = @import("base").regex;
+const block_cache_mod = @import("base").block_cache;
 const vma_mod = @import("runtime").mem_tag.vma;
 const DerivationStore = @import("derivation").DerivationStore;
 const derivation = @import("derivation");
@@ -181,6 +182,9 @@ pub const Evaluator = struct {
         if (gc.enabled) .empty else {},
     /// Speculative import prefetch state (`FIX_IMPORT_PREFETCH`).
     prefetch: Prefetch = .{},
+    /// Whether `releaseEvalState` already ran (the build-phase memory
+    /// release). Makes the release idempotent so `deinit` can share it.
+    eval_released: bool = false,
 
     /// Speculative import prefetch (`FIX_IMPORT_PREFETCH`): `.nix` path
     /// constants discovered by `ChunkRegistry.register` are submitted as
@@ -271,6 +275,39 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
+        self.releaseEvalState();
+        if (self.base_path) |path| self.allocator.free(path);
+        // Stop the IO thread before the daemon connection it drives is closed.
+        // Safe here: the scheduler + main worker are already joined (in
+        // `releaseEvalState`), so no fiber is still parked on an in-flight
+        // store op.
+        self.derivations.clearOffload();
+        self.io_runtime.deinit();
+        self.allocator.destroy(self.io_runtime);
+        self.derivations.deinit();
+    }
+
+    /// Free the language-evaluation half of the evaluator — workers and
+    /// their fiber stacks, the object heap (flat store + segment stores),
+    /// file/fetch caches, retained AST, bytecode registry, and the intern
+    /// table — while keeping the store half (daemon connection + IO thread,
+    /// progress session) alive. The build-phase memory release: once `fix
+    /// build`/`run`/`shell` has copied the drv/out paths out of the intern
+    /// table, the ~2 GB evaluator heap has no further reader, but the
+    /// daemon build can run for minutes. Also flushes the process block
+    /// cache, whose free stacks would otherwise retain the dead segment
+    /// blocks for the build's duration.
+    ///
+    /// Idempotent; `deinit` runs it too. After this only store-side entry
+    /// points are valid (`buildDerivations`, `addIndirectRoot`,
+    /// `lastStoreError`, the progress-session calls) — no evaluation, value
+    /// access, or diagnostics rendering.
+    pub fn releaseEvalState(self: *Evaluator) void {
+        if (self.eval_released) return;
+        self.eval_released = true;
+        // The sampler reads the heap + scheduler; callers stop it before the
+        // build phase already, but be structural about it.
+        self.stopProgressSampler();
         mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.env_map);
         // Detach the import-prefetch sink before teardown (module-level
         // global; only clear it if it still points at THIS evaluator).
@@ -293,6 +330,7 @@ pub const Evaluator = struct {
         // worker. Doing this before scheduler shutdown could race with
         // a helper still resuming a stolen main fiber.
         if (self.main_worker) |w| w.deinit();
+        self.main_worker = null;
         // Every VM (helper fibers, main worker, imports) is dead now —
         // all pooled stack/frames buffers are back on the free list.
         self.vm_buffers.deinit();
@@ -311,18 +349,10 @@ pub const Evaluator = struct {
             self.gc_extra_roots.deinit(self.allocator);
             self.allocator.free(self.gc_workers);
         }
-        if (self.base_path) |path| self.allocator.free(path);
         self.run.deinit();
         self.imports.deinit(self.allocator);
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
-        // Stop the IO thread before the daemon connection it drives is closed.
-        // Safe here: the scheduler + main worker are already joined above, so
-        // no fiber is still parked on an in-flight store op.
-        self.derivations.clearOffload();
-        self.io_runtime.deinit();
-        self.allocator.destroy(self.io_runtime);
-        self.derivations.deinit();
         self.regexes.deinit();
         self.files.deinit();
         self.heap.deinit();
@@ -336,6 +366,13 @@ pub const Evaluator = struct {
         self.retained_arenas.deinit(self.allocator);
         self.registry.deinit();
         self.intern.deinit();
+        // Dangling Value into the freed heap; never read again, but don't
+        // keep it findable.
+        self.builtins_value = null;
+        // The teardown above just flooded the block cache's free stacks
+        // with the dead segment blocks — return them (and everything else
+        // parked) to the OS instead of retaining ~200 MB for the build.
+        block_cache_mod.trimGlobal();
     }
 
     pub fn getDiagnostics(self: *const Evaluator) []const Diagnostic {
