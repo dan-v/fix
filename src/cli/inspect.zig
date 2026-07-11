@@ -181,10 +181,72 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         reg_stats.speculatable_with_strictness,
         percent(reg_stats.speculatable_with_strictness, reg_stats.speculatable),
     });
+    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry());
 
     try writeSchedulerStats(writer, workers, sched_stats);
 
     if (top_n > 0) try writeTopInterned(writer, ev, top_n);
+}
+
+/// Header/body-split census: among the currently-registered chunks (already
+/// deduped on full content INCLUDING source positions), how many share the same
+/// *code* identity? Those are position-variant clones a header/body split would
+/// collapse onto one shared body. Reports two fingerprints: code+constants (what
+/// a naive split shares) and code-only (the upper bound if constants were also
+/// interned).
+fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry) !void {
+    var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer by_full.deinit(allocator);
+    var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer by_code.deinit(allocator);
+
+    var total: u32 = 0;
+    var total_code: usize = 0;
+    var dup_full: u32 = 0;
+    var dup_full_bytes: usize = 0;
+    var dup_code: u32 = 0;
+
+    const n = reg.count();
+    var id: u32 = 0;
+    while (id < n) : (id += 1) {
+        const c = reg.get(id) orelse continue;
+        total += 1;
+        total_code += c.code.len;
+
+        var hf = std.hash.Wyhash.init(0);
+        hf.update(c.code);
+        hf.update(std.mem.sliceAsBytes(c.constants));
+        hf.update(std.mem.sliceAsBytes(c.attr_names));
+        hf.update(std.mem.asBytes(&c.local_count));
+        hf.update(std.mem.asBytes(&c.arity));
+        hf.update(std.mem.asBytes(&c.strict_params));
+        if ((try by_full.getOrPut(allocator, hf.final())).found_existing) {
+            dup_full += 1;
+            dup_full_bytes += c.code.len;
+        }
+
+        var hc = std.hash.Wyhash.init(0);
+        hc.update(c.code);
+        hc.update(std.mem.asBytes(&c.local_count));
+        hc.update(std.mem.asBytes(&c.arity));
+        if ((try by_code.getOrPut(allocator, hc.final())).found_existing) dup_code += 1;
+    }
+
+    try writer.writeAll("  header/body split potential:\n");
+    try writer.print("    distinct bodies (code+consts): {d}  → {d} clones collapse ({d:.1}%)\n", .{
+        by_full.count(), dup_full, percent(dup_full, total),
+    });
+    try writer.print("    code bytes reclaimable:        {d}  of {d} ({d:.1}%)\n", .{
+        dup_full_bytes, total_code, percentUsize(dup_full_bytes, total_code),
+    });
+    try writer.print("    distinct code (consts ignored): {d}  → {d} clones ({d:.1}%, upper bound)\n", .{
+        by_code.count(), dup_code, percent(dup_code, total),
+    });
+}
+
+fn percentUsize(part: usize, whole: usize) f64 {
+    if (whole == 0) return 0;
+    return @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(whole));
 }
 
 fn writeSchedulerStats(writer: *std.Io.Writer, workers: u8, s: anytype) !void {
