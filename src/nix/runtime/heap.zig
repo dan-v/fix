@@ -77,9 +77,16 @@ pub const AttrPosEntry = struct {
 pub const OBJECT_MAX_SLOTS: u32 = 1 << 30;
 const mem_tag = @import("mem_tag.zig");
 const ObjectStore = stable.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .vma_tag = .objects }, mem_tag.vma);
-const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values }, mem_tag.vma);
-const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs }, mem_tag.vma);
-const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos }, mem_tag.vma);
+// `huge_overlay_min`: the ≥64 MB doubling-tail segments get a NORESERVE
+// mapping + chunk-grown hugetlb prefix instead of a fully-mapped hugetlb
+// block — an up-front map bills the whole (mostly empty at peak) tail
+// segment against the pool: ~340 MB of mapped-never-faulted slack across
+// the three stores on a NixOS toplevel. All three stores move their
+// cursors under `write_mu` only (no `appendAtomic`), which the overlay
+// requires. 64 MB keeps the (-Dgc) nursery segments allocator-backed.
+const ValueStore = stable.StableSegments(Value, .{ .first_segment_size = 1024, .vma_tag = .values, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrStore = stable.StableSegments(AttrEntry, .{ .first_segment_size = 512, .vma_tag = .attrs, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
+const AttrPosStore = stable.StableSegments(AttrPosEntry, .{ .first_segment_size = 512, .vma_tag = .attrpos, .huge_overlay_min = 64 << 20 }, mem_tag.vma);
 
 pub var next_heap_token: std.atomic.Value(u64) = .init(1);
 
