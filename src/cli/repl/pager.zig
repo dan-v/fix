@@ -159,7 +159,9 @@ const Pager = struct {
                 };
                 var text: std.Io.Writer.Allocating = .init(arena);
                 const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
-                try disasm.writeChunk(&text.writer, id, chunk, symbols, disasm_options);
+                var options = disasm_options;
+                options.use_color = self.use_color;
+                try disasm.writeChunk(&text.writer, id, chunk, symbols, options);
                 const lines = try splitLines(arena, text.written());
                 return .{
                     .title = try std.fmt.allocPrint(arena, "chunk #{d}", .{id}),
