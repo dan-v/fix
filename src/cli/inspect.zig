@@ -194,15 +194,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
 /// collapse onto one shared body. Reports two fingerprints: code+constants (what
 /// a naive split shares) and code-only (the upper bound if constants were also
 /// interned).
-fn writeCodeDedupCensus(writer: *std.Io.Writer, base_allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry, intern: *const intern_mod.InternTable) !void {
-    _ = base_allocator;
-    // Census scratch on a private arena (page-backed) — the census must not
-    // touch the evaluator's block-cache allocator, which has its own alloc/free
-    // discipline.
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
+fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry, intern: *const intern_mod.InternTable) !void {
     var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer by_full.deinit(allocator);
     var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;

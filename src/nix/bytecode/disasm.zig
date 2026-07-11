@@ -135,8 +135,11 @@ pub const CaptureCensus = struct { total: usize = 0, duplicated: usize = 0, ops:
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
     var scratch: std.Io.Writer.Allocating = .init(allocator);
     defer scratch.deinit();
+    // `writeOperands` grows `referenced_chunks` with `std.heap.smp_allocator`
+    // internally (see its `.put` calls), so it MUST be freed with the same
+    // allocator — freeing it through a different one is an invalid free.
     var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer refs.deinit(allocator);
+    defer refs.deinit(std.heap.smp_allocator);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(allocator);
 
