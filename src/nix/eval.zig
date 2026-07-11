@@ -724,12 +724,15 @@ pub const Evaluator = struct {
         // ~25-50ms of import parse+compile sitting ON the critical chain
         // at w=8 while every helper parked). The import registry dedups
         // and coordinates, so a prefetch is exactly the import the demand
-        // fiber would have run — started earlier. Default ON at 2..16
-        // workers (same gate as the novel lane: at w=32 extra spec-lane
-        // volume chases junk); FIX_IMPORT_PREFETCH=0/1 overrides,
+        // fiber would have run — started earlier. Default ON whenever
+        // helpers exist. (The old 2..16 gate mirrored the novel lane's:
+        // at w=32 extra spec-lane volume chased junk. Re-measured
+        // 2026-07-11 with the bulk-spec drain cap containing that
+        // volume — prefetch-on measured -5% median at w=32, so the
+        // gate is gone.) FIX_IMPORT_PREFETCH=0/1 overrides,
         // FIX_IMPORT_PREFETCH_MAX bounds submissions per eval.
         {
-            var on = self.worker_count >= 2 and self.worker_count <= 16;
+            var on = self.worker_count >= 2;
             var max: u32 = 8192;
             if (self.env_map) |em| {
                 if (em.get("FIX_IMPORT_PREFETCH")) |s| on = !std.mem.eql(u8, s, "0");
@@ -750,12 +753,13 @@ pub const Evaluator = struct {
         // to helpers, who warm the FileCache ahead of the demand fiber's
         // serial child-readDir walk (pkgs/by-name: 756 shard listings
         // back-to-back on the critical chain, ~19ms at w=8). Same default
-        // gate as import prefetch (ON at 2..16 workers);
+        // gate as import prefetch (ON whenever helpers exist; the old
+        // w<=16 bound fell with the bulk-spec drain cap, same evidence);
         // FIX_READDIR_PREFETCH=0/1 overrides, FIX_READDIR_PREFETCH_MIN
         // tunes the directory-children threshold,
         // FIX_READDIR_PREFETCH_MAX bounds total child listings per eval.
         {
-            var on = self.worker_count >= 2 and self.worker_count <= 16;
+            var on = self.worker_count >= 2;
             var min: u32 = 32;
             var max: u32 = 16384;
             if (self.env_map) |em| {
