@@ -71,6 +71,9 @@ Note: `derivation-debug` is **not** a subcommand — derivation records are filt
 | `v` / `value` | the value passed to `builtins.break` (or the error subject) |
 | `break FILE:LINE` | set a source-line breakpoint |
 | `breakpoints` / `delete N` | list / remove breakpoints |
+| `n` / `next` | step to the next line, over calls |
+| `s` / `step` | step to the next line, into calls |
+| `finish` | run until the current frame returns |
 | `c` / `continue` | resume evaluation |
 | `q` / `quit` | abort evaluation |
 | `help` | command list |
@@ -82,6 +85,12 @@ Frames show names when chunk-name capture is on (`--debugger` enables it), so a 
 `break FILE:LINE` pauses whenever execution reaches that line — set it during any pause (drop a `builtins.break` near the entry to get an initial one). It's implemented by **patching the bytecode**, not by a per-instruction check: the opcode byte at the line's first instruction is overwritten with a dedicated `breakpoint` opcode that pauses the debugger and then chains to the saved original opcode (its operands are untouched). The hot dispatch loop is byte-for-byte unchanged and pays nothing until a patched instruction actually runs — so this ships in the default binary with no build flag. `delete N` restores the original bytes. Because bodies compile lazily (imports, deferred attrs register mid-evaluation), a per-registry hook re-patches pending breakpoints onto each newly registered chunk.
 
 The compiler emits a source-map entry per expression node, so essentially every line is breakpointable; a requested line still resolves to the nearest line carrying code (reported when it differs). One caveat: a single source line can compile into several chunks (e.g. a call and its argument thunk), so a breakpoint may report multiple sites and pause at each. Breakpoints force `--workers=1`, so patched bytecode is never shared across threads.
+
+### Stepping
+
+`next`, `step`, and `finish` reuse the breakpoint mechanism: each **arms temporary bytecode patches** and resumes; the next pause is the landing point. `next` patches every next-line site in the current chunk plus the caller's return point and stops at the current frame depth or shallower (so it doesn't stop inside a deeper recursion). `step` additionally patches the entry of every chunk the current one may call or force, and stops at any depth. `finish` patches only the caller's return point. `BreakpointTable.hit` applies the depth guard: a permanent breakpoint always pauses, a step temp only at the target depth; the console clears the step's temps at the next pause.
+
+One honest caveat: this is a **lazy** language, so stepping follows *demand* order, not source order. Stepping "over" a line whose value is a thunk lands wherever that thunk is actually forced — often a different binding or file — and a value already forced (memoised) is skipped. `step` into a call typically lands in the argument thunk first (Nix forces arguments on demand). Stepping is most intuitive as "step into this call and see where evaluation goes next," less so as classic line-by-line imperative stepping. Results are always preserved — a step patch chains to the original opcode.
 
 **Source locations.** A frame's `ip` is resolved with `disasm.frameSpan` — the narrowest covering source span, but with an *inclusive* end and a `body_span` fallback. The inclusive end matters for a caller frame, whose `ip` points *past* the call it's suspended on (exactly at the covering span's exclusive end); plain `bestSpan` (used by `fix disasm` for the instruction about to execute) would miss it and the frame would show no location. This is why a backtrace reads `f.nix:11:8 f ← 13:42 ← 13:3` rather than blank caller lines.
 
