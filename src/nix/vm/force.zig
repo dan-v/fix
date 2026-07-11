@@ -194,7 +194,22 @@ pub inline fn rootsEnd(self: anytype, scope: RootScope) void {
     if (comptime build_options.gc) self.gc_temp_roots.items.len = scope;
 }
 pub inline fn rootKeep(self: anytype, v: Value) void {
-    if (comptime build_options.gc) self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
+    if (comptime build_options.gc) {
+        // DORMANT GATE (the temp-root flavor of forceThunkImpl's force-chain
+        // gate — see the soundness argument there): while collection is
+        // DORMANT (`gc_collect_enabled == false`), `v` was allocated before
+        // any future `gc_track_from` could be set (arming only becomes
+        // visible after an STW this worker was parked in), so `v` is OLD at
+        // every young-gated minor and rooting it would be a no-op — skip the
+        // append. If arming lands mid-scope, later rootKeeps in the same
+        // scope see `true` and append normally; `rootsEnd`'s truncate-to-
+        // scope-start is agnostic to how many pushes actually happened.
+        // This was ~146 call sites of unconditional ArrayList appends on the
+        // hottest call/builtin paths — a measurable slice of the default
+        // build's GC tax (`-Dgc=false` measured −5.3% instructions).
+        if (!self.heap.gc_collect_enabled) return;
+        self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
+    }
 }
 
 pub fn forceThunk(self: *VM, thunk_val: Value) !Value {

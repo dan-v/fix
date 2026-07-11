@@ -1415,7 +1415,7 @@ pub const ObjectHeap = struct {
     /// the source for the next minor iff this is a genuine old→young edge; every
     /// other case bails cheaply. Fired at the write-once mutation sites (thunk
     /// resolve, merge flatten, cell bind).
-    pub fn gcRecordEdge(self: *ObjectHeap, source: ObjectId, referent: Value) void {
+    pub inline fn gcRecordEdge(self: *ObjectHeap, source: ObjectId, referent: Value) void {
         if (comptime !build_options.gc) return;
         if (!self.gc_collect_enabled) return;
         const ref_id = gcHeapId(referent) orelse return;
