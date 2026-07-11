@@ -1608,7 +1608,7 @@ fn writeOperands(
         .fail, .push_builtins,
         .attrs_merge, .attrs_merge_strict, .list_cat,
         .attr_get_dyn,
-        .call, .call_tail, .cell_new, .thunk_shell, .ret, .halt => {},
+        .call, .call_tail, .cell_new, .thunk_shell, .ret, .halt, .breakpoint => {},
 
         .call_n, .call_tail_n => {
             const n = code[ip];

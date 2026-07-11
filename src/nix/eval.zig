@@ -169,6 +169,26 @@ pub const DebugSession = struct {
         return self.ev.debugEvalScoped(self.vm, source, scope);
     }
 
+    /// Set a source-line breakpoint at `file:line`. Resolves to the nearest
+    /// line carrying code; returns null if nothing matches. Applies to already
+    /// compiled chunks and any that compile later.
+    pub fn setBreakpoint(self: *DebugSession, file: []const u8, line: u32) !?bytecode.BreakpointTable.SetResult {
+        if (self.ev.breakpoints) |*bp| return bp.set(&self.ev.registry, file, line);
+        return null;
+    }
+
+    /// All active breakpoint requests (for a `:breakpoints` listing).
+    pub fn listBreakpoints(self: *const DebugSession) []const bytecode.BreakpointTable.Request {
+        if (self.ev.breakpoints) |*bp| return bp.list();
+        return &.{};
+    }
+
+    /// Remove a breakpoint by id; true if it existed.
+    pub fn deleteBreakpoint(self: *DebugSession, id: u32) bool {
+        if (self.ev.breakpoints) |*bp| return bp.remove(&self.ev.registry, id);
+        return false;
+    }
+
     /// Build a one-entry scope attrset binding `name` to `self.value` — handy
     /// for the console to expose the break value as an identifier.
     pub fn bindValueScope(self: *DebugSession, name: []const u8) !Value {
@@ -236,6 +256,10 @@ pub const Evaluator = struct {
     /// a console expression must not open a nested debugger — the console's own
     /// error handling deals with it.
     debug_in_session: bool = false,
+    /// Source-line breakpoints (patched bytecode). Created by `setDebugUi`;
+    /// null with no debugger. Its address is stable (the Evaluator is used by
+    /// pointer), so the registry sink and each VM point at it directly.
+    breakpoints: ?bytecode.BreakpointTable = null,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -401,6 +425,7 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
+        if (self.breakpoints) |*bp| bp.deinit();
         self.releaseEvalState();
         if (self.base_path) |path| self.allocator.free(path);
         // Stop the IO thread before the daemon connection it drives is closed.
@@ -845,6 +870,11 @@ pub const Evaluator = struct {
     /// upcalls through this seam, so the layering stays down-only.
     pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
         self.debug_ui = .{ .ctx = ctx, .run = run };
+        if (self.breakpoints == null) {
+            self.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
+            // Newly (often lazily) compiled chunks get pending breakpoints too.
+            self.registry.breakpoint_sink = self.breakpoints.?.sink();
+        }
     }
 
     /// `vm_mod.BreakSink.fire` trampoline: build a `DebugSession` over the
@@ -1138,8 +1168,10 @@ pub const Evaluator = struct {
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Attach the debugger only when the CLI installed a UI: every VM (main
-        // and nested) then routes `builtins.break` through `fireBreak`.
+        // and nested) then routes `builtins.break` through `fireBreak` and
+        // consults the source-line breakpoint table.
         if (self.debug_ui != null) vm.break_sink = .{ .ctx = self, .fire = fireBreak };
+        if (self.breakpoints != null) vm.breakpoints = &self.breakpoints.?;
         return vm;
     }
 

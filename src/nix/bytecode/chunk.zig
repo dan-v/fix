@@ -637,6 +637,9 @@ pub const ChunkRegistry = struct {
     /// nothing and the hot `Chunk` layout is untouched. Not concurrency-safe;
     /// only enabled for the single-threaded disasm compile.
     capture_names: bool = false,
+    /// Debugger source-line-breakpoint patcher (see `BreakpointSink`). Null
+    /// unless a debugger is attached.
+    breakpoint_sink: ?BreakpointSink = null,
     /// The thread that first recorded into the sidecar, captured lazily. The
     /// maps are not synchronized, so every `recordName`/`recordFile` must come
     /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
@@ -838,6 +841,16 @@ pub const ChunkRegistry = struct {
     };
     pub var path_const_sink: ?PathConstSink = null;
 
+    /// Debugger hook: called for every chunk as it registers, so pending
+    /// source-line breakpoints get patched into freshly (often lazily) compiled
+    /// bodies — imports and deferred attrs register mid-evaluation. Null in
+    /// every normal run. Per-registry (not a global) so it can't leak across
+    /// evaluators. See `bytecode/breakpoints.zig`.
+    pub const BreakpointSink = struct {
+        ctx: *anyopaque,
+        place: *const fn (ctx: *anyopaque, chunk_id: types.ChunkId, chunk: *Chunk) void,
+    };
+
     // Every field of `Chunk` must either be covered by `contentHash` AND
     // `contentEql` or be derived from covered fields (`scheduling` is the
     // one derived field today): a semantic field missing from both silently
@@ -993,10 +1006,15 @@ pub const ChunkRegistry = struct {
             .strict_param = stored.scheduling.strict_param,
             .strict_via_upvalue = stored.scheduling.strict_via_upvalue,
         };
-        return if (self.solo)
+        const id = if (self.solo)
             try self.chunks.appendSerial(self.allocator, new_slot)
         else
             try self.chunks.appendAtomic(self.allocator, new_slot);
+        // Debugger: patch any pending source-line breakpoints into this newly
+        // registered body. Solo-only in practice (the debugger forces w=1), so
+        // patching the just-published chunk races nothing.
+        if (self.breakpoint_sink) |s| s.place(s.ctx, id, stored);
+        return id;
     }
 
     pub fn get(self: *const ChunkRegistry, id: ChunkId) ?*const Chunk {

@@ -152,9 +152,9 @@ pub const ImportHost = struct {
 };
 
 /// Why evaluation paused into the debugger. `break_builtin` is a
-/// `builtins.break x` call; `eval_error` is an evaluation error caught at
-/// the top level with `--debugger` active.
-pub const BreakReason = enum { break_builtin, eval_error };
+/// `builtins.break x` call; `line_breakpoint` is a patched source-line
+/// breakpoint; `eval_error` is an evaluation error caught with `--debugger`.
+pub const BreakReason = enum { break_builtin, line_breakpoint, eval_error };
 
 /// A debugger attachment. Installed on every VM by `Evaluator.initVm` when a
 /// debugger is active; null (the default) means "no debugger" and the break
@@ -200,6 +200,10 @@ pub const VM = struct {
     /// error-entry (throw/abort/assert) suppresses itself while `> 0`, so a
     /// caught error doesn't spuriously pause. Only touched on the debug path.
     tryeval_depth: u32 = 0,
+    /// Source-line breakpoint table (patched-byte → original). Set post-init by
+    /// `Evaluator.initVm` when a debugger is active; read only by the
+    /// `breakpoint` opcode handler, which is unreachable without a patch.
+    breakpoints: ?*bytecode_mod.BreakpointTable = null,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.

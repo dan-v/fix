@@ -445,6 +445,24 @@ fn opJumpIfFalse(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return dispatch(vm, frame, code, next_ip, stop_depth);
 }
 
+/// A source-line breakpoint (patched over another opcode's byte by the
+/// debugger). Pause into the debugger at this location, then chain to the
+/// original opcode's handler — the operands were never touched, and `ip`
+/// already points past the (same-position) opcode byte. Never reached unless a
+/// breakpoint is set, so the normal dispatch path pays nothing.
+fn opBreakpoint(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    const off: u32 = @intCast(ip - 1);
+    frame.ip = ip;
+    const original: u8 = if (vm.breakpoints) |bps|
+        (bps.originalFor(frame.chunk_id, off) orelse @intFromEnum(OpCode.halt))
+    else
+        @intFromEnum(OpCode.halt);
+    if (vm.break_sink) |sink| {
+        sink.fire(sink.ctx, vm, Value.null_val, .line_breakpoint) catch |e| return e;
+    }
+    return @call(.always_tail, handlers[original], .{ vm, frame, code, ip, stop_depth });
+}
+
 fn opFailAssertion(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     _ = frame;
     _ = code;
@@ -1259,6 +1277,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .thunk_defer => opDeferAttrValue,
         .ret => opRet,
         .halt => opHalt,
+        .breakpoint => opBreakpoint,
     };
 }
 

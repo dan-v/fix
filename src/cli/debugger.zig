@@ -112,6 +112,18 @@ pub const Console = struct {
             try self.printValue(s, s.value);
             return false;
         }
+        if (eq(word, "break") or eq(word, "b")) {
+            try self.addBreakpoint(s, rest);
+            return false;
+        }
+        if (eq(word, "breakpoints") or eq(word, "info")) {
+            try self.listBreakpoints(s);
+            return false;
+        }
+        if (eq(word, "delete") or eq(word, "d")) {
+            try self.deleteBreakpoint(s, rest);
+            return false;
+        }
 
         // `p <expr>` prints an expression; a bare expression does the same.
         const expr = if (eq(word, "p") or eq(word, "print") or eq(word, "e") or eq(word, "eval")) rest else line;
@@ -132,16 +144,21 @@ pub const Console = struct {
     fn banner(self: *Console, w: *std.Io.Writer, s: *DebugSession) !void {
         try self.style(w, .trace_label);
         const reason = switch (s.reason) {
-            .break_builtin => "breakpoint",
+            .break_builtin => "break",
+            .line_breakpoint => "breakpoint",
             .eval_error => "error",
         };
         try w.print("\n-- debugger ({s}) --", .{reason});
         try cli.reset(w, self.use_color);
         try w.writeByte('\n');
         if (s.currentFrame()) |f| try self.writeFrameLine(w, s, 0, f, true);
-        try w.writeAll("value: ");
-        self.renderTo(w, s, s.value) catch try w.writeAll("<unavailable>");
-        try w.writeAll("\ntype `help` for commands, `c` to continue.\n");
+        // A line breakpoint carries no meaningful value; break/error do.
+        if (s.reason != .line_breakpoint) {
+            try w.writeAll("value: ");
+            self.renderTo(w, s, s.value) catch try w.writeAll("<unavailable>");
+            try w.writeByte('\n');
+        }
+        try w.writeAll("type `help` for commands, `c` to continue.\n");
     }
 
     fn backtrace(self: *Console, s: *DebugSession) !void {
@@ -217,6 +234,61 @@ pub const Console = struct {
         }
     }
 
+    /// `break FILE:LINE` — set a source-line breakpoint.
+    fn addBreakpoint(self: *Console, s: *DebugSession, arg: []const u8) !void {
+        const colon = std.mem.lastIndexOfScalar(u8, arg, ':') orelse {
+            try self.reportErr("usage: break FILE:LINE", .{});
+            return;
+        };
+        const file = std.mem.trim(u8, arg[0..colon], " \t");
+        const line = std.fmt.parseInt(u32, std.mem.trim(u8, arg[colon + 1 ..], " \t"), 10) catch {
+            try self.reportErr("usage: break FILE:LINE (LINE must be a number)", .{});
+            return;
+        };
+        if (file.len == 0) {
+            try self.reportErr("usage: break FILE:LINE", .{});
+            return;
+        }
+        const set = s.setBreakpoint(file, line) catch |e| {
+            try self.reportErr("{s}", .{@errorName(e)});
+            return;
+        };
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        const w = &out.interface;
+        if (set) |r| {
+            try w.print("breakpoint {d} at {s}:{d}", .{ r.id, file, r.line });
+            if (r.line != line) try w.print(" (nearest code to line {d})", .{line});
+            try w.print(" — {d} site(s)\n", .{r.sites});
+        } else {
+            try w.print("no code found for {s}:{d} in compiled chunks\n", .{ file, line });
+        }
+    }
+
+    fn listBreakpoints(self: *Console, s: *DebugSession) !void {
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        const w = &out.interface;
+        const items = s.listBreakpoints();
+        if (items.len == 0) {
+            try w.writeAll("(no breakpoints)\n");
+            return;
+        }
+        for (items) |bp| try w.print("  {d}  {s}:{d}\n", .{ bp.id, bp.file, bp.line });
+    }
+
+    fn deleteBreakpoint(self: *Console, s: *DebugSession, arg: []const u8) !void {
+        const id = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch {
+            try self.reportErr("usage: delete N", .{});
+            return;
+        };
+        if (s.deleteBreakpoint(id)) {
+            try self.note("deleted breakpoint {d}", .{id});
+        } else {
+            try self.reportErr("no breakpoint {d}", .{id});
+        }
+    }
+
     fn printValue(self: *Console, s: *DebugSession, v: Value) !void {
         var out = self.stderr();
         defer out.interface.flush() catch {};
@@ -252,6 +324,9 @@ pub const Console = struct {
             \\  bt / backtrace    show the call stack with source locations
             \\  l / locals        show the current frame's locals and upvalues
             \\  v / value         print the value passed to builtins.break
+            \\  break FILE:LINE   set a source-line breakpoint (nearest code line)
+            \\  breakpoints       list breakpoints
+            \\  delete N          remove breakpoint N
             \\  c / continue      resume evaluation
             \\  q / quit          abort evaluation
             \\  help              this help
@@ -263,6 +338,12 @@ pub const Console = struct {
 
     fn style(self: *Console, w: *std.Io.Writer, which: cli.Style) !void {
         try cli.style(w, self.use_color, which);
+    }
+
+    fn note(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {
+        var out = self.stderr();
+        defer out.interface.flush() catch {};
+        try out.interface.print(fmt ++ "\n", fmt_args);
     }
 
     fn reportErr(self: *Console, comptime fmt: []const u8, fmt_args: anytype) !void {

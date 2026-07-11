@@ -348,6 +348,14 @@ pub const OpCode = enum(u8) {
     ret,
     /// Halt execution (top-level done).
     halt,
+    // ---- debugger ----
+    /// A source-line breakpoint patched over another opcode's byte (its
+    /// operands are untouched). The handler pauses into the debugger, then
+    /// chains to the original opcode's handler at the same ip. Never emitted by
+    /// the compiler — only written in place by the debugger, and only present
+    /// while a breakpoint is set. Kept last so its value can't shift another
+    /// opcode's byte encoding. Operands: none of its own.
+    breakpoint,
 };
 
 pub const count = @typeInfo(OpCode).@"enum".fields.len;

@@ -24,6 +24,10 @@ const Probe = struct {
     eval_len: usize = 0,
     /// Return this error from the console (to test abort propagation).
     return_error: ?anyerror = null,
+    /// On the first pause, set this source-line breakpoint.
+    set_bp: ?struct { file: []const u8, line: u32 } = null,
+    /// Count of `.line_breakpoint` pauses.
+    line_hits: usize = 0,
 
     fn install(self: *Probe, ev: *Evaluator) void {
         ev.setDebugUi(self, run);
@@ -34,6 +38,12 @@ const Probe = struct {
         self.hits += 1;
         self.last_reason = s.reason;
         self.frame_count = s.frameCount();
+        if (s.reason == .line_breakpoint) self.line_hits += 1;
+
+        if (self.set_bp) |bp| {
+            self.set_bp = null; // once
+            _ = try s.setBreakpoint(bp.file, bp.line);
+        }
 
         var vw: std.Io.Writer = .fixed(&self.value_text);
         s.writeValue(&vw, try s.force(s.value)) catch {};
@@ -109,6 +119,59 @@ test "tryEval suppresses debugger error-entry for caught errors" {
 
     _ = try ev.evaluate("builtins.tryEval (throw \"caught\")");
     try std.testing.expectEqual(@as(usize, 0), probe.hits);
+}
+
+test "source-line breakpoint fires and preserves the result" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    var probe: Probe = .{ .set_bp = .{ .file = "bp.nix", .line = 3 } };
+    probe.install(&ev);
+
+    // Line 3 is a tail apply (`id x`) — a source-mapped, breakpointable line.
+    // The initial `builtins.break` pauses so the probe can set the breakpoint;
+    // continuing then runs `f 7`, which hits it.
+    const src =
+        \\let
+        \\  id = x: x;
+        \\  f = x: id x;
+        \\in builtins.seq (builtins.break 0) (f 7)
+    ;
+    const result = try ev.evaluatePath(src, "bp.nix");
+    try std.testing.expect(probe.line_hits >= 1);
+    try std.testing.expectEqual(eval_mod.BreakReason.line_breakpoint, probe.last_reason.?);
+    // The patched opcode chained to the original: evaluation is unaffected.
+    try std.testing.expectEqual(@as(i64, 7), (try ev.forceValue(result)).asInt());
+}
+
+test "deleting a source-line breakpoint stops it firing" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+
+    // Set then immediately delete on the first pause; the line must not fire.
+    const Local = struct {
+        hits_line: usize = 0,
+        fn run(ctx: *anyopaque, s: *DebugSession) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.reason == .line_breakpoint) {
+                self.hits_line += 1;
+                return;
+            }
+            const set = try s.setBreakpoint("bp.nix", 3);
+            try std.testing.expect(set != null);
+            try std.testing.expect(s.deleteBreakpoint(set.?.id));
+        }
+    };
+    var local: Local = .{};
+    ev.setDebugUi(&local, Local.run);
+
+    const src =
+        \\let
+        \\  id = x: x;
+        \\  f = x: id x;
+        \\in builtins.seq (builtins.break 0) (f 7)
+    ;
+    _ = try ev.evaluatePath(src, "bp.nix");
+    try std.testing.expectEqual(@as(usize, 0), local.hits_line);
 }
 
 test "console abort error propagates out of evaluation" {
