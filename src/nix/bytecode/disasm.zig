@@ -125,6 +125,53 @@ fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHa
     }
 }
 
+/// Per-chunk capture-list census: the inline `[count][3×count descriptors]`
+/// list that `thunk`/`closure_cap`/`thunk_defer`/… carry is often identical
+/// across an attrset's values (they capture the same environment). Measures how
+/// many of those bytes are exact duplicates *within one chunk* — i.e. what a
+/// per-chunk capture-list interning table would reclaim.
+pub const CaptureCensus = struct { total: usize = 0, duplicated: usize = 0, ops: usize = 0 };
+
+pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
+    var scratch: std.Io.Writer.Allocating = .init(allocator);
+    defer scratch.deinit();
+    var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
+    defer refs.deinit(allocator);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(allocator);
+
+    var out: CaptureCensus = .{};
+    var ip: usize = 0;
+    while (ip < chunk.code.len) {
+        const op_byte = chunk.code[ip];
+        if (op_byte >= opcode_mod.count) {
+            ip += 1;
+            continue;
+        }
+        const op: OpCode = @enumFromInt(op_byte);
+        ip += 1;
+        // Byte offset of the capture list (past the op's chunk/deferred id).
+        const list_start: ?usize = switch (op) {
+            .thunk, .thunk_eag, .closure_cap => ip + 2, // u16 id
+            .thunk_w, .thunk_eag_w, .closure_cap_w, .thunk_arg, .thunk_defer => ip + 4, // u32 id
+            else => null,
+        };
+        scratch.writer.end = 0;
+        const next = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, &refs);
+        if (list_start) |ls| {
+            if (ls < next) {
+                const region = chunk.code[ls..next];
+                out.total += region.len;
+                out.ops += 1;
+                const h = std.hash.Wyhash.hash(0, region);
+                if ((try seen.getOrPut(allocator, h)).found_existing) out.duplicated += region.len;
+            }
+        }
+        ip = next;
+    }
+    return out;
+}
+
 /// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
 /// byte, operand bytes, mnemonic, and interpretation all align), and longer
 /// records wrap onto continuation rows.

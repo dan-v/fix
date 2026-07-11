@@ -181,7 +181,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         reg_stats.speculatable_with_strictness,
         percent(reg_stats.speculatable_with_strictness, reg_stats.speculatable),
     });
-    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry());
+    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry(), ev.internTable());
 
     try writeSchedulerStats(writer, workers, sched_stats);
 
@@ -194,7 +194,15 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
 /// collapse onto one shared body. Reports two fingerprints: code+constants (what
 /// a naive split shares) and code-only (the upper bound if constants were also
 /// interned).
-fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry) !void {
+fn writeCodeDedupCensus(writer: *std.Io.Writer, base_allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry, intern: *const intern_mod.InternTable) !void {
+    _ = base_allocator;
+    // Census scratch on a private arena (page-backed) — the census must not
+    // touch the evaluator's block-cache allocator, which has its own alloc/free
+    // discipline.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer by_full.deinit(allocator);
     var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -241,6 +249,28 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
     });
     try writer.print("    distinct code (consts ignored): {d}  → {d} clones ({d:.1}%, upper bound)\n", .{
         by_code.count(), dup_code, percent(dup_code, total),
+    });
+
+    // Capture-list interning potential: duplicated capture descriptors within
+    // chunks (attrset values sharing an environment).
+    const symbols: bytecode.disasm.Symbols = .{ .intern = intern, .registry = reg };
+    var cap_total: usize = 0;
+    var cap_dup: usize = 0;
+    var cap_ops: usize = 0;
+    id = 0;
+    while (id < n) : (id += 1) {
+        const c = reg.get(id) orelse continue;
+        const cc = bytecode.disasm.captureCensus(allocator, c, symbols) catch continue;
+        cap_total += cc.total;
+        cap_dup += cc.duplicated;
+        cap_ops += cc.ops;
+    }
+    try writer.writeAll("  capture-list interning potential:\n");
+    try writer.print("    capture-list bytes:            {d}  over {d} ops ({d:.1}% of code)\n", .{
+        cap_total, cap_ops, percentUsize(cap_total, total_code),
+    });
+    try writer.print("    duplicated within chunks:      {d}  ({d:.1}% of capture bytes, {d:.1}% of code)\n", .{
+        cap_dup, percentUsize(cap_dup, cap_total), percentUsize(cap_dup, total_code),
     });
 }
 
