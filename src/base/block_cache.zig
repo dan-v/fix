@@ -70,6 +70,19 @@ fn classOf(len: usize) ?usize {
 /// inside the `fix:bigblock` smaps bucket.
 pub var retained_bytes: std.atomic.Value(usize) = .init(0);
 
+/// Process-global trim hook, registered by `main` for its cache instance
+/// (`registerGlobalTrim`). Lets subsystems that only hold a plain
+/// `std.mem.Allocator` — the evaluator's build-phase release — flush the
+/// parked blocks back to the OS without plumbing the concrete cache type.
+var global_trim: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null;
+
+/// Release every block parked on the registered global cache's free stacks
+/// (see `BlockCacheAllocator.trim`). No-op when no cache is registered
+/// (Debug builds use the plain gpa).
+pub fn trimGlobal() void {
+    if (global_trim) |h| h.call(h.ctx);
+}
+
 /// The reuse cache is generic over an instantiated `Vma` region-tracker
 /// (see runtime/vma.zig): it registers/retags/unregisters its backing
 /// mappings through `Vma.*` so `FIX_MEM_REPORT` can attribute them, but
@@ -135,21 +148,56 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         /// Release every retained block back to the backing allocator (or
         /// the OS, for hugetlb-owned blocks).
         pub fn deinit(self: *Self) void {
+            self.trim();
+            if (global_trim) |h| {
+                if (h.ctx == @as(*anyopaque, @ptrCast(self))) global_trim = null;
+            }
+        }
+
+        /// Register this instance as the process-global trim target (see
+        /// `trimGlobal`). One instance per process in practice.
+        pub fn registerGlobalTrim(self: *Self) void {
+            global_trim = .{ .ctx = self, .call = trimThunk };
+        }
+
+        fn trimThunk(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.trim();
+        }
+
+        /// Release every *parked* block (free stacks only — live allocations
+        /// are untouched) and keep the cache usable. The evaluator's
+        /// build-phase release calls this after the heap teardown floods the
+        /// stacks with dead segment blocks that would otherwise sit retained
+        /// (~200 MB) for the whole build. Thread-safe: the stacks are drained
+        /// under `mu`, the frees run outside it.
+        pub fn trim(self: *Self) void {
+            var drained: [CLASS_COUNT][MAX_PER_CLASS][*]u8 = undefined;
+            var drained_counts: [CLASS_COUNT]u8 = undefined;
+            self.mu.lock();
+            for (0..CLASS_COUNT) |class| {
+                drained_counts[class] = self.counts[class];
+                @memcpy(
+                    drained[class][0..self.counts[class]],
+                    self.blocks[class][0..self.counts[class]],
+                );
+                self.counts[class] = 0;
+            }
+            self.mu.unlock();
             for (0..CLASS_COUNT) |class| {
                 const size = classSize(class);
-                for (self.blocks[class][0..self.counts[class]]) |ptr| {
+                for (drained[class][0..drained_counts[class]]) |ptr| {
                     Vma.unregisterRegion(ptr);
+                    _ = retained_bytes.fetchSub(size, .monotonic);
                     if (size >= HUGE_PAGE) {
+                        // `hugeLookup` takes `mu` itself — must run unlocked.
                         if (self.hugeLookup(ptr, true)) |rounded| {
                             hugetlb.unmap(ptr, rounded);
-                            _ = retained_bytes.fetchSub(size, .monotonic);
                             continue;
                         }
                     }
                     self.backing.rawFree(ptr[0..size], block_alignment, @returnAddress());
-                    _ = retained_bytes.fetchSub(size, .monotonic);
                 }
-                self.counts[class] = 0;
             }
         }
 

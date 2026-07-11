@@ -76,7 +76,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
     };
-    const out_path = (try ev.derivationOutPath(result)) orelse drv_path;
+    const out_path_borrowed = (try ev.derivationOutPath(result)) orelse drv_path;
 
     // Stop the eval sampler; keep the progress session open so build activity
     // nodes render under the same tree.
@@ -86,13 +86,25 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // This daemon (Lix) parses that, not the newer `<drvpath>^*` form.
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
+    // `drv_path`/`out_path` borrow the intern table, which the release below
+    // frees — copy them into plain memory first.
+    const drv_path_owned = try allocator.dupe(u8, drv_path);
+    defer allocator.free(drv_path_owned);
+    const out_path = try allocator.dupe(u8, out_path_borrowed);
+    defer allocator.free(out_path);
+
+    // The evaluation is complete and everything it produced that we still
+    // need has been copied out — drop the language heap (~2 GB on a NixOS
+    // eval, sitting idle otherwise) before the build phase, which can run
+    // for minutes and needs only the daemon connection.
+    ev.releaseEvalState();
 
     var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
     defer build_progress.deinit();
     const build_sink = if (term.show_progress) build_progress.sink() else null;
     ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
         ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+        return run.buildFailure(&ev, err);
     };
     build_progress.deinit();
     ev.progressSessionEnd();
@@ -109,7 +121,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     }
     if (options.add_drv_link) {
         const name = options.drv_link orelse "derivation";
-        makeLink(init.io, name, drv_path) catch |err| {
+        makeLink(init.io, name, drv_path_owned) catch |err| {
             std.debug.print("warning: could not create ./{s}: {s}\n", .{ name, @errorName(err) });
         };
     }
