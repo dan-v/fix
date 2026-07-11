@@ -32,6 +32,7 @@ const prof = @import("probe").prof;
 const prof_census = @import("probe").prof_census;
 
 const access = @import("access.zig");
+const builtin_errors = @import("builtins/errors.zig");
 const closures = @import("closures.zig");
 const debug = @import("debug.zig");
 const equality = @import("equality.zig");
@@ -445,11 +446,13 @@ fn opJumpIfFalse(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
 }
 
 fn opFailAssertion(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    _ = vm;
     _ = frame;
     _ = code;
     _ = ip;
     _ = stop_depth;
+    // Debugger error-entry (no-op unless a debugger is attached and we're not
+    // inside a tryEval): pause at the failing assertion before unwinding.
+    try builtin_errors.debugBreakError(vm, Value.null_val);
     return error.AssertionFailed;
 }
 

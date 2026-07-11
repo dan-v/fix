@@ -232,6 +232,10 @@ pub const Evaluator = struct {
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
     debug_ui: ?DebugUi = null,
+    /// Re-entrancy guard: true while the console is running. A `break`/throw in
+    /// a console expression must not open a nested debugger — the console's own
+    /// error handling deals with it.
+    debug_in_session: bool = false,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
     progress: ?eval_progress.Sink,
@@ -848,7 +852,12 @@ pub const Evaluator = struct {
     /// current demand fiber, so the console can re-enter the evaluator.
     fn fireBreak(ctx: *anyopaque, vm: *VM, value: Value, reason: vm_mod.BreakReason) anyerror!void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
+        // A break/throw raised while the console is evaluating an expression
+        // must not recurse into a nested debugger.
+        if (self.debug_in_session) return;
         const ui = self.debug_ui orelse return;
+        self.debug_in_session = true;
+        defer self.debug_in_session = false;
         var session: DebugSession = .{ .ev = self, .vm = vm, .value = value, .reason = reason };
         try ui.run(ui.ctx, &session);
     }

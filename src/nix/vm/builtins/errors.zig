@@ -8,17 +8,32 @@ const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
 
+/// Pause into the debugger at an evaluation error, unless we're inside a
+/// `tryEval` (a caught error) or no debugger is attached. `value` is shown as
+/// the error subject (the thrown message, or the offending value). Returns
+/// normally so the caller still propagates the original error; only a `:q`
+/// abort from the console surfaces as an error here.
+pub fn debugBreakError(self: anytype, value: Value) !void {
+    if (self.tryeval_depth != 0) return;
+    if (self.break_sink) |sink| try sink.fire(sink.ctx, self, value, .eval_error);
+}
+
 pub fn builtinThrow(self: anytype, message_arg: Value) !Value {
     try vm_trace.setErrorMessage(self, try strings.stringArg(self, message_arg));
+    try debugBreakError(self, message_arg);
     return error.NixThrow;
 }
 
 pub fn builtinAbort(self: anytype, message_arg: Value) !Value {
     try vm_trace.setErrorMessage(self, try strings.stringArg(self, message_arg));
+    try debugBreakError(self, message_arg);
     return error.NixAbort;
 }
 
 pub fn builtinTryEval(self: anytype, arg: Value) !Value {
+    // Suppress debugger error-entry for errors caught here.
+    self.tryeval_depth += 1;
+    defer self.tryeval_depth -= 1;
     const value = vm_force.forceValue(self, arg) catch |err| switch (err) {
         error.NixThrow,
         error.NixAbort,

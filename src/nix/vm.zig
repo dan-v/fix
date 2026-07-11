@@ -196,6 +196,10 @@ pub const VM = struct {
     /// when a debugger is active; null (the default, in every normal run)
     /// makes `builtins.break` a plain identity. See `BreakSink`.
     break_sink: ?BreakSink = null,
+    /// Nesting depth of `builtins.tryEval` forces on this fiber. The debugger's
+    /// error-entry (throw/abort/assert) suppresses itself while `> 0`, so a
+    /// caught error doesn't spuriously pause. Only touched on the debug path.
+    tryeval_depth: u32 = 0,
     /// Global intern table (shared).
     intern: *InternTable,
     /// Runtime object heap.
