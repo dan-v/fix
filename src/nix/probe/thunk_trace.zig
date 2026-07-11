@@ -75,6 +75,7 @@ pub const ThunkTrace = struct {
         creator_ip: u32,
         target_kind: TargetKind,
         target_chunk_id: ?ChunkId,
+        substantial: bool,
     ) void {
         const seq = self.seq.fetchAdd(1, .monotonic);
         const creator_loc = self.lookupSpan(creator_chunk_id, creator_ip);
@@ -83,8 +84,8 @@ pub const ThunkTrace = struct {
         defer self.mu.unlock();
         const w = self.writer;
         w.print(
-            "seq={d} kind=create thunk={d} worker={d} fiber={d} target={s}",
-            .{ seq, thunk_id, worker_id, fiber_id, @tagName(target_kind) },
+            "seq={d} kind=create thunk={d} worker={d} fiber={d} sub={d} target={s}",
+            .{ seq, thunk_id, worker_id, fiber_id, @intFromBool(substantial), @tagName(target_kind) },
         ) catch return;
         writeLoc(w, " creator", creator_loc, self.intern) catch return;
         if (target_loc) |loc| writeLoc(w, " target_at", loc, self.intern) catch return;
@@ -96,13 +97,15 @@ pub const ThunkTrace = struct {
         thunk_id: ObjectId,
         worker_id: u8,
         fiber_id: u32,
+        demand: bool,
+        spec: bool,
     ) void {
         const seq = self.seq.fetchAdd(1, .monotonic);
         self.mu.lock();
         defer self.mu.unlock();
         self.writer.print(
-            "seq={d} kind=claim thunk={d} worker={d} fiber={d}\n",
-            .{ seq, thunk_id, worker_id, fiber_id },
+            "seq={d} kind=claim thunk={d} worker={d} fiber={d} demand={d} spec={d}\n",
+            .{ seq, thunk_id, worker_id, fiber_id, @intFromBool(demand), @intFromBool(spec) },
         ) catch return;
     }
 
