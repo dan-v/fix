@@ -28,4 +28,5 @@ test {
     _ = @import("tests/paths.zig");
     _ = @import("tests/predicates.zig");
     _ = @import("tests/vm_dispatch.zig");
+    _ = @import("tests/debugger.zig");
 }
