@@ -55,14 +55,15 @@ pub const Options = struct {
 
 /// Chunk cross-reference graph over the whole registry: for each chunk, which
 /// chunks it references (outgoing) and which reference it (incoming). Built once
-/// per disassembly; scanning is O(total bytecode). Uses `page_allocator`, to
-/// match the rest of the disassembler's scratch allocations.
+/// per disassembly; scanning is O(total bytecode). All allocations use the
+/// caller's allocator (stored so `deinit` frees with the same one).
 pub const RefGraph = struct {
     out: []std.ArrayListUnmanaged(ChunkId),
     inc: []std.ArrayListUnmanaged(ChunkId),
+    allocator: std.mem.Allocator,
 
-    pub fn build(registry: *const ChunkRegistry, symbols: Symbols) !RefGraph {
-        const a = std.heap.smp_allocator;
+    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry, symbols: Symbols) !RefGraph {
+        const a = allocator;
         const n = registry.count();
         const out = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
         const inc = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
@@ -78,7 +79,7 @@ pub const RefGraph = struct {
         while (id < n) : (id += 1) {
             const chunk = registry.get(id) orelse continue;
             refs.clearRetainingCapacity();
-            collectRefsInto(chunk, symbols, &refs, &scratch) catch continue;
+            collectRefsInto(chunk, symbols, .{ .map = &refs, .allocator = a }, &scratch) catch continue;
             var it = refs.iterator();
             while (it.next()) |e| {
                 const t = e.key_ptr.*;
@@ -88,11 +89,11 @@ pub const RefGraph = struct {
         }
         for (out) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
         for (inc) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
-        return .{ .out = out, .inc = inc };
+        return .{ .out = out, .inc = inc, .allocator = a };
     }
 
     pub fn deinit(self: *RefGraph) void {
-        const a = std.heap.smp_allocator;
+        const a = self.allocator;
         for (self.out) |*l| l.deinit(a);
         for (self.inc) |*l| l.deinit(a);
         a.free(self.out);
@@ -110,7 +111,7 @@ pub const RefGraph = struct {
 /// Walk a chunk's bytecode, collecting every chunk id it references. Reuses
 /// `writeOperands` (into a throwaway buffer) so the operand-length and
 /// chunk-extraction logic lives in exactly one place.
-fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHashMapUnmanaged(ChunkId, void), scratch: *std.Io.Writer.Allocating) !void {
+fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, sink: RefSink, scratch: *std.Io.Writer.Allocating) !void {
     var ip: usize = 0;
     while (ip < chunk.code.len) {
         const op_byte = chunk.code[ip];
@@ -121,7 +122,7 @@ fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, refs: *std.AutoArrayHa
         const op: OpCode = @enumFromInt(op_byte);
         ip += 1;
         scratch.writer.end = 0;
-        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, refs);
+        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, sink);
     }
 }
 
@@ -135,11 +136,6 @@ pub const CaptureCensus = struct { total: usize = 0, duplicated: usize = 0, ops:
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
     var scratch: std.Io.Writer.Allocating = .init(allocator);
     defer scratch.deinit();
-    // `writeOperands` grows `referenced_chunks` with `std.heap.smp_allocator`
-    // internally (see its `.put` calls), so it MUST be freed with the same
-    // allocator — freeing it through a different one is an invalid free.
-    var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer refs.deinit(std.heap.smp_allocator);
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(allocator);
 
@@ -160,7 +156,7 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols:
             else => null,
         };
         scratch.writer.end = 0;
-        const next = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, &refs);
+        const next = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, null);
         if (list_start) |ls| {
             if (ls < next) {
                 const region = chunk.code[ls..next];
@@ -192,6 +188,7 @@ const table_snippet_max = 48;
 const Visited = std.AutoHashMapUnmanaged(ChunkId, void);
 
 pub fn writeChunk(
+    allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     chunk_id: ?ChunkId,
     chunk: *const Chunk,
@@ -199,8 +196,8 @@ pub fn writeChunk(
     options: Options,
 ) !void {
     var visited: Visited = .empty;
-    defer visited.deinit(std.heap.smp_allocator);
-    try writeChunkAt(writer, chunk_id, chunk, symbols, options, 0, &visited);
+    defer visited.deinit(allocator);
+    try writeChunkAt(allocator, writer, chunk_id, chunk, symbols, options, 0, &visited);
 }
 
 /// Collect the chunk ids this chunk references (closure/thunk/apply
@@ -213,17 +210,17 @@ pub fn collectRefs(
     chunk: *const Chunk,
     out: *std.ArrayListUnmanaged(ChunkId),
 ) !void {
-    const a = std.heap.smp_allocator;
     var referenced: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer referenced.deinit(a);
-    var scratch: std.Io.Writer.Allocating = .init(a);
+    defer referenced.deinit(allocator);
+    var scratch: std.Io.Writer.Allocating = .init(allocator);
     defer scratch.deinit();
-    try collectRefsInto(chunk, .{}, &referenced, &scratch);
+    try collectRefsInto(chunk, .{}, .{ .map = &referenced, .allocator = allocator }, &scratch);
     try out.ensureUnusedCapacity(allocator, referenced.count());
     for (referenced.keys()) |id| out.appendAssumeCapacity(id);
 }
 
 fn writeChunkAt(
+    allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     chunk_id: ?ChunkId,
     chunk: *const Chunk,
@@ -239,7 +236,7 @@ fn writeChunkAt(
     // The visited set only matters when recursing (`dumpAll`'s registry walk
     // passes recurse=false and visits each chunk exactly once) — skip the
     // per-call hashmap allocation entirely otherwise.
-    if (options.recurse) if (chunk_id) |id| try visited.put(std.heap.smp_allocator, id, {});
+    if (options.recurse) if (chunk_id) |id| try visited.put(allocator, id, {});
     // Each chunk is a top-level group: a colored header and a left-margin guide
     // (in the chunk's own color) down every line of its body.
     const cc: [3]u8 = if (chunk_id) |id| hueColor(id) else .{ 0x9a, 0x9a, 0x9a };
@@ -342,14 +339,15 @@ fn writeChunkAt(
 
     var ip: usize = 0;
     var referenced_chunks: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer referenced_chunks.deinit(std.heap.smp_allocator);
+    defer referenced_chunks.deinit(allocator);
+    const ref_sink: RefSink = .{ .map = &referenced_chunks, .allocator = allocator };
 
     // Scratch for each instruction's compact operand decode. Growable (reset,
     // capacity retained, per instruction) rather than a fixed buffer: a decode
     // is normally a few dozen bytes, but a pathological attribute name or path
     // (`x."<multi-KB string>"`) is unbounded, and overflowing a fixed buffer
     // would abort the whole disassembly with a write error.
-    var op_scratch: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+    var op_scratch: std.Io.Writer.Allocating = .init(allocator);
     defer op_scratch.deinit();
 
     const env = Env{
@@ -402,7 +400,7 @@ fn writeChunkAt(
         // byte-range (to print the raw-byte column ahead of the mnemonic) before
         // writing the line.
         op_scratch.writer.end = 0;
-        ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, up_names, &referenced_chunks);
+        ip = try writeOperands(&op_scratch.writer, chunk, op, ip, symbols, up_names, ref_sink);
         const operand_text = op_scratch.writer.buffered();
 
         // Find the narrowest source span covering this instruction; hoist its
@@ -445,7 +443,7 @@ fn writeChunkAt(
             if (visited.contains(child_id)) continue;
             const child = reg.get(child_id) orelse continue;
             try writer.writeByte('\n');
-            try writeChunkAt(writer, child_id, child, symbols, options, depth + 1, visited);
+            try writeChunkAt(allocator, writer, child_id, child, symbols, options, depth + 1, visited);
         }
     }
 }
@@ -1626,6 +1624,20 @@ fn writeChunkRef(writer: *std.Io.Writer, id: ChunkId, symbols: Symbols) !void {
     if (chunkNameOf(symbols, id)) |name| try writer.print(" {s}", .{name});
 }
 
+/// A place to record the chunk ids an instruction references, bundled with the
+/// allocator that owns the map — so `writeOperands` never reaches for a global
+/// allocator to grow a caller's container. `null` means "don't collect refs",
+/// which the length-only walkers (`captureCensus`, `--stats`) use to skip the
+/// allocation entirely.
+const RefSink = struct {
+    map: *std.AutoArrayHashMapUnmanaged(ChunkId, void),
+    allocator: std.mem.Allocator,
+};
+
+fn addRef(sink: ?RefSink, id: ChunkId) !void {
+    if (sink) |s| try s.map.put(s.allocator, id, {});
+}
+
 fn writeOperands(
     writer: *std.Io.Writer,
     chunk: *const Chunk,
@@ -1633,7 +1645,7 @@ fn writeOperands(
     ip_in: usize,
     symbols: Symbols,
     up_names: ?[]const InternId,
-    referenced_chunks: *std.AutoArrayHashMapUnmanaged(ChunkId, void),
+    referenced_chunks: ?RefSink,
 ) !usize {
     var ip = ip_in;
     const code = chunk.code;
@@ -1752,7 +1764,7 @@ fn writeOperands(
             ip += 2;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} upvalues", .{upvalues});
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .thunk, .thunk_eag => {
             const id: ChunkId = @intCast(readU16(code, ip));
@@ -1762,7 +1774,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
             const wide = chunkIdWide(op);
@@ -1776,7 +1788,7 @@ fn writeOperands(
             ip += 1;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .closure_w => {
             const id: ChunkId = readU32(code, ip);
@@ -1785,7 +1797,7 @@ fn writeOperands(
             ip += 2;
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} upvalues", .{upvalues});
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .thunk_w, .thunk_eag_w, .thunk_arg => {
             const id: ChunkId = readU32(code, ip);
@@ -1795,7 +1807,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .closure_cap => {
             const id: ChunkId = @intCast(readU16(code, ip));
@@ -1805,7 +1817,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .closure_cap_w => {
             const id: ChunkId = readU32(code, ip);
@@ -1815,7 +1827,7 @@ fn writeOperands(
             try writeChunkRef(writer, id, symbols);
             try writer.print(", {d} captures", .{upvalues});
             ip += @as(usize, upvalues) * 3;
-            try referenced_chunks.put(std.heap.smp_allocator, id, {});
+            try addRef(referenced_chunks, id);
         },
         .thunk_defer => {
             // Operand: 4-byte deferred-table id, 2-byte env count, then
@@ -2192,8 +2204,8 @@ fn isThunkFamilyOp(op: OpCode) bool {
 /// breakdowns, mnemonic histogram, position-table share, duplicate-body reuse,
 /// and deflate compressibility of the concatenated code — the measurement
 /// harness for codegen-size work.
-pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbols: Symbols) !void {
-    const a = std.heap.smp_allocator;
+pub fn writeStats(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry: *const ChunkRegistry, symbols: Symbols) !void {
+    const a = allocator;
     const n = registry.count();
 
     var total = StatRow{};
@@ -2266,8 +2278,6 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
         var only_const = true;
         var has_agg = false;
         var has_thunk = false;
-        var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-        defer refs.deinit(std.heap.smp_allocator);
         var ip: usize = 0;
         while (ip < code.len) {
             const op_byte = code[ip];
@@ -2280,7 +2290,7 @@ pub fn writeStats(writer: *std.Io.Writer, registry: *const ChunkRegistry, symbol
             const start = ip;
             ip += 1;
             scratch.writer.end = 0;
-            ip = writeOperands(&scratch.writer, chunk, op, ip, symbols, null, &refs) catch code.len;
+            ip = writeOperands(&scratch.writer, chunk, op, ip, symbols, null, null) catch code.len;
             op_counts[op_byte] += 1;
             op_bytes[op_byte] += ip - start;
             if (!isConstOp(op) and !isAggregateOp(op)) only_const = false;

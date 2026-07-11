@@ -45,7 +45,7 @@ fn disassemble(ev: *Evaluator, source: []const u8) !Disassembly {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try disasm.writeChunk(&out.writer, chunk_id, target, symbols, options);
+    try disasm.writeChunk(testing.allocator, &out.writer, chunk_id, target, symbols, options);
     const text = try out.toOwnedSlice();
     errdefer testing.allocator.free(text);
 

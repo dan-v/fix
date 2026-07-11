@@ -30,7 +30,7 @@ pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluato
         return;
     };
     const symbols: disasm.Symbols = .{ .intern = ev.internTable(), .registry = ev.chunkRegistry() };
-    try disasm.writeChunk(w, chunk_id, chunk, symbols, disasm_options);
+    try disasm.writeChunk(allocator, w, chunk_id, chunk, symbols, disasm_options);
 
     var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
     defer refs.deinit(allocator);
@@ -161,7 +161,7 @@ const Pager = struct {
                 const symbols: disasm.Symbols = .{ .intern = self.ev.internTable(), .registry = self.ev.chunkRegistry() };
                 var options = disasm_options;
                 options.use_color = self.use_color;
-                try disasm.writeChunk(&text.writer, id, chunk, symbols, options);
+                try disasm.writeChunk(arena, &text.writer, id, chunk, symbols, options);
                 const lines = try splitLines(arena, text.written());
                 return .{
                     .title = try std.fmt.allocPrint(arena, "chunk #{d}", .{id}),
