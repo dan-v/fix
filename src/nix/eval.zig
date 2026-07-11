@@ -298,6 +298,13 @@ pub const DebugSession = struct {
         // frame has no locals — the enclosing frame carries the `let`/param
         // bindings the user means, so all frames contribute.
         var fi: usize = 0;
+        // Pass 1: `with`-scope attrsets (lowest precedence — lexical bindings
+        // shadow `with`). Merged first so pass 2 overrides them.
+        while (fi < self.vm.frames_len) : (fi += 1) {
+            self.collectWithScopes(&map, fi) catch {};
+        }
+        // Pass 2: named locals + upvalues (override `with`).
+        fi = 0;
         while (fi < self.vm.frames_len) : (fi += 1) {
             try self.collectFrameBindings(&map, fi);
         }
@@ -309,6 +316,42 @@ pub const DebugSession = struct {
         var mit = map.iterator();
         while (mit.next()) |e| try entries.append(self.ev.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
         return Value.attrs(try self.ev.heap.addAttrs(entries.items));
+    }
+
+    /// Merge frame `i`'s in-effect `with` attrsets into `map` (each attr's
+    /// name→value), lowest precedence. A `with` subject is a local slot with an
+    /// empty name (declared by `with`) or an upvalue named `"\x00with"` (a
+    /// `with` captured from an enclosing chunk). Best-effort: a subject that
+    /// errors on force or isn't an attrset is skipped.
+    fn collectWithScopes(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), i: usize) !void {
+        const f = &self.vm.frames[i];
+        // Captured `with`s from enclosing chunks (outer) first, then this
+        // chunk's own `with`s (inner) so inner shadows outer.
+        if (self.ev.registry.upvalueNamesOf(f.chunk_id)) |names| {
+            if (f.upvalues) |ups| {
+                for (names, 0..) |nid, idx| {
+                    if (idx >= ups.len) break;
+                    if (std.mem.eql(u8, self.ev.intern.get(nid), compiler_mod.with_capture_name)) {
+                        try self.mergeWithAttrs(map, ups[idx]);
+                    }
+                }
+            }
+        }
+        if (self.ev.registry.localNamesOf(f.chunk_id)) |names| {
+            for (names, 0..) |nid, slot| {
+                if (slot >= f.local_count) break;
+                if (self.ev.intern.get(nid).len == 0) {
+                    try self.mergeWithAttrs(map, self.vm.stack[f.frame_base + slot]);
+                }
+            }
+        }
+    }
+
+    fn mergeWithAttrs(self: *DebugSession, map: *std.AutoArrayHashMapUnmanaged(types.InternId, Value), subject: Value) !void {
+        const forced = vm_force.forceValue(self.vm, subject) catch return;
+        if (!forced.isAttrs()) return;
+        const entries = self.ev.heap.getAttrs(forced.asObjectId()) catch return;
+        for (entries) |e| try map.put(self.ev.allocator, e.name, e.value);
     }
 
     /// Add frame `i`'s named upvalues then locals (locals shadow upvalues) into

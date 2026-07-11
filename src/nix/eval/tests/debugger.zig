@@ -114,6 +114,25 @@ test "scopeAttrs resolves breakpoint-scope locals and upvalues by name" {
     try std.testing.expectEqualStrings("43", probe.evalResult());
 }
 
+test "scopeAttrs resolves with-scope bindings, inner with shadowing outer" {
+    var ev = try Evaluator.init(std.testing.allocator, 1);
+    defer ev.deinit();
+    ev.setCaptureChunkNames(true);
+    var probe: Probe = .{ .eval_expr = "hello + toString world" };
+    probe.install(&ev);
+
+    const src =
+        \\let
+        \\  pkgs = { hello = "hi"; world = 1; };
+        \\  extra = { world = 2; };
+        \\in with pkgs; with extra;
+        \\   builtins.seq (builtins.break "b") (hello + toString world)
+    ;
+    _ = try ev.evaluatePath(src, "with.nix");
+    // hello from pkgs, world from the inner `with extra` (2) -> "hi2"
+    try std.testing.expectEqualStrings("\"hi2\"", probe.evalResult());
+}
+
 test "no debug UI installed leaves builtins.break as a plain identity" {
     var ev = try Evaluator.init(std.testing.allocator, 1);
     defer ev.deinit();
