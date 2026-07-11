@@ -249,6 +249,9 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
     var cap_total: usize = 0;
     var cap_dup: usize = 0;
     var cap_ops: usize = 0;
+    var cap_dup_defer: usize = 0;
+    var cap_dup_thunk: usize = 0;
+    var cap_dup_closure: usize = 0;
     id = 0;
     while (id < n) : (id += 1) {
         const c = reg.get(id) orelse continue;
@@ -256,6 +259,9 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
         cap_total += cc.total;
         cap_dup += cc.duplicated;
         cap_ops += cc.ops;
+        cap_dup_defer += cc.dup_defer;
+        cap_dup_thunk += cc.dup_thunk;
+        cap_dup_closure += cc.dup_closure;
     }
     try writer.writeAll("  capture-list interning potential:\n");
     try writer.print("    capture-list bytes:            {d}  over {d} ops ({d:.1}% of code)\n", .{
@@ -263,6 +269,11 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
     });
     try writer.print("    duplicated within chunks:      {d}  ({d:.1}% of capture bytes, {d:.1}% of code)\n", .{
         cap_dup, percentUsize(cap_dup, cap_total), percentUsize(cap_dup, total_code),
+    });
+    try writer.print("    dup by op: thunk_defer {d} ({d:.0}%), thunk {d} ({d:.0}%), closure {d} ({d:.0}%)\n", .{
+        cap_dup_defer,   percentUsize(cap_dup_defer, cap_dup),
+        cap_dup_thunk,   percentUsize(cap_dup_thunk, cap_dup),
+        cap_dup_closure, percentUsize(cap_dup_closure, cap_dup),
     });
 }
 

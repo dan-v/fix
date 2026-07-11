@@ -131,7 +131,14 @@ fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, sink: RefSink, scratch
 /// across an attrset's values (they capture the same environment). Measures how
 /// many of those bytes are exact duplicates *within one chunk* — i.e. what a
 /// per-chunk capture-list interning table would reclaim.
-pub const CaptureCensus = struct { total: usize = 0, duplicated: usize = 0, ops: usize = 0 };
+pub const CaptureCensus = struct {
+    total: usize = 0,
+    duplicated: usize = 0,
+    ops: usize = 0,
+    dup_defer: usize = 0,
+    dup_thunk: usize = 0,
+    dup_closure: usize = 0,
+};
 
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
     var scratch: std.Io.Writer.Allocating = .init(allocator);
@@ -163,7 +170,14 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols:
                 out.total += region.len;
                 out.ops += 1;
                 const h = std.hash.Wyhash.hash(0, region);
-                if ((try seen.getOrPut(allocator, h)).found_existing) out.duplicated += region.len;
+                if ((try seen.getOrPut(allocator, h)).found_existing) {
+                    out.duplicated += region.len;
+                    switch (op) {
+                        .thunk_defer => out.dup_defer += region.len,
+                        .closure_cap, .closure_cap_w => out.dup_closure += region.len,
+                        else => out.dup_thunk += region.len,
+                    }
+                }
             }
         }
         ip = next;
