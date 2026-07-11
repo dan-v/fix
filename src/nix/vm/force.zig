@@ -471,6 +471,9 @@ const work_first_grain: u32 = 16;
 /// or the eager `fanOutListShallow`, per the scheduler flag. Drop-in at
 /// demand-safe strict sites — the caller's own loop stays authoritative.
 pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const Value) void {
+    // Solo: no helper can ever drain the fan-out; every submit would be
+    // rejected per batch. One predictable branch spares the whole loop.
+    if (self.solo) return;
     if (self.scheduler.workFirst()) {
         forceCollectionWorkFirst(self, list_id, .list, @intCast(items.len));
     } else {
@@ -483,6 +486,7 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
 /// module-system option-merge work lives, so this is the path that actually
 /// exposes the previously-serial merge to idle workers.
 pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
+    if (self.solo) return; // see forceListAccelerate
     if (self.scheduler.workFirst()) {
         forceCollectionWorkFirst(self, attrs_id, .attrs, @intCast(entries.len));
     } else {
@@ -1197,7 +1201,10 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
 pub fn makeThunk(self: *VM, closure: Value) !Value {
     const id = try self.heap.addThunk(Thunk.init(closure));
     recordCreateForClosure(self, id, closure);
-    if (speculate.shouldSpeculateClosure(self, closure)) {
+    // Solo: nobody could ever run the speculation, and `submit()` would
+    // reject it anyway — skip the eligibility predicate (two dependent,
+    // often cache-missing loads per closure thunk) outright.
+    if (!self.solo and speculate.shouldSpeculateClosure(self, closure)) {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.

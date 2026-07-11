@@ -155,7 +155,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
 
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (slot.body_is_substantial) {
+    if (!self.solo and slot.body_is_substantial) {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of this chunk goes to the high-priority novel lane.
         const ok = if (self.scheduler.spec_novel and self.registry.markSpecSubmitted(chunk_id))
@@ -349,7 +349,7 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
     }
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
-    if (!self.in_speculation and eager_submit_enabled) {
+    if (!self.solo and !self.in_speculation and eager_submit_enabled) {
         _ = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
     }
     try stack.push(self, Value.thunk(id));
