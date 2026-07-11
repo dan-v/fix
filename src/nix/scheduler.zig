@@ -563,11 +563,20 @@ pub const Scheduler = struct {
         sweeps: u64 = 0,
         evicts: u64 = 0,
         novel_ok: u64 = 0,
+        spec_bails: u64 = 0,
 
         comptime {
             std.debug.assert(@sizeOf(Counters) % std.atomic.cache_line == 0);
         }
     };
+
+    /// Record a speculative task abandoned at its root via
+    /// `error.SpeculativeBail` (budget exhausted / demanded result already
+    /// in hand). Called from the worker's task dispatch — off the hot
+    /// path (once per bailed TASK, not per unwound thunk).
+    pub fn noteSpecBail(self: *Scheduler, id: u8) void {
+        self.bump(id, "spec_bails");
+    }
 
     /// Bump one field of worker `id`'s own counter slot. `field` is the
     /// `Counters` field name. Bounds-guarded so a stray id can never
@@ -601,6 +610,10 @@ pub const Scheduler = struct {
         /// ever creation-time speculation of a code region, routed to the
         /// high-priority novel lane.
         novel_ok: u64 = 0,
+        /// Speculative tasks abandoned at their root via
+        /// `error.SpeculativeBail` (create/claim budget exhausted, or the
+        /// demanded result arrived mid-task).
+        spec_bails: u64 = 0,
         /// Deepest fiber native stack high-water seen across all workers
         /// since startup. Use to size `Fiber.min_stack_bytes` against a
         /// representative workload.
@@ -780,7 +793,7 @@ pub const Scheduler = struct {
     sibling_min: u32 = 16,
     sibling_max: u32 = 64,
     /// Per-member CREATION budget for sweep tasks (see
-    /// `VM.spec_create_limit`): a wrongly-predicted member's cascade is
+    /// `VM.spec_create_left`): a wrongly-predicted member's cascade is
     /// abandoned once it has created this many new thunks.
     /// `FIX_SIBLING_BUDGET` overrides.
     sibling_budget: u64 = 4096,
@@ -819,13 +832,31 @@ pub const Scheduler = struct {
     /// `FIX_SPEC_CREATE_BUDGET`: per-task thunk-CREATION budget for
     /// spec-lane `force_thunk` tasks (creation-time speculation + the
     /// novel lane), reusing the sweep-task bounded-speculation machinery
-    /// (`VM.spec_create_limit`; bail = transient reset, resolved
+    /// (`VM.spec_create_left`; bail = transient reset, resolved
     /// sub-thunks kept). 0 = unbounded (historical behavior). Motivation:
     /// at w=32, spec-created thunks reach 10-13M/eval with ~49% never
     /// demanded — junk VOLUME, not discovery, is the residual w=32
     /// regression; a creation budget caps each wrong guess's cascade.
     /// Urgent-lane tasks are never budgeted (they're demand-adjacent).
     spec_task_create_budget: u64 = 0,
+    /// `FIX_SPEC_CLAIMS`: per-task CLAIMED-force budget for spec-lane
+    /// `force_thunk` tasks — the claims analogue of
+    /// `spec_task_create_budget` (see `VM.spec_budget`; the sibling
+    /// sweeps' per-member claim budget is separate,
+    /// `sibling_claim_budget`). 0 = unbounded (default).
+    spec_task_claim_budget: u64 = 0,
+    /// `FIX_SPEC_BAND_BUDGET`: hard per-task creation budget for
+    /// speculative `force_thunk` tasks whose ROOT chunk is below the
+    /// trusted size (`ChunkSlot.spec_band_small`, effective size <
+    /// `SPECULATION_TRUSTED_CODE_BYTES`) — the sub-256 combinator family
+    /// whose single execution can recursively force multi-million-thunk
+    /// never-demanded subgraphs. Default ON at 512: with the admission
+    /// gate at its default (== trusted threshold) no band chunk is ever
+    /// submitted, so this is dormant and free; it makes gate/encoding
+    /// shifts and aged-pool drains of the band contained by construction
+    /// (2026-07: gate 192 unbudgeted +15-52% w=8 wall; under this budget
+    /// = baseline). 0 disables.
+    spec_band_budget: u64 = 512,
     /// `FIX_SPEC_EVICT`: ring semantics for the speculation backlog. When
     /// the global backlog cap (or the submitter's own ring) is full, DROP
     /// THE OLDEST queued spec task and admit the fresh submission, instead
@@ -1047,6 +1078,7 @@ pub const Scheduler = struct {
             c.sweeps += w.sweeps;
             c.evicts += w.evicts;
             c.novel_ok += w.novel_ok;
+            c.spec_bails += w.spec_bails;
         }
         return .{
             .speculative_submitted = c.spec_ok,
@@ -1062,6 +1094,7 @@ pub const Scheduler = struct {
             .sweeps = c.sweeps,
             .evicts = c.evicts,
             .novel_ok = c.novel_ok,
+            .spec_bails = c.spec_bails,
             .max_fiber_stack_used_bytes = self.n_max_fiber_stack.load(.monotonic),
             .max_vm_sp = self.n_max_vm_sp.load(.monotonic),
             .idle_ns = self.n_idle_ns.load(.monotonic),

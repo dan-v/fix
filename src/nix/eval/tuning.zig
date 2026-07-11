@@ -82,6 +82,25 @@ pub fn apply(
             sched.spec_task_create_budget = v;
         } else |_| {}
     };
+    // FIX_SPEC_CLAIMS: per-task claimed-force budget for spec-lane
+    // force_thunk tasks (0 = unbounded) — the claims analogue of
+    // FIX_SPEC_CREATE_BUDGET (creations bound materialization-heavy
+    // cascades; claims bound convergent re-force chains).
+    sched.spec_task_claim_budget = 0;
+    if (env) |em| if (em.get("FIX_SPEC_CLAIMS")) |s| {
+        if (std.fmt.parseInt(u64, s, 10)) |v| {
+            sched.spec_task_claim_budget = v;
+        } else |_| {}
+    };
+    // FIX_SPEC_BAND_BUDGET: hard creation budget for spec tasks rooted
+    // at untrusted-band (sub-256 effective size) chunks; default ON
+    // (dormant while the admission gate == trusted threshold — see
+    // Scheduler.spec_band_budget). 0 disables.
+    if (env) |em| if (em.get("FIX_SPEC_BAND_BUDGET")) |s| {
+        if (std.fmt.parseInt(u64, s, 10)) |v| {
+            sched.spec_band_budget = v;
+        } else |_| {}
+    };
     // FIX_FANOUT_BATCH: items per force_list_range/force_attrs_range
     // task (default 16) — batch-size sweep knob.
     if (env) |em| if (em.get("FIX_FANOUT_BATCH")) |s| {

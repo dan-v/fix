@@ -722,6 +722,13 @@ pub const Worker = struct {
         // the heap flag is per worker THREAD, so refresh it on every
         // resume. `forceValueSpeculative` keeps it in sync mid-quantum.
         f.vm.heap.setSpecCtx(f.vm.in_speculation);
+        // Creation-budget re-base: the per-worker `thunks_created` counter
+        // advanced while this fiber was parked (other fibers' creations)
+        // and may belong to a different worker now (migration). Re-base
+        // the snapshot so only creations made INSIDE this fiber's own run
+        // slices are charged against its budget (see VM.spec_create_left).
+        if (f.vm.spec_create_left != vm_mod.NO_SPEC_BUDGET)
+            vm_force.specCreateArm(&f.vm, f.vm.spec_create_left);
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
         f.in_runfiber.store(0, .release);
@@ -1116,26 +1123,62 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
     }
 }
 
+/// Untrusted-band admission for the creation budget: true when this
+/// speculative task's root thunk is an unresolved BYTECODE thunk whose
+/// chunk sits below the trusted size (`ChunkSlot.spec_band_small`).
+/// Racy-benign union read, same pattern as `force.sweepMemberAdmissible`:
+/// the thunk may resolve concurrently; a torn read at worst arms (or
+/// skips) a budget on a task whose force takes the resolved fast path
+/// anyway. `registry.slot` is bounds-guarded, so a stale chunk id cannot
+/// fault.
+fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
+    const th = f.vm.heap.getThunkAssumeValid(thunk_id);
+    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
+    if (th.targetKind() != .bytecode) return false;
+    const slot = f.vm.registry.slot(th.payload.target.bytecode.chunk_id) orelse return false;
+    return slot.spec_band_small;
+}
+
 /// Run one scheduled task's body (the entry's dispatch switch, factored
 /// out so the census wrapper can bracket it without duplicating arms).
 fn runTask(f: *WorkerFiber, task: Task) void {
     switch (task) {
         .force_thunk => |thunk_id| {
-            // Bounded spec-lane cascade (`FIX_SPEC_CREATE_BUDGET`): arm the
-            // sweep-task creation budget for speculative/novel force_thunk
-            // tasks too, so one wrong creation-time guess can't evaluate an
-            // unbounded never-demanded subgraph (the w=32 junk-volume
-            // pathology). Bail is a transient thunk reset; resolved
-            // sub-thunks are kept — same semantics the sibling sweeps have
-            // shipped with. Urgent (demand-adjacent) tasks stay unbounded.
-            const budget = f.vm.scheduler.spec_task_create_budget;
-            if (budget != 0 and f.current_lane != .urgent) {
-                f.vm.spec_create_limit = f.vm.heap.currentLocal().thunks_created + budget;
-                f.vm.spec_create_worker = worker_id_mod.current;
+            // Bounded spec-lane cascade: arm the per-task creation (and
+            // optionally claimed-force) budgets for speculative/novel
+            // force_thunk tasks, so one wrong creation-time guess can't
+            // evaluate an unbounded never-demanded subgraph (the sub-256-
+            // combinator junk cascade). Bail is a transient thunk reset;
+            // resolved sub-thunks are kept — same semantics the sibling
+            // sweeps have shipped with. Urgent (demand-adjacent) tasks
+            // stay unbounded. Two tiers:
+            //  - band budget (`FIX_SPEC_BAND_BUDGET`, default ON): only
+            //    tasks whose ROOT chunk is below the trusted size
+            //    (`spec_band_small`) — the family whose execution
+            //    cascades. Trusted (≥256) roots run unbudgeted: bailing
+            //    useful deep speculation discards its claim spine, and
+            //    the demand-side redo measured +12% w=8 wall.
+            //  - uniform budget (`FIX_SPEC_CREATE_BUDGET`, default OFF):
+            //    every non-urgent task; kept as the RSS-vs-wall A/B knob.
+            if (f.current_lane != .urgent) {
+                const band = f.vm.scheduler.spec_band_budget;
+                const uniform = f.vm.scheduler.spec_task_create_budget;
+                if (band != 0 and specRootBandSmall(f, thunk_id))
+                    vm_force.specCreateArm(&f.vm, band)
+                else if (uniform != 0)
+                    vm_force.specCreateArm(&f.vm, uniform);
+                const claims = f.vm.scheduler.spec_task_claim_budget;
+                if (claims != 0) f.vm.spec_budget = claims;
             }
-            defer f.vm.spec_create_limit = vm_mod.NO_SPEC_BUDGET;
+            defer {
+                f.vm.spec_create_left = vm_mod.NO_SPEC_BUDGET;
+                f.vm.spec_budget = vm_mod.NO_SPEC_BUDGET;
+            }
             const v = Value.thunk(thunk_id);
-            _ = vm_force.forceValueSpeculative(&f.vm, v) catch {};
+            _ = vm_force.forceValueSpeculative(&f.vm, v) catch |err| {
+                if (err == error.SpeculativeBail)
+                    f.vm.scheduler.noteSpecBail(worker_id_mod.current);
+            };
         },
         .force_list_range => |range| {
             // The list's value range is a RAW store slice held across
@@ -1202,14 +1245,13 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             // that must run unbounded.
             defer {
                 f.vm.spec_budget = vm_mod.NO_SPEC_BUDGET;
-                f.vm.spec_create_limit = vm_mod.NO_SPEC_BUDGET;
+                f.vm.spec_create_left = vm_mod.NO_SPEC_BUDGET;
             }
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
                 if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
                 f.vm.spec_budget = f.vm.scheduler.sibling_claim_budget;
-                f.vm.spec_create_limit = f.vm.heap.currentLocal().thunks_created + f.vm.scheduler.sibling_budget;
-                f.vm.spec_create_worker = worker_id_mod.current;
+                vm_force.specCreateArm(&f.vm, f.vm.scheduler.sibling_budget);
                 if (log) {
                     // Per-member cascade attribution: this worker's own
                     // thunk-creation counter around the force. Best-effort —

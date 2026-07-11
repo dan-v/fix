@@ -183,6 +183,21 @@ pub const SchedulingHints = struct {
     /// scheduler submit/wake overhead costs. Cached here so the
     /// thunk-creation hot path doesn't have to re-read `code.len`.
     body_is_substantial: bool = false,
+    /// True when the chunk's effective body size is below
+    /// `SPECULATION_TRUSTED_CODE_BYTES`: its unattended speculative
+    /// execution is NOT trusted (the sub-256 combinator family — small
+    /// bodies whose one execution can recursively force multi-million-
+    /// thunk never-demanded subgraphs). Speculative `force_thunk` tasks
+    /// whose ROOT chunk carries this bit run under a hard creation
+    /// budget (`Scheduler.spec_band_budget`); trusted (≥256) roots run
+    /// unbudgeted as always. With the admission gate at its default
+    /// (== trusted threshold) no such chunk is ever submitted, so the
+    /// bit is dormant; it exists so lowering the admission gate — or a
+    /// future aged-pool drain of the sub-256 family — is contained by
+    /// construction instead of cascading (measured 2026-07: gate at 192
+    /// unbudgeted = +15-52% w=8 wall; same gate under a 512 creation
+    /// budget = baseline).
+    spec_band_small: bool = false,
     /// See ChunkStrictness.
     strictness: ChunkStrictness = .{},
     /// Trivial-shape classification — see `TrivialBody`.
@@ -373,6 +388,7 @@ pub const ChunkBuilder = struct {
             .strict_params = self.strict_params,
             .scheduling = .{
                 .body_is_substantial = self.code.items.len + self.fusion_savings + self.sideTableWeight() >= SPECULATION_MIN_CODE_BYTES,
+                .spec_band_small = self.code.items.len + self.fusion_savings + self.sideTableWeight() < SPECULATION_TRUSTED_CODE_BYTES,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,
@@ -535,6 +551,14 @@ inline fn readU32Inline(buf: []const u8, off: usize) u32 {
 /// pays the scheduler hop. Used by `SchedulingHints.body_is_substantial`.
 pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
 
+/// Effective size at or above which a chunk's speculative execution is
+/// trusted to run WITHOUT a creation budget. Deliberately a separate
+/// constant from the admission gate above: the admission gate says "worth
+/// a scheduler hop", this one says "safe to run unattended" — see
+/// `SchedulingHints.spec_band_small`. Keep at the 2026-07 sweep's
+/// validated junk cliff (256) even if the admission gate moves.
+pub const SPECULATION_TRUSTED_CODE_BYTES: usize = 256;
+
 /// Well-known chunk ids registered eagerly at `ChunkRegistry.init`. These
 /// are tiny stub chunks that builtins use to materialise lazy values
 /// without allocating a per-element `builtin_closure` object — see
@@ -578,6 +602,10 @@ pub const ChunkRegistry = struct {
         ptr: *Chunk,
         trivial: TrivialBody,
         body_is_substantial: bool,
+        /// Untrusted-band bit (see `SchedulingHints.spec_band_small`):
+        /// speculative tasks rooted at this chunk run under the hard
+        /// creation budget.
+        spec_band_small: bool = false,
         strict_param: bool,
         strict_via_upvalue: ?u16,
         /// Novelty gate (`FIX_SPEC_NOVEL`): set by the FIRST creation-time
@@ -961,6 +989,7 @@ pub const ChunkRegistry = struct {
             .ptr = stored,
             .trivial = stored.scheduling.trivial,
             .body_is_substantial = stored.scheduling.body_is_substantial,
+            .spec_band_small = stored.scheduling.spec_band_small,
             .strict_param = stored.scheduling.strict_param,
             .strict_via_upvalue = stored.scheduling.strict_via_upvalue,
         };

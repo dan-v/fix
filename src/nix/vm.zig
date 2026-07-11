@@ -274,22 +274,34 @@ pub const VM = struct {
     /// fiber across yields/steals).
     spec_budget: u64,
 
-    /// Bounded speculation, creation side (`FIX_SIBLING`): bail the
-    /// current speculative task once this worker's thunk-creation counter
-    /// (`HeapLocal.thunks_created`) exceeds this value. The claimed-force
-    /// budget above cannot bound creation-heavy builtins (one claimed
-    /// force through zipAttrsWith/mapAttrs can materialize 100Ks of
-    /// thunks); this catches those on the next speculative force.
-    /// `NO_SPEC_BUDGET` disables. Best-effort across fiber migration (the
-    /// counter is per-worker): a migrated fiber may bail early or late —
-    /// both benign (bail is a transient reset).
-    spec_create_limit: u64,
-    /// Worker the creation limit was armed on. The counter comparison is
-    /// only meaningful on that worker; if the fiber resumes elsewhere
-    /// (it yielded on a busy thunk and was stolen), treat the budget as
-    /// exhausted — the awaited value is being computed by someone else
-    /// anyway, and an unbounded escape here was the observed failure
-    /// mode (300K+-creation cascades sailing past the limit).
+    /// Bounded speculation, creation side (`FIX_SIBLING` /
+    /// `FIX_SPEC_CREATE_BUDGET`): REMAINING thunk-creation budget for the
+    /// current speculative task. The claimed-force budget above cannot
+    /// bound creation-heavy builtins (one claimed force through
+    /// zipAttrsWith/mapAttrs can materialize 100Ks of thunks); this
+    /// catches those on the next speculative force. `NO_SPEC_BUDGET`
+    /// disables. Fiber-accurate accounting: creations are metered as
+    /// deltas of the per-worker `HeapLocal.thunks_created` counter,
+    /// settled lazily at each budget check (`force.specCreateExhausted`)
+    /// and RE-BASED on every fiber resume (`Worker.runFiber`), so
+    /// unrelated fibers interleaving on the same worker — or a migration
+    /// to another worker — never burn this task's budget. (The previous
+    /// absolute-limit scheme charged the task for every creation on its
+    /// worker while it was parked, and treated migration as instant
+    /// exhaustion: with budgets armed on all spec tasks that mass
+    /// false-bailed useful speculation, measured +15-20% w=8 wall
+    /// regardless of budget size.) Creations between the task's last
+    /// check and a yield are dropped by the resume re-base — a small,
+    /// benign undercount (checks run at every `forceValueImpl`).
+    spec_create_left: u64,
+    /// `HeapLocal.thunks_created` value on `spec_create_worker` at the
+    /// last settle/re-base. Only meaningful while `spec_create_left !=
+    /// NO_SPEC_BUDGET`.
+    spec_create_snapshot: u64,
+    /// Worker the creation snapshot was taken on. If a check runs on a
+    /// different worker before the resume re-base has happened
+    /// (defensive; runFiber re-bases first in practice), the check
+    /// re-bases instead of bailing.
     spec_create_worker: u8,
 
     /// True only when the result will be rendered as lazy XML, where
@@ -392,7 +404,8 @@ pub const VM = struct {
             .in_speculation = false,
             .solo = scheduler.worker_count == 1,
             .spec_budget = NO_SPEC_BUDGET,
-            .spec_create_limit = NO_SPEC_BUDGET,
+            .spec_create_left = NO_SPEC_BUDGET,
+            .spec_create_snapshot = 0,
             .spec_create_worker = 0,
             .lazy_shells_visible = false,
             .fetch_tree_enabled = false,

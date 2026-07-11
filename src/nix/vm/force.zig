@@ -241,15 +241,14 @@ pub fn forceValueSpeculative(self: *VM, value: Value) anyerror!Value {
 }
 
 pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Value {
-    // Bounded speculation (`FIX_SIBLING`): a sweep member's cascade is
-    // abandoned once it has created more thunks than its budget. Checked
-    // here (not just at claimed forces) because creation-heavy builtins
-    // force sub-values far more often than they claim thunks. One
-    // predictable `in_speculation` branch on the demand path.
-    if (self.in_speculation and self.spec_create_limit != vm_mod.NO_SPEC_BUDGET) {
-        if (self.workerId() != self.spec_create_worker or
-            self.heap.currentLocal().thunks_created > self.spec_create_limit)
-            return error.SpeculativeBail;
+    // Bounded speculation (`FIX_SIBLING` / `FIX_SPEC_CREATE_BUDGET`): a
+    // speculative task's cascade is abandoned once it has created more
+    // thunks than its budget. Checked here (not just at claimed forces)
+    // because creation-heavy builtins force sub-values far more often
+    // than they claim thunks. One predictable `in_speculation` branch on
+    // the demand path.
+    if (self.in_speculation and self.spec_create_left != vm_mod.NO_SPEC_BUDGET) {
+        if (specCreateExhausted(self)) return error.SpeculativeBail;
     }
     if (!value.isThunk()) {
         if (comptime prof.enabled) {
@@ -594,12 +593,45 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 /// periodically and `return error.SpeculativeBail` so a single huge,
 /// never-demanded body can't run an allocation loop to completion. Off the
 /// demand path entirely (the `in_speculation` check short-circuits).
-pub inline fn specBailRequested(self: *const VM) bool {
+pub inline fn specBailRequested(self: *VM) bool {
     if (!self.in_speculation) return false;
     if (self.scheduler.backgroundSuppressed() or self.spec_budget == 0) return true;
-    return self.spec_create_limit != vm_mod.NO_SPEC_BUDGET and
-        (self.workerId() != self.spec_create_worker or
-            self.heap.currentLocal().thunks_created > self.spec_create_limit);
+    return self.spec_create_left != vm_mod.NO_SPEC_BUDGET and specCreateExhausted(self);
+}
+
+/// Settle the fiber-accurate creation budget and report exhaustion. Only
+/// call with `spec_create_left != NO_SPEC_BUDGET`. Meters creations as
+/// deltas of the per-worker `thunks_created` counter since the last
+/// settle/re-base on the SAME worker; a check that observes a worker
+/// change before `Worker.runFiber`'s resume re-base ran (defensive — the
+/// re-base runs before the fiber body resumes) re-bases instead of
+/// bailing, so neither migration nor unrelated fibers interleaving on
+/// this worker can burn the task's budget (see `VM.spec_create_left`).
+pub inline fn specCreateExhausted(self: *VM) bool {
+    const wid = self.workerId();
+    const now = self.heap.currentLocal().thunks_created;
+    if (wid != self.spec_create_worker) {
+        self.spec_create_worker = wid;
+        self.spec_create_snapshot = now;
+        return self.spec_create_left == 0;
+    }
+    const delta = now - self.spec_create_snapshot;
+    self.spec_create_snapshot = now;
+    if (delta >= self.spec_create_left) {
+        self.spec_create_left = 0;
+        return true;
+    }
+    self.spec_create_left -= delta;
+    return false;
+}
+
+/// Arm the creation budget on `vm` for a speculative task starting now:
+/// `spec_create_left = budget`, snapshot re-based to the current worker's
+/// creation counter.
+pub inline fn specCreateArm(self: *VM, budget: u64) void {
+    self.spec_create_left = budget;
+    self.spec_create_snapshot = self.heap.currentLocal().thunks_created;
+    self.spec_create_worker = self.workerId();
 }
 
 /// Force the operand at stack depth `depth` (0 = top) IN PLACE: force it
