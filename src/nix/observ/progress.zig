@@ -142,8 +142,9 @@ pub const Span = struct { token: usize };
 /// writer may drive it: the main thread during single-threaded setup, then
 /// the demand fiber (which emits sequentially even if a steal migrates it
 /// across workers). That is why this is a separate type from `SpanSink`: the
-/// evaluator hands it out only where the demand flag is set
-/// (`VM.progress_stage`), so an off-demand stage emit has no handle to call
+/// evaluator hands it out only to the demand fiber's execution context
+/// (`vm/exec_context.zig`, read via `VM.ctx`), so an off-demand stage emit
+/// has no handle to call
 /// through — helpers only ever hold the thread-safe `SpanSink`. Don't add a
 /// bypass. (`metrics` is the sampler thread's channel and `session_*`
 /// bracket the run on the main thread; they share `emit_fn` but mutate

@@ -42,6 +42,8 @@ const Task = scheduler_mod.Task;
 const Continuation = scheduler_mod.Continuation;
 const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
+const exec_context = @import("exec_context.zig");
+const ExecutionContext = exec_context.ExecutionContext;
 const vm_force = @import("force.zig");
 const vm_errors = @import("errors.zig");
 const fiber_mod = @import("base").fiber;
@@ -63,8 +65,9 @@ const FetchCache = @import("runtime").fetch_cache.FetchCache;
 const DerivationStore = @import("derivation").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
-/// initialised for the given (worker_id, fiber_id). The Worker patches
-/// the VM's claimer_id to match the fiber id. `scratch` is the fiber's
+/// initialised for the given (worker_id, fiber_id). The Worker repoints
+/// the VM's `ctx` at the fiber's own ExecutionContext (which carries the
+/// fiber's claim id). `scratch` is the fiber's
 /// per-fiber arena — the VM's run-path allocations land there and are
 /// swept wholesale when the fiber is recycled (see `recycleScratch`).
 pub const InitVmFn = *const fn (ctx: *anyopaque, worker_id: u8, fiber_id: u32, scratch: std.mem.Allocator) anyerror!VM;
@@ -109,6 +112,14 @@ pub const WorkerFiber = struct {
     fiber_id: u32,
     inner: InnerFiber,
     vm: VM,
+    /// Fiber-scoped execution identity (see `vm/exec_context.zig`): the
+    /// claim id (permanent, baked at allocation) plus the demand-role
+    /// fields (`is_demand` + the demand-only progress handles — set by
+    /// `runTopLevel` on the top fiber, reset when the fiber recycles).
+    /// `vm.ctx` points here, and every nested VM created while running on
+    /// this fiber shares the pointer — identity is structural, never
+    /// re-dressed per VM.
+    ctx: ExecutionContext,
     /// Per-fiber scratch arena backing `vm`'s run-path allocations
     /// (builtin temp buffers, drv hashing, equality scratch — ~490 MB of
     /// transient traffic per NixOS eval). Arena semantics are load-bearing:
@@ -250,13 +261,6 @@ pub const Worker = struct {
     /// global totals on park and at drain-loop exit.
     census: if (census_on) prof.FiberLocal else void = if (census_on) prof.FiberLocal{} else {},
 
-    /// The demand-only stage-stack progress handle `runTopLevel` installs on
-    /// the top fiber's VM (paired with `is_demand`; cleared together when the
-    /// fiber recycles). Set by the Evaluator on the main worker only, and only
-    /// when progress is drawn — helpers never carry one, which is what makes
-    /// an off-demand stage emit inexpressible (see `VM.progress_stage`).
-    demand_stage: ?eval_progress.StageSink = null,
-
     pub fn init(
         allocator: std.mem.Allocator,
         scheduler: *Scheduler,
@@ -396,6 +400,11 @@ pub const Worker = struct {
         self: *Worker,
         entry: fiber_mod.EntryFn,
         arg: *anyopaque,
+        /// The demand-only progress handles to dress the top fiber's
+        /// execution context with (null fields when progress isn't drawn).
+        /// Supplied fresh per entry by the embedder, so a sink installed
+        /// between runs (the repl) needs no worker-side bookkeeping.
+        demand: exec_context.DemandRole,
     ) !void {
         worker_id_mod.current = self.worker_id;
         if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
@@ -404,8 +413,14 @@ pub const Worker = struct {
         const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
         const top = try self.acquireFreeFiber();
         top.current_task = null;
-        top.vm.is_demand = true; // its blocking waits are the critical path
-        top.vm.progress_stage = self.demand_stage; // stage handle exists only on the demand VM
+        // Dress the top fiber's execution context — the ONE demand-role
+        // write site. Its blocking waits are the critical path, and the
+        // demand-only progress handles exist only here (helpers' ctxs stay
+        // null, which is what makes an off-demand stage emit
+        // inexpressible). `runFiber`'s finished arm resets the role.
+        top.ctx.is_demand = true;
+        top.ctx.progress_stage = demand.progress_stage;
+        top.ctx.progress_wait = demand.progress_wait;
         top.inner.reset(entry, arg);
         if (comptime census_on) {
             self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
@@ -720,8 +735,7 @@ pub const Worker = struct {
                 // resumed a stolen fiber. Nudge the owning worker so
                 // its `runTopLevel` loop observes the completion (it
                 // may be parked waiting on this very fiber).
-                f.vm.is_demand = false; // clear before recycle (else a reused fiber mislabels)
-                f.vm.progress_stage = null; // paired with is_demand: no demand, no stage handle
+                f.ctx.resetRole(); // clear the demand role before recycle (else a reused fiber mislabels)
                 if (comptime census_on) {
                     self.census.finished += 1;
                     if (f.census_suspends > 0) {
@@ -910,6 +924,9 @@ pub const Worker = struct {
             .fiber_id = fiber_id,
             .inner = undefined,
             .vm = undefined,
+            // Claim identity is baked once, for the fiber's life; the
+            // demand-role fields start (and recycle back to) cleared.
+            .ctx = .{ .claimer_id = thunk_mod.makeClaimer(fiber_id) },
             .scratch = std.heap.ArenaAllocator.init(self.allocator),
             .state = .free,
             .in_runfiber = .init(0),
@@ -941,7 +958,10 @@ pub const Worker = struct {
             f.inner.deinit(self.allocator);
         }
 
-        f.vm.claimer_id = thunk_mod.makeClaimer(fiber_id);
+        // Bind the VM to this fiber's identity: the constructor hands out
+        // the neutral default; from here on the VM (and every nested VM
+        // created while running on this fiber) reads through `f.ctx`.
+        f.vm.ctx = &f.ctx;
         // Speculative work captures only the throw message for sticky
         // caching; skip frame-stack allocation on the hot path.
         f.local_trace.frames_disabled = true;
@@ -1172,7 +1192,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                 std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
                     attrs_id,             entries.len,
                     vm_force.diagNowUs(), worker_id_mod.current,
-                    f.vm.claimer_id,
+                    f.ctx.claimer_id,
                     f.vm.intern.get(entries[0].name), label,
                 });
             }
@@ -1203,7 +1223,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                         else if (subj.text.len != 0) subj.text else "?";
                         std.debug.print("sweep-member attrs={d} attr={s} member={s} created={d} t_us={d} claimer={d}\n", .{
                             attrs_id,             f.vm.intern.get(entry.name), mlabel, created,
-                            vm_force.diagNowUs(), f.vm.claimer_id,
+                            vm_force.diagNowUs(), f.ctx.claimer_id,
                         });
                     }
                     continue;
@@ -1406,7 +1426,7 @@ test "Worker basic init/deinit" {
     // mapping to position in the worker's fibers list. Each fiber's
     // claimer_id should equal `makeClaimer(fiber_id)`.
     for (worker.fibers.items) |f| {
-        try testing.expectEqual(thunk_mod.makeClaimer(f.fiber_id), f.vm.claimer_id);
+        try testing.expectEqual(thunk_mod.makeClaimer(f.fiber_id), f.ctx.claimer_id);
         try testing.expectEqual(FiberState.free, f.state);
     }
     // All fiber ids should be distinct.

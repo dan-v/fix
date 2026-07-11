@@ -180,10 +180,10 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     // stack — a speculative derivation force on a helper fiber interleaving
     // pushes/pops here corrupts the stack (mis-paired `Node.end` →
     // std.Progress render-future UAF). The gate is structural: only the demand
-    // fiber's VMs carry a `progress_stage` handle (helpers hold null), same as
-    // every other stage emit.
-    if (self.progress_stage) |stage| stage.begin(.derivation, drv_name);
-    defer if (self.progress_stage) |stage| stage.end(.derivation, drv_name);
+    // fiber's ExecutionContext carries a `progress_stage` handle (helper
+    // fibers hold null), same as every other stage emit.
+    if (self.ctx.progress_stage) |stage| stage.begin(.derivation, drv_name);
+    defer if (self.ctx.progress_stage) |stage| stage.end(.derivation, drv_name);
 
     const output_names = try derivationOutputNames(self, attrs_id);
     defer self.allocator.free(output_names.names);

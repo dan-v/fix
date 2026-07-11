@@ -200,7 +200,7 @@ fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
 fn currentClaimer() thunk_mod.ClaimerId {
     const inner = fiber_mod.currentFiber() orelse return thunk_mod.INVALID_CLAIMER;
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-    return wf.vm.claimer_id;
+    return wf.ctx.claimer_id;
 }
 
 /// Caller has already claimed the `ImportEntry`. Reads the source

@@ -750,7 +750,7 @@ noinline fn logTouch(self: *VM, thunk_id: ObjectId, demand: bool) void {
         self.workerId(),
         self.in_speculation,
         demand,
-        self.claimer_id,
+        self.ctx.claimer_id,
     });
 }
 
@@ -823,7 +823,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
     const thunk = self.heap.getThunkAssumeValid(thunk_id);
 
     while (true) {
-        switch (thunk.tryForce(self.claimer_id)) {
+        switch (thunk.tryForce(self.ctx.claimer_id)) {
             .already_resolved => |v| {
                 if (demand) thunk.markDemanded();
                 return v;
@@ -1022,7 +1022,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 var disc_spec = false;
                 if (comptime prof.enabled) {
                     if (demand and self.workerId() == 0) {
-                        const is_dem = self.is_demand;
+                        const is_dem = self.ctx.is_demand;
                         if (is_dem) {
                             disc_spec = !thunk.isDemanded();
                             prof_census.disc.busy_wait += 1;
@@ -1081,26 +1081,28 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     // so its target arm is live); after the yield it may be
                     // resolved and the union clobbered. `lbuf` lives on the fiber
                     // stack, preserved across the yield.
-                    const crit_start = if (self.is_demand) timeline.critWaitBegin() else 0;
+                    const crit_start = if (self.ctx.is_demand) timeline.critWaitBegin() else 0;
                     var lbuf: [128]u8 = undefined;
                     const crit_label: timeline.Subject = if (crit_start != 0) force_label.critWaitLabel(self, thunk_id, &lbuf) else .{};
-                    // Progress "waiting on" line: publish only on the demand path
-                    // and only when drawn (free otherwise). Labelled from THIS
+                    // Progress "waiting on" line: the handle exists only on the
+                    // demand fiber's ExecutionContext and only when progress is
+                    // drawn (free otherwise) — precise by construction, no
+                    // compensating is_demand gate. Labelled from THIS
                     // fiber's own current frame span — a stable read — NOT the
                     // target thunk's union, which a concurrent resolver can flip
                     // `.target → .result` mid-decode (a union-field panic in a
                     // safe build; `critWaitLabel` above tolerates it only because
                     // `--timeline` rarely runs, whereas progress blocks here often).
-                    if (self.is_demand) if (self.progress_wait) |pw| {
+                    if (self.ctx.progress_wait) |pw| {
                         var sbuf: [64]u8 = undefined;
                         pw.set(force_label.demandFrameText(self, &sbuf));
-                    };
+                    }
                     const ty = prof.start(.wait_busy_thunk);
                     fiber_mod.Fiber.yield();
                     prof.end(.wait_busy_thunk, ty);
                     worker_fiber.state = .running;
                     if (crit_start != 0) timeline.critWaitEnd(crit_label, crit_start);
-                    if (self.is_demand) if (self.progress_wait) |pw| pw.clear();
+                    if (self.ctx.progress_wait) |pw| pw.clear();
                 }
                 continue;
             },
@@ -1205,7 +1207,7 @@ pub fn makeCell(self: *VM, val: Value) !Value {
 /// installs `pass_through(val)`, transitions back to `.unresolved`,
 /// and wakes parked waiters.
 pub fn makeBindingCell(self: *VM) !Value {
-    const id = try self.heap.addThunk(Thunk.initBindingCell(self.claimer_id));
+    const id = try self.heap.addThunk(Thunk.initBindingCell(self.ctx.claimer_id));
     recordCreatePassThrough(self, id);
     return Value.thunk(id);
 }
@@ -1222,7 +1224,7 @@ fn claimerFiberId(self: *VM) u32 {
     // claimer_id = (worker_id << 24) | fiber_id_24bits — strip the worker
     // byte to get the local fiber id, which is the more useful field at
     // log-read time.
-    return self.claimer_id & 0x00FFFFFF;
+    return self.ctx.claimer_id & 0x00FFFFFF;
 }
 
 // ---- thunk-trace recording helpers ----
