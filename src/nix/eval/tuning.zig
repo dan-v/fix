@@ -52,6 +52,31 @@ pub fn apply(
     if (env) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
         sched.spec_novel = !std.mem.eql(u8, s, "0");
     };
+    // FIX_SPEC_HELPERS: highest worker id allowed to take bulk-spec tasks
+    // (255 = uncapped, the default at every worker count). Worker-count-
+    // aware junk-containment probe for high worker counts: at w=32 the
+    // bulk backlog cap stops binding (31 helpers drain everything, so
+    // spec_ok runs 3.1x w=8's, thunks created +32%, busy_ms 2x) — capping
+    // the DRAIN capacity restores the w=8-like admission economics that
+    // the backlog cap alone cannot (FIX_SPEC_BACKLOG measured dead flat).
+    sched.spec_helper_cap = 255;
+    if (env) |em| if (em.get("FIX_SPEC_HELPERS")) |s| {
+        if (std.fmt.parseInt(u8, s, 10)) |n| sched.spec_helper_cap = n else |_| {}
+    };
+    // FIX_MAX_SPINNERS: override the idle-spinner quota (0 = the default
+    // formula max(7, workers/4); see scheduler.maxSpinners).
+    scheduler_mod.max_spinners_override = 0;
+    if (env) |em| if (em.get("FIX_MAX_SPINNERS")) |s| {
+        if (std.fmt.parseInt(u32, s, 10)) |n| scheduler_mod.max_spinners_override = n else |_| {}
+    };
+    // FIX_SPIN_ITERS: pre-park spin duration in parkAndAccount, in spin
+    // iterations (default 1024, the historical value).
+    worker_mod.spin_iterations = 1024;
+    if (env) |em| if (em.get("FIX_SPIN_ITERS")) |s| {
+        if (std.fmt.parseInt(u32, s, 10)) |n| {
+            if (n > 0) worker_mod.spin_iterations = n;
+        } else |_| {}
+    };
     // FIX_WORK_FIRST: route strict collection-force acceleration through the
     // work-first split-and-steal primitive instead of the eager fan-out.
     if (env) |em| sched.setWorkFirst(em.get("FIX_WORK_FIRST") != null);

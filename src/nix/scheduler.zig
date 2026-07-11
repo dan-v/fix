@@ -528,8 +528,13 @@ const burst_wake_budget: u32 = 4;
 /// measured-optimal behavior there); past that, only a core's worth of
 /// helpers keep scanning while the rest park until a submit wake.
 inline fn maxSpinners(worker_count: u8) u32 {
+    if (max_spinners_override != 0) return max_spinners_override;
     return @max(7, @as(u32, worker_count) / 4);
 }
+
+/// `FIX_MAX_SPINNERS`: overrides the `maxSpinners` idle-spinner quota when
+/// nonzero (probe knob; 0 = the default worker-count formula).
+pub var max_spinners_override: u32 = 0;
 
 /// GC parallel-mark hook (`-Dgc`): the Evaluator installs this so a parked
 /// peer can help drain the mark graph. Type-erased to keep `parallel` free of
@@ -856,6 +861,16 @@ pub const Scheduler = struct {
     /// repeat-instance junk tasks within ~1ms of submit or the whole
     /// ~300ms serial chain starts ~250ms late (w=8 wall 0.95 → 1.05-1.15).
     spec_novel: bool = false,
+    /// `FIX_SPEC_HELPERS`: highest worker id allowed to take BULK-spec
+    /// tasks (own-pop and steal). 255 = uncapped (default, the historical
+    /// behavior). Urgent, novel, cont, ready and sweep work stay open to
+    /// every worker — this only narrows who drains the bulk speculation
+    /// backlog, so at high worker counts the junk-spec execution volume
+    /// (spec_ok 3.1x at w=32 vs w=8, +32% thunks) stops scaling with the
+    /// worker count. Workers past the cap use a lane-aware pre-park spin
+    /// probe (`takableWork`) so they never busy-spin on a backlog they
+    /// are not allowed to touch.
+    spec_helper_cap: u8 = 255,
     /// `FIX_TOUCH_LOG=<file substring>`: diagnosis probe — log every thunk
     /// CLAIM whose source file basename matches, with timestamp, worker,
     /// and spec/demand context (see `vm/force.zig logTouch`). Debug-only;
@@ -1569,7 +1584,9 @@ pub const Scheduler = struct {
                     break :blk t;
                 }
             }
-            if (worker_id >= 64 or self.spec_mask.v.load(.monotonic) & own_bit != 0) {
+            if (worker_id <= self.spec_helper_cap and
+                (worker_id >= 64 or self.spec_mask.v.load(.monotonic) & own_bit != 0))
+            {
                 if (self.spec_queues[worker_id].popNewest(&self.spec_mask.v)) |t| {
                     if (lane) |l| l.* = .spec;
                     break :blk t;
@@ -1635,7 +1652,9 @@ pub const Scheduler = struct {
             }
             scanEnd("novel_steal", t1, false);
         }
-        if (self.spec_mask.v.load(.monotonic) != 0 or self.worker_count > 64) {
+        if (worker_id <= self.spec_helper_cap and
+            (self.spec_mask.v.load(.monotonic) != 0 or self.worker_count > 64))
+        {
             const t2 = rdtscScan();
             if (self.stealSpecExcluding(self.spec_queues, &self.spec_mask.v, worker_id, self.spec_lifo, victim, push_ts)) |t| {
                 scanEnd("spec_steal", t2, true);
@@ -1645,6 +1664,19 @@ pub const Scheduler = struct {
             scanEnd("spec_steal", t2, false);
         }
         return null;
+    }
+
+    /// Lane-aware pre-park spin probe: is there any work THIS worker is
+    /// allowed to take? For workers within the bulk-spec cap this is the
+    /// historical single `pending_tasks` load; workers past the cap must
+    /// not busy-spin on a bulk backlog they cannot drain, so they probe
+    /// the urgent counter, the novel mask, and the cont counter instead.
+    pub inline fn takableWork(self: *const Scheduler, worker_id: u8) bool {
+        if (worker_id <= self.spec_helper_cap)
+            return self.pending_tasks.v.load(.monotonic) > 0 or self.contPending() > 0;
+        return self.urgent_pending.v.load(.monotonic) != 0 or
+            self.novel_mask.v.load(.monotonic) != 0 or
+            self.contPending() > 0;
     }
 
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
