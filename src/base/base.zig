@@ -20,6 +20,7 @@ pub const block_cache = @import("block_cache.zig");
 pub const hugetlb = @import("hugetlb.zig");
 pub const regex = @import("regex.zig");
 pub const toml = @import("toml.zig");
+pub const arena = @import("arena.zig");
 pub const worker_id = @import("worker_id.zig");
 
 // Common flat re-exports for the most-used types.

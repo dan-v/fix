@@ -36,6 +36,7 @@ const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
 const stable = @import("base").sync;
+const arena_mod = @import("base").arena;
 const scheduler_mod = @import("scheduler");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
@@ -127,7 +128,7 @@ pub const WorkerFiber = struct {
     /// allocations. Reset (bounded retention) each time the fiber is
     /// recycled onto the free list — a never-reset arena retained ~240 MB
     /// (w=1) / ~380 MB (w=8) of dead interleaved pages.
-    scratch: std.heap.ArenaAllocator,
+    scratch: arena_mod.ArenaAllocator,
     state: FiberState,
     /// Set to 1 while some worker is inside `inner.resume_()` on this
     /// fiber. The owning worker's `deinit` spin-waits on this to drop
@@ -927,7 +928,7 @@ pub const Worker = struct {
             // Claim identity is baked once, for the fiber's life; the
             // demand-role fields start (and recycle back to) cleared.
             .ctx = .{ .claimer_id = thunk_mod.makeClaimer(fiber_id) },
-            .scratch = std.heap.ArenaAllocator.init(self.allocator),
+            .scratch = arena_mod.ArenaAllocator.init(self.allocator),
             .state = .free,
             .in_runfiber = .init(0),
             .run_mu = .{},
@@ -1367,7 +1368,7 @@ test "Worker basic init/deinit" {
         fetchers: FetchCache,
         derivations: DerivationStore,
         sched: *Scheduler,
-        arena: std.heap.ArenaAllocator,
+        arena: arena_mod.ArenaAllocator,
         opcode_counts: if (vm_mod.opcode_profile_enabled) vm_mod.OpcodeCounts else void,
 
         fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
@@ -1401,7 +1402,7 @@ test "Worker basic init/deinit" {
         .fetchers = FetchCache.init(testing.allocator),
         .derivations = DerivationStore.init(testing.allocator),
         .sched = &sched,
-        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        .arena = arena_mod.ArenaAllocator.init(testing.allocator),
         .opcode_counts = if (vm_mod.opcode_profile_enabled) [_]u64{0} ** bytecode.opcode.count else {},
     };
     defer {

@@ -46,7 +46,7 @@ pub fn compile(
     // Per-body scratch arena: transient compile structures live here and are
     // freed wholesale on return; only the registered chunk's bytecode is
     // duped onto the long-lived `allocator` (at `finishCompiledChild`).
-    var scratch = std.heap.ArenaAllocator.init(allocator);
+    var scratch = @import("base").arena.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const sa = scratch.allocator();
 

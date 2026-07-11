@@ -14,12 +14,12 @@ pub const Match = struct {
 };
 
 pub const Pattern = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: @import("arena.zig").ArenaAllocator,
     root: *Node,
     capture_count: usize,
 
     pub fn compile(allocator: std.mem.Allocator, source: []const u8) !Pattern {
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        var arena = @import("arena.zig").ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
         var parser = Parser{
@@ -51,7 +51,7 @@ pub const Pattern = struct {
     }
 
     fn matchAt(self: *const Pattern, allocator: std.mem.Allocator, text: []const u8, start: usize, require_end: bool) !?Match {
-        var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+        var scratch_arena = @import("arena.zig").ArenaAllocator.init(allocator);
         defer scratch_arena.deinit();
         const scratch = scratch_arena.allocator();
 

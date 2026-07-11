@@ -75,6 +75,10 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     base_mod.addImport("build_options", build_options_mod);
+    // The parser's AST arena is the plain (non-atomic) one in base — see
+    // src/base/arena.zig. `base` sits below `syntax` in the graph, so this
+    // introduces no cycle.
+    syntax_mod.addImport("base", base_mod);
     // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
     // resolved target. Lives with the fiber code.
     switch (target.result.cpu.arch) {
