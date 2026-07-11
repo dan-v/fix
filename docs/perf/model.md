@@ -35,9 +35,9 @@ Consequence: "eliminate duplicate work" and "add more parallelism" are both larg
 
 | config | wall | note |
 | --- | --- | --- |
-| w=1 serial | ~2.75s | throughput-bound |
-| w=32 typical | ~1.7s | parallelism saturates by ~16 workers |
-| w=32 best | ~1.25s | |
+| w=1 serial | ~2.26s | throughput-bound |
+| w=8 typical | ~0.61s | the sweet spot; w=16 matches it |
+| w=32 typical | ~0.70s | parallelism saturates by ~16 workers on this 16c/32t host; the residual w>16 tax is scheduling/latency-shaped, not SMT, kernel, or footprint (2026-07-11 diagnosis) |
 
 Parallelism buys ~0.69s of *earliness*, split ~50/50 between speculation and fanout — it does not raise the floor.
 
