@@ -3,9 +3,34 @@
     "nixpkgs": {
       "type": "Channel",
       "name": "nixpkgs-unstable",
+      "artifact": "nixexprs.tar.xz",
       "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1006043.4100e830e085/nixexprs.tar.xz",
       "hash": "sha256-24YGUZ9p3uLeDBGS5Nc8V7Rt5PaRg1vZ+rnfSuBW7hM="
+    },
+    "lix": {
+      "type": "Git",
+      "repository": {
+        "type": "Git",
+        "url": "https://git.lix.systems/lix-project/lix.git"
+      },
+      "branch": "main",
+      "submodules": false,
+      "revision": "527ecba696e2648a62fce9528a543333ef13e779",
+      "url": null,
+      "hash": "sha256-oqR+vyunpMgRdNvQf97DK4lQvQlEJsSigu4D53WrqZs="
+    },
+    "snix": {
+      "type": "Git",
+      "repository": {
+        "type": "Git",
+        "url": "https://git.snix.dev/snix/snix.git"
+      },
+      "branch": "canon",
+      "submodules": false,
+      "revision": "fe6aa2c677f6aa8829cae3c8104fc98db2ca21fa",
+      "url": null,
+      "hash": "sha256-SL8JVtk07E9Cm/B6373pDM8AWg6aPPjUSYtLVQr8jgI="
     }
   },
-  "version": 7
+  "version": 8
 }
