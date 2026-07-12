@@ -18,7 +18,6 @@
 //! not accrete across evaluations.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
@@ -75,7 +74,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // up front — nothing downstream re-tests tty-ness.
     const stdin_tty = std.Io.File.stdin().isTty(init.io) catch false;
     const stdout_tty = std.Io.File.stdout().isTty(init.io) catch false;
-    const interactive = stdin_tty and stdout_tty and !options.bare and builtin.os.tag == .linux;
+    const interactive = stdin_tty and stdout_tty and !options.bare;
 
     // The debugger needs a deterministic pause point: one worker, no
     // speculation. Same posture as `fix eval --debugger`.

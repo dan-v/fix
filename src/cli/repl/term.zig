@@ -10,7 +10,6 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 
 /// Original termios, saved while raw mode is active. Global on purpose:
 /// the signal handler must reach it without a context pointer.
@@ -32,8 +31,10 @@ pub const Size = struct { cols: usize, rows: usize };
 /// Terminal size via TIOCGWINSZ, with an 80x24 fallback.
 pub fn size() Size {
     var ws: posix.winsize = undefined;
-    const rc = linux.ioctl(posix.STDOUT_FILENO, linux.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (linux.errno(rc) == .SUCCESS and ws.col > 0 and ws.row > 0) {
+    // Route through the per-OS backend (linux syscall / libc) so TIOCGWINSZ
+    // works on Darwin too.
+    const rc = posix.system.ioctl(posix.STDOUT_FILENO, posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (posix.errno(rc) == .SUCCESS and ws.col > 0 and ws.row > 0) {
         return .{ .cols = ws.col, .rows = ws.row };
     }
     return .{ .cols = 80, .rows = 24 };
@@ -163,15 +164,17 @@ pub const ReadResult = union(enum) {
 };
 
 /// Read whatever input is available (blocking, or up to `timeout_ms` when
-/// >= 0). Resize signals surface as `.winch` rather than being swallowed —
-/// raw syscalls, because `std.posix.read`/`poll` retry EINTR internally and
-/// would sit blocked through a resize.
+/// >= 0). Resize signals surface as `.winch` rather than being swallowed. We
+/// call the raw per-OS backend (`posix.system.poll`/`read`, portable across
+/// Linux and Darwin) rather than the `std.posix.poll`/`read` wrappers,
+/// because those retry EINTR internally and would sit blocked through a
+/// resize instead of letting the SIGWINCH handler's flag surface.
 pub fn readInput(buf: []u8, timeout_ms: i32) ReadResult {
     if (takeWinch()) return .winch;
     while (true) {
-        var fds = [_]linux.pollfd{.{ .fd = stdin_fd, .events = linux.POLL.IN, .revents = 0 }};
-        const prc = linux.poll(&fds, 1, timeout_ms);
-        switch (linux.errno(prc)) {
+        var fds = [_]posix.pollfd{.{ .fd = stdin_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const prc = posix.system.poll(&fds, 1, timeout_ms);
+        switch (posix.errno(prc)) {
             .SUCCESS => {
                 if (prc == 0) return .timeout;
             },
@@ -181,8 +184,8 @@ pub fn readInput(buf: []u8, timeout_ms: i32) ReadResult {
             },
             else => return .eof,
         }
-        const rc = linux.read(stdin_fd, buf.ptr, buf.len);
-        switch (linux.errno(rc)) {
+        const rc = posix.system.read(stdin_fd, buf.ptr, buf.len);
+        switch (posix.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return .eof;
                 return .{ .data = @intCast(rc) };
