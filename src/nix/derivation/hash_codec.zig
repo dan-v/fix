@@ -16,25 +16,42 @@ pub fn hashToBase16(allocator: std.mem.Allocator, expected_algo: []const u8, tex
         break :blk text[separator + 1 ..];
     } else text;
 
+    const hex = try decodeToHex(allocator, body, prefixed_sri);
+    // A decoded hash must have exactly the algorithm's digest length; e.g.
+    // `sha256-00` decodes to one byte and is not a valid sha256 hash.
+    if (digestBytes(expected_algo)) |n| {
+        if (hex.len != n * 2) {
+            allocator.free(hex);
+            return error.InvalidHash;
+        }
+    }
+    return hex;
+}
+
+fn decodeToHex(allocator: std.mem.Allocator, body: []const u8, prefixed_sri: bool) ![]u8 {
     if (prefixed_sri) {
         const bytes = try base64LooseDecode(allocator, body);
         defer allocator.free(bytes);
         return bytesToHexAlloc(allocator, bytes);
     }
-
-    if (isHex(body)) {
-        return allocator.dupe(u8, body);
-    }
-
+    if (isHex(body)) return allocator.dupe(u8, body);
     if (std.mem.indexOfScalar(u8, body, '=') != null or std.mem.indexOfScalar(u8, body, '+') != null or std.mem.indexOfScalar(u8, body, '/') != null) {
         const bytes = try base64LooseDecode(allocator, body);
         defer allocator.free(bytes);
         return bytesToHexAlloc(allocator, bytes);
     }
-
     const bytes = try nixBase32Decode(allocator, body);
     defer allocator.free(bytes);
     return bytesToHexAlloc(allocator, bytes);
+}
+
+/// Digest length in bytes for a Nix hash algorithm name.
+fn digestBytes(algo: []const u8) ?usize {
+    if (std.mem.eql(u8, algo, "md5")) return 16;
+    if (std.mem.eql(u8, algo, "sha1")) return 20;
+    if (std.mem.eql(u8, algo, "sha256")) return 32;
+    if (std.mem.eql(u8, algo, "sha512")) return 64;
+    return null;
 }
 
 fn bytesToHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

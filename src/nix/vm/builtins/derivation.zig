@@ -437,7 +437,21 @@ fn applyFixedOutputAttrs(
     };
     const hash_text = self.intern.get(try stringTextInternId(self, hash_forced));
     const algo = try fixedOutputHashAlgorithm(self, attrs_id, hash_text);
-    const hash_hex = try derivation.hashToBase16(self.allocator, algo, hash_text);
+    const hash_hex = derivation.hashToBase16(self.allocator, algo, hash_text) catch |err| switch (err) {
+        error.InvalidHashAlgorithm => {
+            const msg = try std.fmt.allocPrint(self.allocator, "hash '{s}' should have type '{s}'", .{ hash_text, algo });
+            defer self.allocator.free(msg);
+            try vm_trace.setErrorMessage(self, msg);
+            return err;
+        },
+        error.InvalidHash => {
+            const msg = try std.fmt.allocPrint(self.allocator, "invalid hash '{s}'", .{hash_text});
+            defer self.allocator.free(msg);
+            try vm_trace.setErrorMessage(self, msg);
+            return err;
+        },
+        else => return err,
+    };
     errdefer self.allocator.free(hash_hex);
     try owned_strings.append(self.allocator, hash_hex);
     const hash_algo = if (std.mem.eql(u8, mode, "recursive")) blk: {
