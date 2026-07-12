@@ -85,7 +85,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     };
     // `--flake`/`-A`/`--arg` synthesize source text on `ev.allocator`; plain
     // expr/file text is borrowed (argv) or owned by the evaluator's file cache.
-    defer if (source.owned) ev.allocator.free(source.text);
+    defer source.deinit(ev.allocator);
 
     // Compile (or evaluate) up front, before any pager is spawned: this is where
     // user-facing errors and warnings surface, and it resolves the single target

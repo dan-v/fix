@@ -76,17 +76,26 @@ pub const Source = struct {
     /// True when `text` was freshly allocated on `ev.allocator` (a `--flake`
     /// lowering and/or `-A`/`--arg` wrapping); the caller must free it.
     owned: bool = false,
+    /// The file's absolute path, recorded as the evaluation's source path so
+    /// positions (`unsafeGetAttrPos`, `__curPos`) and error traces match Nix,
+    /// which always reports absolute paths. Allocated on `ev.allocator`; null
+    /// for `-e`, `--flake`, and `-A`/`--arg`-wrapped text whose byte offsets no
+    /// longer map to the file.
+    abs_path: ?[]const u8 = null,
+
+    pub fn deinit(self: Source, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.text);
+        if (self.abs_path) |p| allocator.free(p);
+    }
 };
 
 /// The real file path behind a source, when the text is the file's own
 /// content (not `--flake`/`-A`/`--arg`-synthesized wrapping) — so evaluation
-/// attributes spans and attr positions to the file, like Nix does. Positions
-/// only make sense against the original text, hence the `owned` guard.
+/// attributes spans and attr positions to the file, like Nix does. This is the
+/// absolute path (Nix reports absolute paths); null for wrapped/synthetic text.
 pub fn sourcePathOf(source: SourceArg, loaded: Source) ?[]const u8 {
-    return switch (source) {
-        .file => |p| if (loaded.owned) null else p,
-        else => null,
-    };
+    _ = source;
+    return loaded.abs_path;
 }
 
 /// A short human label for the progress "evaluating <label>" node.
@@ -130,19 +139,27 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
         .expr => |text| .{ .text = text, .owned = false },
         .file => |path| blk: {
             const text = try ev.readSourceFile(path);
+            // `ev.base_path` is still the process cwd here (configure set it,
+            // and the setBasePathToFileDir below hasn't repointed it yet), so
+            // resolve `path` against it to get the file's absolute path.
+            const abs = try std.fs.path.resolve(ev.allocator, &.{ ev.base_path orelse ".", path });
             // Resolve the file's relative path literals (`./x`, `import ./y`)
             // against the file's directory, like Nix — not the process cwd.
             try ev.setBasePathToFileDir(path);
-            break :blk .{ .text = text, .owned = false };
+            break :blk .{ .text = text, .owned = false, .abs_path = abs };
         },
         .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
     };
 
-    // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the base flake
-    // lowering (if any) is now embedded in the wrapper, so free it.
+    // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the wrapper
+    // prefix shifts every byte offset, so the file path no longer describes
+    // `text`: drop the whole base (freeing its text and abs_path).
     const selected = try applySelectors(ev, base.text, options);
-    if (selected.owned and base.owned) ev.allocator.free(base.text);
-    return if (selected.owned) selected else base;
+    if (selected.owned) {
+        base.deinit(ev.allocator);
+        return selected;
+    }
+    return base;
 }
 
 /// Wrap `base_text` to apply `-A`/`--arg`/`--argstr`, as in `nix-instantiate`:

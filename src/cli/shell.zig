@@ -141,7 +141,7 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (source.owned) ev.allocator.free(source.text);
+    defer source.deinit(ev.allocator);
 
     const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();

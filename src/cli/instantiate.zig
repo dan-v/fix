@@ -50,7 +50,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         std.debug.print("error: reading source: {s}\n", .{@errorName(err)});
         return 1;
     };
-    defer if (source.owned) ev.allocator.free(source.text);
+    defer source.deinit(ev.allocator);
 
     // Forcing a derivation now writes its `.drv` (and sources) to the store.
     // The daemon connects lazily on the first write.
