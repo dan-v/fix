@@ -239,22 +239,30 @@ pub fn emitClosure(self: *Compiler, chunk_id: types.ChunkId, upvalue_count: u16)
     try self.builder.writeU16(self.allocator, upvalue_count);
 }
 
-pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
-    if (captures.len == 0) return emitClosure(self, chunk_id, 0);
+/// Emit one capture-carrying op — the compile-time twin of `run.zig`'s `capOp`.
+/// Picks the narrow (`narrow`, 2-byte chunk id) or wide (`wide`, 4-byte) opcode
+/// by chunk-id width, then writes `count` + inline `(kind,index)` descriptors.
+/// The `_st`/`_st_cell` store variants aren't emitted here — `fuseStoreToSlot`
+/// rewrites the just-emitted op byte in place.
+fn emitCaptureOp(self: *Compiler, narrow: OpCode, wide: OpCode, chunk_id: types.ChunkId, captures: []const Capture) !void {
     const upvalue_count = try captureCount(captures.len);
-
     if (chunk_id <= std.math.maxInt(u16)) {
-        try emitOpU16(self, .closure_cap, @intCast(chunk_id));
+        try emitOpU16(self, narrow, @intCast(chunk_id));
     } else {
-        try emitOp(self, .closure_cap_w);
+        try emitOp(self, wide);
         try self.builder.writeU32(self.allocator, chunk_id);
     }
     try self.builder.writeU16(self.allocator, upvalue_count);
     try emitCaptureDescriptors(self, captures);
 }
 
+pub fn emitClosureWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
+    if (captures.len == 0) return emitClosure(self, chunk_id, 0);
+    return emitCaptureOp(self, .closure_cap, .closure_cap_w, chunk_id, captures);
+}
+
 pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
-    return emitThunkWithCapturesImpl(self, chunk_id, captures, false);
+    return emitCaptureOp(self, .thunk, .thunk_w, chunk_id, captures);
 }
 
 /// Same as `emitThunkWithCaptures` but emits the `thunk_eag`
@@ -262,27 +270,13 @@ pub fn emitThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures:
 /// queue at creation. Called by `compileThunk` when the surrounding
 /// chunk's strictness signature says this binding will be forced.
 pub fn emitEagerThunkWithCaptures(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
-    return emitThunkWithCapturesImpl(self, chunk_id, captures, true);
-}
-
-fn emitThunkWithCapturesImpl(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture, eager: bool) !void {
-    const upvalue_count = try captureCount(captures.len);
-
-    if (chunk_id <= std.math.maxInt(u16)) {
-        const op: bytecode.OpCode = if (eager) .thunk_eag else .thunk;
-        try emitOpU16(self, op, @intCast(chunk_id));
-    } else {
-        const op: bytecode.OpCode = if (eager) .thunk_eag_w else .thunk_w;
-        try emitOp(self, op);
-        try self.builder.writeU32(self.allocator, chunk_id);
-    }
-    try self.builder.writeU16(self.allocator, upvalue_count);
-    try emitCaptureDescriptors(self, captures);
+    return emitCaptureOp(self, .thunk_eag, .thunk_eag_w, chunk_id, captures);
 }
 
 /// Emit `thunk_arg` — a function argument whose laziness is decided at
-/// runtime from the callee's strictness. Always wide chunk-id (the 2
-/// extra operand bytes are negligible vs. avoiding a second opcode).
+/// runtime from the callee's strictness. Always a 4-byte chunk id (the 2 extra
+/// operand bytes are negligible vs. a second opcode), so it can't share the
+/// narrow/wide `emitCaptureOp` — the handler (`capOp(.arg,.wide)`) reads a u32.
 pub fn emitApplyArg(self: *Compiler, chunk_id: types.ChunkId, captures: []const Capture) !void {
     const upvalue_count = try captureCount(captures.len);
     try emitOp(self, .thunk_arg);

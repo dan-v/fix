@@ -362,6 +362,183 @@ pub const count = @typeInfo(OpCode).@"enum".fields.len;
 
 const std = @import("std");
 
+// ---- operand layout (single source of truth) ----
+//
+// Every opcode's operand shape is declared ONCE, in `layout` below, as a list
+// of typed `Operand` fields. This one table drives `operandLen` (used by the
+// disassembler's stepping + the capture census) and the disassembler's operand
+// RENDERING — so "how many bytes does this op carry, and what do they mean" is
+// not re-derived per subsystem. Semantics (the VM handlers) stay hand-written;
+// they need typed values on the hot path, not a generic walk.
+
+fn rdU16(code: []const u8, at: usize) u16 {
+    return @as(u16, code[at]) | (@as(u16, code[at + 1]) << 8);
+}
+fn rdU32(code: []const u8, at: usize) u32 {
+    return @as(u32, code[at]) | (@as(u32, code[at + 1]) << 8) |
+        (@as(u32, code[at + 2]) << 16) | (@as(u32, code[at + 3]) << 24);
+}
+
+/// Width of a scalar operand field.
+pub const Width = enum {
+    b1,
+    b2,
+    b4,
+    pub fn bytes(w: Width) usize {
+        return switch (w) {
+            .b1 => 1,
+            .b2 => 2,
+            .b4 => 4,
+        };
+    }
+};
+
+/// One typed operand field. The disassembler renders each variant uniformly and
+/// `operandLen` sizes it; variable-length variants read their count from `code`.
+pub const Operand = union(enum) {
+    /// Uninterpreted scalar → shown as `#value`.
+    raw: Width,
+    /// Internal side-table offset (names_start, cap_start, …): advances, unshown.
+    skip: Width,
+    /// u16 constant-pool index → `#idx` + value digest.
+    const_idx,
+    /// Frame slot / upvalue index → `role[idx]`.
+    slot: struct { w: Width, role: Role },
+    /// One capture descriptor `(kind:1, index:2)` → `role[idx]` (role from kind).
+    cap1,
+    /// Chunk id → `chunk[0xid] name` (records an outgoing reference).
+    chunk_id: Width,
+    /// Interned id → the interned name.
+    intern: Width,
+    /// A count → `N noun` (noun labels the collection: entries/items/args/…).
+    count: struct { w: Width, noun: []const u8 },
+    /// u32 relative jump → `+off → target`.
+    jump,
+    /// u16 count then `3×count` inline capture descriptors → `N captures`.
+    captures,
+    /// `captures` followed by a trailing 1-byte store slot → `N captures → local[s]`.
+    captures_slot,
+    /// u8 segment count then `count×width` interned ids → `"a.b.c"`.
+    attr_path: Width,
+    /// u8 allow-extra flag, u16 count, then `count×width` ids → `N expected`.
+    check: Width,
+    /// Irregular static/dynamic tagged path stream (`attr_*_mix`).
+    mix,
+
+    pub const Role = enum { local, upvalue };
+};
+
+// `comptime` params matter: `layout`'s arms return `&[_]Operand{…}` array literals, which
+// are only promoted to static storage when every element is comptime-known. A
+// runtime helper call would make the literal a stack temporary and the returned
+// slice would dangle (was a real bug — the validation assert in `writeOperands`
+// caught it), so these must fold at comptime.
+fn slot(comptime w: Width, comptime role: Operand.Role) Operand {
+    return .{ .slot = .{ .w = w, .role = role } };
+}
+fn cnt(comptime w: Width, comptime noun: []const u8) Operand {
+    return .{ .count = .{ .w = w, .noun = noun } };
+}
+
+/// The operand layout of `op`: the single source consumed by `operandLen` and
+/// the disassembler. Exhaustive (no `else`) so a new opcode is a compile error
+/// until its shape is declared here.
+pub fn layout(op: OpCode) []const Operand {
+    return switch (op) {
+        // No operands.
+        .push_null, .push_true, .push_false, .pop, .int_add, .int_sub, .int_mul, .int_div, .int_neg, .flt_add, .flt_sub, .flt_mul, .flt_div, .cmp_eq, .cmp_ne, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge, .cmp_eq_null, .cmp_ne_null, .bool_not, .fail, .attrs_merge, .attrs_merge_strict, .list_cat, .push_builtins, .attr_get_dyn, .attr_get_dyn_or, .call, .call_tail, .cell_new, .thunk_shell, .ret, .halt, .breakpoint => comptime &[_]Operand{},
+
+        .push_const, .push_const_ret => comptime &[_]Operand{.const_idx},
+
+        // Slot / upvalue reads and writes.
+        .loc_get, .loc_grab, .loc_set, .cell_set, .cell_init, .loc_get_ret => comptime &[_]Operand{slot(.b1, .local)},
+        .loc_get_w, .loc_grab_w, .loc_set_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => comptime &[_]Operand{slot(.b2, .local)},
+        .up_grab, .up_get, .up_get_ret => comptime &[_]Operand{slot(.b2, .upvalue)},
+
+        .jump, .jump_false => comptime &[_]Operand{.jump},
+
+        // Collection builders.
+        .attrs_new, .attrs_new_srt => comptime &[_]Operand{cnt(.b2, "entries")},
+        .attrs_new_named_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 } },
+        .attrs_new_named_pos_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 }, cnt(.b2, "positions"), .{ .skip = .b4 } },
+        .list_new => comptime &[_]Operand{cnt(.b2, "items")},
+        .str_cat => comptime &[_]Operand{cnt(.b2, "parts")},
+        .call_n, .call_tail_n => comptime &[_]Operand{cnt(.b1, "args")},
+
+        .file_find => comptime &[_]Operand{.{ .intern = .b2 }},
+        .file_find_w => comptime &[_]Operand{.{ .intern = .b4 }},
+
+        // Closures / thunks (chunk id + captures).
+        .closure => comptime &[_]Operand{ .{ .chunk_id = .b2 }, cnt(.b2, "upvalues") },
+        .closure_w => comptime &[_]Operand{ .{ .chunk_id = .b4 }, cnt(.b2, "upvalues") },
+        .closure_cap, .thunk, .thunk_eag => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures },
+        .closure_cap_w, .thunk_w, .thunk_eag_w, .thunk_arg => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures },
+        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b2 }, .captures_slot },
+        .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => comptime &[_]Operand{ .{ .chunk_id = .b4 }, .captures_slot },
+        .thunk_attr => comptime &[_]Operand{ .cap1, .{ .intern = .b2 } },
+
+        // Fused slot/upvalue + attribute.
+        .up_get_attr => comptime &[_]Operand{ slot(.b2, .upvalue), .{ .intern = .b2 } },
+        .loc_get_attr => comptime &[_]Operand{ slot(.b1, .local), .{ .intern = .b2 } },
+        .loc_get_attr_w => comptime &[_]Operand{ slot(.b2, .local), .{ .intern = .b2 } },
+
+        // Attribute access.
+        .attr_get => comptime &[_]Operand{.{ .intern = .b2 }},
+        .attr_get_w => comptime &[_]Operand{.{ .intern = .b4 }},
+        .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => comptime &[_]Operand{.{ .attr_path = .b2 }},
+        .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => comptime &[_]Operand{.{ .attr_path = .b4 }},
+        .attr_get_path_mix_or, .attr_has_path_mix => comptime &[_]Operand{.mix},
+        .attr_check => comptime &[_]Operand{.{ .check = .b2 }},
+        .attr_check_w => comptime &[_]Operand{.{ .check = .b4 }},
+        .with_lookup => comptime &[_]Operand{ .{ .intern = .b2 }, cnt(.b1, "scopes") },
+        .with_lookup_w => comptime &[_]Operand{ .{ .intern = .b4 }, cnt(.b1, "scopes") },
+        .thunk_defer => comptime &[_]Operand{ .{ .raw = .b4 }, .{ .skip = .b4 }, cnt(.b2, "env") },
+    };
+}
+
+/// Bytes the mixed static/dynamic attr-path stream occupies at `at`:
+/// u8 seg count, u8 dyn count, then per static segment a `0` tag + 4-byte id,
+/// per dynamic segment a `1` tag.
+fn mixLen(code: []const u8, at: usize) usize {
+    const segments = code[at];
+    var len: usize = 2; // seg count + dyn count
+    var i: usize = 0;
+    while (i < segments) : (i += 1) {
+        const tag = code[at + len];
+        len += 1;
+        if (tag == 0) len += 4;
+    }
+    return len;
+}
+
+/// Byte length of a single operand field at `at` (reads its count for the
+/// variable-length variants). The disassembler advances by this so its
+/// stepping shares one source with `operandLen`.
+pub fn fieldLen(f: Operand, code: []const u8, at: usize) usize {
+    return switch (f) {
+        .raw, .skip, .chunk_id, .intern => |w| w.bytes(),
+        .const_idx => 2,
+        .slot => |s| s.w.bytes(),
+        .cap1 => 3,
+        .count => |c| c.w.bytes(),
+        .jump => 4,
+        .captures => 2 + @as(usize, rdU16(code, at)) * 3,
+        .captures_slot => 2 + @as(usize, rdU16(code, at)) * 3 + 1,
+        .attr_path => |w| 1 + @as(usize, code[at]) * w.bytes(),
+        .check => |w| 1 + 2 + @as(usize, rdU16(code, at + 1)) * w.bytes(),
+        .mix => mixLen(code, at),
+    };
+}
+
+/// Total operand byte length of the instruction at `ip` (excludes the opcode
+/// byte itself), derived from `layout`. Reads counts from `code` for the
+/// variable-length fields.
+pub fn operandLen(op: OpCode, code: []const u8, ip: usize) usize {
+    var len: usize = 0;
+    for (layout(op)) |f| len += fieldLen(f, code, ip + len);
+    return len;
+}
+
 test "opcode byte values round-trip through enumFromInt" {
     inline for (@typeInfo(OpCode).@"enum".fields) |field| {
         const op: OpCode = @enumFromInt(field.value);

@@ -1682,291 +1682,145 @@ fn writeOperands(
     up_names: ?[]const InternId,
     referenced_chunks: ?RefSink,
 ) !usize {
-    var ip = ip_in;
+    // Uniform, table-driven operand rendering. Two passes over the op's operand
+    // layout (`opcode.layout`): pass 1 prints raw operand tokens, pass 2 their
+    // interpretation, joined as "raw ; interp" (the form the multiline view
+    // splits on). Every per-op case that used to live here is now one entry in
+    // that table plus the per-field-type renderers below.
     const code = chunk.code;
-    switch (op) {
-        .push_const, .push_const_ret => {
+    const fields = opcode_mod.layout(op);
+
+    var ip = ip_in;
+    var wrote_raw = false;
+    for (fields) |f| {
+        if (fieldHasRaw(f)) {
+            if (wrote_raw) try writer.writeByte(' ');
+            try writeFieldRaw(writer, f, code, ip);
+            wrote_raw = true;
+        }
+        ip += opcode_mod.fieldLen(f, code, ip);
+    }
+
+    var wrote_int = false;
+    ip = ip_in;
+    for (fields) |f| {
+        if (fieldHasInterp(f)) {
+            try writer.writeAll(if (wrote_int) ", " else if (wrote_raw) " ; " else "");
+            try writeFieldInterp(writer, f, chunk, code, ip, symbols, up_names, referenced_chunks);
+            wrote_int = true;
+        }
+        ip += opcode_mod.fieldLen(f, code, ip);
+    }
+
+    std.debug.assert(ip == ip_in + opcode_mod.operandLen(op, code, ip_in));
+    return ip;
+}
+
+const Operand = opcode_mod.Operand;
+
+fn readWidth(w: opcode_mod.Width, code: []const u8, ip: usize) u32 {
+    return switch (w) {
+        .b1 => code[ip],
+        .b2 => readU16(code, ip),
+        .b4 => readU32(code, ip),
+    };
+}
+
+/// Every field but `.skip` (an internal side-table offset) shows a raw token.
+fn fieldHasRaw(f: Operand) bool {
+    return switch (f) {
+        .skip => false,
+        else => true,
+    };
+}
+
+/// Every field but `.skip` and `.raw` (a bare scalar) has an interpretation.
+fn fieldHasInterp(f: Operand) bool {
+    return switch (f) {
+        .skip, .raw => false,
+        else => true,
+    };
+}
+
+fn writeFieldRaw(writer: *std.Io.Writer, f: Operand, code: []const u8, ip: usize) !void {
+    switch (f) {
+        .raw, .skip => |w| try writer.print("#{d}", .{readWidth(w, code, ip)}),
+        .const_idx => try writer.print("#{d}", .{readU16(code, ip)}),
+        .slot => |s| try writer.print("#{d}", .{readWidth(s.w, code, ip)}),
+        .cap1 => try writer.print("#{d}", .{readU16(code, ip + 1)}),
+        .chunk_id => |w| try writer.print("0x{x}", .{readWidth(w, code, ip)}),
+        .intern => |w| try writer.print("#{d}", .{readWidth(w, code, ip)}),
+        .count => |c| try writer.print("#{d}", .{readWidth(c.w, code, ip)}),
+        .jump => try writer.print("+{d}", .{readU32(code, ip)}),
+        .captures, .captures_slot => try writer.print("#{d}", .{readU16(code, ip)}),
+        .attr_path => try writer.print("#{d}", .{code[ip]}),
+        .check => try writer.print("#{d}", .{readU16(code, ip + 1)}),
+        .mix => try writer.print("#{d} #{d}", .{ code[ip], code[ip + 1] }),
+    }
+}
+
+fn writeFieldInterp(
+    writer: *std.Io.Writer,
+    f: Operand,
+    chunk: *const Chunk,
+    code: []const u8,
+    ip: usize,
+    symbols: Symbols,
+    up_names: ?[]const InternId,
+    referenced_chunks: ?RefSink,
+) !void {
+    switch (f) {
+        .raw, .skip => {},
+        .const_idx => {
             const idx = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d}", .{idx});
-            if (idx < chunk.constants.len) {
-                try writer.writeAll(" ; ");
-                // Plain text: the inline path colors the whole comment dim.
-                try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, false);
+            if (idx < chunk.constants.len)
+                try writeValueDigest(writer, chunk.constants[idx], symbols, snippet_max, false)
+            else
+                try writer.print("const #{d}", .{idx});
+        },
+        .slot => |s| {
+            const v = readWidth(s.w, code, ip);
+            try writer.print("{s}[{d}]", .{ @tagName(s.role), v });
+            if (s.role == .upvalue) {
+                if (upvalueName(up_names, symbols, v)) |nm| try writer.print(" {s}", .{nm});
             }
         },
-        .push_null, .push_true, .push_false, .pop => {},
-
-        .loc_get, .loc_set, .loc_grab, .cell_init, .loc_get_ret => {
-            const slot = code[ip];
-            ip += 1;
-            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
-        },
-        .loc_get_w, .loc_set_w, .loc_grab_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => {
-            const slot = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
-        },
-        .cell_set => {
-            const slot = code[ip];
-            ip += 1;
-            try writer.print("#{d} ; local[{d}]", .{ slot, slot });
-        },
-        .up_grab, .up_get, .up_get_ret => {
-            const slot = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; upvalue[{d}]", .{ slot, slot });
-            if (upvalueName(up_names, symbols, slot)) |nm| try writer.print(" {s}", .{nm});
-        },
-        .thunk_attr => {
-            // One capture descriptor (kind:1 + index:2) + 2-byte attr name.
+        .cap1 => {
             const kind = code[ip];
             const idx = readU16(code, ip + 1);
-            const id: InternId = @intCast(readU16(code, ip + 3));
-            ip += 5;
-            try writeSlotAttr(writer, if (kind == 0) "local" else "upvalue", idx, id, symbols);
+            try writer.print("{s}[{d}]", .{ if (kind == 0) "local" else "upvalue", idx });
         },
-
-        .int_add, .int_sub, .int_mul, .int_div, .int_neg,
-        .flt_add, .flt_sub, .flt_mul, .flt_div,
-        .cmp_eq, .cmp_ne, .cmp_eq_null, .cmp_ne_null, .cmp_lt, .cmp_le, .cmp_gt, .cmp_ge, .bool_not,
-        .fail, .push_builtins,
-        .attrs_merge, .attrs_merge_strict, .list_cat,
-        .attr_get_dyn,
-        .call, .call_tail, .cell_new, .thunk_shell, .ret, .halt, .breakpoint => {},
-
-        .call_n, .call_tail_n => {
-            const n = code[ip];
-            ip += 1;
-            try writer.print("#{d} ; {d} args", .{ n, n });
+        .chunk_id => |w| {
+            const id: ChunkId = readWidth(w, code, ip);
+            try writeChunkRef(writer, id, symbols);
+            try addRef(referenced_chunks, id);
         },
-
+        .intern => |w| {
+            const id: InternId = readWidth(w, code, ip);
+            try writeInternRef(writer, id, symbols);
+        },
+        .count => |c| try writer.print("{d} {s}", .{ readWidth(c.w, code, ip), c.noun }),
         .jump => {
             const off = readU32(code, ip);
-            ip += 4;
-            try writer.print("+{d} ; → {x:0>4}", .{ off, ip + off });
+            try writer.print("→ {x:0>4}", .{ip + 4 + off});
         },
-        .jump_false => {
-            const off = readU32(code, ip);
-            ip += 4;
-            try writer.print("+{d} ; → {x:0>4}", .{ off, ip + off });
-        },
-
-        .attrs_new, .attrs_new_srt => {
+        .captures => try writer.print("{d} captures", .{readU16(code, ip)}),
+        .captures_slot => {
             const n = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; {d} entries", .{ n, n });
+            const slot_b = code[ip + 2 + @as(usize, n) * 3];
+            try writer.print("{d} captures → local[{d}]", .{ n, slot_b });
         },
-        .attrs_new_named_srt => {
-            const n = readU16(code, ip);
-            ip += 6;
-            try writer.print("#{d} ; {d} entries (named)", .{ n, n });
-        },
-        .attrs_new_named_pos_srt => {
-            const n = readU16(code, ip);
-            const pc = readU16(code, ip + 6);
-            ip += 12;
-            try writer.print("#{d} #{d} ; {d} entries, {d} positions (named)", .{ n, pc, n, pc });
-        },
-        .list_new => {
-            const n = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; {d} items", .{ n, n });
-        },
-        .str_cat => {
-            const n = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; {d} parts", .{ n, n });
-        },
-
-        .file_find => {
-            const id: InternId = @intCast(readU16(code, ip));
-            ip += 2;
-            try writeInternRef(writer, id, symbols);
-        },
-        .file_find_w => {
-            const id: InternId = readU32(code, ip);
-            ip += 4;
-            try writeInternRef(writer, id, symbols);
-        },
-
-        .closure => {
-            // `.closure` carries no inline capture descriptors (captures come
-            // off the stack); `.closure_cap`/`.thunk*` do.
-            const id: ChunkId = @intCast(readU16(code, ip));
-            ip += 2;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} upvalues", .{upvalues});
-            try addRef(referenced_chunks, id);
-        },
-        .thunk, .thunk_eag => {
-            const id: ChunkId = @intCast(readU16(code, ip));
-            ip += 2;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} captures", .{upvalues});
-            ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try addRef(referenced_chunks, id);
-        },
-        .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
-            const wide = chunkIdWide(op);
-            const id: ChunkId = if (wide) readU32(code, ip) else @intCast(readU16(code, ip));
-            ip += if (wide) @as(usize, 4) else 2;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            const desc_len = @as(usize, upvalues) * 3;
-            ip += desc_len;
-            const slot = code[ip];
-            ip += 1;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} captures → local[{d}]", .{ upvalues, slot });
-            try addRef(referenced_chunks, id);
-        },
-        .closure_w => {
-            const id: ChunkId = readU32(code, ip);
-            ip += 4;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} upvalues", .{upvalues});
-            try addRef(referenced_chunks, id);
-        },
-        .thunk_w, .thunk_eag_w, .thunk_arg => {
-            const id: ChunkId = readU32(code, ip);
-            ip += 4;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} captures", .{upvalues});
-            ip += @as(usize, upvalues) * 3; // inline capture descriptors
-            try addRef(referenced_chunks, id);
-        },
-        .closure_cap => {
-            const id: ChunkId = @intCast(readU16(code, ip));
-            ip += 2;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} captures", .{upvalues});
-            ip += @as(usize, upvalues) * 3;
-            try addRef(referenced_chunks, id);
-        },
-        .closure_cap_w => {
-            const id: ChunkId = readU32(code, ip);
-            ip += 4;
-            const upvalues = readU16(code, ip);
-            ip += 2;
-            try writeChunkRef(writer, id, symbols);
-            try writer.print(", {d} captures", .{upvalues});
-            ip += @as(usize, upvalues) * 3;
-            try addRef(referenced_chunks, id);
-        },
-        .thunk_defer => {
-            // Operand: 4-byte deferred-table id, 4-byte capture-list start, and
-            // 2-byte env count. The capture descriptors live in the chunk's
-            // deduped side table (see Chunk.capture_bytes), not inline.
-            const id: u32 = readU32(code, ip);
-            ip += 4;
-            const cap_start = readU32(code, ip);
-            ip += 4;
-            const env_count = readU16(code, ip);
-            ip += 2;
-            try writer.print("deferred #{d}, {d} env @cap[{d}]", .{ id, env_count, cap_start });
-        },
-
-        .attr_get => {
-            const id: InternId = @intCast(readU16(code, ip));
-            ip += 2;
-            try writeInternRef(writer, id, symbols);
-        },
-        .attr_get_w => {
-            const id: InternId = readU32(code, ip);
-            ip += 4;
-            try writeInternRef(writer, id, symbols);
-        },
-        .up_get_attr => {
-            const slot = readU16(code, ip);
-            const id: InternId = @intCast(readU16(code, ip + 2));
-            ip += 4;
-            try writeSlotAttr(writer, "upvalue", slot, id, symbols);
-            if (upvalueName(up_names, symbols, slot)) |nm| try writer.print(" ({s})", .{nm});
-        },
-        .loc_get_attr => {
-            const slot = code[ip];
-            const id: InternId = @intCast(readU16(code, ip + 1));
-            ip += 3;
-            try writeSlotAttr(writer, "local", slot, id, symbols);
-        },
-        .loc_get_attr_w => {
-            const slot = readU16(code, ip);
-            const id: InternId = @intCast(readU16(code, ip + 2));
-            ip += 4;
-            try writeSlotAttr(writer, "local", slot, id, symbols);
-        },
-        .attr_get_dyn_or => {
-            try writer.writeAll("(dynamic, with default)");
-        },
-        .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => {
+        .attr_path => |w| {
             const segments = code[ip];
-            ip += 1;
-            ip += @as(usize, segments) * 2;
-            try writeAttrPath(writer, code, ip - @as(usize, segments) * 2, segments, false, symbols);
+            try writeAttrPath(writer, code, ip + 1, segments, w == .b4, symbols);
         },
-        .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => {
-            const segments = code[ip];
-            ip += 1;
-            ip += @as(usize, segments) * 4;
-            try writeAttrPath(writer, code, ip - @as(usize, segments) * 4, segments, true, symbols);
-        },
-        .attr_get_path_mix_or, .attr_has_path_mix => {
-            const segments = code[ip];
-            ip += 1;
-            const dynamic = code[ip];
-            ip += 1;
-            try writer.print("#{d} #{d} ; {d} segments ({d} dynamic)", .{ segments, dynamic, segments, dynamic });
-            for (0..segments) |_| {
-                const tag = code[ip];
-                ip += 1;
-                if (tag == 0) ip += 4;
-            }
-        },
-        .attr_check => {
+        .check => {
             const allow = code[ip];
-            ip += 1;
-            const expected = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; {d} expected (allow_extra={s})", .{ expected, expected, if (allow != 0) "true" else "false" });
-            ip += @as(usize, expected) * 2;
+            const expected = readU16(code, ip + 1);
+            try writer.print("{d} expected (allow_extra={s})", .{ expected, if (allow != 0) "true" else "false" });
         },
-        .attr_check_w => {
-            const allow = code[ip];
-            ip += 1;
-            const expected = readU16(code, ip);
-            ip += 2;
-            try writer.print("#{d} ; {d} expected (allow_extra={s})", .{ expected, expected, if (allow != 0) "true" else "false" });
-            ip += @as(usize, expected) * 4;
-        },
-        .with_lookup => {
-            const id: InternId = @intCast(readU16(code, ip));
-            ip += 2;
-            const scopes = code[ip];
-            ip += 1;
-            try writeInternRef(writer, id, symbols);
-            try writer.print(" ({d} scopes)", .{scopes});
-        },
-        .with_lookup_w => {
-            const id: InternId = readU32(code, ip);
-            ip += 4;
-            const scopes = code[ip];
-            ip += 1;
-            try writeInternRef(writer, id, symbols);
-            try writer.print(" ({d} scopes)", .{scopes});
-        },
+        .mix => try writer.print("{d} segments ({d} dynamic)", .{ code[ip], code[ip + 1] }),
     }
-    return ip;
 }
 
 fn writeAttrPath(
@@ -2279,8 +2133,9 @@ pub fn writeStats(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry
     defer a.free(flate_window);
     var flate = try std.compress.flate.Compress.init(&flate_out.writer, flate_window, .raw, .default);
 
-    var scratch: std.Io.Writer.Allocating = .init(a);
-    defer scratch.deinit();
+    // `symbols` was only needed to render operand text; the stats pass now sizes
+    // instructions straight from `operandLen`, so no rendering scratch is needed.
+    _ = symbols;
 
     var id: ChunkId = 0;
     while (id < n) : (id += 1) {
@@ -2326,8 +2181,9 @@ pub fn writeStats(allocator: std.mem.Allocator, writer: *std.Io.Writer, registry
             const op: OpCode = @enumFromInt(op_byte);
             const start = ip;
             ip += 1;
-            scratch.writer.end = 0;
-            ip = writeOperands(&scratch.writer, chunk, op, ip, symbols, null, null) catch code.len;
+            // Length-only pass: no rendering, straight from the operand-shape
+            // table (the same source `writeOperands` asserts itself against).
+            ip = @min(ip + opcode_mod.operandLen(op, code, ip), code.len);
             op_counts[op_byte] += 1;
             op_bytes[op_byte] += ip - start;
             if (!isConstOp(op) and !isAggregateOp(op)) only_const = false;

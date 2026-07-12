@@ -608,73 +608,70 @@ fn opClosureLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return dispatch(vm, frame, code, ip + 6, stop_depth);
 }
 
-fn opClosureCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
+/// Config for `capOp`: every capture-carrying thunk/closure/arg op is this one
+/// body specialized by comptime flags — the ops are literally a bit-field
+/// (`{kind, wide, eager, store}`) resolved at compile time, so each `capOp(cfg)`
+/// monomorphizes to exactly the straight-line handler the hand-written variant
+/// had. `thunk_defer`/`thunk_attr` stay bespoke (different operand shape).
+const CapCfg = struct {
+    /// Which value the op creates (selects the `closures.make*` call).
+    kind: enum { thunk, closure, arg },
+    /// Wide (u32) vs narrow (u16) chunk id.
+    wide: bool,
+    /// Thunk only: submit to the urgent queue at creation.
+    eager: bool = false,
+    /// Fused thunk+store (`_st`): bind the new thunk into a slot directly
+    /// (`local`) or through the slot's cell (`cell`). Thunk-only.
+    store: ?enum { local, cell } = null,
+};
 
-fn opClosureCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id: ChunkId = readU32(code, ip);
-    const upvalue_count = readU16(code, ip + 4);
-    const descriptors_start = ip + 6;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
-
-fn opApplyArg(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id: ChunkId = readU32(code, ip);
-    const upvalue_count = readU16(code, ip + 4);
-    const descriptors_start = ip + 6;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    // The callee is already on the stack just below where the argument
-    // goes. If it forces its parameter, evaluate the argument eagerly to
-    // a value; otherwise materialise the usual thunk.
-    const callee = vm.stack[vm.sp - 1];
-    const forces = closures.calleeForcesArg(vm, callee);
-    if (forces) {
-        try closures.evalArgEager(vm, ch_id, descriptors, frame);
-    } else {
-        try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-    }
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
-
-fn opThunkCaptures(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
-
-fn opThunkCapturesLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id: ChunkId = readU32(code, ip);
-    const upvalue_count = readU16(code, ip + 4);
-    const descriptors_start = ip + 6;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
+fn capOp(comptime cfg: CapCfg) fn (*VM, *Frame, []const u8, usize, usize) anyerror!void {
+    return struct {
+        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+            frame.ip = ip;
+            const id_len: usize = if (cfg.wide) 4 else 2;
+            const ch_id: u32 = if (cfg.wide) readU32(code, ip) else readU16(code, ip);
+            const upvalue_count = readU16(code, ip + id_len);
+            const descriptors_start = ip + id_len + 2;
+            const descriptor_len = @as(usize, upvalue_count) * 3;
+            if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
+            const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
+            switch (cfg.kind) {
+                .thunk => if (cfg.eager)
+                    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame)
+                else
+                    try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame),
+                .closure => try closures.makeClosureFromCaptures(vm, ch_id, descriptors, frame),
+                .arg => {
+                    // The callee sits just below the arg slot; if it forces its
+                    // parameter, evaluate eagerly, else materialise the thunk.
+                    const callee = vm.stack[vm.sp - 1];
+                    if (closures.calleeForcesArg(vm, callee))
+                        try closures.evalArgEager(vm, ch_id, descriptors, frame)
+                    else
+                        try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
+                },
+            }
+            const after = descriptors_start + descriptor_len;
+            if (cfg.store) |st| {
+                // Slot byte trails the descriptors; bind the just-pushed thunk.
+                const slot = code[after];
+                const val = stack.pop(vm);
+                switch (st) {
+                    .cell => {
+                        const cell_val = vm.stack[frame.frame_base + slot];
+                        if (!cell_val.isThunk()) return error.TypeError;
+                        const cell_thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+                        if (vm.solo) cell_thunk.publishCellBindingSolo(val) else cell_thunk.publishCellBinding(val);
+                        vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
+                    },
+                    .local => stack.setStack(vm, frame.frame_base + slot, val),
+                }
+                return dispatch(vm, frame, code, after + 1, stop_depth);
+            }
+            return dispatch(vm, frame, code, after, stop_depth);
+        }
+    }.op;
 }
 
 fn opDeferAttrValue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -689,30 +686,6 @@ fn opDeferAttrValue(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_de
     return dispatch(vm, frame, code, ip + 10, stop_depth);
 }
 
-fn opThunkCapturesEager(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id = readU16(code, ip);
-    const upvalue_count = readU16(code, ip + 2);
-    const descriptors_start = ip + 4;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
-
-fn opThunkCapturesEagerLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-    frame.ip = ip;
-    const ch_id: ChunkId = readU32(code, ip);
-    const upvalue_count = readU16(code, ip + 4);
-    const descriptors_start = ip + 6;
-    const descriptor_len = @as(usize, upvalue_count) * 3;
-    if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-    const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-    try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
-    return dispatch(vm, frame, code, descriptors_start + descriptor_len, stop_depth);
-}
-
 /// `thunk_attr`: one capture descriptor resolves the attr-access base; the
 /// frameless thunk is created without any wrapper chunk.
 fn opThunkAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
@@ -722,44 +695,6 @@ fn opThunkAttr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: 
     const name = readU16(code, ip + 3);
     try closures.makeAttrAccessThunk(vm, descriptors, name, frame);
     return dispatch(vm, frame, code, ip + 5, stop_depth);
-}
-
-/// Shared implementation of the fused thunk+store family: create the thunk
-/// from the (narrow or wide) chunk id + inline descriptors, then bind the
-/// popped value into the slot — directly (`loc_set`) or by publishing into
-/// the slot's cell (`cell_set`).
-fn thunkStoreOp(comptime wide: bool, comptime eager: bool, comptime cell: bool) fn (*VM, *Frame, []const u8, usize, usize) anyerror!void {
-    return struct {
-        fn op(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
-            frame.ip = ip;
-            const id_len: usize = if (wide) 4 else 2;
-            const ch_id: u32 = if (wide) readU32(code, ip) else readU16(code, ip);
-            const upvalue_count = readU16(code, ip + id_len);
-            const descriptors_start = ip + id_len + 2;
-            const descriptor_len = @as(usize, upvalue_count) * 3;
-            if (descriptor_len > code.len - descriptors_start) return error.InvalidBytecode;
-            const descriptors = code[descriptors_start .. descriptors_start + descriptor_len];
-            if (eager) {
-                try closures.makeBytecodeThunkFromCapturesEager(vm, ch_id, descriptors, frame);
-            } else {
-                try closures.makeBytecodeThunkFromCaptures(vm, ch_id, descriptors, frame);
-            }
-            // Slot byte is at the end of the operand; bind the just-pushed thunk.
-            const slot_offset = descriptors_start + descriptor_len;
-            const slot = code[slot_offset];
-            const val = stack.pop(vm);
-            if (cell) {
-                const cell_val = vm.stack[frame.frame_base + slot];
-                if (!cell_val.isThunk()) return error.TypeError;
-                const cell_thunk = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
-                if (vm.solo) cell_thunk.publishCellBindingSolo(val) else cell_thunk.publishCellBinding(val);
-                vm.heap.gcRecordEdge(cell_val.asObjectId(), val); // old→young barrier
-            } else {
-                stack.setStack(vm, frame.frame_base + slot, val);
-            }
-            return dispatch(vm, frame, code, slot_offset + 1, stop_depth);
-        }
-    }.op;
 }
 
 // ---- handlers: calls ----
@@ -1231,21 +1166,21 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .file_find_w => opFindFileLong,
         .closure => opClosure,
         .closure_w => opClosureLong,
-        .closure_cap => opClosureCaptures,
-        .closure_cap_w => opClosureCapturesLong,
-        .thunk_arg => opApplyArg,
-        .thunk => opThunkCaptures,
-        .thunk_w => opThunkCapturesLong,
-        .thunk_eag => opThunkCapturesEager,
-        .thunk_eag_w => opThunkCapturesEagerLong,
-        .thunk_st_cell => thunkStoreOp(false, false, true),
-        .thunk_st => thunkStoreOp(false, false, false),
-        .thunk_eag_st_cell => thunkStoreOp(false, true, true),
-        .thunk_eag_st => thunkStoreOp(false, true, false),
-        .thunk_w_st_cell => thunkStoreOp(true, false, true),
-        .thunk_w_st => thunkStoreOp(true, false, false),
-        .thunk_eag_w_st_cell => thunkStoreOp(true, true, true),
-        .thunk_eag_w_st => thunkStoreOp(true, true, false),
+        .closure_cap => capOp(.{ .kind = .closure, .wide = false }),
+        .closure_cap_w => capOp(.{ .kind = .closure, .wide = true }),
+        .thunk_arg => capOp(.{ .kind = .arg, .wide = true }),
+        .thunk => capOp(.{ .kind = .thunk, .wide = false }),
+        .thunk_w => capOp(.{ .kind = .thunk, .wide = true }),
+        .thunk_eag => capOp(.{ .kind = .thunk, .wide = false, .eager = true }),
+        .thunk_eag_w => capOp(.{ .kind = .thunk, .wide = true, .eager = true }),
+        .thunk_st_cell => capOp(.{ .kind = .thunk, .wide = false, .store = .cell }),
+        .thunk_st => capOp(.{ .kind = .thunk, .wide = false, .store = .local }),
+        .thunk_eag_st_cell => capOp(.{ .kind = .thunk, .wide = false, .eager = true, .store = .cell }),
+        .thunk_eag_st => capOp(.{ .kind = .thunk, .wide = false, .eager = true, .store = .local }),
+        .thunk_w_st_cell => capOp(.{ .kind = .thunk, .wide = true, .store = .cell }),
+        .thunk_w_st => capOp(.{ .kind = .thunk, .wide = true, .store = .local }),
+        .thunk_eag_w_st_cell => capOp(.{ .kind = .thunk, .wide = true, .eager = true, .store = .cell }),
+        .thunk_eag_w_st => capOp(.{ .kind = .thunk, .wide = true, .eager = true, .store = .local }),
         .call => opCall,
         .call_tail => opTailCall,
         .call_n => opCallN,
