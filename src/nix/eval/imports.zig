@@ -277,6 +277,7 @@ pub fn corepkgsSource(path: []const u8) ?[]const u8 {
     \\  hash ? "",
     \\  sha256 ? "",
     \\  executable ? false,
+    \\  unpack ? false,
     \\  ...
     \\}:
     \\let
@@ -289,7 +290,7 @@ pub fn corepkgsSource(path: []const u8) ?[]const u8 {
     \\  system = "builtin";
     \\  inherit outputHash;
     \\  outputHashAlgo = if hash != "" then null else "sha256";
-    \\  outputHashMode = if executable then "recursive" else "flat";
+    \\  outputHashMode = if unpack || executable then "recursive" else "flat";
     \\  preferLocalBuild = true;
     \\  impureEnvVars = [ "http_proxy" "https_proxy" "ftp_proxy" "all_proxy" "no_proxy" ];
     \\  unpack = false;

@@ -112,6 +112,21 @@ pub const FileCache = struct {
         return true;
     }
 
+    /// Seed the cache with `contents` for `path` as a regular file, so
+    /// `readFile`/`pathExists` on it succeed without hitting disk. Used for a
+    /// fetched fixed-output store path in plain eval (no real store to hold the
+    /// file), matching Nix where the fetched content lives in the store. A no-op
+    /// if the path is already populated.
+    pub fn registerFile(self: *FileCache, path: []const u8, contents: []const u8) !void {
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
+        if (entry.contents == null) entry.contents = try self.allocator.dupe(u8, contents);
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.kind = .regular;
+    }
+
     pub fn readFile(self: *FileCache, path: []const u8) ![]const u8 {
         const entry = try self.entryFor(path);
         entry.mu.lock();

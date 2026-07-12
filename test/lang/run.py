@@ -526,8 +526,13 @@ def snix_flags(c: SnixCase) -> tuple[list[str], str | None]:
 
 
 def run_snix_case(fix: Path, c: SnixCase) -> Result:
-    if c.network or c.nix_store:
-        return Result("snix", c.ident, "skip", "needs-network-or-store")
+    # `network` is NOT a skip: the fetch builtins these cases exercise
+    # (fetchurl/fetchTarball with a sha256) yield a deterministic fixed-output
+    # store path from name+hash, which fix computes offline without touching the
+    # network. Only a running store/daemon (`nix-store`, e.g. import-from-
+    # derivation) is genuinely undrivable here.
+    if c.nix_store:
+        return Result("snix", c.ident, "skip", "needs-store")
     flags, skip = snix_flags(c)
     if skip:
         return Result("snix", c.ident, "skip", skip)
