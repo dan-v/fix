@@ -49,12 +49,29 @@ pub const LineIndex = struct {
         errdefer line_starts.deinit(allocator);
 
         line_starts.appendAssumeCapacity(0);
-        // indexOfScalarPos is SIMD-accelerated; a byte-at-a-time loop over
-        // every imported file's source was a measurable compile-time cost.
-        var pos: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, source, pos, '\n')) |i| {
-            line_starts.appendAssumeCapacity(@intCast(i + 1));
-            pos = i + 1;
+        if (std.mem.indexOfScalar(u8, source, '\r') == null) {
+            // Fast path (the common case): LF-only. indexOfScalarPos is
+            // SIMD-accelerated; a byte-at-a-time loop over every imported file's
+            // source was a measurable compile-time cost.
+            var pos: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, source, pos, '\n')) |i| {
+                line_starts.appendAssumeCapacity(@intCast(i + 1));
+                pos = i + 1;
+            }
+        } else {
+            // CR-aware slow path: a lone `\r` (Mac) and `\r\n` both terminate a
+            // line, so positions in CR/CRLF files match Nix. Capacity above only
+            // counted `\n`, so append (may grow) instead of assuming capacity.
+            var i: usize = 0;
+            while (i < source.len) : (i += 1) {
+                switch (source[i]) {
+                    '\n' => try line_starts.append(allocator, @intCast(i + 1)),
+                    '\r' => if (i + 1 >= source.len or source[i + 1] != '\n') {
+                        try line_starts.append(allocator, @intCast(i + 1));
+                    },
+                    else => {},
+                }
+            }
         }
 
         const first_line_end: u32 = if (line_starts.items.len > 1) line_starts.items[1] else @intCast(source.len);
