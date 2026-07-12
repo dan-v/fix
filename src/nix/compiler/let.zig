@@ -328,7 +328,10 @@ fn compileLetRootBinding(self: *Compiler, bindings: []const Node.Binding, root: 
         if (!attrs.attrSegmentsEqual(self, binding.path[0], root)) continue;
         if (binding.path.len == 1) {
             if (leaf) |previous| {
-                try diagnostics.reportCompileError(self, binding.name_offset, binding.name_len, "duplicate let binding");
+                const span = self.source[binding.name_offset .. binding.name_offset + binding.name_len];
+                const message = try std.fmt.allocPrint(self.allocator, "variable '{s}' already defined", .{span});
+                try self.owned_diagnostic_messages.append(self.allocator, message);
+                try diagnostics.reportCompileError(self, binding.name_offset, binding.name_len, message);
                 try diagnostics.reportCompileNote(self, previous.name_offset, previous.name_len, "first binding defined here");
                 return error.DuplicateBinding;
             }
