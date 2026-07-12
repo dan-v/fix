@@ -1224,12 +1224,19 @@ pub fn builtinFlakeRefToString(self: anytype, arg: Value) !Value {
         defer self.allocator.free(repo);
         const ref = try optionalStringAttr(self, attrs.asObjectId(), "ref");
         defer if (ref) |owned| self.allocator.free(owned);
-        const text = if (ref) |branch|
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.allocator);
+        const base = if (ref) |branch|
             try std.fmt.allocPrint(self.allocator, "github:{s}/{s}/{s}", .{ owner, repo, branch })
         else
             try std.fmt.allocPrint(self.allocator, "github:{s}/{s}", .{ owner, repo });
-        defer self.allocator.free(text);
-        return Value.string(try self.intern.intern(text));
+        defer self.allocator.free(base);
+        try out.appendSlice(self.allocator, base);
+        // Query params (Nix appends `dir` / `host` as `?key=val`).
+        var first_query = true;
+        try appendFlakeQueryString(self, attrs.asObjectId(), "host", &out, &first_query);
+        try appendFlakeQueryString(self, attrs.asObjectId(), "dir", &out, &first_query);
+        return Value.string(try self.intern.intern(out.items));
     }
 
     if (std.mem.eql(u8, type_value, "path")) {

@@ -73,6 +73,9 @@ fn comparePart(left: []const u8, right: []const u8) i8 {
     if (std.mem.eql(u8, left, right)) return 0;
     if (left.len == 0) return if (std.mem.eql(u8, right, "pre")) 1 else -1;
     if (right.len == 0) return if (std.mem.eql(u8, left, "pre")) -1 else 1;
+    // A "pre" (prerelease) component sorts before any other non-empty component.
+    if (std.mem.eql(u8, left, "pre")) return -1;
+    if (std.mem.eql(u8, right, "pre")) return 1;
 
     const left_number = isNumber(left);
     const right_number = isNumber(right);
