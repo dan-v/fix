@@ -123,13 +123,11 @@ fi
 
 # --- GC between inputs: RSS/reserved plateau ---------------------------------
 #
-# --workers=1 on purpose: this checks that the between-input minor collection
-# reclaims a heavy input's garbage so reserved plateaus. Under parallel workers
-# the same soak grows nondeterministically (35 MiB single-threaded vs 60-190
-# MiB with 8 workers, run to run) because cross-generational references tenure
-# more objects and there is no major collector yet to reclaim the old gen — a
-# separate, known limitation, not what this test is asserting. Single-threaded
-# the reclaim is deterministic (a flat 35 MiB -> 35 MiB plateau), so pin it.
+# Checks that reclaiming a heavy input's garbage between inputs holds reserved
+# memory flat. `:gc` runs a MAJOR (full) collection, which reclaims the tenured
+# old generation too — without it, under parallel workers more objects tenure
+# and reserved would ratchet up input to input (a minor only frees the young
+# survivors). Runs at the default worker count on purpose, to exercise that.
 
 gc_soak() {
     local n=$1
@@ -138,7 +136,7 @@ gc_soak() {
             printf 'builtins.length (builtins.genList (x: { v = x * 2; }) 200000)\n'
             printf ':gc\n'
         done
-    } | "$FIX" repl --max-memory=4096 --workers=1 2>/dev/null | grep '^gc:' | tail -1
+    } | "$FIX" repl --max-memory=4096 2>/dev/null | grep '^gc:' | tail -1
 }
 first=$(gc_soak 3)
 last=$(gc_soak 24)

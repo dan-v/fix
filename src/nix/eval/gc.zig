@@ -174,6 +174,52 @@ pub fn collect(ev: anytype, collector_id: u8) void {
     });
 }
 
+/// GC (`-Dgc`): one stop-the-world MAJOR (full) collection at a safepoint.
+/// Unlike `collect` (the young-gated minor), this marks the whole reachable
+/// graph from roots and sweeps EVERY unmarked object — reclaiming the tenured
+/// old-generation garbage a minor can't. Serial mark even at --workers>1 (peers
+/// are parked; a major is rare — driven only by the repl between inputs for
+/// now — so the parallel mark isn't worth the extra machinery here).
+pub fn collectMajor(ev: anytype, collector_id: u8) void {
+    if (comptime !gc.enabled) return;
+    _ = collector_id;
+    // Same lazy-arm as the minor: the first crossing arms tracking (everything
+    // so far becomes untracked/old) rather than collecting.
+    if (!ev.heap.gc_collect_enabled) {
+        heap_gc.armLazy(&ev.heap);
+        return;
+    }
+    timeline.begin(.gc, "major", 0);
+    defer timeline.end(.gc);
+    const tr = &ev.gc_tracer;
+    const t0 = nowNs();
+    // Full mark from all roots. Rescan EVERY chunk's constants: the incremental
+    // cursor (`gc_chunks_scanned`) only covers chunks compiled since the last
+    // minor, but a non-gated mark must trace old referents too.
+    ev.gc_chunks_scanned = 0;
+    tr.resetMajor(ev.heap.objects.count()) catch {
+        heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
+        return;
+    };
+    markRoots(ev, tr);
+    tr.drain(&ev.heap);
+    const t1 = nowNs();
+    // Full sweep: free every unmarked object (young AND old) to the free lists.
+    const st = ev.heap.sweep(tr.mark_bits);
+    // Tenure survivors + empty the nursery, then drop the now-stale remset
+    // (young generation is empty ⇒ no old→young edges remain).
+    ev.heap.gcMajorReconcile(tr.mark_bits);
+    heap_gc.remsetClear(&ev.heap);
+    // Pull the swept slots (round-robined across worker shards) onto the
+    // collector so a demand-concentrated repl workload reuses them next input
+    // instead of ratcheting the store cursor.
+    ev.heap.gcConsolidateFreeLists();
+    const t2 = nowNs();
+    heap_gc.afterCollect(&ev.heap, tr.stats.bytes);
+    gc.recordCollection(st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
+    gc.recordTiming(t1 - t0, t2 - t1);
+}
+
 pub fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);

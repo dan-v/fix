@@ -358,6 +358,19 @@ const RangeFreeList = struct {
         return .{ .segment = @intCast(bits >> 32), .offset = @intCast(bits & 0xFFFF_FFFF) };
     }
 
+    /// Move every freed range out of `self` into `dst` (leaving `self` empty).
+    /// Used by the STW major to consolidate the per-worker free lists onto the
+    /// collector so the next (demand-concentrated) eval can reuse them.
+    fn drainInto(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            const gop = dst.map.getOrPut(allocator, e.key_ptr.*) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            gop.value_ptr.appendSlice(allocator, e.value_ptr.items) catch {};
+            e.value_ptr.clearRetainingCapacity();
+        }
+    }
+
     fn deinit(self: *RangeFreeList, allocator: std.mem.Allocator) void {
         var it = self.map.valueIterator();
         while (it.next()) |v| v.deinit(allocator);
@@ -1481,6 +1494,46 @@ pub const ObjectHeap = struct {
             if (shard >= nshards) shard = 0;
         }
         return st;
+    }
+
+    /// Post-major-sweep reconciliation of the generational state. A full sweep
+    /// reclaimed every unmarked object (young AND old), so the surviving set is
+    /// exactly `mark_bits`. Tenure all of them (a full collection is a total
+    /// tenure) and empty the per-worker young lists, so the young generation
+    /// restarts empty: no live young objects, hence no old→young edges, hence
+    /// the caller can drop the remembered set. The next minor then works from a
+    /// clean nursery. STW-only (the collector alone touches these).
+    pub fn gcMajorReconcile(self: *ObjectHeap, mark_bits: []const u64) void {
+        if (comptime !build_options.gc) return;
+        self.gcGrowOldBits(self.objects.count());
+        for (mark_bits, 0..) |word, wi| {
+            var w = word;
+            while (w != 0) {
+                const bit = @ctz(w);
+                self.gcSetOld(@intCast(wi * 64 + @as(usize, bit)));
+                w &= w - 1;
+            }
+        }
+        for (self.worker_locals) |*wl| wl.gc_young_slots.clearRetainingCapacity();
+    }
+
+    /// Consolidate every worker's GC free lists onto the collector's local
+    /// (`currentLocal`). The per-worker free lists are reused lock-free by
+    /// their owner during eval, but a demand-concentrated workload (e.g. the
+    /// repl) allocates on ~one worker, so freed slots stranded on other
+    /// workers' lists never get reused and the store cursor ratchets up. STW
+    /// only (the collector alone touches the lists here).
+    pub fn gcConsolidateFreeLists(self: *ObjectHeap) void {
+        if (comptime !build_options.gc) return;
+        const dst = self.currentLocal();
+        for (self.worker_locals) |*wl| {
+            if (wl == dst) continue;
+            dst.gc_free_objects.appendSlice(self.allocator, wl.gc_free_objects.items) catch {};
+            wl.gc_free_objects.clearRetainingCapacity();
+            wl.gc_free_values.drainInto(&dst.gc_free_values, self.allocator);
+            wl.gc_free_attrs.drainInto(&dst.gc_free_attrs, self.allocator);
+            wl.gc_free_attr_pos.drainInto(&dst.gc_free_attr_pos, self.allocator);
+        }
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {

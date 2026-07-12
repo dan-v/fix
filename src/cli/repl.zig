@@ -509,7 +509,7 @@ const Repl = struct {
                 }
             },
             .gc => {
-                const r = self.ev.collectNow();
+                const r = self.ev.collectMajorNow();
                 var out = self.stdout();
                 defer out.interface.flush() catch {};
                 if (!r.ran) {
@@ -648,9 +648,12 @@ const Repl = struct {
 
     /// The between-inputs collection: reclaim the last evaluation's garbage
     /// so repl memory tracks the live bindings, not the session's history.
-    /// The first call arms tracking (cheap); later calls run real minors.
+    /// The first call arms tracking (cheap); later calls run a full MAJOR
+    /// collection — the repl is idle here, so pay for reclaiming tenured
+    /// garbage too (a minor leaves the old generation, which under parallel
+    /// workers otherwise ratchets reserved memory up across inputs).
     fn collectBetweenInputs(self: *Repl) !void {
-        _ = self.ev.collectNow();
+        _ = self.ev.collectMajorNow();
     }
 
     // -- introspection ----------------------------------------------------------

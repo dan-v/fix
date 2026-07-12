@@ -1701,6 +1701,31 @@ pub const Evaluator = struct {
         return result;
     }
 
+    /// Like `collectNow`, but runs a MAJOR (full) collection — reclaims the
+    /// tenured old-generation garbage a minor leaves behind. Used by the repl
+    /// between inputs so a heavy input's whole result graph is reclaimed (a
+    /// minor only reclaims the young survivors, so under parallel workers, where
+    /// more objects tenure, repl memory would otherwise ratchet up). Same STW
+    /// dance + cache-invalidating token bump as `collectNow`.
+    pub fn collectMajorNow(self: *Evaluator) CollectNowResult {
+        var result: CollectNowResult = .{
+            .ran = false,
+            .reserved_before = self.heap.totalReservedBytes(),
+            .reserved_after = self.heap.totalReservedBytes(),
+        };
+        if (comptime !gc.enabled) return result;
+        if (self.main_worker == null) return result;
+        if (self.heap.gc_threshold_bytes == std.math.maxInt(u64)) return result;
+        if (!self.scheduler.gcTryBeginCollection()) return result;
+        self.scheduler.gcWaitAllParked(0);
+        self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
+        eval_gc.collectMajor(self, 0);
+        self.scheduler.gcEndCollection(0);
+        result.ran = true;
+        result.reserved_after = self.heap.totalReservedBytes();
+        return result;
+    }
+
     /// Type-erased trampoline for the scheduler's parallel-mark hook: a parked
     /// peer helps drain marker slot `worker_id` to termination. Kept here for
     /// the exact fn-pointer ABI; the body lives in `eval/gc.zig`.

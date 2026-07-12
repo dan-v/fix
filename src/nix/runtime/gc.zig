@@ -258,6 +258,18 @@ pub const Tracer = struct {
         self.minor_gate = false;
     }
 
+    // --- major collection (full, non-gated mark) ---
+
+    /// Prepare a FULL mark over `[0, object_count)`: like `reset`, but also
+    /// clears the young-gate (a prior parallel minor may have left it armed) and
+    /// the parallel-seed hook, so the serial mark traces the whole graph —
+    /// through old objects, not just the young generation.
+    pub fn resetMajor(self: *Tracer, object_count: u32) !void {
+        try self.reset(object_count);
+        self.minor_gate = false;
+        self.parallel_seed = null;
+    }
+
     // --- parallel mark ---
 
     /// Prepare for a parallel mark over `[0, object_count)` with `marker_count`
