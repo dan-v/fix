@@ -84,6 +84,9 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
 
     ev.pipe_operators_enabled = features.contains(.pipe_operators);
     ev.flakes_enabled = features.contains(.flakes);
+    // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
+    if (settings.getUint("max-call-depth")) |n|
+        ev.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
     // `flakes` implies `fetch-tree` (as in Nix).
     ev.fetch_tree_enabled = features.contains(.fetch_tree) or ev.flakes_enabled;
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));

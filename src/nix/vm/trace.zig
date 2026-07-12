@@ -14,6 +14,16 @@ pub fn pushErrorContext(self: *VM, message: []const u8) !void {
     if (self.trace) |trace| try trace.pushFrame(message);
 }
 
+/// The logical call-depth cap (Nix's `max-call-depth`) has been exceeded.
+/// Sets the canonical Nix message and raises. Used by the frame-push and
+/// tail-call paths (`stack.pushFrame` / `closures.replaceCurrentFrame*`).
+pub fn callDepthExceeded(self: *VM) error{CallDepthExceeded} {
+    if (self.trace) |trace| {
+        trace.setMessage("stack overflow; max-call-depth exceeded") catch {};
+    }
+    return error.CallDepthExceeded;
+}
+
 pub fn clearErrorTrace(self: *VM) void {
     if (self.trace) |trace| trace.clear();
 }

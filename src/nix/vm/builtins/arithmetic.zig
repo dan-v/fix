@@ -1,10 +1,12 @@
 //! Nix arithmetic and numeric-comparison builtins: add/sub/mul/div, the
 //! bitwise ops, floor/ceil, and lessThan.
 
+const std = @import("std");
 const Value = @import("runtime").value.Value;
 const numeric = @import("runtime").numeric;
 const vm_force = @import("../force.zig");
 const vm_equality = @import("../equality.zig");
+const vm_trace = @import("../trace.zig");
 
 pub fn builtinAdd(self: anytype, left: Value, right: Value) !Value {
     return numeric.add(self.heap, try vm_force.forceValue(self, left), try vm_force.forceValue(self, right));
@@ -39,9 +41,31 @@ pub fn builtinBitXor(self: anytype, left: Value, right: Value) !Value {
 }
 
 pub fn builtinFloor(self: anytype, arg: Value) !Value {
-    return numeric.floor(self.heap, try vm_force.forceValue(self, arg));
+    const v = try vm_force.forceValue(self, arg);
+    return numeric.floor(self.heap, v) catch |err| return floorCeilError(self, err, v, "floor");
 }
 
 pub fn builtinCeil(self: anytype, arg: Value) !Value {
-    return numeric.ceil(self.heap, try vm_force.forceValue(self, arg));
+    const v = try vm_force.forceValue(self, arg);
+    return numeric.ceil(self.heap, v) catch |err| return floorCeilError(self, err, v, "ceil");
+}
+
+/// Attach Nix's diagnostic for the `floor`/`ceil` integer-corruption error
+/// (`https://github.com/NixOS/nix/issues/12899`); pass any other error
+/// through untouched.
+fn floorCeilError(self: anytype, err: anyerror, v: Value, name: []const u8) anyerror {
+    if (err != error.FloorCeilCorruptsInteger) return err;
+    const was: ?i64 = switch (v.kind()) {
+        .int => v.asInt(),
+        .boxed_int => self.heap.getBoxedInt(v.asObjectId()) catch null,
+        else => null,
+    };
+    if (was) |i| {
+        if (numeric.intRoundTripCorruption(i)) |became| {
+            const msg = std.fmt.allocPrint(self.allocator, "builtins.{s} was corrupting your integer (was {d}, became {d}) in previous versions due to a historical Nix bug (https://github.com/NixOS/nix/issues/12899).\nThis may be changed in the future to pass through integers as-is, which will change the semantics of this code.\nTo suppress this error, use --extra-deprecated-features floor-ceil-corrupt-integers", .{ name, i, became }) catch return err;
+            defer self.allocator.free(msg);
+            vm_trace.setErrorMessage(self, msg) catch {};
+        }
+    }
+    return err;
 }

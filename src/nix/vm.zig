@@ -138,6 +138,16 @@ pub const Frame = struct {
     local_count: u32,
     /// Upvalues for the closure or direct thunk currently executing.
     upvalues: ?[]const Value,
+    /// Logical call depth of this frame — the length of the function-
+    /// application chain that reached it, matching Nix's `max-call-depth`
+    /// accounting. A function-application frame is one deeper than the
+    /// frame that called it; a passthrough frame (top-level entry, a
+    /// thunk-force isolated frame, an eager argument evaluation) inherits
+    /// its parent's depth unchanged. Tail calls (`replaceCurrentFrame`)
+    /// bump this in place, so a tail-recursion loop grows the logical
+    /// depth without growing the physical frame stack — exactly how Nix
+    /// bounds otherwise-unbounded tail recursion.
+    call_depth: u32 = 0,
 };
 
 pub const ImportHost = struct {
@@ -357,6 +367,10 @@ pub const VM = struct {
     /// builtin dispatch.
     flakes_enabled: bool,
 
+    /// Logical call-depth cap (Nix's `max-call-depth`, default 10000). See
+    /// `Frame.call_depth`. Set per-eval from `Evaluator.max_call_depth`.
+    max_call_depth: u32,
+
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`
     /// outside a collection; `void` in normal builds.
@@ -443,6 +457,7 @@ pub const VM = struct {
             .lazy_shells_visible = false,
             .fetch_tree_enabled = false,
             .flakes_enabled = false,
+            .max_call_depth = types.DEFAULT_MAX_CALL_DEPTH,
         };
     }
 
@@ -508,8 +523,9 @@ pub const VM = struct {
     pub fn eval(self: *VM, chunk_id: ChunkId) !Value {
         const ch = self.registry.get(chunk_id) orelse return error.InvalidChunk;
 
-        // Push initial frame.
-        try stack.pushFrame(self, ch, chunk_id, 0, null);
+        // Push initial frame (passthrough: the top-level expression is not
+        // itself a function application, so it starts the call chain at 0).
+        try stack.pushFrame(self, ch, chunk_id, 0, null, false);
         return run.run(self) catch |err| {
             errors.captureErrorTrace(self, err) catch {};
             return err;
