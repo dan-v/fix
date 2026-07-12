@@ -461,6 +461,10 @@ pub const Evaluator = struct {
     /// true for `--extra-experimental-features flakes` (which also implies
     /// `fetch-tree`). Propagated to each VM in `initVm`. Default false.
     flakes_enabled: bool = false,
+    /// Logical call-depth cap (Nix's `max-call-depth`, default 10000).
+    /// Propagated to each VM in `initVm`; the CLI overrides it from
+    /// `--option max-call-depth N`. See `vm.Frame.call_depth`.
+    max_call_depth: u32 = types.DEFAULT_MAX_CALL_DEPTH,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -1383,6 +1387,7 @@ pub const Evaluator = struct {
         vm.lazy_shells_visible = self.lazy_shells_visible;
         vm.fetch_tree_enabled = self.fetch_tree_enabled;
         vm.flakes_enabled = self.flakes_enabled;
+        vm.max_call_depth = self.max_call_depth;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Attach the debugger only when the CLI installed a UI: every VM (main

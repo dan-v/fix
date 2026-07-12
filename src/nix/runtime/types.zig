@@ -9,8 +9,19 @@ pub const DEFAULT_WORKER_COUNT: u8 = 4;
 /// Maximum value stack slots for a VM.
 pub const VM_STACK_CAP: usize = 65_536;
 
-/// Maximum call frame depth.
-pub const MAX_FRAMES: usize = 512;
+/// Maximum physical call frame depth. Bounds non-tail recursion (tail
+/// calls reuse a frame). Kept comfortably above `DEFAULT_MAX_CALL_DEPTH`
+/// so the logical call-depth cap (which matches Nix's `max-call-depth`)
+/// fires with a proper "stack overflow" error before the physical frame
+/// array is exhausted on legitimate deep non-tail recursion.
+pub const MAX_FRAMES: usize = 20_000;
+
+/// Default logical call-depth limit, matching Nix/Lix's `max-call-depth`
+/// setting (10000). Incremented on every function application including
+/// tail calls; when it is exceeded the evaluator raises a
+/// "stack overflow; max-call-depth exceeded" error. Overridable via
+/// `--option max-call-depth N`.
+pub const DEFAULT_MAX_CALL_DEPTH: u32 = 10_000;
 
 /// Hard cap on how many adjacent value-lambda params the compiler merges
 /// into one uncurried chunk (`compiler/ops.zig compileLambda`), and thus

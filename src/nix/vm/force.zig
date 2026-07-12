@@ -1242,7 +1242,8 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
 /// and `.deferred` thunk arms (a deferred thunk is a bytecode thunk whose
 /// ChunkId is computed lazily).
 fn runBytecodeChunk(self: *VM, ch: *const Chunk, chunk_id: ChunkId, upvalues: []const Value) anyerror!Value {
-    return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues);
+    // Passthrough: forcing a thunk body is not a function application.
+    return closures.runIsolatedFrame(self, ch, chunk_id, 0, upvalues, false);
 }
 
 pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
@@ -1251,7 +1252,7 @@ pub fn evalThunkClosure(self: *VM, closure_val: Value) anyerror!Value {
             const closure_id = closure_val.asObjectId();
             const closure = try closures.getClosureById(self, closure_id);
             const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-            return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues);
+            return closures.runIsolatedFrame(self, ch, closure.chunk_id, 0, closure.upvalues, false);
         },
         .builtin_closure => {
             const closure = try self.heap.getBuiltinClosure(closure_val.asObjectId());

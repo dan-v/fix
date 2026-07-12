@@ -106,7 +106,8 @@ pub fn negate(heap: *ObjectHeap, value: Value) !Value {
 
 pub fn floor(heap: *ObjectHeap, value: Value) !Value {
     return switch (value.kind()) {
-        .int, .boxed_int => value,
+        .int => intFloorCeil(value.asInt(), value),
+        .boxed_int => intFloorCeil(try heap.getBoxedInt(value.asObjectId()), value),
         .float => int_mod.make(heap, try floatToI64Safely(@floor(value.asFloat()))),
         else => error.TypeError,
     };
@@ -114,10 +115,32 @@ pub fn floor(heap: *ObjectHeap, value: Value) !Value {
 
 pub fn ceil(heap: *ObjectHeap, value: Value) !Value {
     return switch (value.kind()) {
-        .int, .boxed_int => value,
+        .int => intFloorCeil(value.asInt(), value),
+        .boxed_int => intFloorCeil(try heap.getBoxedInt(value.asObjectId()), value),
         .float => int_mod.make(heap, try floatToI64Safely(@ceil(value.asFloat()))),
         else => error.TypeError,
     };
+}
+
+/// `builtins.floor`/`ceil` of an integer: Nix routes the argument through
+/// `double`, so an integer with more than 53 significant bits would be
+/// silently corrupted by the round-trip. Nix errors on this rather than
+/// return a wrong value (unless the deprecated `floor-ceil-corrupt-integers`
+/// feature is set). When the round-trip is exact we return the integer
+/// unchanged, matching Nix (and the common small-int case).
+fn intFloorCeil(i: i64, original: Value) !Value {
+    if (intRoundTripCorruption(i) != null) return error.FloorCeilCorruptsInteger;
+    return original;
+}
+
+/// If converting `i` to `f64` and back changes its value (`i` needs more
+/// precision than an f64 mantissa holds), returns the corrupted round-trip
+/// value; otherwise null. Floor and ceil of an already-integer-valued
+/// double are identical, so a single round-trip covers both.
+pub fn intRoundTripCorruption(i: i64) ?i64 {
+    const f: f64 = @floatFromInt(i);
+    const back = floatToI64Safely(f) catch return i; // out of i64 range ⇒ corrupted
+    return if (back != i) back else null;
 }
 
 /// Convert a finite, in-range f64 to i64 with Nix-parity semantics:

@@ -7,6 +7,7 @@ const Value = @import("runtime").value.Value;
 const chunk = @import("bytecode").chunk;
 const Chunk = chunk.Chunk;
 const trace_log = @import("trace_log.zig");
+const trace = @import("trace.zig");
 
 const VM = vm_mod.VM;
 const Frame = vm_mod.Frame;
@@ -14,9 +15,17 @@ const ChunkId = types.ChunkId;
 
 // ---- frame management ----
 
-pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value) !void {
+/// `is_call` marks a genuine function application (as opposed to the
+/// top-level entry frame or a thunk-force / eager-argument isolated
+/// frame). A call frame is one logical call-depth deeper than the frame
+/// that pushed it and is subject to the `max-call-depth` cap; a
+/// passthrough frame inherits its parent's depth unchanged.
+pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value, is_call: bool) !void {
     if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
+    const parent_depth: u32 = if (self.frames_len > 0) self.frames[self.frames_len - 1].call_depth else 0;
+    const new_depth: u32 = if (is_call) parent_depth + 1 else parent_depth;
+    if (is_call and new_depth > self.max_call_depth) return trace.callDepthExceeded(self);
     const frame_base = self.sp - arg_count;
     const reserved = @as(u32, ch.local_count) - arg_count;
 
@@ -35,6 +44,7 @@ pub fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32,
         .frame_base = frame_base,
         .local_count = ch.local_count,
         .upvalues = upvalues,
+        .call_depth = new_depth,
     };
     self.frames_len += 1;
     trace_log.framePush(self.vm_trace, self.workerId(), self.frames_len, chunk_id, frame_base);
