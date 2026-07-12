@@ -297,6 +297,10 @@ pub const Tracer = struct {
             m.deque.clear();
             m.stats = .{};
             m.mark_bits = self.mark_bits;
+            // Default to a FULL (non-gated) mark; `resetParallelMinor` re-arms
+            // the gate. Without this a parallel major inherits a leftover
+            // young-gate from the previous minor and misses old objects.
+            m.minor_gate = false;
         }
         self.marker_count = marker_count;
         self.active_idle = .init(0);

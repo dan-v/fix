@@ -462,6 +462,12 @@ pub const ObjectHeap = struct {
     /// Each helping worker grabs the next slot; a worker whose slot is beyond
     /// the cap parks idle rather than piling on. Reset per collection.
     gc_mark_slot: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    /// True while a MAJOR is marking: parked peers that help the parallel mark
+    /// (`helpMark`) then skip `evacClaimLoop` — a major sweeps the whole heap
+    /// serially rather than evacuating the young lists. Published before
+    /// `gcOpenMark` (release) and read after it (acquire), so peers see it; kept
+    /// set until after the sweep, long past any peer's evac-phase check.
+    gc_collecting_major: if (build_options.gc) bool else void = if (build_options.gc) false else {},
     gc_evac_promoted: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     gc_evac_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
