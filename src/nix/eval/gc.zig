@@ -282,14 +282,33 @@ pub fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-// --- memory budget (the collection-threshold policy) ----------------------
+// --- collection policy (the automatic line) -------------------------------
 //
-// Deliberately simple (owner's brief): one number — the heap-reserved-bytes
-// ceiling the collector defends. On a big-RAM machine the default budget
-// dwarfs any eval, so the collector never fires and a `-Dgc` build behaves
-// like a non-gc build; on a small-RAM device collections start well before
-// the eval OOMs. One flag (`--max-memory`) / env var (`FIX_MAX_MEMORY`)
-// overrides it; `0` disables collection outright.
+// One coarse decision, made once, from one stable number — total RAM. We keep
+// the object stores under `clamp(fraction × MemTotal, floor, ceiling)`:
+//   - below the line, never collect: small evals, and any eval on a roomy
+//     machine, run flat-out (no pauses, no tracking) — the "waste" is RAM you
+//     weren't going to use;
+//   - above it, collect so the stores stop ballooning (a tight machine reclaims
+//     before it OOMs; a roomy one never gets there);
+//   - the CLAMP scales it: a floor so a tiny box doesn't thrash small evals, a
+//     ceiling so a huge box doesn't sit on absurd garbage (bounded absolute
+//     waste). After a major the collector floats the threshold up toward the
+//     true live set (see `heap_gc.afterCollect`), so a genuinely big heap
+//     doesn't thrash the line.
+//
+// Deliberately NOT consulted: swap, hugetlb accounting, RSS-vs-reserved,
+// moment-to-moment MemAvailable. Those are diagnostics; if an eval genuinely
+// outgrows RAM that's the kernel's job (swap / OOM), not ours to micro-manage.
+// The flag/env is a pure OVERRIDE — pin a ceiling (CI) or `0` to disable.
+
+/// Fraction of RAM the stores may reach before collecting (num/den), and the
+/// default clamp bounds. The bounds are overridable per run via `FIX_GC_FLOOR`
+/// / `FIX_GC_CEILING` (same SIZE syntax as `--max-memory`).
+pub const GC_LINE_NUM: u64 = 1;
+pub const GC_LINE_DEN: u64 = 2; // half of RAM
+pub const GC_LINE_FLOOR: u64 = 256 << 20; // 256 MB — below this, don't bother
+pub const GC_LINE_CEILING: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
 
 /// Parse a `--max-memory` / `FIX_MAX_MEMORY` size: a decimal integer with an
 /// optional k/m/g (KiB/MiB/GiB) suffix; a bare integer is MiB. Returns bytes,
@@ -317,20 +336,61 @@ pub fn parseMemorySize(text: []const u8) ?u64 {
     return n *| mult;
 }
 
-/// Resolve the memory budget: `--max-memory` if given, else `FIX_MAX_MEMORY`,
-/// else half of `/proc/meminfo` MemAvailable (fallbacks: half of MemTotal,
-/// then 2 GiB). Half, because the budget bounds only the four heap stores —
-/// side allocations (chunks, interner, strings, thread stacks) ride on top,
-/// and other processes need to keep running.
+/// Resolve the collection line: `--max-memory` if given, else `FIX_MAX_MEMORY`,
+/// else the automatic `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
+/// value is taken verbatim (including `0` = never collect) — a hard override of
+/// the auto policy; the auto path never returns `0`.
 pub fn memoryBudget(ev: anytype) u64 {
     if (ev.max_memory_bytes) |b| return b;
-    if (ev.env_map) |em| if (em.get("FIX_MAX_MEMORY")) |s|
-        if (parseMemorySize(s)) |b| return b;
-    return halfSystemMemory() orelse (2 << 30);
+    if (envSize(ev, "FIX_MAX_MEMORY")) |b| return b;
+    return autoCollectLine(ev);
 }
 
-/// Half of MemAvailable (fallback: MemTotal) from /proc/meminfo, in bytes.
-fn halfSystemMemory() ?u64 {
+/// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
+/// fluctuating MemAvailable) so it's stable and read exactly once. The clamp
+/// bounds default to `GC_LINE_FLOOR`/`GC_LINE_CEILING`, overridable per run via
+/// `FIX_GC_FLOOR`/`FIX_GC_CEILING`. Fallback: a conservative 4 GiB assumption
+/// when /proc/meminfo is unreadable.
+fn autoCollectLine(ev: anytype) u64 {
+    const floor = envSize(ev, "FIX_GC_FLOOR") orelse GC_LINE_FLOOR;
+    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse GC_LINE_CEILING;
+    return lineFor(systemMemoryTotal() orelse (4 << 30), floor, ceiling);
+}
+
+/// A `SIZE`-syntax env override (same grammar as `--max-memory`), or null.
+fn envSize(ev: anytype, key: []const u8) ?u64 {
+    if (ev.env_map) |em| if (em.get(key)) |s| return parseMemorySize(s);
+    return null;
+}
+
+/// `clamp(fraction × ram, floor, ceiling)` — pure, so the policy is testable.
+/// `@max(floor, ceiling)` guards a floor set above the ceiling.
+fn lineFor(ram: u64, floor: u64, ceiling: u64) u64 {
+    return std.math.clamp(ram / GC_LINE_DEN *| GC_LINE_NUM, floor, @max(floor, ceiling));
+}
+
+test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
+    const f = GC_LINE_FLOOR;
+    const c = GC_LINE_CEILING;
+    // Floor: tiny boxes don't thrash small evals.
+    try std.testing.expectEqual(f, lineFor(256 << 20, f, c)); // ½·256MB=128MB → floor
+    try std.testing.expectEqual(f, lineFor(512 << 20, f, c)); // ½·512MB=256MB → floor
+    // Mid-range: scales at the fraction.
+    try std.testing.expectEqual(@as(u64, 1 << 30), lineFor(2 << 30, f, c)); // 2GB → 1GB
+    try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(4 << 30, f, c)); // 4GB → 2GB
+    try std.testing.expectEqual(@as(u64, 4 << 30), lineFor(8 << 30, f, c)); // 8GB → 4GB
+    // Ceiling: huge boxes don't sit on absurd garbage.
+    try std.testing.expectEqual(c, lineFor(16 << 30, f, c)); // 16GB → 8GB (cap)
+    try std.testing.expectEqual(c, lineFor(128 << 30, f, c)); // 128GB → 8GB (cap)
+    // Overridden bounds: a raised ceiling lets a big box hold more before GC.
+    try std.testing.expectEqual(@as(u64, 32 << 30), lineFor(64 << 30, f, 64 << 30)); // ½·64=32GB, under raised 64GB cap
+    try std.testing.expectEqual(@as(u64, 64 << 30), lineFor(256 << 30, f, 64 << 30)); // ½·256=128GB → capped at 64GB
+    // A floor set above the ceiling collapses to the floor (guarded).
+    try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(8 << 30, 2 << 30, 1 << 30));
+}
+
+/// MemTotal from /proc/meminfo, in bytes.
+fn systemMemoryTotal() ?u64 {
     var buf: [8192]u8 = undefined;
     const linux = std.os.linux;
     const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
@@ -341,8 +401,7 @@ fn halfSystemMemory() ?u64 {
     const rd: isize = @bitCast(n);
     if (rd <= 0) return null;
     const text = buf[0..@intCast(rd)];
-    if (meminfoKb(text, "MemAvailable:")) |kb| return (kb << 10) / 2;
-    if (meminfoKb(text, "MemTotal:")) |kb| return (kb << 10) / 2;
+    if (meminfoKb(text, "MemTotal:")) |kb| return kb << 10;
     return null;
 }
 

@@ -43,14 +43,14 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     armTracking(heap);
 }
 
-/// Lazy variant (the production `--max-memory` policy): don't start any
-/// per-allocation tracking yet — just watch the reserved-bytes cursor. At
-/// half the budget the safepoint driver arms tracking (STW, `armTracking`);
-/// at the budget it collects. A run that never reaches budget/2 pays ZERO
-/// tracking cost (no young-slot appends, no write barrier, no free-list
-/// probes) — on a big-RAM machine a `-Dgc` build stays at rooting-tax-only.
-/// The price: objects allocated before arming are permanently old
-/// (unreclaimable floor ≈ reserved at budget/2 — half the ceiling, by
+/// Lazy variant (the production collection-line policy, see
+/// `eval_gc.memoryBudget`): don't start any per-allocation tracking yet — just
+/// watch the reserved-bytes cursor. At half the line the safepoint driver arms
+/// tracking (STW, `armTracking`); at the line it collects. A run that never
+/// reaches line/2 pays ZERO tracking cost (no young-slot appends, no write
+/// barrier, no free-list probes) — below the line a `-Dgc` build stays at
+/// rooting-tax-only. The price: objects allocated before arming are permanently
+/// old (unreclaimable floor ≈ reserved at line/2 — half the line, by
 /// construction).
 pub fn enableBudget(heap: *ObjectHeap, budget: u64) void {
     if (comptime !build_options.gc) return;

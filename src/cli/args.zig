@@ -176,9 +176,9 @@ pub const Options = struct {
     vm_trace_main_only: bool = false,
     thunks_log_path: ?[:0]const u8 = null,
     workers: ?u8 = null,
-    /// GC (`-Dgc`) memory budget in bytes (`--max-memory`); see
-    /// `eval/gc.zig:memoryBudget`. `null` = resolve the default at eval
-    /// setup; `0` = never collect.
+    /// GC (`-Dgc`) collection-line override in bytes (`--max-memory`); see
+    /// `eval/gc.zig:memoryBudget`. `null` = the automatic RAM-scaled line;
+    /// `0` = never collect.
     max_memory: ?u64 = null,
     /// `--hugetlb auto|on|off`: back the evaluation heap with explicit 2 MB
     /// huge pages. `null` = not given; resolution (CLI > `FIX_HUGETLB` env >
@@ -406,7 +406,7 @@ const specs = [_]Spec{
     .{ .id = .debug_derivation_filter, .long = "--debug-derivation-filter", .arg = .req, .metavar = "TEXT", .help = "only show derivations mentioning TEXT", .show_in = derivation_debug_cmds },
     .{ .id = .debug_derivation_name, .long = "--debug-derivation-name", .arg = .req, .metavar = "NAME", .help = "only show derivations with exactly NAME", .show_in = derivation_debug_cmds },
     .{ .id = .debug_derivation_drv, .long = "--debug-derivation-drv", .arg = .req, .metavar = "PATH", .help = "only show the derivation with exactly PATH", .show_in = derivation_debug_cmds },
-    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "memory budget before GC kicks in (MiB, or with a\nk/m/g suffix; 0 = never; default: half MemAvailable).\n-Dgc builds only.", .show_in = eval_cmds },
+    .{ .id = .max_memory, .long = "--max-memory", .arg = .req, .metavar = "SIZE", .help = "override the automatic GC line (MiB, or with a\nk/m/g suffix; 0 = never collect). Default: auto,\nscaled to RAM. -Dgc builds only.", .show_in = eval_cmds },
     .{ .id = .hugetlb, .long = "--hugetlb", .arg = .req, .metavar = "MODE", .help = "back the evaluation heap with 2 MB huge pages: auto,\non, off (default auto = only when the kernel pool\nhas capacity; provision via vm.nr_hugepages)", .show_in = eval_cmds },
     .{ .id = .help, .short = "-h", .long = "--help", .help = "show this help" },
 
