@@ -7,6 +7,7 @@
 //!   fix switch build           # just build + ./result (no profile, no root)
 //!   fix switch dry-activate    # show what activation would do
 //!   fix switch --flake .#host  # flake source (requires the flakes feature)
+//!   fix switch --target-host h # build locally, copy closure + activate on h
 //!
 //! Like `nixos-rebuild`, the configuration is supplied exactly as it is for the
 //! nix CLI: the default source (`<nixpkgs/nixos>`, with `-I nixos-config=…`) or
@@ -71,7 +72,8 @@ pub const synopsis =
     \\action (first argument) is one of: switch (default), boot, test, build,
     \\dry-activate. The configuration is given like nixos-rebuild — the default
     \\source with -I nixos-config=…, or your own -e/--file/--flake/-A. The
-    \\profile-set and activation run under sudo when not already root.
+    \\profile-set and activation run under sudo when not already root, or on a
+    \\remote host with --target-host (build stays local; the closure is copied).
 ;
 
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -193,11 +195,82 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
     build.linkRoot(init.io, allocator, &ev, gc_link, out_path, true);
     defer std.Io.Dir.cwd().deleteFile(init.io, gc_link) catch {};
 
-    // Activation needs root for nixos/darwin. Elevate the privileged half only.
+    // Remote deploy: copy the closure and activate on the target host over SSH.
+    // The local side stays unprivileged; root (if needed) is on the remote.
+    if (options.target_host) |host| {
+        return deployRemote(allocator, init, target, action, out_path, host, options.use_remote_sudo);
+    }
+
+    // Local activation needs root for nixos/darwin. Elevate that half only.
     if (needsRoot(target, action) and effectiveUid() != 0) {
         return sudoReexec(allocator, init, target, action, out_path);
     }
     return activate(allocator, init, target, action, out_path);
+}
+
+// ---------------------------------------------------------------------------
+// Remote deploy: nix-copy-closure + activate over SSH (nixos-rebuild
+// --target-host). The build already ran locally; here we stage the closure to
+// the remote store and drive its profile-set + activation.
+// ---------------------------------------------------------------------------
+
+fn deployRemote(allocator: std.mem.Allocator, init: std.process.Init, target: Target, action: Action, top: []const u8, host: []const u8, remote_sudo: bool) !u8 {
+    // 1. Copy the closure to the remote store (nix-copy-closure reads NIX_SSHOPTS
+    // from the inherited environment for SSH options).
+    {
+        const argv = [_][]const u8{ "nix-copy-closure", "--to", host, top };
+        var child = std.process.spawn(init.io, .{ .argv = &argv, .environ_map = init.environ_map }) catch |err| {
+            std.debug.print("error: launching nix-copy-closure: {s}\n", .{@errorName(err)});
+            return 127;
+        };
+        const code = try waitCode(init.io, &child);
+        if (code != 0) {
+            std.debug.print("error: copying the closure to {s} failed\n", .{host});
+            return code;
+        }
+    }
+
+    // 2. Set the remote system profile (switch/boot). Done with the target's own
+    // `nix-env` over SSH — the remote profile dir is root-owned there too.
+    if (setsProfile(target, action)) {
+        const code = try remoteRun(allocator, init, host, remote_sudo, &.{
+            "nix-env", "-p", "/nix/var/nix/profiles/system", "--set", top,
+        });
+        if (code != 0) return code;
+    }
+
+    // 3. Run the remote activation script.
+    const stc = try std.fmt.allocPrint(allocator, "{s}/bin/switch-to-configuration", .{top});
+    defer allocator.free(stc);
+    const activate_cmd: []const u8 = try std.fmt.allocPrint(allocator, "{s}/activate", .{top});
+    defer allocator.free(activate_cmd);
+    const remote_cmd: []const []const u8 = switch (target) {
+        .nixos => &.{ stc, action.word() },
+        .darwin, .home_manager => &.{activate_cmd},
+    };
+    return remoteRun(allocator, init, host, remote_sudo, remote_cmd);
+}
+
+/// Run `cmd` on `host` over SSH, optionally under `sudo`, inheriting stdio.
+/// `NIX_SSHOPTS` (as used by nix-copy-closure) is split onto the ssh argv so
+/// custom ports/keys/jump-hosts apply here too.
+fn remoteRun(allocator: std.mem.Allocator, init: std.process.Init, host: []const u8, remote_sudo: bool, cmd: []const []const u8) !u8 {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "ssh");
+    if (init.environ_map.get("NIX_SSHOPTS")) |opts| {
+        var it = std.mem.tokenizeAny(u8, opts, " \t");
+        while (it.next()) |tok| try argv.append(allocator, tok);
+    }
+    try argv.append(allocator, host);
+    if (remote_sudo) try argv.append(allocator, "sudo");
+    try argv.appendSlice(allocator, cmd);
+
+    var child = std.process.spawn(init.io, .{ .argv = argv.items, .environ_map = init.environ_map }) catch |err| {
+        std.debug.print("error: launching ssh: {s}\n", .{@errorName(err)});
+        return 127;
+    };
+    return waitCode(init.io, &child);
 }
 
 /// Re-exec `sudo fix switch <action> <target> --activate-toplevel <top>` so the

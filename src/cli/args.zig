@@ -146,6 +146,13 @@ pub const Options = struct {
     /// eval+build phase is skipped and the given store path is activated. This
     /// is how the non-root run re-execs its privileged half under `sudo`.
     activate_toplevel: ?[]const u8 = null,
+    /// `fix switch --target-host [user@]host`: build locally, copy the closure
+    /// (`nix-copy-closure`), and activate on that remote host over SSH. Borrowed
+    /// from argv.
+    target_host: ?[]const u8 = null,
+    /// `fix switch --use-remote-sudo`: prefix the remote profile-set/activation
+    /// commands with `sudo` (when the SSH user is not root).
+    use_remote_sudo: bool = false,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -302,6 +309,8 @@ const Opt = enum {
     darwin,
     home_manager,
     activate_toplevel,
+    target_host,
+    use_remote_sudo,
     // Disasm.
     chunk,
     no_recurse,
@@ -434,6 +443,8 @@ const specs = [_]Spec{
     .{ .id = .darwin, .long = "--darwin", .help = "build/activate a nix-darwin configuration", .show_in = &.{.@"switch"} },
     .{ .id = .home_manager, .long = "--home-manager", .help = "build/activate a home-manager configuration", .show_in = &.{.@"switch"} },
     .{ .id = .home_manager, .long = "--hm", .hidden = true }, // alias for --home-manager
+    .{ .id = .target_host, .long = "--target-host", .arg = .req, .metavar = "[USER@]HOST", .help = "build locally, then copy the closure and activate on\nthis remote host over SSH", .show_in = &.{.@"switch"} },
+    .{ .id = .use_remote_sudo, .long = "--use-remote-sudo", .help = "run the remote profile-set/activation under sudo", .show_in = &.{.@"switch"} },
     .{ .id = .activate_toplevel, .long = "--activate-toplevel", .arg = .req, .metavar = "PATH", .hidden = true },
 
     // Disasm.
@@ -632,6 +643,8 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .darwin => options.switch_target = .darwin,
         .home_manager => options.switch_target = .home_manager,
         .activate_toplevel => options.activate_toplevel = v0.?,
+        .target_host => options.target_host = v0.?,
+        .use_remote_sudo => options.use_remote_sudo = true,
 
         // Accept decimal or `0x` hex (disasm prints ids in hex).
         .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 0) catch return error.InvalidChunkId,
