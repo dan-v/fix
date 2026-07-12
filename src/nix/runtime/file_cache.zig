@@ -138,6 +138,24 @@ pub const FileCache = struct {
         return contents;
     }
 
+    /// Seed the cache so `path` resolves to `contents` as a regular file,
+    /// without touching the host filesystem. Used to make a fixed-output store
+    /// path readable in storeless eval — its bytes are already known from the
+    /// fetch — so `builtins.readFile`/`readFileType` on a `fetchurl` result
+    /// behave as they would against Nix's realized store. A no-op if the entry
+    /// is already populated.
+    pub fn provideRegular(self: *FileCache, path: []const u8, contents: []const u8) !void {
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
+        if (entry.contents != null) return;
+        const owned = try self.allocator.dupe(u8, contents);
+        entry.contents = owned;
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.kind = .regular;
+    }
+
     pub fn fileType(self: *FileCache, path: []const u8) !FileKind {
         const entry = try self.entryFor(path);
         entry.mu.lock();

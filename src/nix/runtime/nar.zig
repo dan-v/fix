@@ -16,9 +16,46 @@ pub fn serialize(allocator: std.mem.Allocator, files: *FileCache, path: []const 
     errdefer out.deinit(allocator);
 
     try appendString(allocator, &out, "nix-archive-1");
-    try appendNode(allocator, files, &out, path, filter);
+    // Nix resolves the *root* source object before serializing: a top-level
+    // symlink is followed to its target, which is then dumped as that target's
+    // type (e.g. a directory). Only the root is resolved — symlinks encountered
+    // as directory entries are still serialized as symlink nodes (below).
+    const root = try resolveRootSymlink(allocator, files, path);
+    defer allocator.free(root);
+    try appendNode(allocator, files, &out, root, filter);
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Follow a chain of symlinks at the *root* of a source path, returning the
+/// resolved path (caller owns it). Matches Nix: the top-level object of a
+/// `filterSource`/`builtins.path`/path-coercion ingest is resolved before
+/// serialization, while nested symlinks are left alone. A non-symlink root, a
+/// broken/dangling chain, or a symlink cycle falls back to the original path
+/// (so a dangling root still serializes as a symlink node, as before).
+fn resolveRootSymlink(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![]u8 {
+    const kind = files.fileType(path) catch return allocator.dupe(u8, path);
+    if (kind != .symlink) return allocator.dupe(u8, path);
+
+    var current = try allocator.dupe(u8, path);
+    errdefer allocator.free(current);
+    var depth: usize = 0;
+    while (depth < 256) : (depth += 1) {
+        const cur_kind = files.fileType(current) catch {
+            allocator.free(current);
+            return allocator.dupe(u8, path);
+        };
+        if (cur_kind != .symlink) return current;
+        const target = try files.readLink(current);
+        defer allocator.free(target);
+        const dir = std.fs.path.dirname(current) orelse "/";
+        const next = try std.fs.path.resolve(allocator, &.{ dir, target });
+        allocator.free(current);
+        current = next;
+    }
+    // Symlink cycle: give up and serialize the original as a symlink node.
+    allocator.free(current);
+    return allocator.dupe(u8, path);
 }
 
 pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![]u8 {
