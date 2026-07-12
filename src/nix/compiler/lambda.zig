@@ -18,6 +18,7 @@ const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
+const attrs_mod = @import("attrs.zig");
 const access = @import("access.zig");
 const control = @import("control.zig");
 const strictness = @import("strictness.zig");
@@ -313,6 +314,11 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
     var function_args: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer function_args.deinit(self.allocator);
     try function_args.ensureTotalCapacity(self.allocator, lambda.params.len);
+    // Source positions of the formals, so `unsafeGetAttrPos` can report where a
+    // parameter was declared. Only recorded when compiling a real file.
+    var function_arg_pos: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+    defer function_arg_pos.deinit(self.allocator);
+    const record_positions = self.source_path != null;
     for (lambda.params) |param| {
         const name = self.source[param.name.offset .. param.name.offset + param.name.len];
         const name_id = try self.intern.intern(name);
@@ -321,8 +327,16 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
             .name = name_id,
             .value = Value.boolVal(param.default != null),
         });
+        if (record_positions) {
+            const pos = try diagnostics.sourcePositionForOffset(self, param.name.offset);
+            try function_arg_pos.append(self.allocator, .{
+                .name = name_id,
+                .pos = .{ .file = try attrs_mod.sourceFileId(self), .line = pos.line, .column = pos.column },
+            });
+        }
     }
     try child_builder.setFunctionArgs(self.allocator, function_args.items);
+    if (function_arg_pos.items.len > 0) try child_builder.setFunctionArgPositions(self.allocator, function_arg_pos.items);
 
     // Binding cells are only needed when a formal's default references
     // another formal (mutually-recursive defaults, e.g. `{ a, b ? a }`):

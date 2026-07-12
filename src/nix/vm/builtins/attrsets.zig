@@ -225,6 +225,11 @@ pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
 
     const closure = try self.heap.getClosure(func.asObjectId());
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
+    // Carry the formals' source positions so unsafeGetAttrPos works on the
+    // result (Nix records a parameter's declaration site).
+    if (ch.function_arg_pos.len != 0) {
+        return Value.attrs(try self.heap.addAttrsWithPositions(ch.function_args, ch.function_arg_pos));
+    }
     return Value.attrs(try self.heap.addAttrs(ch.function_args));
 }
 

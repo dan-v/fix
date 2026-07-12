@@ -63,6 +63,10 @@ pub const Chunk = struct {
     scheduling: SchedulingHints = .{},
     /// Attrset function parameter metadata for builtins.functionArgs.
     function_args: []const AttrEntry = &.{},
+    /// Source positions of the function parameters (parallel data for
+    /// `builtins.functionArgs`), so `unsafeGetAttrPos` can report a formal's
+    /// location. Empty when the chunk was compiled without a source path.
+    function_arg_pos: []const AttrPosEntry = &.{},
     /// Attr-position records referenced by `attrs_new_named_pos_srt` ops.
     /// Kept OUT of the dispatched code stream (they were 16 bytes/entry
     /// inline — ~38% of all emitted bytecode on a NixOS eval, cold data read
@@ -99,6 +103,7 @@ pub const Chunk = struct {
         allocator.free(self.code);
         allocator.free(self.constants);
         allocator.free(self.function_args);
+        allocator.free(self.function_arg_pos);
         allocator.free(self.attr_pos);
         allocator.free(self.attr_names);
         allocator.free(self.capture_bytes);
@@ -240,6 +245,7 @@ pub const ChunkBuilder = struct {
     code: std.ArrayListUnmanaged(u8),
     constants: std.ArrayListUnmanaged(Value),
     function_args: std.ArrayListUnmanaged(AttrEntry),
+    function_arg_pos: std.ArrayListUnmanaged(AttrPosEntry) = .empty,
     source_map: std.ArrayListUnmanaged(Chunk.SourceMapEntry),
     /// Attr-position records collected by `emitBuildAttrsSorted` — carried
     /// onto `Chunk.attr_pos` at finish (see that field's doc).
@@ -308,6 +314,7 @@ pub const ChunkBuilder = struct {
         self.code.deinit(allocator);
         self.constants.deinit(allocator);
         self.function_args.deinit(allocator);
+        self.function_arg_pos.deinit(allocator);
         self.source_map.deinit(allocator);
         self.attr_pos.deinit(allocator);
         self.attr_names.deinit(allocator);
@@ -321,6 +328,7 @@ pub const ChunkBuilder = struct {
         self.code.clearRetainingCapacity();
         self.constants.clearRetainingCapacity();
         self.function_args.clearRetainingCapacity();
+        self.function_arg_pos.clearRetainingCapacity();
         self.attr_pos.clearRetainingCapacity();
         self.attr_names.clearRetainingCapacity();
         self.capture_bytes.clearRetainingCapacity();
@@ -393,6 +401,11 @@ pub const ChunkBuilder = struct {
         try self.function_args.appendSlice(allocator, args);
     }
 
+    pub fn setFunctionArgPositions(self: *ChunkBuilder, allocator: std.mem.Allocator, positions: []const AttrPosEntry) !void {
+        self.function_arg_pos.clearRetainingCapacity();
+        try self.function_arg_pos.appendSlice(allocator, positions);
+    }
+
     pub fn addSourceMapEntry(self: *ChunkBuilder, allocator: std.mem.Allocator, start: usize, end: usize, span: Chunk.SourceSpan) !void {
         if (start >= end) return;
         try self.source_map.append(allocator, .{
@@ -425,6 +438,8 @@ pub const ChunkBuilder = struct {
         errdefer allocator.free(constants);
         const function_args = try allocator.dupe(AttrEntry, self.function_args.items);
         errdefer allocator.free(function_args);
+        const function_arg_pos = try allocator.dupe(AttrPosEntry, self.function_arg_pos.items);
+        errdefer allocator.free(function_arg_pos);
         const attr_pos = try allocator.dupe(AttrPosEntry, self.attr_pos.items);
         errdefer allocator.free(attr_pos);
         const attr_names = try allocator.dupe(types.InternId, self.attr_names.items);
@@ -448,6 +463,7 @@ pub const ChunkBuilder = struct {
                 .strict_via_upvalue = if (local_count == 1) self.strict_via_upvalue else null,
             },
             .function_args = function_args,
+            .function_arg_pos = function_arg_pos,
             .attr_pos = attr_pos,
             .attr_names = attr_names,
             .source_map = source_map,
@@ -935,7 +951,7 @@ pub const ChunkRegistry = struct {
     // maps instead — those are keyed by id after registration and never
     // perturb dedup.
     comptime {
-        const chunk_field_count = 12;
+        const chunk_field_count = 13;
         if (std.meta.fields(Chunk).len != chunk_field_count)
             @compileError("Chunk changed shape: update contentHash + contentEql (or route diagnostic-only metadata through the registry sidecar), then adjust chunk_field_count.");
     }
@@ -957,6 +973,7 @@ pub const ChunkRegistry = struct {
         h.update(std.mem.sliceAsBytes(chunk.attr_names));
         h.update(chunk.capture_bytes);
         h.update(std.mem.sliceAsBytes(chunk.function_args));
+        h.update(std.mem.sliceAsBytes(chunk.function_arg_pos));
         var fp: [4]u32 = .{ @intCast(chunk.attr_pos.len), @intCast(chunk.source_map.len), 0, 0 };
         if (chunk.source_map.len > 0) {
             fp[2] = chunk.source_map[0].span.line;
@@ -996,6 +1013,10 @@ pub const ChunkRegistry = struct {
             if (x.name != y.name or x.pos.file != y.pos.file or x.pos.line != y.pos.line or x.pos.column != y.pos.column) return false;
         }
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(a.function_args), std.mem.sliceAsBytes(b.function_args))) return false;
+        if (a.function_arg_pos.len != b.function_arg_pos.len) return false;
+        for (a.function_arg_pos, b.function_arg_pos) |x, y| {
+            if (x.name != y.name or x.pos.file != y.pos.file or x.pos.line != y.pos.line or x.pos.column != y.pos.column) return false;
+        }
         if (!std.mem.eql(u8, a.capture_bytes, b.capture_bytes)) return false;
         if (a.source_map.len != b.source_map.len) return false;
         for (a.source_map, b.source_map) |x, y| {
