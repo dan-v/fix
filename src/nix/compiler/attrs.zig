@@ -683,7 +683,6 @@ fn emitRecursiveAttrObject(self: *Compiler, groups: []const AttrEntryGroup) anye
 pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrEntryView, tails: []const AttrEntryView) !void {
     std.debug.assert(leaves.len > 0);
     std.debug.assert(leaves[0].expr.tag == .attr_set);
-    const first_attr_set = leaves[0].expr.data.attr_set;
 
     var merged_count: usize = tails.len;
     for (leaves) |leaf| {
@@ -708,7 +707,30 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
         };
     }
 
-    try compileNodeAttrEntriesThunk(self, merged, first_attr_set.recursive);
+    // The merged set is recursive iff the FIRST definition (in source order) is
+    // a `rec` leaf — Nix's deprecated `rec-set-merges`. So
+    // `{ foo = rec { x=1; y=2; }; foo.bar = y; }` stays recursive (`bar = y` sees
+    // 2), while `{ foo.bar = 1; foo = rec { x=1; y=x; }; }` — where the implicit
+    // non-rec `foo.bar` comes first — becomes non-recursive, so `y = x` errors.
+    // A leaf's source position is its own name atom; a tail's is its outer
+    // origin segment (the `foo` of `foo.bar`).
+    var recursive = false;
+    var earliest: u32 = std.math.maxInt(u32);
+    for (leaves) |leaf| {
+        const off = leaf.path[0].offset;
+        if (off < earliest) {
+            earliest = off;
+            recursive = leaf.expr.data.attr_set.recursive;
+        }
+    }
+    for (tails) |tail| {
+        const off = if (tail.origin) |o| o.offset else tail.path[0].offset;
+        if (off < earliest) {
+            earliest = off;
+            recursive = false;
+        }
+    }
+    try compileNodeAttrEntriesThunk(self, merged, recursive);
 }
 
 fn duplicateExtendedLeaf(group: AttrEntryGroup, leaf: AttrEntryView) ?AttrEntryView {
