@@ -4,6 +4,7 @@
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const numeric = @import("runtime").numeric;
+const int_mod = @import("runtime").int;
 const vm_force = @import("../force.zig");
 const vm_equality = @import("../equality.zig");
 const vm_trace = @import("../trace.zig");
@@ -42,12 +43,27 @@ pub fn builtinBitXor(self: anytype, left: Value, right: Value) !Value {
 
 pub fn builtinFloor(self: anytype, arg: Value) !Value {
     const v = try vm_force.forceValue(self, arg);
-    return numeric.floor(self.heap, v) catch |err| return floorCeilError(self, err, v, "floor");
+    return numeric.floor(self.heap, v) catch |err| return floorCeilResult(self, err, v, "floor");
 }
 
 pub fn builtinCeil(self: anytype, arg: Value) !Value {
     const v = try vm_force.forceValue(self, arg);
-    return numeric.ceil(self.heap, v) catch |err| return floorCeilError(self, err, v, "ceil");
+    return numeric.ceil(self.heap, v) catch |err| return floorCeilResult(self, err, v, "ceil");
+}
+
+/// On the integer-corruption error: with the `floor-ceil-corrupt-integers`
+/// deprecated feature enabled, return the (corrupted) f64-round-tripped value
+/// as Nix historically did; otherwise raise the diagnostic error.
+fn floorCeilResult(self: anytype, err: anyerror, v: Value, name: []const u8) anyerror!Value {
+    if (err == error.FloorCeilCorruptsInteger and self.allow_floor_ceil_corrupt) {
+        const i: i64 = switch (v.kind()) {
+            .int => v.asInt(),
+            .boxed_int => try self.heap.getBoxedInt(v.asObjectId()),
+            else => return err,
+        };
+        if (numeric.intRoundTripCorruption(i)) |became| return int_mod.make(self.heap, became);
+    }
+    return floorCeilError(self, err, v, name);
 }
 
 /// Attach Nix's diagnostic for the `floor`/`ceil` integer-corruption error

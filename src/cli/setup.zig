@@ -84,6 +84,11 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
 
     ev.pipe_operators_enabled = features.contains(.pipe_operators);
     ev.flakes_enabled = features.contains(.flakes);
+    ev.coerce_integers_enabled = features.contains(.coerce_integers);
+    // Deprecated features (Lix `--extra-deprecated-features`) re-permit
+    // behaviour fix rejects by default.
+    ev.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
+    ev.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
     // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
     if (settings.getUint("max-call-depth")) |n|
         ev.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));

@@ -465,6 +465,16 @@ pub const Evaluator = struct {
     /// Propagated to each VM in `initVm`; the CLI overrides it from
     /// `--option max-call-depth N`. See `vm.Frame.call_depth`.
     max_call_depth: u32 = types.DEFAULT_MAX_CALL_DEPTH,
+    /// `coerce-integers` experimental feature (Lix): allow coercing ints/bools
+    /// to strings in `${…}`/`+`. Propagated to each VM. Default false.
+    coerce_integers_enabled: bool = false,
+    /// `nul-bytes` deprecated feature: when true, a NUL in a string literal
+    /// truncates at the NUL rather than erroring. Default false (error).
+    allow_nul_bytes: bool = false,
+    /// `floor-ceil-corrupt-integers` deprecated feature: when true,
+    /// `floor`/`ceil` of an integer that loses precision as f64 returns the
+    /// corrupted value rather than erroring. Default false (error).
+    allow_floor_ceil_corrupt: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -994,6 +1004,7 @@ pub const Evaluator = struct {
         compiler.base_path = base_path;
         compiler.source_path = source_path;
         compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
+        compiler.allow_nul_bytes = self.allow_nul_bytes;
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
         // their file in the disasm sidecar.
@@ -1388,6 +1399,8 @@ pub const Evaluator = struct {
         vm.fetch_tree_enabled = self.fetch_tree_enabled;
         vm.flakes_enabled = self.flakes_enabled;
         vm.max_call_depth = self.max_call_depth;
+        vm.coerce_integers_enabled = self.coerce_integers_enabled;
+        vm.allow_floor_ceil_corrupt = self.allow_floor_ceil_corrupt;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Attach the debugger only when the CLI installed a UI: every VM (main

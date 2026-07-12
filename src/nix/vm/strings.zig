@@ -8,6 +8,7 @@ const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
+const int_mod = @import("runtime").int;
 const source_paths = @import("derivation").source_path;
 
 const closures = @import("closures.zig");
@@ -144,7 +145,7 @@ pub fn concatStackStrings(self: *VM, count: u32) !Value {
 
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        self.stack[base + i] = try coerceLanguageStringValue(self, self.stack[base + i]);
+        self.stack[base + i] = try coerceLanguageStringValueOpt(self, self.stack[base + i], true);
     }
     // Single part: the coerced value is the result — its text is already
     // interned, so re-interning (what `"" + x` pays) would be a no-op probe.
@@ -247,6 +248,13 @@ pub fn concatStackPath(self: *VM, count: u32) !Value {
 }
 
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
+    return coerceLanguageStringValueOpt(self, value, false);
+}
+
+/// String coercion for `+`/`str_cat`. `allow_int` enables the `coerce-integers`
+/// experimental feature — but ONLY on the `${…}` interpolation path (Nix does
+/// not coerce integers for binary `+` or `substring`).
+pub fn coerceLanguageStringValueOpt(self: *VM, value: Value, allow_int: bool) !Value {
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);
     const forced = try force.forceValue(self, value);
@@ -254,10 +262,15 @@ pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
     return switch (forced.kind()) {
         .string, .string_context => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
+        .int, .boxed_int => if (allow_int and self.coerce_integers_enabled) blk: {
+            const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(forced, self.heap)});
+            defer self.allocator.free(s);
+            break :blk Value.string(try self.intern.intern(s));
+        } else trace.coercionError(self, forced),
         .attrs => blk: {
             const to_string_id = try self.intern.intern("__toString");
             if (self.heap.getAttrValue(forced.asObjectId(), to_string_id)) |to_string| {
-                break :blk try coerceLanguageStringValue(self, try closures.callValue(self, try force.forceValue(self, to_string), forced));
+                break :blk try coerceLanguageStringValueOpt(self, try closures.callValue(self, try force.forceValue(self, to_string), forced), allow_int);
             } else |err| switch (err) {
                 error.MissingAttribute => {},
                 else => return err,
@@ -268,7 +281,7 @@ pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
                 error.MissingAttribute => return trace.coercionError(self, forced),
                 else => return err,
             };
-            break :blk try coerceLanguageStringValue(self, out_path);
+            break :blk try coerceLanguageStringValueOpt(self, out_path, allow_int);
         },
         else => trace.coercionError(self, forced),
     };

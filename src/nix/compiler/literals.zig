@@ -85,15 +85,32 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
     var ops_emitted: u32 = 0;
     var first_is_interp = false;
     var single_is_text = false;
+    var nul_truncated = false;
     for (parsed.parts) |part| {
         switch (part) {
             .text => |text| {
-                if (text.bytes.len == 0) continue;
-                const id = try self.intern.intern(text.bytes);
+                var bytes = text.bytes;
+                // A NUL byte is a compile error unless the `nul-bytes`
+                // deprecated feature is on, in which case the string is
+                // truncated at the NUL (fix/Nix strings are NUL-terminated).
+                if (std.mem.indexOfScalar(u8, bytes, 0)) |nul_idx| {
+                    if (!self.allow_nul_bytes) {
+                        try diagnostics.reportCompileError(self, atom.offset, atom.len, "NUL bytes (`\\0`) are currently not well supported, because internally strings are NUL-terminated, which may lead to unexpected truncation. Use --extra-deprecated-features nul-bytes to disable this error.");
+                        return error.NulByteInString;
+                    }
+                    bytes = bytes[0..nul_idx];
+                    nul_truncated = true;
+                }
+                if (bytes.len == 0) {
+                    if (nul_truncated) break;
+                    continue;
+                }
+                const id = try self.intern.intern(bytes);
                 try self.builder.emitConstant(self.allocator, Value.string(id));
                 parts += 1;
                 total_parts += 1;
                 single_is_text = total_parts == 1;
+                if (nul_truncated) break;
             },
             .interpolation => |span| {
                 if (total_parts == 0) first_is_interp = true;

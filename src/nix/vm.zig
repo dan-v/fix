@@ -370,6 +370,11 @@ pub const VM = struct {
     /// Logical call-depth cap (Nix's `max-call-depth`, default 10000). See
     /// `Frame.call_depth`. Set per-eval from `Evaluator.max_call_depth`.
     max_call_depth: u32,
+    /// `coerce-integers` experimental feature — allow int/bool→string coercion.
+    coerce_integers_enabled: bool = false,
+    /// `floor-ceil-corrupt-integers` deprecated feature — `floor`/`ceil` of a
+    /// precision-losing integer returns the corrupted value instead of erroring.
+    allow_floor_ceil_corrupt: bool = false,
 
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`

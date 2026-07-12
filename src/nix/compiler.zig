@@ -77,6 +77,9 @@ pub const Compiler = struct {
     /// $HOME, for expanding `~/…` home-relative path literals at compile time
     /// (Nix resolves the tilde at parse time). Null when unset in the env.
     home_dir: ?[]const u8,
+    /// `nul-bytes` deprecated feature: when true a NUL in a string literal
+    /// truncates at the NUL; when false (default) it is a compile error.
+    allow_nul_bytes: bool = false,
     source_file_id: ?InternId,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
@@ -207,6 +210,7 @@ pub const Compiler = struct {
         child.base_path = self.base_path;
         child.source_path = self.source_path;
         child.home_dir = self.home_dir;
+        child.allow_nul_bytes = self.allow_nul_bytes;
         child.source_file_id = self.source_file_id;
         // Qualified-name tree: the first child spun up for a named bound value
         // claims the pending name as a child node of this compiler's name and

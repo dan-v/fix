@@ -22,16 +22,56 @@ pub const ExperimentalFeature = enum {
     pipe_operators,
     fetch_tree,
     flakes,
+    coerce_integers,
 
     pub fn fromName(name: []const u8) ?ExperimentalFeature {
         if (std.mem.eql(u8, name, "pipe-operators")) return .pipe_operators;
         if (std.mem.eql(u8, name, "fetch-tree")) return .fetch_tree;
         if (std.mem.eql(u8, name, "flakes")) return .flakes;
+        if (std.mem.eql(u8, name, "coerce-integers")) return .coerce_integers;
         return null;
     }
 };
 
 pub const ExperimentalFeatures = std.EnumSet(ExperimentalFeature);
+
+/// Nix-style deprecated features (Lix `--extra-deprecated-features`). Enabling
+/// one re-permits behaviour that fix rejects by default. Names match Lix.
+pub const DeprecatedFeature = enum {
+    nul_bytes,
+    floor_ceil_corrupt_integers,
+    // Accepted for compatibility but not gated — fix is already lenient here,
+    // so enabling them is a no-op (the corresponding syntax/behaviour always
+    // works). Kept so `--extra-deprecated-features <name>` doesn't error.
+    floating_without_zero,
+    cr_line_endings,
+    or_as_identifier,
+    rec_set_merges,
+
+    pub fn fromName(name: []const u8) ?DeprecatedFeature {
+        if (std.mem.eql(u8, name, "nul-bytes")) return .nul_bytes;
+        if (std.mem.eql(u8, name, "floor-ceil-corrupt-integers")) return .floor_ceil_corrupt_integers;
+        if (std.mem.eql(u8, name, "floating-without-zero")) return .floating_without_zero;
+        if (std.mem.eql(u8, name, "cr-line-endings")) return .cr_line_endings;
+        if (std.mem.eql(u8, name, "or-as-identifier")) return .or_as_identifier;
+        if (std.mem.eql(u8, name, "rec-set-merges")) return .rec_set_merges;
+        return null;
+    }
+};
+
+pub const DeprecatedFeatures = std.EnumSet(DeprecatedFeature);
+
+fn parseDeprecatedList(set: *DeprecatedFeatures, list: []const u8) !void {
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |name| {
+        // Unknown names are accepted as no-ops: many Lix deprecated features
+        // (rec-set-overrides, ancient-let, rec-set-dynamic-attrs, …) name
+        // behaviour fix implements unconditionally, so enabling them changes
+        // nothing. Only the gated ones (nul-bytes, floor-ceil-corrupt-integers)
+        // matter.
+        if (DeprecatedFeature.fromName(name)) |feat| set.insert(feat);
+    }
+}
 
 /// Parse a space-separated feature list into `set`, inserting each recognized
 /// feature. Unknown names are an error (Nix warns; we reject to keep the CLI's
@@ -104,6 +144,10 @@ pub const Options = struct {
     /// value is the base and `--extra-experimental-features` appends to it (Nix
     /// precedence). See `setup.configure`.
     experimental_features_reset: bool = false,
+    /// Deprecated features enabled via `--extra-deprecated-features` /
+    /// `--deprecated-features` (Lix compat).
+    deprecated_features: DeprecatedFeatures = .{},
+    deprecated_features_reset: bool = false,
     /// `--option NAME VALUE`: nix.conf setting overrides, in argv order.
     /// Borrowed from argv; the list backing is owned (caller frees via `deinit`).
     option_overrides: std.ArrayListUnmanaged(OptionOverride) = .empty,
@@ -267,6 +311,8 @@ const Opt = enum {
     // Settings / features.
     experimental_features,
     extra_experimental_features,
+    deprecated_features,
+    extra_deprecated_features,
     option,
     // Build outputs / links.
     no_link,
@@ -401,6 +447,8 @@ const specs = [_]Spec{
 
     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
     .{ .id = .extra_experimental_features, .long = "--extra-experimental-features", .arg = .req, .metavar = "FEATS", .help = "like --experimental-features, but adds to the set" },
+    .{ .id = .deprecated_features, .long = "--deprecated-features", .arg = .req, .metavar = "FEATS", .help = "space-separated deprecated features to re-enable,\nreplacing the current set (available: nul-bytes,\nfloor-ceil-corrupt-integers)" },
+    .{ .id = .extra_deprecated_features, .long = "--extra-deprecated-features", .arg = .req, .metavar = "FEATS", .help = "like --deprecated-features, but adds to the set" },
     .{ .id = .option, .long = "--option", .arg = .req2, .metavar = "NAME VALUE", .help = "override a nix.conf setting" },
 
     .{ .id = .out_link, .short = "-o", .long = "--out-link", .arg = .req, .metavar = "NAME", .help = "name of the result symlink (default: result)", .show_in = &.{.build} },
@@ -597,6 +645,12 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
             try parseFeatureList(&options.experimental_features, v0.?);
         },
         .extra_experimental_features => try parseFeatureList(&options.experimental_features, v0.?),
+        .deprecated_features => {
+            options.deprecated_features = .{};
+            options.deprecated_features_reset = true;
+            try parseDeprecatedList(&options.deprecated_features, v0.?);
+        },
+        .extra_deprecated_features => try parseDeprecatedList(&options.deprecated_features, v0.?),
         .option => try options.option_overrides.append(allocator, .{ .name = v0.?, .value = v1.? }),
 
         .no_link => options.no_link = true,

@@ -47,14 +47,20 @@ SUPPORTED_FLAGS = {
     "-I", "--include", "--xml", "--json", "--strict",
     "--expr", "-e", "--file",
 }
-# Flags that are Lix/CppNix-specific knobs with no fix equivalent and no bearing
-# on the value produced; drop them silently.
-DROP_FLAGS_WITH_ARG = {"--extra-deprecated-features", "--deprecated-features"}
 DROP_FLAGS_NO_ARG = {"--no-warning"}
 
 # Experimental features fix implements (see `fix eval --help`). A test that
 # requires anything else is skipped as unsupported rather than failed.
-FIX_EXPERIMENTAL_FEATURES = {"pipe-operators", "fetch-tree", "flakes"}
+FIX_EXPERIMENTAL_FEATURES = {"pipe-operators", "fetch-tree", "flakes", "coerce-integers"}
+
+# Deprecated features fix honors (Lix `--extra-deprecated-features`). fix accepts
+# the whole Lix set; only nul-bytes and floor-ceil-corrupt-integers actually gate
+# behaviour, the rest are no-ops (fix is already lenient). Passed through so the
+# deprecated-syntax cases are DRIVEN rather than dropped.
+FIX_DEPRECATED_FEATURES = {
+    "nul-bytes", "floor-ceil-corrupt-integers", "floating-without-zero",
+    "cr-line-endings", "or-as-identifier", "rec-set-merges",
+}
 
 
 class Colors:
@@ -142,7 +148,11 @@ def translate_flags(flags: list[str]) -> tuple[list[str], str | None]:
     i = 0
     while i < len(flags):
         f = flags[i]
-        if f in DROP_FLAGS_WITH_ARG:
+        if f in ("--extra-deprecated-features", "--deprecated-features"):
+            # Pass through verbatim. fix accepts the whole Lix deprecated-feature
+            # set (gating only nul-bytes / floor-ceil-corrupt-integers; the rest
+            # name behaviour fix already implements, so they are no-ops).
+            out += [f, flags[i + 1]]
             i += 2
             continue
         if f in DROP_FLAGS_NO_ARG:
