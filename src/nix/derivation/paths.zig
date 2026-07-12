@@ -34,9 +34,11 @@ pub fn fixedOutputPath(
 ) ![]u8 {
     const output_name = try outputPathName(allocator, drv_name, output);
     defer allocator.free(output_name);
-    // Nix only takes the "source"-type shortcut for recursive *sha256*; every
-    // other fixed-output case (flat, or recursive md5/sha1/sha512) hashes the
-    // `fixed:out:r?:<algo>:<hex>:` fingerprint under type "output:out".
+    // Nix's `makeFixedOutputPath` only takes the direct `source:sha256:<hash>`
+    // shortcut for recursive (NAR) SHA-256; every other fixed-output case —
+    // flat, or recursive with a non-SHA-256 algo (e.g. `r:sha1`) — hashes a
+    // `fixed:out:<algo>:<hex>:` fingerprint into an `output:out` path.
+    // `hash_algo` already carries the `r:` prefix for recursive outputs.
     if (std.mem.eql(u8, hash_algo, "r:sha256")) {
         return storePathFromInnerDigest(allocator, store_dir, "source", hash, output_name);
     }

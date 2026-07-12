@@ -438,35 +438,63 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
 
+    // Fast path: an explicit `sha256`/`hash` fixes the flat fixed-output store
+    // path from name+hash, so Nix returns it (as a context string) without ever
+    // dereferencing the URL. No network needed.
+    if (try hashedFodPath(self, arg, spec.name, false)) |path| {
+        defer self.allocator.free(path);
+        return contextStringWithPath(self, try self.intern.intern(path));
+    }
+
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
     defer result.deinit(self.fetchers.allocator);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
     defer self.allocator.free(path);
-    // `builtins.fetchurl` always yields a fixed-output store path carrying an
-    // opaque store-path reference in its string context, like Nix — so
-    // `getContext` sees `{ <storepath> = { path = true; }; }` and using the
-    // result as a `src` records it. (Unlike the tree fetchers, the flat path is
-    // cheap to compute even when store writes are off.)
+    // The flat fixed-output store path is fully determined by the fetched
+    // content's hash, so return it (with context) even in plain eval — matching
+    // Nix, whose `fetchurl` always yields the store path with `{ path = true }`.
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-/// Realize a fetched single file to its flat (`fixed:sha256`) store path — like
-/// Nix's fetchurl. The path is always computed (it names the store object);
-/// the content is only written to a real store when store writes are enabled
-/// (`instantiateFlat` is itself gated). Returns the store path (owned by
-/// `self.allocator`).
+/// If `arg` is an attrset carrying an explicit `sha256`, return the
+/// deterministic fixed-output store path it names — flat (`recursive=false`,
+/// like `fetchurl`) or recursive/NAR (`recursive=true`, like `fetchTarball`) —
+/// computed from `name`+hash, without fetching. Matches Nix, which returns this
+/// path lazily and never touches the URL when the hash is known upfront. Null
+/// when there is no hash attr (caller falls back to the real fetch).
+fn hashedFodPath(self: anytype, arg: Value, name: []const u8, recursive: bool) !?[]u8 {
+    const value = try vm_force.forceValue(self, arg);
+    if (!value.isAttrs()) return null;
+    const id = value.asObjectId();
+    // Only `sha256` fixes the path here — `builtins.fetchurl`/`fetchTarball`
+    // reject a bare `hash` attr (see the `invalid-attrs` conformance case).
+    const hash = (try optionalStringAttr(self, id, "sha256")) orelse return null;
+    defer self.allocator.free(hash);
+    const hex = try derivation.hashToBase16(self.allocator, "sha256", hash);
+    defer self.allocator.free(hex);
+    const algo = if (recursive) "r:sha256" else "sha256";
+    return try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", algo, hex);
+}
+
+/// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
+/// store path — like Nix's fetchurl. Under store writes the bytes are added to
+/// the real store; in plain eval the store path is still returned, with the
+/// fetched content seeded into the file cache so reads of it succeed.
+/// Returns the store path (owned by `self.allocator`).
 fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8, name: []const u8) ![]u8 {
+    // The flat store path is determined by the content hash regardless of store
+    // writes; only the store instantiation is gated on them.
     const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", "sha256", hash_hex);
     errdefer self.allocator.free(store_path);
     if (self.derivations.store_writes_enabled) {
         try self.derivations.instantiateFlat(store_path, try self.files.readFile(cache_path));
     } else {
-        // Storeless eval: the store path names the object but isn't on disk.
-        // Seed the cache from the fetched bytes so `readFile`/`readFileType`
-        // on the result still work (Nix's store would have realized it).
-        try self.files.provideRegular(store_path, try self.files.readFile(cache_path));
+        // Plain eval has no store to materialize the file; seed the cache so
+        // `readFile`/`import` on the returned store path still work, as they do
+        // in Nix (where the fetched content is added to the store).
+        try self.files.registerFile(store_path, try self.files.readFile(cache_path));
     }
     return store_path;
 }
@@ -518,6 +546,16 @@ fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]con
 }
 
 pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
+    // Fast path: an explicit `sha256`/`hash` fixes the recursive (NAR)
+    // fixed-output store path from the tree name (default "source") + hash, so
+    // Nix returns it (as a context string) without fetching the archive.
+    const tree_name = try tarballTreeName(self, arg);
+    defer self.allocator.free(tree_name);
+    if (try hashedFodPath(self, arg, tree_name, true)) |path| {
+        defer self.allocator.free(path);
+        return contextStringWithPath(self, try self.intern.intern(path));
+    }
+
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
 
@@ -526,9 +564,7 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
     defer self.fetchers.allocator.free(path);
     // The unpacked tree is named "source" by default (Nix), independent of the
-    // archive's URL basename which named the download.
-    const tree_name = try tarballTreeName(self, arg);
-    defer self.allocator.free(tree_name);
+    // archive's URL basename which named the download (`tree_name`, above).
     const out = try ingestFetchedTree(self, path, tree_name, "", null);
     defer out.deinit(self.allocator);
     return fetchedPathValue(self, out.out_path);
