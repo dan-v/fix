@@ -104,6 +104,7 @@ fn compileMixedRecursiveAttrSet(self: *Compiler, entries: []const Node.AttrSetEn
     try declareRecursiveAttrLocals(self, grouped.groups);
     try compileRecursiveAttrCells(self, grouped.groups);
     try emitRecursiveAttrObject(self, grouped.groups);
+    try maybeEmitRecursiveOverrides(self, grouped.groups);
 
     for (entries) |entry| {
         if (!isDynamicAttrEntry(self, entry)) continue;
@@ -255,6 +256,7 @@ fn compileMixedRecursiveAttrEntryViews(self: *Compiler, entries: []const AttrEnt
     try declareRecursiveAttrLocals(self, grouped.groups);
     try compileRecursiveAttrCells(self, grouped.groups);
     try emitRecursiveAttrObject(self, grouped.groups);
+    try maybeEmitRecursiveOverrides(self, grouped.groups);
 
     for (entries) |entry| {
         if (!isDynamicAttrEntryView(self, entry)) continue;
@@ -536,6 +538,7 @@ fn compileRecursiveAttrEntries(self: *Compiler, entries: []const AttrEntryView) 
     try declareRecursiveAttrLocals(self, grouped.groups);
     try compileRecursiveAttrCells(self, grouped.groups);
     try emitRecursiveAttrObject(self, grouped.groups);
+    try maybeEmitRecursiveOverrides(self, grouped.groups);
     scope.endScope(self);
 }
 
@@ -596,6 +599,22 @@ fn compilePlainAttrGroup(
     self.armName(group.name_id);
     try access.compileContainerValue(self, body, .{ .raw_identifier = true });
     try appendAttrPosition(self, positions, group.first, group.name_id);
+}
+
+/// If this recursive set statically declares a top-level `__overrides`
+/// attribute, emit the runtime override-application step over the
+/// just-built rec object (on the stack). No-op for the overwhelmingly
+/// common case (no `__overrides` key), so plain rec sets pay nothing.
+/// Nested `__overrides` (e.g. `rec { a.__overrides.a = 1; }`) is NOT a
+/// top-level key here, so it correctly does not trigger.
+fn maybeEmitRecursiveOverrides(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {
+    const overrides_id = try self.intern.intern("__overrides");
+    for (groups) |group| {
+        if (group.name_id == overrides_id) {
+            try emit.emitApplyOverrides(self, overrides_id);
+            return;
+        }
+    }
 }
 
 fn declareRecursiveAttrLocals(self: *Compiler, groups: []const AttrEntryGroup) anyerror!void {

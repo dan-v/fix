@@ -40,6 +40,7 @@ const force = @import("force.zig");
 const objects = @import("objects.zig");
 const stack = @import("stack.zig");
 const strings = @import("strings.zig");
+const trace = @import("trace.zig");
 const trace_log = @import("trace_log.zig");
 
 const VM = vm_mod.VM;
@@ -802,6 +803,77 @@ fn opGetAttrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth
     return dispatch(vm, frame, code, ip + 4, stop_depth);
 }
 
+fn opApplyOverrides(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const overrides_name: InternId = readU32(code, ip);
+    // The freshly-built rec object stays on the stack (GC root) across every
+    // force/allocation below; we replace it in place at the end.
+    const built = vm.stack[vm.sp - 1];
+    if (!built.isAttrs()) return error.TypeError; // rec object is always attrs
+    const built_id = built.asObjectId();
+
+    // Force `__overrides` to WHNF; it must be a set. (Forcing to WHNF yields
+    // the outer attrset without forcing its members, so recursive sibling
+    // cells stay unresolved here — exactly what the re-point below needs.)
+    const ov_raw = try vm.heap.getAttrValue(built_id, overrides_name);
+    const ov = force.forceValue(vm, ov_raw) catch |err| {
+        trace.pushErrorContext(vm, "while evaluating the `__overrides` attribute") catch {};
+        return err;
+    };
+    if (!ov.isAttrs()) {
+        const e = trace.typeErrorExpected(vm, "a set", ov);
+        trace.pushErrorContext(vm, "while evaluating the `__overrides` attribute") catch {};
+        return e;
+    }
+
+    try applyOverrides(vm, built_id, ov.asObjectId());
+    return dispatch(vm, frame, code, ip + 4, stop_depth);
+}
+
+/// Apply the forced `__overrides` set (`ov_id`) to the rec object
+/// (`built_id`, on the stack top). For an override name that already
+/// exists in the rec set, re-point its shared binding cell so both the
+/// built attr and any recursive sibling that captured that cell observe
+/// the override; for a new name, collect it and rebuild the attrset with
+/// the additions. Mirrors Nix's `ExprAttrs::eval` `__overrides` branch.
+fn applyOverrides(vm: *VM, built_id: types.ObjectId, ov_id: types.ObjectId) !void {
+    const ov_entries = try vm.heap.getAttrs(ov_id);
+
+    var new_entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer new_entries.deinit(vm.allocator);
+
+    // Read-only walk of `ov_entries` (no attr-storage mutation inside), so
+    // the slice stays valid; `publishCellBinding` only mutates thunks.
+    for (ov_entries) |entry| {
+        const existing = try vm.heap.getAttrValueOpt(built_id, entry.name);
+        if (existing) |cell_val| {
+            // Existing rec attr: its stored value IS the shared binding cell
+            // (loc_grab pushed the cell thunk into the object). Re-point the
+            // cell so already-captured sibling thunks resolve to the override.
+            if (cell_val.isThunk()) {
+                const th = vm.heap.getThunkAssumeValid(cell_val.asObjectId());
+                if (vm.solo) th.publishCellBindingSolo(entry.value) else th.publishCellBinding(entry.value);
+                vm.heap.gcRecordEdge(cell_val.asObjectId(), entry.value); // old→young barrier
+            }
+        } else {
+            try new_entries.append(vm.allocator, entry);
+        }
+    }
+
+    // No new names: the shared-cell re-points already made `built` reflect
+    // every override, so leave it (and its source positions) untouched.
+    if (new_entries.items.len == 0) return;
+
+    // Rebuild with the additions. Copy the built entries out first: `addAttrs`
+    // appends to the same heap attr storage and may move the `getAttrs` slice.
+    var all: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer all.deinit(vm.allocator);
+    try all.appendSlice(vm.allocator, try vm.heap.getAttrs(built_id));
+    try all.appendSlice(vm.allocator, new_entries.items);
+    const merged_id = try vm.heap.addAttrs(all.items);
+    vm.stack[vm.sp - 1] = Value.attrs(merged_id);
+}
+
 fn opGetAttrDynamic(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     // [attrs, name] both stay on the stack across the forces.
@@ -1214,6 +1286,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .with_lookup => opLookupWith,
         .with_lookup_w => opLookupWithLong,
         .thunk_defer => opDeferAttrValue,
+        .attrs_apply_overrides => opApplyOverrides,
         .ret => opRet,
         .halt => opHalt,
         .breakpoint => opBreakpoint,
