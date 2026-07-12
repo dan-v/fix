@@ -168,52 +168,13 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
     defer if (source.owned) ev.allocator.free(source.text);
 
     ev.enableStoreWrites();
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
-    var torn = false;
-    defer if (!torn) progress.deinit(false);
-    if (term.show_progress) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin(run.sourceLabel(source_arg));
-    ev.startProgressSampler();
 
-    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+    const realized = switch (try cli.realize(allocator, init.io, &ev, term, options.*, source_arg, source, false)) {
+        .failed => |code| return code,
+        .ok => |r| r,
     };
-    const drv_path = (ev.derivationDrvPath(result) catch |err| {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
-    }) orelse {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        std.debug.print("error: that did not evaluate to a derivation (is it a system configuration?)\n", .{});
-        return 1;
-    };
-    const out_path_borrowed = (try ev.derivationOutPath(result)) orelse drv_path;
-
-    ev.stopProgressSampler();
-
-    const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
-    defer allocator.free(derived);
-    // `out_path` borrows the intern table, which the release below frees.
-    const out_path = try allocator.dupe(u8, out_path_borrowed);
-    defer allocator.free(out_path);
-
-    // Drop the language heap before the (minutes-long) build phase; see build.zig.
-    ev.releaseEvalState();
-
-    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
-    const build_sink = if (term.show_progress) build_progress.sink() else null;
-    ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options.*)) catch |err| {
-        build_progress.deinit();
-        ev.progressSessionEnd();
-        return run.buildFailure(&ev, err);
-    };
-    build_progress.deinit();
-    ev.progressSessionEnd();
-    progress.deinit(true);
-    torn = true;
+    defer realized.deinit(allocator);
+    const out_path = realized.out_path;
 
     // `build`: just link ./result and print the path, like `fix build`.
     if (action == .build) {

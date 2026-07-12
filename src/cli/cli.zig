@@ -4,6 +4,7 @@
 //! formatting primitives. Evaluation progress itself is backed by `std.Progress`.
 
 const std = @import("std");
+const Evaluator = @import("fix").Evaluator;
 const eval_progress = @import("fix").eval_progress;
 const gc = @import("runtime").gc;
 const sync = @import("base").sync;
@@ -459,6 +460,106 @@ pub const EvalProgress = struct {
         node.end();
     }
 };
+
+/// The store paths produced by realizing one derivation (see `realize`). Paths
+/// are owned by the allocator passed to `realize`; free via `deinit`.
+pub const Realized = struct {
+    drv_path: []const u8,
+    out_path: []const u8,
+    /// The program to run (`meta.mainProgram`/`pname`/`name`), when requested.
+    program: ?[]const u8 = null,
+
+    pub fn deinit(self: Realized, allocator: std.mem.Allocator) void {
+        allocator.free(self.drv_path);
+        allocator.free(self.out_path);
+        if (self.program) |p| allocator.free(p);
+    }
+};
+
+/// Either a realized derivation or an already-reported failure exit code.
+pub const RealizeResult = union(enum) { ok: Realized, failed: u8 };
+
+/// Shared eval→derivation→build core for the realizing subcommands (`build`,
+/// `run`, `switch`). Drives the progress session + sampler, evaluates `source`
+/// to a derivation, builds its outputs via the daemon, and returns owned
+/// drv/out paths (plus the program name when `want_program`). The language heap
+/// is released and the progress bar fully torn down before returning, so the
+/// caller can print, link, exec, or activate without contending for the
+/// terminal. Any eval/build failure is rendered here and returned as `.failed`.
+///
+/// `shell` keeps its own progress lifecycle (it realizes several derivations
+/// under one session) and does not use this.
+pub fn realize(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ev: *Evaluator,
+    term: setup.Terminal,
+    options: args.Options,
+    source_arg: args.SourceArg,
+    source: run.Source,
+    want_program: bool,
+) !RealizeResult {
+    var progress = EvalProgress.init(io, term.show_progress);
+    var torn = false;
+    defer if (!torn) progress.deinit(false);
+    if (term.show_progress) ev.setProgressSink(progress.sink());
+    ev.progressSessionBegin(run.sourceLabel(source_arg));
+    ev.startProgressSampler();
+
+    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
+        ev.stopProgressSampler();
+        ev.progressSessionEnd();
+        return .{ .failed = try run.storeOrEvalFailure(io, term.use_color, options.show_trace, ev, source.text, err) };
+    };
+    const drv_path = (ev.derivationDrvPath(result) catch |err| {
+        ev.stopProgressSampler();
+        ev.progressSessionEnd();
+        return .{ .failed = try run.storeOrEvalFailure(io, term.use_color, options.show_trace, ev, source.text, err) };
+    }) orelse {
+        ev.stopProgressSampler();
+        ev.progressSessionEnd();
+        std.debug.print("error: that did not evaluate to a derivation\n", .{});
+        return .{ .failed = 1 };
+    };
+    const out_path_borrowed = (try ev.derivationOutPath(result)) orelse drv_path;
+    const program_borrowed: ?[]const u8 = if (want_program) ((try ev.derivationProgram(result)) orelse {
+        ev.stopProgressSampler();
+        ev.progressSessionEnd();
+        std.debug.print("error: could not determine a program name to run\n", .{});
+        return .{ .failed = 1 };
+    }) else null;
+
+    ev.stopProgressSampler();
+
+    // Legacy derived-path wire form `<drvpath>!*` (all outputs); see build.zig.
+    const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
+    defer allocator.free(derived);
+    // The borrowed paths live in the intern table, which `releaseEvalState`
+    // frees — copy them into plain memory first.
+    var realized: Realized = .{
+        .drv_path = try allocator.dupe(u8, drv_path),
+        .out_path = try allocator.dupe(u8, out_path_borrowed),
+        .program = if (program_borrowed) |p| try allocator.dupe(u8, p) else null,
+    };
+    errdefer realized.deinit(allocator);
+
+    // Drop the language heap (~2 GB on a NixOS eval) before the build phase.
+    ev.releaseEvalState();
+
+    var bp = build_progress.BuildProgress.init(allocator, &progress);
+    const build_sink = if (term.show_progress) bp.sink() else null;
+    ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
+        bp.deinit();
+        ev.progressSessionEnd();
+        return .{ .failed = run.buildFailure(ev, err) };
+    };
+    bp.deinit();
+    ev.progressSessionEnd();
+    progress.deinit(true);
+    torn = true;
+
+    return .{ .ok = realized };
+}
 
 // Per-section row formatters for the stats subtree (see `Stats`). Each writes
 // one section's whole compact readout into `buf` (which must hold

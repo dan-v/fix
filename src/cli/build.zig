@@ -53,62 +53,13 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     ev.enableStoreWrites();
 
-    var progress = cli.EvalProgress.init(init.io, term.show_progress);
-    var ok = false;
-    defer progress.deinit(ok);
-    if (term.show_progress) ev.setProgressSink(progress.sink());
-    ev.progressSessionBegin(run.sourceLabel(source_arg));
-    ev.startProgressSampler();
-
-    // Evaluate + instantiate the .drv closure.
-    const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
+    const realized = switch (try cli.realize(allocator, init.io, &ev, term, options, source_arg, source, false)) {
+        .failed => |code| return code,
+        .ok => |r| r,
     };
-    const drv_path = (ev.derivationDrvPath(result) catch |err| {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        return run.storeOrEvalFailure(init.io, term.use_color, options.show_trace, &ev, source.text, err);
-    }) orelse {
-        ev.stopProgressSampler();
-        ev.progressSessionEnd();
-        std.debug.print("error: expression did not evaluate to a derivation\n", .{});
-        return 1;
-    };
-    const out_path_borrowed = (try ev.derivationOutPath(result)) orelse drv_path;
-
-    // Stop the eval sampler; keep the progress session open so build activity
-    // nodes render under the same tree.
-    ev.stopProgressSampler();
-
-    // Legacy derived-path wire form `<drvpath>!<outputs>` (`*` = all outputs).
-    // This daemon (Lix) parses that, not the newer `<drvpath>^*` form.
-    const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
-    defer allocator.free(derived);
-    // `drv_path`/`out_path` borrow the intern table, which the release below
-    // frees — copy them into plain memory first.
-    const drv_path_owned = try allocator.dupe(u8, drv_path);
-    defer allocator.free(drv_path_owned);
-    const out_path = try allocator.dupe(u8, out_path_borrowed);
-    defer allocator.free(out_path);
-
-    // The evaluation is complete and everything it produced that we still
-    // need has been copied out — drop the language heap (~2 GB on a NixOS
-    // eval, sitting idle otherwise) before the build phase, which can run
-    // for minutes and needs only the daemon connection.
-    ev.releaseEvalState();
-
-    var build_progress = cli.build_progress.BuildProgress.init(allocator, &progress);
-    defer build_progress.deinit();
-    const build_sink = if (term.show_progress) build_progress.sink() else null;
-    ev.buildDerivations(&.{derived}, build_sink, run.buildMode(options)) catch |err| {
-        ev.progressSessionEnd();
-        return run.buildFailure(&ev, err);
-    };
-    build_progress.deinit();
-    ev.progressSessionEnd();
-    ok = true;
+    defer realized.deinit(allocator);
+    const drv_path_owned = realized.drv_path;
+    const out_path = realized.out_path;
 
     // The output link, which — as in nix-build — is registered as an indirect
     // GC root. `--add-root PATH` relocates it (and, per nix-store/-instantiate,
