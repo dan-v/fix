@@ -28,17 +28,90 @@ pub fn writeValue(ev: anytype, writer: *std.Io.Writer, value: Value) !void {
 
 fn writeQuotedString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
         switch (c) {
             '\\' => try writer.writeAll("\\\\"),
             '"' => try writer.writeAll("\\\""),
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
+            // Nix escapes a `$` that begins an interpolation (`${`) as `\${` so
+            // the printed form re-parses to the same string.
+            '$' => {
+                if (i + 1 < s.len and s[i + 1] == '{') try writer.writeByte('\\');
+                try writer.writeByte('$');
+            },
             else => try writer.writeByte(c),
         }
     }
     try writer.writeByte('"');
+}
+
+/// Render a float the way Nix/Lix does: C++ `ostream` default formatting,
+/// i.e. printf `%g` with the default precision of 6 significant digits.
+/// `18446744073709551616.0` → `1.84467e+19`, `3.1415` → `3.1415`, `1.0` → `1`.
+fn writeNixFloat(writer: *std.Io.Writer, v: f64) !void {
+    if (std.math.isNan(v)) return writer.writeAll("nan");
+    if (std.math.isInf(v)) return writer.writeAll(if (v < 0) "-inf" else "inf");
+    var buf: [64]u8 = undefined;
+    try writer.writeAll(try formatG(&buf, v, 6));
+}
+
+/// Minimal printf `%g` for f64 with `prec` significant digits, matching glibc:
+/// choose `%e` when the decimal exponent is < -4 or >= prec, else `%f`, then
+/// strip trailing zeros (and a bare trailing `.`).
+fn formatG(buf: []u8, v: f64, prec: usize) ![]const u8 {
+    const p: usize = if (prec == 0) 1 else prec;
+    if (v == 0) return "0";
+
+    // Determine the decimal exponent from a full-precision scientific render.
+    var ebuf: [64]u8 = undefined;
+    const e_str = try std.fmt.bufPrint(&ebuf, "{e}", .{v});
+    const e_idx = std.mem.indexOfScalar(u8, e_str, 'e').?;
+    const exp = try std.fmt.parseInt(i32, e_str[e_idx + 1 ..], 10);
+
+    if (exp < -4 or exp >= @as(i32, @intCast(p))) {
+        // Scientific with p-1 fractional digits (= p significant digits).
+        var sbuf: [64]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&sbuf, "{e:.[1]}", .{ v, p - 1 });
+        return normalizeSci(buf, raw);
+    } else {
+        // Fixed with p-1-exp fractional digits.
+        const frac: usize = @intCast(@as(i32, @intCast(p)) - 1 - exp);
+        var fbuf: [80]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&fbuf, "{d:.[1]}", .{ v, frac });
+        return stripTrailingZeros(buf, raw);
+    }
+}
+
+/// Convert Zig's `{e:.N}` output (`1.84467e19`, `5.00000e-3`) into C's `%g`
+/// form (`1.84467e+19`): strip trailing zeros in the mantissa, force a signed
+/// two-digit-minimum exponent.
+fn normalizeSci(out: []u8, raw: []const u8) ![]const u8 {
+    const e_idx = std.mem.indexOfScalar(u8, raw, 'e').?;
+    var mant = raw[0..e_idx];
+    if (std.mem.indexOfScalar(u8, mant, '.') != null) {
+        while (mant.len > 0 and mant[mant.len - 1] == '0') mant = mant[0 .. mant.len - 1];
+        if (mant.len > 0 and mant[mant.len - 1] == '.') mant = mant[0 .. mant.len - 1];
+    }
+    const exp = try std.fmt.parseInt(i32, raw[e_idx + 1 ..], 10);
+    const sign: u8 = if (exp < 0) '-' else '+';
+    const mag: u32 = @intCast(if (exp < 0) -exp else exp);
+    return std.fmt.bufPrint(out, "{s}e{c}{d:0>2}", .{ mant, sign, mag });
+}
+
+fn stripTrailingZeros(out: []u8, raw: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, '.') == null) {
+        @memcpy(out[0..raw.len], raw);
+        return out[0..raw.len];
+    }
+    var end = raw.len;
+    while (end > 0 and raw[end - 1] == '0') end -= 1;
+    if (end > 0 and raw[end - 1] == '.') end -= 1;
+    @memcpy(out[0..end], raw[0..end]);
+    return out[0..end];
 }
 
 fn ValuePrinter(comptime EvaluatorPtr: type) type {
@@ -97,7 +170,7 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 },
                 .float => {
                     try self.on(col_number);
-                    try self.writer.print("{d}", .{value.asFloat()});
+                    try writeNixFloat(self.writer, value.asFloat());
                     try self.off();
                 },
                 .string => try self.quotedString(self.ev.intern.get(value.asInternId())),
