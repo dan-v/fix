@@ -348,7 +348,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
             const name = self.source[param.name.offset .. param.name.offset + param.name.len];
             const name_id = try self.intern.intern(name);
             const slot = scope.resolveLocal(&child, name) orelse return error.UndefinedVariable;
-            try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
+            try compileAttrParam(&child, arg_slot, name_id, param.default);
             try emit.emitSetCellLocal(&child, slot);
         }
     } else {
@@ -356,7 +356,7 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
             const name = self.source[param.name.offset .. param.name.offset + param.name.len];
             const name_id = try self.intern.intern(name);
             const slot = try scope.declareLocal(&child, name, name_id);
-            try compileAttrParamThunk(&child, arg_slot, name_id, param.default);
+            try compileAttrParam(&child, arg_slot, name_id, param.default);
             try emit.emitSetLocal(&child, slot);
         }
     }
@@ -398,6 +398,43 @@ fn attrParamsNeedCells(self: *Compiler, params: []const Node.LambdaAttrParam) bo
         if (refs.contains(name)) return true;
     }
     return false;
+}
+
+/// Does this default expression bind directly as a value (no thunk) under
+/// Nix's `Expr::maybeThunk`? Only trivial scalar literals qualify — a computed
+/// default (`1 + 1`, `-1`), an identifier (`bar`), a list/set/lambda, etc. all
+/// thunk (printing `<CODE>` when the fallback is taken and left unforced).
+fn defaultIsTrivialLiteral(self: *Compiler, default: *const Node) bool {
+    const unwrapped = ast.unwrapParens(default);
+    return switch (unwrapped.tag) {
+        .integer, .float_val, .bool_true, .bool_false, .null => true,
+        .string, .path => blk: {
+            // Interpolated forms are `ExprConcatStrings` — not literals.
+            const atom = unwrapped.data.atom;
+            const span = self.source[atom.offset .. atom.offset + atom.len];
+            break :blk std.mem.indexOf(u8, span, "${") == null;
+        },
+        else => false,
+    };
+}
+
+/// Emit the value bound to one attrset-pattern formal, leaving it on the stack
+/// for the caller's `loc_set`/`cell_set`. A formal whose default is a trivial
+/// literal binds the argument (unforced) or the literal directly via
+/// `arg_or_lit` — matching Nix, which does NOT thunk a literal fallback (so
+/// `({ foo ? 12 }: [ foo ]) { }` prints `[ 12 ]`, not `[ <CODE> ]`). Everything
+/// else keeps the lazy per-formal thunk.
+fn compileAttrParam(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {
+    if (default) |default_expr| {
+        if (name_id <= std.math.maxInt(u16) and defaultIsTrivialLiteral(self, default_expr)) {
+            try emit.emitGetLocal(self, arg_slot); // push args attrset
+            const pushed = try access.compileImmediateContainerValue(self, ast.unwrapParens(default_expr), .{});
+            std.debug.assert(pushed); // trivial literals always emit an immediate value
+            try emit.emitArgOrLit(self, name_id);
+            return;
+        }
+    }
+    try compileAttrParamThunk(self, arg_slot, name_id, default);
 }
 
 fn compileAttrParamThunk(self: *Compiler, arg_slot: u16, name_id: InternId, default: ?*const Node) !void {

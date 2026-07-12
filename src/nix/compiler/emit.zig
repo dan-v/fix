@@ -225,6 +225,14 @@ pub fn emitGetAttr(self: *Compiler, id: InternId) !void {
     try emitInternOp(self, .attr_get, .attr_get_w, id);
 }
 
+/// Emit `arg_or_lit <name_id>`: bind an attrset-pattern formal with a trivial
+/// literal default without a thunk. Only the narrow (u16) name form exists; the
+/// caller must guarantee `id` fits in a u16.
+pub fn emitArgOrLit(self: *Compiler, id: InternId) !void {
+    try emitOp(self, .arg_or_lit);
+    try self.builder.writeU16(self.allocator, @intCast(id));
+}
+
 pub fn writeInternId(self: *Compiler, id: InternId, wide: bool) !void {
     try bytecode.writeInternId(&self.builder.code, self.allocator, id, wide);
 }

@@ -343,6 +343,13 @@ pub const OpCode = enum(u8) {
     /// Operand: 4-byte deferred-table id, 2-byte env count, then `env`
     /// capture descriptors (kind:1, index:2) — same format as thunk.
     thunk_defer,
+    /// Bind an attrset-pattern formal whose default is a trivial literal,
+    /// WITHOUT wrapping it in a thunk (Nix's `Expr::maybeThunk` for literals).
+    /// Looks up the formal name in the arguments attrset without forcing the
+    /// stored value; if absent, uses the literal default already on the stack.
+    /// Operand: 2-byte InternId of the formal name.
+    /// Stack layout before: [args_attrset, literal_default].
+    arg_or_lit,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,
@@ -488,6 +495,7 @@ pub fn layout(op: OpCode) []const Operand {
         .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => comptime &[_]Operand{.{ .attr_path = .b2 }},
         .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => comptime &[_]Operand{.{ .attr_path = .b4 }},
         .attr_get_path_mix_or, .attr_has_path_mix => comptime &[_]Operand{.mix},
+        .arg_or_lit => comptime &[_]Operand{.{ .intern = .b2 }},
         .attr_check => comptime &[_]Operand{.{ .check = .b2 }},
         .attr_check_w => comptime &[_]Operand{.{ .check = .b4 }},
         .with_lookup => comptime &[_]Operand{ .{ .intern = .b2 }, cnt(.b1, "scopes") },

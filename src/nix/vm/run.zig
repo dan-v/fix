@@ -895,6 +895,27 @@ fn opGetAttrPathOrLong(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop
     return dispatch(vm, frame, code, names_end, stop_depth);
 }
 
+fn opArgOrLit(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const name_id = readU16(code, ip);
+    // Stack: [args_attrset, literal_default]. Bind the formal to the stored
+    // argument value WITHOUT forcing it (preserving argument laziness), or to
+    // the literal default if the argument is absent — Nix's `maybeThunk` for a
+    // literal default binds the value directly instead of a thunk.
+    const default_val = vm.stack[vm.sp - 1];
+    const attrs = try force.forceValue(vm, vm.stack[vm.sp - 2]);
+    var result: Value = default_val;
+    if (attrs.isAttrs()) {
+        result = vm.heap.getAttrValue(attrs.asObjectId(), @intCast(name_id)) catch |err| switch (err) {
+            error.MissingAttribute => default_val,
+            else => return err,
+        };
+    }
+    vm.sp -= 2;
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
 fn opGetAttrPathMixedOr(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const segment_count = code[ip];
@@ -1214,6 +1235,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .with_lookup => opLookupWith,
         .with_lookup_w => opLookupWithLong,
         .thunk_defer => opDeferAttrValue,
+        .arg_or_lit => opArgOrLit,
         .ret => opRet,
         .halt => opHalt,
         .breakpoint => opBreakpoint,
