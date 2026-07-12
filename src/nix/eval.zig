@@ -1011,6 +1011,12 @@ pub const Evaluator = struct {
         if (self.registry.capture_names) {
             if (source_path) |p| compiler.source_file_id = try self.intern.intern(p);
         }
+        // A scoped import (`builtins.scopedImport`) supplies BOTH an ambient
+        // scope and a source path; that attrset replaces the base env, so free
+        // identifiers — even ones that name builtins — must bind to it first. A
+        // repl/debug overlay also carries a scope but no source_path, and must
+        // keep builtins visible; hence the source_path conjunct.
+        compiler.scoped_base = scope != null and source_path != null;
         compiler.deferred_table = &self.deferred_table;
         // Elided bodies materialize into the file's AST arena (retained
         // below alongside deferred bodies); this compile is single-threaded,

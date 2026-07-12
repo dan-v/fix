@@ -279,8 +279,34 @@ pub fn emitPathTextPart(self: *Compiler, part: []const u8, have_base: *bool) !bo
 pub fn compileSearchPath(self: *Compiler, node: *const Node) !void {
     const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
     if (span.len < 2) return error.InvalidSearchPath;
-    const id = try self.intern.intern(span[1 .. span.len - 1]);
-    try emit.emitInternOp(self, .file_find, .file_find_w, id);
+    const name_id = try self.intern.intern(span[1 .. span.len - 1]);
+
+    // `<name>` desugars to `builtins.findFile __nixPath "name"`, exactly as in
+    // Nix. Threading it through the `__nixPath` *identifier* (rather than a
+    // baked-in static search path) is what lets a local `let __nixPath = …`
+    // override the lookup lexically. `findFile` itself honors `prefix=path`
+    // entries and the synthetic `<nix/fetchurl.nix>` corepkgs file.
+    try self.builder.emitConstant(self.allocator, Value.builtin(@intFromEnum(builtins.BuiltinId.findFile)));
+    try emitNixPathRef(self);
+    try emit.emitOp(self, .call);
+    try self.builder.emitConstant(self.allocator, Value.string(name_id));
+    try emit.emitOp(self, .call);
+}
+
+/// Emit a reference to `__nixPath`: a lexically-bound `__nixPath` (a `let`/
+/// argument, so an in-file override wins) if one is in scope, otherwise the
+/// global `builtins.nixPath` built from `-I`/`NIX_PATH`.
+fn emitNixPathRef(self: *Compiler) !void {
+    const name = "__nixPath";
+    const name_id = try self.intern.intern(name);
+    if (scope.resolveLocalId(self, name_id)) |slot| {
+        try emit.emitGetLocal(self, slot);
+    } else if (try scope.resolveCaptureId(self, name, name_id)) |slot| {
+        try emit.emitOpU16(self, .up_get, slot);
+    } else {
+        try emit.emitOp(self, .push_builtins);
+        try emit.emitGetAttr(self, try self.intern.intern("nixPath"));
+    }
 }
 
 pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
@@ -334,6 +360,13 @@ pub fn compileIdent(self: *Compiler, node: *const Node) !void {
         try emit.emitGetLocal(self, slot);
     } else if (try scope.resolveCaptureId(self, span, name_id)) |slot| {
         try emit.emitOpU16(self, .up_get, slot);
+    } else if (self.scoped_base and try scope.emitWithLookup(self, span)) {
+        // `builtins.scopedImport`: the ambient attrset REPLACES the base env,
+        // so it shadows the static builtins — check it before `builtins`/the
+        // ambient builtin table (and never fall through to them). A name absent
+        // from the scope raises `undefined variable` at runtime, matching Nix's
+        // "the supplied set is the whole environment" semantic.
+        return;
     } else if (std.mem.eql(u8, span, "builtins")) {
         try emit.emitOp(self, .push_builtins);
     } else if (try emitAmbientBuiltin(self, span)) {
@@ -375,6 +408,16 @@ pub fn compileCurPos(self: *Compiler, atom: Node.Atom) !void {
 pub fn emitAmbientBuiltin(self: *Compiler, name: []const u8) !bool {
     if (builtins.ambientIdForName(name)) |id| {
         try self.builder.emitConstant(self.allocator, Value.builtin(@intFromEnum(id)));
+        return true;
+    }
+
+    // `__nixPath` is a global (== `builtins.nixPath`), the search path built
+    // from `-I`/`NIX_PATH`. It lives outside the `builtins` set as a bare
+    // identifier so `length __nixPath` / `<name>` desugaring resolve it; a
+    // local `let __nixPath` shadows it (locals are resolved before we get here).
+    if (std.mem.eql(u8, name, "__nixPath")) {
+        try emit.emitOp(self, .push_builtins);
+        try emit.emitGetAttr(self, try self.intern.intern("nixPath"));
         return true;
     }
 
