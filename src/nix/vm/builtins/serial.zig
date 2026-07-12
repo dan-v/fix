@@ -118,7 +118,10 @@ fn writeJsonStringValue(
     value: Value,
     context: ?*std.ArrayListUnmanaged(heap_mod.AttrEntry),
 ) !void {
-    try std.json.Stringify.encodeJsonString(self.intern.get(try stringTextInternId(self, value)), .{}, writer);
+    const text = self.intern.get(try stringTextInternId(self, value));
+    // Nix's toJSON errors on invalid UTF-8 (JSON strings must be valid UTF-8).
+    if (!std.unicode.utf8ValidateSlice(text)) return error.TypeError;
+    try std.json.Stringify.encodeJsonString(text, .{}, writer);
     if (context) |entries| {
         for (try contextEntriesForValue(self, value)) |entry| {
             try appendContextEntry(self, entries, entry.name, entry.value);

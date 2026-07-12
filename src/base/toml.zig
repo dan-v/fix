@@ -139,7 +139,13 @@ const Parser = struct {
         const raw = std.mem.trim(u8, self.text[start..self.pos], " \t");
         if (std.mem.eql(u8, raw, "true")) return .{ .boolean = true };
         if (std.mem.eql(u8, raw, "false")) return .{ .boolean = false };
-        if (parseInteger(self.allocator, raw)) |integer| return .{ .integer = integer } else |_| {}
+        if (parseInteger(self.allocator, raw)) |integer| return .{ .integer = integer } else |err| {
+            // An integer-shaped literal (no '.'/'e'/'E') that fails to parse is
+            // out of range — propagate rather than degrading to a float, so a
+            // 64-bit overflow errors instead of silently becoming ~9.2e18.
+            if (raw.len != 0 and std.mem.indexOfAny(u8, raw, ".eE") == null and
+                (std.ascii.isDigit(raw[0]) or raw[0] == '+' or raw[0] == '-')) return err;
+        }
         if (parseFloat(self.allocator, raw)) |float| return .{ .float = float } else |_| {}
         if (raw.len != 0) return .{ .string = try self.allocator.dupe(u8, raw) };
         return error.InvalidToml;

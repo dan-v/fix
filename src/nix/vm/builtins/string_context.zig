@@ -64,23 +64,38 @@ pub fn builtinUnsafeDiscardOutputDependency(self: anytype, arg: Value) !Value {
 
 pub fn builtinAddDrvOutputDependencies(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
-    if (!strings.isStringLike(value)) return error.TypeError;
+    if (!strings.isStringLike(value)) return vm_trace.typeErrorExpected(self, "a string", value);
     const text_id = try strings.stringTextInternId(self, value);
-    const text = self.intern.get(text_id);
+
+    // Nix requires the context to have exactly one element, which must be a
+    // bare derivation (`.drv`), not one of its outputs.
+    const ctx = try contextEntriesForValue(self, value);
+    if (ctx.len != 1) {
+        try vm_trace.setErrorMessage(self, "context of string must have exactly one element, but has a different number");
+        return error.TypeError;
+    }
+    const entry = ctx[0];
+    if (!std.mem.endsWith(u8, self.intern.get(entry.name), ".drv")) {
+        try vm_trace.setErrorMessage(self, "addDrvOutputDependencies can only act on derivations");
+        return error.TypeError;
+    }
+    // A `{ outputs = [...] }` marker means the element is a derivation OUTPUT,
+    // which is rejected; `path`/`allOutputs` markers are the derivation itself.
+    const marker = try vm_force.forceValue(self, entry.value);
+    if (marker.isAttrs()) {
+        const outputs_id = try self.intern.intern("outputs");
+        if (self.heap.getAttrValue(marker.asObjectId(), outputs_id)) |_| {
+            try vm_trace.setErrorMessage(self, "addDrvOutputDependencies can only act on derivations, not on a derivation output");
+            return error.TypeError;
+        } else |err| switch (err) {
+            error.MissingAttribute => {},
+            else => return err,
+        }
+    }
+
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
-    for (try contextEntriesForValue(self, value)) |entry| {
-        const path = self.intern.get(entry.name);
-        const context_value = if (std.mem.endsWith(u8, path, ".drv"))
-            try allOutputsContextValue(self)
-        else
-            entry.value;
-        try appendContextEntry(self, &entries, entry.name, context_value);
-    }
-    if (entries.items.len == 0 and std.mem.endsWith(u8, text, ".drv")) {
-        try appendContextEntry(self, &entries, text_id, try allOutputsContextValue(self));
-    }
-    if (entries.items.len == 0) return Value.string(text_id);
+    try appendContextEntry(self, &entries, entry.name, try allOutputsContextValue(self));
     return Value.contextString(try self.heap.addContextString(text_id, entries.items));
 }
 
