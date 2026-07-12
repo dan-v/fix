@@ -586,8 +586,17 @@ fn forgeTreeSpec(self: anytype, attrs_id: ObjectId, forge: []const u8) !GithubTr
     defer self.allocator.free(owner);
     const repo = try requiredStringAttr(self, attrs_id, "repo");
     defer self.allocator.free(repo);
-    const rev = try optionalStringAttr(self, attrs_id, "rev") orelse try optionalStringAttr(self, attrs_id, "ref");
-    errdefer if (rev) |owned| self.allocator.free(owned);
+    const rev_attr = try optionalStringAttr(self, attrs_id, "rev");
+    errdefer if (rev_attr) |owned| self.allocator.free(owned);
+    const ref_attr = try optionalStringAttr(self, attrs_id, "ref");
+    errdefer if (ref_attr) |owned| self.allocator.free(owned);
+    // A forge ref (github/gitlab/sourcehut) cannot pin both a branch/tag and a
+    // revision (Nix/Lix reject this, lix#1133).
+    if (rev_attr != null and ref_attr != null) {
+        try vm_trace.setErrorMessage(self, "fetchTree: 'ref' and 'rev' cannot both be specified for a forge source");
+        return error.UnexpectedArgument;
+    }
+    const rev = rev_attr orelse ref_attr;
     const host = try optionalStringAttr(self, attrs_id, "host");
     defer if (host) |h| self.allocator.free(h);
     const archive_ref = rev orelse "HEAD";
