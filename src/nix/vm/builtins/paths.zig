@@ -107,10 +107,12 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
             }
         };
         var context: Context = .{ .vm = self, .pred = pred };
-        break :filtered try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, path, store_name, .{
+        var unsupported: nar.Unsupported = .{};
+        defer unsupported.deinit(self.allocator);
+        break :filtered source_paths.storePathForFilteredSourceReport(self.allocator, self.derivations, self.files, path, store_name, .{
             .context = &context,
             .accept = Context.accept,
-        });
+        }, &unsupported) catch |err| return fetch.reportUnsupportedType(self, &unsupported, err);
     };
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));

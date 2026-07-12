@@ -115,6 +115,7 @@ pub fn defaultErrorMessage(err: anyerror) []const u8 {
         error.AssertionFailed => "assertion failed",
         error.ImportCycle => "import cycle detected",
         error.FileNotFound => "file not found",
+        error.UnsupportedPathType => "file has an unsupported type",
         error.MissingExperimentalFeature => "experimental feature disabled",
         else => @errorName(err),
     };
