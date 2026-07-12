@@ -470,12 +470,14 @@ fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
         };
     }
 
+    // Direct fetchurl/fetchTarball accept only url / sha256 / name; anything
+    // else (e.g. `hash`) errors. (fetchTree's file/tarball reuse the spec below
+    // but carry an extra `type` attr, so they don't go through this check.)
+    try rejectUnknownFetchAttrs(self, value.asObjectId(), &.{ "url", "sha256", "name" });
     return fetchUrlSpecFromAttrs(self, value.asObjectId(), null);
 }
 
 fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]const u8) !FetchUrlSpec {
-    // Only url / sha256 / name are accepted; anything else (e.g. `hash`) errors.
-    try rejectUnknownFetchAttrs(self, attrs_id, &.{ "url", "sha256", "name" });
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse if (default_name) |name|
