@@ -227,16 +227,12 @@ const Parser = struct {
     }
 
     fn ensureTablePath(self: *Parser, base: *Table, path: []const []const u8) !*Table {
+        // Array-aware: a `[fruit.physical]` header after `[[fruit]]` navigates
+        // into the LAST element of the `fruit` array-of-tables before creating
+        // `physical`, so intermediate array-table segments must be followed.
         var table = base;
         for (path) |key| {
-            if (table.find(key)) |entry| {
-                if (entry.value != .table) return error.DuplicateAttribute;
-                table = entry.value.table;
-            } else {
-                const child = try newTable(self.allocator);
-                try table.entries.append(self.allocator, .{ .key = key, .value = .{ .table = child } });
-                table = child;
-            }
+            table = try self.descendArrayAwareTable(table, key);
         }
         return table;
     }
@@ -380,7 +376,7 @@ fn newTable(allocator: std.mem.Allocator) !*Table {
 }
 
 fn parseInteger(allocator: std.mem.Allocator, raw: []const u8) !i64 {
-    if (raw.len == 0 or std.mem.indexOfAny(u8, raw, ".eE") != null) return error.InvalidToml;
+    if (raw.len == 0) return error.InvalidToml;
     const cleaned = try cleanNumber(allocator, raw);
     defer allocator.free(cleaned);
 
@@ -397,8 +393,12 @@ fn parseInteger(allocator: std.mem.Allocator, raw: []const u8) !i64 {
             'b' => 2,
             else => 10,
         };
+        // Hex/oct/bin literals can contain digits like 'e'/'E' (0xDEADBEEF), so
+        // check the radix prefix BEFORE rejecting float indicators.
         if (base != 10) return sign * @as(i64, @intCast(std.fmt.parseInt(u64, number[2..], base) catch return error.InvalidToml));
     }
+    // A base-10 literal with a decimal point or exponent is a float, not an int.
+    if (std.mem.indexOfAny(u8, number, ".eE") != null) return error.InvalidToml;
     return std.fmt.parseInt(i64, cleaned, 10) catch return error.InvalidToml;
 }
 
