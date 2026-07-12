@@ -77,7 +77,6 @@ pub fn helpMark(ev: anytype, worker_id: u8) void {
 /// the lone mutator at --workers=1; see docs/plans/gc-plan.md for the roots.
 pub fn collect(ev: anytype, collector_id: u8) void {
     if (comptime !gc.enabled) return;
-    _ = collector_id; // marker slot is grabbed dynamically (capped participants)
     // Lazy policy (`enableBudget`): the first threshold (budget/2) crossing
     // arms tracking instead of collecting — everything allocated so far
     // becomes untracked/old, and the real collections start at the budget.
@@ -87,6 +86,15 @@ pub fn collect(ev: anytype, collector_id: u8) void {
         heap_gc.armLazy(&ev.heap);
         return;
     }
+    // Escalate to a full collection once enough has tenured that a young-gated
+    // minor can't recover the accumulated old-generation garbage (see
+    // `gc_major_gate`). Same STW; the major reclaims old dead objects too.
+    if (ev.heap.gcShouldMajor()) {
+        collectMajor(ev, collector_id);
+        return;
+    }
+    // Minor below: the marker slot is grabbed dynamically (capped participants),
+    // so `collector_id` isn't needed past the major dispatch.
     // Timeline (`--timeline`): a `.gc` span on the collector's track so a pause
     // is visible in the trace, correlatable with the RSS/backlog counters. A
     // no-op single branch when tracing is off; nests inside the running quantum.
@@ -161,6 +169,9 @@ pub fn collect(ev: anytype, collector_id: u8) void {
         heap_gc.minorCollect(&ev.heap, tr.mark_bits);
     const t2 = nowNs();
     heap_gc.remsetClear(&ev.heap);
+    // Charge this minor's tenurings against the major gate: once enough has
+    // accumulated in the old generation, the next collection escalates.
+    ev.heap.gcNoteMinorPromoted(st.promoted);
     heap_gc.afterCollect(&ev.heap, tr.stats.bytes);
     gc.recordCollection(st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
     gc.recordTiming(t1 - t0, t2 - t1);
@@ -207,13 +218,14 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
     // Full sweep: free every unmarked object (young AND old) to the free lists.
     const st = ev.heap.sweep(tr.mark_bits);
     // Tenure survivors + empty the nursery, then drop the now-stale remset
-    // (young generation is empty ⇒ no old→young edges remain).
+    // (young generation is empty ⇒ no old→young edges remain). Swept slots stay
+    // round-robined across worker shards; the allocation path work-steals across
+    // shards, so a demand-concentrated workload still reuses the whole pool.
     ev.heap.gcMajorReconcile(tr.mark_bits);
     heap_gc.remsetClear(&ev.heap);
-    // Pull the swept slots (round-robined across worker shards) onto the
-    // collector so a demand-concentrated repl workload reuses them next input
-    // instead of ratcheting the store cursor.
-    ev.heap.gcConsolidateFreeLists();
+    // Re-arm the major gate to the surviving live set: the next major fires once
+    // the old generation has roughly doubled with fresh tenurings again.
+    ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
     heap_gc.afterCollect(&ev.heap, tr.stats.bytes);
     gc.recordCollection(st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());

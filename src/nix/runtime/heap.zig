@@ -291,12 +291,16 @@ pub const HeapLocal = struct {
     /// read at thunk creation to tag demand-created thunks for the
     /// scavenger / `-Dprof-main` creation-context probe.
     spec_ctx: bool = false,
-    // GC per-worker free lists (`-Dgc`): lock-free reclaim reuse. The sweep
-    // (STW, single collector) distributes freed slots/ranges round-robin
-    // across every worker's shard; each worker's allocation hot path then pops
-    // from its OWN shard with no lock — this is what makes reclaim viable at
-    // --workers>1 (a single shared free list serialized all allocation). A
-    // worker whose shard lacks the needed size just bump-allocates.
+    // GC per-worker free lists (`-Dgc`): reclaim reuse. The sweep (STW, single
+    // collector) distributes freed slots/ranges round-robin across every
+    // worker's shard; each worker's allocation hot path pops from its OWN shard,
+    // and WORK-STEALS from a peer's shard when its own runs dry — so a
+    // demand-concentrated workload (repl, or an uneven parallel eval) reuses the
+    // whole free pool instead of stranding most of it. `gc_free_mu` guards this
+    // worker's four free lists; a stealer locks the victim's. Only engaged while
+    // collection is armed (`gc_collect_enabled`) — zero cost otherwise. STW
+    // writers (sweep/evac) don't lock: the world is stopped, no eval allocates.
+    gc_free_mu: if (build_options.gc) sync.SpinMutex else void = if (build_options.gc) .{} else {},
     gc_free_objects: if (build_options.gc) std.ArrayListUnmanaged(ObjectId) else void = if (build_options.gc) .empty else {},
     gc_free_values: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
     gc_free_attrs: if (build_options.gc) RangeFreeList else void = if (build_options.gc) .{} else {},
@@ -350,25 +354,12 @@ const RangeFreeList = struct {
         gop.value_ptr.append(allocator, (@as(u64, segment) << 32) | offset) catch {};
     }
 
-    const Loc = struct { segment: u32, offset: u32 };
+    pub const Loc = struct { segment: u32, offset: u32 };
 
     fn pop(self: *RangeFreeList, len: u32) ?Loc {
         const entry = self.map.getPtr(len) orelse return null;
         const bits = entry.pop() orelse return null;
         return .{ .segment = @intCast(bits >> 32), .offset = @intCast(bits & 0xFFFF_FFFF) };
-    }
-
-    /// Move every freed range out of `self` into `dst` (leaving `self` empty).
-    /// Used by the STW major to consolidate the per-worker free lists onto the
-    /// collector so the next (demand-concentrated) eval can reuse them.
-    fn drainInto(self: *RangeFreeList, dst: *RangeFreeList, allocator: std.mem.Allocator) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            const gop = dst.map.getOrPut(allocator, e.key_ptr.*) catch continue;
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            gop.value_ptr.appendSlice(allocator, e.value_ptr.items) catch {};
-            e.value_ptr.clearRetainingCapacity();
-        }
     }
 
     fn deinit(self: *RangeFreeList, allocator: std.mem.Allocator) void {
@@ -425,6 +416,14 @@ pub const ObjectHeap = struct {
     /// `gc_threshold_bytes`; consumed at the next safepoint poll.
     gc_collect_requested: if (build_options.gc) bool else void = if (build_options.gc) false else {},
     gc_threshold_bytes: if (build_options.gc) u64 else void = if (build_options.gc) std.math.maxInt(u64) else {},
+    /// Major-collection policy: minors only reclaim young survivors and tenure
+    /// the rest, so tenured garbage accumulates in the old generation. Count the
+    /// objects promoted (tenured) since the last major; once it crosses
+    /// `gc_major_gate` (roughly "the old gen has grown by a live-set's worth"),
+    /// the next in-eval collection runs a MAJOR (full mark/sweep) instead of a
+    /// minor. Reset after each major.
+    gc_promoted_since_major: if (build_options.gc) u64 else void = if (build_options.gc) 0 else {},
+    gc_major_gate: if (build_options.gc) u64 else void = if (build_options.gc) GC_MAJOR_GATE_FLOOR else {},
     /// GC reclaim state (`-Dgc`). Inert until `gc_collect_enabled` is set
     /// (the evaluator turns it on only at `--workers=1` for now — the
     /// alloc-bitmap maintenance is not yet thread-safe). When off, the
@@ -1039,6 +1038,43 @@ pub const ObjectHeap = struct {
         return .{ .segment = r.segment, .offset = r.offset, .len = r.len };
     }
 
+    /// Reuse a freed object slot: pop this worker's shard, else work-steal one
+    /// from a peer whose shard still has slots. One lock held at a time (own
+    /// released before locking a peer) — no deadlock. Returns null only when
+    /// the whole free pool is empty (⇒ bump-allocate).
+    fn gcReuseObject(self: *ObjectHeap, local: *HeapLocal) ?ObjectId {
+        local.gc_free_mu.lock();
+        const own = local.gc_free_objects.pop();
+        local.gc_free_mu.unlock();
+        if (own) |id| return id;
+        for (self.worker_locals) |*peer| {
+            if (peer == local) continue;
+            peer.gc_free_mu.lock();
+            const stolen = peer.gc_free_objects.pop();
+            peer.gc_free_mu.unlock();
+            if (stolen) |id| return id;
+        }
+        return null;
+    }
+
+    /// Reuse a freed range of exactly `n` slots from the `field` free list
+    /// (`gc_free_values`/`gc_free_attrs`/`gc_free_attr_pos`): own shard first,
+    /// then work-steal from a peer. Same one-lock-at-a-time discipline.
+    fn gcReuseRange(self: *ObjectHeap, local: *HeapLocal, comptime field: []const u8, n: u32) ?RangeFreeList.Loc {
+        local.gc_free_mu.lock();
+        const own = @field(local, field).pop(n);
+        local.gc_free_mu.unlock();
+        if (own) |loc| return loc;
+        for (self.worker_locals) |*peer| {
+            if (peer == local) continue;
+            peer.gc_free_mu.lock();
+            const stolen = @field(peer, field).pop(n);
+            peer.gc_free_mu.unlock();
+            if (stolen) |loc| return loc;
+        }
+        return null;
+    }
+
     fn reserveValuesLocal(self: *ObjectHeap, n: u32) !ValueRange {
         const local = self.currentLocal();
         // NON-MOVING reuse: a swept dead range of exactly `n` is reused in
@@ -1046,7 +1082,7 @@ pub const ObjectHeap = struct {
         // returned slice is stable across forces (no re-fetch needed).
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled) {
-                if (local.gc_free_values.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         return self.reserveRangeLocal(ValueStore, &self.values, &local.value, VALUE_CHUNK_SIZE, n);
@@ -1091,7 +1127,7 @@ pub const ObjectHeap = struct {
         const local = self.currentLocal();
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled) {
-                if (local.gc_free_attrs.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, ATTR_CHUNK_SIZE, n);
@@ -1101,7 +1137,7 @@ pub const ObjectHeap = struct {
         const local = self.currentLocal();
         if (comptime build_options.gc) {
             if (self.gc_collect_enabled) {
-                if (local.gc_free_attr_pos.pop(n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
+                if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
             }
         }
         return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
@@ -1197,10 +1233,11 @@ pub const ObjectHeap = struct {
         const local = self.currentLocal();
         const id = blk: {
             if (comptime build_options.gc) {
-                // Reuse a slot freed by a prior minor. Detector leaves freed
-                // slots unused so use-after-free is caught.
+                // Reuse a slot freed by a prior collection (own shard, else
+                // work-steal from a peer). Detector leaves freed slots unused so
+                // use-after-free is caught.
                 if (self.gc_collect_enabled and !gc_disable_reuse and !gc_debug) {
-                    if (local.gc_free_objects.pop()) |rid| break :blk rid;
+                    if (self.gcReuseObject(local)) |rid| break :blk rid;
                 }
             }
             const chunk = &local.object;
@@ -1249,6 +1286,11 @@ pub const ObjectHeap = struct {
 
     /// Floor on the collection threshold.
     pub const GC_MIN_THRESHOLD: u64 = 256 << 20;
+    /// Floor on the major-collection gate (see `gc_major_gate`): promote at
+    /// least this many objects since the last major before the next one, so a
+    /// small heap never major-thrashes. Above the floor the gate tracks the
+    /// live set (major when the old gen has roughly doubled with tenurings).
+    pub const GC_MAJOR_GATE_FLOOR: u64 = 1 << 20;
     /// Headroom of genuinely-fresh committed pages between collections
     /// (additive, anchored to the cursor at last collect — see
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
@@ -1505,7 +1547,16 @@ pub const ObjectHeap = struct {
     /// clean nursery. STW-only (the collector alone touches these).
     pub fn gcMajorReconcile(self: *ObjectHeap, mark_bits: []const u64) void {
         if (comptime !build_options.gc) return;
-        self.gcGrowOldBits(self.objects.count());
+        const n = self.objects.count();
+        self.gcGrowOldBits(n);
+        // Clear the whole generation bitmap first, THEN re-tenure survivors: a
+        // just-freed OLD slot must lose its old bit, or when the allocator reuses
+        // it the object is wrongly seen as old — the write barrier skips its
+        // old→young edges and the next minor never scans it (use-after-free).
+        // (Bootstrap ids < gc_track_from are old via that check, not the bit, so
+        // clearing them here is harmless.) STW: no concurrent generation reads.
+        const words = (@as(usize, n) + 63) >> 6;
+        @memset(self.gc_old_bits[0..@min(words, self.gc_old_bits.len)], 0);
         for (mark_bits, 0..) |word, wi| {
             var w = word;
             while (w != 0) {
@@ -1517,23 +1568,29 @@ pub const ObjectHeap = struct {
         for (self.worker_locals) |*wl| wl.gc_young_slots.clearRetainingCapacity();
     }
 
-    /// Consolidate every worker's GC free lists onto the collector's local
-    /// (`currentLocal`). The per-worker free lists are reused lock-free by
-    /// their owner during eval, but a demand-concentrated workload (e.g. the
-    /// repl) allocates on ~one worker, so freed slots stranded on other
-    /// workers' lists never get reused and the store cursor ratchets up. STW
-    /// only (the collector alone touches the lists here).
-    pub fn gcConsolidateFreeLists(self: *ObjectHeap) void {
+    /// Major-collection policy hooks (see `gc_major_gate`). ---
+
+    /// Should the next in-eval collection be a MAJOR? True once enough objects
+    /// have tenured since the last major that the old generation likely holds a
+    /// live-set's worth of reclaimable garbage.
+    pub fn gcShouldMajor(self: *const ObjectHeap) bool {
+        if (comptime !build_options.gc) return false;
+        return self.gc_promoted_since_major >= self.gc_major_gate;
+    }
+
+    /// A minor tenured `promoted` objects; charge them against the major gate.
+    pub fn gcNoteMinorPromoted(self: *ObjectHeap, promoted: u64) void {
         if (comptime !build_options.gc) return;
-        const dst = self.currentLocal();
-        for (self.worker_locals) |*wl| {
-            if (wl == dst) continue;
-            dst.gc_free_objects.appendSlice(self.allocator, wl.gc_free_objects.items) catch {};
-            wl.gc_free_objects.clearRetainingCapacity();
-            wl.gc_free_values.drainInto(&dst.gc_free_values, self.allocator);
-            wl.gc_free_attrs.drainInto(&dst.gc_free_attrs, self.allocator);
-            wl.gc_free_attr_pos.drainInto(&dst.gc_free_attr_pos, self.allocator);
-        }
+        self.gc_promoted_since_major += promoted;
+    }
+
+    /// A major just ran, leaving `live_objects` alive (all now tenured). Reset
+    /// the promotion counter and re-arm the gate to the new live set (floored),
+    /// so the next major fires once the old gen has ~doubled again.
+    pub fn gcNoteMajor(self: *ObjectHeap, live_objects: u64) void {
+        if (comptime !build_options.gc) return;
+        self.gc_promoted_since_major = 0;
+        self.gc_major_gate = @max(GC_MAJOR_GATE_FLOOR, live_objects);
     }
 
     pub fn get(self: *ObjectHeap, id: ObjectId) *Object {
