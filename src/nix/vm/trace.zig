@@ -27,6 +27,16 @@ pub fn typeErrorExpected(self: *VM, expected: []const u8, got: Value) error{Type
     return error.TypeError;
 }
 
+/// A string-coercion failure, phrased like Nix ("cannot coerce X to a string").
+pub fn coercionError(self: *VM, got: Value) error{TypeError} {
+    if (self.trace) |trace| {
+        const message = std.fmt.allocPrint(self.allocator, "cannot coerce {s} to a string", .{valueTypeName(self, got)}) catch return error.TypeError;
+        defer self.allocator.free(message);
+        trace.setMessageIfAbsent(message) catch {};
+    }
+    return error.TypeError;
+}
+
 pub fn notCallableError(self: *VM, got: Value) error{NotCallable} {
     if (self.trace) |trace| {
         const message = std.fmt.allocPrint(self.allocator, "expected function, got {s}", .{valueTypeName(self, got)}) catch return error.NotCallable;

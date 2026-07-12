@@ -114,7 +114,7 @@ pub fn defaultErrorMessage(err: anyerror) []const u8 {
         error.DivisionByZero => "division by zero",
         error.AssertionFailed => "assertion failed",
         error.ImportCycle => "import cycle detected",
-        error.FileNotFound => "file not found",
+        error.FileNotFound => "No such file or directory",
         error.MissingExperimentalFeature => "experimental feature disabled",
         else => @errorName(err),
     };

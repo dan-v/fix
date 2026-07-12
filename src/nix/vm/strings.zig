@@ -47,7 +47,7 @@ pub fn stringLikeValue(self: *VM, value: Value) !Value {
     return switch (forced.kind()) {
         .string, .path, .string_context => forced,
         .attrs => try attrsStringLikeValue(self, forced),
-        else => trace.typeErrorExpected(self, "string or path", forced),
+        else => trace.coercionError(self, forced),
     };
 }
 
@@ -88,7 +88,7 @@ pub fn attrsStringLikeValue(self: *VM, attrs: Value) !Value {
 
     const out_path_id = try self.intern.intern("outPath");
     const out_path = self.heap.getAttrValue(attrs.asObjectId(), out_path_id) catch |err| switch (err) {
-        error.MissingAttribute => return trace.typeErrorExpected(self, "string or path", attrs),
+        error.MissingAttribute => return trace.coercionError(self, attrs),
         else => return err,
     };
     return stringLikeValue(self, out_path);
@@ -265,12 +265,12 @@ pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
 
             const out_path_id = try self.intern.intern("outPath");
             const out_path = self.heap.getAttrValue(forced.asObjectId(), out_path_id) catch |err| switch (err) {
-                error.MissingAttribute => return trace.typeErrorExpected(self, "string or path", forced),
+                error.MissingAttribute => return trace.coercionError(self, forced),
                 else => return err,
             };
             break :blk try coerceLanguageStringValue(self, out_path);
         },
-        else => trace.typeErrorExpected(self, "string or path", forced),
+        else => trace.coercionError(self, forced),
     };
 }
 

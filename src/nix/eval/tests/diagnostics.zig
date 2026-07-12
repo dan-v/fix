@@ -97,7 +97,7 @@ test "evaluate records runtime error message and expression trace" {
 
     const trace = ev.getTrace();
     try std.testing.expect(trace.message != null);
-    try std.testing.expectEqualStrings("expected string or path, got int", trace.message.?);
+    try std.testing.expectEqualStrings("cannot coerce int to a string", trace.message.?);
     // `y` is strictly used by the body, so it is eagerly evaluated into
     // its slot (no binding thunk) — the trace points straight at the
     // erroring RHS `1 + "x"` (col 9) without an extra "while evaluating
@@ -138,7 +138,7 @@ test "evaluate records imported file source trace" {
 
     const trace = ev.getTrace();
     try std.testing.expect(trace.message != null);
-    try std.testing.expectEqualStrings("expected string or path, got int", trace.message.?);
+    try std.testing.expectEqualStrings("cannot coerce int to a string", trace.message.?);
     try std.testing.expect(trace.frames.items.len >= 1);
     try std.testing.expect(trace.frames.items[0].diagnostic != null);
     try std.testing.expect(trace.frames.items[0].source_path != null);
