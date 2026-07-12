@@ -193,14 +193,17 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         }
 
         fn writeList(self: *Self, id: types.ObjectId) !void {
-            if (!try self.enter(.list, id)) {
-                try self.writer.writeAll("«repeated»");
-                return;
-            }
-
             const items = try self.ev.heap.getList(id);
+            // Nix only records NON-empty containers for identity («repeated»)
+            // tracking — an empty list/attrs is always rendered in full. Check
+            // emptiness before `enter` so a shared empty `[ ]` (e.g. an
+            // `inherit`ed leaf) doesn't spuriously print as «repeated».
             if (items.len == 0) {
                 try self.writer.writeAll("[ ]");
+                return;
+            }
+            if (!try self.enter(.list, id)) {
+                try self.writer.writeAll("«repeated»");
                 return;
             }
 
@@ -223,14 +226,15 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 return;
             }
 
-            if (!try self.enter(.attrs, id)) {
-                try self.writer.writeAll("«repeated»");
-                return;
-            }
-
             const stored = try self.ev.heap.getAttrs(id);
+            // Empty attrs are never «repeated» (see writeList) — render `{ }`
+            // before recording identity.
             if (stored.len == 0) {
                 try self.writer.writeAll("{ }");
+                return;
+            }
+            if (!try self.enter(.attrs, id)) {
+                try self.writer.writeAll("«repeated»");
                 return;
             }
 

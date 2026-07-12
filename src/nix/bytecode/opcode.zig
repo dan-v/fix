@@ -358,6 +358,16 @@ pub const OpCode = enum(u8) {
     /// Operand: 2-byte InternId of the formal name.
     /// Stack layout before: [args_attrset, literal_default].
     arg_or_lit,
+    /// Recursive-set `__overrides`: after the rec object is built (on the
+    /// stack) and its binding cells filled, apply the `__overrides` attrset.
+    /// Force `built.__overrides` (must be a set, else error); for each entry
+    /// `k = v`, if `k` names an existing rec attr re-point its (shared)
+    /// binding cell to `v` so recursive siblings see the override, otherwise
+    /// add `k = v` as a new attribute. `__overrides` itself is retained.
+    /// Emitted ONLY when a rec set statically declares a `__overrides` key —
+    /// plain rec sets never carry it. Operand: 4-byte InternId of
+    /// `__overrides`. Stack: [built_attrs] -> [final_attrs].
+    attrs_apply_overrides,
     // ---- termination ----
     /// Return from the current frame with the value on top of stack.
     ret,
@@ -509,6 +519,7 @@ pub fn layout(op: OpCode) []const Operand {
         .with_lookup => comptime &[_]Operand{ .{ .intern = .b2 }, cnt(.b1, "scopes") },
         .with_lookup_w => comptime &[_]Operand{ .{ .intern = .b4 }, cnt(.b1, "scopes") },
         .thunk_defer => comptime &[_]Operand{ .{ .raw = .b4 }, .{ .skip = .b4 }, cnt(.b2, "env") },
+        .attrs_apply_overrides => comptime &[_]Operand{.{ .intern = .b4 }},
     };
 }
 

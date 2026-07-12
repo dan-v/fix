@@ -144,6 +144,15 @@ pub fn emitInitCellSlot(self: *Compiler, slot: u16) !void {
     try emitLocalOp(self, .cell_init, .cell_init_w, slot);
 }
 
+/// Emit the recursive-set `__overrides` application step (see the opcode
+/// doc). `name_id` is the interned `__overrides` name. Always uses the
+/// wide (4-byte) intern encoding — this op is rare, so the width choice
+/// is not perf-sensitive and keeps the operand layout uniform.
+pub fn emitApplyOverrides(self: *Compiler, name_id: InternId) !void {
+    try emitOp(self, .attrs_apply_overrides);
+    try self.builder.writeU32(self.allocator, name_id);
+}
+
 pub fn emitGetLocalRet(self: *Compiler, slot: u16) !void {
     try emitLocalOp(self, .loc_get_ret, .loc_get_ret_w, slot);
 }
