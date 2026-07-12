@@ -441,10 +441,28 @@ fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8,
     return store_path;
 }
 
+/// Reject any attr not in `allowed`, matching Nix's argument validation for
+/// the simple fetchers.
+fn rejectUnknownFetchAttrs(self: anytype, attrs_id: ObjectId, comptime allowed: []const []const u8) !void {
+    const entries = try self.heap.getAttrs(attrs_id);
+    outer: for (entries) |entry| {
+        const name = self.intern.get(entry.name);
+        inline for (allowed) |a| {
+            if (std.mem.eql(u8, name, a)) continue :outer;
+        }
+        const msg = try std.fmt.allocPrint(self.allocator, "unexpected argument '{s}'", .{name});
+        defer self.allocator.free(msg);
+        try vm_trace.setErrorMessage(self, msg);
+        return error.UnexpectedArgument;
+    }
+}
+
 fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) {
-        const url = try self.allocator.dupe(u8, try pathArg(self, value));
+        // fetchurl/fetchTarball take a string URL (or an attrset); a path is a
+        // type error.
+        const url = try self.allocator.dupe(u8, try stringArg(self, value));
         errdefer self.allocator.free(url);
         return .{
             .url = url,
@@ -456,6 +474,8 @@ fn fetchUrlSpec(self: anytype, arg: Value) !FetchUrlSpec {
 }
 
 fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]const u8) !FetchUrlSpec {
+    // Only url / sha256 / name are accepted; anything else (e.g. `hash`) errors.
+    try rejectUnknownFetchAttrs(self, attrs_id, &.{ "url", "sha256", "name" });
     const url = try dupPathAttr(self, attrs_id, "url");
     errdefer self.allocator.free(url);
     const name = try optionalStringAttr(self, attrs_id, "name") orelse if (default_name) |name|
