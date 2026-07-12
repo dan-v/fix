@@ -383,6 +383,12 @@ fn normalizeDerivation(self: anytype, attrs_id: ObjectId, drv_name: []const u8, 
                 continue;
             }
             const text = try derivationAttrString(self, entry.value, &inputs, &owned_strings);
+            // A user-provided `__json` is the pre-serialized structured-attrs
+            // payload — it must be valid JSON, else the derivation is rejected.
+            if (std.mem.eql(u8, attr_name, "__json") and !(std.json.validate(self.allocator, text) catch false)) {
+                try vm_trace.setErrorMessage(self, "cannot process __json: not valid JSON");
+                return error.InvalidDerivation;
+            }
             try env.append(self.allocator, .{ .name = attr_name, .value = text });
         }
     }
