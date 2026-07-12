@@ -637,6 +637,16 @@ pub const Parser = struct {
                 .pipe = .none,
             } }) },
 
+            // ---- application of the bare `or` identifier (`f or` → `f (or)`) ----
+            .apply_or => {
+                const or_var = try self.atom(.identifier, rhs[1].tok);
+                return .{ .node = try self.arena.createNode(.apply, .{ .apply = .{
+                    .func = rhs[0].node,
+                    .arg = or_var.node,
+                    .pipe = .none,
+                } }) };
+            },
+
             // ---- selection ----
             .select => return .{ .node = try self.buildSelect(rhs[0].node, rhs[2].segs) },
             .select_or => {
@@ -669,6 +679,32 @@ pub const Parser = struct {
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
                 } }) };
+            },
+            // Ancient `let { … }` == `(rec { … }).body`. Build the rec set, then
+            // select its `body` attribute (reusing a real "body" source span so
+            // the select segment reads the right name).
+            .let_attrs => {
+                var entries = rhs[2].entries;
+                const rec = try self.arena.createNode(.attr_set, .{ .attr_set = .{
+                    .entries = try entries.toOwnedSlice(a),
+                    .recursive = true,
+                } });
+                var body_atom: ?Node.Atom = null;
+                for (rec.data.attr_set.entries) |entry| {
+                    if (entry.path.len != 1) continue;
+                    const seg = entry.path[0];
+                    if (std.mem.eql(u8, self.source[seg.offset .. seg.offset + seg.len], "body")) {
+                        body_atom = seg;
+                        break;
+                    }
+                }
+                const body_name = body_atom orelse {
+                    self.report(rhs[0].tok, "'let { ... }' requires a 'body' attribute");
+                    return error.ParseError;
+                };
+                var segs: SegAccum = .{};
+                try segs.push(a, .{ .static = body_name });
+                return .{ .node = try self.buildSelect(rec, segs) };
             },
             .list => {
                 var nodes = rhs[1].nodes;

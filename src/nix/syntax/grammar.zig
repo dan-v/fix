@@ -75,6 +75,7 @@ pub const Act = enum {
     assert_, // assert Expr ; Expr
     with_, // with Expr ; Expr
     let_in, // let Binds in Expr
+    let_attrs, // let { Binds } — ancient let, == (rec { Binds }).body
 
     // ExprIf
     if_else,
@@ -107,6 +108,7 @@ pub const Act = enum {
     // ExprSelect
     select, // ExprSimple . AttrPath
     select_or, // ExprSimple . AttrPath or ExprSelect
+    apply_or, // ExprSimple or — `or` used as an identifier argument (Nix compat)
 
     // ExprSimple atoms
     ident,
@@ -219,6 +221,9 @@ const productions = [_]P{
     .{ .lhs = .expr_select, .rhs = &.{n(.expr_simple)}, .act = .pass },
     .{ .lhs = .expr_select, .rhs = &.{ n(.expr_simple), t(.dot), n(.attrpath) }, .act = .select },
     .{ .lhs = .expr_select, .rhs = &.{ n(.expr_simple), t(.dot), n(.attrpath), t(.kw_or), n(.expr_select) }, .act = .select_or },
+    // Backwards compatibility: `or` is a keyword, but Nix allows it as a bare
+    // identifier argument, so `f or` parses as `f (or)` — the variable `or`.
+    .{ .lhs = .expr_select, .rhs = &.{ n(.expr_simple), t(.kw_or) }, .act = .apply_or },
 
     // ExprSimple
     .{ .lhs = .expr_simple, .rhs = &.{t(.identifier)}, .act = .ident },
@@ -233,6 +238,8 @@ const productions = [_]P{
     .{ .lhs = .expr_simple, .rhs = &.{ t(.left_paren), n(.expr), t(.right_paren) }, .act = .parens },
     .{ .lhs = .expr_simple, .rhs = &.{n(.brace)}, .act = .attrset_from_brace },
     .{ .lhs = .expr_simple, .rhs = &.{ t(.kw_rec), t(.left_brace), n(.binds), t(.right_brace) }, .act = .rec_attr_set },
+    // Ancient `let { … }`: sugar for `(rec { … }).body`.
+    .{ .lhs = .expr_simple, .rhs = &.{ t(.kw_let), t(.left_brace), n(.binds), t(.right_brace) }, .act = .let_attrs },
     .{ .lhs = .expr_simple, .rhs = &.{ t(.left_bracket), n(.list_items), t(.right_bracket) }, .act = .list },
 
     // AttrPath

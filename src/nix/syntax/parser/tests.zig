@@ -645,18 +645,19 @@ test "parser attaches or-default to attribute path produced by function applicat
     try std.testing.expectEqual(NodeTag.identifier, node.data.apply.arg.data.attr_or.default.tag);
 }
 
-test "parser rejects or-default on a non-attribute-path expression" {
+test "parser accepts a bare `or` as an identifier argument (Nix compat)" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
     var parser = Parser.init(std.testing.allocator, &arena, "1 or 2");
     defer parser.deinit();
 
-    // `or` is only valid as a default after a `.`-selection, so a bare `1 or 2`
-    // is rejected — the grammar has no production that accepts `or` here.
-    try std.testing.expectError(error.ParseError, parser.parse());
-    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
-    try std.testing.expectEqualStrings("Unexpected token 'or'.", parser.diagnostics.items[0].message);
+    // Nix allows the `or` keyword as a bare identifier argument, so `1 or 2`
+    // parses as `(1 (or)) 2` — an application, not a syntax error. (It is still
+    // a *type* error at eval time, since `1` is not a function.)
+    const node = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    try std.testing.expectEqual(ast.NodeTag.apply, node.tag);
 }
 
 test "parser reports missing binding name in attrset lambda pattern" {
