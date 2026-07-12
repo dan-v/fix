@@ -96,6 +96,42 @@ pub fn storePathForFilteredSource(
     return ingested.store_path;
 }
 
+/// A single regular file added to (or computed for) the store via FLAT
+/// (`fixed:sha256`) ingestion — the `recursive = false` mode of `builtins.path`.
+pub const FlatIngested = struct {
+    /// The `/nix/store/...` path (flat, `fixed:sha256`).
+    store_path: []u8,
+    /// sha256 of the file's raw contents, lowercase hex (for FOD locking).
+    hash_hex: [64]u8,
+
+    pub fn deinit(self: FlatIngested, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_path);
+    }
+};
+
+/// Compute the flat store path for a single regular file `path` (hashing its
+/// raw contents, not a NAR) and, when a daemon is attached, add it to the
+/// store. Mirrors `ingest`, but flat: `fixedOutputPath(.., "sha256", hex)`.
+pub fn flatStorePathForFile(
+    allocator: std.mem.Allocator,
+    derivations: *DerivationStore,
+    files: *FileCache,
+    path: []const u8,
+    name: []const u8,
+) !FlatIngested {
+    const bytes = try files.readFile(path);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+
+    const store_path = try drv_paths.fixedOutputPath(allocator, derivations.store_dir, name, "out", "sha256", hex[0..]);
+    errdefer allocator.free(store_path);
+    try derivations.instantiateFlat(store_path, bytes);
+
+    return .{ .store_path = store_path, .hash_hex = hex };
+}
+
 pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, store_dir)) return false;
     if (path.len <= store_dir.len or path[store_dir.len] != '/') return false;
