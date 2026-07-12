@@ -989,29 +989,12 @@ fn lineValueDigest(l: *Line, value: Value, symbols: Symbols, max: usize) void {
 /// with the interpretation as a colored token comment. Ops without a bespoke
 /// arm fall back to the compact `operand_text` decode. Returns the number of
 /// operand bytes the head covers.
+/// Mnemonic-row head. Three ops keep a bespoke arm (their head/body split or
+/// format isn't a plain scalar sequence); everything else is rendered from the
+/// operand-layout table by `buildHeadGeneric`.
 fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, local_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
     const code = chunk.code;
     switch (op) {
-        .closure, .closure_w, .closure_cap, .closure_cap_w, .thunk, .thunk_w, .thunk_eag, .thunk_eag_w, .thunk_arg, .thunk_st, .thunk_st_cell, .thunk_eag_st, .thunk_eag_st_cell, .thunk_w_st, .thunk_w_st_cell, .thunk_eag_w_st, .thunk_eag_w_st_cell => {
-            const wide = chunkIdWide(op);
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: ChunkId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
-            l.groupPinned(1, id_len, objColor(id), "0x{x}", .{id});
-            l.comment();
-            l.storeRef("chunk", objColor(id), "0x{x}", .{id});
-            if (chunkNameOf(symbols, id)) |name| l.tint(name_color, " {s}", .{name});
-            return id_len;
-        },
-        .attrs_new_named_srt, .attrs_new_named_pos_srt => {
-            const entries = readU16(code, start + 1);
-            const c_e = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 2, c_e, "#{d}", .{entries});
-            l.comment();
-            l.tint(c_e, "{d}", .{entries});
-            l.glue(" entries (named)", .{});
-            return 2;
-        },
         .thunk_defer => {
             // deferred id (4) + capture-list start (4) + env count (2). Captures
             // are interned in the chunk side table, not inline — single line.
@@ -1022,6 +1005,16 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.comment();
             l.glue("deferred #{d}, {d} env @cap[{d}]", .{ id, cap_count, cap_start });
             return 10;
+        },
+        .attrs_new_named_srt, .attrs_new_named_pos_srt => {
+            const entries = readU16(code, start + 1);
+            const c_e = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(1, 2, c_e, "#{d}", .{entries});
+            l.comment();
+            l.tint(c_e, "{d}", .{entries});
+            l.glue(" entries (named)", .{});
+            return 2;
         },
         .attr_check, .attr_check_w => {
             const allow = code[start + 1];
@@ -1038,174 +1031,148 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.tint(c_a, "extra {s}", .{if (allow != 0) "allowed" else "rejected"});
             return 3;
         },
+        else => return buildHeadGeneric(l, op, chunk, start, symbols, up_names, local_names, operand_text, end_ip, seq),
+    }
+}
 
-        // ---- single-line ops: the whole operand IS the head ----
-        .push_const, .push_const_ret => {
-            const idx = readU16(code, start + 1);
-            l.groupPinned(1, 2, constColor(idx), "#{d}", .{idx});
-            if (idx < chunk.constants.len) {
-                l.comment();
-                lineValueDigest(l, chunk.constants[idx], symbols, snippet_max);
-            }
-            return 2;
+/// Whether a field's contents are drawn as multiline child rows (by
+/// `writeOperandTail`) rather than on the mnemonic row.
+fn fieldIsList(f: Operand) bool {
+    return switch (f) {
+        .captures, .captures_slot, .attr_path, .check, .mix => true,
+        else => false,
+    };
+}
+
+/// Table-driven head: render an op's leading SCALAR operand fields as byte-
+/// pinned colored groups plus their grey interpretation — the flag-rendering of
+/// what used to be ~11 near-identical per-op arms. Multiline ops keep only their
+/// leading scalar here (chunk id); the list body is drawn by `writeOperandTail`.
+/// Ops whose head is a list (attr paths, mix) or empty fall back to the compact
+/// decode.
+fn buildHeadGeneric(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: Symbols, up_names: ?[]const InternId, local_names: ?[]const InternId, operand_text: []const u8, end_ip: usize, seq: *usize) u16 {
+    const code = chunk.code;
+    const fields = opcode_mod.layout(op);
+    const n_head: usize = if (isMultiline(op)) 1 else fields.len;
+    if (n_head == 0 or fieldIsList(fields[0])) return buildHeadCompact(l, operand_text, start, end_ip);
+
+    // Colors are computed in pass 1 and reused in pass 2 — a seq-based hue must
+    // not advance twice for one field.
+    var colors: [4][3]u8 = undefined;
+    var byte: u16 = 0;
+    var i: usize = 0;
+    while (i < n_head) : (i += 1) {
+        const f = fields[i];
+        const off = start + 1 + byte;
+        const flen: u16 = @intCast(opcode_mod.fieldLen(f, code, off));
+        colors[i] = headColor(f, code, off, seq);
+        if (i > 0) l.glue(" ", .{});
+        headRaw(l, f, code, off, 1 + byte, flen, colors[i]);
+        byte += flen;
+    }
+    l.comment();
+    byte = 0;
+    i = 0;
+    while (i < n_head) : (i += 1) {
+        if (i > 0) l.glue(", ", .{});
+        headInterp(l, fields[i], chunk, code, start + 1 + byte, colors[i], symbols, up_names, local_names);
+        byte += @intCast(opcode_mod.fieldLen(fields[i], code, start + 1 + byte));
+    }
+    return byte;
+}
+
+/// Fallback head for ops with no bespoke breakdown: the compact `writeOperands`
+/// text, split into a byte-linked raw group and a grey ` ; ` interpretation.
+fn buildHeadCompact(l: *Line, operand_text: []const u8, start: usize, end_ip: usize) u16 {
+    const oplen: u16 = @intCast(end_ip - (start + 1));
+    const cut = std.mem.indexOf(u8, operand_text, " ; ") orelse operand_text.len;
+    if (oplen > 0 and cut > 0) l.group(1, oplen, "{s}", .{operand_text[0..cut]});
+    if (cut < operand_text.len) {
+        l.comment();
+        l.glue("{s}", .{operand_text[cut + 3 ..]});
+    } else if (oplen == 0 and operand_text.len > 0) {
+        l.comment();
+        l.glue("{s}", .{operand_text});
+    }
+    return oplen;
+}
+
+/// The identity color for a head field's byte group: value-derived for the
+/// ref-like fields (chunk/intern/const/upvalue), a fresh sequential hue for the
+/// positional ones (local slot / count / jump).
+fn headColor(f: Operand, code: []const u8, off: usize, seq: *usize) [3]u8 {
+    switch (f) {
+        .const_idx => return constColor(readU16(code, off)),
+        .slot => |s| if (s.role == .upvalue) return upvColor(readWidth(s.w, code, off)),
+        .chunk_id, .intern => |w| return objInternColor(f, readWidth(w, code, off)),
+        else => {},
+    }
+    const c = hueColor(seq.*);
+    seq.* += 1;
+    return c;
+}
+
+fn objInternColor(f: Operand, id: u32) [3]u8 {
+    return switch (f) {
+        .chunk_id => objColor(id),
+        else => internColor(id),
+    };
+}
+
+fn headRaw(l: *Line, f: Operand, code: []const u8, off: usize, col_byte: u16, flen: u16, color: [3]u8) void {
+    switch (f) {
+        .chunk_id, .intern => |w| l.groupPinned(col_byte, flen, color, "0x{x}", .{readWidth(w, code, off)}),
+        .jump => l.groupPinned(col_byte, flen, color, "+{d}", .{readU32(code, off)}),
+        .cap1 => l.groupPinned(col_byte, flen, color, "#{d}", .{readU16(code, off + 1)}),
+        .const_idx => l.groupPinned(col_byte, flen, color, "#{d}", .{readU16(code, off)}),
+        .slot => |s| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(s.w, code, off)}),
+        .count => |c| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(c.w, code, off)}),
+        .raw => |w| l.groupPinned(col_byte, flen, color, "#{d}", .{readWidth(w, code, off)}),
+        else => {},
+    }
+}
+
+fn headInterp(l: *Line, f: Operand, chunk: *const Chunk, code: []const u8, off: usize, color: [3]u8, symbols: Symbols, up_names: ?[]const InternId, local_names: ?[]const InternId) void {
+    switch (f) {
+        .const_idx => {
+            const idx = readU16(code, off);
+            if (idx < chunk.constants.len) lineValueDigest(l, chunk.constants[idx], symbols, snippet_max);
         },
-        .loc_get, .loc_set, .loc_grab, .cell_init, .loc_get_ret, .cell_set => {
-            const slot = code[start + 1];
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 1, c, "#{d}", .{slot});
-            l.comment();
-            l.glue("local[", .{});
-            l.tint(c, "{d}", .{slot});
+        .slot => |s| {
+            const v = readWidth(s.w, code, off);
+            const role = if (s.role == .upvalue) "upvalue" else "local";
+            l.glue("{s}[", .{role});
+            l.tint(color, "{d}", .{v});
             l.glue("]", .{});
-            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
-            return 1;
+            const nm = if (s.role == .upvalue) upvalueName(up_names, symbols, v) else localName(local_names, symbols, v);
+            if (nm) |name| l.tint(name_color, " {s}", .{name});
         },
-        .loc_get_w, .loc_set_w, .loc_grab_w, .cell_set_w, .cell_init_w, .loc_get_ret_w => {
-            const slot = readU16(code, start + 1);
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 2, c, "#{d}", .{slot});
-            l.comment();
-            l.glue("local[", .{});
-            l.tint(c, "{d}", .{slot});
+        .cap1 => {
+            const kind = code[off];
+            const idx = readU16(code, off + 1);
+            l.glue("{s}[", .{if (kind == 0) "local" else "upvalue"});
+            l.tint(color, "{d}", .{idx});
             l.glue("]", .{});
-            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
-            return 2;
         },
-        .up_grab, .up_get, .up_get_ret => {
-            const slot = readU16(code, start + 1);
-            const c = upvColor(slot);
-            l.groupPinned(1, 2, c, "#{d}", .{slot});
-            l.comment();
-            l.glue("upvalue[", .{});
-            l.tint(c, "{d}", .{slot});
-            l.glue("]", .{});
-            if (upvalueName(up_names, symbols, slot)) |nm| l.tint(name_color, " {s}", .{nm});
-            return 2;
+        .chunk_id => |w| {
+            const id: ChunkId = readWidth(w, code, off);
+            l.storeRef("chunk", color, "0x{x}", .{id});
+            if (chunkNameOf(symbols, id)) |nm| l.tint(name_color, " {s}", .{nm});
         },
-        .up_get_attr => {
-            const slot = readU16(code, start + 1);
-            const id: InternId = @intCast(readU16(code, start + 3));
-            const c = upvColor(slot);
-            const ci = internColor(id);
-            l.groupPinned(1, 2, c, "#{d}", .{slot});
-            l.glue(" ", .{});
-            l.groupPinned(3, 2, ci, "0x{x}", .{id});
-            l.comment();
-            l.glue("upvalue[", .{});
-            l.tint(c, "{d}", .{slot});
-            l.glue("].", .{});
-            if (symbols.internName(id)) |nm| {
-                var buf: [128]u8 = undefined;
-                l.tint(ci, "\"{s}\"", .{escSnippet(&buf, nm, snippet_max)});
-            } else {
-                l.tint(ci, "0x{x}", .{id});
-            }
-            if (upvalueName(up_names, symbols, slot)) |nm| l.tint(name_color, " ({s})", .{nm});
-            return 4;
+        .intern => |w| {
+            const id: InternId = readWidth(w, code, off);
+            lineStringRef(l, "str", id, symbols, snippet_max);
         },
-        .loc_get_attr, .loc_get_attr_w => {
-            const wide = op == .loc_get_attr_w;
-            const slot: u16 = if (wide) readU16(code, start + 1) else code[start + 1];
-            const slot_len: u16 = if (wide) 2 else 1;
-            const id: InternId = @intCast(readU16(code, start + 1 + slot_len));
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            const ci = internColor(id);
-            l.groupPinned(1, slot_len, c, "#{d}", .{slot});
-            l.glue(" ", .{});
-            l.groupPinned(1 + slot_len, 2, ci, "0x{x}", .{id});
-            l.comment();
-            l.glue("local[", .{});
-            l.tint(c, "{d}", .{slot});
-            l.glue("].", .{});
-            if (symbols.internName(id)) |nm| {
-                var buf: [128]u8 = undefined;
-                l.tint(ci, "\"{s}\"", .{escSnippet(&buf, nm, snippet_max)});
-            } else {
-                l.tint(ci, "0x{x}", .{id});
-            }
-            if (localName(local_names, symbols, slot)) |nm| l.tint(name_color, " ({s})", .{nm});
-            return 2 + slot_len;
+        .count => |c| {
+            l.tint(color, "{d}", .{readWidth(c.w, code, off)});
+            l.glue(" {s}", .{c.noun});
         },
-        .call_n, .call_tail_n => {
-            const n = code[start + 1];
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 1, c, "#{d}", .{n});
-            l.comment();
-            l.tint(c, "{d}", .{n});
-            l.glue(" args", .{});
-            return 1;
-        },
-        .jump, .jump_false => {
-            const off = readU32(code, start + 1);
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 4, c, "+{d}", .{off});
-            l.comment();
+        .jump => {
+            const target = off + 4 + readU32(code, off);
             l.glue("→ ", .{});
-            l.tint(c, "{x:0>4}", .{start + 5 + off});
-            return 4;
+            l.tint(color, "{x:0>4}", .{target});
         },
-        .attrs_new, .attrs_new_srt, .list_new, .str_cat => {
-            const n = readU16(code, start + 1);
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, 2, c, "#{d}", .{n});
-            l.comment();
-            l.tint(c, "{d}", .{n});
-            l.glue(" {s}", .{switch (op) {
-                .list_new => "items",
-                .str_cat => "parts",
-                else => "entries",
-            }});
-            return 2;
-        },
-        .attr_get, .attr_get_w, .file_find, .file_find_w => {
-            const wide = op == .attr_get_w or op == .file_find_w;
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: InternId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
-            l.groupPinned(1, id_len, internColor(id), "0x{x}", .{id});
-            l.comment();
-            lineStringRef(l, "str", id, symbols, snippet_max);
-            return id_len;
-        },
-        .with_lookup, .with_lookup_w => {
-            const wide = op == .with_lookup_w;
-            const id_len: u16 = if (wide) 4 else 2;
-            const id: InternId = if (wide) readU32(code, start + 1) else @intCast(readU16(code, start + 1));
-            const scopes = code[start + 1 + id_len];
-            const c = hueColor(seq.*);
-            seq.* += 1;
-            l.groupPinned(1, id_len, internColor(id), "0x{x}", .{id});
-            l.glue(" ", .{});
-            l.groupPinned(1 + id_len, 1, c, "#{d}", .{scopes});
-            l.comment();
-            lineStringRef(l, "str", id, symbols, snippet_max);
-            l.glue(" (", .{});
-            l.tint(c, "{d}", .{scopes});
-            l.glue(" scopes)", .{});
-            return id_len + 1;
-        },
-        else => {
-            // No bespoke arm: fall back to the compact decode — raw part as one
-            // byte-linked group, its ` ; ` interpretation as a grey comment.
-            const oplen: u16 = @intCast(end_ip - (start + 1));
-            const cut = std.mem.indexOf(u8, operand_text, " ; ") orelse operand_text.len;
-            if (oplen > 0 and cut > 0) l.group(1, oplen, "{s}", .{operand_text[0..cut]});
-            if (cut < operand_text.len) {
-                l.comment();
-                l.glue("{s}", .{operand_text[cut + 3 ..]});
-            } else if (oplen == 0 and operand_text.len > 0) {
-                // Stack-only operands (e.g. "(dynamic, with default)"): pure
-                // interpretation, no bytes.
-                l.comment();
-                l.glue("{s}", .{operand_text});
-            }
-            return oplen;
-        },
+        else => {},
     }
 }
 
