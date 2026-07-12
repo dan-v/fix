@@ -766,7 +766,7 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
         if (!gop.found_existing) {
             gop.value_ptr.* = groups_list.items.len;
             try groups_list.append(self.allocator, .{
-                .first = entry.path[0],
+                .first = entry.origin orelse entry.path[0],
                 .name = try attrSegmentNameAlloc(self, entry.path[0]),
                 .name_id = name_id,
             });
@@ -829,6 +829,9 @@ fn attrEntryGroups(self: *Compiler, entries: []const AttrEntryView) !AttrEntryGr
             .path = entry.path[1..],
             .expr = entry.expr,
             .inherit_outer = entry.inherit_outer,
+            // Keep the outermost segment so the nested set reports the attr
+            // path's start position for its desugared segments.
+            .origin = entry.origin orelse entry.path[0],
         };
         group.tail_count += 1;
     }

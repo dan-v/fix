@@ -36,6 +36,11 @@ pub const AttrEntryView = struct {
     path: []const Node.Atom,
     expr: *const Node,
     inherit_outer: bool = false,
+    /// The outermost attr-path segment this view was desugared from, threaded
+    /// through nested-set splits. Nix reports the *start* of an attr path as the
+    /// position of every desugared segment, so `{ foo.bar = 1; }` gives `bar`
+    /// the position of `foo`. Null for a top-level segment (use `path[0]`).
+    origin: ?Node.Atom = null,
 };
 
 /// All entries sharing one attr-name root, bucketed into direct `leaves`
