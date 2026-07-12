@@ -165,6 +165,26 @@ fn derivationStructuredAttrs(self: anytype, attrs_id: ObjectId) !bool {
     return forced.asBool();
 }
 
+/// Validate a derivation `name` as a Nix store-path name: non-empty, at most
+/// 211 chars, not `.`/`..`, and only `[A-Za-z0-9+._?=-]`.
+fn validateDerivationName(self: anytype, name: []const u8) !void {
+    const invalid = name.len == 0 or name.len > 211 or
+        std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        !nameCharsValid(name);
+    if (!invalid) return;
+    const msg = try std.fmt.allocPrint(self.allocator, "invalid derivation name '{s}'", .{name});
+    defer self.allocator.free(msg);
+    try vm_trace.setErrorMessage(self, msg);
+    return error.InvalidDerivationName;
+}
+
+fn nameCharsValid(name: []const u8) bool {
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "+-._?=", c) != null)) return false;
+    }
+    return true;
+}
+
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     // GC: `attrs_id` is a bare id held across the whole (force-heavy) build.
     const gc_roots = vm_force.rootsBegin(self);
@@ -175,6 +195,7 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     if (!isPlainString(name_value)) return error.TypeError;
     const drv_name_id = try stringTextInternId(self, name_value);
     const drv_name = self.intern.get(drv_name_id);
+    try validateDerivationName(self, drv_name);
 
     // The `.derivation` span drives the demand fiber's single-writer LIFO stage
     // stack — a speculative derivation force on a helper fiber interleaving
@@ -843,6 +864,16 @@ fn derivationOutputNames(self: anytype, attrs_id: ObjectId) !DerivationOutputNam
         if (!isPlainString(value)) return error.TypeError;
         name.* = try stringTextInternId(self, value);
         if (self.intern.get(name.*).len == 0) return error.InvalidDerivationOutput;
+    }
+    // Reject duplicate output names (Nix errors before building the .drv).
+    for (names, 0..) |n, i| {
+        for (names[0..i]) |m| {
+            if (n != m) continue;
+            const msg = try std.fmt.allocPrint(self.allocator, "duplicate derivation output '{s}'", .{self.intern.get(n)});
+            defer self.allocator.free(msg);
+            try vm_trace.setErrorMessage(self, msg);
+            return error.InvalidDerivationOutput;
+        }
     }
     return .{ .names = names, .explicit = true };
 }
