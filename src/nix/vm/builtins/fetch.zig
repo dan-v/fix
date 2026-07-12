@@ -113,12 +113,29 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
 
     const src_span = self.storeCopySpanBegin(path_ops.baseName(root));
     defer self.storeCopySpanEnd(src_span);
-    const store_path = try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
+    var unsupported: nar.Unsupported = .{};
+    defer unsupported.deinit(self.allocator);
+    const store_path = source_paths.storePathForFilteredSourceReport(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
         .context = &context,
         .accept = Context.accept,
-    });
+    }, &unsupported) catch |err| return reportUnsupportedType(self, &unsupported, err);
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));
+}
+
+/// On `error.UnsupportedPathType` from NAR ingestion, attach the Nix-style
+/// `file '<path>' has an unsupported type` message (using the path the
+/// serializer recorded) before re-raising. Shared by the `path`/`filterSource`
+/// copy-to-store builtins.
+pub fn reportUnsupportedType(self: anytype, unsupported: *const nar.Unsupported, err: anyerror) anyerror {
+    if (err == error.UnsupportedPathType) {
+        if (unsupported.path) |p| {
+            const msg = std.fmt.allocPrint(self.allocator, "file '{s}' has an unsupported type", .{p}) catch return err;
+            defer self.allocator.free(msg);
+            vm_trace.setErrorMessage(self, msg) catch {};
+        }
+    }
+    return err;
 }
 
 const FetchGitSpec = struct {

@@ -29,6 +29,8 @@ import argparse
 import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -488,7 +490,19 @@ def load_snix_case(kdl_path: Path, cases_root: Path) -> SnixCase:
     return c
 
 
-def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path) -> str | None:
+def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path,
+                          omitted: list[str] | None = None) -> str | None:
+    """Create the declared fixture tree under `dest`.
+
+    Returns a hard skip-reason string when a fixture the harness cannot make at
+    all is required. Device nodes (char/block/device) that need root but that we
+    couldn't create are recorded in `omitted` and *skipped* rather than
+    hard-failing: the caller downgrades an inconclusive run to a skip (never a
+    false pass/fail) so a test whose device node turns out not to be load-
+    bearing (e.g. the filter excludes it) can still run and pass.
+    """
+    if omitted is None:
+        omitted = []
     for fx in fixtures:
         if fx.name == "file":
             target = dest / fx.args[0]
@@ -505,14 +519,52 @@ def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path) -
                 shutil.copytree(case_dir / fx.props["ref"], target, dirs_exist_ok=True)
             else:
                 target.mkdir(parents=True, exist_ok=True)
-                err = _materialize_fixtures(fx.children, case_dir, target)
+                err = _materialize_fixtures(fx.children, case_dir, target, omitted)
                 if err:
                     return err
         elif fx.name == "symlink":
             (dest / fx.args[0]).parent.mkdir(parents=True, exist_ok=True)
             os.symlink(fx.props.get("target", ""), dest / fx.args[0])
+        elif fx.name == "fifo":
+            # A named pipe: creatable unprivileged with mkfifo(2). fix's NAR
+            # ingestion must reject it (unsupported type) unless the filter
+            # excludes it — that's exactly what these cases pin down.
+            target = dest / fx.args[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(target)
+        elif fx.name == "socket":
+            # A unix-domain socket file: creatable unprivileged by binding an
+            # AF_UNIX socket to the path. The bound inode persists after the
+            # socket object is closed (it is only removed by unlink), so the
+            # fixture is a real socket node on disk.
+            target = dest / fx.args[0]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            s = socket.socket(socket.AF_UNIX)
+            try:
+                s.bind(str(target))
+            finally:
+                s.close()
+        elif fx.name in ("char", "block", "device"):
+            # Character / block device nodes. `mknod(2)` for a device needs
+            # CAP_MKNOD (root), so we can only make these when running
+            # privileged. A `device` fixture naming an already-present node
+            # (e.g. /dev/null, referenced absolutely by the .nix) needs no
+            # creation at all — that case runs unprivileged.
+            target = dest / fx.args[0]
+            if target.exists():
+                continue
+            fmt = stat.S_IFBLK if fx.name == "block" else stat.S_IFCHR
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.mknod(target, fmt | 0o600, os.makedev(1, 3))
+            except (PermissionError, OSError):
+                # Unprivileged: can't mknod. Record it and press on — if the
+                # node is load-bearing the run will be inconclusive and the
+                # caller downgrades it to a skip; if not (filtered out), the
+                # run still matches golden and passes.
+                omitted.append(fx.name)
+                continue
         else:
-            # device / fifo / socket / char need special privileges or syscalls
             return f"unsupported-fixture:{fx.name}"
     return None
 
@@ -552,7 +604,8 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
 
     with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
         tmp = Path(td)
-        fxerr = _materialize_fixtures(c.fixtures, c.kdl.parent, tmp)
+        omitted: list[str] = []
+        fxerr = _materialize_fixtures(c.fixtures, c.kdl.parent, tmp, omitted)
         if fxerr:
             return Result("snix", c.ident, "skip", fxerr)
         code_path = tmp / nix_src.name
@@ -560,14 +613,21 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
         env = {name: val for name, val in c.env_vars}
         p = run_fix(fix, [*flags, code_path.name], tmp, env)
 
+        # A privileged device node we couldn't create makes any non-pass
+        # inconclusive rather than a real divergence — downgrade to a skip so
+        # we never report a false failure for something we couldn't set up.
+        def fail(detail: str) -> Result:
+            if omitted:
+                return Result("snix", c.ident, "skip", f"unsupported-fixture:{omitted[0]}")
+            return Result("snix", c.ident, "fail", detail)
+
         if err.exists():
             kind = err.read_text().strip()
             subs = ERROR_KINDS.get(kind, [])
             ok = p.returncode != 0 and any(s in p.stderr for s in subs)
             if ok:
                 return Result("snix", c.ident, "pass")
-            return Result("snix", c.ident, "fail",
-                          f"expected error kind {kind} (one of {subs}); rc={p.returncode}\n{_indent(p.stderr.strip())}")
+            return fail(f"expected error kind {kind} (one of {subs}); rc={p.returncode}\n{_indent(p.stderr.strip())}")
 
         expected = exp.read_text() if exp.exists() else ""
         out = p.stdout
@@ -577,10 +637,10 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
             if name == "HOME":
                 out = out.replace(os.path.expanduser("~"), val)
         if p.returncode != 0:
-            return Result("snix", c.ident, "fail", f"eval failed:\n{_indent(p.stderr.strip())}")
+            return fail(f"eval failed:\n{_indent(p.stderr.strip())}")
         if out.strip() == expected.strip():
             return Result("snix", c.ident, "pass")
-        return Result("snix", c.ident, "fail", _diff(expected, out))
+        return fail(_diff(expected, out))
 
 
 # --------------------------------------------------------------------------

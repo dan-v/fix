@@ -57,7 +57,22 @@ pub fn ingest(
     name: []const u8,
     filter: ?nar.Filter,
 ) !Ingested {
-    const nar_bytes = try nar.serialize(allocator, files, path, filter);
+    return ingestReport(allocator, derivations, files, path, name, filter, null);
+}
+
+/// `ingest`, but records the offending path into `unsupported` (when non-null)
+/// on `error.UnsupportedPathType`, so path/filterSource builtins can raise a
+/// Nix-style `file '<path>' has an unsupported type` diagnostic.
+pub fn ingestReport(
+    allocator: std.mem.Allocator,
+    derivations: *DerivationStore,
+    files: *FileCache,
+    path: []const u8,
+    name: []const u8,
+    filter: ?nar.Filter,
+    unsupported: ?*nar.Unsupported,
+) !Ingested {
+    const nar_bytes = try nar.serializeReport(allocator, files, path, filter, unsupported);
     defer allocator.free(nar_bytes);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -91,7 +106,21 @@ pub fn storePathForFilteredSource(
     name: []const u8,
     filter: ?nar.Filter,
 ) ![]u8 {
-    const ingested = try ingest(allocator, derivations, files, path, name, filter);
+    return storePathForFilteredSourceReport(allocator, derivations, files, path, name, filter, null);
+}
+
+/// `storePathForFilteredSource`, but records the offending path into
+/// `unsupported` (when non-null) on `error.UnsupportedPathType`.
+pub fn storePathForFilteredSourceReport(
+    allocator: std.mem.Allocator,
+    derivations: *DerivationStore,
+    files: *FileCache,
+    path: []const u8,
+    name: []const u8,
+    filter: ?nar.Filter,
+    unsupported: ?*nar.Unsupported,
+) ![]u8 {
+    const ingested = try ingestReport(allocator, derivations, files, path, name, filter, unsupported);
     allocator.free(ingested.nar_hash);
     return ingested.store_path;
 }

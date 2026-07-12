@@ -8,10 +8,36 @@ pub const Filter = struct {
     accept: *const fn (context: *anyopaque, path: []const u8, kind: FileCache.FileKind) anyerror!bool,
 };
 
+/// Out-parameter for `serialize`: when serialization aborts on a file whose
+/// type NAR cannot represent (fifo/socket/device — anything reported as
+/// `.unknown`), the offending path is recorded here so callers can build the
+/// Nix-style `file '<path>' has an unsupported type` diagnostic. `path` is
+/// allocated with the serializer's allocator; the caller owns and frees it.
+pub const Unsupported = struct {
+    path: ?[]u8 = null,
+
+    pub fn deinit(self: *Unsupported, allocator: std.mem.Allocator) void {
+        if (self.path) |p| allocator.free(p);
+        self.path = null;
+    }
+};
+
 /// Serialize `path` to a NAR byte stream (`nix-archive-1` format), applying
 /// `filter` to directory descent. Caller owns the returned buffer. This is the
 /// dump the daemon's `AddToStore` (recursive/NAR ingestion) reads.
 pub fn serialize(allocator: std.mem.Allocator, files: *FileCache, path: []const u8, filter: ?Filter) ![]u8 {
+    return serializeReport(allocator, files, path, filter, null);
+}
+
+/// `serialize`, but records the offending path into `unsupported` (when
+/// non-null) on `error.UnsupportedPathType`.
+pub fn serializeReport(
+    allocator: std.mem.Allocator,
+    files: *FileCache,
+    path: []const u8,
+    filter: ?Filter,
+    unsupported: ?*Unsupported,
+) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -22,7 +48,7 @@ pub fn serialize(allocator: std.mem.Allocator, files: *FileCache, path: []const 
     // as directory entries are still serialized as symlink nodes (below).
     const root = try resolveRootSymlink(allocator, files, path);
     defer allocator.free(root);
-    try appendNode(allocator, files, &out, root, filter);
+    try appendNode(allocator, files, &out, root, filter, unsupported);
 
     return out.toOwnedSlice(allocator);
 }
@@ -76,7 +102,7 @@ pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8
     return allocator.dupe(u8, &encoded);
 }
 
-fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8, filter: ?Filter) !void {
+fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
     try appendString(allocator, out, "(");
     switch (try files.fileType(path)) {
         .regular => {
@@ -105,7 +131,7 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
                 try appendString(allocator, out, "name");
                 try appendString(allocator, out, entry.name);
                 try appendString(allocator, out, "node");
-                try appendNode(allocator, files, out, child, filter);
+                try appendNode(allocator, files, out, child, filter, unsupported);
                 try appendString(allocator, out, ")");
             }
         },
@@ -117,7 +143,12 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
             try appendString(allocator, out, "target");
             try appendString(allocator, out, target);
         },
-        .unknown => return error.UnsupportedPathType,
+        .unknown => {
+            if (unsupported) |u| {
+                if (u.path == null) u.path = try allocator.dupe(u8, path);
+            }
+            return error.UnsupportedPathType;
+        },
     }
     try appendString(allocator, out, ")");
 }

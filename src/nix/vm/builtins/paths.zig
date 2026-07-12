@@ -189,7 +189,10 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 
     // Recursive (NAR) ingestion, computing the NAR hash so a FOD `sha256`
     // attr can be checked even when a `filter` is present.
-    const ingested = try recursiveIngest(self, path, store_name, filter_value);
+    var unsupported: nar.Unsupported = .{};
+    defer unsupported.deinit(self.allocator);
+    const ingested = recursiveIngest(self, path, store_name, filter_value, &unsupported) catch |err|
+        return fetch.reportUnsupportedType(self, &unsupported, err);
     defer ingested.deinit(self.allocator);
     if (expected_hash) |expected| {
         const actual_hex = try derivation.hashToBase16(self.allocator, "sha256", ingested.nar_hash);
@@ -201,10 +204,11 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 
 /// Recursive (NAR) ingestion of `path` under an optional `filter`, returning
 /// the store path and NAR hash. Split out so the closure-holding `Context`
-/// lives on this frame for the duration of `ingest`.
-fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value) !source_paths.Ingested {
+/// lives on this frame for the duration of `ingest`. Records the offending path
+/// in `unsupported` when the source contains an unsupported node (fifo/socket).
+fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value, unsupported: *nar.Unsupported) !source_paths.Ingested {
     if (filter_value.isNull()) {
-        return source_paths.ingest(self.allocator, self.derivations, self.files, path, store_name, null);
+        return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, null, unsupported);
     }
     const pred = try vm_force.forceValue(self, filter_value);
     const Context = struct {
@@ -217,8 +221,8 @@ fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filt
         }
     };
     var context: Context = .{ .vm = self, .pred = pred };
-    return source_paths.ingest(self.allocator, self.derivations, self.files, path, store_name, .{
+    return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, .{
         .context = &context,
         .accept = Context.accept,
-    });
+    }, unsupported);
 }
