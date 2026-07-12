@@ -8,6 +8,8 @@
 const std = @import("std");
 const compiler_mod = @import("../compiler.zig");
 
+const fold = @import("fold.zig");
+
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 
@@ -51,8 +53,17 @@ pub fn walkReferencedNames(self: *Compiler, node: *const Node, ctx: anytype) voi
             const ident = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
             ctx.mark(ident);
         },
-        .unary_op => walkReferencedNames(self, node.data.unary.expr, ctx),
+        .unary_op => {
+            // Lix operator overloading: unary `-e` lowers to `__sub 0 e`, so
+            // mark `__sub` referenced — a matching lexical binding must be
+            // kept alive even though no identifier textually names it.
+            if (node.data.unary.op == .negate) ctx.mark("__sub");
+            walkReferencedNames(self, node.data.unary.expr, ctx);
+        },
         .binary_op => {
+            // Likewise `-` `*` `/` `<` lower to calls of `__sub`/`__mul`/
+            // `__div`/`__lessThan` when such a binding is in scope.
+            if (fold.overloadNameForBinary(node.data.binary.op)) |name| ctx.mark(name);
             walkReferencedNames(self, node.data.binary.left, ctx);
             walkReferencedNames(self, node.data.binary.right, ctx);
         },

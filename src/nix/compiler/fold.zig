@@ -14,6 +14,10 @@ const heap_mod = @import("runtime").heap;
 const string_syntax = @import("syntax").string_syntax;
 const attrs_mod = @import("attrs.zig");
 const literals_mod = @import("literals.zig");
+const types = @import("runtime").types;
+const scope = @import("scope.zig");
+const thunks = @import("thunks.zig");
+const access = @import("access.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -28,6 +32,19 @@ pub fn compileBinary(self: *Compiler, node: *const Node) !void {
         .or_ => return compileOr(self, bin.left, bin.right),
         .impl => return compileImpl(self, bin.left, bin.right),
         else => {},
+    }
+
+    // Lix operator overloading: `-` `*` `/` `<` desugar to a call of the
+    // lexical variable `__sub`/`__mul`/`__div`/`__lessThan` when that name
+    // resolves to a *user* (let/lambda) binding in scope. See
+    // `overloadBindingInScope` — the probe is side-effect-free, so the
+    // overwhelming common case (no such binding) falls straight through to
+    // the direct arithmetic op below with identical bytecode.
+    if (overloadNameForBinary(bin.op)) |name| {
+        const name_id = try self.intern.intern(name);
+        if (overloadBindingInScope(self, name_id)) {
+            return compileOverloadCall(self, name, name_id, bin.left, bin.right);
+        }
     }
 
     // Compile-time fold pure literal-on-literal expressions. Skips
@@ -119,10 +136,17 @@ fn tryFoldNode(self: *Compiler, node: *const Node) anyerror!?Value {
         .list => return tryFoldList(self, n),
         .binary_op => {
             const bin = n.data.binary;
+            // Never fold an operator that a user `__sub`/`__mul`/`__div`/
+            // `__lessThan` overloads — it must lower to the call instead.
+            if (overloadNameForBinary(bin.op)) |name| {
+                if (overloadBindingInScope(self, try self.intern.intern(name))) return null;
+            }
             return tryFoldBinaryOp(self, bin.op, bin.left, bin.right);
         },
         .unary_op => {
             const u = n.data.unary;
+            // Unary `-e` overloads via `__sub` (`__sub 0 e`); don't fold it.
+            if (u.op == .negate and overloadBindingInScope(self, try self.intern.intern("__sub"))) return null;
             return tryFoldUnaryOp(self, u.op, u.expr);
         },
         else => return null,
@@ -403,13 +427,84 @@ fn compileImpl(self: *Compiler, left: *const Node, right: *const Node) !void {
 }
 
 pub fn compileUnary(self: *Compiler, node: *const Node) !void {
+    const un = node.data.unary;
+    // Lix operator overloading: unary `-e` desugars to `__sub 0 e` when a
+    // user `__sub` binding is in scope (matching the binary `-` overload).
+    if (un.op == .negate) {
+        const name_id = try self.intern.intern("__sub");
+        if (overloadBindingInScope(self, name_id)) {
+            try emitOverloadCallee(self, "__sub", name_id);
+            try self.builder.emitConstant(self.allocator, try int_ops.make(self.heap, 0));
+            try compileOverloadArg(self, un.expr);
+            try emit.emitOpByte(self, .call_n, 2);
+            return;
+        }
+    }
     if (try tryFoldNode(self, node)) |val| {
         return self.builder.emitConstant(self.allocator, val);
     }
-    const un = node.data.unary;
     try self.compileNode(un.expr);
     switch (un.op) {
         .negate => try emit.emitOp(self, .int_neg),
         .not => try emit.emitOp(self, .bool_not),
     }
+}
+
+/// The `__`-prefixed builtin name a binary operator overloads through, or
+/// null for operators Lix does not overload (`+` has no `__add`; structural
+/// and equality operators are never overloaded). Also consulted by the
+/// reference walker (`refs.zig`) so a `let __mul = …;` referenced only
+/// through the `*` operator is kept alive rather than pruned.
+pub fn overloadNameForBinary(op: BinaryOp) ?[]const u8 {
+    return switch (op) {
+        .sub => "__sub",
+        .mul => "__mul",
+        .div => "__div",
+        .lt => "__lessThan",
+        else => null,
+    };
+}
+
+/// True iff `name_id` resolves to a *user* binding (a local, or a local of
+/// some ancestor compiler that would be captured as an upvalue). This walks
+/// the same local/ancestor chain as `resolveCaptureId` but WITHOUT its
+/// capture side effect, so a probe that finds nothing leaves the compiler
+/// state untouched — the direct arithmetic op is emitted exactly as before,
+/// keeping the common (non-overloaded) case byte-for-byte identical.
+fn overloadBindingInScope(self: *const Compiler, name_id: types.InternId) bool {
+    if (scope.resolveLocalId(self, name_id)) |_| return true;
+    var p = self.parent;
+    while (p) |parent| : (p = parent.parent) {
+        if (scope.resolveLocalId(parent, name_id)) |_| return true;
+    }
+    return false;
+}
+
+/// Push the resolved overload callee (`__mul` etc.) onto the stack. Only
+/// called after `overloadBindingInScope` has confirmed a user binding, so
+/// resolution here always succeeds (as a local or, via capture threading,
+/// an upvalue).
+fn emitOverloadCallee(self: *Compiler, name: []const u8, name_id: types.InternId) !void {
+    if (scope.resolveLocalId(self, name_id)) |slot| {
+        try emit.emitGetLocal(self, slot);
+    } else if (try scope.resolveCaptureId(self, name, name_id)) |cap| {
+        try emit.emitOpU16(self, .up_get, cap);
+    } else unreachable;
+}
+
+/// Compile one overload-call argument with the same laziness as a normal
+/// application spine arg: a bare immediate/local passes through directly,
+/// everything else becomes a lazy thunk.
+fn compileOverloadArg(self: *Compiler, arg: *const Node) !void {
+    if (try access.compileImmediateContainerValue(self, arg, .{ .raw_identifier = true })) return;
+    try thunks.compileThunk(self, arg);
+}
+
+/// Emit `<name> left right` as a saturated 2-arg call for an overloaded
+/// binary operator.
+fn compileOverloadCall(self: *Compiler, name: []const u8, name_id: types.InternId, left: *const Node, right: *const Node) !void {
+    try emitOverloadCallee(self, name, name_id);
+    try compileOverloadArg(self, left);
+    try compileOverloadArg(self, right);
+    try emit.emitOpByte(self, .call_n, 2);
 }
