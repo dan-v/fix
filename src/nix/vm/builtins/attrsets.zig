@@ -298,7 +298,17 @@ pub fn builtinRemoveAttrs(self: anytype, attrs_arg: Value, names_arg: Value) !Va
 
     // Surviving entries are a subsequence of the (sorted, unique) input,
     // so the output is sorted+unique by construction — skip the re-sort.
-    return Value.attrs(try self.heap.addAttrsSorted(entries.items));
+    // Nix keeps each surviving attr's source position; carry them over when the
+    // source has any (falling through to the fast sorted path otherwise).
+    var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+    defer positions.deinit(self.allocator);
+    for (entries.items) |entry| {
+        if (self.heap.getAttrPos(attrs_id, entry.name)) |pos| {
+            try positions.append(self.allocator, .{ .name = entry.name, .pos = pos });
+        }
+    }
+    if (positions.items.len == 0) return Value.attrs(try self.heap.addAttrsSorted(entries.items));
+    return Value.attrs(try self.heap.addAttrsWithPositions(entries.items, positions.items));
 }
 
 /// Binary search a sorted attr-entry slice by name (heap invariant:
@@ -365,5 +375,16 @@ pub fn builtinIntersectAttrs(self: anytype, left_arg: Value, right_arg: Value) !
     // `left_entries` and `right_entries` are sorted by name (heap
     // invariant); each strategy preserves order and adds no
     // duplicates, so `entries.items` is sorted+unique by construction.
-    return Value.attrs(try self.heap.addAttrsSorted(entries.items));
+    // The emitted entries are the RIGHT ones, so their positions (which Nix
+    // reports) come from the right operand.
+    var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+    defer positions.deinit(self.allocator);
+    const right_id = right.asObjectId();
+    for (entries.items) |entry| {
+        if (self.heap.getAttrPos(right_id, entry.name)) |pos| {
+            try positions.append(self.allocator, .{ .name = entry.name, .pos = pos });
+        }
+    }
+    if (positions.items.len == 0) return Value.attrs(try self.heap.addAttrsSorted(entries.items));
+    return Value.attrs(try self.heap.addAttrsWithPositions(entries.items, positions.items));
 }

@@ -75,6 +75,10 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
     const value_id = try self.intern.intern("value");
     var entries: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer entries.deinit(self.allocator);
+    // Nix records each result attr's position as the position of the `value`
+    // attribute inside the corresponding list element.
+    var positions: std.ArrayListUnmanaged(heap_mod.AttrPosEntry) = .empty;
+    defer positions.deinit(self.allocator);
     var entry_idx: shared.NameIndex = .{};
     defer entry_idx.deinit(self.allocator);
 
@@ -97,9 +101,13 @@ pub fn builtinListToAttrs(self: anytype, arg: Value) !Value {
             .value = try self.heap.getAttrValue(item_value.asObjectId(), value_id),
         });
         try entry_idx.record(self.allocator, name_intern, entries.items.len - 1);
+        if (self.heap.getAttrPos(item_value.asObjectId(), value_id)) |pos| {
+            try positions.append(self.allocator, .{ .name = name_intern, .pos = pos });
+        }
     }
 
-    return Value.attrs(try self.heap.addAttrs(entries.items));
+    if (positions.items.len == 0) return Value.attrs(try self.heap.addAttrs(entries.items));
+    return Value.attrs(try self.heap.addAttrsWithPositions(entries.items, positions.items));
 }
 
 pub fn callComparator(self: anytype, cmp: Value, left: Value, right: Value) !bool {
