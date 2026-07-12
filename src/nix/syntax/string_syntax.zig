@@ -287,19 +287,16 @@ fn parseIndented(
     body_end: usize,
     parts: *std.ArrayListUnmanaged(Part),
 ) !void {
-    const indent = minIndent(source, body_start, body_end);
-    var state = IndentState.init(indent, body_start < body_end and source[body_start] == '\n');
+    // Nix strips the first line if it consists only of spaces followed by a
+    // newline (the common `''<newline>` idiom, but also `''   <newline>`).
+    const start = leadingSkip(source, body_start, body_end);
+    const indent = minIndent(source, start, body_end);
+    var state = IndentState.init(indent);
     var text: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text.deinit(allocator);
 
-    var i = body_start;
+    var i = start;
     while (i < body_end) {
-        if (state.skip_initial_newline and i == body_start and source[i] == '\n') {
-            i += 1;
-            state.afterNewline();
-            continue;
-        }
-
         if (source[i] == '$') {
             const run_start = i;
             while (i < body_end and source[i] == '$') i += 1;
@@ -338,21 +335,45 @@ fn parseIndented(
         i += 1;
     }
 
+    // Nix drops the final line if it is empty and consists only of spaces
+    // (the closing `''` on its own indented line), keeping the newline.
+    trimTrailingBlankLine(&text);
+
     try flushOwnedText(allocator, &text, parts);
+}
+
+/// Number of source bytes to skip at the start of an indented-string body.
+/// If the first line is spaces-only and ends with a newline, that whole line
+/// (including the newline) is removed. Tabs count as content, so a first line
+/// containing a tab is not stripped.
+fn leadingSkip(source: []const u8, body_start: usize, body_end: usize) usize {
+    var i = body_start;
+    while (i < body_end and source[i] == ' ') i += 1;
+    if (i < body_end and source[i] == '\n') return i + 1;
+    return body_start;
+}
+
+/// Strip a trailing spaces-only final line in place, keeping the newline that
+/// precedes it. Only spaces are stripped (a trailing tab is preserved), and
+/// only when a newline is present (a spaces-only tail with no newline stays).
+fn trimTrailingBlankLine(text: *std.ArrayListUnmanaged(u8)) void {
+    const nl = std.mem.lastIndexOfScalar(u8, text.items, '\n') orelse return;
+    for (text.items[nl + 1 ..]) |byte| {
+        if (byte != ' ') return;
+    }
+    text.shrinkRetainingCapacity(nl + 1);
 }
 
 const IndentState = struct {
     indent: usize,
     remaining: usize,
     at_line_start: bool,
-    skip_initial_newline: bool,
 
-    fn init(indent: usize, skip_initial_newline: bool) IndentState {
+    fn init(indent: usize) IndentState {
         return .{
             .indent = indent,
             .remaining = indent,
             .at_line_start = true,
-            .skip_initial_newline = skip_initial_newline,
         };
     }
 
@@ -422,14 +443,6 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
     var i = body_start;
 
     while (i < body_end) {
-        if (i == body_start and source[i] == '\n') {
-            i += 1;
-            at_line_start = true;
-            line_indent = 0;
-            line_has_content = false;
-            continue;
-        }
-
         if (source[i] == '$' and i + 1 < body_end and source[i + 1] == '{') {
             line_has_content = true;
             at_line_start = false;
@@ -448,7 +461,9 @@ fn minIndent(source: []const u8, body_start: usize, body_end: usize) usize {
         i += 1;
     }
     if (line_has_content) best = @min(best orelse line_indent, line_indent);
-    return best orelse 0;
+    // No line carries non-whitespace content: strip every leading space so an
+    // all-whitespace indented string collapses to the empty string, as in Nix.
+    return best orelse std.math.maxInt(usize);
 }
 
 fn accountIndentByte(
@@ -523,7 +538,9 @@ fn decodeIndentedEscape(source: []const u8, i: usize) DecodedIndentedEscape {
 }
 
 fn isIndentByte(byte: u8) bool {
-    return byte == ' ' or byte == '\t';
+    // Nix only treats spaces as indentation whitespace; tabs count as content
+    // (their display width is unknowable), so they end leading-indent counting.
+    return byte == ' ';
 }
 
 test "scans nested interpolation strings" {

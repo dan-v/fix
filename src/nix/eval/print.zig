@@ -28,13 +28,20 @@ pub fn writeValue(ev: anytype, writer: *std.Io.Writer, value: Value) !void {
 
 fn writeQuotedString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
-    for (s) |c| {
+    for (s, 0..) |c, i| {
         switch (c) {
             '\\' => try writer.writeAll("\\\\"),
             '"' => try writer.writeAll("\\\""),
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
+            // Nix escapes a `$` only when it opens an interpolation (`${`), so
+            // the rendered literal round-trips back to the same string.
+            '$' => if (i + 1 < s.len and s[i + 1] == '{') {
+                try writer.writeAll("\\$");
+            } else {
+                try writer.writeByte(c);
+            },
             else => try writer.writeByte(c),
         }
     }
