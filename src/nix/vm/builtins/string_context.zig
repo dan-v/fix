@@ -10,9 +10,15 @@ const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
+const vm_trace = @import("../trace.zig");
 
 pub fn builtinGetContext(self: anytype, arg: Value) !Value {
     const value = try vm_force.forceValue(self, arg);
+    // getContext does not coerce — a path or derivation is a type error (unlike
+    // string concatenation, which coerces them).
+    if (value.kind() != .string and value.kind() != .string_context) {
+        return vm_trace.typeErrorExpected(self, "a string", value);
+    }
     return Value.attrs(try self.heap.addAttrs(try contextEntriesForValue(self, value)));
 }
 
@@ -37,8 +43,9 @@ pub fn builtinAppendContext(self: anytype, string_arg: Value, context_arg: Value
 }
 
 pub fn builtinUnsafeDiscardStringContext(self: anytype, arg: Value) !Value {
-    const value = try vm_force.forceValue(self, arg);
-    if (!strings.isStringLike(value)) return error.TypeError;
+    // Nix coerces the argument to a string first (paths, derivations, and
+    // `__toString` attrsets are accepted), then drops the context.
+    const value = try strings.coerceStringContextValue(self, arg);
     return Value.string(try strings.stringTextInternId(self, value));
 }
 

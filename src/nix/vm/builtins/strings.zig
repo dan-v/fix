@@ -218,7 +218,7 @@ pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, stri
 
 pub fn stringArg(self: anytype, arg: Value) ![]const u8 {
     const value = try vm_force.forceValue(self, arg);
-    if (!isStringLike(value) or value.isPath()) return error.TypeError;
+    if (!isStringLike(value) or value.isPath()) return vm_trace.typeErrorExpected(self, "a string", value);
     return self.intern.get(try stringTextInternId(self, value));
 }
 

@@ -11,6 +11,7 @@ const shared = @import("shared.zig");
 const strings = @import("strings.zig");
 const vm_force = @import("../force.zig");
 const vm_closures = @import("../closures.zig");
+const vm_trace = @import("../trace.zig");
 
 const makeBuiltinThunk = shared.makeBuiltinThunk;
 const isPlainString = strings.isPlainString;
@@ -221,7 +222,7 @@ pub fn builtinFunctionArgs(self: anytype, arg: Value) !Value {
     if (func.isBuiltin() or func.isBuiltinClosure() or func.isPartialApp()) {
         return Value.attrs(try self.heap.addAttrs(&.{}));
     }
-    if (!func.isClosure()) return error.TypeError;
+    if (!func.isClosure()) return vm_trace.typeErrorExpected(self, "a function", func);
 
     const closure = try self.heap.getClosure(func.asObjectId());
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
