@@ -40,11 +40,11 @@ REPO = Path(__file__).resolve().parents[2]
 LANG_DIR = Path(__file__).resolve().parent
 
 # fix eval flags we know how to honor. Anything a test requires that is not in
-# here (e.g. Lix's --no-location) makes the case a SKIP(unsupported-flag)
-# rather than a spurious language FAIL.
+# here makes the case a SKIP(unsupported-flag) rather than a spurious language
+# FAIL.
 SUPPORTED_FLAGS = {
     "-A", "--attr", "--arg", "--argstr", "--option",
-    "-I", "--include", "--xml", "--json", "--strict",
+    "-I", "--include", "--xml", "--json", "--strict", "--no-location",
     "--expr", "-e", "--file",
 }
 # Flags that are Lix/CppNix-specific knobs with no fix equivalent and no bearing
@@ -163,8 +163,6 @@ def translate_flags(flags: list[str]) -> tuple[list[str], str | None]:
                 out += [f, " ".join(vals)]
             i += 2
             continue
-        if f == "--no-location":
-            return out, "unsupported-flag:--no-location"
         # values that follow a flag we pass through verbatim
         if f in ("-A", "--attr", "--option", "--arg", "--argstr", "-I", "--include"):
             n = 2 if f in ("--option", "--arg", "--argstr") else 1
@@ -511,8 +509,9 @@ def snix_flags(c: SnixCase) -> tuple[list[str], str | None]:
     if c.eval_strict:
         flags.append("--strict")
     if c.xml_output:
-        # reference runner passes --no-location --xml; fix has no --no-location
-        return flags, "unsupported-flag:--no-location(xml)"
+        # reference runner passes --xml --no-location; fix omits positions from
+        # its XML, so --no-location is accepted as a no-op (matching Nix's form).
+        flags += ["--xml", "--no-location"]
     for p in c.search_path:
         flags += ["--include", p]
     feats = []

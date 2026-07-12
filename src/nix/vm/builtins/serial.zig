@@ -291,7 +291,8 @@ fn writeXmlValue(
         },
         .list => try writeXmlList(self, writer, forced.asObjectId(), depth, context),
         .attrs => try writeXmlAttrs(self, writer, forced.asObjectId(), depth, context),
-        .closure, .builtin, .builtin_closure, .partial_app => try writer.writeAll("<function />\n"),
+        .closure => try writeXmlFunction(self, writer, forced, depth),
+        .builtin, .builtin_closure, .partial_app => try writer.writeAll("<function />\n"),
         .thunk => unreachable,
     }
 }
@@ -367,6 +368,64 @@ fn writeXmlAttrs(
     }
     try writeXmlIndent(writer, depth);
     try writer.writeAll("</attrs>\n");
+}
+
+/// Render a user closure as Nix does under `--xml`: `<function>` wrapping a
+/// `<varpat>` (value lambda) or `<attrspat>` (attrset-pattern lambda). The
+/// opening `<function>`'s indent is already emitted by the caller. Falls back
+/// to a self-closing `<function />` when the chunk carries no pattern (never
+/// happens for real lambdas, but keeps non-lambda closures well-formed).
+fn writeXmlFunction(self: anytype, writer: *std.Io.Writer, value: Value, depth: usize) !void {
+    const closure = try self.heap.getClosure(value.asObjectId());
+    const ch = self.registry.get(closure.chunk_id) orelse {
+        try writer.writeAll("<function />\n");
+        return;
+    };
+    switch (ch.lambda_pattern) {
+        .none => {
+            try writer.writeAll("<function />\n");
+            return;
+        },
+        .var_pat => |name_id| {
+            try writer.writeAll("<function>\n");
+            try writeXmlIndent(writer, depth + 1);
+            try writer.writeAll("<varpat name=\"");
+            try writeXmlEscaped(writer, self.intern.get(name_id));
+            try writer.writeAll("\" />\n");
+        },
+        .attrs_pat => |ap| {
+            try writer.writeAll("<function>\n");
+            try writeXmlIndent(writer, depth + 1);
+            try writer.writeAll("<attrspat");
+            if (ap.ellipsis) try writer.writeAll(" ellipsis=\"1\"");
+            if (ap.has_bind) {
+                try writer.writeAll(" name=\"");
+                try writeXmlEscaped(writer, self.intern.get(ap.bind_name));
+                try writer.writeAll("\"");
+            }
+            try writer.writeAll(">\n");
+
+            // Formal names, sorted lexicographically (as Nix prints them).
+            const sorted = try self.allocator.dupe(heap_mod.AttrEntry, ch.function_args);
+            defer self.allocator.free(sorted);
+            const Cmp = struct {
+                pub fn lessThan(vm: @TypeOf(self), a: heap_mod.AttrEntry, b: heap_mod.AttrEntry) bool {
+                    return std.mem.lessThan(u8, vm.intern.get(a.name), vm.intern.get(b.name));
+                }
+            };
+            std.mem.sort(heap_mod.AttrEntry, sorted, self, Cmp.lessThan);
+            for (sorted) |entry| {
+                try writeXmlIndent(writer, depth + 2);
+                try writer.writeAll("<attr name=\"");
+                try writeXmlEscaped(writer, self.intern.get(entry.name));
+                try writer.writeAll("\" />\n");
+            }
+            try writeXmlIndent(writer, depth + 1);
+            try writer.writeAll("</attrspat>\n");
+        },
+    }
+    try writeXmlIndent(writer, depth);
+    try writer.writeAll("</function>\n");
 }
 
 fn writeXmlIndent(writer: *std.Io.Writer, depth: usize) !void {

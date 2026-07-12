@@ -257,6 +257,9 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
         child_builder.strict_params = mask;
     }
     child_builder.arity = n;
+    // For `--xml`, a value lambda renders as `<varpat name="…">` using its
+    // (first) parameter name — matching how Nix prints a merged curried chain.
+    child_builder.lambda_pattern = .{ .var_pat = param_ids[0] };
     try emit.emitRet(&child);
     try emit.emitOp(&child, .halt);
 
@@ -323,6 +326,18 @@ pub fn compileLambdaAttrs(self: *Compiler, node: *const Node) !void {
         });
     }
     try child_builder.setFunctionArgs(self.allocator, function_args.items);
+
+    // For `--xml`, an attrset-pattern lambda renders as `<attrspat>` with the
+    // formal names (from `function_args`), plus the optional `@`-binding name
+    // and `...` ellipsis flag.
+    child_builder.lambda_pattern = .{ .attrs_pat = .{
+        .has_bind = lambda.bind_name != null,
+        .bind_name = if (lambda.bind_name) |bn|
+            try self.intern.intern(self.source[bn.offset .. bn.offset + bn.len])
+        else
+            0,
+        .ellipsis = lambda.allow_extra,
+    } };
 
     // Binding cells are only needed when a formal's default references
     // another formal (mutually-recursive defaults, e.g. `{ a, b ? a }`):
