@@ -980,7 +980,7 @@ pub const ChunkRegistry = struct {
     // maps instead — those are keyed by id after registration and never
     // perturb dedup.
     comptime {
-        const chunk_field_count = 13;
+        const chunk_field_count = 14;
         if (std.meta.fields(Chunk).len != chunk_field_count)
             @compileError("Chunk changed shape: update contentHash + contentEql (or route diagnostic-only metadata through the registry sidecar), then adjust chunk_field_count.");
     }
