@@ -382,6 +382,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     const bench_step = b.step("bench", "Parse microbenchmark");
     bench_step.dependOn(&run_bench.step);
+
+    // Language conformance: run the pinned Lix + snix language test corpora
+    // (see test/lang/) against the freshly built `fix`. This is a differential
+    // suite, not a unit test — it needs Nix (to resolve the npins pins) and a
+    // python3 (the wrapper borrows one from nix-shell if none is on PATH), and
+    // it exits non-zero while any case diverges. Pass runner flags through, e.g.
+    // `zig build test-lang -- --suite lix -v`.
+    const lang_step = b.step("test-lang", "Run the Lix + snix language conformance suites against fix");
+    const run_lang = b.addSystemCommand(&.{"bash"});
+    run_lang.addFileArg(b.path("test/lang/run.sh"));
+    run_lang.step.dependOn(b.getInstallStep());
+    run_lang.has_side_effects = true;
+    if (b.args) |args| run_lang.addArgs(args);
+    lang_step.dependOn(&run_lang.step);
 }
 
 const SharedImports = struct {
