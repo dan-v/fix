@@ -16,6 +16,28 @@ const name_tree_mod = @import("name_tree.zig");
 const ChunkId = types.ChunkId;
 const ConstIdx = types.ConstIdx;
 
+/// The formal-parameter pattern of a lambda chunk, carried so `--xml`
+/// output can render `<varpat>`/`<attrspat>` the way Nix does. `none` for
+/// non-lambda (thunk) bodies, builtins, and merged bodies with no param
+/// info. Semantically distinguishing (two identity lambdas `x: x` and
+/// `y: y` compile to identical bytecode but render different varpat names),
+/// so it participates in chunk dedup (`contentHash`/`contentEql`).
+pub const LambdaPattern = union(enum) {
+    none,
+    /// `x: …` (value lambda; for a merged `a: b: …` chain, the first param).
+    var_pat: types.InternId,
+    /// `{a, b, …}: …` / `args@{…}: …`. Formal names come from `function_args`.
+    attrs_pat: AttrsPattern,
+
+    pub const AttrsPattern = struct {
+        /// The `@`-binding name (`args` in `args@{…}`); valid iff `has_bind`.
+        bind_name: types.InternId = 0,
+        has_bind: bool = false,
+        /// The pattern ends in `...` (accepts extra attrs).
+        ellipsis: bool = false,
+    };
+};
+
 pub const Chunk = struct {
     pub const SourceSpan = struct {
         file: ?types.InternId,
@@ -92,6 +114,8 @@ pub const Chunk = struct {
     /// constructs). Used by the timeline to label a thunk quantum / demand
     /// wait. Set at `stampOnBuilder`; null for chunks that skip it.
     body_span: ?SourceSpan = null,
+    /// Formal-parameter pattern for `--xml` function rendering. See the type.
+    lambda_pattern: LambdaPattern = .none,
 
     /// The capture-descriptor bytes for a `(start, count)` reference: `count`
     /// `(kind:1, index:2)` triples starting at `start` in `capture_bytes`.
@@ -294,6 +318,9 @@ pub const ChunkBuilder = struct {
     /// Per-param must-force bitmask for an uncurried chunk — carried onto
     /// `Chunk.strict_params`. Set by `compileLambda`.
     strict_params: u8 = 0,
+    /// Formal-parameter pattern for `--xml` rendering — carried onto
+    /// `Chunk.lambda_pattern`. Set by `compileLambda`/`compileLambdaAttrs`.
+    lambda_pattern: LambdaPattern = .none,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
         var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
@@ -343,6 +370,7 @@ pub const ChunkBuilder = struct {
         self.strict_via_upvalue = null;
         self.arity = 1;
         self.strict_params = 0;
+        self.lambda_pattern = .none;
     }
 
     /// Intern a capture-descriptor list (`descriptors` = `(kind:1, index:2)*`),
@@ -468,6 +496,7 @@ pub const ChunkBuilder = struct {
             .attr_names = attr_names,
             .source_map = source_map,
             .body_span = self.body_span,
+            .lambda_pattern = self.lambda_pattern,
         };
     }
 };
@@ -984,6 +1013,19 @@ pub const ChunkRegistry = struct {
         h.update(std.mem.asBytes(&chunk.local_count));
         h.update(std.mem.asBytes(&chunk.arity));
         h.update(std.mem.asBytes(&chunk.strict_params));
+        switch (chunk.lambda_pattern) {
+            .none => h.update(&.{0}),
+            .var_pat => |id| {
+                h.update(&.{1});
+                h.update(std.mem.asBytes(&id));
+            },
+            .attrs_pat => |ap| {
+                h.update(&.{2});
+                h.update(std.mem.asBytes(&ap.bind_name));
+                h.update(std.mem.asBytes(&ap.has_bind));
+                h.update(std.mem.asBytes(&ap.ellipsis));
+            },
+        }
         return h.final();
     }
 
@@ -1024,7 +1066,18 @@ pub const ChunkRegistry = struct {
         }
         if ((a.body_span == null) != (b.body_span == null)) return false;
         if (a.body_span) |ba| if (!spanEql(ba, b.body_span.?)) return false;
+        if (!lambdaPatternEql(a.lambda_pattern, b.lambda_pattern)) return false;
         return true;
+    }
+
+    fn lambdaPatternEql(a: LambdaPattern, b: LambdaPattern) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .none => true,
+            .var_pat => |id| id == b.var_pat,
+            .attrs_pat => |ap| ap.bind_name == b.attrs_pat.bind_name and
+                ap.has_bind == b.attrs_pat.has_bind and ap.ellipsis == b.attrs_pat.ellipsis,
+        };
     }
 
     /// Register `chunk`, reusing an existing structurally identical

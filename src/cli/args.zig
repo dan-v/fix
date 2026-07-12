@@ -138,6 +138,11 @@ pub const SwitchTarget = enum { nixos, darwin, home_manager };
 pub const Options = struct {
     output: OutputFormat = .nix,
     strict: bool = false,
+    /// `--no-location`: omit source positions from `--xml` output. fix's XML
+    /// serializer never emits positions, so this is accepted for CLI/tooling
+    /// compatibility (Nix's `nix-instantiate --eval --xml --no-location`) and
+    /// is effectively a no-op — the output already matches Nix's no-location form.
+    no_location: bool = false,
     experimental_features: ExperimentalFeatures = .{},
     /// True once `--experimental-features` (the replace form) has been seen on
     /// the CLI. It overrides the `nix.conf` base entirely; without it the config
@@ -308,6 +313,7 @@ const Opt = enum {
     json,
     xml,
     strict,
+    no_location,
     // Settings / features.
     experimental_features,
     extra_experimental_features,
@@ -443,6 +449,7 @@ const specs = [_]Spec{
 
     .{ .id = .json, .long = "--json", .help = "write the evaluated value as JSON", .show_in = value_cmds },
     .{ .id = .xml, .long = "--xml", .help = "write the evaluated value as XML", .show_in = value_cmds },
+    .{ .id = .no_location, .long = "--no-location", .help = "omit source positions from --xml output", .show_in = value_cmds },
     .{ .id = .strict, .long = "--strict", .help = "recursively force values before writing", .show_in = value_cmds },
 
     .{ .id = .experimental_features, .long = "--experimental-features", .arg = .req, .metavar = "FEATS", .help = "space-separated experimental features to enable,\nreplacing the current set (available: pipe-operators,\nfetch-tree, flakes)" },
@@ -637,6 +644,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
 
         .json => options.output = .json,
         .xml => options.output = .xml,
+        .no_location => options.no_location = true,
         .strict => options.strict = true,
 
         .experimental_features => {
