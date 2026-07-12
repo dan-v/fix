@@ -19,6 +19,7 @@ pub const instantiate = @import("instantiate.zig");
 pub const build = @import("build.zig");
 pub const runcmd = @import("runcmd.zig");
 pub const shell = @import("shell.zig");
+pub const @"switch" = @import("switch.zig");
 pub const build_progress = @import("build_progress.zig");
 pub const repl = @import("repl.zig");
 pub const disasm = @import("disasm.zig");

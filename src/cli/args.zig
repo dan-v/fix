@@ -89,7 +89,11 @@ pub const OptionOverride = struct {
 
 /// Which subcommand is asking (used only to scope `--help` output; every
 /// subcommand shares this one parser and accepts the whole option set).
-pub const Cmd = enum { eval, instantiate, build, run, shell, repl, disasm };
+pub const Cmd = enum { eval, instantiate, build, run, shell, repl, disasm, @"switch" };
+
+/// `fix switch` target: which activation flavour to build and switch to. Chosen
+/// by `--nixos`/`--darwin`/`--home-manager`, else auto-detected in `switch.zig`.
+pub const SwitchTarget = enum { nixos, darwin, home_manager };
 
 pub const Options = struct {
     output: OutputFormat = .nix,
@@ -135,6 +139,13 @@ pub const Options = struct {
     repair: bool = false,
     /// `--verbose`/`-v` repeat count → daemon build-log verbosity.
     verbose: u8 = 0,
+    /// `fix switch --nixos|--darwin|--home-manager`: the activation target.
+    /// `null` = auto-detect (see `switch.zig:resolveTarget`).
+    switch_target: ?SwitchTarget = null,
+    /// `fix switch --activate-toplevel PATH` (hidden, internal): when set, the
+    /// eval+build phase is skipped and the given store path is activated. This
+    /// is how the non-root run re-execs its privileged half under `sudo`.
+    activate_toplevel: ?[]const u8 = null,
     /// `fix shell -p <names>`: package attr-paths in `<nixpkgs>`. Borrowed from
     /// argv; the list backing is owned (caller frees via `deinit`).
     packages: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -286,6 +297,11 @@ const Opt = enum {
     bare,
     // Shell.
     packages,
+    // Switch.
+    nixos,
+    darwin,
+    home_manager,
+    activate_toplevel,
     // Disasm.
     chunk,
     no_recurse,
@@ -345,21 +361,21 @@ const Spec = struct {
 /// Commands that take a source expression and its selectors (everything but the
 /// bare `repl`). `disasm` compiles rather than evaluates, but shares the same
 /// source model (bare path / `-e` / `--file` / `--flake` / `-A` / `-I`).
-const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm };
+const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
 /// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
-const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl };
+const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"switch" };
 /// Commands that print an evaluated value, so the output format (`--json`,
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
 const value_cmds = &[_]Cmd{ .eval, .repl };
 /// Commands that evaluate to a derivation whose debug records make sense.
-const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell };
+const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .@"switch" };
 /// Commands that produce a top-level `.drv` a link/root can point at.
 const drv_cmds = &[_]Cmd{ .build, .instantiate };
 /// Commands that realize (build/substitute) derivations via the daemon.
-const realize_cmds = &[_]Cmd{ .build, .run, .shell };
+const realize_cmds = &[_]Cmd{ .build, .run, .shell, .@"switch" };
 
 const specs = [_]Spec{
     .{ .id = .expr, .short = "-e", .long = "--expr", .arg = .req, .metavar = "EXPR", .help = "evaluate expression text", .show_in = source_cmds },
@@ -413,6 +429,12 @@ const specs = [_]Spec{
     .{ .id = .bare, .long = "--bare", .help = "plain line-based input: no editor, no escape\nsequences (for pipes and expect-style automation)", .show_in = &.{.repl} },
 
     .{ .id = .packages, .short = "-p", .long = "--packages", .arg = .greedy, .metavar = "NAMES...", .help = "packages (attr paths) from <nixpkgs>, e.g. -p ripgrep jq", .show_in = &.{.shell} },
+
+    .{ .id = .nixos, .long = "--nixos", .help = "build/activate a NixOS system configuration", .show_in = &.{.@"switch"} },
+    .{ .id = .darwin, .long = "--darwin", .help = "build/activate a nix-darwin configuration", .show_in = &.{.@"switch"} },
+    .{ .id = .home_manager, .long = "--home-manager", .help = "build/activate a home-manager configuration", .show_in = &.{.@"switch"} },
+    .{ .id = .home_manager, .long = "--hm", .hidden = true }, // alias for --home-manager
+    .{ .id = .activate_toplevel, .long = "--activate-toplevel", .arg = .req, .metavar = "PATH", .hidden = true },
 
     // Disasm.
     .{ .id = .disasm_eval, .long = "--eval", .help = "evaluate first, then disassemble every chunk that\ncompiled (imports + whatever evaluation forces)", .show_in = &.{.disasm} },
@@ -605,6 +627,11 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .bare => options.bare = true,
 
         .packages => unreachable, // handled in the parse loop
+
+        .nixos => options.switch_target = .nixos,
+        .darwin => options.switch_target = .darwin,
+        .home_manager => options.switch_target = .home_manager,
+        .activate_toplevel => options.activate_toplevel = v0.?,
 
         // Accept decimal or `0x` hex (disasm prints ids in hex).
         .chunk => options.disasm_chunk = std.fmt.parseInt(u32, v0.?, 0) catch return error.InvalidChunkId,
