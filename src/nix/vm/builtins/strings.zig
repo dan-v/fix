@@ -154,10 +154,13 @@ pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_
 pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, string_arg: Value) !Value {
     const from_ids = try stringListInternIdsArg(self, from_arg);
     defer self.allocator.free(from_ids);
-    const to_values = try stringListValuesArg(self, to_arg);
-    defer self.allocator.free(to_values);
+    // `to` stays lazy: Nix forces `to[i]` only when `from[i]` actually matches,
+    // so an unused replacement may be `throw`.
+    const to_list = try vm_force.forceValue(self, to_arg);
+    if (!to_list.isList()) return error.TypeError;
+    const to_id = to_list.asObjectId();
     const input_value = try vm_force.forceValue(self, string_arg);
-    if (from_ids.len != to_values.len or !isPlainString(input_value)) return error.TypeError;
+    if (from_ids.len != (try self.heap.getList(to_id)).len or !isPlainString(input_value)) return error.TypeError;
 
     const input = self.intern.get(try stringTextInternId(self, input_value));
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -169,19 +172,28 @@ pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, stri
         try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
     }
 
+    // Iterate one past the end so an empty needle can match at the final
+    // position (`replaceStrings [""] ["X"] "abc"` → "XaXbXcX"), matching Nix.
     var index: usize = 0;
-    while (index < input.len) {
+    while (index <= input.len) {
         if (firstReplacementIdAt(self, input[index..], from_ids)) |replacement_index| {
             const needle = self.intern.get(from_ids[replacement_index]);
-            if (needle.len == 0) return error.TypeError;
-            const replacement = to_values[replacement_index];
+            const replacement = try vm_force.forceValue(self, try self.heap.getListItem(to_id, replacement_index));
+            if (!isPlainString(replacement)) return error.TypeError;
             try out.appendSlice(self.allocator, self.intern.get(try stringTextInternId(self, replacement)));
             for (try string_context.contextEntriesForValue(self, replacement)) |entry| {
                 try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
             }
-            index += needle.len;
+            if (needle.len == 0) {
+                // Empty match: emit the current char (if any) and advance one,
+                // so the empty pattern interleaves rather than looping forever.
+                if (index < input.len) try out.append(self.allocator, input[index]);
+                index += 1;
+            } else {
+                index += needle.len;
+            }
         } else {
-            try out.append(self.allocator, input[index]);
+            if (index < input.len) try out.append(self.allocator, input[index]);
             index += 1;
         }
     }
@@ -255,23 +267,6 @@ pub fn stringListInternIdsArg(self: anytype, arg: Value) ![]InternId {
         id.* = try stringTextInternId(self, value);
     }
     return ids;
-}
-
-pub fn stringListValuesArg(self: anytype, arg: Value) ![]Value {
-    const list = try vm_force.forceValue(self, arg);
-    if (!list.isList()) return error.TypeError;
-
-    const list_id = list.asObjectId();
-    const items = try self.heap.getList(list_id);
-    const values = try self.allocator.alloc(Value, items.len);
-    errdefer self.allocator.free(values);
-    // gc: re-fetch — range may move across the force
-    for (values, 0..) |*dest, i| {
-        const value = try vm_force.forceValue(self, try self.heap.getListItem(list_id, i));
-        if (!isPlainString(value)) return error.TypeError;
-        dest.* = value;
-    }
-    return values;
 }
 
 pub fn builtinToString(self: anytype, arg: Value) !Value {

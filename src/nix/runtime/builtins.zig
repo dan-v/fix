@@ -140,6 +140,7 @@ pub const BuiltinId = enum(u16) {
     /// hash is only computed when accessed. Args: (tree path, exclude basename |
     /// "" — e.g. ".git"/".hg" to drop the VCS dir). See fetch.zig.
     compute_nar_hash = 112,
+    warn = 113,
 };
 
 const BuiltinBinding = struct {
@@ -233,6 +234,7 @@ const builtin_bindings = [_]BuiltinBinding{
     .{ .name = "match", .id = .match },
     .{ .name = "split", .id = .split },
     .{ .name = "traceVerbose", .id = .traceVerbose },
+    .{ .name = "warn", .id = .warn },
     .{ .name = "addErrorContext", .id = .addErrorContext },
     .{ .name = "unsafeDiscardStringContext", .id = .unsafeDiscardStringContext },
     .{ .name = "unsafeDiscardOutputDependency", .id = .unsafeDiscardOutputDependency },
@@ -409,6 +411,7 @@ pub fn arity(id: BuiltinId) u8 {
         .match,
         .split,
         .traceVerbose,
+        .warn,
         .addErrorContext,
         .appendContext,
         .toFile,

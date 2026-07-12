@@ -134,6 +134,7 @@ pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value 
         .getFlake => fetch.builtinGetFlakeEntry(self, args[0]),
         .scopedImport => io.builtinScopedImport(self, args[0], args[1]),
         .traceVerbose => errors.builtinTraceVerbose(self, args[0], args[1]),
+        .warn => errors.builtinWarn(self, args[0], args[1]),
         .addErrorContext => errors.builtinAddErrorContext(self, args[0], args[1]),
         .unsafeDiscardStringContext => string_context.builtinUnsafeDiscardStringContext(self, args[0]),
         .unsafeDiscardOutputDependency => string_context.builtinUnsafeDiscardOutputDependency(self, args[0]),

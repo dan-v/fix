@@ -77,6 +77,14 @@ pub fn builtinTraceVerbose(self: anytype, message_arg: Value, value_arg: Value) 
     return vm_force.forceValue(self, value_arg);
 }
 
+/// `builtins.warn msg x` — evaluate `x` and return it, emitting `msg` as a
+/// warning (to stderr, which the conformance runner ignores). `msg` must be a
+/// string, matching Nix.
+pub fn builtinWarn(self: anytype, message_arg: Value, value_arg: Value) !Value {
+    _ = try strings.stringArg(self, message_arg);
+    return vm_force.forceValue(self, value_arg);
+}
+
 pub fn tryEvalResult(self: anytype, success: bool, value: Value) !Value {
     const entries = [_]heap_mod.AttrEntry{
         .{
