@@ -138,6 +138,12 @@ pub const CaptureCensus = struct {
     dup_defer: usize = 0,
     dup_thunk: usize = 0,
     dup_closure: usize = 0,
+    /// Lists with >= 2 captures: the ones where a fixed 6-byte side-table ref
+    /// beats the `2 + 3*M` inline encoding (a dual inline/ref op would ref
+    /// these and leave single-capture lists inline on the hot path).
+    total_ge2: usize = 0,
+    ops_ge2: usize = 0,
+    dup_ge2: usize = 0,
 };
 
 pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
@@ -171,9 +177,17 @@ pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols:
                 const region = chunk.code[ls..next];
                 out.total += region.len;
                 out.ops += 1;
+                // region = [count:u16][descriptors:3*M]; M = (len - 2) / 3.
+                const m: usize = if (region.len >= 2) (region.len - 2) / 3 else 0;
+                const ge2 = m >= 2;
+                if (ge2) {
+                    out.total_ge2 += region.len;
+                    out.ops_ge2 += 1;
+                }
                 const h = std.hash.Wyhash.hash(0, region);
                 if ((try seen.getOrPut(allocator, h)).found_existing) {
                     out.duplicated += region.len;
+                    if (ge2) out.dup_ge2 += region.len;
                     switch (op) {
                         .thunk_defer => out.dup_defer += region.len,
                         .closure_cap, .closure_cap_w => out.dup_closure += region.len,

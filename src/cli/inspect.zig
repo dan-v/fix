@@ -252,6 +252,9 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
     var cap_dup_defer: usize = 0;
     var cap_dup_thunk: usize = 0;
     var cap_dup_closure: usize = 0;
+    var cap_total_ge2: usize = 0;
+    var cap_ops_ge2: usize = 0;
+    var cap_dup_ge2: usize = 0;
     id = 0;
     while (id < n) : (id += 1) {
         const c = reg.get(id) orelse continue;
@@ -262,6 +265,9 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
         cap_dup_defer += cc.dup_defer;
         cap_dup_thunk += cc.dup_thunk;
         cap_dup_closure += cc.dup_closure;
+        cap_total_ge2 += cc.total_ge2;
+        cap_ops_ge2 += cc.ops_ge2;
+        cap_dup_ge2 += cc.dup_ge2;
     }
     try writer.writeAll("  capture-list interning potential:\n");
     try writer.print("    capture-list bytes:            {d}  over {d} ops ({d:.1}% of code)\n", .{
@@ -274,6 +280,13 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
         cap_dup_defer,   percentUsize(cap_dup_defer, cap_dup),
         cap_dup_thunk,   percentUsize(cap_dup_thunk, cap_dup),
         cap_dup_closure, percentUsize(cap_dup_closure, cap_dup),
+    });
+    // Dual-op (ref for M>=2, keep single-capture inline) recoverable code: the
+    // M>=2 inline bytes minus the 6-byte refs that replace them.
+    const ref_bytes = cap_ops_ge2 * 6;
+    const recoverable = if (cap_total_ge2 > ref_bytes) cap_total_ge2 - ref_bytes else 0;
+    try writer.print("    M>=2 lists: {d} ops, {d} bytes; dual-op ref saves ~{d} code ({d:.1}% of code), dup among them {d}\n", .{
+        cap_ops_ge2, cap_total_ge2, recoverable, percentUsize(recoverable, total_code), cap_dup_ge2,
     });
 }
 
