@@ -1631,7 +1631,7 @@ pub const Evaluator = struct {
                 if (step_bytes > 0)
                     heap_gc.enableCollect(&self.heap, budget, step_bytes)
                 else if (budget > 0)
-                    heap_gc.enableBudget(&self.heap, budget);
+                    heap_gc.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
             }
         }
         return w;

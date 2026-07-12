@@ -40,6 +40,11 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
     // every TLAB refill.
     heap.gc_threshold_bytes = if (step_bytes > 0) ObjectHeap.GC_MIN_THRESHOLD else budget;
+    // Validation path arms eagerly (bootstrap_end == the arming count, so the
+    // pre-arming region is empty), but turn on constrained mode so the always-
+    // on transient-root gates are exercised. `armTracking` sets gc_root_active.
+    heap.gc_bootstrap_end = heap.objects.count();
+    heap.gc_root_always = true;
     armTracking(heap);
 }
 
@@ -51,12 +56,22 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
 /// barrier, no free-list probes) — below the line a `-Dgc` build stays at
 /// rooting-tax-only. The price: objects allocated before arming are permanently
 /// old (unreclaimable floor ≈ reserved at line/2 — half the line, by
-/// construction).
-pub fn enableBudget(heap: *ObjectHeap, budget: u64) void {
+/// construction) UNLESS `root_always` (constrained mode): then a major also
+/// reclaims that pre-arming region, paid for by keeping the transient-root
+/// gates live from here (`gc_root_active`). `gc_bootstrap_end` is captured now
+/// as the reclaim boundary (bootstrap below it stays pinned).
+pub fn enableBudget(heap: *ObjectHeap, budget: u64, root_always: bool) void {
     if (comptime !build_options.gc) return;
     ObjectHeap.gc_step_bytes = 0;
     ObjectHeap.gc_budget_bytes = budget;
     heap.gc_threshold_bytes = budget / 2;
+    heap.gc_bootstrap_end = heap.objects.count();
+    heap.gc_root_always = root_always;
+    heap.gc_root_active = root_always;
+    // Detector: with bits live from here (per-fill, gated on gc_root_active),
+    // size the bitmap now — arming won't be the first sizer, and its re-size
+    // (guarded on !gc_root_always) would otherwise wipe bits set in between.
+    if (comptime gc_debug) if (root_always) heap.gcPresizeAllocBits();
 }
 
 /// Start reclaim tracking: young-slot lists, the old→young write barrier,
@@ -69,6 +84,7 @@ pub fn enableBudget(heap: *ObjectHeap, budget: u64) void {
 pub fn armTracking(heap: *ObjectHeap) void {
     if (comptime !build_options.gc) return;
     heap.gc_collect_enabled = true;
+    heap.gc_root_active = true; // arming turns rooting on (already on if constrained)
     heap.gc_track_from = heap.objects.count();
     // Flush each worker's TLABs so the first post-enable allocation refills
     // fresh instead of draining a leftover chunk carried over from bootstrap.
@@ -92,11 +108,9 @@ pub fn armTracking(heap: *ObjectHeap) void {
     // would free the array under a concurrent reader/setter at
     // --workers>1). With a stable array, set uses atomic-or and read uses
     // atomic-load — no lock on the hot detector paths. ~128 MB, debug only.
-    if (comptime gc_debug) {
-        const words = (@as(usize, heap_mod.OBJECT_MAX_SLOTS) + 63) >> 6;
-        heap.gc_alloc_bits = heap.allocator.realloc(heap.gc_alloc_bits, words) catch heap.gc_alloc_bits;
-        @memset(heap.gc_alloc_bits, 0);
-    }
+    // Constrained mode already sized-and-populated the bitmap from eval start
+    // (gcEnableBudget); re-sizing here would @memset those live bits to zero.
+    if (comptime gc_debug) if (!heap.gc_root_always) heap.gcPresizeAllocBits();
 }
 
 /// The budget/2 STW safepoint under the lazy policy: arm tracking and

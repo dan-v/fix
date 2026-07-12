@@ -207,7 +207,15 @@ pub inline fn rootKeep(self: anytype, v: Value) void {
         // This was ~146 call sites of unconditional ArrayList appends on the
         // hottest call/builtin paths — a measurable slice of the default
         // build's GC tax (`-Dgc=false` measured −5.3% instructions).
-        if (!self.heap.gc_collect_enabled) return;
+        //
+        // Gate on `gc_root_active` (= `gc_root_always OR armed`), not
+        // `gc_collect_enabled`: the "dormant ⇒ old ⇒ no-op" argument holds ONLY
+        // when the pre-arming region is never swept. In CONSTRAINED mode a major
+        // reclaims it, so a pre-arming temp value spanning the arming boundary
+        // must be rooted from eval start — `gc_root_active` is true from
+        // gcEnableBudget there. When not constrained it matches `gc_collect_
+        // enabled` exactly (false until arming), so this stays free.
+        if (!self.heap.gc_root_active) return;
         self.gc_temp_roots.append(self.allocator, v) catch @panic("gc temp root oom");
     }
 }
@@ -1008,9 +1016,17 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // follows an `.evaluating` thunk's target. See docs/plans/gc-plan.md.
                 //
                 // DORMANT GATE (the GC-default rooting tax): skip this push/pop
-                // entirely while collection is DORMANT (`gc_collect_enabled ==
-                // false`). Soundness — a thunk claimed while dormant is provably
-                // OLD in every collection, so rooting it is a no-op:
+                // entirely while rooting is DORMANT (`gc_root_active == false`).
+                // Soundness argument below assumes the pre-arming region is NEVER
+                // swept — true on roomy machines. In CONSTRAINED mode a major
+                // reclaims it, so `gc_root_active` (= `gc_root_always OR armed`)
+                // is forced true from eval start there and this gate stays open,
+                // rooting the in-flight thunk before the pre-arming major (whose
+                // sweep of a live-but-unrooted in-flight thunk was a UAF).
+                // Non-constrained: `gc_root_active` == `gc_collect_enabled`, so
+                // the original zero-cost-when-dormant argument holds verbatim —
+                // a thunk claimed while dormant is provably OLD in every
+                // collection, so rooting it is a no-op:
                 //   • `armTracking` sets `gc_track_from = objects.count()` at the
                 //     budget/2 STW safepoint; arming is monotonic and only
                 //     becomes visible after an STW where this worker was parked.
@@ -1034,7 +1050,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // Captured ONCE so push and pop agree even if a peer arms
                 // mid-body. Once armed (`--max-memory` small), this is true
                 // forever and the chain is maintained exactly as before.
-                const gc_root_chain: bool = if (comptime build_options.gc) self.heap.gc_collect_enabled else false;
+                const gc_root_chain: bool = if (comptime build_options.gc) self.heap.gc_root_active else false;
                 if (comptime build_options.gc) {
                     if (gc_root_chain) self.gc_force_chain.append(self.allocator, thunk_id) catch @panic("gc force chain oom");
                 }

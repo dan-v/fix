@@ -433,6 +433,28 @@ pub const ObjectHeap = struct {
     /// Objects created before collection was enabled aren't tracked/swept,
     /// so the detector's assert skips them.
     gc_track_from: if (build_options.gc) ObjectId else void = if (build_options.gc) 0 else {},
+    /// CONSTRAINED-MODE pre-arming reclaim boundary: the first ObjectId a major
+    /// may sweep. Below it is true bootstrap (interns/builtins/chunk constants),
+    /// pinned forever. On a tight machine (`gc_root_always`) a major also
+    /// reclaims `[gc_bootstrap_end, gc_track_from)` — the ~line/2 pinned floor
+    /// drops toward bootstrap size. Captured at gcEnableBudget/gcEnableCollect.
+    /// When `gc_root_always` is false this is unused: the sweep floor stays at
+    /// `gc_track_from` (today's behavior, pre-arming pinned).
+    gc_bootstrap_end: if (build_options.gc) ObjectId else void = if (build_options.gc) 0 else {},
+    /// Constrained mode: reclaim the pre-arming region AND (the price) keep the
+    /// force-chain + temp-root gates live even while collection is DORMANT, so
+    /// an in-flight thunk / builtin temp value that predates arming is still
+    /// rooted when the pre-arming major sweeps it. Off on roomy machines (they
+    /// never arm ⇒ pinning is free and the reclaim is moot). Set once at
+    /// gcEnableBudget from the collection policy (`eval_gc.constrainedMode`).
+    gc_root_always: if (build_options.gc) bool else void = if (build_options.gc) false else {},
+    /// Hot-path rooting gate for the transient-root appends (force chain,
+    /// rootKeep): `gc_root_always OR armed`. Read in place of
+    /// `gc_collect_enabled` by those two appends only. When NOT constrained it
+    /// is false until arming and true after — byte-identical to gating on
+    /// `gc_collect_enabled` (zero added cost). When constrained it is true from
+    /// eval start so pre-arming transients are rooted before the first major.
+    gc_root_active: if (build_options.gc) bool else void = if (build_options.gc) false else {},
     /// One bit per ObjectId: set when a slot is *filled* (a real object),
     /// cleared when swept. Lets `sweep` tell live objects from TLAB-
     /// reserved-but-unfilled slots and already-freed slots.
@@ -1295,7 +1317,11 @@ pub const ObjectHeap = struct {
         // (`gcReconstructAllocBits`) from the id range minus the free lists,
         // keeping this hot path free of GC work.
         if (comptime gc_debug) {
-            if (self.gc_collect_enabled) self.gcSetAllocBit(id);
+            // `gc_root_active` (not `gc_collect_enabled`): in constrained mode
+            // bits go live from eval start so the pre-arming region [bootstrap_
+            // end, track_from) has precise per-object bits for the major sweep +
+            // assert. Non-constrained: identical to gating on collect_enabled.
+            if (self.gc_root_active) self.gcSetAllocBit(id);
         }
     }
 
@@ -1351,7 +1377,7 @@ pub const ObjectHeap = struct {
     /// Detector: trap if a *tracked* slot is read after being freed.
     inline fn gcAssertLive(self: *const ObjectHeap, id: ObjectId) void {
         if (comptime !gc_debug) return;
-        if (self.gc_collect_enabled and id >= self.gc_track_from and !self.gcAllocBitSet(id)) {
+        if (self.gc_collect_enabled and id >= self.gcSweepFloor() and !self.gcAllocBitSet(id)) {
             // Reuse is off in the detector, so the slot still holds its real
             // payload — print the kind so we know which root is missing.
             std.debug.print("GC use-after-free: object {d} (kind={s}) read after sweep\n", .{ id, @tagName(self.objects.get(id).*) });
@@ -1384,6 +1410,24 @@ pub const ObjectHeap = struct {
     /// lone worker fills each chunk fully before refilling. Release builds
     /// only; the detector build keeps the incremental bitmap (it asserts
     /// liveness on every read, between collections).
+    /// Lowest ObjectId a major sweep may reclaim: the pre-arming boundary in
+    /// constrained mode (`gc_root_always`), else the arming boundary (pre-arming
+    /// region pinned). Doubles as the detector's read-after-free assert floor.
+    inline fn gcSweepFloor(self: *const ObjectHeap) ObjectId {
+        return if (self.gc_root_always) self.gc_bootstrap_end else self.gc_track_from;
+    }
+
+    /// Detector build: size the alloc bitmap to the whole object id space so
+    /// per-fill bit-sets never realloc under a concurrent reader/setter at
+    /// --workers>1. ~128 MB, debug only. Called at arming, or earlier at
+    /// gcEnableBudget in constrained mode (bits go live from eval start there).
+    pub fn gcPresizeAllocBits(self: *ObjectHeap) void {
+        if (comptime !gc_debug) return;
+        const words = (@as(usize, OBJECT_MAX_SLOTS) + 63) >> 6;
+        self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch self.gc_alloc_bits;
+        @memset(self.gc_alloc_bits, 0);
+    }
+
     pub fn gcReconstructAllocBits(self: *ObjectHeap) void {
         const n = self.objects.count();
         const words = (@as(usize, n) + 63) >> 6;
@@ -1393,7 +1437,7 @@ pub const ObjectHeap = struct {
             @memset(self.gc_alloc_bits[old_len..words], 0);
         }
         @memset(self.gc_alloc_bits[0..words], 0);
-        gcSetBitRange(self.gc_alloc_bits, self.gc_track_from, n);
+        gcSetBitRange(self.gc_alloc_bits, self.gcSweepFloor(), n);
         // Exclude each worker's reserved-but-unfilled current object chunk.
         for (self.worker_locals) |*wl| {
             const lo = ObjectStore.globalIdOf(wl.object.segment, wl.object.cursor);
@@ -1583,6 +1627,12 @@ pub const ObjectHeap = struct {
             }
         }
         for (self.worker_locals) |*wl| wl.gc_young_slots.clearRetainingCapacity();
+        // Constrained mode: this major swept the pre-arming region too, so unify
+        // the tracked frontier down to the bootstrap boundary. gcIsYoung's hard
+        // floor is gc_track_from (id < it ⇒ forced old); lowering it lets a
+        // reused pre-arming slot be correctly young-eligible instead of
+        // mis-tagged permanently-old (which would skip its write barrier → UAF).
+        if (self.gc_root_always) self.gc_track_from = self.gc_bootstrap_end;
     }
 
     /// Major-collection policy hooks (see `gc_major_gate`). ---
