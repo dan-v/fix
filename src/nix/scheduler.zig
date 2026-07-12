@@ -1784,20 +1784,7 @@ pub const Scheduler = struct {
             return;
         }
         if (self.shutdown_flag.load(.acquire)) return;
-        switch (builtin.os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_4arg(
-                    @ptrCast(word),
-                    .{ .cmd = .WAIT, .private = true },
-                    0,
-                    null,
-                );
-            },
-            else => {
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
-            },
-        }
+        stable.Futex.wait(word, 0);
         // Drain any wake signal that arrived.
         word.store(0, .release);
     }
@@ -1906,16 +1893,7 @@ pub const Scheduler = struct {
         // sleeper consumed the old signal it also cleared the word, so
         // this swap would see 0 and we fall through to the wake.)
         if (word.swap(1, .release) == 1) return;
-        switch (builtin.os.tag) {
-            .linux => {
-                _ = std.os.linux.futex_3arg(
-                    @ptrCast(word),
-                    .{ .cmd = .WAKE, .private = true },
-                    1,
-                );
-            },
-            else => {},
-        }
+        stable.Futex.wake(word, 1);
     }
 
     comptime {

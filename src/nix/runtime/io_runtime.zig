@@ -15,7 +15,6 @@
 //! submitter's stack) so `submit` never allocates and cannot fail.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const stable = @import("base").sync;
 
 pub const Job = struct {
@@ -78,14 +77,7 @@ pub const IoRuntime = struct {
 
     fn wake(self: *IoRuntime) void {
         _ = self.seq.fetchAdd(1, .release);
-        switch (builtin.os.tag) {
-            .linux => _ = std.os.linux.futex_3arg(
-                @ptrCast(&self.seq),
-                .{ .cmd = .WAKE, .private = true },
-                1,
-            ),
-            else => {},
-        }
+        stable.Futex.wake(&self.seq, 1);
     }
 
     fn loop(self: *IoRuntime) void {
@@ -97,15 +89,7 @@ pub const IoRuntime = struct {
                 // bumps `seq`, so the wait returns instead of being lost.
                 const s = self.seq.load(.acquire);
                 self.mu.unlock();
-                switch (builtin.os.tag) {
-                    .linux => _ = std.os.linux.futex_4arg(
-                        @ptrCast(&self.seq),
-                        .{ .cmd = .WAIT, .private = true },
-                        s,
-                        null,
-                    ),
-                    else => std.Thread.yield() catch {},
-                }
+                stable.Futex.wait(&self.seq, s);
                 self.mu.lock();
             }
             if (self.head == null and self.shutdown) {

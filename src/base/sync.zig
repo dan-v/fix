@@ -7,6 +7,56 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Minimal portable futex: park/wake a thread on a `u32` word. The whole
+/// tree's blocking primitives (this file's Semaphore/BlockingMutex, the
+/// scheduler's worker park, the IO runtime's job queue) route through here.
+///
+/// Linux uses the private futex; Darwin uses `__ulock` COMPARE_AND_WAIT (the
+/// same primitive libdispatch/pthread_cond sit on — this mirrors what
+/// `std.Io.Threaded` does, since std 0.16 only exposes futexes through a full
+/// `Io` instance, not as a free function). Every other OS falls back to a
+/// yield, so callers MUST re-check their condition in a loop — which they all
+/// already do, since spurious wakeups are possible on every backend anyway.
+///
+/// The Linux path is byte-identical to the hand-rolled `switch` blocks it
+/// replaced: zero behavior change on the platform we bench, real blocking
+/// (instead of a busy spin) added for Darwin.
+pub const Futex = struct {
+    /// Park while `ptr.* == expect`. Returns on a matching `wake`, a spurious
+    /// wakeup, or immediately if the value already differs.
+    pub fn wait(ptr: *const std.atomic.Value(u32), expect: u32) void {
+        switch (builtin.os.tag) {
+            .linux => _ = std.os.linux.futex_4arg(
+                @ptrCast(ptr),
+                .{ .cmd = .WAIT, .private = true },
+                expect,
+                null,
+            ),
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+                _ = std.c.__ulock_wait(flags, @ptrCast(ptr), expect, 0);
+            },
+            else => std.Thread.yield() catch {},
+        }
+    }
+
+    /// Wake up to `n` threads parked on `ptr`.
+    pub fn wake(ptr: *const std.atomic.Value(u32), n: u32) void {
+        switch (builtin.os.tag) {
+            .linux => _ = std.os.linux.futex_3arg(
+                @ptrCast(ptr),
+                .{ .cmd = .WAKE, .private = true },
+                @min(n, std.math.maxInt(i32)),
+            ),
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true, .WAKE_ALL = n > 1 };
+                _ = std.c.__ulock_wake(flags, @ptrCast(ptr), 0);
+            },
+            else => {},
+        }
+    }
+};
+
 /// Sleep the current thread for approximately `ns` nanoseconds. Portable
 /// across Linux (direct `nanosleep` syscall, no libc) and other POSIX
 /// systems including Darwin (libc `nanosleep`). For coarse background-poll
@@ -61,28 +111,13 @@ pub const Semaphore = struct {
                 }
             }
             // count == 0: wait for a release to bump it.
-            switch (builtin.os.tag) {
-                .linux => _ = std.os.linux.futex_4arg(
-                    @ptrCast(&self.count),
-                    .{ .cmd = .WAIT, .private = true },
-                    0,
-                    null,
-                ),
-                else => std.Thread.yield() catch {},
-            }
+            Futex.wait(&self.count, 0);
         }
     }
 
     pub fn release(self: *Semaphore) void {
         _ = self.count.fetchAdd(1, .release);
-        switch (builtin.os.tag) {
-            .linux => _ = std.os.linux.futex_3arg(
-                @ptrCast(&self.count),
-                .{ .cmd = .WAKE, .private = true },
-                1,
-            ),
-            else => {},
-        }
+        Futex.wake(&self.count, 1);
     }
 };
 
@@ -116,33 +151,14 @@ pub const BlockingMutex = struct {
             // by virtue of swapping in 2.
             const prev = self.state.swap(2, .acquire);
             if (prev == 0) return;
-            switch (builtin.os.tag) {
-                .linux => {
-                    _ = std.os.linux.futex_4arg(
-                        @ptrCast(&self.state),
-                        .{ .cmd = .WAIT, .private = true },
-                        2,
-                        null,
-                    );
-                },
-                else => std.Thread.yield() catch {},
-            }
+            Futex.wait(&self.state, 2);
         }
     }
 
     pub fn unlock(self: *BlockingMutex) void {
         const prev = self.state.swap(0, .release);
         if (prev == 2) {
-            switch (builtin.os.tag) {
-                .linux => {
-                    _ = std.os.linux.futex_3arg(
-                        @ptrCast(&self.state),
-                        .{ .cmd = .WAKE, .private = true },
-                        1,
-                    );
-                },
-                else => {},
-            }
+            Futex.wake(&self.state, 1);
         }
     }
 };
