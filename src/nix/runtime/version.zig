@@ -53,9 +53,13 @@ pub fn compareVersions(allocator: std.mem.Allocator, left: []const u8, right: []
 }
 
 pub fn parseDrvName(text: []const u8) ParsedDrvName {
-    var index: usize = 0;
-    while (index + 1 < text.len) : (index += 1) {
-        if (text[index] == '-' and std.ascii.isDigit(text[index + 1])) {
+    // Nix splits at the first `-` (past position 0) whose following character is
+    // not a letter — so `name-that-ends-with-dash--1.0` splits at the first of
+    // the double dash, giving version "-1.0" (not "1.0").
+    var index: usize = 1;
+    while (index < text.len) : (index += 1) {
+        const next_not_alpha = index + 1 >= text.len or !std.ascii.isAlphabetic(text[index + 1]);
+        if (text[index] == '-' and next_not_alpha) {
             return .{
                 .name = text[0..index],
                 .version = text[index + 1 ..],

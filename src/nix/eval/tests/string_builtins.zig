@@ -24,13 +24,12 @@ test "substring on a start index past the string end returns an empty string rat
     try std.testing.expectEqualStrings("", ev.intern.get(result.asInternId()));
 }
 
-test "replaceStrings rejects an empty needle" {
+test "replaceStrings with an empty needle inserts the replacement between every character" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
-    try std.testing.expectError(
-        error.TypeError,
-        ev.evaluate("builtins.replaceStrings [ \"\" ] [ \"x\" ] \"abc\""),
-    );
+    // Matches Nix: an empty pattern matches at every position, including the end.
+    const result = try ev.evaluate("builtins.replaceStrings [ \"\" ] [ \"x\" ] \"abc\"");
+    try std.testing.expectEqualStrings("xaxbxcx", ev.intern.get(result.asInternId()));
 }
 
 test "concatStringsSep joins a list of strings with the given separator" {

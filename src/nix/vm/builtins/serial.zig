@@ -386,7 +386,11 @@ fn writeXmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
 
 pub fn builtinFromJSON(self: anytype, arg: Value) !Value {
     const text = try stringArg(self, arg);
-    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, text, .{});
+    // Duplicate object keys keep the last value, matching Nix (`{"k":1,"k":2}`
+    // → `{ k = 2; }`) rather than erroring.
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, text, .{
+        .duplicate_field_behavior = .use_last,
+    });
     defer parsed.deinit();
     return valueFromJson(self, parsed.value);
 }

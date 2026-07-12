@@ -572,7 +572,10 @@ pub fn builtinGenericClosure(self: anytype, arg: Value) !Value {
 
 pub fn builtinFoldlStrict(self: anytype, op_arg: Value, nul_arg: Value, list_arg: Value) !Value {
     const op = try vm_force.forceValue(self, op_arg);
-    var acc = try vm_force.forceValue(self, nul_arg);
+    // The initial accumulator stays lazy — Nix's foldl' is not strict in the
+    // seed, so `foldl' (_: x: x) (throw "…") xs` never forces the throw. Only
+    // each op *result* is forced, below.
+    var acc = nul_arg;
     const list = try vm_force.forceValue(self, list_arg);
     if (!list.isList()) return error.TypeError;
 
