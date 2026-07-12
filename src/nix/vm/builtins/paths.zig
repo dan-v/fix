@@ -13,6 +13,7 @@ const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
 const fetch = @import("fetch.zig");
 const vm_force = @import("../force.zig");
+const vm_trace = @import("../trace.zig");
 
 const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
@@ -60,6 +61,63 @@ pub fn builtinStorePath(self: anytype, arg: Value) !Value {
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
+fn optionalAttr(self: anytype, attrs_id: anytype, name: []const u8) !Value {
+    const id = try self.intern.intern(name);
+    return self.heap.getAttrValue(attrs_id, id) catch |err| switch (err) {
+        error.MissingAttribute => Value.null_val,
+        else => return err,
+    };
+}
+
+/// Validate a store-path name (mirrors Nix `checkName`): non-empty, ≤211 bytes,
+/// not `.`/`..`, and only `[A-Za-z0-9+._?=-]`. On failure sets an error trace
+/// message containing "is not a valid store path" and returns the error.
+fn validateStorePathName(self: anytype, name: []const u8) !void {
+    const ok = name.len != 0 and name.len <= 211 and
+        !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..") and
+        blk: {
+            for (name) |char| {
+                if (std.ascii.isAlphanumeric(char)) continue;
+                switch (char) {
+                    '+', '-', '.', '_', '?', '=' => continue,
+                    else => break :blk false,
+                }
+            }
+            break :blk true;
+        };
+    if (ok) return;
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "store path name '{s}' is not a valid store path name",
+        .{name},
+    );
+    defer self.allocator.free(message);
+    try vm_trace.setErrorMessage(self, message);
+    return error.InvalidStorePath;
+}
+
+/// Compare a FOD-locking `sha256`/`hash` attr (`expected`, in SRI/base32/base16)
+/// against the `actual_hex` content hash for the chosen ingestion mode. On a
+/// mismatch sets an error trace message containing "hash mismatch" and errors.
+fn checkFodHash(self: anytype, expected: []const u8, actual_hex: []const u8) !void {
+    const expected_hex = derivation.hashToBase16(self.allocator, "sha256", expected) catch {
+        const message = try std.fmt.allocPrint(self.allocator, "invalid sha256 hash '{s}'", .{expected});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    };
+    defer self.allocator.free(expected_hex);
+    if (std.ascii.eqlIgnoreCase(expected_hex, actual_hex)) return;
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "hash mismatch importing path: expected sha256 '{s}', got '{s}'",
+        .{ expected_hex, actual_hex },
+    );
+    defer self.allocator.free(message);
+    try vm_trace.setErrorMessage(self, message);
+    return error.HashMismatch;
+}
+
 pub fn builtinPath(self: anytype, arg: Value) !Value {
     const attrs = try vm_force.forceValue(self, arg);
     if (!attrs.isAttrs()) return error.TypeError;
@@ -73,45 +131,84 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
     };
     if (!std.fs.path.isAbsolute(path)) return error.RelativePath;
 
-    const name_id = try self.intern.intern("name");
-    const name_value = self.heap.getAttrValue(attrs_id, name_id) catch |err| switch (err) {
-        error.MissingAttribute => Value.null_val,
-        else => return err,
-    };
+    const name_value = try optionalAttr(self, attrs_id, "name");
     var store_name = path_ops.baseName(path);
     if (!name_value.isNull()) {
         const name = try vm_force.forceValue(self, name_value);
         if (!isPlainString(name)) return error.TypeError;
         store_name = self.intern.get(try stringTextInternId(self, name));
     }
+    // Nix validates the store-path name before touching the filesystem.
+    try validateStorePathName(self, store_name);
 
-    const filter_id = try self.intern.intern("filter");
-    const filter_value = self.heap.getAttrValue(attrs_id, filter_id) catch |err| switch (err) {
-        error.MissingAttribute => Value.null_val,
-        else => return err,
-    };
+    // `recursive` defaults to true (NAR / fixed:r:sha256 ingestion). When
+    // false, a single regular file is ingested flat (fixed:sha256).
+    const recursive_value = try optionalAttr(self, attrs_id, "recursive");
+    var recursive = true;
+    if (!recursive_value.isNull()) {
+        const value = try vm_force.forceValue(self, recursive_value);
+        recursive = switch (value.kind()) {
+            .bool_true => true,
+            .bool_false => false,
+            else => return error.TypeError,
+        };
+    }
+
+    // Optional FOD lock: `sha256` (or `hash`) attr checked against the content.
+    var sha_value = try optionalAttr(self, attrs_id, "sha256");
+    if (sha_value.isNull()) sha_value = try optionalAttr(self, attrs_id, "hash");
+    var expected_hash: ?[]const u8 = null;
+    if (!sha_value.isNull()) {
+        const value = try vm_force.forceValue(self, sha_value);
+        if (!isPlainString(value)) return error.TypeError;
+        expected_hash = self.intern.get(try stringTextInternId(self, value));
+    }
 
     const src_span = self.storeCopySpanBegin(store_name);
     defer self.storeCopySpanEnd(src_span);
-    const store_path = if (filter_value.isNull())
-        try source_paths.storePathForSourceName(self.allocator, self.derivations, self.files, path, store_name)
-    else filtered: {
-        const pred = try vm_force.forceValue(self, filter_value);
-        const Context = struct {
-            vm: @TypeOf(self),
-            pred: Value,
 
-            fn accept(context: *anyopaque, candidate: []const u8, kind: file_cache.FileCache.FileKind) anyerror!bool {
-                const ctx: *@This() = @ptrCast(@alignCast(context));
-                return filterSourceAccepts(ctx.vm, ctx.pred, candidate, kind);
-            }
-        };
-        var context: Context = .{ .vm = self, .pred = pred };
-        break :filtered try source_paths.storePathForFilteredSource(self.allocator, self.derivations, self.files, path, store_name, .{
-            .context = &context,
-            .accept = Context.accept,
-        });
+    if (!recursive) {
+        // Flat ingestion: a single regular file, hashed by its raw contents.
+        const flat = try source_paths.flatStorePathForFile(self.allocator, self.derivations, self.files, path, store_name);
+        defer flat.deinit(self.allocator);
+        if (expected_hash) |expected| try checkFodHash(self, expected, flat.hash_hex[0..]);
+        return contextStringWithPath(self, try self.intern.intern(flat.store_path));
+    }
+
+    const filter_value = try optionalAttr(self, attrs_id, "filter");
+
+    // Recursive (NAR) ingestion, computing the NAR hash so a FOD `sha256`
+    // attr can be checked even when a `filter` is present.
+    const ingested = try recursiveIngest(self, path, store_name, filter_value);
+    defer ingested.deinit(self.allocator);
+    if (expected_hash) |expected| {
+        const actual_hex = try derivation.hashToBase16(self.allocator, "sha256", ingested.nar_hash);
+        defer self.allocator.free(actual_hex);
+        try checkFodHash(self, expected, actual_hex);
+    }
+    return contextStringWithPath(self, try self.intern.intern(ingested.store_path));
+}
+
+/// Recursive (NAR) ingestion of `path` under an optional `filter`, returning
+/// the store path and NAR hash. Split out so the closure-holding `Context`
+/// lives on this frame for the duration of `ingest`.
+fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value) !source_paths.Ingested {
+    if (filter_value.isNull()) {
+        return source_paths.ingest(self.allocator, self.derivations, self.files, path, store_name, null);
+    }
+    const pred = try vm_force.forceValue(self, filter_value);
+    const Context = struct {
+        vm: @TypeOf(self),
+        pred: Value,
+
+        fn accept(context: *anyopaque, candidate: []const u8, kind: file_cache.FileCache.FileKind) anyerror!bool {
+            const ctx: *@This() = @ptrCast(@alignCast(context));
+            return filterSourceAccepts(ctx.vm, ctx.pred, candidate, kind);
+        }
     };
-    defer self.allocator.free(store_path);
-    return contextStringWithPath(self, try self.intern.intern(store_path));
+    var context: Context = .{ .vm = self, .pred = pred };
+    return source_paths.ingest(self.allocator, self.derivations, self.files, path, store_name, .{
+        .context = &context,
+        .accept = Context.accept,
+    });
 }
