@@ -245,6 +245,32 @@ pub fn compareValues(self: *VM, a: Value, b: Value) !CompareResult {
                 .gt => .gt,
             };
         },
+        // Lexicographic list ordering (Nix's stable `lexical-lists-comparison`):
+        // compare element-wise; the first non-equal pair decides, else the
+        // shorter list is less. Equal elements are skipped via `valuesEqual`,
+        // so equal-but-unorderable elements (e.g. two identical attrsets) don't
+        // spuriously error — only a genuinely differing, unorderable pair does,
+        // exactly as Nix's element-wise `<` would.
+        .list => {
+            if (!vb.isList()) return error.TypeError;
+            const ida = va.asObjectId();
+            const idb = vb.asObjectId();
+            const na = try self.heap.getListLen(ida);
+            const nb = try self.heap.getListLen(idb);
+            const n = @min(na, nb);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                // Re-fetch each element by index: comparing an earlier element
+                // forces values, which can move the list segment under GC.
+                const ea = try self.heap.getListItem(ida, i);
+                const eb = try self.heap.getListItem(idb, i);
+                if (try valuesEqual(self, ea, eb)) continue;
+                return try compareValues(self, ea, eb);
+            }
+            if (na < nb) return .lt;
+            if (na > nb) return .gt;
+            return .eq;
+        },
         else => return error.TypeError,
     }
 }
