@@ -92,6 +92,10 @@ pub const Scanner = struct {
         if (c == '"') return self.lexString(start, .double_quoted);
         if (c == '\'' and self.peek() == '\'') return self.lexString(start, .indented);
         if (c == '.' and (self.peek() == '/' or (self.peek() == '.' and self.peekAhead(1) == '/'))) return self.lexPath(start);
+        // Leading-dot float: `.5`, `.5e3` (Nix's `0?\.[0-9]+` form). Deprecated
+        // in Lix but still valid; `.` followed by a digit is never a selector
+        // here because a bare `.` cannot start a select.
+        if (c == '.' and isDigit(self.peek())) return self.lexFractionAndExponent(start);
 
         // Single-character tokens.
         switch (c) {
@@ -144,7 +148,15 @@ pub const Scanner = struct {
             '/' => {
                 if (self.match('/')) return self.makeToken(.double_slash, start, 2);
                 if (isPathContinue(self.peek()) and !isDigit(self.peek())) return self.lexPath(start);
+                // Absolute path opening with an interpolation: `/${x}`.
+                if (self.peek() == '$' and self.peekAhead(1) == '{') return self.lexPath(start);
                 return self.makeToken(.slash, start, 1);
+            },
+            // Home-relative path (`~/...`, HPATH): a `~` is only a path when
+            // immediately followed by `/`.
+            '~' => {
+                if (self.peek() == '/') return self.lexPath(start);
+                return self.makeToken(.error_token, start, 1);
             },
             '&' => {
                 if (self.match('&')) return self.makeToken(.amp_amp, start, 2);
@@ -269,28 +281,35 @@ pub const Scanner = struct {
         }
         if (self.pos < self.source.len and self.source[self.pos] == '.') {
             self.pos += 1;
-            while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
-                self.pos += 1;
-            }
-            if (self.pos < self.source.len and (self.source[self.pos] == 'e' or self.source[self.pos] == 'E')) {
-                const exponent_start = self.pos;
-                var exponent_pos = self.pos + 1;
-                if (exponent_pos < self.source.len and (self.source[exponent_pos] == '+' or self.source[exponent_pos] == '-')) {
-                    exponent_pos += 1;
-                }
-                const digits_start = exponent_pos;
-                while (exponent_pos < self.source.len and isDigit(self.source[exponent_pos])) {
-                    exponent_pos += 1;
-                }
-                if (exponent_pos > digits_start) {
-                    self.pos = @intCast(exponent_pos);
-                } else {
-                    self.pos = exponent_start;
-                }
-            }
-            return self.makeToken(.float_val, start, self.pos - start);
+            return self.lexFractionAndExponent(start);
         }
         return self.makeToken(.integer, start, self.pos - start);
+    }
+
+    /// Scan a float's fractional digits and optional exponent, with `self.pos`
+    /// positioned just past the decimal point. Used both by `lexNumber` (after
+    /// the integer part) and by the leading-dot form (`.5`).
+    fn lexFractionAndExponent(self: *Scanner, start: u32) Token {
+        while (self.pos < self.source.len and isDigit(self.source[self.pos])) {
+            self.pos += 1;
+        }
+        if (self.pos < self.source.len and (self.source[self.pos] == 'e' or self.source[self.pos] == 'E')) {
+            const exponent_start = self.pos;
+            var exponent_pos = self.pos + 1;
+            if (exponent_pos < self.source.len and (self.source[exponent_pos] == '+' or self.source[exponent_pos] == '-')) {
+                exponent_pos += 1;
+            }
+            const digits_start = exponent_pos;
+            while (exponent_pos < self.source.len and isDigit(self.source[exponent_pos])) {
+                exponent_pos += 1;
+            }
+            if (exponent_pos > digits_start) {
+                self.pos = @intCast(exponent_pos);
+            } else {
+                self.pos = exponent_start;
+            }
+        }
+        return self.makeToken(.float_val, start, self.pos - start);
     }
 
     fn lexString(self: *Scanner, start: u32, kind: string_syntax.LiteralKind) Token {

@@ -287,7 +287,10 @@ def run_lix_case(fix: Path, lang_dir: Path, c: LixCase) -> Result:
         # the reference eval runner always evaluates --strict and with the
         # flakes xp feature enabled (nix fixture flake=True).
         args = ["--strict", "--extra-experimental-features", "flakes", *fix_flags, "in.nix"]
-        p = run_fix(fix, args, tmp)
+        # The reference functional2 runner points HOME at a per-test dir, so
+        # `~`-relative paths resolve inside the sandbox; mirror that here (the
+        # tmp path is rewritten to /pwd below, matching the golden output).
+        p = run_fix(fix, args, tmp, {"HOME": str(tmp)})
         out = p.stdout.replace(str(tmp), "/pwd")
 
         if c.runner == "eval-fail":

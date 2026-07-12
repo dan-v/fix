@@ -989,6 +989,7 @@ pub const Evaluator = struct {
         );
         compiler.base_path = base_path;
         compiler.source_path = source_path;
+        compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
         // their file in the disasm sidecar.

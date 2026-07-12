@@ -568,6 +568,17 @@ fn opConcatStrings(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_dep
     return dispatch(vm, frame, code, ip + 2, stop_depth);
 }
 
+fn opConcatPath(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
+    frame.ip = ip;
+    const count = readU16(code, ip);
+    // Operands stay on the stack across the coercions/forces inside (precise
+    // GC roots); drop only after the result is built.
+    const result = try strings.concatStackPath(vm, count);
+    stack.dropN(vm, count);
+    try stack.push(vm, result);
+    return dispatch(vm, frame, code, ip + 2, stop_depth);
+}
+
 fn opPushBuiltins(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     try stack.push(vm, vm.builtins);
@@ -1161,6 +1172,7 @@ fn handlerFor(comptime op: OpCode) HandlerFn {
         .attrs_merge => opMergeAttrs,
         .list_cat => opConcatLists,
         .str_cat => opConcatStrings,
+        .path_cat => opConcatPath,
         .push_builtins => opPushBuiltins,
         .file_find => opFindFile,
         .file_find_w => opFindFileLong,

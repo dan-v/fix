@@ -188,6 +188,64 @@ pub fn concatStackStrings(self: *VM, count: u32) !Value {
     return Value.contextString(try self.heap.addContextString(text_id, context.items));
 }
 
+/// `path_cat` opcode body: concatenate the top `count` stack operands into a
+/// single path, canonicalizing ONCE at the end. The first operand supplies the
+/// base path text; the rest are coerced string-like and appended raw. Mirrors
+/// `concatPathLike` (used by binary `path + x`) but over N parts with a single
+/// canonicalization, so separators between adjacent `${…}` interpolations in a
+/// path literal survive.
+pub fn concatStackPath(self: *VM, count: u32) !Value {
+    std.debug.assert(count >= 1 and self.sp >= count);
+    const base = self.sp - count;
+
+    // Coerce every part in place (each stays a precise GC root in its slot).
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        self.stack[base + i] = try stringLikeValue(self, self.stack[base + i]);
+    }
+
+    // Assemble the raw concatenated text, then canonicalize once.
+    var total: usize = 0;
+    i = 0;
+    while (i < count) : (i += 1) {
+        total += self.intern.get(try stringTextInternId(self, self.stack[base + i])).len;
+    }
+    const buf = try self.allocator.alloc(u8, total);
+    defer self.allocator.free(buf);
+    var off: usize = 0;
+    i = 0;
+    while (i < count) : (i += 1) {
+        const s = self.intern.get(try stringTextInternId(self, self.stack[base + i]));
+        @memcpy(buf[off..][0..s.len], s);
+        off += s.len;
+    }
+    const raw_text_id = try self.intern.intern(buf);
+    const raw_text = self.intern.get(raw_text_id);
+    const text_id = if (std.fs.path.isAbsolute(raw_text)) text_id: {
+        const normalized = try std.fs.path.resolve(self.allocator, &.{raw_text});
+        defer self.allocator.free(normalized);
+        break :text_id try self.intern.intern(normalized);
+    } else raw_text_id;
+
+    // Merge context from any context-string parts; store-path context is
+    // illegal inside a path (matches concatPathLike).
+    var context: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
+    defer context.deinit(self.allocator);
+    i = 0;
+    while (i < count) : (i += 1) {
+        const v = self.stack[base + i];
+        if (v.isContextString()) {
+            if (try hasStorePathContext(self, v)) return error.InvalidPathConcatenation;
+            const gc_roots = force.rootsBegin(self);
+            defer force.rootsEnd(self, gc_roots);
+            for (context.items) |e| force.rootKeep(self, e.value);
+            try appendStringContext(self, &context, v);
+        }
+    }
+    if (context.items.len == 0) return Value.path(text_id);
+    return Value.contextString(try self.heap.addContextString(text_id, context.items));
+}
+
 pub fn coerceLanguageStringValue(self: *VM, value: Value) !Value {
     const gc_roots = force.rootsBegin(self);
     defer force.rootsEnd(self, gc_roots);

@@ -214,37 +214,49 @@ pub fn compilePath(self: *Compiler, node: *const Node) !void {
 }
 
 pub fn compileInterpolatedPath(self: *Compiler, span: []const u8, source_offset: u32) !void {
+    // Push every part (leading text as a base path constant, later text as
+    // string constants, and each interpolation's value) then assemble with ONE
+    // `path_cat`. A left fold of binary `path + string` would canonicalize
+    // after each step and lose the `/` separators between adjacent `${…}`
+    // interpolations (`/${a}/${b}`); Nix builds a single concatenation and
+    // canonicalizes the whole path once.
     var cursor: usize = 0;
-    var have_value = false;
+    var parts: u16 = 0;
+    var have_base = false;
 
     while (std.mem.indexOf(u8, span[cursor..], "${")) |relative_start| {
         const interp_start = cursor + relative_start;
-        try emitPathPart(self, span[cursor..interp_start], &have_value);
+        if (try emitPathTextPart(self, span[cursor..interp_start], &have_base)) parts += 1;
 
         const expr_start = interp_start + 2;
         const expr_end = string_syntax.findInterpolationEnd(span, expr_start) orelse return error.InvalidPathLiteral;
         try compileInterpolatedExpr(self, span[expr_start..expr_end], source_offset + @as(u32, @intCast(expr_start)));
-        if (have_value) try emit.emitOp(self, .int_add);
-        have_value = true;
+        parts += 1;
         cursor = expr_end + 1;
     }
 
-    try emitPathPart(self, span[cursor..], &have_value);
-    if (!have_value) return error.InvalidPathLiteral;
+    if (try emitPathTextPart(self, span[cursor..], &have_base)) parts += 1;
+    if (parts == 0) return error.InvalidPathLiteral;
+    try emit.emitOpU16(self, .path_cat, parts);
 }
 
-pub fn emitPathPart(self: *Compiler, part: []const u8, have_value: *bool) !void {
-    if (part.len == 0) return;
-    if (!have_value.*) {
+/// Emit one text part of an interpolated path. The first non-empty part is the
+/// base and is resolved to a path constant (preserving a trailing slash so the
+/// next part concatenates cleanly); later text parts are plain string
+/// constants. Returns whether an operand was pushed.
+pub fn emitPathTextPart(self: *Compiler, part: []const u8, have_base: *bool) !bool {
+    if (part.len == 0) return false;
+    if (!have_base.*) {
         const path = try resolvePathLiteralPreserveTrailingSlash(self, part);
         defer if (path.owned) self.allocator.free(path.text);
         const id = try self.intern.intern(path.text);
         try self.builder.emitConstant(self.allocator, Value.path(id));
-        have_value.* = true;
-        return;
+        have_base.* = true;
+        return true;
     }
-
-    try emitStringPart(self, part, have_value);
+    const id = try self.intern.intern(part);
+    try self.builder.emitConstant(self.allocator, Value.string(id));
+    return true;
 }
 
 pub fn compileSearchPath(self: *Compiler, node: *const Node) !void {
@@ -255,6 +267,17 @@ pub fn compileSearchPath(self: *Compiler, node: *const Node) !void {
 }
 
 pub fn resolvePathLiteral(self: *Compiler, span: []const u8) !ResolvedPath {
+    // Home-relative path (`~/foo`): expand the leading `~` to $HOME, matching
+    // Nix, which resolves it at parse time.
+    if (span.len > 0 and span[0] == '~' and (span.len == 1 or span[1] == '/')) {
+        const home = self.home_dir orelse return error.NoHomeDir;
+        const joined = try std.fs.path.join(self.allocator, &.{ home, span[1..] });
+        defer self.allocator.free(joined);
+        return .{
+            .text = try std.fs.path.resolve(self.allocator, &.{joined}),
+            .owned = true,
+        };
+    }
     if (std.fs.path.isAbsolute(span)) {
         return .{
             .text = try std.fs.path.resolve(self.allocator, &.{span}),

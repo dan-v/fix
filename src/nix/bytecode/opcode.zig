@@ -119,6 +119,14 @@ pub const OpCode = enum(u8) {
     /// is a bare string coercion — no re-intern of the coerced text.
     /// Operand: 2-byte count (N >= 1).
     str_cat,
+    /// Concatenate N parts into a single path, canonicalizing the whole path
+    /// ONCE at the end. Stack before: [base, part2, ..., partN] (base lowest);
+    /// after: [path]. The base part is a path literal; the rest are coerced
+    /// string-like and appended raw. Emitted for interpolated path literals
+    /// (`/${a}/${b}`) — a left fold of binary `path + string` would canonicalize
+    /// after each step and drop the separators between adjacent `${…}` parts.
+    /// Operand: 2-byte count (N >= 1).
+    path_cat,
     /// Push the evaluator-owned builtins attrset.
     push_builtins,
     /// Resolve an evaluator search-path literal.
@@ -462,7 +470,7 @@ pub fn layout(op: OpCode) []const Operand {
         .attrs_new_named_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 } },
         .attrs_new_named_pos_srt => comptime &[_]Operand{ cnt(.b2, "entries (named)"), .{ .skip = .b4 }, cnt(.b2, "positions"), .{ .skip = .b4 } },
         .list_new => comptime &[_]Operand{cnt(.b2, "items")},
-        .str_cat => comptime &[_]Operand{cnt(.b2, "parts")},
+        .str_cat, .path_cat => comptime &[_]Operand{cnt(.b2, "parts")},
         .call_n, .call_tail_n => comptime &[_]Operand{cnt(.b1, "args")},
 
         .file_find => comptime &[_]Operand{.{ .intern = .b2 }},
