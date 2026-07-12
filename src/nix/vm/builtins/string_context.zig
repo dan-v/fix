@@ -202,6 +202,15 @@ pub fn mergeContextOutputs(self: anytype, left: Value, right: Value) !Value {
     var ri: usize = 0;
     while (ri < right_n) : (ri += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(right_id, ri));
 
+    // Nix stores output names in a sorted set; sort so context identity
+    // comparisons hold regardless of merge order.
+    const Ctx = struct {
+        intern: @TypeOf(self.intern),
+        fn lt(ctx: @This(), a: Value, b: Value) bool {
+            return std.mem.order(u8, ctx.intern.get(a.asInternId()), ctx.intern.get(b.asInternId())) == .lt;
+        }
+    };
+    std.mem.sort(Value, outputs.items, Ctx{ .intern = self.intern }, Ctx.lt);
     return Value.list(try self.heap.addList(outputs.items));
 }
 

@@ -58,11 +58,18 @@ pub fn builtinConcatStringsSep(self: anytype, sep_arg: Value, list_arg: Value) !
     const gc_roots = vm_force.rootsBegin(self);
     defer vm_force.rootsEnd(self, gc_roots);
     for (item_values) |item_value| vm_force.rootKeep(self, item_value);
+    vm_force.rootKeep(self, sep_value);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(self.allocator);
     var ctx: std.ArrayListUnmanaged(heap_mod.AttrEntry) = .empty;
     defer ctx.deinit(self.allocator);
+
+    // Nix folds the separator's context into the result unconditionally, even
+    // when the list has fewer than two elements.
+    for (try string_context.contextEntriesForValue(self, sep_value)) |entry| {
+        try string_context.appendContextEntry(self, &ctx, entry.name, entry.value);
+    }
 
     for (item_values, 0..) |item_value, i| {
         if (i > 0) try out.appendSlice(self.allocator, sep);
@@ -134,9 +141,11 @@ pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_
 
     const string_value = try coerceStringContextValue(self, string_arg);
     const string = self.intern.get(try stringTextInternId(self, string_value));
-    if (start_i > std.math.maxInt(usize)) return Value.string(try self.intern.intern(""));
+    // Nix always attaches the source string's context to the result — even for
+    // an out-of-range slice that yields "".
+    if (start_i > std.math.maxInt(usize)) return substringResult(self, "", string_value);
     const start: usize = @intCast(start_i);
-    if (start >= string.len) return Value.string(try self.intern.intern(""));
+    if (start >= string.len) return substringResult(self, "", string_value);
     const available = string.len - start;
     const requested_len: usize = if (len_i < 0)
         available
@@ -145,8 +154,12 @@ pub fn builtinSubstring(self: anytype, start_arg: Value, len_arg: Value, string_
     else
         @intCast(len_i);
     const end = start + @min(available, requested_len);
-    const text_id = try self.intern.intern(string[start..end]);
-    const ctx = try string_context.contextEntriesForValue(self, string_value);
+    return substringResult(self, string[start..end], string_value);
+}
+
+fn substringResult(self: anytype, text: []const u8, source: Value) !Value {
+    const text_id = try self.intern.intern(text);
+    const ctx = try string_context.contextEntriesForValue(self, source);
     if (ctx.len == 0) return Value.string(text_id);
     return Value.contextString(try self.heap.addContextString(text_id, ctx));
 }

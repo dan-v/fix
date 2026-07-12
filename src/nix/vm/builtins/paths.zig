@@ -21,26 +21,36 @@ const contextStringWithPath = string_context.contextStringWithPath;
 const filterSourceAccepts = fetch.filterSourceAccepts;
 
 pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
-    const value = try vm_force.forceValue(self, arg);
-    const path = switch (value.kind()) {
-        .path, .string, .string_context => self.intern.get(try stringTextInternId(self, value)),
+    // Coerce like Nix (copyToStore = false): a raw path keeps its text without a
+    // store copy; a string/derivation keeps its context.
+    const forced = try vm_force.forceValue(self, arg);
+    const value = switch (forced.kind()) {
+        .path, .string, .string_context => forced,
+        .attrs => try strings.coerceAttrsStringContextValue(self, forced),
         else => return error.TypeError,
     };
-    return Value.string(try self.intern.intern(path_ops.baseName(path)));
+    const base_id = try self.intern.intern(path_ops.baseName(self.intern.get(try stringTextInternId(self, value))));
+    if (value.isContextString()) {
+        const ctx = (try self.heap.getContextString(value.asObjectId())).context;
+        return Value.contextString(try self.heap.addContextString(base_id, ctx));
+    }
+    return Value.string(base_id);
 }
 
 pub fn builtinDirOf(self: anytype, arg: Value) !Value {
-    const value = try vm_force.forceValue(self, arg);
-    const path = switch (value.kind()) {
-        .path, .string, .string_context => self.intern.get(try stringTextInternId(self, value)),
+    const forced = try vm_force.forceValue(self, arg);
+    const value = switch (forced.kind()) {
+        .path, .string, .string_context => forced,
+        .attrs => try strings.coerceAttrsStringContextValue(self, forced),
         else => return error.TypeError,
     };
-    const dir = try self.intern.intern(path_ops.dirOf(path));
-    return switch (value.kind()) {
-        .path => Value.path(dir),
-        .string, .string_context => Value.string(dir),
-        else => unreachable,
-    };
+    const dir_id = try self.intern.intern(path_ops.dirOf(self.intern.get(try stringTextInternId(self, value))));
+    if (value.isPath()) return Value.path(dir_id);
+    if (value.isContextString()) {
+        const ctx = (try self.heap.getContextString(value.asObjectId())).context;
+        return Value.contextString(try self.heap.addContextString(dir_id, ctx));
+    }
+    return Value.string(dir_id);
 }
 
 pub fn builtinPlaceholder(self: anytype, arg: Value) !Value {

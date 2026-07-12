@@ -418,7 +418,21 @@ pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
     var ri: usize = 0;
     while (ri < right_n) : (ri += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(right_id, ri));
 
+    sortContextOutputs(self, outputs.items);
     return Value.list(try self.heap.addList(outputs.items));
+}
+
+/// Nix stores a context's output names in a sorted set, so the merged list must
+/// be name-sorted for identity comparisons (`getContext a == getContext b`) to
+/// hold regardless of the order outputs were merged in.
+pub fn sortContextOutputs(self: *VM, outputs: []Value) void {
+    const Ctx = struct {
+        vm: *VM,
+        fn lt(ctx: @This(), a: Value, b: Value) bool {
+            return std.mem.order(u8, ctx.vm.intern.get(a.asInternId()), ctx.vm.intern.get(b.asInternId())) == .lt;
+        }
+    };
+    std.mem.sort(Value, outputs, Ctx{ .vm = self }, Ctx.lt);
 }
 
 pub fn appendUniqueContextOutput(self: *VM, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
