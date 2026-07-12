@@ -83,6 +83,16 @@ pub const DerivationStore = struct {
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
 
+    /// Import-from-derivation (IFD) scope depth. When > 0, `instantiate*` /
+    /// `pathIsValid` behave as if store writes were enabled even during plain
+    /// `eval` — the narrow, on-demand window where a demanded derivation
+    /// output (readFile/readDir/pathExists of a not-yet-built `.drv` output) is
+    /// realized on the fly. Kept separate from `store_writes_enabled` so plain
+    /// eval stays pure everywhere else: only the closure re-forced *inside* a
+    /// realize writes its `.drv`. Atomic because input forcing during the
+    /// re-force can fan to helper fibers on other workers.
+    ifd_writes: std.atomic.Value(u32) = .init(0),
+
     /// Optional off-thread executor for blocking daemon ops. When set (by the
     /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
     /// on the shared IO thread while the calling fiber parks — keeping the
@@ -165,6 +175,22 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
+    /// Whether store writes are currently permitted — either globally
+    /// (`fix instantiate`/`build`) or transiently inside an IFD realize.
+    pub fn writesActive(self: *DerivationStore) bool {
+        return self.store_writes_enabled or self.ifd_writes.load(.seq_cst) != 0;
+    }
+
+    /// Enter an import-from-derivation realize scope: `.drv`/source writes are
+    /// permitted until the matching `endIfdWrites`. Balanced by the caller.
+    pub fn beginIfdWrites(self: *DerivationStore) void {
+        _ = self.ifd_writes.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn endIfdWrites(self: *DerivationStore) void {
+        _ = self.ifd_writes.fetchSub(1, .seq_cst);
+    }
+
     /// Install the off-thread daemon-op executor. Must be called before any
     /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
     /// torn down.
@@ -205,7 +231,7 @@ pub const DerivationStore = struct {
     /// Write a text-addressed object (a `.drv` or `builtins.toFile` result),
     /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
-        if (!self.store_writes_enabled) return;
+        if (!self.writesActive()) return;
         return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
     }
 
@@ -213,14 +239,14 @@ pub const DerivationStore = struct {
     /// Sources ingest during derivation normalization — before the `.drv` that
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
-        if (!self.store_writes_enabled) return;
+        if (!self.writesActive()) return;
         return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
-        if (!self.store_writes_enabled) return;
+        if (!self.writesActive()) return;
         return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } });
     }
 
@@ -230,7 +256,7 @@ pub const DerivationStore = struct {
     /// (else there is no daemon); returns false otherwise. Offloaded like the
     /// writes so the calling fiber parks rather than blocking on the socket.
     pub fn pathIsValid(self: *DerivationStore, store_path: []const u8) !bool {
-        if (!self.store_writes_enabled) return false;
+        if (!self.writesActive()) return false;
         if (self.offload) |off| {
             var cell: QueryCell = .{ .store = self, .store_path = store_path };
             off.run(off.ctx, QueryCell.run, &cell);
@@ -271,6 +297,33 @@ pub const DerivationStore = struct {
         const daemon = try self.ensureDaemon();
         try daemon.buildPaths(derived_paths, sink, mode);
     }
+
+    /// Realize `derived_paths` for import-from-derivation: like `buildPaths`,
+    /// but dispatched onto the IO thread (when an offload is installed and we're
+    /// on a fiber) so the demand fiber parks rather than blocking a compute
+    /// worker on the daemon socket for the whole build. Inline otherwise (the
+    /// `run`/`shell` main-thread callers). The borrowed `derived_paths` stay
+    /// valid because the parked fiber's stack is preserved for the transfer.
+    pub fn realizePaths(self: *DerivationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
+        if (self.offload) |off| {
+            var cell: BuildCell = .{ .store = self, .paths = derived_paths, .mode = mode };
+            off.run(off.ctx, BuildCell.run, &cell);
+            return cell.err;
+        }
+        return self.buildPaths(derived_paths, null, mode);
+    }
+
+    const BuildCell = struct {
+        store: *DerivationStore,
+        paths: []const []const u8,
+        mode: rstore.BuildMode,
+        err: anyerror!void = {},
+
+        fn run(p: *anyopaque) void {
+            const self: *BuildCell = @ptrCast(@alignCast(p));
+            self.err = self.store.buildPaths(self.paths, null, self.mode);
+        }
+    };
 
     /// Register `link_path` (an existing absolute symlink into the store) as an
     /// indirect GC root via the daemon.

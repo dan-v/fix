@@ -56,6 +56,26 @@ DROP_FLAGS_NO_ARG = {"--no-warning"}
 # requires anything else is skipped as unsupported rather than failed.
 FIX_EXPERIMENTAL_FEATURES = {"pipe-operators", "fetch-tree", "flakes"}
 
+# The nix-daemon socket `fix` connects to for real store ops (import-from-
+# derivation realizes its output by building via this daemon). When it exists,
+# `nix-store` cases can actually run; otherwise they stay skipped.
+NIX_DAEMON_SOCKET = os.environ.get(
+    "NIX_DAEMON_SOCKET", "/nix/var/nix/daemon-socket/socket"
+)
+
+
+def _store_available() -> bool:
+    """A usable nix store/daemon for the `nix-store` environment cases: the
+    daemon socket exists, or we are in single-user mode with a writable store."""
+    try:
+        import stat as _stat
+
+        if _stat.S_ISSOCK(os.stat(NIX_DAEMON_SOCKET).st_mode):
+            return True
+    except OSError:
+        pass
+    return os.path.isdir("/nix/store") and os.access("/nix/store", os.W_OK)
+
 
 class Colors:
     on = sys.stdout.isatty()
@@ -526,8 +546,13 @@ def snix_flags(c: SnixCase) -> tuple[list[str], str | None]:
 
 
 def run_snix_case(fix: Path, c: SnixCase) -> Result:
-    if c.network or c.nix_store:
-        return Result("snix", c.ident, "skip", "needs-network-or-store")
+    if c.network:
+        return Result("snix", c.ident, "skip", "needs-network")
+    # `nix-store` cases (e.g. import-from-derivation) need a real store: fix now
+    # realizes derivation outputs on demand via the running nix-daemon, so let
+    # them run when one is reachable; only skip when there is no store at all.
+    if c.nix_store and not _store_available():
+        return Result("snix", c.ident, "skip", "needs-store")
     flags, skip = snix_flags(c)
     if skip:
         return Result("snix", c.ident, "skip", skip)

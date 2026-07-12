@@ -112,6 +112,20 @@ pub const FileCache = struct {
         return true;
     }
 
+    /// Trap: deliberately UNcached existence probe. Used by import-from-
+    /// derivation to decide whether a demanded store path still needs building,
+    /// WITHOUT memoizing the result — a path that becomes valid after an
+    /// on-demand build must not be pinned to a stale `false` (as `pathExists`
+    /// would). `path` must be absolute (store paths always are).
+    pub fn existsUncached(self: *FileCache, path: []const u8) !bool {
+        const io = self.io orelse return error.FileIoUnavailable;
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn readFile(self: *FileCache, path: []const u8) ![]const u8 {
         const entry = try self.entryFor(path);
         entry.mu.lock();
