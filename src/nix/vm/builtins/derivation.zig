@@ -185,6 +185,27 @@ fn nameCharsValid(name: []const u8) bool {
     return true;
 }
 
+/// Import-from-derivation: write `drv_attrs`'s `.drv` to the real store (and any
+/// input closure that is (re)forced here and not yet cached), then realize
+/// `derived_path` (`<drvpath>!*`) via the daemon so the demanded output exists
+/// on disk. `drv_attrs_id` is the original input attrs — the derivation value's
+/// `drvAttrs`. Called only when a not-yet-built derivation output's content or
+/// existence is demanded during plain `eval` (readFile/readDir/pathExists).
+///
+/// Note: input `.drv`s already forced (and cached) during the surrounding pure
+/// eval are NOT rewritten here — the daemon relies on them already being valid
+/// in the store, as they normally are. Only the demanded closure re-forced
+/// inside this scope gets written.
+pub fn realizeDerivationForIfd(self: anytype, drv_attrs_id: ObjectId, derived_path: []const u8) !void {
+    self.derivations.beginIfdWrites();
+    defer self.derivations.endIfdWrites();
+    // Re-force writes the target `.drv` (via `instantiateDrv`, now permitted by
+    // the IFD scope). `.lazy` still normalizes + writes the `.drv`; it just
+    // skips forcing every output's value, which the daemon build materializes.
+    _ = try buildForcedDerivationValue(self, drv_attrs_id, .lazy);
+    try self.derivations.realizePaths(&.{derived_path}, .normal);
+}
+
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     // GC: `attrs_id` is a bare id held across the whole (force-heavy) build.
     const gc_roots = vm_force.rootsBegin(self);
@@ -227,11 +248,12 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
     try self.derivations.recordDebug(&normalized.drv, computed);
 
-    // When a daemon store is attached (`fix instantiate`/`build`), write this
-    // derivation's `.drv` to the real store as it is forced. Its input `.drv`s
-    // were forced (hence written) during `normalizeDerivation` above, so their
-    // paths are already valid references — correct topological order for free.
-    if (self.derivations.store_writes_enabled) {
+    // When a daemon store is attached (`fix instantiate`/`build`, or a transient
+    // import-from-derivation realize), write this derivation's `.drv` to the real
+    // store as it is forced. Its input `.drv`s were forced (hence written) during
+    // `normalizeDerivation` above, so their paths are already valid references —
+    // correct topological order for free.
+    if (self.derivations.writesActive()) {
         // A store write can happen off the demand fiber, so report it as an
         // independent concurrent span (its own render node, safe to open/close
         // from any thread) rather than on the demand-only stage stack.

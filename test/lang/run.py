@@ -66,6 +66,26 @@ FIX_DEPRECATED_FEATURES = {
     "cr-line-endings", "or-as-identifier", "rec-set-merges",
 }
 
+# The nix-daemon socket `fix` connects to for real store ops (import-from-
+# derivation realizes its output by building via this daemon). When it exists,
+# `nix-store` cases can actually run; otherwise they stay skipped.
+NIX_DAEMON_SOCKET = os.environ.get(
+    "NIX_DAEMON_SOCKET", "/nix/var/nix/daemon-socket/socket"
+)
+
+
+def _store_available() -> bool:
+    """A usable nix store/daemon for the `nix-store` environment cases: the
+    daemon socket exists, or we are in single-user mode with a writable store."""
+    try:
+        import stat as _stat
+
+        if _stat.S_ISSOCK(os.stat(NIX_DAEMON_SOCKET).st_mode):
+            return True
+    except OSError:
+        pass
+    return os.path.isdir("/nix/store") and os.access("/nix/store", os.W_OK)
+
 
 class Colors:
     on = sys.stdout.isatty()
@@ -641,9 +661,10 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
     # `network` is NOT a skip: the fetch builtins these cases exercise
     # (fetchurl/fetchTarball with a sha256) yield a deterministic fixed-output
     # store path from name+hash, which fix computes offline without touching the
-    # network. Only a running store/daemon (`nix-store`, e.g. import-from-
-    # derivation) is genuinely undrivable here.
-    if c.nix_store:
+    # network. `nix-store` cases (e.g. import-from-derivation) need a real store:
+    # fix realizes derivation outputs on demand via the running nix-daemon, so
+    # run them when one is reachable and only skip when there is no store at all.
+    if c.nix_store and not _store_available():
         return Result("snix", c.ident, "skip", "needs-store")
     flags, skip = snix_flags(c)
     if skip:

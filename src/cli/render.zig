@@ -40,7 +40,11 @@ pub fn evaluationError(io: std.Io, use_color: bool, show_trace: bool, ev: *Evalu
     try cli.style(writer, use_color, .error_label);
     try writer.writeAll("error");
     try cli.reset(writer, use_color);
-    if (trace.message) |message| {
+    if (err == error.DaemonError) {
+        // An import-from-derivation build (or other on-demand store op) failed;
+        // surface the daemon's own message, which the trace does not carry.
+        try writer.print(": daemon: {s}\n", .{ev.lastStoreError() orelse "unknown store error"});
+    } else if (trace.message) |message| {
         try writer.print(": {s}\n", .{message});
     } else {
         try writer.print(": evaluation failed with {s}\n", .{@errorName(err)});
