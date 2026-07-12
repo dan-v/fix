@@ -59,8 +59,12 @@ test "forceDeep terminates and is correct over a DAG with a shared sub-list and 
     try ev.writeValue(&out.writer, value);
     const rendered = try out.toOwnedSlice();
     defer std.testing.allocator.free(rendered);
+    // writeValue prints attribute keys lexicographically (as Nix does), not in
+    // definition order: both, l1, l2. And the shared list `a` is one object,
+    // so every reference past the first renders as «repeated» (Nix identity
+    // semantics) — proving the shared node is not re-forced or duplicated.
     try std.testing.expectEqualStrings(
-        "{ l1 = [ 1 2 3 ]; l2 = [ 1 2 3 ]; both = [ [ 1 2 3 ] [ 1 2 3 ] ]; }",
+        "{ both = [ [ 1 2 3 ] «repeated» ]; l1 = «repeated»; l2 = «repeated»; }",
         rendered,
     );
 }

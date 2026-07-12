@@ -30,11 +30,11 @@ test "writeValue colorizes strings, numbers, keywords, and attr names when value
 test "writeValue prints lazy containers without forcing contents" {
     const list_output = try renderForTest("[ 1 (1 / 0) \"x\" ]");
     defer std.testing.allocator.free(list_output);
-    try std.testing.expectEqualStrings("[ 1 ... \"x\" ]", list_output);
+    try std.testing.expectEqualStrings("[ 1 <CODE> \"x\" ]", list_output);
 
     const attrs_output = try renderForTest("{ a = 1; b = 1 / 0; c = \"x\"; }");
     defer std.testing.allocator.free(attrs_output);
-    try std.testing.expectEqualStrings("{ a = 1; b = ...; c = \"x\"; }", attrs_output);
+    try std.testing.expectEqualStrings("{ a = 1; b = <CODE>; c = \"x\"; }", attrs_output);
 }
 
 test "forceDeep recursively evaluates lazy containers" {
@@ -48,7 +48,7 @@ test "forceDeep recursively evaluates lazy containers" {
 test "forceDeep handles recursive containers without hiding recursive thunks" {
     const repeated = try renderStrictForTest("let x = rec { a = x; }; in x");
     defer std.testing.allocator.free(repeated);
-    try std.testing.expectEqualStrings("{ a = ...; }", repeated);
+    try std.testing.expectEqualStrings("{ a = «repeated»; }", repeated);
 
     try std.testing.expectError(error.RecursiveThunk, renderStrictForTest("rec { a = a; b = 1; }"));
 }
@@ -56,7 +56,7 @@ test "forceDeep handles recursive containers without hiding recursive thunks" {
 test "writeValue prints recursive attrsets without looping" {
     const output = try renderForTest("rec { a = a; b = 1; }");
     defer std.testing.allocator.free(output);
-    try std.testing.expectEqualStrings("{ a = ...; b = 1; }", output);
+    try std.testing.expectEqualStrings("{ a = «repeated»; b = 1; }", output);
 }
 
 test "writeValue prints derivations as drv paths" {
@@ -435,7 +435,7 @@ test "evaluate builtins.typeOf" {
 test "evaluate concatLists and listToAttrs builtins" {
     const concat = try renderForTest("builtins.concatLists [ [ 1 ] [ (1 / 0) ] [ 3 ] ]");
     defer std.testing.allocator.free(concat);
-    try std.testing.expectEqualStrings("[ 1 ... 3 ]", concat);
+    try std.testing.expectEqualStrings("[ 1 <CODE> 3 ]", concat);
 
     const first_duplicate_wins = try renderForTest("(builtins.listToAttrs [ { name = \"a\"; value = 1; } { name = \"a\"; value = 2; } ]).a");
     defer std.testing.allocator.free(first_duplicate_wins);

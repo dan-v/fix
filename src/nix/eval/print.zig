@@ -48,18 +48,18 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         ev: EvaluatorPtr,
         writer: *std.Io.Writer,
         use_color: bool,
-        seen: std.ArrayListUnmanaged(SeenObject),
+        /// Objects already visited in THIS print. A shared or recursive
+        /// reference reached a second time (by any path, not just an
+        /// ancestor) renders as «repeated», matching Nix's identity-based
+        /// printer — it is never pruned mid-print. Keyed by (id, kind); the
+        /// id is a heap slot, so this is identity, not structural, equality.
+        seen: std.AutoHashMapUnmanaged(u64, void),
         /// Recursion depth, so top-level (`depth == 0`) list/attrs walks can
         /// report `[i/N]` item progress on the render node without every nested
         /// container fighting over the same counter.
         depth: u32 = 0,
 
-        const SeenKind = enum { list, attrs, thunk };
-
-        const SeenObject = struct {
-            kind: SeenKind,
-            id: types.ObjectId,
-        };
+        const SeenKind = enum(u2) { list, attrs, thunk };
 
         /// Emit an SGR code (or nothing when color is off).
         fn on(self: *Self, code: []const u8) !void {
@@ -108,20 +108,22 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
                 },
                 .list => try self.writeList(value.asObjectId()),
                 .attrs => try self.writeAttrs(value.asObjectId()),
-                .closure => try self.writer.writeAll("<closure>"),
+                // Marker strings match Nix's value printer: a user lambda is
+                // <LAMBDA>, a builtin is <PRIMOP>, a partially-applied builtin
+                // is <PRIMOP-APP>.
+                .closure => try self.writer.writeAll("<LAMBDA>"),
                 .thunk => try self.writeThunk(value.asObjectId()),
-                .builtin => try self.writer.writeAll("<builtin>"),
-                .builtin_closure => try self.writer.writeAll("<builtin-closure>"),
-                .partial_app => try self.writer.writeAll("<partial-app>"),
+                .builtin => try self.writer.writeAll("<PRIMOP>"),
+                .builtin_closure => try self.writer.writeAll("<PRIMOP-APP>"),
+                .partial_app => try self.writer.writeAll("<PRIMOP-APP>"),
             }
         }
 
         fn writeList(self: *Self, id: types.ObjectId) !void {
             if (!try self.enter(.list, id)) {
-                try self.writer.writeAll("...");
+                try self.writer.writeAll("«repeated»");
                 return;
             }
-            defer self.leave();
 
             const items = try self.ev.heap.getList(id);
             if (items.len == 0) {
@@ -149,16 +151,31 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             }
 
             if (!try self.enter(.attrs, id)) {
-                try self.writer.writeAll("...");
+                try self.writer.writeAll("«repeated»");
                 return;
             }
-            defer self.leave();
 
-            const entries = try self.ev.heap.getAttrs(id);
-            if (entries.len == 0) {
+            const stored = try self.ev.heap.getAttrs(id);
+            if (stored.len == 0) {
                 try self.writer.writeAll("{ }");
                 return;
             }
+
+            // Nix prints attribute sets with their keys in lexicographic order,
+            // regardless of definition order (fix's JSON/XML writers already do
+            // this via attrsets.sortedAttrEntries). Sort a private copy here so
+            // the plain value form matches — attr storage is symbol-id order,
+            // which is first-seen order, not alphabetical.
+            const Entry = std.meta.Elem(@TypeOf(stored));
+            const entries = try self.ev.allocator.dupe(Entry, stored);
+            defer self.ev.allocator.free(entries);
+            const Cmp = struct {
+                intern: @TypeOf(self.ev.intern),
+                fn lessThan(ctx: @This(), a: Entry, b: Entry) bool {
+                    return std.mem.lessThan(u8, ctx.intern.get(a.name), ctx.intern.get(b.name));
+                }
+            };
+            std.mem.sort(Entry, entries, Cmp{ .intern = self.ev.intern }, Cmp.lessThan);
 
             const count_on = self.depth == 0 and self.ev.progressCountBegin(entries.len);
             self.depth += 1;
@@ -206,10 +223,9 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
 
         fn writeThunk(self: *Self, id: types.ObjectId) !void {
             if (!try self.enter(.thunk, id)) {
-                try self.writer.writeAll("...");
+                try self.writer.writeAll("«repeated»");
                 return;
             }
-            defer self.leave();
 
             const thunk = try self.ev.heap.getThunk(id);
             const state: FutureState = @enumFromInt(thunk.future.state.load(.acquire));
@@ -223,7 +239,8 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
             if (thunk.targetKind() == .pass_through) {
                 try self.write(thunk.payload.target.pass_through);
             } else {
-                try self.writer.writeAll("...");
+                // An unforced thunk renders as <CODE>, matching Nix's printer.
+                try self.writer.writeAll("<CODE>");
             }
         }
 
@@ -238,15 +255,9 @@ fn ValuePrinter(comptime EvaluatorPtr: type) type {
         }
 
         fn enter(self: *Self, kind: SeenKind, id: types.ObjectId) !bool {
-            for (self.seen.items) |seen| {
-                if (seen.kind == kind and seen.id == id) return false;
-            }
-            try self.seen.append(self.ev.allocator, .{ .kind = kind, .id = id });
-            return true;
-        }
-
-        fn leave(self: *Self) void {
-            _ = self.seen.pop();
+            const key = (@as(u64, id) << 2) | @intFromEnum(kind);
+            const gop = try self.seen.getOrPut(self.ev.allocator, key);
+            return !gop.found_existing;
         }
 
         fn isBareAttrName(name: []const u8) bool {

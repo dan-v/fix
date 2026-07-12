@@ -73,7 +73,7 @@ test "evaluate map concatMap mapAttrs and genList builtins" {
 
     const generated = try renderForTest("builtins.genList (x: x + 1) 3");
     defer std.testing.allocator.free(generated);
-    try std.testing.expectEqualStrings("[ ... ... ... ]", generated);
+    try std.testing.expectEqualStrings("[ <CODE> <CODE> <CODE> ]", generated);
 
     const generated_forced = try renderForTest("builtins.elemAt (builtins.genList (x: x + 1) 3) 2");
     defer std.testing.allocator.free(generated_forced);
