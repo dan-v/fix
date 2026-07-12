@@ -146,6 +146,16 @@ pub const Compiler = struct {
     /// string naming above (gated on `capture_names`), this is always built —
     /// cheaply, one small node per bound chunk.
     name_id: bytecode.NameId = bytecode.NAME_ROOT,
+    /// This compile's ambient scope REPLACES the base (builtins) scope rather
+    /// than overlaying it — the `builtins.scopedImport` semantic, where the
+    /// supplied attrset becomes the entire free-identifier environment. When
+    /// set, free identifiers resolve against the ambient scope BEFORE (and
+    /// instead of) the static builtins, so even names that are builtins
+    /// (`import`, `map`, …) bind to the attrset's entries. Set on the root by
+    /// `parseAndCompile` (scope present AND a source_path — i.e. a scoped
+    /// import, not a repl/debug overlay), inherited by children. The repl's
+    /// ambient scope keeps this false, so builtins stay visible there.
+    scoped_base: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -200,6 +210,7 @@ pub const Compiler = struct {
             self.heap,
         );
         child.parent = self;
+        child.scoped_base = self.scoped_base;
         child.base_path = self.base_path;
         child.source_path = self.source_path;
         child.source_file_id = self.source_file_id;
