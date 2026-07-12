@@ -80,10 +80,12 @@ pub fn build(b: *std.Build) void {
     // introduces no cycle.
     syntax_mod.addImport("base", base_mod);
     // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
-    // resolved target. Lives with the fiber code.
+    // resolved target. Lives with the fiber code. Each .S is preprocessed and
+    // handles both ELF (Linux) and Mach-O (Darwin) via `__APPLE__` guards.
     switch (target.result.cpu.arch) {
         .x86_64 => base_mod.addAssemblyFile(b.path("src/base/fiber/swap_x86_64.S")),
-        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64"),
+        .aarch64 => base_mod.addAssemblyFile(b.path("src/base/fiber/swap_aarch64.S")),
+        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64 and aarch64"),
     }
 
     const runtime_mod = b.addModule("runtime", .{

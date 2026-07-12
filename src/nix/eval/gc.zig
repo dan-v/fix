@@ -15,6 +15,7 @@
 //! so the whole cluster compiles to nothing in a default (non-`-Dgc`) build.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gc = @import("runtime").gc;
 const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
@@ -426,20 +427,34 @@ test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
     try std.testing.expectEqual(@as(u64, 2 << 30), lineFor(8 << 30, 2 << 30, 1 << 30));
 }
 
-/// MemTotal from /proc/meminfo, in bytes.
+/// Total physical RAM in bytes, or null if the OS query fails (the caller
+/// then assumes a conservative default). Linux reads /proc/meminfo; Darwin
+/// queries the `hw.memsize` sysctl. The `comptime` gates ensure the
+/// libc-only sysctl reference is never codegen'd on non-Darwin targets.
 fn systemMemoryTotal() ?u64 {
-    var buf: [8192]u8 = undefined;
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
-    const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
-    if (fd < 0) return null;
-    defer _ = linux.close(fd);
-    const n = linux.read(fd, &buf, buf.len);
-    const rd: isize = @bitCast(n);
-    if (rd <= 0) return null;
-    const text = buf[0..@intCast(rd)];
-    if (meminfoKb(text, "MemTotal:")) |kb| return kb << 10;
-    return null;
+    if (comptime builtin.os.tag == .linux) {
+        var buf: [8192]u8 = undefined;
+        const linux = std.os.linux;
+        const fd_raw = linux.open("/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0);
+        const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
+        if (fd < 0) return null;
+        defer _ = linux.close(fd);
+        const n = linux.read(fd, &buf, buf.len);
+        const rd: isize = @bitCast(n);
+        if (rd <= 0) return null;
+        const text = buf[0..@intCast(rd)];
+        if (meminfoKb(text, "MemTotal:")) |kb| return kb << 10;
+        return null;
+    } else if (comptime builtin.os.tag.isDarwin()) {
+        var val: u64 = 0;
+        var len: usize = @sizeOf(u64);
+        if (std.c.sysctlbyname("hw.memsize", &val, &len, null, 0) == 0 and val != 0) {
+            return val;
+        }
+        return null;
+    } else {
+        return null;
+    }
 }
 
 /// Extract `<key>   <n> kB` from /proc/meminfo text.

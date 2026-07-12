@@ -1256,8 +1256,7 @@ pub const ObjectHeap = struct {
             }
             self.values.populateAhead(&values_state, TOUCHER_AHEAD_BYTES);
             self.attrs.populateAhead(&attrs_state, TOUCHER_AHEAD_BYTES);
-            var req: std.os.linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-            _ = std.os.linux.nanosleep(&req, null);
+            sync.sleepNs(1_000_000);
         }
     }
 

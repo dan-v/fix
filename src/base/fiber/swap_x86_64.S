@@ -22,11 +22,23 @@
 // the swap whose lifetime no longer matches the function's, corrupting
 // state on resume. Doing the entire save/load/ret as one atomic dance
 // is the only correct shape.
+//
+// This file is preprocessed (`.S`), so it targets both ELF (Linux) and
+// Mach-O (Darwin). Mach-O prefixes C symbols with `_` and rejects the
+// ELF-only `.type`/`.size`/`.note.GNU-stack` directives.
+
+#if defined(__APPLE__)
+# define FIX_SYM(name) _##name
+#else
+# define FIX_SYM(name) name
+#endif
 
     .text
-    .globl fix_swap_context
-    .type fix_swap_context, @function
-fix_swap_context:
+    .globl FIX_SYM(fix_swap_context)
+#if !defined(__APPLE__)
+    .type FIX_SYM(fix_swap_context), @function
+#endif
+FIX_SYM(fix_swap_context):
     // Save callee-saved registers + rsp into `from`.
     movq %rbx,  0(%rdi)
     movq %rbp,  8(%rdi)
@@ -51,7 +63,12 @@ fix_swap_context:
     // fiber, this is the saved return address from its previous
     // `fix_swap_context` call.
     retq
-    .size fix_swap_context, .-fix_swap_context
+#if !defined(__APPLE__)
+    .size FIX_SYM(fix_swap_context), .-FIX_SYM(fix_swap_context)
+#endif
 
-// Mark stack as non-executable (Linux convention).
+// Mark stack as non-executable (Linux/ELF convention; Mach-O has no
+// equivalent directive and doesn't need one).
+#if defined(__linux__)
 .section .note.GNU-stack,"",@progbits
+#endif

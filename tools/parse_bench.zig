@@ -3,16 +3,34 @@
 //! wired `parser_tables`, so it measures the real driver).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const syntax = @import("syntax");
 
+/// Cheap monotonic tick counter for the inner timing loop. x86_64 uses the
+/// cycle-accurate TSC; aarch64 reads the virtual count register (a fixed-
+/// frequency tick, so the reported "cyc/byte" is really "ticks/byte" there,
+/// fine for the relative best-of-N comparison this tool does). Anything else
+/// falls back to a nanosecond clock.
 inline fn rdtsc() u64 {
-    var hi: u32 = undefined;
-    var lo: u32 = undefined;
-    asm volatile ("lfence\nrdtsc\nlfence"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-    );
-    return (@as(u64, hi) << 32) | @as(u64, lo);
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            var hi: u32 = undefined;
+            var lo: u32 = undefined;
+            asm volatile ("lfence\nrdtsc\nlfence"
+                : [lo] "={eax}" (lo),
+                  [hi] "={edx}" (hi),
+            );
+            return (@as(u64, hi) << 32) | @as(u64, lo);
+        },
+        .aarch64 => {
+            var v: u64 = undefined;
+            asm volatile ("isb\nmrs %[v], cntvct_el0"
+                : [v] "=r" (v),
+            );
+            return v;
+        },
+        else => return @intCast(std.time.nanoTimestamp()),
+    }
 }
 
 fn readAll(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {

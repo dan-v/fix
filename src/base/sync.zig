@@ -7,6 +7,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Sleep the current thread for approximately `ns` nanoseconds. Portable
+/// across Linux (direct `nanosleep` syscall, no libc) and other POSIX
+/// systems including Darwin (libc `nanosleep`). For coarse background-poll
+/// delays that don't want the `std.Io` scheduler — `std.Thread.sleep` no
+/// longer exists in the Io-refactored std. EINTR is treated as "close
+/// enough"; these are timers, not deadlines. The comptime gate keeps the
+/// libc `nanosleep` reference out of codegen on Linux (which links no libc).
+pub fn sleepNs(ns: u64) void {
+    const ts: std.posix.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    if (comptime builtin.os.tag == .linux) {
+        _ = std.os.linux.nanosleep(&ts, null);
+    } else {
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
 /// Spinlock built on `std.atomic.Mutex`. Short critical sections only —
 /// writers on the segmented-storage primitives are O(allocator call) at most.
 pub const SpinMutex = struct {

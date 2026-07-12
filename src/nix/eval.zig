@@ -1897,8 +1897,7 @@ pub const Evaluator = struct {
             self.progressSample();
             var slept: u32 = 0;
             while (slept < sample_period_ms and !self.progress_stop.load(.acquire)) : (slept += stop_check_ms) {
-                var req: std.os.linux.timespec = .{ .sec = 0, .nsec = stop_check_ms * std.time.ns_per_ms };
-                _ = std.os.linux.nanosleep(&req, null);
+                @import("base").sync.sleepNs(stop_check_ms * std.time.ns_per_ms);
             }
         }
     }

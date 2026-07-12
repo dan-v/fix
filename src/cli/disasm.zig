@@ -188,8 +188,10 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
 /// terminal / the query fails.
 fn terminalWidth() ?u16 {
     var ws: std.posix.winsize = undefined;
-    const rc = std.os.linux.ioctl(1, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (rc != 0) return null;
+    // Route through the per-OS backend (linux syscall / libc) so this works
+    // on Darwin as well as Linux; TIOCGWINSZ + winsize exist on both.
+    const rc = std.posix.system.ioctl(1, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (std.posix.errno(rc) != .SUCCESS) return null;
     return if (ws.col > 0) ws.col else null;
 }
 

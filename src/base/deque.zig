@@ -1,12 +1,29 @@
 //! Lock-free Chase-Lev work-stealing deques (fixed `Deque` + growable
 //! `GrowableDeque`). Single-owner LIFO push/pop, multi-consumer FIFO steal;
-//! the `top`/`bottom` counters, seq_cst last-element CAS, and x86_64
-//! `mfence`s are load-bearing. The `top`/`bottom` counters are wrapped in
-//! the `Isolated` cache-line pad (see `cache_line.zig`).
+//! the `top`/`bottom` counters, seq_cst last-element CAS, and the seq_cst
+//! `seqCstFence` StoreLoad barriers are load-bearing. The `top`/`bottom`
+//! counters are wrapped in the `Isolated` cache-line pad (see
+//! `cache_line.zig`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Isolated = @import("cache_line.zig").Isolated;
+
+/// Full StoreLoad barrier — the seq_cst thread fence the Chase-Lev protocol
+/// needs between the owner's `bottom` write and its `top` read (in `pop`),
+/// and between a stealer's `top` and `bottom` reads (in `steal`). Emitted as
+/// a bare barrier instruction per arch rather than a seq_cst RMW so the hot
+/// steal path issues NO memory write (an RMW would dirty a cache line and add
+/// coherence traffic across stealers). `mfence`/`dmb ish` are exactly what a
+/// C11 `atomic_thread_fence(seq_cst)` lowers to on each arch.
+inline fn seqCstFence() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("mfence" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("dmb ish" ::: .{ .memory = true }),
+        else => @compileError("deque: no seq_cst StoreLoad fence for this arch"),
+    }
+}
 
 /// Shared Chase-Lev work-stealing deque protocol, comptime-specialized over
 /// payload `T` and `growable`.
@@ -239,7 +256,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             // above with the top load below. Without it, the owner
             // could observe a stale `top` and dequeue a slot a stealer
             // is concurrently taking.
-            asm volatile ("mfence" ::: .{ .memory = true });
+            seqCstFence();
             const t = self.top.v.load(.monotonic);
             if (@as(i64, @bitCast(b -% t)) < 0) {
                 // Empty — restore bottom.
@@ -276,7 +293,7 @@ fn DequeImpl(comptime T: type, comptime growable: bool) type {
             // this we could observe a `bottom` from before `top` was
             // bumped by another stealer, leading to phantom reads of
             // already-claimed slots.
-            asm volatile ("mfence" ::: .{ .memory = true });
+            seqCstFence();
             const b = self.bottom.v.load(.acquire);
             if (@as(i64, @bitCast(b -% t)) <= 0) return null;
             // Acquire (growable only): pair with the owner's release store

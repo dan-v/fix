@@ -623,7 +623,9 @@ fn pct(live: u64, reserved: u64) f64 {
 /// Peak resident set size in bytes (kernel high-water, never decreases).
 pub fn peakRssBytes() u64 {
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
-    return @as(u64, @intCast(ru.maxrss)) * 1024; // ru_maxrss is KiB on Linux
+    const maxrss: u64 = @intCast(ru.maxrss);
+    // ru_maxrss units differ by OS: KiB on Linux/BSD, bytes on Darwin.
+    return if (comptime builtin.os.tag.isDarwin()) maxrss else maxrss * 1024;
 }
 
 // Hugetlb-backed bytes are invisible to every kernel RSS figure (ru_maxrss,
@@ -647,7 +649,15 @@ pub fn peakFootprintBytes() u64 {
 
 /// Current resident set size in bytes, read from /proc/self/statm (field 2
 /// = resident pages). Returns 0 if unavailable.
+///
+/// Linux-only via procfs. On Darwin a precise current RSS needs mach
+/// `task_info(TASK_BASIC_INFO)` (libc/mach, not wired here), so we fall back
+/// to the peak high-water — an over-approximation, but keeps footprint
+/// reporting meaningful rather than zero. Other OSes report 0.
 pub fn currentRssBytes() u64 {
+    if (comptime builtin.os.tag != .linux) {
+        return if (comptime builtin.os.tag.isDarwin()) peakRssBytes() else 0;
+    }
     var buf: [128]u8 = undefined;
     const linux = std.os.linux;
     const fd_raw = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);

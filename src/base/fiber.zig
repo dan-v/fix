@@ -7,8 +7,9 @@
 //! resumption.
 //!
 //! Stack switching is done via a small naked assembly routine
-//! (`fix_swap_context`, see src/parallel/fiber/swap_x86_64.S) that saves the
-//! callee-saved register set + rsp into a `Context` and loads a new one.
+//! (`fix_swap_context`, see src/base/fiber/swap_<arch>.S) that saves the
+//! callee-saved register set + stack pointer into a `Context` and loads a
+//! new one.
 //! Caller-saved registers are clobbered on swap — Zig's calling convention
 //! lets the compiler handle that around the swap call site.
 //!
@@ -34,8 +35,9 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 comptime {
-    if (builtin.cpu.arch != .x86_64) {
-        @compileError("fiber.zig currently only supports x86_64");
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => {},
+        else => @compileError("fiber.zig only supports x86_64 and aarch64"),
     }
 }
 
@@ -74,20 +76,78 @@ pub inline fn censusNow() u64 {
     return (@as(u64, high) << 32) | @as(u64, low);
 }
 
-/// Callee-saved register set + saved stack pointer.
-/// Layout must match src/parallel/fiber/swap_x86_64.S exactly.
-pub const Context = extern struct {
-    rbx: u64 = 0,
-    rbp: u64 = 0,
-    r12: u64 = 0,
-    r13: u64 = 0,
-    r14: u64 = 0,
-    r15: u64 = 0,
-    rsp: u64 = 0,
+/// Callee-saved register set + saved stack pointer. The layout is
+/// arch-specific and MUST match the corresponding swap_<arch>.S exactly.
+pub const Context = switch (builtin.cpu.arch) {
+    // SysV/Win64-agnostic x86_64 callee-saved set. See swap_x86_64.S.
+    .x86_64 => extern struct {
+        rbx: u64 = 0,
+        rbp: u64 = 0,
+        r12: u64 = 0,
+        r13: u64 = 0,
+        r14: u64 = 0,
+        r15: u64 = 0,
+        rsp: u64 = 0,
+    },
+    // AAPCS64 callee-saved set: x19-x28, fp (x29), lr (x30), sp, and the
+    // low 64 bits of the callee-saved SIMD registers v8-v15. See
+    // swap_aarch64.S. Field order/offsets are load-bearing.
+    .aarch64 => extern struct {
+        x19: u64 = 0,
+        x20: u64 = 0,
+        x21: u64 = 0,
+        x22: u64 = 0,
+        x23: u64 = 0,
+        x24: u64 = 0,
+        x25: u64 = 0,
+        x26: u64 = 0,
+        x27: u64 = 0,
+        x28: u64 = 0,
+        fp: u64 = 0,
+        lr: u64 = 0,
+        sp: u64 = 0,
+        d8: u64 = 0,
+        d9: u64 = 0,
+        d10: u64 = 0,
+        d11: u64 = 0,
+        d12: u64 = 0,
+        d13: u64 = 0,
+        d14: u64 = 0,
+        d15: u64 = 0,
+    },
+    else => unreachable, // gated by the comptime block above
 };
 
-/// Implemented in src/parallel/fiber/swap_x86_64.S.
+/// Implemented in src/base/fiber/swap_<arch>.S.
 extern fn fix_swap_context(from: *Context, to: *Context) callconv(.c) void;
+
+/// Bootstrap a fresh `Context` on `stack` so the first `fix_swap_context`
+/// into it lands in `trampoline` on the fiber's own stack. The mechanism
+/// is arch-specific: x86_64 `ret`s off the stack top (so we push the
+/// trampoline address there), while aarch64 `ret`s to the link register
+/// (so we seed `lr` directly and leave `sp` at the aligned top).
+fn bootstrapContext(stack: []u8) Context {
+    const top = @intFromPtr(stack.ptr) + stack.len;
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            // sp_start must satisfy sp_start % 16 == 0 so that AFTER `ret`
+            // pops the return address the trampoline sees rsp ≡ 8 (mod 16),
+            // which is what SysV expects at function entry. Round down.
+            const sp_start = (top - 8) & ~@as(usize, 15);
+            const slot: *usize = @ptrFromInt(sp_start);
+            slot.* = @intFromPtr(&trampoline);
+            return .{ .rsp = sp_start };
+        },
+        .aarch64 => {
+            // AAPCS64 requires sp 16-byte aligned at all times. `top` is
+            // page-aligned (mmap), hence already 16-aligned. `ret` branches
+            // to lr, so no return address is pushed onto the stack.
+            const sp_start = top & ~@as(usize, 15);
+            return .{ .sp = sp_start, .lr = @intFromPtr(&trampoline) };
+        },
+        else => unreachable,
+    }
+}
 
 pub const State = enum(u8) {
     ready,
@@ -197,19 +257,9 @@ pub const Fiber = struct {
             .caller_ctx = null,
         };
 
-        // Set up the new stack so the first `ret` inside `fix_swap_context`
-        // jumps into `trampoline`. We reserve the topmost 16-byte aligned
-        // slot for the return address; trampoline will see rsp pointing
-        // just past it (i.e. 16-byte aligned on function entry — matches
-        // the ABI convention where the caller pushed the return address).
-        const top = @intFromPtr(stack.ptr) + stack.len;
-        // sp_start must satisfy (sp_start) % 16 == 0 so that AFTER `ret`
-        // pops the return address, the trampoline sees rsp ≡ 8 (mod 16),
-        // which is what SysV expects at function entry. Round down.
-        const sp_start = (top - 8) & ~@as(usize, 15);
-        const trampoline_addr_slot: *usize = @ptrFromInt(sp_start);
-        trampoline_addr_slot.* = @intFromPtr(&trampoline);
-        fiber.ctx.rsp = sp_start;
+        // Set up the new stack so the first swap into this fiber lands in
+        // `trampoline` on its own stack (arch-specific mechanism).
+        fiber.ctx = bootstrapContext(stack);
 
         return fiber;
     }
@@ -236,7 +286,9 @@ pub const Fiber = struct {
     /// MADV_DONTNEED (immediate reclaim, visible RSS drop, guaranteed
     /// re-fault on reuse).
     pub fn releaseStackPages(self: *Fiber, retain_top: usize, lazy: bool) void {
-        if (comptime builtin.os.tag != .linux) return;
+        // MADV_FREE / MADV_DONTNEED are available on Linux and Darwin; a
+        // no-op on any other OS.
+        if (comptime builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return;
         // The stack-probe watermark scan reads the whole stack; reclaimed
         // pages would zero the sentinel pattern and skew it.
         if (comptime stack_probe_enabled) return;
@@ -244,8 +296,8 @@ pub const Fiber = struct {
         const keep = std.mem.alignForward(usize, retain_top, page);
         if (self.stack.len <= keep) return;
         const len = self.stack.len - keep; // stack.len is page-aligned (mmap)
-        const advice: u32 = if (lazy) std.os.linux.MADV.FREE else std.os.linux.MADV.DONTNEED;
-        _ = std.os.linux.madvise(@alignCast(self.stack.ptr), len, advice);
+        const advice: u32 = if (lazy) std.posix.MADV.FREE else std.posix.MADV.DONTNEED;
+        std.posix.madvise(@alignCast(self.stack.ptr), len, advice) catch {};
     }
 
     /// Rewind the fiber so the next `resume_` starts a fresh invocation
@@ -258,11 +310,7 @@ pub const Fiber = struct {
     /// enrolled on thunks via its slot.
     pub fn reset(self: *Fiber, entry: EntryFn, arg: *anyopaque) void {
         std.debug.assert(self.state == .finished or self.state == .ready);
-        const top = @intFromPtr(self.stack.ptr) + self.stack.len;
-        const sp_start = (top - 8) & ~@as(usize, 15);
-        const trampoline_addr_slot: *usize = @ptrFromInt(sp_start);
-        trampoline_addr_slot.* = @intFromPtr(&trampoline);
-        self.ctx = .{ .rsp = sp_start };
+        self.ctx = bootstrapContext(self.stack);
         self.entry = entry;
         self.entry_arg = arg;
         self.caller_ctx = null;
