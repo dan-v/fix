@@ -202,9 +202,57 @@ fn hasAttrSegmentsHaveInterpolation(self: *Compiler, segments: []const Node.Atom
 pub fn compileList(self: *Compiler, node: *const Node) !void {
     const list = node.data.list;
     for (list.items) |item| {
-        try compileContainerValue(self, item, .{ .raw_identifier = true });
+        try compileListElement(self, item);
     }
     try emit.emitOpU16(self, .list_new, try diagnostics.requireU16At(self, list.items.len, diagnosticAtom(node), "too many list items"));
+}
+
+/// Compile a single list element with Nix's `Expr::maybeThunk` semantics: a
+/// trivial atom (int/float/string/path/bool/null, an empty list, or a
+/// statically-resolvable identifier) is stored directly as a value; every
+/// other expression is stored as an unforced thunk. In a non-strict print the
+/// thunk renders as `<CODE>` — matching Nix, which never inlines a composite
+/// or computed element. This deliberately differs from `compileContainerValue`
+/// (attr/let RHS values), whose composite fast paths inline pre-resolved lazy
+/// shells that print as their value.
+fn compileListElement(self: *Compiler, item: *const Node) !void {
+    // Mirror `compileContainerValue`'s name-hint hygiene.
+    defer self.name_hint = null;
+    const unwrapped = unwrapParens(item);
+    switch (unwrapped.tag) {
+        .integer, .float_val, .bool_true, .bool_false, .null, .string, .path => {
+            // Pure literals bind directly (interpolated string/path fall
+            // through to a thunk, matching `ExprConcatStrings`).
+            if (try compileImmediateContainerValue(self, unwrapped, .{})) return;
+            try thunks.compileListElementThunk(self, item);
+        },
+        .identifier => {
+            // A statically-resolvable variable is `ExprVar::maybeThunk`: bind
+            // its slot/upvalue directly (no fresh thunk). Dynamic (`with`) and
+            // builtin names aren't resolvable here, so they thunk instead.
+            if (try compileRawIdent(self, unwrapped)) return;
+            try thunks.compileListElementThunk(self, item);
+        },
+        .list => {
+            // Empty list is a shared constant value (`[ [] ]` prints
+            // `[ [ ] ]`); a non-empty list literal is thunked (`[ <CODE> ]`).
+            if (unwrapped.data.list.items.len == 0) {
+                try emit.emitOpU16(self, .list_new, 0);
+            } else {
+                try thunks.compileListElementThunk(self, item);
+            }
+        },
+        .attr_set => {
+            // An empty non-recursive set is a shared constant value too
+            // (`[ {} {} ]` prints `[ { } { } ]`); any populated set is thunked.
+            if (unwrapped.data.attr_set.entries.len == 0 and !unwrapped.data.attr_set.recursive) {
+                try emit.emitOpU16(self, .attrs_new, 0);
+            } else {
+                try thunks.compileListElementThunk(self, item);
+            }
+        },
+        else => try thunks.compileListElementThunk(self, item),
+    }
 }
 
 pub fn compileContainerValue(self: *Compiler, node: *const Node, options: ContainerValueOptions) !void {

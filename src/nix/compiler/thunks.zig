@@ -94,6 +94,38 @@ pub fn compileThunk(self: *Compiler, expr: *const Node) !void {
     return compileThunkEager(self, expr, false);
 }
 
+/// Compile a list element into a genuine, unforced, lazy thunk — never
+/// eager, and (unlike `compileThunk`) never elided to a folded literal.
+/// Nix's `Expr::maybeThunk` wraps every non-trivial list element in a fresh
+/// thunk, so a non-strict print renders it as `<CODE>`. fix's ordinary thunk
+/// path folds/eliminates trivial bodies (e.g. `1 + 1` -> constant `2`), which
+/// would print the value instead. Keeping the thunk unresolved here is what
+/// makes `[ (1 + 1) ]` render `[ <CODE> ]` like Nix. In `--strict` mode the
+/// thunk is forced anyway, so the observable result is unchanged there.
+pub fn compileListElementThunk(self: *Compiler, expr: *const Node) !void {
+    self.armNodeTagName(expr);
+    var child_builder = try self.acquireBuilder();
+    defer self.releaseBuilder(&child_builder);
+
+    var child = self.initChild(&child_builder);
+    defer child.deinit();
+
+    child.compileNode(expr) catch |err| {
+        try diagnostics.absorbChildDiagnostics(self, &child);
+        return err;
+    };
+    var child_chunk = try finishChildChunk(&child, &child_builder, expr);
+    // Suppress the runtime trivial-body short-circuit (`makeBytecodeThunkFromCaptures`):
+    // a `.literal`/`.closure_zero` classification would push the folded value or
+    // closure directly instead of allocating a thunk, so `[ (1 + 1) ]` / `[ (x: x) ]`
+    // would print `[ 2 ]` / `[ <LAMBDA> ]`. Forcing `.none` keeps a genuine unforced
+    // thunk, which renders as `<CODE>` (Nix parity). Under `--strict` the thunk is
+    // forced regardless, so the value is unchanged.
+    child_chunk.scheduling.trivial = .none;
+    const child_id = try child.registerChunk(child_chunk);
+    try emit.emitThunkWithCaptures(self, child_id, child.captures.items);
+}
+
 /// Same as `compileThunk`, but emits the eager-spawn variant if
 /// `eager` is true — the resulting thunk gets submitted to the
 /// scheduler's urgent queue at creation. Called from let-binding
