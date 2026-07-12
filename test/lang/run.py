@@ -28,12 +28,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -122,22 +124,72 @@ class TimedOut:
     stderr = "fix timed out"
 
 
-def run_fix(fix: Path, args: list[str], cwd: Path, env: dict | None = None):
+def run_fix(fix: Path, args: list[str], cwd: Path, env: dict | None = None,
+            devices: list[str] | None = None):
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
     # keep evaluation deterministic and quiet
     full_env.setdefault("NO_COLOR", "1")
+    # --workers 1: these programs are tiny, so a per-process worker pool is pure
+    # startup overhead — and we already fan out across cases.
+    fix_cmd = [str(fix), "eval", "--workers", "1", *args]
+    if devices:
+        # A case needs genuine device nodes (char/block/device fixtures) that
+        # can't be created unprivileged. Run fix inside a rootless user+mount
+        # namespace and bind-mount /dev/null — a real character special file —
+        # onto each fixture path first, so fix's NAR ingestion hits the real
+        # "unsupported file type" path on an honest device inode. A fresh mount
+        # namespace copies the current mounts, so /nix/store, the tmp dir and
+        # HOME stay visible; the bind-mount only overlays the fixture path.
+        inner = "".join(f"mount --bind /dev/null {shlex.quote(t)} && " for t in devices)
+        inner += "exec " + " ".join(shlex.quote(a) for a in fix_cmd)
+        cmd = ["unshare", "--map-root-user", "--user", "--mount", "sh", "-c", inner]
+    else:
+        cmd = fix_cmd
     try:
         return subprocess.run(
-            # --workers 1: these programs are tiny, so a per-process worker pool
-            # is pure startup overhead — and we already fan out across cases.
-            [str(fix), "eval", "--workers", "1", *args],
+            cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=str(cwd), env=full_env, timeout=CASE_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         return TimedOut()
+
+
+# Device-node fixtures (char/block/device) can't be created without privilege.
+# We present them via a bind-mount of /dev/null inside a rootless user+mount
+# namespace (see run_fix). Some kernels disable unprivileged user namespaces, so
+# probe the whole mechanism once and degrade to a skip if it's unavailable —
+# never a false pass/fail.
+_userns_lock = threading.Lock()
+_userns_ok: bool | None = None
+
+
+def userns_available() -> bool:
+    global _userns_ok
+    with _userns_lock:
+        if _userns_ok is None:
+            _userns_ok = _probe_userns()
+        return _userns_ok
+
+
+def _probe_userns() -> bool:
+    try:
+        with tempfile.TemporaryDirectory(prefix="fixlang-userns-") as td:
+            mp = os.path.join(td, "probe")
+            open(mp, "w").close()
+            # Create the namespace AND actually bind-mount a device, confirming
+            # the result stats as a character special file — the exact path a
+            # device fixture relies on.
+            r = subprocess.run(
+                ["unshare", "--map-root-user", "--user", "--mount", "sh", "-c",
+                 f"mount --bind /dev/null {shlex.quote(mp)} && [ -c {shlex.quote(mp)} ]"],
+                capture_output=True, timeout=CASE_TIMEOUT_S,
+            )
+            return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
 
 
 def translate_flags(flags: list[str]) -> tuple[list[str], str | None]:
@@ -490,19 +542,20 @@ def load_snix_case(kdl_path: Path, cases_root: Path) -> SnixCase:
     return c
 
 
-def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path,
-                          omitted: list[str] | None = None) -> str | None:
-    """Create the declared fixture tree under `dest`.
+# char/block/device fixtures name a device special file. We can't mknod one
+# without root, so instead of creating it eagerly we present it at run time via
+# a bind-mount of /dev/null inside a rootless namespace (see run_fix). The
+# caller collects these into `devices` (absolute fixture paths) and skips the
+# case if unprivileged userns turns out to be unavailable.
+DEVICE_FIXTURE_KINDS = {"char", "block", "device"}
 
-    Returns a hard skip-reason string when a fixture the harness cannot make at
-    all is required. Device nodes (char/block/device) that need root but that we
-    couldn't create are recorded in `omitted` and *skipped* rather than
-    hard-failing: the caller downgrades an inconclusive run to a skip (never a
-    false pass/fail) so a test whose device node turns out not to be load-
-    bearing (e.g. the filter excludes it) can still run and pass.
-    """
-    if omitted is None:
-        omitted = []
+
+def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path,
+                          devices: list[str]) -> str | None:
+    """Create the declared fixture tree under `dest`. fifo/socket nodes are made
+    unprivileged; char/block/device nodes are recorded in `devices` for a
+    run-time bind-mount (run_fix). Returns a hard skip-reason for a fixture the
+    harness genuinely cannot present."""
     for fx in fixtures:
         if fx.name == "file":
             target = dest / fx.args[0]
@@ -519,7 +572,7 @@ def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path,
                 shutil.copytree(case_dir / fx.props["ref"], target, dirs_exist_ok=True)
             else:
                 target.mkdir(parents=True, exist_ok=True)
-                err = _materialize_fixtures(fx.children, case_dir, target, omitted)
+                err = _materialize_fixtures(fx.children, case_dir, target, devices)
                 if err:
                     return err
         elif fx.name == "symlink":
@@ -544,26 +597,21 @@ def _materialize_fixtures(fixtures: list[KdlNode], case_dir: Path, dest: Path,
                 s.bind(str(target))
             finally:
                 s.close()
-        elif fx.name in ("char", "block", "device"):
-            # Character / block device nodes. `mknod(2)` for a device needs
-            # CAP_MKNOD (root), so we can only make these when running
-            # privileged. A `device` fixture naming an already-present node
-            # (e.g. /dev/null, referenced absolutely by the .nix) needs no
-            # creation at all — that case runs unprivileged.
-            target = dest / fx.args[0]
-            if target.exists():
+        elif fx.name in DEVICE_FIXTURE_KINDS:
+            arg = fx.args[0] if fx.args else ""
+            if os.path.isabs(arg):
+                # An absolute path names an existing system device (e.g.
+                # /dev/null) the program reads directly — nothing to create.
+                if not os.path.exists(arg):
+                    return f"unsupported-fixture:{fx.name}"
                 continue
-            fmt = stat.S_IFBLK if fx.name == "block" else stat.S_IFCHR
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.mknod(target, fmt | 0o600, os.makedev(1, 3))
-            except (PermissionError, OSError):
-                # Unprivileged: can't mknod. Record it and press on — if the
-                # node is load-bearing the run will be inconclusive and the
-                # caller downgrades it to a skip; if not (filtered out), the
-                # run still matches golden and passes.
-                omitted.append(fx.name)
-                continue
+            # A device node to present at dest/arg. Don't create it here (needs
+            # root); touch a mountpoint and record the path for the bind-mount
+            # run_fix sets up inside the namespace.
+            target = dest / arg
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("")
+            devices.append(str(target))
         else:
             return f"unsupported-fixture:{fx.name}"
     return None
@@ -604,21 +652,21 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
 
     with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
         tmp = Path(td)
-        omitted: list[str] = []
-        fxerr = _materialize_fixtures(c.fixtures, c.kdl.parent, tmp, omitted)
+        devices: list[str] = []
+        fxerr = _materialize_fixtures(c.fixtures, c.kdl.parent, tmp, devices)
         if fxerr:
             return Result("snix", c.ident, "skip", fxerr)
+        if devices and not userns_available():
+            # Device fixtures need a rootless user+mount namespace to present a
+            # genuine device node; this kernel doesn't allow it. Skip rather
+            # than risk a false result.
+            return Result("snix", c.ident, "skip", "unsupported-fixture:device(no-userns)")
         code_path = tmp / nix_src.name
         shutil.copy(nix_src, code_path)
         env = {name: val for name, val in c.env_vars}
-        p = run_fix(fix, [*flags, code_path.name], tmp, env)
+        p = run_fix(fix, [*flags, code_path.name], tmp, env, devices=devices or None)
 
-        # A privileged device node we couldn't create makes any non-pass
-        # inconclusive rather than a real divergence — downgrade to a skip so
-        # we never report a false failure for something we couldn't set up.
         def fail(detail: str) -> Result:
-            if omitted:
-                return Result("snix", c.ident, "skip", f"unsupported-fixture:{omitted[0]}")
             return Result("snix", c.ident, "fail", detail)
 
         if err.exists():

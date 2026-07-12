@@ -124,7 +124,12 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayLi
                 const child = try std.fs.path.join(allocator, &.{ path, entry.name });
                 defer allocator.free(child);
                 if (filter) |f| {
-                    if (!try f.accept(f.context, child, entry.kind)) continue;
+                    // Use the stat-accurate type (like Nix's lstat), not the
+                    // readdir d_type — they can disagree (DT_UNKNOWN on some
+                    // filesystems, or a bind-mounted node), and the type handed
+                    // to the filter must match what serialization sees below.
+                    const kind = files.fileType(child) catch entry.kind;
+                    if (!try f.accept(f.context, child, kind)) continue;
                 }
                 try appendString(allocator, out, "entry");
                 try appendString(allocator, out, "(");
