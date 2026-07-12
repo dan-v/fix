@@ -369,6 +369,63 @@ pub fn finishEvac(heap: *ObjectHeap) ObjectHeap.MinorStats {
     return .{ .promoted = heap.gc_evac_promoted.load(.monotonic), .freed = heap.gc_evac_freed.load(.monotonic) };
 }
 
+// --- parallel MAJOR sweep (`--workers>1`) -------------------------------
+//
+// The full sweep walks the whole id range, so it's partitioned into word-
+// aligned chunks that the mark participants (collector + helping peers) claim
+// and sweep into their OWN free-list shard. Word-aligned chunks are alloc-bit
+// disjoint, so the per-slot bit clears need no atomics. Coordinated like the
+// evac phase: the collector reconstructs the alloc bitmap serially, opens the
+// phase, sweeps alongside the peers, then waits for done. A `chunk` never
+// straddles a 64-bit alloc-bit word (SWEEP_CHUNK is a multiple of 64).
+const SWEEP_CHUNK: usize = 1 << 15; // 32768 ids = 512 alloc-bit words
+
+/// Collector: reconstruct the alloc bitmap (release) — or verify mark closure
+/// (debug) — so the parallel sweep reads a valid filled-set. Call after the
+/// mark terminates, before opening the sweep.
+pub fn sweepPrep(heap: *ObjectHeap, mark_bits: []const u64) void {
+    if (comptime !build_options.gc) return;
+    if (comptime !gc_debug) heap.gcReconstructAllocBits();
+    if (comptime gc_debug) verifyMarkClosed(heap, mark_bits);
+}
+
+/// Any participant (collector or helping peer): claim id-range chunks and free
+/// every unmarked filled slot in them to THIS worker's shard, until the range
+/// is exhausted. Spins until the collector opens the phase.
+pub fn sweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
+    if (comptime !build_options.gc) return;
+    while (!heap.gc_sweep_open.load(.acquire)) std.atomic.spinLoopHint();
+    const local = heap.currentLocal();
+    const n: usize = heap.objects.count();
+    var freed: u64 = 0;
+    while (true) {
+        const chunk = heap.gc_sweep_next.fetchAdd(1, .monotonic);
+        const lo: usize = @as(usize, chunk) * SWEEP_CHUNK;
+        if (lo >= n) break;
+        const hi: usize = @min(lo + SWEEP_CHUNK, n);
+        var id: ObjectId = @intCast(lo);
+        while (id < hi) : (id += 1) {
+            const word = id >> 6;
+            if (word >= heap.gc_alloc_bits.len) break;
+            const bit = @as(u64, 1) << @intCast(id & 63);
+            if (heap.gc_alloc_bits[word] & bit == 0) continue; // unfilled / already free
+            if (word < mark_bits.len and (mark_bits[word] & bit != 0)) continue; // live
+            freeObjectRanges(heap, local, heap.objects.get(id));
+            heap.gc_alloc_bits[word] &= ~bit; // word-disjoint across chunks ⇒ no atomic
+            local.gc_free_objects.append(heap.allocator, id) catch {};
+            freed += 1;
+        }
+    }
+    _ = heap.gc_sweep_freed.fetchAdd(freed, .monotonic);
+    _ = heap.gc_sweep_done.fetchAdd(1, .release);
+}
+
+/// Collector: block until every participant finished sweeping.
+pub fn sweepWaitDone(heap: *ObjectHeap) void {
+    if (comptime !build_options.gc) return;
+    while (heap.gc_sweep_done.load(.acquire) < heap.gc_sweep_count) std.atomic.spinLoopHint();
+}
+
 /// Debug: verify the mark is closed — no MARKED object may reference an
 /// unmarked filled object. A violation means the tracer missed an edge
 /// (systematic bug); silence means marking is complete and any swept

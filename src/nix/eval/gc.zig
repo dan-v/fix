@@ -64,13 +64,14 @@ pub fn helpMark(ev: anytype, worker_id: u8) void {
     const marker_count = @min(@as(u32, ev.worker_count), gc_par_cap);
     const slot = ev.heap.gcMarkSlotGrab();
     if (slot >= marker_count) return;
-    // Drain the mark to global termination. For a MINOR, then help evacuate:
-    // the young-object lists are a shared work queue, so this peer claims and
-    // copies survivors into its own tenured TLAB alongside the collector. For a
-    // MAJOR there is no evac (the collector sweeps the whole heap serially), so
-    // just return and park until the collection ends.
+    // Drain the mark to global termination, then help the second phase: a MINOR
+    // evacuates the young-object lists; a MAJOR sweeps the whole id range. Both
+    // are claim loops over a shared work queue that this peer joins alongside
+    // the collector.
     ev.gc_tracer.drainParallel(&ev.heap, slot);
-    if (!ev.heap.gc_collecting_major)
+    if (ev.heap.gc_collecting_major)
+        heap_gc.sweepClaimLoop(&ev.heap, ev.gc_tracer.mark_bits)
+    else
         heap_gc.evacClaimLoop(&ev.heap, ev.gc_tracer.mark_bits);
 }
 
@@ -211,6 +212,7 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
     // minor, but a non-gated mark must trace old referents too. No remembered
     // set is seeded — a non-gated mark traces through old objects directly.
     ev.gc_chunks_scanned = 0;
+    var st: @import("runtime").heap.SweepStats = .{};
     if (ev.worker_count > 1) {
         // Parallel full mark: seed roots into the collector's marker deque, open
         // the mark so the parked peers help drain, then drain alongside them.
@@ -221,6 +223,14 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
             return;
         };
         ev.heap.gc_mark_slot.store(0, .release); // slot dispenser (minor does this in beginEvac)
+        // Arm the parallel-sweep phase BEFORE opening the mark: each participant
+        // flows drain→sweepClaimLoop inside one `helpMark`, so `gc_sweep_open`
+        // must already be false when a peer reaches the sweep loop.
+        ev.heap.gc_sweep_next.store(0, .monotonic);
+        ev.heap.gc_sweep_done.store(0, .monotonic);
+        ev.heap.gc_sweep_freed.store(0, .monotonic);
+        ev.heap.gc_sweep_count = marker_count;
+        ev.heap.gc_sweep_open.store(false, .release);
         ev.heap.gc_collecting_major = true;
         const collector_slot = ev.heap.gcMarkSlotGrab(); // grabbed before gcOpenMark ⇒ slot 0
         tr.beginSeeding(collector_slot);
@@ -230,6 +240,14 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
         tr.drainParallel(&ev.heap, collector_slot); // returns at global termination
         ev.scheduler.gcCloseMark();
         tr.sumStats();
+        // Parallel sweep: reconstruct the alloc bitmap (serial), then release the
+        // peers — spinning in `sweepClaimLoop` since their drain returned — to
+        // claim id-range chunks alongside the collector.
+        heap_gc.sweepPrep(&ev.heap, tr.mark_bits);
+        ev.heap.gc_sweep_open.store(true, .release);
+        heap_gc.sweepClaimLoop(&ev.heap, tr.mark_bits);
+        heap_gc.sweepWaitDone(&ev.heap);
+        st = .{ .objects_freed = ev.heap.gc_sweep_freed.load(.acquire) };
     } else {
         tr.resetMajor(ev.heap.objects.count()) catch {
             heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
@@ -237,10 +255,9 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
         };
         markRoots(ev, tr);
         tr.drain(&ev.heap);
+        st = ev.heap.sweep(tr.mark_bits); // serial full sweep
     }
     const t1 = nowNs();
-    // Full sweep: free every unmarked object (young AND old) to the free lists.
-    const st = ev.heap.sweep(tr.mark_bits);
     // Tenure survivors + empty the nursery, then drop the now-stale remset
     // (young generation is empty ⇒ no old→young edges remain). Swept slots stay
     // round-robined across worker shards; the allocation path work-steals across

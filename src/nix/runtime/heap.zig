@@ -470,6 +470,17 @@ pub const ObjectHeap = struct {
     gc_collecting_major: if (build_options.gc) bool else void = if (build_options.gc) false else {},
     gc_evac_promoted: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
     gc_evac_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
+    /// Parallel MAJOR sweep coordination (`--workers>1`). The full sweep walks
+    /// the whole id range `[0, count)`, so it's partitioned into word-aligned
+    /// chunks the mark participants claim (`gc_sweep_next`) and sweep into their
+    /// OWN free-list shard (word-disjoint ⇒ no alloc-bit races). `gc_sweep_open`
+    /// gates the phase (the collector reconstructs the alloc bitmap serially
+    /// first); `gc_sweep_done` counts finishers against `gc_sweep_count`.
+    gc_sweep_next: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    gc_sweep_done: if (build_options.gc) std.atomic.Value(u32) else void = if (build_options.gc) .init(0) else {},
+    gc_sweep_freed: if (build_options.gc) std.atomic.Value(u64) else void = if (build_options.gc) .init(0) else {},
+    gc_sweep_open: if (build_options.gc) std.atomic.Value(bool) else void = if (build_options.gc) .init(false) else {},
+    gc_sweep_count: if (build_options.gc) u32 else void = if (build_options.gc) 0 else {},
     // Free lists are PER-WORKER (`HeapLocal.gc_free_*`) so the allocation hot
     // path reuses without a lock — a single shared free list + mutex
     // serialized all allocation across workers and was the entire w>1 wall
@@ -1373,7 +1384,7 @@ pub const ObjectHeap = struct {
     /// lone worker fills each chunk fully before refilling. Release builds
     /// only; the detector build keeps the incremental bitmap (it asserts
     /// liveness on every read, between collections).
-    fn gcReconstructAllocBits(self: *ObjectHeap) void {
+    pub fn gcReconstructAllocBits(self: *ObjectHeap) void {
         const n = self.objects.count();
         const words = (@as(usize, n) + 63) >> 6;
         if (self.gc_alloc_bits.len < words) {
