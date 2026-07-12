@@ -45,6 +45,7 @@ pub const TokenType = enum(u8) {
     integer,
     float_val,
     path,
+    uri,
     search_path,
 
     // ---- keywords ----

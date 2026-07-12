@@ -12,6 +12,7 @@ pub const NodeTag = enum(u8) {
     float_val,
     string,
     path,
+    uri,
     search_path,
     identifier,
     bool_true,
@@ -285,6 +286,7 @@ fn nodeSourceSpan(tag: NodeTag, data: Node.Data) ?Node.Atom {
         .float_val,
         .string,
         .path,
+        .uri,
         .search_path,
         .identifier,
         .bool_true,
@@ -392,6 +394,7 @@ pub fn cloneNode(arena: *AstArena, node: *const Node) anyerror!*Node {
         .float_val,
         .string,
         .path,
+        .uri,
         .search_path,
         .identifier,
         .bool_true,
@@ -565,7 +568,7 @@ pub fn nodeMayEvaluateToFloat(node: *const Node) bool {
 pub fn offsetNode(node: *Node, offset: u32) void {
     if (node.span) |*span| span.offset += offset;
     switch (node.tag) {
-        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null, .elided => {
+        .integer, .float_val, .string, .path, .uri, .search_path, .identifier, .bool_true, .bool_false, .null, .elided => {
             node.data.atom.offset += offset;
         },
         .unary_op => offsetNode(node.data.unary.expr, offset),

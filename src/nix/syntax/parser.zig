@@ -663,6 +663,7 @@ pub const Parser = struct {
             .float_val => return self.atom(.float_val, rhs[0].tok),
             .string => return self.atom(.string, rhs[0].tok),
             .path => return self.atom(.path, rhs[0].tok),
+            .uri => return self.atom(.uri, rhs[0].tok),
             .search_path => return self.atom(.search_path, rhs[0].tok),
             // Real token atoms (not {0,0} placeholders): a zero offset would
             // poison every ancestor's combined span back to file offset 0 —

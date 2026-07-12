@@ -220,7 +220,7 @@ fn compileListElement(self: *Compiler, item: *const Node) !void {
     defer self.name_hint = null;
     const unwrapped = unwrapParens(item);
     switch (unwrapped.tag) {
-        .integer, .float_val, .bool_true, .bool_false, .null, .string, .path => {
+        .integer, .float_val, .bool_true, .bool_false, .null, .string, .path, .uri => {
             // Pure literals bind directly (interpolated string/path fall
             // through to a thunk, matching `ExprConcatStrings`).
             if (try compileImmediateContainerValue(self, unwrapped, .{})) return;
@@ -293,6 +293,7 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             if (pathHasInterpolation(self, unwrapped)) return false;
             try literals.compilePath(self, unwrapped);
         },
+        .uri => try literals.compileUri(self, unwrapped),
         .bool_true => try emit.emitOp(self, .push_true),
         .bool_false => try emit.emitOp(self, .push_false),
         .null => try emit.emitOp(self, .push_null),

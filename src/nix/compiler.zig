@@ -404,6 +404,7 @@ pub const Compiler = struct {
             .float_val => try literals.compileFloat(self, node),
             .string => try literals.compileString(self, node),
             .path => try literals.compilePath(self, node),
+            .uri => try literals.compileUri(self, node),
             .search_path => try literals.compileSearchPath(self, node),
             .identifier => try literals.compileIdent(self, node),
             .bool_true => try emit.emitOp(self, .push_true),

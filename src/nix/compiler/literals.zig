@@ -63,6 +63,13 @@ pub fn compileString(self: *Compiler, node: *const Node) !void {
     try compileStringAtom(self, node.data.atom);
 }
 
+/// An unquoted URI literal (`https://…`) is a plain string of its verbatim
+/// span — no escapes, no interpolation.
+pub fn compileUri(self: *Compiler, node: *const Node) !void {
+    const span = self.source[node.data.atom.offset .. node.data.atom.offset + node.data.atom.len];
+    try self.builder.emitConstant(self.allocator, Value.string(try self.intern.intern(span)));
+}
+
 /// Cap on operands accumulated for one `str_cat`. Keeps the
 /// operand count in the opcode's u16 and bounds transient VM stack
 /// growth for pathological many-part literals; when the cap is hit the

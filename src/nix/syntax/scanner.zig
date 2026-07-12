@@ -272,7 +272,26 @@ pub const Scanner = struct {
         }
         const len = self.pos - start;
         const tt = keywordType(self.source[start..][0..len]);
+        // Unquoted URI literal (deprecated Nix syntax): a plain identifier
+        // immediately followed by `:` and a URI-body char (no whitespace) is a
+        // scheme, and the whole `scheme:body` lexes as one string token. A
+        // lambda `x: e` has whitespace (or a non-URI char) after the `:`, so it
+        // is unaffected. Keywords are never schemes.
+        if (tt == .identifier and self.pos < self.source.len and self.source[self.pos] == ':' and
+            self.pos + 1 < self.source.len and isUriChar(self.source[self.pos + 1]))
+        {
+            self.pos += 1; // consume ':'
+            while (self.pos < self.source.len and isUriChar(self.source[self.pos])) self.pos += 1;
+            return self.makeToken(.uri, start, self.pos - start);
+        }
         return self.makeToken(tt, start, len);
+    }
+
+    fn isUriChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or switch (c) {
+            '%', '/', '?', ':', '@', '&', '=', '+', '$', ',', '-', '_', '.', '!', '~', '*', '\'' => true,
+            else => false,
+        };
     }
 
     fn lexNumber(self: *Scanner, start: u32) Token {

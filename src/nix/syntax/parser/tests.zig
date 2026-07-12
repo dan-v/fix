@@ -739,7 +739,7 @@ fn nodeEq(a: *const Node, b: *const Node) bool {
     if (a.tag != b.tag) return false;
     if (!optAtomEq(a.span, b.span)) return false;
     switch (a.tag) {
-        .integer, .float_val, .string, .path, .search_path, .identifier, .bool_true, .bool_false, .null, .elided => return atomEq(a.data.atom, b.data.atom),
+        .integer, .float_val, .string, .path, .uri, .search_path, .identifier, .bool_true, .bool_false, .null, .elided => return atomEq(a.data.atom, b.data.atom),
         .unary_op => return a.data.unary.op == b.data.unary.op and nodeEq(a.data.unary.expr, b.data.unary.expr),
         .binary_op => return a.data.binary.op == b.data.binary.op and
             nodeEq(a.data.binary.left, b.data.binary.left) and
