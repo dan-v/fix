@@ -427,17 +427,30 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     defer result.deinit(self.fetchers.allocator);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
     defer self.allocator.free(path);
-    return fetchedPathValue(self, path);
+    // `builtins.fetchurl` always yields a fixed-output store path carrying an
+    // opaque store-path reference in its string context, like Nix — so
+    // `getContext` sees `{ <storepath> = { path = true; }; }` and using the
+    // result as a `src` records it. (Unlike the tree fetchers, the flat path is
+    // cheap to compute even when store writes are off.)
+    return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-/// Realize a fetched single file: flat (`fixed:sha256`) ingestion — like Nix's
-/// fetchurl — when store writes are enabled, else the download-cache path.
-/// Returns the resulting path (owned by `self.allocator`).
+/// Realize a fetched single file to its flat (`fixed:sha256`) store path — like
+/// Nix's fetchurl. The path is always computed (it names the store object);
+/// the content is only written to a real store when store writes are enabled
+/// (`instantiateFlat` is itself gated). Returns the store path (owned by
+/// `self.allocator`).
 fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8, name: []const u8) ![]u8 {
-    if (!self.derivations.store_writes_enabled) return self.allocator.dupe(u8, cache_path);
     const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", "sha256", hash_hex);
     errdefer self.allocator.free(store_path);
-    try self.derivations.instantiateFlat(store_path, try self.files.readFile(cache_path));
+    if (self.derivations.store_writes_enabled) {
+        try self.derivations.instantiateFlat(store_path, try self.files.readFile(cache_path));
+    } else {
+        // Storeless eval: the store path names the object but isn't on disk.
+        // Seed the cache from the fetched bytes so `readFile`/`readFileType`
+        // on the result still work (Nix's store would have realized it).
+        try self.files.provideRegular(store_path, try self.files.readFile(cache_path));
+    }
     return store_path;
 }
 
