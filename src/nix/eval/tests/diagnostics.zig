@@ -27,7 +27,7 @@ test "evaluate exposes duplicate binding diagnostics" {
     try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
     try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
     try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
-    try std.testing.expectEqualStrings("duplicate let binding", diagnostics[0].message);
+    try std.testing.expectEqualStrings("variable 'x' already defined", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 11), diagnostics[0].offset);
     try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
     try std.testing.expectEqualStrings("first binding defined here", diagnostics[1].message);
