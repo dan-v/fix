@@ -313,6 +313,30 @@ fn writeChunkAt(
         }
     }
 
+    // Attr-name / attr-position side tables: the names and source positions the
+    // `attrs_new_named*` ops pull out of the code stream. Each op carries only a
+    // `names[start..]` / `positions[start..]` reference into these tables — the
+    // resolved contents live here, once, like the constant pool. Gated with the
+    // constants flag: they are compile-time data of the same family.
+    if (options.show_constants and chunk.attr_names.len > 0) {
+        try writeGuide(writer, cc, null, options.use_color);
+        try writer.writeAll("  attr names:\n");
+        for (chunk.attr_names, 0..) |nm, i| {
+            try writeTableRowHead(writer, cc, sec_attr_names_color, i, i == chunk.attr_names.len - 1, attrNameColor(i), options.use_color);
+            try writeStringRef(writer, "str", nm, symbols, table_snippet_max, options.use_color);
+            try writer.writeByte('\n');
+        }
+    }
+    if (options.show_constants and chunk.attr_pos.len > 0) {
+        try writeGuide(writer, cc, null, options.use_color);
+        try writer.writeAll("  attr positions:\n");
+        for (chunk.attr_pos, 0..) |rec, i| {
+            try writeTableRowHead(writer, cc, sec_attr_pos_color, i, i == chunk.attr_pos.len - 1, attrPosColor(i), options.use_color);
+            try writeAttrPosRow(writer, rec, symbols, options.use_color);
+            try writer.writeByte('\n');
+        }
+    }
+
     // Upvalue table: the best-effort binding name behind each upvalue slot
     // (mirrored by the `upvalue[N] name` comments in the body), with the
     // chunk's strictness flags folded in per slot. `#N` takes the slot's
@@ -628,6 +652,21 @@ const sec_upvalues_color: [3]u8 = .{ 0xb8, 0x5c, 0x74 };
 const sec_references_color: [3]u8 = .{ 0x5c, 0xb8, 0xa6 };
 const sec_incoming_color: [3]u8 = .{ 0xa6, 0x5c, 0xb8 };
 const sec_outgoing_color: [3]u8 = .{ 0x5c, 0x8a, 0xb8 };
+const sec_attr_names_color: [3]u8 = .{ 0x8a, 0xb8, 0x5c };
+const sec_attr_pos_color: [3]u8 = .{ 0xb8, 0x8a, 0x5c };
+
+/// Identity color for an `attr_names` side-table row: the same hue on the row
+/// `#i` and on the `names[i..]` reference that points at it, so a reference ties
+/// back to its section row (like a constant's `#N`). Own seed range.
+fn attrNameColor(i: anytype) [3]u8 {
+    return hueColor(@as(usize, @intCast(i)) + 13000);
+}
+
+/// Identity color for an `attr_pos` side-table row — like `attrNameColor`, its
+/// own seed so a `positions[i..]` reference links to its row.
+fn attrPosColor(i: anytype) [3]u8 {
+    return hueColor(@as(usize, @intCast(i)) + 17000);
+}
 
 /// Column (from the mnemonic's first character) where instruction-line `;`
 /// comments start. Field rows compute their pad from this too (minus their
@@ -1031,8 +1070,87 @@ fn buildHead(l: *Line, op: OpCode, chunk: *const Chunk, start: usize, symbols: S
             l.tint(c_a, "extra {s}", .{if (allow != 0) "allowed" else "rejected"});
             return 3;
         },
+        .attr_get_path_or, .attr_get_path_dyn_or, .attr_has_path => return buildAttrPathHead(l, code, start, false, symbols, seq),
+        .attr_get_path_or_w, .attr_get_path_dyn_or_w, .attr_has_path_w => return buildAttrPathHead(l, code, start, true, symbols, seq),
+        .attr_get_path_mix_or, .attr_has_path_mix => return buildMixPathHead(l, code, start, symbols, seq),
         else => return buildHeadGeneric(l, op, chunk, start, symbols, up_names, local_names, operand_text, end_ip, seq),
     }
+}
+
+/// A path segment's name group in the `; "a.b.c"` comment: `escSnippet` copies
+/// the source name into the line buffer, so its stack scratch need not outlive
+/// this call. `off` is the byte offset (from the opcode) of the segment's id
+/// run and `len` its width — pinning the name's color to those exact bytes so
+/// the id run in the hex column reads as the same color as the name it decodes.
+fn appendPathSegment(l: *Line, id: InternId, off: u16, len: u16, symbols: Symbols) void {
+    const c = internColor(id);
+    if (symbols.internName(id)) |name| {
+        var buf: [128]u8 = undefined;
+        l.groupPinned(off, len, c, "{s}", .{escSnippet(&buf, name, snippet_max)});
+    } else {
+        l.groupPinned(off, len, c, "0x{x}", .{id});
+    }
+}
+
+/// Single-line head for a static attribute path (`attr_get_path_or` &c.): the
+/// leading segment-count byte in its own hue, then the dotted path as the
+/// comment with EACH segment byte-linked to — and tinted to — its own id run,
+/// so every id run in the hex column maps by color to the name it resolves to
+/// (rather than the whole operand reading as one count-colored block).
+fn buildAttrPathHead(l: *Line, code: []const u8, start: usize, wide: bool, symbols: Symbols, seq: *usize) u16 {
+    const w: u16 = if (wide) 4 else 2;
+    const segments = code[start + 1];
+    const c_cnt = hueColor(seq.*);
+    seq.* += 1;
+    l.groupPinned(1, 1, c_cnt, "#{d}", .{segments});
+    l.comment();
+    l.glue("\"", .{});
+    var off: u16 = 2; // first segment id, as a byte offset from the opcode
+    var i: u8 = 0;
+    while (i < segments) : (i += 1) {
+        if (i > 0) l.glue(".", .{});
+        const id: InternId = @intCast(readWidth(if (wide) .b4 else .b2, code, start + off));
+        appendPathSegment(l, id, off, w, symbols);
+        off += w;
+    }
+    l.glue("\"", .{});
+    return off - 1; // count byte + segments * w
+}
+
+/// Single-line head for a mixed static/dynamic attribute path
+/// (`attr_get_path_mix_or` / `attr_has_path_mix`): segment count and dynamic
+/// count each get a hue, then the path renders in the comment with static
+/// segments byte-linked to their name and dynamic segments shown as `${…}`
+/// (their key comes from the stack), each tinted to its own byte run.
+fn buildMixPathHead(l: *Line, code: []const u8, start: usize, symbols: Symbols, seq: *usize) u16 {
+    const segments = code[start + 1];
+    const dyn = code[start + 2];
+    const c_cnt = hueColor(seq.*);
+    seq.* += 1;
+    const c_dyn = hueColor(seq.*);
+    seq.* += 1;
+    l.groupPinned(1, 1, c_cnt, "#{d}", .{segments});
+    l.glue(" ", .{});
+    l.groupPinned(2, 1, c_dyn, "#{d}", .{dyn});
+    l.comment();
+    l.glue("\"", .{});
+    var off: u16 = 3; // first segment tag, as a byte offset from the opcode
+    var i: u8 = 0;
+    while (i < segments) : (i += 1) {
+        if (i > 0) l.glue(".", .{});
+        if (code[start + off] == 0) { // static: tag byte + 4-byte id
+            const id: InternId = @intCast(readU32(code, start + off + 1));
+            appendPathSegment(l, id, off, 5, symbols); // whole tag+id run
+            off += 5;
+        } else { // dynamic: tag byte only, key popped from the stack
+            const c = hueColor(seq.*);
+            seq.* += 1;
+            l.groupPinned(off, 1, c, "${{…}}", .{});
+            off += 1;
+        }
+    }
+    l.glue("\"", .{});
+    return off - 1;
 }
 
 /// Whether a field's contents are drawn as multiline child rows (by
@@ -1361,9 +1479,12 @@ fn writeOperandTail(
             const count = readU16(code, off - 2);
             const names_start = readU32(code, off);
             const has_pos = op == .attrs_new_named_pos_srt;
+            // The resolved names/positions live in the chunk `attr names:` /
+            // `attr positions:` sections; the op carries only the reference into
+            // them. Tint the reference to its start row's identity color so it
+            // links back to the section (like a constant's `#N`).
             {
-                const c = hueColor(seq.*);
-                seq.* += 1;
+                const c = attrNameColor(names_start);
                 var l: Line = undefined;
                 l.reset();
                 l.groupPinned(0, 4, c, "#{d}", .{names_start});
@@ -1371,14 +1492,12 @@ fn writeOperandTail(
                 l.glue("names[", .{});
                 l.tint(c, "{d}..{d}", .{ names_start, names_start + count });
                 l.glue("]", .{});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], if (has_pos) 0 else 0b01, takeBg(stripe, env.use_color), env);
             }
-            var pos_slice: []const @import("runtime").heap.AttrPosEntry = &.{};
             if (has_pos) {
                 const pos_count = readU16(code, off);
                 const pos_start = readU32(code, off + 2);
-                const c = hueColor(seq.*);
-                seq.* += 1;
+                const c = attrPosColor(pos_start);
                 var l: Line = undefined;
                 l.reset();
                 l.group(0, 2, "#{d}", .{pos_count});
@@ -1388,37 +1507,7 @@ fn writeOperandTail(
                 l.glue("positions[", .{});
                 l.tint(c, "{d}..{d}", .{ pos_start, pos_start + pos_count });
                 l.glue("]", .{});
-                try emitLine(writer, code, &off, &l, seq, g[0..1], 0, takeBg(stripe, env.use_color), env);
-                if (pos_start + pos_count <= chunk.attr_pos.len) pos_slice = chunk.attr_pos[pos_start .. pos_start + pos_count];
-            }
-            const names = chunk.attr_names;
-            var k: usize = 0;
-            while (k < count) : (k += 1) {
-                if (names_start + k >= names.len) break;
-                const nm = names[names_start + k];
-                const c_nm = internColor(nm);
-                var esc: [128]u8 = undefined;
-                var ew: std.Io.Writer = .fixed(&esc);
-                if (symbols.internName(nm)) |s| writeEscapedSnippet(&ew, s, 24) catch {};
-                var l: Line = undefined;
-                l.reset();
-                l.storeRef("str", c_nm, "0x{x}", .{nm});
-                l.glue(" → ", .{});
-                l.tint(c_nm, "\"{s}\"", .{esc[0..ew.end]});
-                // Positions are name-sorted like the names — attach when present.
-                for (pos_slice) |rec| {
-                    if (rec.name != nm) continue;
-                    l.comment();
-                    l.glue("@ ", .{});
-                    if (symbols.internName(rec.pos.file)) |f| {
-                        l.tint(internColor(rec.pos.file), "{s}", .{std.fs.path.basename(f)});
-                    } else {
-                        l.storeRef("file", internColor(rec.pos.file), "0x{x}", .{rec.pos.file});
-                    }
-                    l.glue(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
-                    break;
-                }
-                try emitLine(writer, code, &off, &l, seq, g[0..1], if (k == count - 1) 0b01 else 0, takeBg(stripe, env.use_color), env);
+                try emitLine(writer, code, &off, &l, seq, g[0..1], 0b01, takeBg(stripe, env.use_color), env);
             }
         },
         .thunk_defer => {
@@ -1969,6 +2058,55 @@ fn writeStringRef(writer: *std.Io.Writer, kind: []const u8, id: InternId, symbol
         try writer.writeByte('"');
         if (use_color) try writer.writeAll("\x1b[0m");
     }
+}
+
+/// Set the foreground to `rgb` (no-op when not coloring).
+fn setFg(writer: *std.Io.Writer, rgb: [3]u8, use_color: bool) !void {
+    if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ rgb[0], rgb[1], rgb[2] });
+}
+
+/// One `attr positions:` row body: `"name" @ file:line:col`, the name and the
+/// filename each in their intern identity color, structural glue comment-grey.
+fn writeAttrPosRow(writer: *std.Io.Writer, rec: @import("runtime").heap.AttrPosEntry, symbols: Symbols, use_color: bool) !void {
+    if (symbols.internName(rec.name)) |s| {
+        try setFg(writer, internColor(rec.name), use_color);
+        try writer.writeByte('"');
+        try writeEscapedSnippet(writer, s, table_snippet_max);
+        try writer.writeByte('"');
+        if (use_color) try writer.writeAll("\x1b[0m");
+    } else {
+        try writeStoreRefText(writer, "str", rec.name, internColor(rec.name), use_color);
+    }
+    try setCommentFg(writer, use_color);
+    try writer.writeAll(" @ ");
+    if (symbols.internName(rec.pos.file)) |f| {
+        try setFg(writer, internColor(rec.pos.file), use_color);
+        try writer.writeAll(std.fs.path.basename(f));
+        if (use_color) try writer.writeAll("\x1b[0m");
+    } else {
+        try writeStoreRefText(writer, "file", rec.pos.file, internColor(rec.pos.file), use_color);
+    }
+    try setCommentFg(writer, use_color);
+    try writer.print(":{d}:{d}", .{ rec.pos.line, rec.pos.column });
+    if (use_color) try writer.writeAll("\x1b[0m");
+}
+
+/// The `│  └ #idx` prefix of one `name:` section-table row: chunk gutter, the
+/// section's tree guide (`└` on the last row, else `│`), then the row index in
+/// its identity color padded to the value column. The shared row opener for the
+/// attr-name/position tables.
+fn writeTableRowHead(writer: *std.Io.Writer, cc: [3]u8, sec_color: [3]u8, idx: usize, last: bool, idx_color: [3]u8, use_color: bool) !void {
+    try writeGuide(writer, cc, null, use_color);
+    try writer.writeAll("  ");
+    try writeTreeGuide(writer, sec_color, if (last) .corner else .vert, null, use_color);
+    var ibuf: [16]u8 = undefined;
+    const istr = std.fmt.bufPrint(&ibuf, "#{d}", .{idx}) catch "#?";
+    if (use_color) {
+        try writer.print("\x1b[38;2;{d};{d};{d}m{s}\x1b[0m", .{ idx_color[0], idx_color[1], idx_color[2], istr });
+    } else {
+        try writer.writeAll(istr);
+    }
+    try writer.splatByteAll(' ', 6 -| istr.len);
 }
 
 /// Escape a string for display, truncating in the MIDDLE (`head…tail`) when
