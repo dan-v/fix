@@ -72,6 +72,9 @@ pub const Scanner = struct {
     /// deprecated CR/CRLF line ending. Recorded for the compile chokepoint to
     /// gate on the `cr-line-endings` feature (see `Parser.first_cr_offset`).
     first_cr: ?u32 = null,
+    /// Offset+len of the first leading-dot float (`.5`) — the deprecated
+    /// `floating-without-zero` syntax, surfaced as a warning.
+    first_float_no_zero: ?struct { offset: u32, len: u32 } = null,
 
     pub fn init(source: []const u8) Scanner {
         return .{
@@ -99,7 +102,11 @@ pub const Scanner = struct {
         // Leading-dot float: `.5`, `.5e3` (Nix's `0?\.[0-9]+` form). Deprecated
         // in Lix but still valid; `.` followed by a digit is never a selector
         // here because a bare `.` cannot start a select.
-        if (c == '.' and isDigit(self.peek())) return self.lexFractionAndExponent(start);
+        if (c == '.' and isDigit(self.peek())) {
+            const tok = self.lexFractionAndExponent(start);
+            if (self.first_float_no_zero == null) self.first_float_no_zero = .{ .offset = tok.offset, .len = tok.len };
+            return tok;
+        }
 
         // Single-character tokens.
         switch (c) {

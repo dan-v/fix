@@ -314,6 +314,7 @@ test "parser recognizes contextual or attr names" {
     defer arena.deinit();
 
     var parser = Parser.init(std.testing.allocator, &arena, "{ or = 2; x.or = 3; }");
+    defer parser.deinit();
     const node = try parser.parse();
 
     try std.testing.expectEqual(NodeTag.attr_set, node.tag);

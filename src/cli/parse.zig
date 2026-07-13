@@ -90,6 +90,10 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         return 1;
     };
 
+    // Deprecation warnings: emit each recorded warning whose feature is not
+    // enabled (to stderr, semantically — not Nix's exact prose).
+    try emitWarnings(init, allocator, &parser, options, source, source_path);
+
     // 3. Emit the AST as JSON.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
@@ -112,6 +116,32 @@ fn loadSource(allocator: std.mem.Allocator, init: std.process.Init, source_arg: 
         },
         .flake => error.FlakeParseUnsupported,
     };
+}
+
+const DeprecationWarning = syntax.parser.DeprecationWarning;
+
+fn emitWarnings(init: std.process.Init, allocator: std.mem.Allocator, parser: *Parser, options: args.Options, source: []const u8, source_path: ?[]const u8) !void {
+    if (parser.warnings.items.len == 0) return;
+    var warns: std.ArrayListUnmanaged(Diagnostic) = .empty;
+    defer warns.deinit(allocator);
+    for (parser.warnings.items) |wn| {
+        // Silenced when its deprecated feature is enabled.
+        if (args.DeprecatedFeature.fromName(DeprecationWarning.feature(wn.kind))) |feat| {
+            if (options.deprecated_features.contains(feat)) continue;
+        }
+        warns.append(allocator, .{
+            .severity = .warning,
+            .line = syntax.diagnostic.lineForOffset(source, wn.offset),
+            .column = syntax.diagnostic.columnForOffset(source, wn.offset),
+            .offset = wn.offset,
+            .len = wn.len,
+            .token_type = null,
+            .message = DeprecationWarning.message(wn.kind),
+            .source = source,
+            .source_path = source_path,
+        }) catch break;
+    }
+    if (warns.items.len != 0) try writeDiagnostics(init, source, warns.items);
 }
 
 fn writeDiagnostics(init: std.process.Init, source: []const u8, diagnostics: []const Diagnostic) !void {

@@ -38,6 +38,36 @@ const DupTree = struct {
     };
 };
 
+/// A deprecated-syntax warning recorded during parsing. The parser is
+/// feature-agnostic (like `used_pipe_operators`): it records every occurrence,
+/// and the consumer (`fix parse`, the eval chokepoint) emits the ones whose
+/// deprecated feature is not enabled. `message`/`feature` are semantic, not
+/// byte-identical to Nix's prose.
+pub const DeprecationWarning = struct {
+    pub const Kind = enum {
+        or_as_identifier,
+        floating_without_zero,
+    };
+    kind: Kind,
+    offset: u32,
+    len: u32,
+
+    pub fn message(kind: Kind) []const u8 {
+        return switch (kind) {
+            .or_as_identifier => "using `or` as an identifier is deprecated; use --extra-deprecated-features or-as-identifier to silence this warning",
+            .floating_without_zero => "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
+        };
+    }
+
+    /// The deprecated-feature name that silences this warning.
+    pub fn feature(kind: Kind) []const u8 {
+        return switch (kind) {
+            .or_as_identifier => "or-as-identifier",
+            .floating_without_zero => "floating-without-zero",
+        };
+    }
+};
+
 /// Comptime-generated LALR tables (see `gen_parser_tables.zig`). Unit `pass`
 /// productions are eliminated during generation, so the driver never performs a
 /// do-nothing chain reduction — every reduce runs a real semantic action.
@@ -132,6 +162,9 @@ pub const Parser = struct {
     /// the scanner after driving. The compile chokepoint gates it on the
     /// `cr-line-endings` deprecated feature, like `used_pipe_operators`.
     first_cr_offset: ?u32 = null,
+    /// Deprecated-syntax warnings recorded during parsing (feature-agnostic);
+    /// the consumer emits the ones whose feature is disabled.
+    warnings: std.ArrayListUnmanaged(DeprecationWarning) = .empty,
     /// Body-span elision (lazy parsing): when enabled, a bind body inside a
     /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
     /// earlier clauses in the same brace, (b) spans at least
@@ -168,6 +201,11 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         self.diagnostics.deinit(self.allocator);
+        self.warnings.deinit(self.allocator);
+    }
+
+    fn noteWarning(self: *Parser, kind: DeprecationWarning.Kind, tok: Token) void {
+        self.warnings.append(self.allocator, .{ .kind = kind, .offset = tok.offset, .len = tok.len }) catch {};
     }
 
     pub fn span(self: *const Parser, tok: Token) []const u8 {
@@ -332,6 +370,9 @@ pub const Parser = struct {
         var scanner = Scanner.init(self.source);
         const root = try self.drive(&scanner);
         self.first_cr_offset = scanner.first_cr;
+        if (scanner.first_float_no_zero) |f| {
+            self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch {};
+        }
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
@@ -783,6 +824,7 @@ pub const Parser = struct {
 
             // ---- application of the bare `or` identifier (`f or` → `f (or)`) ----
             .apply_or => {
+                self.noteWarning(.or_as_identifier, rhs[1].tok);
                 const or_var = try self.atom(.identifier, rhs[1].tok);
                 return .{ .node = try self.arena.createNode(.apply, .{ .apply = .{
                     .func = rhs[0].node,
@@ -881,7 +923,12 @@ pub const Parser = struct {
                 try segs.push(a, rhs[2].seg);
                 return .{ .segs = segs };
             },
-            .attr_static => return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } },
+            .attr_static => {
+                // `or` used as an attribute name (`let or = 1;`, `x.or`) is the
+                // deprecated `or`-as-identifier syntax.
+                if (rhs[0].tok.type == .kw_or) self.noteWarning(.or_as_identifier, rhs[0].tok);
+                return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } };
+            },
             .attr_dynamic => return .{ .seg = .{ .dynamic = rhs[1].node } },
 
             // ---- brace / clauses (unified attrset-or-pattern body) ----

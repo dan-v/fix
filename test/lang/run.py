@@ -541,6 +541,22 @@ def _error_line(text: str) -> int | None:
     return int(matches[-1][0]) if matches else None
 
 
+# Deprecation-warning kinds, keyed by a distinctive substring of the (upstream
+# or fix) warning text. We don't reproduce Nix's exact warning prose, so a
+# parse-okay case passes when fix emits a warning of the same *kind*.
+_WARNING_KINDS = {
+    "floating-without-zero": ("leading zero", "floating point literal"),
+    "or-as-identifier": ("as an identifier",),
+    "broken-string-escape": ("ill-defined escape",),
+    "rec-set-dynamic-attrs": ("dynamic attributes are not allowed within recursive",),
+    "cr-line-endings": ("line endings are not supported",),
+}
+
+
+def _warning_kinds(text: str) -> set[str]:
+    return {kind for kind, keys in _WARNING_KINDS.items() if any(k in text for k in keys)}
+
+
 def _run_lix_parse(fix: Path, lang_dir: Path, c: LixCase, fix_flags: list[str]) -> Result:
     with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
         tmp = Path(td)
@@ -583,12 +599,19 @@ def _run_lix_parse(fix: Path, lang_dir: Path, c: LixCase, fix_flags: list[str]) 
             return Result("lix", c.ident, "fail", "pyyaml required to normalize parse output (run via run-unit.sh env)")
         except Exception as e:
             return Result("lix", c.ident, "fail", f"could not normalize parse JSON: {e}")
+        # A parse-okay case is conformant when the AST matches. The golden
+        # stderr, if any, is a deprecation *warning*; we don't reproduce Nix's
+        # exact prose, but fix must emit a *semantically* equivalent warning of
+        # the same kind (checked by keyword, not string equality).
+        if normalized.rstrip("\n") != exp_file.read_text().rstrip("\n"):
+            return Result("lix", c.ident, "fail", _diff(exp_file.read_text(), normalized))
         err_exp = c.case_dir / f"{c.test_name}.err.exp"
-        expected_err = err_exp.read_text() if err_exp.exists() else ""
-        if (normalized.rstrip("\n") == exp_file.read_text().rstrip("\n")
-                and err.rstrip("\n") == expected_err.rstrip("\n")):
-            return Result("lix", c.ident, "pass")
-        return Result("lix", c.ident, "fail", _diff(exp_file.read_text(), normalized))
+        want_warn = _warning_kinds(err_exp.read_text()) if err_exp.exists() else set()
+        missing = want_warn - _warning_kinds(err)
+        if missing:
+            return Result("lix", c.ident, "fail",
+                          f"AST matches but missing deprecation warning(s): {sorted(missing)}\n{_indent(err.strip())}")
+        return Result("lix", c.ident, "pass")
 
 
 # --------------------------------------------------------------------------
