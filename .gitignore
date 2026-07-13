@@ -5,6 +5,9 @@
 .zig-cache/
 zig-out/
 
+# Isolated implementation worktrees
+.worktrees/
+
 # Nix build symlinks
 result
 result-*
