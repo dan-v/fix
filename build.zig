@@ -406,6 +406,13 @@ pub fn build(b: *std.Build) void {
     run_lang.addFileArg(b.path("test/lang/run.sh"));
     run_lang.step.dependOn(b.getInstallStep());
     run_lang.has_side_effects = true;
+    // Capture both streams so the step does not inherit stdio: Zig only hands a
+    // child the std.Progress IPC pipe (ZIG_PROGRESS) when nothing is inherited
+    // (see std/Build/Step/Run.zig — `if (!disable_zig_progress and !inherit)`).
+    // The harness draws its live lix/snix tree over that pipe and writes its
+    // pass/fail report to stderr, which Zig surfaces if the step fails.
+    _ = run_lang.captureStdOut(.{});
+    _ = run_lang.captureStdErr(.{});
     if (b.args) |args| run_lang.addArgs(args);
     lang_step.dependOn(&run_lang.step);
 }

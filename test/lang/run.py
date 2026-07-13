@@ -1340,6 +1340,11 @@ _progress_tree = _ProgressTree(_zig_progress)
 
 
 def _progress(suite: str, i: int, total: int, n_pass: int, n_fail: int, n_block: int):
+    # Under `zig build`, the live tree over ZIG_PROGRESS is the progress display;
+    # skip the textual line so the captured stderr stays clean (it is only shown
+    # if the step fails).
+    if _zig_progress.enabled:
+        return
     msg = f"[{suite}] {i}/{total}  {n_pass} pass  {n_fail} fail  {n_block} blocked"
     if sys.stderr.isatty():
         sys.stderr.write("\r\033[K" + msg)
@@ -1395,7 +1400,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--suite", choices=["lix", "snix", "all"], default="all")
     ap.add_argument("--fix", default=str(REPO / "zig-out/bin/fix"), help="path to the fix binary")
-    ap.add_argument("-v", "--verbose", action="store_true", help="show diffs for failures")
+    # Failure diffs are always shown now; kept for backward compatibility.
+    ap.add_argument("-v", "--verbose", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     fix = Path(args.fix)
@@ -1411,20 +1417,26 @@ def main():
         blocked = [r for r in results if r.status == "blocked"]
         n_pass = sum(1 for r in results if r.status == "pass")
 
+        # The report goes to stderr: under `zig build` the live tree owns the
+        # display and stdout is discarded, but Zig surfaces captured stderr when
+        # the step fails — so the divergences stay diagnosable.
         head = Colors.bold(f"[{suite}]")
         print(f"{head} {Colors.green(str(n_pass) + ' pass')}, "
               f"{Colors.red(str(len(fails)) + ' fail')}, "
-              f"{Colors.blue(str(len(blocked)) + ' blocked')}")
+              f"{Colors.blue(str(len(blocked)) + ' blocked')}", file=sys.stderr)
 
         # Every divergence — the point of this suite is to show, honestly, where
         # fix does not yet match the reference evaluator.
         for r in sorted(fails, key=lambda r: r.ident):
-            print(f"  {Colors.red('FAIL')} {r.ident}")
-            if args.verbose and r.detail:
-                print(_indent(r.detail, "      "))
+            print(f"  {Colors.red('FAIL')} {r.ident}", file=sys.stderr)
+            # Always show the divergence detail (diff / error) for a failure —
+            # this report is only printed when something failed, so the diff is
+            # the point.
+            if r.detail:
+                print(_indent(r.detail, "      "), file=sys.stderr)
         # BLOCKED is always listed with its reason (it is not a pass).
         for r in sorted(blocked, key=lambda r: r.ident):
-            print(f"  {Colors.blue('BLOCKED')} {r.ident} {Colors.dim('(' + r.detail + ')')}")
+            print(f"  {Colors.blue('BLOCKED')} {r.ident} {Colors.dim('(' + r.detail + ')')}", file=sys.stderr)
 
         total_fail += len(fails)
 
