@@ -10,7 +10,9 @@ const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
 const clone = @import("clone.zig");
 const stable = @import("base").sync;
-const rstore = @import("runtime").store;
+const runtime = @import("runtime");
+const rstore = runtime.store;
+const FileCache = runtime.file_cache.FileCache;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -100,6 +102,13 @@ pub const DerivationStore = struct {
     /// caller (the `fix store` CLI and tests, which have no fiber to park).
     offload: ?Offload = null,
 
+    /// Store-owned IFD recipes, keyed by full store path. Separate from the
+    /// derivation/debug registry so unrelated eval hot paths add no recipe
+    /// locking or payload refcount traffic.
+    recipes: std.StringHashMapUnmanaged(*Recipe) = .empty,
+    realization_claims: std.StringHashMapUnmanaged(*RealizationClaim) = .empty,
+    recipe_mu: stable.BlockingMutex = .{},
+
     /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
     /// on the IO thread and blocks the calling fiber until it returns.
     pub const Offload = struct {
@@ -120,11 +129,115 @@ pub const DerivationStore = struct {
         }
     };
 
+    const Recipe = struct {
+        payload: Payload,
+
+        const TextPayload = struct {
+            bytes: []u8,
+            references: [][]u8,
+        };
+
+        const Payload = union(enum) {
+            text: TextPayload,
+            nar: []u8,
+            flat: FileCache.ImmutableBytes,
+        };
+
+        fn deinit(self: *Recipe, allocator: std.mem.Allocator) void {
+            switch (self.payload) {
+                .text => |text| {
+                    allocator.free(text.bytes);
+                    for (text.references) |reference| allocator.free(reference);
+                    allocator.free(text.references);
+                },
+                .nar => |nar_bytes| allocator.free(nar_bytes),
+                .flat => |*bytes| bytes.release(),
+            }
+            allocator.destroy(self);
+        }
+
+        fn textMatches(self: *const Recipe, text: []const u8, refs: []const []const u8) bool {
+            const existing = switch (self.payload) {
+                .text => |payload| payload,
+                else => return false,
+            };
+            if (!std.mem.eql(u8, existing.bytes, text) or existing.references.len != refs.len) return false;
+            for (existing.references, refs) |left, right| {
+                if (!std.mem.eql(u8, left, right)) return false;
+            }
+            return true;
+        }
+
+        fn narMatches(self: *const Recipe, nar_bytes: []const u8) bool {
+            return switch (self.payload) {
+                .nar => |existing| std.mem.eql(u8, existing, nar_bytes),
+                else => false,
+            };
+        }
+
+        fn flatMatches(self: *const Recipe, handle: FileCache.ImmutableBytes) bool {
+            return switch (self.payload) {
+                .flat => |existing| std.mem.eql(u8, existing.bytes(), handle.bytes()),
+                else => false,
+            };
+        }
+
+        fn references(self: *const Recipe) []const []const u8 {
+            return switch (self.payload) {
+                .text => |text| text.references,
+                else => &.{},
+            };
+        }
+    };
+
+    const RealizationClaim = struct {
+        mu: stable.BlockingMutex = .{},
+        seq: std.atomic.Value(u32) = .init(0),
+        refs: std.atomic.Value(usize) = .init(1),
+        state: State = .writing,
+        err: ?anyerror = null,
+
+        const State = enum {
+            writing,
+            success,
+            retry,
+            permanent_failure,
+        };
+
+        fn retain(self: *RealizationClaim) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+
+        fn release(self: *RealizationClaim, allocator: std.mem.Allocator) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            allocator.destroy(self);
+        }
+
+        fn publish(self: *RealizationClaim, state: State, err: ?anyerror) void {
+            self.mu.lock();
+            self.state = state;
+            self.err = err;
+            self.mu.unlock();
+            _ = self.seq.fetchAdd(1, .release);
+            stable.Futex.wake(&self.seq, std.math.maxInt(u32));
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator) DerivationStore {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DerivationStore) void {
+        self.releaseRecipePayloads();
+        self.recipes.deinit(self.allocator);
+        self.recipe_mu.lock();
+        var claims = self.realization_claims.iterator();
+        while (claims.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.release(self.allocator);
+        }
+        self.realization_claims.deinit(self.allocator);
+        self.recipe_mu.unlock();
         self.clearDebugRecords();
         self.debug_records.deinit(self.allocator);
         var it = self.records.iterator();
@@ -181,12 +294,16 @@ pub const DerivationStore = struct {
         return self.store_writes_enabled or self.ifd_writes.load(.seq_cst) != 0;
     }
 
+    /// TEMPORARY Task-4 bridge for the legacy producer-driven IFD path.
+    /// Task 5 removes these in favor of explicit recipe registration.
     /// Enter an import-from-derivation realize scope: `.drv`/source writes are
     /// permitted until the matching `endIfdWrites`. Balanced by the caller.
     pub fn beginIfdWrites(self: *DerivationStore) void {
         _ = self.ifd_writes.fetchAdd(1, .seq_cst);
     }
 
+    /// TEMPORARY Task-4 bridge for the legacy producer-driven IFD path.
+    /// Task 5 removes these in favor of explicit recipe registration.
     pub fn endIfdWrites(self: *DerivationStore) void {
         _ = self.ifd_writes.fetchSub(1, .seq_cst);
     }
@@ -257,6 +374,10 @@ pub const DerivationStore = struct {
     /// writes so the calling fiber parks rather than blocking on the socket.
     pub fn pathIsValid(self: *DerivationStore, store_path: []const u8) !bool {
         if (!self.writesActive()) return false;
+        return self.queryPathValid(store_path);
+    }
+
+    fn queryPathValid(self: *DerivationStore, store_path: []const u8) !bool {
         if (self.offload) |off| {
             var cell: QueryCell = .{ .store = self, .store_path = store_path };
             off.run(off.ctx, QueryCell.run, &cell);
@@ -391,6 +512,248 @@ pub const DerivationStore = struct {
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
         try self.instantiated.put(self.allocator, key, {});
+    }
+
+    pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+
+        if (self.recipes.get(store_path)) |recipe| {
+            defer self.allocator.free(text);
+            if (recipe.textMatches(text, references)) return;
+            return error.RecipeConflict;
+        }
+
+        errdefer self.allocator.free(text);
+        const recipe = try self.allocator.create(Recipe);
+        errdefer self.allocator.destroy(recipe);
+        const owned_refs = try cloneOwnedStrings(self.allocator, references);
+        errdefer freeOwnedStrings(self.allocator, owned_refs);
+        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } } };
+
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        try self.recipes.put(self.allocator, key, recipe);
+    }
+
+    pub fn recordOwnedNarRecipe(self: *DerivationStore, store_path: []const u8, nar_bytes: []u8) !void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+
+        if (self.recipes.get(store_path)) |recipe| {
+            defer self.allocator.free(nar_bytes);
+            if (recipe.narMatches(nar_bytes)) return;
+            return error.RecipeConflict;
+        }
+
+        errdefer self.allocator.free(nar_bytes);
+        const recipe = try self.allocator.create(Recipe);
+        errdefer self.allocator.destroy(recipe);
+        recipe.* = .{ .payload = .{ .nar = nar_bytes } };
+
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        try self.recipes.put(self.allocator, key, recipe);
+    }
+
+    pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes) !void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+
+        var retained = handle.retain();
+        errdefer retained.release();
+
+        if (self.recipes.get(store_path)) |recipe| {
+            retained.release();
+            if (recipe.flatMatches(handle)) return;
+            return error.RecipeConflict;
+        }
+
+        const recipe = try self.allocator.create(Recipe);
+        errdefer self.allocator.destroy(recipe);
+        recipe.* = .{ .payload = .{ .flat = retained } };
+
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        try self.recipes.put(self.allocator, key, recipe);
+    }
+
+    pub fn releaseRecipePayloads(self: *DerivationStore) void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        var it = self.recipes.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit(self.allocator);
+        }
+        self.recipes.clearRetainingCapacity();
+    }
+
+    pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
+        while (true) {
+            if (try self.queryPathValid(store_path)) return;
+
+            const claim_result = try self.claimMissingPath(store_path);
+            const claim = claim_result.claim;
+            defer claim.release(self.allocator);
+
+            if (!claim_result.writer) {
+                switch (self.waitForClaim(claim)) {
+                    .success => return,
+                    .retry => continue,
+                    .permanent_failure => return claim.err.?,
+                    .writing => unreachable,
+                }
+            }
+
+            self.ensureClosureWriter(store_path) catch |err| {
+                if (retryableRealizationError(err)) {
+                    self.finishRetryableClaim(store_path, claim, err);
+                } else {
+                    claim.publish(.permanent_failure, err);
+                }
+                return err;
+            };
+            self.finishSuccessfulClaim(store_path, claim);
+            return;
+        }
+    }
+
+    pub fn realizeOutput(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
+        try self.ensureClosure(drv_path);
+        const derived = try self.derivedPathString(drv_path, outputs);
+        defer self.allocator.free(derived);
+        try self.realizePaths(&.{derived}, .normal);
+    }
+
+    fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8) anyerror!void {
+        const recipe = blk: {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            break :blk self.recipes.get(store_path) orelse return error.MissingStoreRecipe;
+        };
+
+        for (recipe.references()) |reference| try self.ensureClosure(reference);
+        switch (recipe.payload) {
+            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
+            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
+            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
+        }
+        self.releaseRecipeForPath(store_path);
+    }
+
+    fn claimMissingPath(self: *DerivationStore, store_path: []const u8) !struct { claim: *RealizationClaim, writer: bool } {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+
+        if (self.realization_claims.get(store_path)) |claim| {
+            claim.retain();
+            return .{ .claim = claim, .writer = false };
+        }
+
+        const claim = try self.allocator.create(RealizationClaim);
+        errdefer self.allocator.destroy(claim);
+        claim.* = .{};
+        claim.retain();
+        errdefer claim.release(self.allocator);
+
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        try self.realization_claims.put(self.allocator, key, claim);
+        return .{ .claim = claim, .writer = true };
+    }
+
+    fn waitForClaim(self: *DerivationStore, claim: *RealizationClaim) RealizationClaim.State {
+        _ = self;
+        while (true) {
+            claim.mu.lock();
+            const state = claim.state;
+            if (state != .writing) {
+                claim.mu.unlock();
+                return state;
+            }
+            const seq = claim.seq.load(.acquire);
+            claim.mu.unlock();
+            stable.Futex.wait(&claim.seq, seq);
+        }
+    }
+
+    fn finishSuccessfulClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
+        self.removeClaim(store_path, claim);
+        claim.publish(.success, null);
+    }
+
+    fn finishRetryableClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim, err: anyerror) void {
+        self.removeClaim(store_path, claim);
+        claim.publish(.retry, err);
+    }
+
+    fn removeClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        const removed = self.realization_claims.fetchRemove(store_path) orelse return;
+        std.debug.assert(removed.value == claim);
+        self.allocator.free(removed.key);
+        claim.release(self.allocator);
+    }
+
+    fn releaseRecipeForPath(self: *DerivationStore, store_path: []const u8) void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        const removed = self.recipes.fetchRemove(store_path) orelse return;
+        self.allocator.free(removed.key);
+        removed.value.deinit(self.allocator);
+    }
+
+    fn derivedPathString(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) ![]u8 {
+        var rendered: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer rendered.deinit(self.allocator);
+        try rendered.appendSlice(self.allocator, drv_path);
+        try rendered.append(self.allocator, '^');
+        if (outputs.len == 0) {
+            try rendered.append(self.allocator, '*');
+        } else {
+            for (outputs, 0..) |output, index| {
+                if (index != 0) try rendered.append(self.allocator, ',');
+                try rendered.appendSlice(self.allocator, output);
+            }
+        }
+        return rendered.toOwnedSlice(self.allocator);
+    }
+
+    fn cloneOwnedStrings(allocator: std.mem.Allocator, strings: []const []const u8) ![][]u8 {
+        const result = try allocator.alloc([]u8, strings.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |string| allocator.free(string);
+            allocator.free(result);
+        }
+        while (initialized < result.len) : (initialized += 1) {
+            result[initialized] = try allocator.dupe(u8, strings[initialized]);
+        }
+        return result;
+    }
+
+    fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
+        for (strings) |string| allocator.free(string);
+        allocator.free(strings);
+    }
+
+    fn retryableRealizationError(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory,
+            error.FileNotFound,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.BrokenPipe,
+            error.SystemResources,
+            error.WouldBlock,
+            error.TemporaryNameServerFailure,
+            error.NetworkSubsystemFailed,
+            error.Unexpected,
+            => true,
+            else => false,
+        };
     }
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.
