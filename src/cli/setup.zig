@@ -128,9 +128,27 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
 fn applyDaemonSettings(ev: *Evaluator, options: args.Options, settings: *nix_conf.Settings) !void {
     var overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty;
     defer overrides.deinit(ev.allocator);
+    // Owned `extra-<key>` names for keys with no explicit base; freed after the
+    // (duping) setDaemonBuildSettings call below.
+    var extra_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (extra_names.items) |n| ev.allocator.free(n);
+        extra_names.deinit(ev.allocator);
+    }
     var it = settings.map.iterator();
-    while (it.next()) |e|
-        try overrides.append(ev.allocator, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        // A key set only via `extra-<key>` (no explicit base) must forward as
+        // `extra-<key>` so the daemon *appends* to its own default rather than
+        // replacing it — otherwise fix, lacking Nix's compiled-in defaults (e.g.
+        // `sandbox-paths`'s `/bin/sh=<busybox>`), would strip them.
+        const name = if (settings.hasBase(key)) key else blk: {
+            const prefixed = try std.fmt.allocPrint(ev.allocator, "extra-{s}", .{key});
+            try extra_names.append(ev.allocator, prefixed);
+            break :blk prefixed;
+        };
+        try overrides.append(ev.allocator, .{ .name = name, .value = e.value_ptr.* });
+    }
 
     // setDaemonBuildSettings dupes the overrides into owned storage, so this
     // borrowed slice need only live across the call.

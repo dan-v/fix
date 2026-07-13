@@ -53,6 +53,13 @@ pub const Settings = struct {
     allocator: std.mem.Allocator,
     /// Owned keys and values. Last-wins across sources.
     map: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Keys assigned directly (non-`extra-`) at least once. Such a key carries an
+    /// explicit base value the daemon should adopt wholesale, so it forwards as
+    /// `<key>`; a key seen only via `extra-<key>` has no base and forwards as
+    /// `extra-<key>` — an append onto the daemon's own (possibly compiled-in)
+    /// default rather than a replacement (see `hasBase`, used by `set_options`
+    /// forwarding). Separate from `map` so `get`/`getUint` are unaffected.
+    bases: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn deinit(self: *Settings) void {
         var it = self.map.iterator();
@@ -61,6 +68,14 @@ pub const Settings = struct {
             self.allocator.free(e.value_ptr.*);
         }
         self.map.deinit(self.allocator);
+        var bit = self.bases.keyIterator();
+        while (bit.next()) |k| self.allocator.free(k.*);
+        self.bases.deinit(self.allocator);
+    }
+
+    /// Whether `key` was ever set by a direct (non-`extra-`) assignment.
+    pub fn hasBase(self: *const Settings, key: []const u8) bool {
+        return self.bases.contains(key);
     }
 
     pub fn get(self: *const Settings, key: []const u8) ?[]const u8 {
@@ -92,6 +107,8 @@ pub const Settings = struct {
             try self.append(name["extra-".len..], value);
         } else {
             try self.put(name, value);
+            const gop = try self.bases.getOrPut(self.allocator, name);
+            if (!gop.found_existing) gop.key_ptr.* = try self.allocator.dupe(u8, name);
         }
     }
 
@@ -274,4 +291,23 @@ test "nix.conf extra-<name> appends (as in Nix)" {
     try testing.expectEqualStrings("flakes", s.get("experimental-features").?);
     try s.setOrAppend("access-tokens", "only=x"); // non-extra replaces
     try testing.expectEqualStrings("only=x", s.get("access-tokens").?);
+}
+
+test "nix.conf tracks explicit base vs extra-only for daemon forwarding" {
+    const testing = std.testing;
+    var s: Settings = .{ .allocator = testing.allocator };
+    defer s.deinit();
+    try s.mergeLines(
+        \\sandbox = true
+        \\extra-sandbox-paths = /run/binfmt
+    );
+    // `sandbox` was set directly -> has a base -> forwards as `sandbox`.
+    try testing.expect(s.hasBase("sandbox"));
+    // `sandbox-paths` only ever came from `extra-sandbox-paths` -> no base ->
+    // forwards as `extra-sandbox-paths` (append onto the daemon's own default).
+    try testing.expect(!s.hasBase("sandbox-paths"));
+    try testing.expectEqualStrings("/run/binfmt", s.get("sandbox-paths").?);
+    // A later direct assignment establishes a base (replaces from then on).
+    try s.setOrAppend("sandbox-paths", "/only");
+    try testing.expect(s.hasBase("sandbox-paths"));
 }
