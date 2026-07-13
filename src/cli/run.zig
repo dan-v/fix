@@ -143,6 +143,9 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
             // and the setBasePathToFileDir below hasn't repointed it yet), so
             // resolve `path` against it to get the file's absolute path.
             const abs = try std.fs.path.resolve(ev.allocator, &.{ ev.base_path orelse ".", path });
+            // Roll back `abs` if the base-path repoint below fails; otherwise it
+            // would leak (the Source that would own it is never constructed).
+            errdefer ev.allocator.free(abs);
             // Resolve the file's relative path literals (`./x`, `import ./y`)
             // against the file's directory, like Nix — not the process cwd.
             try ev.setBasePathToFileDir(path);
@@ -150,6 +153,11 @@ pub fn getSource(ev: *Evaluator, source: SourceArg, options: args.Options) !Sour
         },
         .flake => |installable| .{ .text = try lowerFlakeInstallable(ev, installable), .owned = true },
     };
+
+    // If selector wrapping fails, `base` (owned flake text and/or file
+    // `abs_path`) would otherwise leak. This only fires on the error path; the
+    // success paths below hand `base` off or free it explicitly.
+    errdefer base.deinit(ev.allocator);
 
     // Apply `-A`/`--arg`/`--argstr`. When they wrap the text, the wrapper
     // prefix shifts every byte offset, so the file path no longer describes
