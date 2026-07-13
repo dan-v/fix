@@ -178,6 +178,71 @@ pub const FakeDaemon = struct {
         return result;
     }
 
+    pub fn effectCount(self: *FakeDaemon) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var result: usize = 0;
+        for (self.operations.items) |operation| {
+            if (operation.kind != .query) result += 1;
+        }
+        return result;
+    }
+
+    pub fn effectKindAt(self: *FakeDaemon, index: usize) ?Kind {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var seen: usize = 0;
+        for (self.operations.items) |operation| {
+            if (operation.kind == .query) continue;
+            if (seen == index) return operation.kind;
+            seen += 1;
+        }
+        return null;
+    }
+
+    pub fn effectSubjectEquals(self: *FakeDaemon, index: usize, expected: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var seen: usize = 0;
+        for (self.operations.items) |operation| {
+            if (operation.kind == .query) continue;
+            if (seen == index) return std.mem.eql(u8, operation.subject, expected);
+            seen += 1;
+        }
+        return false;
+    }
+
+    pub fn effectPayloadEquals(self: *FakeDaemon, index: usize, expected: []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var seen: usize = 0;
+        for (self.operations.items) |operation| {
+            if (operation.kind == .query) continue;
+            if (seen == index) return std.mem.eql(u8, operation.payload, expected);
+            seen += 1;
+        }
+        return false;
+    }
+
+    pub fn effectReferencesEqual(self: *FakeDaemon, index: usize, expected: []const []const u8) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var seen: usize = 0;
+        for (self.operations.items) |operation| {
+            if (operation.kind == .query) continue;
+            if (seen != index) {
+                seen += 1;
+                continue;
+            }
+            if (operation.references.len != expected.len) return false;
+            for (operation.references, expected) |left, right| {
+                if (!std.mem.eql(u8, left, right)) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
     pub fn kindAt(self: *FakeDaemon, index: usize) ?Kind {
         self.mu.lock();
         defer self.mu.unlock();
