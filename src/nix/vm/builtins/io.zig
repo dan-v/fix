@@ -240,7 +240,7 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
     // than any real search-path entry (mirrors `search_path.Paths.findFile`);
     // `builtins.fetchurl` and the corepkgs feature rely on it.
     if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
-        return Value.path(try self.intern.intern("/fetchurl.nix"));
+        return Value.path(try self.intern.intern("/__corepkgs__/fetchurl.nix"));
     }
 
     const path_id = try self.intern.intern("path");
