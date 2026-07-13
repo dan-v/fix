@@ -490,6 +490,9 @@ pub const Evaluator = struct {
     /// to the next token with no whitespace (`0a`, `1.a`, `"x"2`) is accepted;
     /// default false (compile error, matching Lix).
     allow_tokens_no_whitespace: bool = false,
+    /// `nix-path-shadow` deprecated feature: allow shadowing `<nix/...>` or a
+    /// reserved `nix=` search-path prefix; default false (error, matching Lix).
+    allow_nix_path_shadow: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -1464,6 +1467,7 @@ pub const Evaluator = struct {
         vm.max_call_depth = self.max_call_depth;
         vm.coerce_integers_enabled = self.coerce_integers_enabled;
         vm.allow_floor_ceil_corrupt = self.allow_floor_ceil_corrupt;
+        vm.allow_nix_path_shadow = self.allow_nix_path_shadow;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Attach the debugger only when the CLI installed a UI: every VM (main

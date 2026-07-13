@@ -93,6 +93,7 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     ev.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
     ev.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
     ev.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
+    ev.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
     // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
     if (settings.getUint("max-call-depth")) |n|
         ev.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));

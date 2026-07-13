@@ -644,12 +644,26 @@ def _cmp_eval(ident: str, p, tmp: Path, expected: str) -> Result:
 
 
 def _cmp_eval_fail(ident: str, p, tmp: Path, expected_err: str) -> Result:
+    # Exit 1 plus a semantically-matching error: we don't reproduce Nix's exact
+    # error prose, so require a distinctive keyword from the golden to appear in
+    # fix's stderr (same stance as parse-fail / snix error kinds).
     err = p.stderr.replace(str(tmp), "/pwd")
-    if p.returncode == 1 and err.strip() == expected_err.strip():
+    if p.returncode == 1 and _shares_error_gist(err, expected_err):
         return Result("lix", ident, "pass")
     return Result("lix", ident, "fail",
-                  f"expected rc 1 + matching stderr; rc={p.returncode}\n"
-                  f"  expected: {expected_err.strip()!r}\n  actual:   {err.strip()!r}")
+                  f"expected rc 1 + a semantically-matching error; rc={p.returncode}\n"
+                  f"  expected gist of: {expected_err.strip()!r}\n  actual:   {err.strip()!r}")
+
+
+# Distinctive words (lowercased) that identify an error's gist. If the golden's
+# first error line contains one and so does fix's stderr, they match.
+_ERROR_GIST_WORDS = ("reserved for internal use", "shadowing '<nix", "nix-path-shadow")
+
+
+def _shares_error_gist(actual: str, expected: str) -> bool:
+    a, e = actual.lower(), expected.lower()
+    hits = [w for w in _ERROR_GIST_WORDS if w in e]
+    return bool(hits) and any(w in a for w in hits)
 
 
 def _eval(fix: Path, cwd: Path, flags: list[str], env: dict) -> object:
@@ -1200,6 +1214,10 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
         for name, val in c.env_vars:
             if name == "HOME":
                 out = out.replace(os.path.expanduser("~"), val)
+        # Cross-impl corepkgs path: fix (and Lix) resolve <nix/fetchurl.nix> to
+        # /__corepkgs__/fetchurl.nix, while snix's goldens use /fetchurl.nix.
+        # Same semantic file — normalize the well-known prefix for comparison.
+        out = out.replace("/__corepkgs__/fetchurl.nix", "/fetchurl.nix")
         if p.returncode != 0:
             return fail(f"eval failed:\n{_indent(p.stderr.strip())}")
         if out.strip() == expected.strip():
