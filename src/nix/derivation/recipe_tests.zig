@@ -1,4 +1,5 @@
 const std = @import("std");
+const stable = @import("base").sync;
 const DerivationStore = @import("store.zig").DerivationStore;
 const FileCache = @import("runtime").file_cache.FileCache;
 const FakeDaemon = @import("test_daemon.zig").FakeDaemon;
@@ -444,12 +445,43 @@ const ConcurrentDemand = struct {
 const ConcurrentPathDemand = struct {
     store: *DerivationStore,
     path: []const u8,
-    start: *std.atomic.Value(u8),
     result: anyerror!void = {},
 
     fn run(self: *ConcurrentPathDemand) void {
-        while (self.start.load(.acquire) == 0) std.atomic.spinLoopHint();
         self.result = self.store.ensureClosure(self.path);
+    }
+};
+
+const RootClaimBarrier = struct {
+    observed: std.atomic.Value(u32) = .init(0),
+    released: std.atomic.Value(u32) = .init(0),
+
+    const both_claimed: u32 = 0b11;
+
+    fn hook(ctx: *anyopaque, store_path: []const u8) void {
+        const self: *RootClaimBarrier = @ptrCast(@alignCast(ctx));
+        const bit: u32 = if (std.mem.eql(u8, store_path, root_path))
+            0b01
+        else if (std.mem.eql(u8, store_path, dep_text_path))
+            0b10
+        else
+            unreachable;
+        _ = self.observed.fetchOr(bit, .acq_rel);
+        stable.Futex.wake(&self.observed, std.math.maxInt(u32));
+        while (self.released.load(.acquire) == 0) stable.Futex.wait(&self.released, 0);
+    }
+
+    fn waitForBoth(self: *RootClaimBarrier) u32 {
+        while (true) {
+            const current = self.observed.load(.acquire);
+            if (current == both_claimed) return current;
+            stable.Futex.wait(&self.observed, current);
+        }
+    }
+
+    fn releaseBoth(self: *RootClaimBarrier) void {
+        self.released.store(1, .release);
+        stable.Futex.wake(&self.released, std.math.maxInt(u32));
     }
 };
 
@@ -463,16 +495,19 @@ test "concurrent cross-root cyclic demands return RecipeCycle without deadlock" 
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "cross cycle a"), &.{dep_text_path});
         try store.recordOwnedTextRecipe(dep_text_path, try owned(std.testing.allocator, "cross cycle b"), &.{root_path});
 
-        var start: std.atomic.Value(u8) = .init(0);
+        var barrier: RootClaimBarrier = .{};
+        store.setRootClaimHookForTest(.{ .ctx = &barrier, .observe = RootClaimBarrier.hook });
+        defer store.setRootClaimHookForTest(null);
         var demands = [_]ConcurrentPathDemand{
-            .{ .store = &store, .path = root_path, .start = &start },
-            .{ .store = &store, .path = dep_text_path, .start = &start },
+            .{ .store = &store, .path = root_path },
+            .{ .store = &store, .path = dep_text_path },
         };
         var threads: [demands.len]std.Thread = undefined;
         for (&demands, &threads) |*demand, *thread| {
             thread.* = try std.Thread.spawn(.{}, ConcurrentPathDemand.run, .{demand});
         }
-        start.store(1, .release);
+        try std.testing.expectEqual(RootClaimBarrier.both_claimed, barrier.waitForBoth());
+        barrier.releaseBoth();
         for (threads) |thread| thread.join();
         for (&demands) |*demand| try std.testing.expectError(error.RecipeCycle, demand.result);
         try std.testing.expectEqual(@as(usize, 0), fake.materializationCount());

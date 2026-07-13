@@ -5,6 +5,7 @@
 //! and a separate `lazy_drv_mu` spinlock guards the lazy value cache.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_record_mod = @import("debug_record.zig");
 const drv_mod = @import("drv.zig");
 const types = @import("types.zig");
@@ -108,6 +109,9 @@ pub const DerivationStore = struct {
     recipes: std.StringHashMapUnmanaged(*Recipe) = .empty,
     realization_claims: std.StringHashMapUnmanaged(*RealizationClaim) = .empty,
     recipe_mu: stable.BlockingMutex = .{},
+    /// Test-only deterministic scheduling hook. This field is zero-bit `void`
+    /// and all access is compiled out of production builds.
+    test_root_claim_hook: if (builtin.is_test) ?RootClaimHook else void = if (builtin.is_test) null else {},
 
     /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
     /// on the IO thread and blocks the calling fiber until it returns.
@@ -115,6 +119,17 @@ pub const DerivationStore = struct {
         ctx: *anyopaque,
         run: *const fn (ctx: *anyopaque, work: *const fn (*anyopaque) void, work_ctx: *anyopaque) void,
     };
+
+    pub const RootClaimHook = struct {
+        ctx: *anyopaque,
+        observe: *const fn (ctx: *anyopaque, store_path: []const u8) void,
+    };
+
+    pub fn setRootClaimHookForTest(self: *DerivationStore, hook: ?RootClaimHook) void {
+        if (comptime builtin.is_test) {
+            self.test_root_claim_hook = hook;
+        } else unreachable;
+    }
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
 
@@ -610,6 +625,12 @@ pub const DerivationStore = struct {
             const claim_result = try self.claimMissingPath(store_path);
             const claim = claim_result.claim;
             defer claim.release(self.allocator);
+
+            if (comptime builtin.is_test) {
+                if (claim_result.writer and parent == null) {
+                    if (self.test_root_claim_hook) |hook| hook.observe(hook.ctx, store_path);
+                }
+            }
 
             if (!claim_result.writer) {
                 const wait_source: ?*RealizationClaim = if (parent) |visit| blk: {
