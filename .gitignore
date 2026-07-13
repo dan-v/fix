@@ -23,3 +23,7 @@ perf.data*
 *.perfetto.json
 .claude/
 zig-out-*/
+
+# Python bytecode cache (test/lang conformance harness)
+__pycache__/
+*.pyc
