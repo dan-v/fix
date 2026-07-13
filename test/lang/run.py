@@ -548,7 +548,7 @@ _WARNING_KINDS = {
     "floating-without-zero": ("leading zero", "floating point literal"),
     "or-as-identifier": ("as an identifier",),
     "broken-string-escape": ("ill-defined escape",),
-    "rec-set-dynamic-attrs": ("dynamic attributes are not allowed within recursive",),
+    "rec-set-dynamic-attrs": ("dynamic attribute",),
     "cr-line-endings": ("line endings are not supported",),
 }
 

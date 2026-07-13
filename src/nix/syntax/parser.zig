@@ -47,6 +47,7 @@ pub const DeprecationWarning = struct {
     pub const Kind = enum {
         or_as_identifier,
         floating_without_zero,
+        rec_set_dynamic_attrs,
     };
     kind: Kind,
     offset: u32,
@@ -56,6 +57,7 @@ pub const DeprecationWarning = struct {
         return switch (kind) {
             .or_as_identifier => "using `or` as an identifier is deprecated; use --extra-deprecated-features or-as-identifier to silence this warning",
             .floating_without_zero => "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
+            .rec_set_dynamic_attrs => "dynamic attributes in a recursive set are deprecated; use --extra-deprecated-features rec-set-dynamic-attrs to silence this warning",
         };
     }
 
@@ -64,6 +66,7 @@ pub const DeprecationWarning = struct {
         return switch (kind) {
             .or_as_identifier => "or-as-identifier",
             .floating_without_zero => "floating-without-zero",
+            .rec_set_dynamic_attrs => "rec-set-dynamic-attrs",
         };
     }
 };
@@ -205,7 +208,11 @@ pub const Parser = struct {
     }
 
     fn noteWarning(self: *Parser, kind: DeprecationWarning.Kind, tok: Token) void {
-        self.warnings.append(self.allocator, .{ .kind = kind, .offset = tok.offset, .len = tok.len }) catch {};
+        self.noteWarningAt(kind, tok.offset, tok.len);
+    }
+
+    fn noteWarningAt(self: *Parser, kind: DeprecationWarning.Kind, offset: u32, len: u32) void {
+        self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len }) catch {};
     }
 
     pub fn span(self: *const Parser, tok: Token) []const u8 {
@@ -873,6 +880,13 @@ pub const Parser = struct {
             .rec_attr_set => {
                 var entries = rhs[2].entries;
                 try self.checkDuplicateAttrs(entries.items, false);
+                // A dynamic attribute (`${e} = …`) in a recursive set is
+                // deprecated — it is evaluated outside the recursive scope.
+                for (entries.items) |entry| {
+                    if (entry.dynamic_name) |dyn| {
+                        if (dyn.span) |s| self.noteWarningAt(.rec_set_dynamic_attrs, s.offset, s.len);
+                    }
+                }
                 return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
