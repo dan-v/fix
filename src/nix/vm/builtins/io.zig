@@ -18,7 +18,15 @@ const stringTextInternId = strings.stringTextInternId;
 const isPlainString = strings.isPlainString;
 
 pub fn builtinPathExists(self: anytype, arg: Value) !Value {
-    return Value.boolVal(try self.files.pathExists(try demandPathArg(self, arg)));
+    const path = try demandPathArg(self, arg);
+    if (!try self.files.pathExists(path)) return Value.boolVal(false);
+    // A trailing `/` or `/.` requires the target to be a directory (Nix): the
+    // path model canonicalizes those away, so check the resolved type (a final
+    // symlink is followed here, so `<symlink-to-dir>/.` counts as a directory).
+    if (std.mem.endsWith(u8, path, "/") or std.mem.endsWith(u8, path, "/.")) {
+        return Value.boolVal(try self.files.isDirectoryFollowing(path));
+    }
+    return Value.boolVal(true);
 }
 
 pub fn builtinReadFile(self: anytype, arg: Value) !Value {
@@ -237,11 +245,11 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
     const name = try pathArg(self, name_arg);
 
     // `<nix/fetchurl.nix>` resolves to fix's synthetic corepkgs file rather
-    // than any real search-path entry (mirrors `search_path.Paths.findFile`);
-    // `builtins.fetchurl` and the corepkgs feature rely on it.
-    if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
-        return Value.path(try self.intern.intern("/fetchurl.nix"));
-    }
+    // than any real search-path entry. Lix additionally deprecates shadowing
+    // it: a reserved `nix=` prefix, or a prefixless entry that supplies
+    // `nix/fetchurl.nix`, is an error unless `nix-path-shadow` is enabled (in
+    // which case a matching prefixless entry wins over the corepkgs default).
+    const is_corepkgs = std.mem.eql(u8, name, "nix/fetchurl.nix");
 
     const path_id = try self.intern.intern("path");
     const prefix_id = try self.intern.intern("prefix");
@@ -268,11 +276,33 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
         if (!isPlainString(prefix_forced)) return error.TypeError;
         const prefix = self.intern.get(try stringTextInternId(self, prefix_forced));
 
+        if (is_corepkgs) {
+            if (std.mem.eql(u8, prefix, "nix")) {
+                if (!self.allow_nix_path_shadow) {
+                    try vm_trace.setErrorMessage(self, "the prefix 'nix' is reserved for internal use in the Nix search path; use --extra-deprecated-features nix-path-shadow to silence this error");
+                    return error.NixPathShadow;
+                }
+                continue; // feature on: ignore the reserved entry, corepkgs wins
+            }
+            if (prefix.len == 0) {
+                if (try findFileCandidate(self, base, "", name)) |candidate| {
+                    defer self.allocator.free(candidate);
+                    if (!self.allow_nix_path_shadow) {
+                        try vm_trace.setErrorMessage(self, "shadowing '<nix/...>' by configuring the nix-path is deprecated; use --extra-deprecated-features nix-path-shadow to silence this error");
+                        return error.NixPathShadow;
+                    }
+                    return Value.path(try self.intern.intern(candidate));
+                }
+            }
+            continue; // only reserved-prefix / prefixless entries affect corepkgs
+        }
+
         if (try findFileCandidate(self, base, prefix, name)) |candidate| {
             defer self.allocator.free(candidate);
             return Value.path(try self.intern.intern(candidate));
         }
     }
+    if (is_corepkgs) return Value.path(try self.intern.intern("/__corepkgs__/fetchurl.nix"));
     return error.FileNotFound;
 }
 

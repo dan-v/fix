@@ -375,6 +375,7 @@ pub const VM = struct {
     /// `floor-ceil-corrupt-integers` deprecated feature — `floor`/`ceil` of a
     /// precision-losing integer returns the corrupted value instead of erroring.
     allow_floor_ceil_corrupt: bool = false,
+    allow_nix_path_shadow: bool = false,
 
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`

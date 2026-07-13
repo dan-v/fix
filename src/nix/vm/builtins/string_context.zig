@@ -135,8 +135,17 @@ pub fn allOutputsContextValue(self: anytype) !Value {
 }
 
 pub fn contextStringWithPath(self: anytype, text_id: InternId) !Value {
+    return contextStringTextWithPath(self, text_id, text_id);
+}
+
+/// Like `contextStringWithPath`, but the string text (`text_id`) may differ
+/// from the store path recorded in its context (`path_id`). A plain-eval fetch
+/// uses this: its text is a readable download-cache path while its context
+/// references the real fixed-output store path (so `builtins.getContext`
+/// matches Nix even though there is no store to materialize the path).
+pub fn contextStringTextWithPath(self: anytype, text_id: InternId, path_id: InternId) !Value {
     const entries = [_]heap_mod.AttrEntry{
-        .{ .name = text_id, .value = try pathContextValue(self) },
+        .{ .name = path_id, .value = try pathContextValue(self) },
     };
     return Value.contextString(try self.heap.addContextString(text_id, &entries));
 }

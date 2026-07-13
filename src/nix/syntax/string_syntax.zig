@@ -251,7 +251,9 @@ fn appendDoubleText(
     parts: *std.ArrayListUnmanaged(Part),
 ) !void {
     if (raw.len == 0) return;
-    if (std.mem.indexOfScalar(u8, raw, '\\') == null) {
+    // A run with neither an escape nor a raw CR needs no decoding — keep the
+    // zero-copy source slice.
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null and std.mem.indexOfScalar(u8, raw, '\r') == null) {
         try parts.append(allocator, .{ .text = .{ .bytes = raw, .owned = false } });
         return;
     }
@@ -261,6 +263,13 @@ fn appendDoubleText(
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
         if (raw[i] != '\\' or i + 1 >= raw.len) {
+            // Normalize a raw CR/CRLF line ending to LF, as Nix does (a `\r`
+            // escape is decoded below and stays a CR character).
+            if (raw[i] == '\r') {
+                try out.append(allocator, '\n');
+                if (i + 1 < raw.len and raw[i + 1] == '\n') i += 1; // CRLF -> LF
+                continue;
+            }
             try out.append(allocator, raw[i]);
             continue;
         }

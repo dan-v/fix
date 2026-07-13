@@ -269,7 +269,7 @@ pub fn scopedImportDirectory(ev: anytype, scope: Value, path: []const u8, parent
 /// Synthetic source for `<nix/fetchurl.nix>`, hard-coded so the
 /// evaluator doesn't need a corepkgs store path on disk.
 pub fn corepkgsSource(path: []const u8) ?[]const u8 {
-    if (!std.mem.eql(u8, path, "/fetchurl.nix")) return null;
+    if (!std.mem.eql(u8, path, "/__corepkgs__/fetchurl.nix")) return null;
     return
     \\{
     \\  system ? "", # obsolete

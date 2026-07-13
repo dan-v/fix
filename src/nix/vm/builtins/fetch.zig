@@ -576,9 +576,15 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
                 &payload.digest,
             );
             defer ingested.deinit(self.allocator);
-            return fetchedPathValue(self, ingested.store_path);
+            return contextStringWithPath(self, try self.intern.intern(ingested.store_path));
         }
-        return fetchedPathValue(self, result.path);
+        // Plain eval: the value text is the readable download-cache path, but
+        // its context references the real recursive fixed-output store path, so
+        // `builtins.getContext` matches Nix without a store to materialize it.
+        const nar_hex = std.fmt.bytesToHex(payload.digest, .lower);
+        const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, tree_name, &nar_hex);
+        defer self.allocator.free(store_path);
+        return string_context.contextStringTextWithPath(self, try self.intern.intern(result.path), try self.intern.intern(store_path));
     }
 
     // The unpacked tree is named "source" by default (Nix), independent of the

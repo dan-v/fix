@@ -75,6 +75,10 @@ pub const Scanner = struct {
     /// Offset+len of the first leading-dot float (`.5`) — the deprecated
     /// `floating-without-zero` syntax, surfaced as a warning.
     first_float_no_zero: ?struct { offset: u32, len: u32 } = null,
+    /// Offset of the first place a value token (number/string/path) is followed
+    /// with no whitespace by a char that starts another token (`0a`, `1.a`,
+    /// `"x"2`) — Lix's deprecated `tokens-no-whitespace`. Gated at the chokepoint.
+    first_tokens_no_ws: ?u32 = null,
 
     pub fn init(source: []const u8) Scanner {
         return .{
@@ -84,6 +88,28 @@ pub const Scanner = struct {
     }
 
     pub fn next(self: *Scanner) Token {
+        const tok = self.nextRaw();
+        // tokens-no-whitespace: a value token (number/string/path) immediately
+        // followed — no intervening whitespace — by a char that would start
+        // another token is Lix's deprecated adjacency. `self.pos` sits right
+        // after the token here (the next `nextRaw` skips layout).
+        if (self.first_tokens_no_ws == null and self.pos < self.source.len) {
+            const nc = self.source[self.pos];
+            const stuck = switch (tok.type) {
+                // A number stuck to an identifier, a `.` (select/leading-dot
+                // float), or a string opener: `0a`, `1.a`, `0.0.0`, `0."`.
+                .integer, .float_val => isAlpha(nc) or nc == '_' or nc == '.' or nc == '"' or nc == '\'',
+                // A string/path stuck to a following number (`"1"2`). A `.`
+                // after a string is an ordinary select and is NOT flagged.
+                .string, .path, .uri => isDigit(nc),
+                else => false,
+            };
+            if (stuck) self.first_tokens_no_ws = self.pos;
+        }
+        return tok;
+    }
+
+    fn nextRaw(self: *Scanner) Token {
         self.skipLayout();
 
         if (self.pos >= self.source.len) {
@@ -319,8 +345,18 @@ pub const Scanner = struct {
             self.pos += 1;
         }
         if (self.pos < self.source.len and self.source[self.pos] == '.') {
-            self.pos += 1;
-            return self.lexFractionAndExponent(start);
+            // A `digits.` is a float only per Nix's grammar: `[1-9][0-9]*\.[0-9]*`
+            // (int part starts 1-9, empty fraction allowed) or `0?\.[0-9]+` (a
+            // single leading `0` needs a fractional digit). Otherwise the `.` is
+            // a separate token — `0.`, `00.`, `00012.3` lex as int + `.`/float.
+            const int_len = self.pos - start;
+            const first = self.source[start];
+            const frac_digit = self.pos + 1 < self.source.len and isDigit(self.source[self.pos + 1]);
+            const is_float = (first >= '1' and first <= '9') or (int_len == 1 and first == '0' and frac_digit);
+            if (is_float) {
+                self.pos += 1;
+                return self.lexFractionAndExponent(start);
+            }
         }
         return self.makeToken(.integer, start, self.pos - start);
     }
@@ -407,6 +443,7 @@ pub const Scanner = struct {
     fn isPathContinue(c: u8) bool {
         return hasClass(c, C_PATH_CONT);
     }
+
 
     fn isSearchPathStart(c: u8) bool {
         return hasClass(c, C_IDENT_START) or c == '.' or c == '-';

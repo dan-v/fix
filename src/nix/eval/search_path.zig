@@ -95,7 +95,7 @@ pub const Paths = struct {
         name: []const u8,
     ) !Value {
         if (std.mem.eql(u8, name, "nix/fetchurl.nix")) {
-            return Value.path(try intern.intern("/fetchurl.nix"));
+            return Value.path(try intern.intern("/__corepkgs__/fetchurl.nix"));
         }
 
         for (self.entries) |entry| {

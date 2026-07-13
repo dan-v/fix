@@ -486,6 +486,13 @@ pub const Evaluator = struct {
     /// `cr-line-endings` deprecated feature: when true, CR/CRLF line endings are
     /// accepted; default false (compile error, matching Lix).
     allow_cr_line_endings: bool = false,
+    /// `tokens-no-whitespace` deprecated feature: when true, a value token stuck
+    /// to the next token with no whitespace (`0a`, `1.a`, `"x"2`) is accepted;
+    /// default false (compile error, matching Lix).
+    allow_tokens_no_whitespace: bool = false,
+    /// `nix-path-shadow` deprecated feature: allow shadowing `<nix/...>` or a
+    /// reserved `nix=` search-path prefix; default false (error, matching Lix).
+    allow_nix_path_shadow: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -1010,6 +1017,25 @@ pub const Evaluator = struct {
             }
         }
 
+        // Lix deprecated `tokens-no-whitespace`: a value token stuck to the next
+        // token without whitespace is rejected by default. The tokenization
+        // still succeeds, so enabling the feature Just Works.
+        if (parser.first_tokens_no_ws_offset) |off| {
+            if (!self.allow_tokens_no_whitespace) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, off),
+                    .column = diagnostic.columnForOffset(source, off),
+                    .offset = off,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "whitespace between tokens is required here. Use --extra-deprecated-features tokens-no-whitespace to disable this error.",
+                }}, source, source_path);
+                return error.TokensNoWhitespaceDisabled;
+            }
+        }
+
         // Per-compilation-unit scratch arena: all of the compiler's
         // transient structures (builder buffers, locals/captures, strictness
         // and name-resolution maps, diagnostics) allocate here and are freed
@@ -1441,6 +1467,7 @@ pub const Evaluator = struct {
         vm.max_call_depth = self.max_call_depth;
         vm.coerce_integers_enabled = self.coerce_integers_enabled;
         vm.allow_floor_ceil_corrupt = self.allow_floor_ceil_corrupt;
+        vm.allow_nix_path_shadow = self.allow_nix_path_shadow;
         vm.deferred_table = &self.deferred_table;
         vm.regexes = &self.regexes;
         // Attach the debugger only when the CLI installed a UI: every VM (main

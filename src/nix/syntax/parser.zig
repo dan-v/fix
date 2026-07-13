@@ -48,6 +48,7 @@ pub const DeprecationWarning = struct {
         or_as_identifier,
         floating_without_zero,
         rec_set_dynamic_attrs,
+        cr_line_endings,
     };
     kind: Kind,
     offset: u32,
@@ -58,15 +59,19 @@ pub const DeprecationWarning = struct {
             .or_as_identifier => "using `or` as an identifier is deprecated; use --extra-deprecated-features or-as-identifier to silence this warning",
             .floating_without_zero => "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
             .rec_set_dynamic_attrs => "dynamic attributes in a recursive set are deprecated; use --extra-deprecated-features rec-set-dynamic-attrs to silence this warning",
+            .cr_line_endings => "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported; normalize the file to LF",
         };
     }
 
-    /// The deprecated-feature name that silences this warning.
+    /// The deprecated-feature name that silences this warning. `cr_line_endings`
+    /// is inverted (the feature *enables* the syntax, downgrading the error to a
+    /// warning), so it is emitted directly rather than through the shared gate.
     pub fn feature(kind: Kind) []const u8 {
         return switch (kind) {
             .or_as_identifier => "or-as-identifier",
             .floating_without_zero => "floating-without-zero",
             .rec_set_dynamic_attrs => "rec-set-dynamic-attrs",
+            .cr_line_endings => "cr-line-endings",
         };
     }
 };
@@ -168,6 +173,9 @@ pub const Parser = struct {
     /// Deprecated-syntax warnings recorded during parsing (feature-agnostic);
     /// the consumer emits the ones whose feature is disabled.
     warnings: std.ArrayListUnmanaged(DeprecationWarning) = .empty,
+    /// Offset of the first `tokens-no-whitespace` adjacency (a value token
+    /// stuck to the next token), or null. Gated at the compile chokepoint.
+    first_tokens_no_ws_offset: ?u32 = null,
     /// Body-span elision (lazy parsing): when enabled, a bind body inside a
     /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
     /// earlier clauses in the same brace, (b) spans at least
@@ -377,6 +385,7 @@ pub const Parser = struct {
         var scanner = Scanner.init(self.source);
         const root = try self.drive(&scanner);
         self.first_cr_offset = scanner.first_cr;
+        self.first_tokens_no_ws_offset = scanner.first_tokens_no_ws;
         if (scanner.first_float_no_zero) |f| {
             self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch {};
         }
