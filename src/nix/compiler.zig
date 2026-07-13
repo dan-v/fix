@@ -152,6 +152,14 @@ pub const Compiler = struct {
     /// Whether `name_hint` is synthetic (λ/tag) rather than a real binding name
     /// — selects the `·` joiner and lets real names take precedence.
     name_hint_synthetic: bool = false,
+    /// Whether `name_hint` names a genuinely RECURSIVE binding — i.e. one whose
+    /// RHS can see it by name and resolve to itself. Only `let` bindings
+    /// qualify (Nix `let` is recursive, and an inner `let` shadows any outer
+    /// binding of the same name). Attr-set attrs do NOT: a same-named reference
+    /// in `{ overrides = self: super: (overrides …) …; }` resolves to an OUTER
+    /// `overrides`, not the attr. The strictness self-recursion fixpoint keys
+    /// off this so it never mistakes such a shadowing reference for a self-call.
+    name_hint_recursive: bool = false,
     /// Always-on qualified-name node for the chunk this compiler emits (see
     /// `bytecode/name_tree.zig`). Threaded down the compiler chain: a named
     /// child extends it, an anonymous child inherits it. Unlike the `·`/`.`
@@ -242,6 +250,7 @@ pub const Compiler = struct {
             child.name_id = self.registry.childName(self.name_id, seg, self.name_hint_synthetic) catch self.name_id;
             self.name_hint = null;
             self.name_hint_synthetic = false;
+            self.name_hint_recursive = false;
         }
         return child;
     }
@@ -257,6 +266,16 @@ pub const Compiler = struct {
         // disasm-only. See `initChild`.
         self.name_hint = name_id;
         self.name_hint_synthetic = false;
+        self.name_hint_recursive = false;
+    }
+
+    /// Like `armName`, but flags the binding as genuinely recursive (a `let`
+    /// binding — see `name_hint_recursive`). Used by `let` compilation so the
+    /// strictness self-recursion fixpoint may key off the lambda's own name.
+    pub fn armRecursiveName(self: *Compiler, name_id: InternId) void {
+        self.name_hint = name_id;
+        self.name_hint_synthetic = false;
+        self.name_hint_recursive = true;
     }
 
     /// Arm a *synthetic* name (e.g. `λpkgs` for an unbound lambda, `(apply)`

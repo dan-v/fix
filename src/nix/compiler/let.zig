@@ -115,7 +115,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
         switch (kind) {
             .literal => {
                 const leaf = singleLeafBinding(self, let_in.bindings, binding.path[0]).?;
-                self.armName(name_id);
+                self.armRecursiveName(name_id);
                 try access.compileContainerValue(self, leaf.expr, .{});
                 try emit.emitSetLocal(self, slot);
             },
@@ -139,7 +139,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
             first_demanded != null and binding_name_ids[index] == first_demanded.?)
         {
             if (eligibleEagerLeaf(self, let_in.bindings, binding.path[0], &earliest_index, index)) |leaf| {
-                self.armName(binding_name_ids[index]);
+                self.armRecursiveName(binding_name_ids[index]);
                 try self.compileNode(leaf.expr);
                 self.name_hint = null; // don't leak a nameless RHS onto the body
                 try emit.emitSetLocal(self, slot);
@@ -147,7 +147,7 @@ fn compileLetInBody(self: *Compiler, node: *const Node, tail_body: bool) anyerro
             }
         }
 
-        self.armName(binding_name_ids[index]);
+        self.armRecursiveName(binding_name_ids[index]);
         try compileLetRootBinding(self, let_in.bindings, binding.path[0], slot, eager_flags[index]);
         switch (kind) {
             .needs_cell => try emit.emitSetCellLocal(self, slot),

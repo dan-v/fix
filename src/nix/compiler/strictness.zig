@@ -123,6 +123,16 @@ const Analyzer = struct {
     intern: *InternTable,
     source: []const u8,
     bound_stack: std.ArrayListUnmanaged(BoundFrame),
+    /// Self-recursion fixpoint context — null/empty unless `strictParamsMask`
+    /// is analyzing a named recursive function. `self_name` is its binding
+    /// name; `self_params[i]` the name of param `i`; `self_strict` the current
+    /// hypothesis of which params it forces. A saturated direct call to
+    /// `self_name` then credits the argument in each hypothesized-strict
+    /// position (see `trySelfCall`). Off (`self_name == null`) for every other
+    /// caller, so their analysis is unchanged.
+    self_name: ?InternId = null,
+    self_params: []const InternId = &.{},
+    self_strict: u8 = 0,
 
     fn deinit(self: *Analyzer) void {
         for (self.bound_stack.items) |*frame| {
@@ -138,6 +148,50 @@ const Analyzer = struct {
             if (self.bound_stack.items[i].name == name_id) return i;
         }
         return null;
+    }
+
+    /// If `node` is a SATURATED direct call to the self-recursive function
+    /// `self_name` — the flattened call head is that (unshadowed) free name and
+    /// the argument count equals the arity — fold the callee plus each
+    /// hypothesized-strict argument into `out` and return true. Otherwise
+    /// return false so the caller applies the default "callee only" rule.
+    /// Under-approximates by construction: an argument is analyzed only where
+    /// `self_strict` marks that position, so nothing outside the (converging)
+    /// hypothesis is credited.
+    fn trySelfCall(self: *Analyzer, node: *const Node, self_name: InternId, out: *Strictness) !bool {
+        // Flatten `f a0 a1 …` (right-nested `apply{apply{f, a0}, a1}`) into the
+        // call head plus args; `args_rev[0]` is the outermost (last) argument.
+        var args_rev: [types.MAX_UNCURRY_ARITY]*const Node = undefined;
+        var n_args: usize = 0;
+        var cur: *const Node = node;
+        while (cur.tag == .apply) {
+            if (n_args >= args_rev.len) return false; // over-applied → conservative
+            args_rev[n_args] = cur.data.apply.arg;
+            n_args += 1;
+            cur = ast.unwrapParens(cur.data.apply.func);
+        }
+        if (cur.tag != .identifier) return false;
+        const head_id = try self.identifierNameId(cur);
+        if (head_id != self_name) return false;
+        // A `let`/`with` binding shadowing the name makes this a different value.
+        if (self.findBound(head_id) != null) return false;
+        // Only a saturated call has a known argument for every param position.
+        if (n_args != self.self_params.len) return false;
+
+        // The callee is forced to WHNF to be applied — mirror the free-name rule.
+        try out.shallow.put(self.allocator, head_id, {});
+        try out.deep.put(self.allocator, head_id, {});
+        try out.shallow_must.put(self.allocator, head_id, {});
+        // Credit each argument the recursion forces. `args_rev[0]` is the last
+        // arg, so its param index counts down from `n_args - 1`.
+        var k: usize = 0;
+        while (k < n_args) : (k += 1) {
+            const param_index = n_args - 1 - k;
+            if (self.self_strict & (@as(u8, 1) << @as(u3, @intCast(param_index))) != 0) {
+                try self.analyzeInto(args_rev[k], out);
+            }
+        }
+        return true;
     }
 
     fn identifierNameId(self: *Analyzer, node: *const Node) !InternId {
@@ -225,7 +279,17 @@ const Analyzer = struct {
                 }
             },
 
-            .apply => try self.analyzeInto(node.data.apply.func, out),
+            .apply => {
+                // A saturated direct call to the self-recursive function forces
+                // its callee plus each hypothesized-strict argument (the
+                // fixpoint seam — see `trySelfCall`). Every other application
+                // forces only the callee; argument strictness across an
+                // unknown callee is not modeled (sound: it stays lazy).
+                if (self.self_name) |sname| {
+                    if (try self.trySelfCall(node, sname, out)) return;
+                }
+                try self.analyzeInto(node.data.apply.func, out);
+            },
 
             .let_in => {
                 const let = node.data.let_in;
@@ -594,6 +658,73 @@ pub fn bodyMustForceName(
     return strict.shallow_must.contains(name_id);
 }
 
+/// Must-force parameter bitmask (bit i = param i) for a function body — the
+/// `strict_params` the saturated-call path evaluates eagerly instead of
+/// thunking. When `self_name` is the function's own recursive binding name, a
+/// bounded greatest fixpoint additionally credits arguments passed in a
+/// hypothesized-strict position of a saturated direct self-call, so a
+/// tail-recursive accumulator (`go = acc: i: … go (acc + …) (i - 1)`) is proven
+/// strict in its accumulator and passed eagerly — no lazy `+`-thunk chain, so
+/// it evaluates in constant space instead of building an O(depth) chain that a
+/// later force must walk.
+///
+/// Sound (Mycroft greatest fixpoint): the hypothesis starts with every param
+/// assumed strict and shrinks monotonically to a fixpoint (≤ `arity` steps) — a
+/// param survives only where the converged hypothesis shows the body forces it
+/// on every path (the `if`-intersection rule still gates each branch). A
+/// non-saturated / shadowed / non-self call credits nothing extra. With no
+/// `self_name` (or a param that shadows it) this is exactly the old per-param
+/// `bodyMustForceName`.
+pub fn strictParamsMask(
+    allocator: std.mem.Allocator,
+    intern: *InternTable,
+    source: []const u8,
+    body: *const Node,
+    param_ids: []const InternId,
+    self_name: ?InternId,
+) !u8 {
+    std.debug.assert(param_ids.len <= 8);
+    // A param that shadows the self name rebinds it inside the body, so a
+    // reference there is the parameter, not the recursion — drop self-detection.
+    var sname = self_name;
+    if (sname) |s| {
+        for (param_ids) |p| {
+            if (p == s) {
+                sname = null;
+                break;
+            }
+        }
+    }
+
+    const all: u8 = if (param_ids.len >= 8) 0xFF else (@as(u8, 1) << @as(u3, @intCast(param_ids.len))) - 1;
+    var hyp: u8 = all;
+    var guard: usize = 0;
+    while (true) : (guard += 1) {
+        var an: Analyzer = .{
+            .allocator = allocator,
+            .intern = intern,
+            .source = source,
+            .bound_stack = .empty,
+            .self_name = sname,
+            .self_params = param_ids,
+            .self_strict = hyp,
+        };
+        defer an.deinit();
+        var strict = try an.analyze(body);
+        defer strict.deinit(allocator);
+
+        var mask: u8 = 0;
+        for (param_ids, 0..) |p, i| {
+            if (strict.shallow_must.contains(p)) mask |= @as(u8, 1) << @as(u3, @intCast(i));
+        }
+        // No self name → the hypothesis is irrelevant, one pass is the answer.
+        // Otherwise iterate to the fixpoint (monotone decreasing, so `guard`
+        // only backstops the ≤ arity convergence).
+        if (sname == null or mask == hyp or guard >= param_ids.len) return mask;
+        hyp = mask;
+    }
+}
+
 /// The first free identifier forced when reducing `body` to WHNF, in
 /// evaluation order — or null when the first thing forced is not a bare name
 /// (a nested computation, a literal/structure that forces nothing, or a
@@ -931,4 +1062,52 @@ test "bodyMustForceName is false when the name is shadowed by a nested lambda" {
 
     const forces = try bodyMustForceName(allocator, &intern, source, body, x_id);
     try std.testing.expect(!forces);
+}
+
+test "strictParamsMask: self-recursion proves a let accumulator strict" {
+    const allocator = std.testing.allocator;
+    const source = "let go = acc: i: if i == 0 then acc else go (acc + i) (i - 1); in go";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    // `go`'s RHS is `acc: (i: BODY)`; unwrap both value lambdas to the body.
+    const lam_acc = parsed.bindings()[0].expr;
+    const lam_i = ast.unwrapParens(lam_acc.data.lambda.body);
+    const body = ast.unwrapParens(lam_i.data.lambda.body);
+
+    const acc = try parsed.intern.intern("acc");
+    const i = try parsed.intern.intern("i");
+    const go = try parsed.intern.intern("go");
+    const params = [_]InternId{ acc, i };
+
+    // Without a self name the recursive call's args aren't credited, so only
+    // `i` (the `if` condition) is must-forced — the old, conservative result.
+    const base = try strictParamsMask(allocator, &parsed.intern, source, body, &params, null);
+    try std.testing.expectEqual(@as(u8, 0b10), base);
+
+    // With the self name, the greatest fixpoint additionally proves `acc`
+    // strict (the recursive call forces `acc + i`, hence `acc`).
+    const rec = try strictParamsMask(allocator, &parsed.intern, source, body, &params, go);
+    try std.testing.expectEqual(@as(u8, 0b11), rec);
+}
+
+test "strictParamsMask: a constant base case keeps the accumulator lazy" {
+    const allocator = std.testing.allocator;
+    // The `then` branch returns 0 (not `acc`), so `acc` is forced only on the
+    // else path — not unconditionally — even with the self-recursion fixpoint.
+    const source = "let go = acc: i: if i == 0 then 0 else go (acc + i) (i - 1); in go";
+    var parsed = try parseLet(allocator, source);
+    defer parsed.deinit();
+
+    const lam_acc = parsed.bindings()[0].expr;
+    const lam_i = ast.unwrapParens(lam_acc.data.lambda.body);
+    const body = ast.unwrapParens(lam_i.data.lambda.body);
+
+    const acc = try parsed.intern.intern("acc");
+    const i = try parsed.intern.intern("i");
+    const go = try parsed.intern.intern("go");
+    const params = [_]InternId{ acc, i };
+
+    const mask = try strictParamsMask(allocator, &parsed.intern, source, body, &params, go);
+    try std.testing.expectEqual(@as(u8, 0b10), mask); // `i` only; `acc` stays lazy
 }

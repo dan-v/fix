@@ -209,6 +209,16 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     }
     const body = cur;
 
+    // The binding name this lambda is armed for, captured before `initChild`
+    // consumes `name_hint`. Only a genuinely RECURSIVE binding (a `let` — see
+    // `name_hint_recursive`) is a valid self-recursion target: an attr-set attr
+    // of the same name (`{ overrides = self: super: (overrides …) …; }`)
+    // resolves OUTWARD, not to itself, so treating it as a self-call would
+    // wrongly force a fixed-point knot. This is what the strictness fixpoint
+    // keys off to recognize the lambda's own recursive calls.
+    const self_name_id: ?InternId =
+        if (self.name_hint_recursive and !self.name_hint_synthetic) self.name_hint else null;
+
     // Unbound lambda (no attr/let binding armed a name): synthesize one from
     // the parameter, so e.g. a module's top `pkgs: …` reads as `λpkgs`.
     if (self.registry.capture_names and n > 0) {
@@ -234,28 +244,25 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     // Strict-param / forwarding analysis only applies to the single-param
     // (curried) shape — `finish` gates `strict_param` to `local_count == 1`
     // anyway, and an uncurried chunk's params are locals, not upvalues.
+    // Which parameters does the body unconditionally force? A saturated call
+    // may then evaluate those argument positions eagerly instead of thunking
+    // them. `strictParamsMask` folds in a self-recursion fixpoint keyed off the
+    // lambda's own binding name (`self_name_id`), so a tail-recursive
+    // accumulator is seen as strict in its accumulator — evaluated eagerly
+    // rather than left to build a lazy `+`-thunk chain.
+    const strict_mask = try strictness.strictParamsMask(self.allocator, self.intern, self.source, body, param_ids[0..n], self_name_id);
     if (n == 1) {
-        // Does the body unconditionally force its single parameter? Lets a
-        // caller evaluate the argument eagerly instead of thunking it.
-        child_builder.strict_param = try strictness.bodyMustForceName(self.allocator, self.intern, self.source, body, param_ids[0]);
+        child_builder.strict_param = (strict_mask & 1) != 0;
         // Forwarding `x: f x` forces x iff `f` does — record `f`'s upvalue
         // index so the caller can resolve it at the call site.
         if (!child_builder.strict_param) {
             child_builder.strict_via_upvalue = forwardingUpvalue(self, &child, body, params[0]);
         }
     } else {
-        // Uncurried chunk: a per-param must-force bitmask. The saturated
-        // `call_n` path forces these arg positions eagerly, recovering the
-        // eager-arg behavior `thunk_arg` gives the single-param shape (and
-        // avoiding lazy-thunk-chain buildup in accumulator recursion).
-        var mask: u8 = 0;
-        var si: u16 = 0;
-        while (si < n) : (si += 1) {
-            if (try strictness.bodyMustForceName(self.allocator, self.intern, self.source, body, param_ids[si])) {
-                mask |= @as(u8, 1) << @intCast(si);
-            }
-        }
-        child_builder.strict_params = mask;
+        // Uncurried chunk: the saturated `call_n` path forces these arg
+        // positions eagerly, recovering the eager-arg behavior `thunk_arg`
+        // gives the single-param shape.
+        child_builder.strict_params = strict_mask;
     }
     child_builder.arity = n;
     // For `--xml`, a value lambda renders as `<varpat name="…">` using its
