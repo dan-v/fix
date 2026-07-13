@@ -50,6 +50,15 @@ class ProcessCleanupTests(unittest.TestCase):
              mock.patch.object(os, "killpg", side_effect=kill_group):
             result = runner.run_fix(Path("fix"), ["in.nix"], Path(td), devices=devices)
         self.assertEqual(-1, result.returncode)
+        self.assertIsNotNone(popen.call_args, "run_fix must invoke subprocess.Popen")
+        command = popen.call_args.args[0]
+        if devices:
+            self.assertEqual(
+                ["unshare", "--map-root-user", "--user", "--mount", "sh", "-c"],
+                command[:7],
+            )
+        else:
+            self.assertEqual(["fix", "eval"], command[:2])
         term = ("killpg", process.pid, signal.SIGTERM)
         kill = ("killpg", process.pid, signal.SIGKILL)
         self.assertIn(term, process.events)

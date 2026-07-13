@@ -63,12 +63,22 @@ class InventoryTests(unittest.TestCase):
     def test_pinned_snix_inventory(self):
         self.assertEqual(116, len(list(self.snix.rglob("*.kdl"))))
 
-    def test_skip_status_makes_main_fail(self):
-        skipped = runner.Result("lix", "omitted", "skip", "unsupported")
+    def assert_results_make_main_fail(self, results):
         with mock.patch.object(runner.Path, "exists", return_value=True), \
-             mock.patch.object(runner, "run_suite", return_value=[skipped]), \
+             mock.patch.object(runner, "run_suite", return_value=results), \
              mock.patch.object(runner.sys, "argv", ["run.py", "--suite", "lix"]):
             self.assertEqual(1, runner.main())
+
+    def test_skip_status_makes_main_fail(self):
+        self.assert_results_make_main_fail([
+            runner.Result("lix", "omitted", "skip", "unsupported"),
+        ])
+
+    def test_skip_status_makes_main_fail_among_passes(self):
+        self.assert_results_make_main_fail([
+            runner.Result("lix", "supported", "pass"),
+            runner.Result("lix", "omitted", "skip", "unsupported"),
+        ])
 
 
 if __name__ == "__main__":

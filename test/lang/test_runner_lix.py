@@ -83,7 +83,7 @@ class LixManifestTests(unittest.TestCase):
 
     def test_duplicate_manifest_key_is_validation_failure(self):
         td, root = self.make_case('[[test]]\nrunner = "eval-okay"\nrunner = "eval-fail"\n')
-        with td, self.assertRaises(Exception):
+        with td, self.assertRaises(tomllib.TOMLDecodeError):
             list(runner.discover_lix_cases(root))
 
 
