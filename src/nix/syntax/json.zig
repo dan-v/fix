@@ -209,6 +209,20 @@ const Ser = struct {
             return self.literal("String", try self.strOrBytes(bytes[0..end]));
         }
 
+        // An indented string (`''...''`) whose only content is a single
+        // constant-string interpolation (`''${"y"}''`) folds to that literal,
+        // as Nix does. Regular strings and empty interpolations do not fold.
+        const text = self.atomText(atom);
+        const indented = text.len >= 2 and text[0] == '\'' and text[1] == '\'';
+        if (indented) {
+            if (singleInterpolationSpan(parsed.parts)) |span| {
+                if (try self.constInterpolation(span)) |bytes| {
+                    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+                    return self.literal("String", try self.strOrBytes(bytes[0..end]));
+                }
+            }
+        }
+
         var es: std.ArrayListUnmanaged(J) = .empty;
         for (parsed.parts) |part| {
             switch (part) {
@@ -224,6 +238,42 @@ const Ser = struct {
             .{ .key = "es", .val = self.arr(try es.toOwnedSlice(self.arena)) },
             .{ .key = "isInterpolation", .val = .{ .boolean = true } },
         });
+    }
+
+    /// The span of the sole interpolation part when a string's only non-empty
+    /// content is one `${...}` (all other parts empty text); else null.
+    fn singleInterpolationSpan(parts: []const string_syntax.Part) ?string_syntax.Span {
+        var span: ?string_syntax.Span = null;
+        for (parts) |part| switch (part) {
+            .text => |t| if (t.bytes.len != 0) return null,
+            .interpolation => |s| {
+                if (span != null) return null; // more than one interpolation
+                span = s;
+            },
+        };
+        return span;
+    }
+
+    /// If `${...}` interpolates a single constant string literal, its decoded
+    /// bytes (arena-owned); else null.
+    fn constInterpolation(self: *Ser, span: string_syntax.Span) !?[]const u8 {
+        const sub = self.source[span.start..span.end];
+        var arena = ast.AstArena.init(self.gpa);
+        defer arena.deinit();
+        var parser = parser_mod.Parser.init(self.gpa, &arena, sub);
+        defer parser.deinit();
+        const n = ast.unwrapParens(parser.parse() catch return null);
+        if (n.tag != .string) return null;
+        const lit = string_syntax.parseLiteral(self.gpa, sub, .{
+            .start = n.data.atom.offset, .end = n.data.atom.offset + n.data.atom.len,
+        }) catch return null;
+        defer lit.deinit();
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        for (lit.parts) |p| switch (p) {
+            .text => |t| try buf.appendSlice(self.arena, t.bytes),
+            .interpolation => return null, // not a constant string
+        };
+        return buf.items;
     }
 
     /// Parse and serialize one `${...}` interpolation. It's a standalone
