@@ -611,6 +611,13 @@ fn maybeEmitRecursiveOverrides(self: *Compiler, groups: []const AttrEntryGroup) 
     const overrides_id = try self.intern.intern("__overrides");
     for (groups) |group| {
         if (group.name_id == overrides_id) {
+            // Lix deprecated `__overrides`: an error by default, re-permitted by
+            // the `rec-set-overrides` feature. Scoped to top-level static keys
+            // of a rec set, so nested/non-rec/dynamic `__overrides` don't trip.
+            if (!self.allow_rec_set_overrides) {
+                try diagnostics.reportCompileError(self, group.first.offset, group.first.len, "__overrides attributes are deprecated and will be removed in the future. Use --extra-deprecated-features rec-set-overrides to silence this warning.");
+                return error.RecSetOverridesDeprecated;
+            }
             try emit.emitApplyOverrides(self, overrides_id);
             return;
         }
@@ -716,7 +723,10 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
     // origin segment (the `foo` of `foo.bar`).
     var recursive = false;
     var earliest: u32 = std.math.maxInt(u32);
+    var has_rec = false;
+    var has_nonrec = tails.len > 0; // a path continuation (`foo.bar`) is non-recursive
     for (leaves) |leaf| {
+        if (leaf.expr.data.attr_set.recursive) has_rec = true else has_nonrec = true;
         const off = leaf.path[0].offset;
         if (off < earliest) {
             earliest = off;
@@ -729,6 +739,17 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
             earliest = off;
             recursive = false;
         }
+    }
+    // Lix deprecated `rec-set-merges`: merging definitions that disagree on
+    // recursiveness (a `rec` set with a non-rec set or a path continuation)
+    // discards a `rec` modifier, so it errors by default and is re-permitted by
+    // the feature.
+    if (has_rec and has_nonrec and !self.allow_rec_set_merges) {
+        const name = self.source[leaves[0].path[0].offset..][0..leaves[0].path[0].len];
+        const message = try std.fmt.allocPrint(self.allocator, "attribute '{s}' cannot be merged, because one set is marked as recursive and the other isn't. Use --extra-deprecated-features rec-set-merges to disable this error and make the expression parse as-is with implementation-defined semantics.", .{name});
+        try self.owned_diagnostic_messages.append(self.allocator, message);
+        try diagnostics.reportCompileError(self, leaves[0].path[0].offset, leaves[0].path[0].len, message);
+        return error.RecSetMergesDeprecated;
     }
     try compileNodeAttrEntriesThunk(self, merged, recursive);
 }

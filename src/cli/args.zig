@@ -47,6 +47,7 @@ pub const DeprecatedFeature = enum {
     cr_line_endings,
     or_as_identifier,
     rec_set_merges,
+    rec_set_overrides,
 
     pub fn fromName(name: []const u8) ?DeprecatedFeature {
         if (std.mem.eql(u8, name, "nul-bytes")) return .nul_bytes;
@@ -55,6 +56,7 @@ pub const DeprecatedFeature = enum {
         if (std.mem.eql(u8, name, "cr-line-endings")) return .cr_line_endings;
         if (std.mem.eql(u8, name, "or-as-identifier")) return .or_as_identifier;
         if (std.mem.eql(u8, name, "rec-set-merges")) return .rec_set_merges;
+        if (std.mem.eql(u8, name, "rec-set-overrides")) return .rec_set_overrides;
         return null;
     }
 };
