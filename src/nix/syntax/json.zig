@@ -192,7 +192,11 @@ const Ser = struct {
                     .interpolation => {},
                 }
             }
-            return self.literal("String", .{ .str = try buf.toOwnedSlice(self.arena) });
+            // Nix strings are NUL-terminated, so a `\0` truncates the value (the
+            // `nul-bytes` feature only decides whether that is also an error).
+            const bytes = buf.items;
+            const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+            return self.literal("String", .{ .str = try self.arena.dupe(u8, bytes[0..end]) });
         }
 
         var es: std.ArrayListUnmanaged(J) = .empty;
