@@ -334,6 +334,21 @@ test "successful realization releases recipe payload and realizes requested outp
     } else return error.MissingRecipeRealizationApi;
 }
 
+test "realizeOutput canonicalizes unsorted duplicate output names" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "multi output derivation"), &.{});
+
+        try store.realizeOutput(root_path, &.{ "out", "dev", "out", "dev" });
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
+        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "^dev,out"));
+    } else return error.MissingRecipeRealizationApi;
+}
+
 test "releaseRecipePayloads is idempotent and teardown frees exactly once" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
@@ -402,6 +417,21 @@ test "ensureClosure errors for an invalid referenced path with no recipe" {
     } else return error.MissingClosureRealizationApi;
 }
 
+test "ensureClosure rejects a cyclic recipe graph deterministically" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "cycle a"), &.{dep_text_path});
+        try store.recordOwnedTextRecipe(dep_text_path, try owned(std.testing.allocator, "cycle b"), &.{root_path});
+
+        try std.testing.expectError(error.RecipeCycle, store.ensureClosure(root_path));
+        try std.testing.expectEqual(@as(usize, 0), fake.materializationCount());
+    } else return error.MissingClosureRealizationApi;
+}
+
 const ConcurrentDemand = struct {
     store: *DerivationStore,
     result: anyerror!void = {},
@@ -410,6 +440,44 @@ const ConcurrentDemand = struct {
         self.result = self.store.ensureClosure(root_path);
     }
 };
+
+const ConcurrentPathDemand = struct {
+    store: *DerivationStore,
+    path: []const u8,
+    start: *std.atomic.Value(u8),
+    result: anyerror!void = {},
+
+    fn run(self: *ConcurrentPathDemand) void {
+        while (self.start.load(.acquire) == 0) std.atomic.spinLoopHint();
+        self.result = self.store.ensureClosure(self.path);
+    }
+};
+
+test "concurrent cross-root cyclic demands return RecipeCycle without deadlock" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "cross cycle a"), &.{dep_text_path});
+        try store.recordOwnedTextRecipe(dep_text_path, try owned(std.testing.allocator, "cross cycle b"), &.{root_path});
+
+        var start: std.atomic.Value(u8) = .init(0);
+        var demands = [_]ConcurrentPathDemand{
+            .{ .store = &store, .path = root_path, .start = &start },
+            .{ .store = &store, .path = dep_text_path, .start = &start },
+        };
+        var threads: [demands.len]std.Thread = undefined;
+        for (&demands, &threads) |*demand, *thread| {
+            thread.* = try std.Thread.spawn(.{}, ConcurrentPathDemand.run, .{demand});
+        }
+        start.store(1, .release);
+        for (threads) |thread| thread.join();
+        for (&demands) |*demand| try std.testing.expectError(error.RecipeCycle, demand.result);
+        try std.testing.expectEqual(@as(usize, 0), fake.materializationCount());
+    } else return error.MissingClosureRealizationApi;
+}
 
 test "concurrent closure demand has exactly one materializing writer" {
     if (comptime realizationApiAvailable()) {

@@ -196,6 +196,9 @@ pub const DerivationStore = struct {
         refs: std.atomic.Value(usize) = .init(1),
         state: State = .writing,
         err: ?anyerror = null,
+        /// Cold-path wait-for edge, guarded by `recipe_mu`. A retained target
+        /// keeps graph traversal safe while concurrent claims complete.
+        waiting_on: ?*RealizationClaim = null,
 
         const State = enum {
             writing,
@@ -589,16 +592,33 @@ pub const DerivationStore = struct {
         self.recipes.clearRetainingCapacity();
     }
 
+    const Visit = struct {
+        path: []const u8,
+        claim: *RealizationClaim,
+        parent: ?*const Visit,
+    };
+
     pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
+        return self.ensureClosureInner(store_path, null);
+    }
+
+    fn ensureClosureInner(self: *DerivationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
         while (true) {
             if (try self.queryPathValid(store_path)) return;
+            if (visitContains(parent, store_path)) return error.RecipeCycle;
 
             const claim_result = try self.claimMissingPath(store_path);
             const claim = claim_result.claim;
             defer claim.release(self.allocator);
 
             if (!claim_result.writer) {
-                switch (self.waitForClaim(claim)) {
+                const wait_source: ?*RealizationClaim = if (parent) |visit| blk: {
+                    if (self.beginClaimWait(visit.claim, claim)) return error.RecipeCycle;
+                    break :blk visit.claim;
+                } else null;
+                const state = self.waitForClaim(claim);
+                if (wait_source) |source| self.endClaimWait(source, claim);
+                switch (state) {
                     .success => return,
                     .retry => continue,
                     .permanent_failure => return claim.err.?,
@@ -606,7 +626,8 @@ pub const DerivationStore = struct {
                 }
             }
 
-            self.ensureClosureWriter(store_path) catch |err| {
+            const visit: Visit = .{ .path = store_path, .claim = claim, .parent = parent };
+            self.ensureClosureWriter(store_path, &visit) catch |err| {
                 if (retryableRealizationError(err)) {
                     self.finishRetryableClaim(store_path, claim, err);
                 } else {
@@ -626,14 +647,14 @@ pub const DerivationStore = struct {
         try self.realizePaths(&.{derived}, .normal);
     }
 
-    fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8) anyerror!void {
+    fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8, visit: *const Visit) anyerror!void {
         const recipe = blk: {
             self.recipe_mu.lock();
             defer self.recipe_mu.unlock();
             break :blk self.recipes.get(store_path) orelse return error.MissingStoreRecipe;
         };
 
-        for (recipe.references()) |reference| try self.ensureClosure(reference);
+        for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
         switch (recipe.payload) {
             .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
             .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
@@ -661,6 +682,43 @@ pub const DerivationStore = struct {
         errdefer self.allocator.free(key);
         try self.realization_claims.put(self.allocator, key, claim);
         return .{ .claim = claim, .writer = true };
+    }
+
+    fn visitContains(parent: ?*const Visit, path: []const u8) bool {
+        var cursor = parent;
+        while (cursor) |visit| : (cursor = visit.parent) {
+            if (std.mem.eql(u8, visit.path, path)) return true;
+        }
+        return false;
+    }
+
+    /// Add one cold-path wait-for edge and report whether it closes a cycle.
+    /// The edge retains its target and is visible only under `recipe_mu`.
+    fn beginClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) bool {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        std.debug.assert(source.waiting_on == null);
+        target.retain();
+        source.waiting_on = target;
+
+        var cursor: ?*RealizationClaim = target;
+        while (cursor) |claim| : (cursor = claim.waiting_on) {
+            if (claim == source) {
+                source.waiting_on = null;
+                target.release(self.allocator);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn endClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        if (source.waiting_on == target) {
+            source.waiting_on = null;
+            target.release(self.allocator);
+        }
     }
 
     fn waitForClaim(self: *DerivationStore, claim: *RealizationClaim) RealizationClaim.State {
@@ -713,9 +771,23 @@ pub const DerivationStore = struct {
         if (outputs.len == 0) {
             try rendered.append(self.allocator, '*');
         } else {
-            for (outputs, 0..) |output, index| {
-                if (index != 0) try rendered.append(self.allocator, ',');
+            const ordered = try self.allocator.alloc([]const u8, outputs.len);
+            defer self.allocator.free(ordered);
+            @memcpy(ordered, outputs);
+            std.mem.sort([]const u8, ordered, {}, struct {
+                fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.lessThan);
+
+            var previous: ?[]const u8 = null;
+            for (ordered) |output| {
+                if (previous) |seen| {
+                    if (std.mem.eql(u8, seen, output)) continue;
+                    try rendered.append(self.allocator, ',');
+                }
                 try rendered.appendSlice(self.allocator, output);
+                previous = output;
             }
         }
         return rendered.toOwnedSlice(self.allocator);
