@@ -53,6 +53,52 @@ pub const FileCache = struct {
         kind: FileKind,
     };
 
+    /// Shared ownership of an immutable byte allocation. Handles are cheap to
+    /// copy explicitly with `retain`; reading the bytes does not touch the
+    /// refcount.
+    pub const ImmutableBytes = struct {
+        blob: *Blob,
+
+        const Blob = struct {
+            allocator: std.mem.Allocator,
+            refs: std.atomic.Value(usize),
+            owned: []u8,
+        };
+
+        /// Takes ownership of `owned` without copying it. On blob allocation
+        /// failure, ownership is still consumed and the bytes are freed.
+        pub fn fromOwned(allocator: std.mem.Allocator, owned: []u8) !ImmutableBytes {
+            const blob = allocator.create(Blob) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
+            blob.* = .{
+                .allocator = allocator,
+                .refs = .init(1),
+                .owned = owned,
+            };
+            return .{ .blob = blob };
+        }
+
+        pub fn bytes(self: ImmutableBytes) []const u8 {
+            return self.blob.owned;
+        }
+
+        pub fn retain(self: ImmutableBytes) ImmutableBytes {
+            const previous = self.blob.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+            return self;
+        }
+
+        pub fn release(self: *ImmutableBytes) void {
+            if (self.blob.refs.fetchSub(1, .acq_rel) != 1) return;
+            const blob = self.blob;
+            const allocator = blob.allocator;
+            allocator.free(blob.owned);
+            allocator.destroy(blob);
+        }
+    };
+
     const Entry = struct {
         path: []u8,
         /// Guards the populated-fields below. Held during I/O so a
@@ -63,7 +109,7 @@ pub const FileCache = struct {
         exists_known: bool = false,
         exists: bool = false,
         kind: ?FileKind = null,
-        contents: ?[]u8 = null,
+        contents: ?ImmutableBytes = null,
         dir_entries: ?[]DirEntry = null,
     };
 
@@ -80,7 +126,7 @@ pub const FileCache = struct {
         while (iter.next()) |kv| {
             const entry = kv.value_ptr.*;
             self.allocator.free(entry.path);
-            if (entry.contents) |contents| self.allocator.free(contents);
+            if (entry.contents) |*contents| contents.release();
             if (entry.dir_entries) |entries| self.freeDirEntries(entries);
             self.allocator.destroy(entry);
         }
@@ -112,21 +158,6 @@ pub const FileCache = struct {
         return true;
     }
 
-    /// Seed the cache with `contents` for `path` as a regular file, so
-    /// `readFile`/`pathExists` on it succeed without hitting disk. Used for a
-    /// fetched fixed-output store path in plain eval (no real store to hold the
-    /// file), matching Nix where the fetched content lives in the store. A no-op
-    /// if the path is already populated.
-    pub fn registerFile(self: *FileCache, path: []const u8, contents: []const u8) !void {
-        const entry = try self.entryFor(path);
-        entry.mu.lock();
-        defer entry.mu.unlock();
-        if (entry.contents == null) entry.contents = try self.allocator.dupe(u8, contents);
-        entry.exists_known = true;
-        entry.exists = true;
-        entry.kind = .regular;
-    }
-
     /// Trap: deliberately UNcached existence probe. Used by import-from-
     /// derivation to decide whether a demanded store path still needs building,
     /// WITHOUT memoizing the result — a path that becomes valid after an
@@ -145,7 +176,7 @@ pub const FileCache = struct {
         const entry = try self.entryFor(path);
         entry.mu.lock();
         defer entry.mu.unlock();
-        if (entry.contents) |contents| return contents;
+        if (entry.contents) |contents| return contents.bytes();
 
         const io = self.io orelse return error.FileIoUnavailable;
         // RSS attribution: cached source texts live for the evaluator's
@@ -158,13 +189,39 @@ pub const FileCache = struct {
             self.allocator,
             .limited(max_read_bytes),
         );
-        errdefer self.allocator.free(contents);
+        const handle = try ImmutableBytes.fromOwned(self.allocator, contents);
 
         entry.exists_known = true;
         entry.exists = true;
-        entry.contents = contents;
+        entry.contents = handle;
         entry.kind = .regular;
-        return contents;
+        return handle.bytes();
+    }
+
+    /// Return a retained immutable handle for a file, populating the same
+    /// cache entry used by `readFile` on a cold miss.
+    pub fn retainFile(self: *FileCache, path: []const u8) !ImmutableBytes {
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
+        if (entry.contents) |contents| return contents.retain();
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        const prev_tag = vma.setAllocTag(.file_cache);
+        defer _ = vma.setAllocTag(prev_tag);
+        const owned = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            entry.path,
+            self.allocator,
+            .limited(max_read_bytes),
+        );
+        const handle = try ImmutableBytes.fromOwned(self.allocator, owned);
+
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.contents = handle;
+        entry.kind = .regular;
+        return handle.retain();
     }
 
     /// Seed the cache so `path` resolves to `contents` as a regular file,
@@ -173,13 +230,12 @@ pub const FileCache = struct {
     /// fetch — so `builtins.readFile`/`readFileType` on a `fetchurl` result
     /// behave as they would against Nix's realized store. A no-op if the entry
     /// is already populated.
-    pub fn provideRegular(self: *FileCache, path: []const u8, contents: []const u8) !void {
+    pub fn provideRegular(self: *FileCache, path: []const u8, contents: ImmutableBytes) !void {
         const entry = try self.entryFor(path);
         entry.mu.lock();
         defer entry.mu.unlock();
         if (entry.contents != null) return;
-        const owned = try self.allocator.dupe(u8, contents);
-        entry.contents = owned;
+        entry.contents = contents.retain();
         entry.exists_known = true;
         entry.exists = true;
         entry.kind = .regular;

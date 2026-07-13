@@ -494,7 +494,9 @@ fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8,
         // Plain eval has no store to materialize the file; seed the cache so
         // `readFile`/`import` on the returned store path still work, as they do
         // in Nix (where the fetched content is added to the store).
-        try self.files.registerFile(store_path, try self.files.readFile(cache_path));
+        var contents = try self.files.retainFile(cache_path);
+        defer contents.release();
+        try self.files.provideRegular(store_path, contents);
     }
     return store_path;
 }
