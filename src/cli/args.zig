@@ -49,6 +49,7 @@ pub const DeprecatedFeature = enum {
     rec_set_merges,
     rec_set_overrides,
     rec_set_dynamic_attrs,
+    tokens_no_whitespace,
 
     pub fn fromName(name: []const u8) ?DeprecatedFeature {
         if (std.mem.eql(u8, name, "nul-bytes")) return .nul_bytes;
@@ -59,6 +60,7 @@ pub const DeprecatedFeature = enum {
         if (std.mem.eql(u8, name, "rec-set-merges")) return .rec_set_merges;
         if (std.mem.eql(u8, name, "rec-set-overrides")) return .rec_set_overrides;
         if (std.mem.eql(u8, name, "rec-set-dynamic-attrs")) return .rec_set_dynamic_attrs;
+        if (std.mem.eql(u8, name, "tokens-no-whitespace")) return .tokens_no_whitespace;
         return null;
     }
 };

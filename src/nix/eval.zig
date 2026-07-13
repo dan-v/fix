@@ -486,6 +486,10 @@ pub const Evaluator = struct {
     /// `cr-line-endings` deprecated feature: when true, CR/CRLF line endings are
     /// accepted; default false (compile error, matching Lix).
     allow_cr_line_endings: bool = false,
+    /// `tokens-no-whitespace` deprecated feature: when true, a value token stuck
+    /// to the next token with no whitespace (`0a`, `1.a`, `"x"2`) is accepted;
+    /// default false (compile error, matching Lix).
+    allow_tokens_no_whitespace: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -1007,6 +1011,25 @@ pub const Evaluator = struct {
                     .message = "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported. Please inspect the file and normalize it to use LF (`\\n`) line endings instead. Use --extra-deprecated-features cr-line-endings to silence this warning.",
                 }}, source, source_path);
                 return error.CrLineEndingsDisabled;
+            }
+        }
+
+        // Lix deprecated `tokens-no-whitespace`: a value token stuck to the next
+        // token without whitespace is rejected by default. The tokenization
+        // still succeeds, so enabling the feature Just Works.
+        if (parser.first_tokens_no_ws_offset) |off| {
+            if (!self.allow_tokens_no_whitespace) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, off),
+                    .column = diagnostic.columnForOffset(source, off),
+                    .offset = off,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "whitespace between tokens is required here. Use --extra-deprecated-features tokens-no-whitespace to disable this error.",
+                }}, source, source_path);
+                return error.TokensNoWhitespaceDisabled;
             }
         }
 

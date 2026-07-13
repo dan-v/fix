@@ -758,14 +758,24 @@ def _ptw_case(case_dir: Path, golden_base: str, full: str, flags: list[str], exp
         expected_err = err_g.read_text() if err_g.exists() else ""
         with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
             p = run_fix(fix, [*flags, "-e", full], Path(td), subcmd=("parse", "--json"))
-        if (p.returncode == expected_rc
-                and p.stdout.rstrip("\n") == expected_out.rstrip("\n")
-                and p.stderr.rstrip("\n") == expected_err.rstrip("\n")):
+        if p.returncode != expected_rc:
+            return Result("lix", ident, "fail",
+                          f"rc={p.returncode} (expected {expected_rc})\n  stderr={p.stderr.strip()!r}")
+        if expected_rc != 0:
+            # A parse error: exit code matched and no AST expected. We don't
+            # reproduce Nix's error prose (same stance as declarative parse-fail).
+            if p.stdout.strip():
+                return Result("lix", ident, "fail", f"expected no AST, got:\n{_indent(p.stdout.strip())}")
             return Result("lix", ident, "pass")
-        return Result("lix", ident, "fail",
-                      f"rc={p.returncode} (expected {expected_rc})\n"
-                      f"  stdout={p.stdout!r}\n  exp-out={expected_out!r}\n"
-                      f"  stderr={p.stderr.strip()!r}\n  exp-err={expected_err.strip()!r}")
+        # A parse-okay: AST must match; a deprecation warning must be present
+        # semantically (by kind), not by exact prose.
+        if p.stdout.rstrip("\n") != expected_out.rstrip("\n"):
+            return Result("lix", ident, "fail", _diff(expected_out, p.stdout))
+        missing = _warning_kinds(expected_err) - _warning_kinds(p.stderr)
+        if missing:
+            return Result("lix", ident, "fail",
+                          f"AST matches but missing warning(s): {sorted(missing)}\n{_indent(p.stderr.strip())}")
+        return Result("lix", ident, "pass")
     return LixCase(case_dir, ident, "parse-okay", handler=h)
 
 

@@ -168,6 +168,9 @@ pub const Parser = struct {
     /// Deprecated-syntax warnings recorded during parsing (feature-agnostic);
     /// the consumer emits the ones whose feature is disabled.
     warnings: std.ArrayListUnmanaged(DeprecationWarning) = .empty,
+    /// Offset of the first `tokens-no-whitespace` adjacency (a value token
+    /// stuck to the next token), or null. Gated at the compile chokepoint.
+    first_tokens_no_ws_offset: ?u32 = null,
     /// Body-span elision (lazy parsing): when enabled, a bind body inside a
     /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
     /// earlier clauses in the same brace, (b) spans at least
@@ -377,6 +380,7 @@ pub const Parser = struct {
         var scanner = Scanner.init(self.source);
         const root = try self.drive(&scanner);
         self.first_cr_offset = scanner.first_cr;
+        self.first_tokens_no_ws_offset = scanner.first_tokens_no_ws;
         if (scanner.first_float_no_zero) |f| {
             self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch {};
         }
