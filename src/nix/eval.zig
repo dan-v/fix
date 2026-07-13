@@ -1573,6 +1573,11 @@ pub const Evaluator = struct {
         return self.derivations.setBuildSettings(settings);
     }
 
+    /// Override the nix-daemon socket path (`$NIX_DAEMON_SOCKET_PATH`).
+    pub fn setDaemonSocket(self: *Evaluator, path: []const u8) !void {
+        return self.derivations.setDaemonSocket(path);
+    }
+
     /// Register `link_path` (an existing absolute symlink into the store) as an
     /// indirect GC root via the daemon (`--add-root`/`--indirect`).
     pub fn addIndirectRoot(self: *Evaluator, link_path: []const u8) !void {

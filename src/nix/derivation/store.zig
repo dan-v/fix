@@ -73,7 +73,11 @@ pub const DerivationStore = struct {
     /// whole text/NAR the daemon would just hash and discard.
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
     io: ?std.Io = null,
+    /// Path to the nix-daemon socket. Defaults to Nix's well-known location;
+    /// `setDaemonSocket` (from `$NIX_DAEMON_SOCKET_PATH`) overrides it, pointing
+    /// at `daemon_socket_owned`.
     daemon_socket: []const u8 = rstore.default_socket_path,
+    daemon_socket_owned: ?[]u8 = null,
     /// Per-connection daemon settings (`--cores`/`--max-jobs`/`--fallback`/…),
     /// sent via `set_options` right after the handshake. Null = send nothing
     /// (the daemon uses its own config). Its `overrides` slice is owned via
@@ -460,6 +464,7 @@ pub const DerivationStore = struct {
             self.allocator.free(o.value);
         }
         self.daemon_overrides.deinit(self.allocator);
+        if (self.daemon_socket_owned) |owned| self.allocator.free(owned);
         if (self.daemon) |d| d.deinit();
     }
 
@@ -480,6 +485,16 @@ pub const DerivationStore = struct {
         var owned = settings;
         owned.overrides = self.daemon_overrides.items;
         self.daemon_options = owned;
+    }
+
+    /// Override the nix-daemon socket path (from `$NIX_DAEMON_SOCKET_PATH`).
+    /// Dupes `path` into owned storage (freed in `deinit`); a no-op if empty.
+    pub fn setDaemonSocket(self: *DerivationStore, path: []const u8) !void {
+        if (path.len == 0) return;
+        const owned = try self.allocator.dupe(u8, path);
+        if (self.daemon_socket_owned) |old| self.allocator.free(old);
+        self.daemon_socket_owned = owned;
+        self.daemon_socket = owned;
     }
 
     /// Provide the IO handle used to connect to the daemon on demand.

@@ -106,6 +106,10 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     // authenticate fetches to private GitHub/GitLab/… hosts.
     if (settings.get("access-tokens")) |tokens| try ev.setAccessTokens(tokens);
     try applyNetrc(ev, init, &settings);
+    // Nix's `NIX_DAEMON_SOCKET_PATH` overrides the daemon socket location (empty
+    // = unset, as in Nix). Useful for pointing at an alternate/proxied daemon.
+    if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock|
+        if (sock.len != 0) try ev.setDaemonSocket(sock);
     try applyDaemonSettings(ev, options, &settings);
     try ev.setBasePathFromCurrentPath(init.io);
     try applyNixPath(ev, init, options);

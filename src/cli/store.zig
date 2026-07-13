@@ -43,9 +43,17 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     return 2;
 }
 
+fn socketPath(init: std.process.Init) []const u8 {
+    // `NIX_DAEMON_SOCKET_PATH` overrides the default (empty = unset, as in Nix).
+    if (init.environ_map.get("NIX_DAEMON_SOCKET_PATH")) |sock|
+        if (sock.len != 0) return sock;
+    return store.default_socket_path;
+}
+
 fn connect(allocator: std.mem.Allocator, init: std.process.Init) !*store.DaemonStore {
-    return store.DaemonStore.connect(allocator, init.io, store.default_socket_path) catch |err| {
-        std.debug.print("error: connecting to nix-daemon at {s}: {s}\n", .{ store.default_socket_path, @errorName(err) });
+    const path = socketPath(init);
+    return store.DaemonStore.connect(allocator, init.io, path) catch |err| {
+        std.debug.print("error: connecting to nix-daemon at {s}: {s}\n", .{ path, @errorName(err) });
         return err;
     };
 }
