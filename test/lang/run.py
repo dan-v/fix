@@ -529,6 +529,18 @@ def _normalize_parse_json(stdout: str) -> str:
     return yaml.dump(obj, Dumper=CustomFixedIndentationDumper, default_flow_style=False)
 
 
+# The caret location `at <path>:<line>:<col>:` in a Nix or fix parser
+# diagnostic. The trailing colon distinguishes the caret line from an inline
+# reference like `already defined at <path>:2:3` (no trailing colon).
+_ERR_LOC_RE = re.compile(r"at\s+\S*?:(\d+):(\d+):")
+
+
+def _error_line(text: str) -> int | None:
+    """Line of the (last) positioned parse error in a diagnostic, or None."""
+    matches = _ERR_LOC_RE.findall(text)
+    return int(matches[-1][0]) if matches else None
+
+
 def _run_lix_parse(fix: Path, lang_dir: Path, c: LixCase, fix_flags: list[str]) -> Result:
     with tempfile.TemporaryDirectory(prefix="fixlang-") as td:
         tmp = Path(td)
@@ -541,10 +553,24 @@ def _run_lix_parse(fix: Path, lang_dir: Path, c: LixCase, fix_flags: list[str]) 
         err = p.stderr.replace(str(tmp), "/pwd")
 
         if c.runner == "parse-fail":
-            # Attempted (expect rc 1) but a visible FAIL: we do not reproduce
-            # Nix's exact parser error strings.
-            return Result("lix", c.ident, "fail",
-                          f"parse-fail: error-text parity not reproduced (rc={p.returncode})")
+            # "Close enough" parse-fail: we do not reproduce Nix's exact error
+            # prose, but fix must genuinely reject the input as a parse error —
+            # exit 1 with no AST on stdout — and locate it on the same source
+            # line Nix does. Column and message differences are tolerated.
+            # Semantic errors fix only detects after parsing (e.g. duplicate
+            # attributes) exit 0 here and correctly stay FAIL.
+            if p.returncode != 1 or out.strip():
+                detail = f"expected a parse error (exit 1, no AST); got rc={p.returncode}"
+                if err.strip():
+                    detail += f"\n{_indent(err.strip())}"
+                return Result("lix", c.ident, "fail", detail)
+            err_exp = c.case_dir / f"{c.test_name}.err.exp"
+            want_line = _error_line(err_exp.read_text()) if err_exp.exists() else None
+            got_line = _error_line(err)
+            if want_line is not None and got_line is not None and want_line != got_line:
+                return Result("lix", c.ident, "fail",
+                              f"parse error on line {got_line}, Nix reports line {want_line}")
+            return Result("lix", c.ident, "pass")
 
         exp_file = c.case_dir / f"{c.test_name}.out.exp"
         if not exp_file.exists():
