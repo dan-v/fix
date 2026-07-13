@@ -339,6 +339,150 @@ test "evaluate fetchTarball builtin through fetch cache" {
     try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
 }
 
+test "hashed fetchurl reads content with the specified sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "payload.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
+test "hashed fetchurl reports mismatched and malformed sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "payload.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const malformed_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"sha256-not-a-hash\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(malformed_source);
+    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer malformed_ev.deinit();
+    malformed_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
+    try std.testing.expect(malformed_ev.getTrace().message != null);
+
+    const mismatch_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(mismatch_source);
+    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer mismatch_ev.deinit();
+    mismatch_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
+    const mismatch_message = mismatch_ev.getTrace().message orelse return error.MissingHashDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "0000000000000000000000000000000000000000000000000000000000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5") != null);
+}
+
+test "hashed fetchTarball reads a subpath with the specified sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer std.testing.allocator.free(archive_path);
+
+    const tar = try std.process.run(std.testing.allocator, std.testing.io, .{ .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" } });
+    defer std.testing.allocator.free(tar.stdout);
+    defer std.testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"e7836a3c011cee6b24037385323b9883d4657e2fb7c44bc18b6c166eac5555d0\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
+test "hashed fetchTarball reports mismatched and malformed sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer std.testing.allocator.free(archive_path);
+    const tar = try std.process.run(std.testing.allocator, std.testing.io, .{ .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" } });
+    defer std.testing.allocator.free(tar.stdout);
+    defer std.testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    const malformed_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"sha256-not-a-hash\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(malformed_source);
+    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer malformed_ev.deinit();
+    malformed_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
+    try std.testing.expect(malformed_ev.getTrace().message != null);
+
+    const mismatch_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(mismatch_source);
+    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer mismatch_ev.deinit();
+    mismatch_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
+    const mismatch_message = mismatch_ev.getTrace().message orelse return error.MissingHashDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "0000000000000000000000000000000000000000000000000000000000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "e7836a3c011cee6b24037385323b9883d4657e2fb7c44bc18b6c166eac5555d0") != null);
+}
+
 test "evaluate fetchTree builtin through fetch cache" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
