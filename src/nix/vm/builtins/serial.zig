@@ -88,7 +88,10 @@ fn writeJsonValueInner(
         .bool_true => try writer.writeAll("true"),
         .int => try writer.print("{}", .{forced.asInt()}),
         .boxed_int => try writer.print("{}", .{try self.heap.getBoxedInt(forced.asObjectId())}),
-        .float => try writer.print("{d}", .{forced.asFloat()}),
+        .float => {
+            var fbuf: [shared.JSON_FLOAT_BUF]u8 = undefined;
+            try writer.writeAll(shared.jsonFloatText(&fbuf, forced.asFloat()));
+        },
         .string, .string_context => try writeJsonStringValue(self, writer, forced, context),
         .path => {
             switch (path_mode) {

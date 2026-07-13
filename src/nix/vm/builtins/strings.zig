@@ -301,7 +301,10 @@ pub fn coerceToStringValue(self: anytype, arg: Value) !Value {
             return Value.string(try self.intern.intern(s));
         },
         .float => {
-            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{value.asFloat()});
+            // Nix coerces a float with C++ `std::to_string` — fixed-point with
+            // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
+            // NOT the shortest `%g` form used to *print* a value.
+            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
             defer self.allocator.free(s);
             return Value.string(try self.intern.intern(s));
         },
@@ -397,7 +400,10 @@ pub fn coerceDerivationStringValue(self: anytype, arg: Value) !Value {
             return Value.string(try self.intern.intern(s));
         },
         .float => {
-            const s = try std.fmt.allocPrint(self.allocator, "{d}", .{value.asFloat()});
+            // Nix coerces a float with C++ `std::to_string` — fixed-point with
+            // 6 fractional digits (`1.0` → "1.000000", `1.5e-6` → "0.000002"),
+            // NOT the shortest `%g` form used to *print* a value.
+            const s = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{value.asFloat()});
             defer self.allocator.free(s);
             return Value.string(try self.intern.intern(s));
         },

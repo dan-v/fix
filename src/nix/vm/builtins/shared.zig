@@ -13,6 +13,28 @@ const vm_equality = @import("../equality.zig");
 const vm_closures = @import("../closures.zig");
 const vm_trace = @import("../trace.zig");
 
+/// Format a float the way Nix's `builtins.toJSON` does (via nlohmann::json):
+/// the shortest round-tripping decimal, but always recognizable as a float —
+/// an integer-valued float gets a ".0" suffix (`1.0`, `100.0`, and `1e10` →
+/// "10000000000.0"). Non-finite values serialize as JSON `null`, as nlohmann
+/// does. Writes into `buf` and returns the slice; `buf` must be large enough
+/// for the fixed-point expansion (use `JSON_FLOAT_BUF`).
+///
+/// NB: nlohmann switches to exponent notation at large/small magnitudes
+/// (`1e+20`, `1e-06`); Zig's `{d}` stays fixed-point, so those extremes differ
+/// (and would already have differed — this only adds the missing ".0"). Every
+/// float in normal Nix data, including all module-option docs, lies in the
+/// fixed-point range where this matches Nix exactly.
+pub const JSON_FLOAT_BUF = 512;
+pub fn jsonFloatText(buf: []u8, v: f64) []const u8 {
+    if (!std.math.isFinite(v)) return "null";
+    const s = std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
+    if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
+    buf[s.len] = '.';
+    buf[s.len + 1] = '0';
+    return buf[0 .. s.len + 2];
+}
+
 /// Cycle-guard for the recursive JSON writers (`toJSON`, structured
 /// derivation env). A stack of (kind, id) pairs; `enterJsonObject` refuses a
 /// re-entry into an object already on the stack so a self-referential

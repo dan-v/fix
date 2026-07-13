@@ -601,7 +601,10 @@ fn appendStructuredJsonValue(
         .bool_true => try out.appendSlice(self.allocator, "true"),
         .int => try appendJsonFmt(self, out, "{}", .{forced.asInt()}),
         .boxed_int => try appendJsonFmt(self, out, "{}", .{try self.heap.getBoxedInt(forced.asObjectId())}),
-        .float => try appendJsonFmt(self, out, "{d}", .{forced.asFloat()}),
+        .float => {
+            var fbuf: [shared.JSON_FLOAT_BUF]u8 = undefined;
+            try out.appendSlice(self.allocator, shared.jsonFloatText(&fbuf, forced.asFloat()));
+        },
         .string, .path, .string_context => {
             try appendStructuredJsonStringValue(self, out, forced, inputs, owned_strings);
         },
