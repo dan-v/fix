@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const nix_hash = @import("hash.zig");
+const nar = @import("nar.zig");
 const FileCache = @import("file_cache.zig").FileCache;
 const sync = @import("base").sync;
 
@@ -87,6 +88,11 @@ pub const FetchCache = struct {
         url: []const u8,
         name: []const u8 = "source",
         forge: ?Forge = null,
+        /// Serialize and hash the unpacked tree while still on the bounded
+        /// fetch worker. Direct hashed fetchTarball requests this payload;
+        /// unhashed and fetchTree callers retain the original extraction-only
+        /// path.
+        serialize_nar: bool = false,
     };
 
     pub const MercurialSpec = struct {
@@ -114,6 +120,21 @@ pub const FetchCache = struct {
         pub fn deinit(self: UrlResult, allocator: std.mem.Allocator) void {
             allocator.free(self.path);
             allocator.free(self.hash);
+        }
+    };
+
+    pub const TarballNar = struct {
+        bytes: []u8,
+        digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    };
+
+    pub const TarballResult = struct {
+        path: []u8,
+        nar_payload: ?TarballNar,
+
+        pub fn deinit(self: TarballResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.path);
+            if (self.nar_payload) |payload| allocator.free(payload.bytes);
         }
     };
 
@@ -439,7 +460,7 @@ pub const FetchCache = struct {
         return .{ .path = path, .hash = hash };
     }
 
-    pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) ![]u8 {
+    pub fn fetchTarball(self: *FetchCache, files: *FileCache, spec: TarballSpec, reporter: ?Reporter) !TarballResult {
         const io = self.io orelse return error.FetchIoUnavailable;
         const archive = try self.fetchUrl(files, .{ .url = spec.url, .name = spec.name, .forge = spec.forge }, reporter);
         defer archive.deinit(self.allocator);
@@ -450,7 +471,15 @@ pub const FetchCache = struct {
             try std.Io.Dir.cwd().createDirPath(io, out_path);
             try self.runCommandDiscard(&.{ "tar", "-xf", archive.path, "-C", out_path, "--strip-components=1" });
         }
-        return out_path;
+
+        const nar_payload: ?TarballNar = if (spec.serialize_nar) payload: {
+            const bytes = try nar.serialize(self.allocator, files, out_path, null);
+            errdefer self.allocator.free(bytes);
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            break :payload .{ .bytes = bytes, .digest = digest };
+        } else null;
+        return .{ .path = out_path, .nar_payload = nar_payload };
     }
 
     pub fn fetchMercurial(self: *FetchCache, files: *FileCache, spec: MercurialSpec, _: ?Reporter) !MercurialResult {
@@ -1042,4 +1071,52 @@ test "access-tokens: per-forge auth header (matches Nix)" {
     try check.one(&fc, .gitlab, "https://gitea.example.org/g/p", "abc", "def");
     // No token configured for this host → no header.
     try testing.expect((try fc.authHeader(.github, "https://unlisted.example/x")) == null);
+}
+
+test "fetchTarball only serializes NAR when requested" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer testing.allocator.free(archive_path);
+    const cache_path = try std.fs.path.resolve(testing.allocator, &.{ base_path, "fetch-cache" });
+    defer testing.allocator.free(cache_path);
+
+    const tar = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" },
+    });
+    defer testing.allocator.free(tar.stdout);
+    defer testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    var files = FileCache.init(testing.allocator);
+    defer files.deinit();
+    files.setIo(testing.io);
+    var fc = FetchCache.init(testing.allocator);
+    defer fc.deinit();
+    fc.setIo(testing.io);
+    try fc.setCacheRoot(cache_path);
+
+    const url = try std.fmt.allocPrint(testing.allocator, "file://{s}", .{archive_path});
+    defer testing.allocator.free(url);
+    const unhashed = try fc.fetchTarball(&files, .{ .url = url, .name = "src" }, null);
+    defer unhashed.deinit(testing.allocator);
+    try testing.expect(unhashed.nar_payload == null);
+
+    const hashed = try fc.fetchTarball(&files, .{ .url = url, .name = "src", .serialize_nar = true }, null);
+    defer hashed.deinit(testing.allocator);
+    const payload = hashed.nar_payload orelse return error.MissingNarPayload;
+    var independently_hashed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload.bytes, &independently_hashed, .{});
+    try testing.expectEqualSlices(u8, &independently_hashed, &payload.digest);
 }

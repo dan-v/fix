@@ -77,13 +77,25 @@ pub fn ingestReport(
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
+    return ingestSerializedNar(allocator, derivations, name, nar_bytes, &digest);
+}
 
+/// Ingest an already serialized and SHA-256-hashed NAR without repeating
+/// either operation. The NAR bytes and digest are borrowed for the duration of
+/// the synchronous daemon operation; the returned paths remain caller-owned.
+pub fn ingestSerializedNar(
+    allocator: std.mem.Allocator,
+    derivations: *DerivationStore,
+    name: []const u8,
+    nar_bytes: []const u8,
+    digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) !Ingested {
+    const hex = std.fmt.bytesToHex(digest.*, .lower);
     const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
     errdefer allocator.free(store_path);
     try derivations.instantiatePath(store_path, nar_bytes);
 
-    return .{ .store_path = store_path, .nar_hash = try sriHash(allocator, &digest) };
+    return .{ .store_path = store_path, .nar_hash = try sriHash(allocator, digest) };
 }
 
 /// Encode a sha256 digest as a Nix SRI hash: `sha256-<standard base64>`.
@@ -165,4 +177,19 @@ pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, store_dir)) return false;
     if (path.len <= store_dir.len or path[store_dir.len] != '/') return false;
     return std.mem.indexOfScalar(u8, path[store_dir.len + 1 ..], '/') == null;
+}
+
+test "ingestSerializedNar uses the supplied digest without rehashing" {
+    const testing = std.testing;
+    var derivations = DerivationStore.init(testing.allocator);
+    defer derivations.deinit();
+
+    const digest = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const ingested = try ingestSerializedNar(testing.allocator, &derivations, "source", "borrowed NAR bytes", &digest);
+    defer ingested.deinit(testing.allocator);
+
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const expected_path = try drv_paths.sourcePath(testing.allocator, derivations.store_dir, "source", &hex);
+    defer testing.allocator.free(expected_path);
+    try testing.expectEqualStrings(expected_path, ingested.store_path);
 }

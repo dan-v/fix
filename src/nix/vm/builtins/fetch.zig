@@ -479,16 +479,6 @@ fn validateFetchedSha256(self: anytype, noun: []const u8, url: []const u8, expec
     return error.HashMismatch;
 }
 
-fn fetchedTreeNarSha256Hex(self: anytype, path: []const u8) ![]u8 {
-    const nar_bytes = try nar.serialize(self.allocator, self.files, path, null);
-    defer self.allocator.free(nar_bytes);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
-    const encoded = std.fmt.bytesToHex(digest, .lower);
-    return self.allocator.dupe(u8, &encoded);
-}
-
 /// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
 /// store path — like Nix's fetchurl. Under store writes the bytes are added to
 /// the real store; in plain eval the store path is still returned, with the
@@ -568,14 +558,34 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
-    defer self.fetchers.allocator.free(path);
-    const actual_hash = try fetchedTreeNarSha256Hex(self, path);
-    defer self.allocator.free(actual_hash);
-    try validateFetchedSha256(self, "tarball", spec.url, expected_hash, actual_hash);
+    const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+        .url = spec.url,
+        .name = spec.name,
+        .serialize_nar = expected_hash != null,
+    }, span);
+    defer result.deinit(self.fetchers.allocator);
+
+    if (expected_hash) |expected| {
+        const payload = result.nar_payload orelse unreachable;
+        const actual_hash = std.fmt.bytesToHex(payload.digest, .lower);
+        try validateFetchedSha256(self, "tarball", spec.url, expected, &actual_hash);
+        if (self.derivations.store_writes_enabled) {
+            const ingested = try source_paths.ingestSerializedNar(
+                self.allocator,
+                self.derivations,
+                tree_name,
+                payload.bytes,
+                &payload.digest,
+            );
+            defer ingested.deinit(self.allocator);
+            return fetchedPathValue(self, ingested.store_path);
+        }
+        return fetchedPathValue(self, result.path);
+    }
+
     // The unpacked tree is named "source" by default (Nix), independent of the
     // archive's URL basename which named the download (`tree_name`, above).
-    const out = try ingestFetchedTree(self, path, tree_name, "", null);
+    const out = try ingestFetchedTree(self, result.path, tree_name, "", null);
     defer out.deinit(self.allocator);
     return fetchedPathValue(self, out.out_path);
 }
@@ -767,9 +777,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
-        defer self.fetchers.allocator.free(path);
-        const out = try ingestFetchedTree(self, path, spec.name, "", null);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
+        defer result.deinit(self.fetchers.allocator);
+        const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
         return pathTreeValue(self, out.out_path, out.nar_hash);
     }
@@ -793,9 +803,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
             .gitlab
         else
             .sourcehut;
-        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
-        defer self.fetchers.allocator.free(path);
-        const out = try ingestFetchedTree(self, path, spec.name, spec.rev orelse "", null);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
+        defer result.deinit(self.fetchers.allocator);
+        const out = try ingestFetchedTree(self, result.path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
         return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev);
     }
