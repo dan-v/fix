@@ -11,6 +11,7 @@ pub const string_syntax = @import("syntax/string_syntax.zig");
 pub const diagnostic = @import("syntax/diagnostic.zig");
 pub const ast = @import("syntax/ast.zig");
 pub const parser = @import("syntax/parser.zig");
+pub const json = @import("syntax/json.zig");
 
 // Common flat re-exports for the most-used types.
 pub const Token = token.Token;
@@ -24,4 +25,5 @@ pub const Parser = parser.Parser;
 test {
     _ = parser;
     _ = scanner;
+    _ = json;
 }

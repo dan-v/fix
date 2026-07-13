@@ -21,6 +21,7 @@ const NodeTag = ast.NodeTag;
 const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const Scanner = @import("scanner.zig").Scanner;
+const string_syntax = @import("string_syntax.zig");
 const grammar = @import("grammar.zig");
 const lr = @import("lr.zig");
 
@@ -562,14 +563,26 @@ pub const Parser = struct {
                 var entries = rhs[1].entries;
                 const bindings = try a.alloc(Node.Binding, entries.items.len);
                 for (entries.items, bindings) |entry, *b| {
-                    if (entry.path.len == 0) {
-                        self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
-                        return error.ParseError;
+                    var path = entry.path;
+                    if (path.len == 0) {
+                        // A dynamic attr in a let. Nix folds a constant-string
+                        // key (`${"x"}`) to the static attr `x` before checking
+                        // for dynamic bindings, so it's allowed; a genuine
+                        // dynamic key (`${var}`) is not. The folded name reuses
+                        // the string token (quotes included), exactly as a plain
+                        // `"x" = ...;` binding would.
+                        const folded = self.constStringAttrAtom(entry.dynamic_name) orelse {
+                            self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
+                            return error.ParseError;
+                        };
+                        const single = try a.alloc(Node.Atom, 1);
+                        single[0] = folded;
+                        path = single;
                     }
                     b.* = .{
-                        .name_offset = entry.path[0].offset,
-                        .name_len = entry.path[0].len,
-                        .path = entry.path,
+                        .name_offset = path[0].offset,
+                        .name_len = path[0].len,
+                        .path = path,
                         .expr = entry.expr,
                         .inherit_outer = entry.inherit_outer,
                     };
@@ -981,11 +994,10 @@ pub const Parser = struct {
     fn inheritEntries(self: *Parser, source: ?*Node, names_in: std.ArrayListUnmanaged(Node.Atom), inherit_tok: Token) ![]Node.AttrSetEntry {
         var names = names_in;
         defer names.deinit(self.arenaAllocator());
-        if (names.items.len == 0) {
-            // `inherit ;` / `inherit (src) ;` — nothing named.
-            self.report(inherit_tok, "Expected inherited variable name.");
-            return error.ParseError;
-        }
+        // `inherit ;` / `inherit (src) ;` — an empty inherit is a valid no-op in
+        // Nix (it names nothing), so it contributes no entries rather than being
+        // a parse error.
+        _ = inherit_tok;
         const a = self.arenaAllocator();
         const entries = try a.alloc(Node.AttrSetEntry, names.items.len);
         for (names.items, entries) |name, *entry| {
@@ -1002,6 +1014,26 @@ pub const Parser = struct {
             };
         }
         return entries;
+    }
+
+    /// If `node` is a constant (non-interpolating) string literal, its source
+    /// atom (quotes included) — usable directly as a static attribute name, the
+    /// same way a plain `"x" = ...;` binding stores it. Otherwise null (a
+    /// genuine dynamic key). Drives Nix's `${"x"}` → static fold for let
+    /// bindings, where a real dynamic attribute is rejected.
+    fn constStringAttrAtom(self: *Parser, node: ?*Node) ?Node.Atom {
+        const n = node orelse return null;
+        if (n.tag != .string) return null;
+        const str_atom = n.data.atom;
+        const parsed = string_syntax.parseLiteral(self.allocator, self.source, .{
+            .start = str_atom.offset,
+            .end = str_atom.offset + str_atom.len,
+        }) catch return null;
+        defer parsed.deinit();
+        for (parsed.parts) |part| {
+            if (part == .interpolation) return null;
+        }
+        return str_atom;
     }
 
     fn inheritSourceAttr(self: *Parser, source: *Node, name: Node.Atom) !*Node {
