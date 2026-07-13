@@ -14,6 +14,17 @@ runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
 
+# Per-directory custom-adapter inventory (must equal 79 in total).
+CUSTOM_COUNTS = {
+    "builtins.getEnv": 1,
+    "builtins.pathExists": 1,
+    "builtins.readDir": 1,
+    "builtins.readFileType": 1,
+    "err_context": 1,
+    "parser-token-whitespace": 68,
+    "search-path": 6,
+}
+
 
 def pin(name):
     expr = f"builtins.toString (import {runner.REPO}/npins).{name}"
@@ -22,9 +33,14 @@ def pin(name):
 
 
 def declarative_inventory(root):
+    """Independent re-scan of the corpus's declarative test declarations, so the
+    counts the runner asserts are checked against the corpus, not against the
+    runner's own discovery."""
     counts = Counter()
     pattern = re.compile(r"^(eval-okay|eval-fail|parse-okay|parse-fail)(-[\w-]+?)?$")
-    for directory in sorted(p for p in root.iterdir() if p.is_dir() and not any(p.glob("*.py"))):
+    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+        if directory.name == "assets" or any(directory.glob("*.py")):
+            continue
         manifest = directory / "test.toml"
         if manifest.exists():
             for entry in tomllib.loads(manifest.read_text()).get("test", []):
@@ -57,10 +73,23 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(211, counts["eval-okay"] + counts["eval-fail"])
         self.assertEqual(67, counts["parse-okay"] + counts["parse-fail"])
 
-    def test_runner_discovers_every_declarative_case(self):
-        self.assertEqual(278, len(list(runner.discover_lix_cases(self.lix))))
+    def test_runner_discovers_declarative_plus_custom(self):
+        cases = list(runner.discover_lix_cases(self.lix))
+        # 211 declarative eval + 67 declarative parse + 79 custom = 357.
+        self.assertEqual(357, len(cases))
+        custom = Counter(
+            c.case_dir.name for c in cases if c.case_dir.name in runner.CUSTOM_DIRS
+        )
+        self.assertEqual(CUSTOM_COUNTS, dict(custom))
+        self.assertEqual(79, sum(custom.values()))
+        declarative = [c for c in cases if c.case_dir.name not in runner.CUSTOM_DIRS]
+        self.assertEqual(278, len(declarative))
+
+    def test_parser_token_whitespace_is_17x2x2(self):
+        self.assertEqual(68, len(runner.PTW_EXPRS) * 2 * 2)
 
     def test_pinned_snix_inventory(self):
+        # meta.kdl lives outside cases/ and is docs, not a case.
         self.assertEqual(116, len(list(self.snix.rglob("*.kdl"))))
 
     def assert_results_make_main_fail(self, results):
@@ -69,15 +98,29 @@ class InventoryTests(unittest.TestCase):
              mock.patch.object(runner.sys, "argv", ["run.py", "--suite", "lix"]):
             self.assertEqual(1, runner.main())
 
-    def test_skip_status_makes_main_fail(self):
+    def assert_results_make_main_pass(self, results):
+        with mock.patch.object(runner.Path, "exists", return_value=True), \
+             mock.patch.object(runner, "run_suite", return_value=results), \
+             mock.patch.object(runner.sys, "argv", ["run.py", "--suite", "lix"]):
+            self.assertEqual(0, runner.main())
+
+    def test_fail_makes_main_fail(self):
         self.assert_results_make_main_fail([
-            runner.Result("lix", "omitted", "skip", "unsupported"),
+            runner.Result("lix", "gap", "fail", "diverges"),
         ])
 
-    def test_skip_status_makes_main_fail_among_passes(self):
+    def test_blocked_does_not_fail_the_build(self):
+        self.assert_results_make_main_pass([
+            runner.Result("lix", "ok", "pass"),
+            runner.Result("lix", "gated", "blocked", "needs-store"),
+        ])
+
+    def test_stray_non_pass_non_blocked_status_fails(self):
+        # A status that is neither pass nor blocked (e.g. a leftover "skip") must
+        # count as a failure, so nothing can hide behind an unknown status.
         self.assert_results_make_main_fail([
             runner.Result("lix", "supported", "pass"),
-            runner.Result("lix", "omitted", "skip", "unsupported"),
+            runner.Result("lix", "omitted", "skip", "unexpected"),
         ])
 
 

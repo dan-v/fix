@@ -55,8 +55,11 @@ class ProcessCleanupTests(unittest.TestCase):
         if devices:
             self.assertEqual(
                 ["unshare", "--map-root-user", "--user", "--mount", "sh", "-c"],
-                command[:7],
+                command[:6],
             )
+            # the 7th argv element is the in-namespace bind-mount + exec script
+            self.assertIn("mount --bind /dev/null", command[6])
+            self.assertIn("exec fix eval", command[6])
         else:
             self.assertEqual(["fix", "eval"], command[:2])
         term = ("killpg", process.pid, signal.SIGTERM)

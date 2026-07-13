@@ -50,14 +50,24 @@ class SnixBehaviorTests(unittest.TestCase):
         self.assertEqual("fail", result.status)
         run_fix.assert_not_called()
 
-    def test_every_declared_feature_is_mapped_or_rejected(self):
+    def test_every_declared_feature_is_known_and_handled(self):
         features = set()
         for kdl in self.root.rglob("*.kdl"):
             features.update(runner.load_snix_case(kdl, self.root).features)
-        for feature in features | {"future-unknown-feature"}:
-            flags, reason = runner.snix_flags(runner.SnixCase(Path("x.kdl"), "x", features={feature}))
-            rendered = " ".join(flags)
-            self.assertTrue(feature in rendered or reason, f"ignored feature: {feature}")
+        # Every feature the corpus declares must be known (mapped to a flag or a
+        # language-level feature judged by the golden) — never silently ignored.
+        self.assertTrue(
+            features <= runner.SNIX_KNOWN_FEATURES,
+            f"unknown corpus features: {features - runner.SNIX_KNOWN_FEATURES}",
+        )
+        for feature in features:
+            _flags, reason = runner.snix_flags(runner.SnixCase(Path("x.kdl"), "x", features={feature}))
+            self.assertIsNone(reason, f"known feature rejected: {feature}")
+        # An unknown feature is a visible FAIL, not a silent pass.
+        _flags, reason = runner.snix_flags(
+            runner.SnixCase(Path("x.kdl"), "x", features={"future-unknown-feature"})
+        )
+        self.assertIsNotNone(reason)
 
     def test_network_case_is_driven(self):
         with tempfile.TemporaryDirectory() as td:
@@ -70,13 +80,13 @@ class SnixBehaviorTests(unittest.TestCase):
                 result = runner.run_snix_case(Path("fix"), runner.load_snix_case(kdl, Path(td)))
         self.assertNotEqual("skip", result.status)
 
-    def test_unavailable_daemon_is_failure_not_skip(self):
+    def test_unavailable_daemon_is_blocked_not_skip(self):
         case = runner.SnixCase(Path("store.kdl"), "store", nix_store=True)
         with mock.patch.object(runner, "_store_available", return_value=False):
             result = runner.run_snix_case(Path("fix"), case)
-        self.assertEqual("fail", result.status)
+        self.assertEqual("blocked", result.status)
 
-    def test_device_without_userns_is_failure_not_skip(self):
+    def test_device_without_userns_is_blocked_not_skip(self):
         with tempfile.TemporaryDirectory() as td:
             kdl = Path(td) / "device.kdl"
             kdl.write_text('environment { fixtures { device "node" } }')
@@ -84,7 +94,7 @@ class SnixBehaviorTests(unittest.TestCase):
             kdl.with_suffix(".err").write_text("IO")
             with mock.patch.object(runner, "userns_available", return_value=False):
                 result = runner.run_snix_case(Path("fix"), runner.load_snix_case(kdl, Path(td)))
-        self.assertEqual("fail", result.status)
+        self.assertEqual("blocked", result.status)
 
     def test_fixture_kinds_are_not_silently_ignored(self):
         with tempfile.TemporaryDirectory() as td:

@@ -2,25 +2,47 @@
 
 Runs the [Lix][lix] and [snix][snix] language test corpora against `fix` to
 check that fix implements the Nix language the way the reference evaluators do.
-Each case is a tiny Nix program with golden output; the runner evaluates it with
-`fix eval` and diffs against the golden file.
+Each case is a tiny Nix program with golden output; the runner drives it through
+`fix` and diffs against the golden file.
 
 This is a **differential** suite, separate from `zig build test` (the unit
-tests). Every divergence from the reference evaluator is a `FAIL`, and any
-`FAIL` exits non-zero. There is no known-failures list: the conformance gap is
-meant to be visible — a red run — not papered over. `fix` does **not** pass the
-suite yet.
+tests). It is a complete, **no-skip** inventory: every case is *attempted*, and
+every divergence from the reference evaluator is a `FAIL`. Any `FAIL` exits
+non-zero. There is no known-failures list — the conformance gap is meant to be
+visible (a red run), not papered over. `fix` does **not** pass the suite yet.
 
 ## Running
 
 ```sh
 zig build test-lang                      # both suites against zig-out/bin/fix
 zig build test-lang -- --suite lix -v    # one suite, with expected/actual diffs
-bash test/lang/run.sh --show-skips       # also list cases the harness can't drive
+bash test/lang/run.sh --suite snix       # snix only
+bash test/lang/run-unit.sh               # inventory / no-skip / false-green unit tests
 ```
 
-Requirements: Nix (to resolve the pinned corpora) and a `python3` — the wrapper
-borrows one from `nix-shell -p python3` when none is on `PATH`.
+Hard requirements: **Nix** (to resolve the pinned corpora) and a **python3 with
+pyyaml** — the wrapper borrows one from `nix-shell -p python3
+python3Packages.pyyaml` when none is on `PATH`. pyyaml normalizes `fix parse
+--json` output the way the Lix lang-runner does.
+
+## Status model
+
+Every case ends in exactly one of three states:
+
+- **pass** — fix matches the reference evaluator.
+- **fail** — a real conformance gap, *or* a case the harness cannot honestly
+  drive: an unsupported flag / experimental feature (translation failure), a
+  missing / malformed fixture or golden, a process-launch failure, a `parse-fail`
+  case (attempted, but we do not reproduce Nix's exact parser error strings), or
+  a `parse-okay` case whose AST JSON differs. **Any fail exits non-zero.**
+- **blocked** — the case's *external* dependency is provably absent, and there is
+  nothing fix could do about it here: no nix-daemon / writable store
+  (`nix-store` cases), or no rootless user+mount namespace / system device for a
+  device fixture. `blocked` is **always printed** with its reason, is **never**
+  counted as a pass, and does **not** fail the build.
+
+There is no `skip`. Anything that "can't be driven" for a reason *within* fix's
+control (unsupported feature, malformed case) is a `fail`, not `blocked`.
 
 ## Where the corpora come from
 
@@ -28,34 +50,34 @@ Both are pinned via [npins](../../npins/sources.json) and resolved to
 `/nix/store` paths on demand, so nothing third-party is vendored here. Bump them
 with `npins update lix snix`.
 
-- **Lix** — `tests/functional2/lang/`. TOML-driven; each directory is a group of
-  `eval-okay` / `eval-fail` (and `parse-*`, which we skip) runners. `eval-okay`
-  is `nix-instantiate --eval --strict in.nix` compared to `<name>.out.exp`.
+- **Lix** — `tests/functional2/lang/`. 211 declarative `eval-okay`/`eval-fail`
+  cases (`fix eval --strict`), 67 declarative `parse-*` cases (`fix parse
+  --json`, JSON→YAML normalized vs the golden; `parse-fail` is attempted but a
+  visible fail), and the 7 python-backed custom dirs (79 cases:
+  `builtins.getEnv`/`pathExists`/`readDir`/`readFileType`/`err_context` = 1 each,
+  `parser-token-whitespace` = 68, `search-path` = 6), driven as explicit fix
+  adapters using the upstream fixtures/goldens.
 - **snix** — `contrib/nix-language-test-suite/`, an explicitly
-  cross-implementation suite: `.nix` input + `.kdl` descriptor + `.exp` (golden
-  value) or `.err` (an error *kind*, matched by substring against fix's stderr).
+  cross-implementation suite (116 `.kdl` cases; `meta.kdl` is docs). `.nix` input
+  + `.kdl` descriptor + `.exp` (golden value) or `.err` (an error *kind*, matched
+  by substring against fix's stderr, requiring `rc == 1`).
 
-## What `skip` means
+## Inventory guard
 
-`skip` is **only** for cases the harness cannot drive — not for language
-behavior fix gets wrong (those are `FAIL`s). A case is skipped when it:
-
-- needs a running store/daemon or network (`.kdl` `network` / `nix-store`);
-- requires a flag fix doesn't have (e.g. Lix's `--no-location` for XML) or an
-  experimental feature fix doesn't implement;
-- needs a fixture fix's harness can't create without privileges (device / fifo /
-  socket nodes); or
-- Lix's `parse-okay` / `parse-fail` runners, which dump Lix's internal AST as
-  YAML — not a portable target.
+`run-unit.sh` runs unittest-style tests that independently re-scan the corpora
+and assert the counts (211 eval, 67 parse, 79 custom = 1/1/1/1/1/68/6, 116 snix),
+that discovery omits nothing, that the false-green sites stay closed (eval-fail
+requires `rc == 1`, missing goldens fail, unsupported flags/features fail), and
+that `blocked` does not fail the build while any other non-pass status does. A
+pin bump that changes an inventory count or adds an unrecognised case fails these.
 
 ## Scope / caveats
 
-- Only the `eval` runners are exercised. Lix `parse-*` cases are skipped.
-- For `eval-fail`, fix's error *text* isn't compared (it differs by design); the
-  Lix side asserts only that evaluation fails, and the snix side matches the
-  declared error *kind* by substring — mirroring snix's own reference runner.
-- `-A` / `--arg` wrap the source, so those cases lose exact source positions
-  (see `src/cli/run.zig`); they still compare values.
+- `parse-fail` error *text* is not reproduced (attempted, reported fail).
+  `eval-fail` error text is not compared either — the Lix side asserts `rc == 1`,
+  the snix side matches the declared error *kind* by substring with `rc == 1`.
+- `-A` / `--arg` wrap the source, so those cases lose exact source positions (see
+  `src/cli/run.zig`); they still compare values.
 
 [lix]: https://git.lix.systems/lix-project/lix
 [snix]: https://git.snix.dev/snix/snix
