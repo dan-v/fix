@@ -1,21 +1,33 @@
 //! `fix parse` — parse a Nix expression and print its AST as JSON, matching
-//! Lix's `nix-instantiate --parse` schema. Parsing only: no evaluator, no
-//! store. On a parse error, fix's own diagnostics go to stderr and we exit 1
-//! (byte-parity with Nix's parse-fail messages is out of scope).
+//! Lix's `nix-instantiate --parse` schema.
+//!
+//! Nix's `--parse` runs static name-binding (`bindVars`) after parsing, so
+//! unbound variables and the deprecated-feature gates are reported before the
+//! AST is printed. We mirror that: after the syntactic parse (used for the JSON
+//! AST), we compile-and-discard through the evaluator to surface those static
+//! errors. This is the CLI reusing the evaluator — like `fix inspect
+//! --no-eval` — not the syntax layer depending on the compiler. Byte-parity
+//! with Nix's error prose is out of scope; the exit code and rejection are what
+//! the pinned parse corpus checks.
 
 const std = @import("std");
+const fix = @import("fix");
 const syntax = @import("syntax");
 const args = @import("args.zig");
+const setup = @import("setup.zig");
 
+const Evaluator = fix.Evaluator;
 const Parser = syntax.parser.Parser;
 const AstArena = syntax.ast.AstArena;
+const Diagnostic = syntax.diagnostic.Diagnostic;
 
 pub const synopsis =
     \\usage: fix parse [options] [path | -e <expression>]
     \\
     \\parse a Nix expression, file, or the default file and print its AST as
     \\JSON (the schema of `nix-instantiate --parse`). Output always JSON;
-    \\`--json` is accepted for compatibility.
+    \\`--json` is accepted for compatibility. Unbound variables and disabled
+    \\deprecated features are reported as errors, as in `nix-instantiate --parse`.
 ;
 
 pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std.process.Args.Iterator) !u8 {
@@ -43,19 +55,42 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         else => null,
     };
 
+    // 1. Syntactic parse — the AST we print, and the syntax-error gate.
     var arena = AstArena.init(allocator);
     defer arena.deinit();
     var parser = Parser.init(allocator, &arena, source);
     defer parser.deinit();
-
     const node = parser.parse() catch |err| switch (err) {
         error.ParseError => {
-            try writeDiagnostics(init, &parser, source, source_path);
+            // Diagnostics carry only spans; fill in the shared source and path.
+            for (parser.diagnostics.items) |*d| {
+                if (d.source == null) d.source = source;
+                if (d.source_path == null) d.source_path = source_path;
+            }
+            try writeDiagnostics(init, source, parser.diagnostics.items);
             return 1;
         },
         else => return err,
     };
 
+    // 2. Static binding / feature check — compile-and-discard through the
+    // evaluator so unbound variables and the deprecated-feature gates surface
+    // exactly as `fix eval` would report them. `source_path = null` forces
+    // eager, whole-expression compilation (no lazy body deferral), so an
+    // unbound variable in any position is caught, matching `bindVars`.
+    setup.applyMemoryBacking(null, init);
+    var ev = try Evaluator.init(allocator, 1);
+    defer ev.deinit();
+    _ = setup.configure(&ev, init, options) catch |err| {
+        std.debug.print("error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    _ = ev.compileSource(source, null) catch {
+        try writeDiagnostics(init, source, ev.getDiagnostics());
+        return 1;
+    };
+
+    // 3. Emit the AST as JSON.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
     syntax.json.write(&w.interface, allocator, source, node) catch |err| {
@@ -79,16 +114,11 @@ fn loadSource(allocator: std.mem.Allocator, init: std.process.Init, source_arg: 
     };
 }
 
-fn writeDiagnostics(init: std.process.Init, parser: *Parser, source: []const u8, source_path: ?[]const u8) !void {
+fn writeDiagnostics(init: std.process.Init, source: []const u8, diagnostics: []const Diagnostic) !void {
     var buf: [8192]u8 = undefined;
     var stderr = try init.io.lockStderr(&buf, null);
     defer init.io.unlockStderr();
     const w = &stderr.file_writer.interface;
-    // Fill in the shared source (diagnostics carry only spans) and path.
-    for (parser.diagnostics.items) |*d| {
-        if (d.source == null) d.source = source;
-        if (d.source_path == null) d.source_path = source_path;
-    }
-    syntax.diagnostic.writeAll(w, source, parser.diagnostics.items) catch {};
+    syntax.diagnostic.writeAll(w, source, diagnostics) catch {};
     w.flush() catch {};
 }
