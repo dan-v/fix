@@ -1,0 +1,352 @@
+const std = @import("std");
+const DerivationStore = @import("store.zig").DerivationStore;
+const FileCache = @import("runtime").file_cache.FileCache;
+const FakeDaemon = @import("test_daemon.zig").FakeDaemon;
+
+const root_path = "/nix/store/00000000000000000000000000000000-root.drv";
+const dep_text_path = "/nix/store/11111111111111111111111111111111-dep-text";
+const dep_nar_path = "/nix/store/22222222222222222222222222222222-dep-nar";
+const missing_path = "/nix/store/33333333333333333333333333333333-missing";
+
+fn recipeApiAvailable() bool {
+    return @hasDecl(DerivationStore, "recordOwnedTextRecipe") and
+        @hasDecl(DerivationStore, "recordOwnedNarRecipe") and
+        @hasDecl(DerivationStore, "recordFlatRecipe") and
+        @hasDecl(DerivationStore, "releaseRecipePayloads");
+}
+
+fn realizationApiAvailable() bool {
+    return recipeApiAvailable() and
+        @hasDecl(DerivationStore, "ensureClosure") and
+        @hasDecl(DerivationStore, "realizeOutput");
+}
+
+fn attachFake(store: *DerivationStore, fake: *FakeDaemon) void {
+    store.setIo(std.testing.io);
+    store.daemon_socket = fake.socketPath();
+}
+
+fn owned(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    return allocator.dupe(u8, bytes);
+}
+
+const TrackingAllocator = struct {
+    child: std.mem.Allocator,
+    tracked_ptr: std.atomic.Value(usize) = .init(0),
+    frees: std.atomic.Value(usize) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn init(child: std.mem.Allocator) TrackingAllocator {
+        return .{ .child = child };
+    }
+
+    fn allocator(self: *TrackingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn track(self: *TrackingAllocator, bytes: []u8) void {
+        std.debug.assert(self.tracked_ptr.load(.seq_cst) == 0);
+        self.tracked_ptr.store(@intFromPtr(bytes.ptr), .seq_cst);
+    }
+
+    fn freeCount(self: *TrackingAllocator) usize {
+        return self.frees.load(.seq_cst);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+        const tracked = @intFromPtr(memory.ptr) == self.tracked_ptr.load(.seq_cst);
+        self.child.rawFree(memory, alignment, return_address);
+        if (tracked) _ = self.frees.fetchAdd(1, .monotonic);
+    }
+};
+
+test "recordOwnedTextRecipe consumes the producer allocation" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(allocator);
+        const payload = try owned(allocator, "owned derivation text");
+        const payload_ptr = @intFromPtr(payload.ptr);
+        tracking.track(payload);
+
+        try store.recordOwnedTextRecipe(root_path, payload, &.{dep_text_path});
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+        store.releaseRecipePayloads();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        try std.testing.expectEqual(payload_ptr, tracking.tracked_ptr.load(.seq_cst));
+        store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "recordOwnedNarRecipe consumes the original serializer allocation" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(allocator);
+        const payload = try owned(allocator, "nix-archive-1 serialized tree");
+        tracking.track(payload);
+
+        try store.recordOwnedNarRecipe(dep_nar_path, payload);
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+        store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "recordFlatRecipe retains the same ImmutableBytes blob" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        const bytes = try owned(allocator, "flat cache payload");
+        const original_ptr = @intFromPtr(bytes.ptr);
+        tracking.track(bytes);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
+
+        try store.recordFlatRecipe(dep_text_path, handle);
+        try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
+        handle.release();
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+        store.releaseRecipePayloads();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "duplicate identical owned recipe registration releases incoming ownership" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(allocator);
+        defer store.deinit();
+        try store.recordOwnedTextRecipe(root_path, try owned(allocator, "same text"), &.{dep_text_path});
+        const duplicate = try owned(allocator, "same text");
+        tracking.track(duplicate);
+
+        try store.recordOwnedTextRecipe(root_path, duplicate, &.{dep_text_path});
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "duplicate identical flat recipe does not leak an incoming retain" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(std.testing.allocator);
+        const bytes = try owned(allocator, "same flat bytes");
+        tracking.track(bytes);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
+
+        try store.recordFlatRecipe(dep_text_path, handle);
+        try store.recordFlatRecipe(dep_text_path, handle);
+        handle.release();
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+        store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "conflicting recipe preserves the original and consumes the rejected payload" {
+    if (comptime realizationApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(allocator, "original text"), &.{});
+        const rejected = try owned(allocator, "conflicting text");
+        tracking.track(rejected);
+
+        try std.testing.expectError(
+            error.RecipeConflict,
+            store.recordOwnedTextRecipe(root_path, rejected, &.{}),
+        );
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        try store.ensureClosure(root_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
+        try std.testing.expect(fake.nthPayloadEquals(.text, 0, "original text"));
+    } else return error.MissingRecipeRealizationApi;
+}
+
+test "successful realization releases recipe payload and realizes requested output" {
+    if (comptime realizationApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        const payload = try owned(allocator, "realized derivation");
+        tracking.track(payload);
+        try store.recordOwnedTextRecipe(root_path, payload, &.{});
+
+        try store.realizeOutput(root_path, &.{"out"});
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
+        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "^out"));
+    } else return error.MissingRecipeRealizationApi;
+}
+
+test "releaseRecipePayloads is idempotent and teardown frees exactly once" {
+    if (comptime recipeApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var store = DerivationStore.init(std.testing.allocator);
+        const bytes = try owned(allocator, "released once");
+        tracking.track(bytes);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
+        try store.recordFlatRecipe(dep_text_path, handle);
+        handle.release();
+
+        store.releaseRecipePayloads();
+        store.releaseRecipePayloads();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        store.deinit();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
+}
+
+test "ensureClosure materializes invalid references dependency first" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedNarRecipe(dep_nar_path, try owned(std.testing.allocator, "dep nar"));
+        try store.recordOwnedTextRecipe(dep_text_path, try owned(std.testing.allocator, "dep text"), &.{});
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "root text"), &.{ dep_nar_path, dep_text_path });
+
+        try store.ensureClosure(root_path);
+        try std.testing.expectEqual(@as(usize, 3), fake.materializationCount());
+        try std.testing.expect(fake.nthMaterializationSubjectEquals(0, "dep-nar"));
+        try std.testing.expect(fake.nthMaterializationSubjectEquals(1, "dep-text"));
+        try std.testing.expect(fake.nthMaterializationSubjectEquals(2, "root.drv"));
+    } else return error.MissingClosureRealizationApi;
+}
+
+test "ensureClosure is a no-op for an already valid path" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        try fake.markValid(root_path);
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "unused"), &.{});
+
+        try store.ensureClosure(root_path);
+        try std.testing.expectEqual(@as(usize, 0), fake.materializationCount());
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.query));
+    } else return error.MissingClosureRealizationApi;
+}
+
+test "ensureClosure errors for an invalid referenced path with no recipe" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "root"), &.{missing_path});
+
+        try std.testing.expectError(error.MissingStoreRecipe, store.ensureClosure(root_path));
+        try std.testing.expectEqual(@as(usize, 0), fake.materializationCount());
+    } else return error.MissingClosureRealizationApi;
+}
+
+const ConcurrentDemand = struct {
+    store: *DerivationStore,
+    result: anyerror!void = {},
+
+    fn run(self: *ConcurrentDemand) void {
+        self.result = self.store.ensureClosure(root_path);
+    }
+};
+
+test "concurrent closure demand has exactly one materializing writer" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "one writer"), &.{});
+
+        var demands: [8]ConcurrentDemand = undefined;
+        var threads: [demands.len]std.Thread = undefined;
+        for (&demands, &threads) |*demand, *thread| {
+            demand.* = .{ .store = &store };
+            thread.* = try std.Thread.spawn(.{}, ConcurrentDemand.run, .{demand});
+        }
+        for (threads) |thread| thread.join();
+        for (&demands) |*demand| try demand.result;
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
+    } else return error.MissingClosureRealizationApi;
+}
+
+test "permanent realization failure is replayed without a second writer" {
+    if (comptime realizationApiAvailable()) {
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        fake.failNextAdd();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "permanent failure"), &.{});
+
+        try std.testing.expectError(error.DaemonError, store.ensureClosure(root_path));
+        try std.testing.expectError(error.DaemonError, store.ensureClosure(root_path));
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
+    } else return error.MissingClosureRealizationApi;
+}
+
+test "transient connection failure resets claim state and permits retry" {
+    if (comptime realizationApiAvailable()) {
+        const socket_path = try FakeDaemon.makeSocketPath(std.testing.allocator);
+        defer std.testing.allocator.free(socket_path);
+        var fake: ?*FakeDaemon = null;
+        defer if (fake) |daemon| daemon.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        store.setIo(std.testing.io);
+        store.daemon_socket = socket_path;
+        try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "retry succeeds"), &.{});
+
+        var failed = false;
+        store.ensureClosure(root_path) catch {
+            failed = true;
+        };
+        try std.testing.expect(failed);
+        fake = try FakeDaemon.startAt(std.testing.allocator, std.testing.io, socket_path);
+        try store.ensureClosure(root_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.?.count(.text));
+    } else return error.MissingClosureRealizationApi;
+}
