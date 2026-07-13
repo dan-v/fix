@@ -28,6 +28,17 @@ pub const Drv = struct {
     env: []EnvVar,
 
     pub fn computePaths(self: *Drv, allocator: std.mem.Allocator, resolver: HashModuloResolver) !ComputedPaths {
+        return self.computePathsWithPayloadAllocator(allocator, allocator, resolver);
+    }
+
+    /// Compute paths while placing the final ATerm in the long-lived store
+    /// allocator so its exact allocation can be transferred into a recipe.
+    pub fn computePathsWithPayloadAllocator(
+        self: *Drv,
+        allocator: std.mem.Allocator,
+        payload_allocator: std.mem.Allocator,
+        resolver: HashModuloResolver,
+    ) !ComputedPaths {
         for (self.outputs) |*output| {
             if (output.hash_algo.len != 0) {
                 output.path = try paths.fixedOutputPath(allocator, resolver.store_dir, self.name, output.name, output.hash_algo, output.hash);
@@ -65,18 +76,21 @@ pub const Drv = struct {
             }
         }
 
-        const text = try self.toATerm(allocator, false, null);
-        defer allocator.free(text);
+        const text = try self.toATerm(payload_allocator, false, null);
+        errdefer payload_allocator.free(text);
         const refs = try self.textReferences(allocator);
-        defer allocator.free(refs);
+        errdefer allocator.free(refs);
         const drv_name = try paths.drvPathName(allocator, self.name);
         defer allocator.free(drv_name);
         const drv_path = try paths.textPath(allocator, resolver.store_dir, drv_name, text, refs);
+        errdefer allocator.free(drv_path);
         const dependency_hash_modulo = try self.hashModuloWithInputs(allocator, actual_inputs, false);
         errdefer dependency_hash_modulo.deinit(allocator);
         return .{
             .drv_path = drv_path,
             .hash_modulo = dependency_hash_modulo,
+            .drv_aterm = text,
+            .drv_text_references = refs,
         };
     }
 

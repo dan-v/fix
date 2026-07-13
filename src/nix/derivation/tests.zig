@@ -63,6 +63,8 @@ test "derivation IR computes minimal Nix paths" {
     const paths = try drv.computePaths(std.testing.allocator, store.resolver());
     defer std.testing.allocator.free(paths.drv_path);
     defer paths.hash_modulo.deinit(std.testing.allocator);
+    defer std.testing.allocator.free(paths.drv_aterm);
+    defer std.testing.allocator.free(paths.drv_text_references);
 
     try std.testing.expectEqualStrings("/nix/store/s8l8ca4j8fb6d94205514xd6wf9b57ng-pkg.drv", paths.drv_path);
     try std.testing.expectEqualStrings("/nix/store/8w6a3g1mvf8qkz788dysw8k4hmq91cc8-pkg", outputs[0].path);
@@ -667,6 +669,8 @@ test "debugRecordFromDrv captures aterm hash and text references, freed on deini
     const paths = try drv.computePaths(std.testing.allocator, store.resolver());
     defer std.testing.allocator.free(paths.drv_path);
     defer paths.hash_modulo.deinit(std.testing.allocator);
+    defer std.testing.allocator.free(paths.drv_aterm);
+    defer std.testing.allocator.free(paths.drv_text_references);
 
     const record = try debug_record_mod.debugRecordFromDrv(std.testing.allocator, &drv, paths.drv_path, store.resolver());
     defer record.deinit(std.testing.allocator);

@@ -72,12 +72,22 @@ pub fn ingestReport(
     filter: ?nar.Filter,
     unsupported: ?*nar.Unsupported,
 ) !Ingested {
-    const nar_bytes = try nar.serializeReport(allocator, files, path, filter, unsupported);
-    defer allocator.free(nar_bytes);
+    const payload_allocator = derivations.allocator;
+    const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
+    var nar_owned = true;
+    defer if (nar_owned) payload_allocator.free(nar_bytes);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
-    return ingestSerializedNar(allocator, derivations, name, nar_bytes, &digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
+    errdefer allocator.free(store_path);
+    const nar_hash = try sriHash(allocator, &digest);
+    errdefer allocator.free(nar_hash);
+    try derivations.noteProducerPayloadForTest(store_path, nar_bytes);
+    nar_owned = false; // recordOwnedNarRecipe consumes on success and error.
+    try derivations.recordOwnedNarRecipe(store_path, nar_bytes);
+    return .{ .store_path = store_path, .nar_hash = nar_hash };
 }
 
 /// Ingest an already serialized and SHA-256-hashed NAR without repeating
@@ -160,15 +170,16 @@ pub fn flatStorePathForFile(
     path: []const u8,
     name: []const u8,
 ) !FlatIngested {
-    const bytes = try files.readFile(path);
+    var contents = try files.retainFile(path);
+    defer contents.release();
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(contents.bytes(), &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
 
     const store_path = try drv_paths.fixedOutputPath(allocator, derivations.store_dir, name, "out", "sha256", hex[0..]);
     errdefer allocator.free(store_path);
-    try derivations.instantiateFlat(store_path, bytes);
+    try derivations.recordFlatRecipe(store_path, contents);
 
     return .{ .store_path = store_path, .hash_hex = hex };
 }

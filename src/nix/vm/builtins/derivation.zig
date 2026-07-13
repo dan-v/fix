@@ -185,27 +185,6 @@ fn nameCharsValid(name: []const u8) bool {
     return true;
 }
 
-/// Import-from-derivation: write `drv_attrs`'s `.drv` to the real store (and any
-/// input closure that is (re)forced here and not yet cached), then realize
-/// `derived_path` (`<drvpath>!*`) via the daemon so the demanded output exists
-/// on disk. `drv_attrs_id` is the original input attrs — the derivation value's
-/// `drvAttrs`. Called only when a not-yet-built derivation output's content or
-/// existence is demanded during plain `eval` (readFile/readDir/pathExists).
-///
-/// Note: input `.drv`s already forced (and cached) during the surrounding pure
-/// eval are NOT rewritten here — the daemon relies on them already being valid
-/// in the store, as they normally are. Only the demanded closure re-forced
-/// inside this scope gets written.
-pub fn realizeDerivationForIfd(self: anytype, drv_attrs_id: ObjectId, derived_path: []const u8) !void {
-    self.derivations.beginIfdWrites();
-    defer self.derivations.endIfdWrites();
-    // Re-force writes the target `.drv` (via `instantiateDrv`, now permitted by
-    // the IFD scope). `.lazy` still normalizes + writes the `.drv`; it just
-    // skips forcing every output's value, which the daemon build materializes.
-    _ = try buildForcedDerivationValue(self, drv_attrs_id, .lazy);
-    try self.derivations.realizePaths(&.{derived_path}, .normal);
-}
-
 fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: DerivationMode) !Value {
     // GC: `attrs_id` is a bare id held across the whole (force-heavy) build.
     const gc_roots = vm_force.rootsBegin(self);
@@ -238,41 +217,46 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
     prof.end(.drv_normalize, t_norm);
     defer normalized.deinit(self.allocator);
     const t_comp = prof.start(.drv_compute);
-    const computed = normalized.drv.computePaths(self.allocator, self.derivations.resolver()) catch |err| {
+    const computed = normalized.drv.computePathsWithPayloadAllocator(
+        self.allocator,
+        self.derivations.allocator,
+        self.derivations.resolver(),
+    ) catch |err| {
         prof.end(.drv_compute, t_comp);
         return err;
     };
     prof.end(.drv_compute, t_comp);
     defer self.allocator.free(computed.drv_path);
     defer computed.hash_modulo.deinit(self.allocator);
+    defer self.allocator.free(computed.drv_text_references);
+    var drv_aterm_owned = true;
+    defer if (drv_aterm_owned) self.derivations.allocator.free(computed.drv_aterm);
     try self.derivations.record(computed.drv_path, computed.hash_modulo.view(), normalized.drv.outputs);
     try self.derivations.recordDebug(&normalized.drv, computed);
 
-    // When a daemon store is attached (`fix instantiate`/`build`, or a transient
-    // import-from-derivation realize), write this derivation's `.drv` to the real
-    // store as it is forced. Its input `.drv`s were forced (hence written) during
-    // `normalizeDerivation` above, so their paths are already valid references —
-    // correct topological order for free.
-    if (self.derivations.writesActive()) {
-        // A store write can happen off the demand fiber, so report it as an
-        // independent concurrent span (its own render node, safe to open/close
-        // from any thread) rather than on the demand-only stage stack.
-        var store_span: ?eval_progress.Span = null;
+    // Render the ATerm exactly once and transfer that allocation to the store's
+    // recipe graph. In global store-writing mode recordOwnedTextRecipe writes it
+    // immediately and consumes it without retaining a recipe.
+    var store_span: ?eval_progress.Span = null;
+    if (self.derivations.store_writes_enabled) {
         if (self.progress_spans) |spans| {
             var name_buf: [128]u8 = undefined;
             const label = std.fmt.bufPrint(&name_buf, "{s}.drv", .{drv_name}) catch drv_name;
             store_span = spans.beginSpan(.store, label);
         }
-        defer if (store_span) |sp| {
-            if (self.progress_spans) |spans| spans.endSpan(sp);
-        };
-
-        const aterm = try normalized.drv.toATerm(self.allocator, false, null);
-        defer self.allocator.free(aterm);
-        const references = try normalized.drv.textReferences(self.allocator);
-        defer self.allocator.free(references); // elements borrowed from the Drv
-        try self.derivations.instantiateDrv(computed.drv_path, aterm, references);
     }
+    defer if (store_span) |sp| {
+        if (self.progress_spans) |spans| spans.endSpan(sp);
+    };
+
+    try self.derivations.noteProducerPayloadForTest(computed.drv_path, computed.drv_aterm);
+    // recordOwnedTextRecipe consumes drv_aterm on success and error.
+    drv_aterm_owned = false;
+    try self.derivations.recordOwnedTextRecipe(
+        computed.drv_path,
+        computed.drv_aterm,
+        computed.drv_text_references,
+    );
 
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);

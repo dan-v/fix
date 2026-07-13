@@ -381,6 +381,7 @@ pub const Worker = struct {
     pub fn run(self: *Worker) void {
         worker_id_mod.current = self.worker_id;
         if (comptime gc.enabled) vm_force.gcRegisterWorkerCaches(self.worker_id);
+        defer if (comptime gc.enabled) vm_force.gcUnregisterWorkerCaches(self.worker_id);
         while (!self.shouldStop()) {
             self.gcSafepoint();
             if (self.drainStep() catch |err| {

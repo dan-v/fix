@@ -86,16 +86,6 @@ pub const DerivationStore = struct {
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
 
-    /// Import-from-derivation (IFD) scope depth. When > 0, `instantiate*` /
-    /// `pathIsValid` behave as if store writes were enabled even during plain
-    /// `eval` — the narrow, on-demand window where a demanded derivation
-    /// output (readFile/readDir/pathExists of a not-yet-built `.drv` output) is
-    /// realized on the fly. Kept separate from `store_writes_enabled` so plain
-    /// eval stays pure everywhere else: only the closure re-forced *inside* a
-    /// realize writes its `.drv`. Atomic because input forcing during the
-    /// re-force can fan to helper fibers on other workers.
-    ifd_writes: std.atomic.Value(u32) = .init(0),
-
     /// Optional off-thread executor for blocking daemon ops. When set (by the
     /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
     /// on the shared IO thread while the calling fiber parks — keeping the
@@ -108,15 +98,16 @@ pub const DerivationStore = struct {
     /// locking or payload refcount traffic.
     recipes: std.StringHashMapUnmanaged(*Recipe) = .empty,
     realization_claims: std.StringHashMapUnmanaged(*RealizationClaim) = .empty,
+    realized_outputs: std.StringHashMapUnmanaged(void) = .empty,
     recipe_mu: stable.BlockingMutex = .{},
     /// Test-only deterministic scheduling hook. This field is zero-bit `void`
     /// and all access is compiled out of production builds.
     test_root_claim_hook: if (builtin.is_test) ?RootClaimHook else void = if (builtin.is_test) null else {},
-    /// Original payload allocations observed at Task 5 producer boundaries.
-    /// Future producer registration records here immediately before transferring
-    /// ownership to a recipe. The field is zero-bit and every operation compiles
-    /// away outside tests, so production has no storage or runtime cost.
-    test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(usize) else void = if (builtin.is_test) .empty else {},
+    /// Original payload allocations observed at producer allocation boundaries.
+    /// A path can be produced more than once, so tests retain every observation
+    /// until recipe identity is compared and then consume the whole entry. The
+    /// field is zero-bit and all calls compile away outside tests.
+    test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) else void = if (builtin.is_test) .empty else {},
 
     /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
     /// on the IO thread and blocks the calling fiber until it returns.
@@ -136,33 +127,101 @@ pub const DerivationStore = struct {
         } else unreachable;
     }
 
-    /// Test-only producer-boundary seam for Task 5 GREEN. Producers call this
-    /// with their original owned ATerm, toFile text, or serialized NAR slice
-    /// immediately before passing that same allocation to `recordOwned*Recipe`.
+    /// Test-only producer-boundary seam. Producers call this after the owned
+    /// allocation is created, independently of whether registration succeeds.
     pub fn noteProducerPayloadForTest(self: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
         if (comptime builtin.is_test) {
             self.recipe_mu.lock();
             defer self.recipe_mu.unlock();
             const owned_path = try self.allocator.dupe(u8, store_path);
-            errdefer self.allocator.free(owned_path);
-            const result = try self.test_producer_payload_pointers.getOrPut(self.allocator, owned_path);
-            const pointer = @intFromPtr(payload.ptr);
+            const result = self.test_producer_payload_pointers.getOrPut(self.allocator, owned_path) catch |err| {
+                self.allocator.free(owned_path);
+                return err;
+            };
             if (result.found_existing) {
                 self.allocator.free(owned_path);
-                if (result.value_ptr.* != pointer) return error.ProducerPayloadPointerConflict;
             } else {
-                result.value_ptr.* = pointer;
+                result.value_ptr.* = .empty;
             }
+            const pointer = @intFromPtr(payload.ptr);
+            for (result.value_ptr.items) |observed| if (observed == pointer) return;
+            result.value_ptr.append(self.allocator, pointer) catch |err| {
+                if (!result.found_existing) {
+                    const removed = self.test_producer_payload_pointers.fetchRemove(store_path).?;
+                    self.allocator.free(removed.key);
+                }
+                return err;
+            };
         }
     }
 
-    /// Pointer captured by `noteProducerPayloadForTest`; test-only and absent
-    /// from production storage/code paths.
+    /// Consume the allocation observations for `store_path`, returning the one
+    /// actually retained by the recipe. A non-matching first observation keeps
+    /// identity failures visible. Consumption prevents stale-map false passes.
     pub fn producerPayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
         if (comptime builtin.is_test) {
             self.recipe_mu.lock();
             defer self.recipe_mu.unlock();
-            return self.test_producer_payload_pointers.get(store_path);
+            var removed = self.test_producer_payload_pointers.fetchRemove(store_path) orelse return null;
+            defer self.allocator.free(removed.key);
+            defer removed.value.deinit(self.allocator);
+            const retained = if (self.recipes.get(store_path)) |recipe| recipePayloadPointer(recipe) else null;
+            if (retained) |pointer| {
+                for (removed.value.items) |observed| if (observed == pointer) return observed;
+            }
+            return if (removed.value.items.len == 0) null else removed.value.items[0];
+        } else return null;
+    }
+
+    pub const RecipeVariantForTest = enum { text, nar, flat };
+
+    pub fn recipeCountForTest(self: *DerivationStore) usize {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            return self.recipes.count();
+        } else return 0;
+    }
+
+    pub fn recipeVariantForTest(self: *DerivationStore, store_path: []const u8) ?RecipeVariantForTest {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            const recipe = self.recipes.get(store_path) orelse return null;
+            return switch (recipe.payload) {
+                .text => .text,
+                .nar => .nar,
+                .flat => .flat,
+            };
+        } else return null;
+    }
+
+    pub fn recipePayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            return recipePayloadPointer(self.recipes.get(store_path) orelse return null);
+        } else return null;
+    }
+
+    pub fn recipePayloadBytesForTest(self: *DerivationStore, store_path: []const u8) ?[]const u8 {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            const recipe = self.recipes.get(store_path) orelse return null;
+            return switch (recipe.payload) {
+                .text => |text| text.bytes,
+                .nar => |bytes| bytes,
+                .flat => |bytes| bytes.bytes(),
+            };
+        } else return null;
+    }
+
+    pub fn recipeReferencesForTest(self: *DerivationStore, store_path: []const u8) ?[]const []const u8 {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            return (self.recipes.get(store_path) orelse return null).references();
         } else return null;
     }
 
@@ -240,6 +299,14 @@ pub const DerivationStore = struct {
         }
     };
 
+    fn recipePayloadPointer(recipe: *const Recipe) usize {
+        return switch (recipe.payload) {
+            .text => |text| @intFromPtr(text.bytes.ptr),
+            .nar => |bytes| @intFromPtr(bytes.ptr),
+            .flat => |bytes| @intFromPtr(bytes.bytes().ptr),
+        };
+    }
+
     const RealizationClaim = struct {
         mu: stable.BlockingMutex = .{},
         seq: std.atomic.Value(u32) = .init(0),
@@ -290,9 +357,15 @@ pub const DerivationStore = struct {
             entry.value_ptr.*.release(self.allocator);
         }
         self.realization_claims.deinit(self.allocator);
+        var realized = self.realized_outputs.keyIterator();
+        while (realized.next()) |key| self.allocator.free(key.*);
+        self.realized_outputs.deinit(self.allocator);
         if (comptime builtin.is_test) {
-            var producer_pointers = self.test_producer_payload_pointers.keyIterator();
-            while (producer_pointers.next()) |key| self.allocator.free(key.*);
+            var producer_pointers = self.test_producer_payload_pointers.iterator();
+            while (producer_pointers.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
             self.test_producer_payload_pointers.deinit(self.allocator);
         }
         self.recipe_mu.unlock();
@@ -346,26 +419,6 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
-    /// Whether store writes are currently permitted — either globally
-    /// (`fix instantiate`/`build`) or transiently inside an IFD realize.
-    pub fn writesActive(self: *DerivationStore) bool {
-        return self.store_writes_enabled or self.ifd_writes.load(.seq_cst) != 0;
-    }
-
-    /// TEMPORARY Task-4 bridge for the legacy producer-driven IFD path.
-    /// Task 5 removes these in favor of explicit recipe registration.
-    /// Enter an import-from-derivation realize scope: `.drv`/source writes are
-    /// permitted until the matching `endIfdWrites`. Balanced by the caller.
-    pub fn beginIfdWrites(self: *DerivationStore) void {
-        _ = self.ifd_writes.fetchAdd(1, .seq_cst);
-    }
-
-    /// TEMPORARY Task-4 bridge for the legacy producer-driven IFD path.
-    /// Task 5 removes these in favor of explicit recipe registration.
-    pub fn endIfdWrites(self: *DerivationStore) void {
-        _ = self.ifd_writes.fetchSub(1, .seq_cst);
-    }
-
     /// Install the off-thread daemon-op executor. Must be called before any
     /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
     /// torn down.
@@ -406,7 +459,7 @@ pub const DerivationStore = struct {
     /// Write a text-addressed object (a `.drv` or `builtins.toFile` result),
     /// gated on `store_writes_enabled` (off during plain eval).
     pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
-        if (!self.writesActive()) return;
+        if (!self.store_writes_enabled) return;
         return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
     }
 
@@ -414,14 +467,14 @@ pub const DerivationStore = struct {
     /// Sources ingest during derivation normalization — before the `.drv` that
     /// references them — so `input_srcs` are valid in time.
     pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
-        if (!self.writesActive()) return;
+        if (!self.store_writes_enabled) return;
         return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
     pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
-        if (!self.writesActive()) return;
+        if (!self.store_writes_enabled) return;
         return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } });
     }
 
@@ -431,7 +484,7 @@ pub const DerivationStore = struct {
     /// (else there is no daemon); returns false otherwise. Offloaded like the
     /// writes so the calling fiber parks rather than blocking on the socket.
     pub fn pathIsValid(self: *DerivationStore, store_path: []const u8) !bool {
-        if (!self.writesActive()) return false;
+        if (!self.store_writes_enabled) return false;
         return self.queryPathValid(store_path);
     }
 
@@ -573,6 +626,11 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+        if (self.store_writes_enabled) {
+            defer self.allocator.free(text);
+            return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
+        }
+
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 
@@ -595,6 +653,11 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordOwnedNarRecipe(self: *DerivationStore, store_path: []const u8, nar_bytes: []u8) !void {
+        if (self.store_writes_enabled) {
+            defer self.allocator.free(nar_bytes);
+            return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
+        }
+
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 
@@ -615,17 +678,20 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes) !void {
+        if (self.store_writes_enabled) {
+            return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = handle.bytes() } });
+        }
+
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 
         var retained = handle.retain();
-        errdefer retained.release();
-
         if (self.recipes.get(store_path)) |recipe| {
-            retained.release();
+            defer retained.release();
             if (recipe.flatMatches(handle)) return;
             return error.RecipeConflict;
         }
+        errdefer retained.release();
 
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
@@ -654,12 +720,32 @@ pub const DerivationStore = struct {
     };
 
     pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
+        if (self.offload) |off| {
+            var cell: EnsureClosureCell = .{ .store = self, .store_path = store_path };
+            off.run(off.ctx, EnsureClosureCell.run, &cell);
+            return cell.err;
+        }
         return self.ensureClosureInner(store_path, null);
     }
 
+    const EnsureClosureCell = struct {
+        store: *DerivationStore,
+        store_path: []const u8,
+        err: anyerror!void = {},
+
+        fn run(pointer: *anyopaque) void {
+            const self: *EnsureClosureCell = @ptrCast(@alignCast(pointer));
+            self.err = self.store.ensureClosureInner(self.store_path, null);
+        }
+    };
+
     fn ensureClosureInner(self: *DerivationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
         while (true) {
-            if (try self.queryPathValid(store_path)) return;
+            // This runs inside the one outer realization offload when an I/O
+            // executor is installed. Keep nested daemon operations inline on
+            // that I/O thread so concurrent realization jobs cannot enqueue
+            // work behind themselves.
+            if (try self.applyIsValid(store_path)) return;
             if (visitContains(parent, store_path)) return error.RecipeCycle;
 
             const claim_result = try self.claimMissingPath(store_path);
@@ -702,10 +788,73 @@ pub const DerivationStore = struct {
     }
 
     pub fn realizeOutput(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
-        try self.ensureClosure(drv_path);
+        if (self.offload) |off| {
+            var cell: RealizeOutputCell = .{ .store = self, .drv_path = drv_path, .outputs = outputs };
+            off.run(off.ctx, RealizeOutputCell.run, &cell);
+            return cell.err;
+        }
+        return self.realizeOutputInline(drv_path, outputs);
+    }
+
+    const RealizeOutputCell = struct {
+        store: *DerivationStore,
+        drv_path: []const u8,
+        outputs: []const []const u8,
+        err: anyerror!void = {},
+
+        fn run(pointer: *anyopaque) void {
+            const self: *RealizeOutputCell = @ptrCast(@alignCast(pointer));
+            self.err = self.store.realizeOutputInline(self.drv_path, self.outputs);
+        }
+    };
+
+    fn realizeOutputInline(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
+        try self.ensureClosureInner(drv_path, null);
         const derived = try self.derivedPathString(drv_path, outputs);
         defer self.allocator.free(derived);
-        try self.realizePaths(&.{derived}, .normal);
+
+        while (true) {
+            self.recipe_mu.lock();
+            const already_realized = self.realized_outputs.contains(derived);
+            self.recipe_mu.unlock();
+            if (already_realized) return;
+
+            const claim_result = try self.claimMissingPath(derived);
+            const claim = claim_result.claim;
+            defer claim.release(self.allocator);
+            if (!claim_result.writer) {
+                switch (self.waitForClaim(claim)) {
+                    .success => return,
+                    .retry => continue,
+                    .permanent_failure => return claim.err.?,
+                    .writing => unreachable,
+                }
+            }
+
+            self.buildPaths(&.{derived}, null, .normal) catch |err| {
+                if (retryableRealizationError(err)) {
+                    self.finishRetryableClaim(derived, claim, err);
+                } else {
+                    claim.publish(.permanent_failure, err);
+                }
+                return err;
+            };
+            self.markOutputRealized(derived) catch |err| {
+                self.finishRetryableClaim(derived, claim, err);
+                return err;
+            };
+            self.finishSuccessfulClaim(derived, claim);
+            return;
+        }
+    }
+
+    fn markOutputRealized(self: *DerivationStore, derived: []const u8) !void {
+        const key = try self.allocator.dupe(u8, derived);
+        errdefer self.allocator.free(key);
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        const result = try self.realized_outputs.getOrPut(self.allocator, key);
+        if (result.found_existing) self.allocator.free(key);
     }
 
     fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8, visit: *const Visit) anyerror!void {
@@ -717,9 +866,9 @@ pub const DerivationStore = struct {
 
         for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
         switch (recipe.payload) {
-            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
-            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
-            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
+            .text => |text| try self.applyDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
+            .nar => |nar_bytes| try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
+            .flat => |bytes| try self.applyDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
         }
         self.releaseRecipeForPath(store_path);
     }

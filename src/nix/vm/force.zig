@@ -122,6 +122,14 @@ pub fn gcRegisterWorkerCaches(worker_id: u8) void {
     access.gcRegisterAttrCache(worker_id);
 }
 
+/// Remove cache pointers before a helper thread exits; its TLS storage becomes
+/// invalid immediately afterward and must not remain visible to a later GC.
+pub fn gcUnregisterWorkerCaches(worker_id: u8) void {
+    if (comptime !gc.enabled) return;
+    thunk_memo_registry[worker_id] = null;
+    access.gcUnregisterAttrCache(worker_id);
+}
+
 /// Mark every registered worker's live memo entries. STW-only (peers parked).
 pub fn gcMarkThunkMemo(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     if (comptime !gc.enabled) return;

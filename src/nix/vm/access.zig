@@ -187,6 +187,11 @@ pub fn gcRegisterAttrCache(worker_id: u8) void {
     attr_cache_registry[worker_id] = &attr_cache;
 }
 
+pub fn gcUnregisterAttrCache(worker_id: u8) void {
+    if (comptime !gc.enabled) return;
+    attr_cache_registry[worker_id] = null;
+}
+
 /// Mark every registered worker's live attr-cache entries. STW-only.
 pub fn gcMarkAttrCache(tr: *gc.Tracer, heap: *const heap_mod.ObjectHeap) void {
     if (comptime !gc.enabled) return;

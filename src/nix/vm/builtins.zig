@@ -22,6 +22,7 @@ const prof = @import("probe").prof;
 
 pub const writeJsonValue = serial.writeJsonValue;
 pub const writeLazyXmlValue = serial.writeLazyXmlValue;
+pub const demandPathArg = io.demandPathArg;
 
 pub fn applyBuiltin(self: anytype, builtin_id: u16, args: []const Value) !Value {
     const t = prof.startBuiltin(builtin_id);

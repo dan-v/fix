@@ -75,11 +75,18 @@ pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value
     for (ref_ids.items, refs) |ref_id, *ref| ref.* = self.intern.get(ref_id);
 
     const name = self.intern.get(name_id);
-    const contents = self.intern.get(contents_id);
-    const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs);
+    const contents = try self.derivations.allocator.dupe(u8, self.intern.get(contents_id));
+    const path = derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs) catch |err| {
+        self.derivations.allocator.free(contents);
+        return err;
+    };
     defer self.allocator.free(path);
-    // When a daemon is attached, populate the text object in the real store.
-    try self.derivations.instantiateText(path, contents, refs);
+    self.derivations.noteProducerPayloadForTest(path, contents) catch |err| {
+        self.derivations.allocator.free(contents);
+        return err;
+    };
+    // recordOwnedTextRecipe consumes contents on success and error.
+    try self.derivations.recordOwnedTextRecipe(path, contents, refs);
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
@@ -489,16 +496,14 @@ fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8,
     // writes; only the store instantiation is gated on them.
     const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", "sha256", hash_hex);
     errdefer self.allocator.free(store_path);
-    if (self.derivations.store_writes_enabled) {
-        try self.derivations.instantiateFlat(store_path, try self.files.readFile(cache_path));
-    } else {
+    var contents = try self.files.retainFile(cache_path);
+    defer contents.release();
+    if (!self.derivations.store_writes_enabled) {
         // Plain eval has no store to materialize the file; seed the cache so
-        // `readFile`/`import` on the returned store path still work, as they do
-        // in Nix (where the fetched content is added to the store).
-        var contents = try self.files.retainFile(cache_path);
-        defer contents.release();
+        // `readFile`/`import` on the returned store path stays zero-copy.
         try self.files.provideRegular(store_path, contents);
     }
+    try self.derivations.recordFlatRecipe(store_path, contents);
     return store_path;
 }
 
