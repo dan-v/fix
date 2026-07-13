@@ -13,6 +13,7 @@ const source_paths = @import("derivation").source_path;
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");
+const context_merge = @import("context_merge.zig");
 const trace = @import("trace.zig");
 const prof = @import("probe").prof;
 const prof_census = @import("probe").prof_census;
@@ -313,14 +314,14 @@ pub fn appendStringContext(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.
         .path => {
             const path = self.intern.get(value.asInternId());
             if (!try self.files.pathExists(path)) return error.FileNotFound;
-            try appendContextEntry(self, context, value.asInternId(), try pathContextValue(self));
+            try context_merge.appendContextEntry(self, context, value.asInternId(), try pathContextValue(self));
         },
         .string_context => {
             const gc_roots = force.rootsBegin(self);
             defer force.rootsEnd(self, gc_roots);
             force.rootKeep(self, value); // owns string.context slice, held across appendContextEntry forces
             const string = try self.heap.getContextString(value.asObjectId());
-            for (string.context) |entry| try appendContextEntry(self, context, entry.name, entry.value);
+            for (string.context) |entry| try context_merge.appendContextEntry(self, context, entry.name, entry.value);
         },
         else => return error.TypeError,
     }
@@ -333,129 +334,6 @@ pub fn hasStorePathContext(self: *VM, value: Value) !bool {
         if (std.mem.startsWith(u8, self.intern.get(entry.name), "/nix/store/")) return true;
     }
     return false;
-}
-
-pub fn appendContextEntry(self: *VM, context: *std.ArrayListUnmanaged(heap_mod.AttrEntry), name: InternId, value: Value) !void {
-    for (context.items) |*entry| {
-        if (entry.name == name) {
-            entry.value = try mergeContextValues(self, entry.value, value);
-            return;
-        }
-    }
-    try context.append(self.allocator, .{ .name = name, .value = value });
-}
-
-pub fn mergeContextValues(self: *VM, left: Value, right: Value) !Value {
-    const gc_roots = force.rootsBegin(self);
-    defer force.rootsEnd(self, gc_roots);
-    const left_forced = try force.forceValue(self, left);
-    force.rootKeep(self, left_forced); // held across the `right` force + mergeContextAttrs
-    const right_forced = try force.forceValue(self, right);
-    if (left_forced.isAttrs() and right_forced.isAttrs()) {
-        return Value.attrs(try mergeContextAttrs(self, left_forced.asObjectId(), right_forced.asObjectId()));
-    }
-    return right;
-}
-
-pub fn mergeContextAttrs(self: *VM, left_id: ObjectId, right_id: ObjectId) !ObjectId {
-    const gc_roots = force.rootsBegin(self);
-    defer force.rootsEnd(self, gc_roots);
-    force.rootKeep(self, Value.attrs(left_id)); // owns `left` slice, held across mergeContextAttrValue forces
-    force.rootKeep(self, Value.attrs(right_id)); // owns `right` slice
-    var left = try self.heap.getAttrs(left_id);
-    var right = try self.heap.getAttrs(right_id);
-    const left_len = left.len;
-    const right_len = right.len;
-
-    var merged = try std.ArrayListUnmanaged(heap_mod.AttrEntry).initCapacity(self.allocator, left_len + right_len);
-    defer merged.deinit(self.allocator);
-
-    var left_i: usize = 0;
-    var right_i: usize = 0;
-    while (left_i < left_len and right_i < right_len) {
-        // gc: re-fetch — ranges may move across mergeContextAttrValue's force
-        left = try self.heap.getAttrs(left_id);
-        right = try self.heap.getAttrs(right_id);
-        const l = left[left_i];
-        const r = right[right_i];
-        if (l.name < r.name) {
-            merged.appendAssumeCapacity(l);
-            left_i += 1;
-        } else if (l.name > r.name) {
-            merged.appendAssumeCapacity(r);
-            right_i += 1;
-        } else {
-            const value = try mergeContextAttrValue(self, l.name, l.value, r.value);
-            merged.appendAssumeCapacity(.{ .name = l.name, .value = value });
-            left_i += 1;
-            right_i += 1;
-        }
-    }
-    // gc: re-fetch — ranges may have moved across the loop's forces
-    left = try self.heap.getAttrs(left_id);
-    right = try self.heap.getAttrs(right_id);
-    while (left_i < left_len) : (left_i += 1) {
-        merged.appendAssumeCapacity(left[left_i]);
-    }
-    while (right_i < right_len) : (right_i += 1) {
-        merged.appendAssumeCapacity(right[right_i]);
-    }
-
-    return self.heap.addAttrsSorted(merged.items);
-}
-
-pub fn mergeContextAttrValue(self: *VM, name: InternId, left: Value, right: Value) !Value {
-    if (name == try self.intern.intern("outputs")) return mergeContextOutputs(self, left, right);
-    return right;
-}
-
-pub fn mergeContextOutputs(self: *VM, left: Value, right: Value) !Value {
-    const gc_roots = force.rootsBegin(self);
-    defer force.rootsEnd(self, gc_roots);
-    const left_list = try force.forceValue(self, left);
-    force.rootKeep(self, left_list); // owns getList slice, held across appendUniqueContextOutput forces
-    const right_list = try force.forceValue(self, right);
-    force.rootKeep(self, right_list); // owns getList slice, held across appendUniqueContextOutput forces
-    if (!left_list.isList() or !right_list.isList()) return error.TypeError;
-
-    var outputs: std.ArrayListUnmanaged(Value) = .empty;
-    defer outputs.deinit(self.allocator);
-
-    // gc: re-fetch — ranges may move across appendUniqueContextOutput's force
-    const left_id = left_list.asObjectId();
-    const left_n = try self.heap.getListLen(left_id);
-    var li: usize = 0;
-    while (li < left_n) : (li += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(left_id, li));
-    const right_id = right_list.asObjectId();
-    const right_n = try self.heap.getListLen(right_id);
-    var ri: usize = 0;
-    while (ri < right_n) : (ri += 1) try appendUniqueContextOutput(self, &outputs, try self.heap.getListItem(right_id, ri));
-
-    sortContextOutputs(self, outputs.items);
-    return Value.list(try self.heap.addList(outputs.items));
-}
-
-/// Nix stores a context's output names in a sorted set, so the merged list must
-/// be name-sorted for identity comparisons (`getContext a == getContext b`) to
-/// hold regardless of the order outputs were merged in.
-pub fn sortContextOutputs(self: *VM, outputs: []Value) void {
-    const Ctx = struct {
-        vm: *VM,
-        fn lt(ctx: @This(), a: Value, b: Value) bool {
-            return std.mem.order(u8, ctx.vm.intern.get(a.asInternId()), ctx.vm.intern.get(b.asInternId())) == .lt;
-        }
-    };
-    std.mem.sort(Value, outputs, Ctx{ .vm = self }, Ctx.lt);
-}
-
-pub fn appendUniqueContextOutput(self: *VM, outputs: *std.ArrayListUnmanaged(Value), item: Value) !void {
-    const value = try force.forceValue(self, item);
-    if (!isPlainString(value)) return error.TypeError;
-    const text = try stringTextInternId(self, value);
-    for (outputs.items) |existing| {
-        if (existing.asInternId() == text) return;
-    }
-    try outputs.append(self.allocator, Value.string(text));
 }
 
 pub fn pathContextValue(self: *VM) !Value {
