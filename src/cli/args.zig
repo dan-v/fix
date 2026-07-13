@@ -47,6 +47,8 @@ pub const DeprecatedFeature = enum {
     cr_line_endings,
     or_as_identifier,
     rec_set_merges,
+    rec_set_overrides,
+    rec_set_dynamic_attrs,
 
     pub fn fromName(name: []const u8) ?DeprecatedFeature {
         if (std.mem.eql(u8, name, "nul-bytes")) return .nul_bytes;
@@ -55,6 +57,8 @@ pub const DeprecatedFeature = enum {
         if (std.mem.eql(u8, name, "cr-line-endings")) return .cr_line_endings;
         if (std.mem.eql(u8, name, "or-as-identifier")) return .or_as_identifier;
         if (std.mem.eql(u8, name, "rec-set-merges")) return .rec_set_merges;
+        if (std.mem.eql(u8, name, "rec-set-overrides")) return .rec_set_overrides;
+        if (std.mem.eql(u8, name, "rec-set-dynamic-attrs")) return .rec_set_dynamic_attrs;
         return null;
     }
 };
@@ -129,7 +133,7 @@ pub const OptionOverride = struct {
 
 /// Which subcommand is asking (used only to scope `--help` output; every
 /// subcommand shares this one parser and accepts the whole option set).
-pub const Cmd = enum { eval, instantiate, build, run, shell, repl, disasm, @"switch" };
+pub const Cmd = enum { eval, parse, instantiate, build, run, shell, repl, disasm, @"switch" };
 
 /// `fix switch` target: which activation flavour to build and switch to. Chosen
 /// by `--nixos`/`--darwin`/`--home-manager`, else auto-detected in `switch.zig`.
@@ -422,7 +426,7 @@ const Spec = struct {
 /// Commands that take a source expression and its selectors (everything but the
 /// bare `repl`). `disasm` compiles rather than evaluates, but shares the same
 /// source model (bare path / `-e` / `--file` / `--flake` / `-A` / `-I`).
-const source_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
+const source_cmds = &[_]Cmd{ .eval, .parse, .instantiate, .build, .run, .shell, .disasm, .@"switch" };
 /// Commands that run the evaluator, so diagnostics (`--show-trace`, `--color`),
 /// progress, and the GC memory budget apply. `disasm` stops at compilation, so
 /// it is excluded.
@@ -430,7 +434,7 @@ const eval_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .repl, .@"
 /// Commands that print an evaluated value, so the output format (`--json`,
 /// `--xml`) and `--strict` apply. The realizing commands print store paths, not
 /// a value, and `disasm` prints bytecode.
-const value_cmds = &[_]Cmd{ .eval, .repl };
+const value_cmds = &[_]Cmd{ .eval, .parse, .repl };
 /// Commands that evaluate to a derivation whose debug records make sense.
 const derivation_debug_cmds = &[_]Cmd{ .eval, .instantiate, .build, .run, .shell, .@"switch" };
 /// Commands that produce a top-level `.drv` a link/root can point at.

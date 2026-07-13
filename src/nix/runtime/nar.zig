@@ -68,8 +68,11 @@ fn resolveRootSymlink(allocator: std.mem.Allocator, files: *FileCache, path: []c
     var depth: usize = 0;
     while (depth < 256) : (depth += 1) {
         const cur_kind = files.fileType(current) catch {
+            // Allocate the fallback before freeing `current`: if the dupe fails,
+            // `errdefer allocator.free(current)` must be the only free of it.
+            const fallback = try allocator.dupe(u8, path);
             allocator.free(current);
-            return allocator.dupe(u8, path);
+            return fallback;
         };
         if (cur_kind != .symlink) return current;
         const target = try files.readLink(current);
@@ -80,8 +83,11 @@ fn resolveRootSymlink(allocator: std.mem.Allocator, files: *FileCache, path: []c
         current = next;
     }
     // Symlink cycle: give up and serialize the original as a symlink node.
+    // Allocate the fallback before freeing `current` so an allocation failure
+    // leaves exactly one owner for `errdefer` to free.
+    const fallback = try allocator.dupe(u8, path);
     allocator.free(current);
-    return allocator.dupe(u8, path);
+    return fallback;
 }
 
 pub fn hashPath(allocator: std.mem.Allocator, files: *FileCache, path: []const u8) ![]u8 {

@@ -91,14 +91,7 @@ pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value
 }
 
 fn validateStorePathName(name: []const u8) !void {
-    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidStorePathName;
-    for (name) |char| {
-        if (std.ascii.isAlphanumeric(char)) continue;
-        switch (char) {
-            '+', '-', '.', '_', '?', '=' => continue,
-            else => return error.InvalidStorePathName,
-        }
-    }
+    if (!derivation.store_name.isValid(name)) return error.InvalidStorePathName;
 }
 
 pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {

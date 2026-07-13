@@ -68,6 +68,13 @@ inline fn maskIdentCont(v: Vec) VMask {
 pub const Scanner = struct {
     source: []const u8,
     pos: u32,
+    /// Offset of the first structural CR (`\r`) seen between tokens — a
+    /// deprecated CR/CRLF line ending. Recorded for the compile chokepoint to
+    /// gate on the `cr-line-endings` feature (see `Parser.first_cr_offset`).
+    first_cr: ?u32 = null,
+    /// Offset+len of the first leading-dot float (`.5`) — the deprecated
+    /// `floating-without-zero` syntax, surfaced as a warning.
+    first_float_no_zero: ?struct { offset: u32, len: u32 } = null,
 
     pub fn init(source: []const u8) Scanner {
         return .{
@@ -95,7 +102,11 @@ pub const Scanner = struct {
         // Leading-dot float: `.5`, `.5e3` (Nix's `0?\.[0-9]+` form). Deprecated
         // in Lix but still valid; `.` followed by a digit is never a selector
         // here because a bare `.` cannot start a select.
-        if (c == '.' and isDigit(self.peek())) return self.lexFractionAndExponent(start);
+        if (c == '.' and isDigit(self.peek())) {
+            const tok = self.lexFractionAndExponent(start);
+            if (self.first_float_no_zero == null) self.first_float_no_zero = .{ .offset = tok.offset, .len = tok.len };
+            return tok;
+        }
 
         // Single-character tokens.
         switch (c) {
@@ -203,13 +214,22 @@ pub const Scanner = struct {
     fn skipLayout(self: *Scanner) void {
         while (self.pos < self.source.len) {
             switch (self.source[self.pos]) {
-                ' ', '\r', '\t', '\n' => {
+                '\r' => {
+                    // A structural CR line ending — record the first for the
+                    // `cr-line-endings` deprecation gate, then treat as layout.
+                    if (self.first_cr == null) self.first_cr = self.pos;
+                    self.pos += 1;
+                    self.skipWhitespaceRun();
+                },
+                ' ', '\t', '\n' => {
                     self.pos += 1;
                     self.skipWhitespaceRun();
                 },
                 '#' => {
-                    // Line comment: SIMD scan to the newline.
-                    self.pos = @intCast(std.mem.indexOfScalarPos(u8, self.source, self.pos, '\n') orelse self.source.len);
+                    // Line comment: scan to the next line terminator. A lone
+                    // `\r` (old-Mac) ends the line too, matching Nix — otherwise
+                    // a CR-terminated comment would swallow the following line.
+                    self.pos = @intCast(std.mem.indexOfAnyPos(u8, self.source, self.pos, "\r\n") orelse self.source.len);
                 },
                 '/' => {
                     if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '*') {

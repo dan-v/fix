@@ -314,6 +314,7 @@ test "parser recognizes contextual or attr names" {
     defer arena.deinit();
 
     var parser = Parser.init(std.testing.allocator, &arena, "{ or = 2; x.or = 3; }");
+    defer parser.deinit();
     const node = try parser.parse();
 
     try std.testing.expectEqual(NodeTag.attr_set, node.tag);
@@ -676,34 +677,32 @@ test "parser reports missing binding name in attrset lambda pattern" {
     );
 }
 
-test "parser reports missing inherit source variable name" {
+test "parser accepts an empty inherit-from as a no-op" {
+    // `inherit (src);` names nothing — a valid no-op in Nix, contributing no
+    // attributes rather than being a parse error.
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
     var parser = Parser.init(std.testing.allocator, &arena, "{ inherit (src); }");
     defer parser.deinit();
 
-    try std.testing.expectError(error.ParseError, parser.parse());
-    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
-    try std.testing.expectEqualStrings(
-        "Expected inherited variable name.",
-        parser.diagnostics.items[0].message,
-    );
+    const node = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    try std.testing.expectEqual(NodeTag.attr_set, node.tag);
+    try std.testing.expectEqual(@as(usize, 0), node.data.attr_set.entries.len);
 }
 
-test "parser reports missing variable name in let inherit" {
+test "parser accepts an empty inherit in let as a no-op" {
     var arena = ast.AstArena.init(std.testing.allocator);
     defer arena.deinit();
 
     var parser = Parser.init(std.testing.allocator, &arena, "let inherit; in 1");
     defer parser.deinit();
 
-    try std.testing.expectError(error.ParseError, parser.parse());
-    try std.testing.expectEqual(@as(usize, 1), parser.diagnostics.items.len);
-    try std.testing.expectEqualStrings(
-        "Expected inherited variable name.",
-        parser.diagnostics.items[0].message,
-    );
+    const node = try parser.parse();
+    try std.testing.expectEqual(@as(usize, 0), parser.diagnostics.items.len);
+    try std.testing.expectEqual(NodeTag.let_in, node.tag);
+    try std.testing.expectEqual(@as(usize, 0), node.data.let_in.bindings.len);
 }
 
 // ---- body-span elision --------------------------------------------------

@@ -4,7 +4,7 @@ const std = @import("std");
 const TokenType = @import("token.zig").TokenType;
 
 pub const Diagnostic = struct {
-    pub const Severity = enum { err, note };
+    pub const Severity = enum { err, warning, note };
     pub const Kind = enum { parse, compile };
 
     severity: Severity = .err,
@@ -217,6 +217,14 @@ fn writeOne(writer: *std.Io.Writer, source: []const u8, diagnostic: Diagnostic, 
                 try writer.writeByte('\n');
             },
         },
+        .warning => {
+            try style(writer, options, .warning_label);
+            try writer.writeAll("warning");
+            try reset(writer, options);
+            try writer.print(": {s} at ", .{diagnostic.message});
+            try writeLocation(writer, diagnostic);
+            try writer.writeByte('\n');
+        },
         .note => {
             try style(writer, options, .note_label);
             try writer.writeAll("note");
@@ -275,6 +283,7 @@ fn offsetTarget(source: []const u8, offset: u32) usize {
 
 const Style = enum {
     error_label,
+    warning_label,
     note_label,
     error_caret,
     note_caret,
@@ -286,6 +295,7 @@ fn style(writer: *std.Io.Writer, options: RenderOptions, which: Style) !void {
     if (!options.color) return;
     try writer.writeAll(switch (which) {
         .error_label => "\x1b[1;31m",
+        .warning_label => "\x1b[1;33m",
         .note_label => "\x1b[1;36m",
         .error_caret => "\x1b[31m",
         .note_caret => "\x1b[36m",

@@ -223,8 +223,8 @@ test "applying a non-callable value raises NotCallable instead of panicking" {
     try testing.expectError(error.NotCallable, ev.evaluate("(1) 2"));
 }
 
-test "duplicate let bindings raise DuplicateBinding instead of panicking" {
+test "duplicate let bindings raise a parse error instead of panicking" {
     var ev = try Evaluator.init(testing.allocator, 0);
     defer ev.deinit();
-    try testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; x = 2; in x"));
+    try testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
 }

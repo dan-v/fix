@@ -83,19 +83,7 @@ fn optionalAttr(self: anytype, attrs_id: anytype, name: []const u8) !Value {
 /// not `.`/`..`, and only `[A-Za-z0-9+._?=-]`. On failure sets an error trace
 /// message containing "is not a valid store path" and returns the error.
 fn validateStorePathName(self: anytype, name: []const u8) !void {
-    const ok = name.len != 0 and name.len <= 211 and
-        !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..") and
-        blk: {
-            for (name) |char| {
-                if (std.ascii.isAlphanumeric(char)) continue;
-                switch (char) {
-                    '+', '-', '.', '_', '?', '=' => continue,
-                    else => break :blk false,
-                }
-            }
-            break :blk true;
-        };
-    if (ok) return;
+    if (derivation.store_name.isValid(name)) return;
     const message = try std.fmt.allocPrint(
         self.allocator,
         "store path name '{s}' is not a valid store path name",

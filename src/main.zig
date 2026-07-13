@@ -10,6 +10,7 @@ const trace_cmd = cli.trace;
 const thunks_cmd = cli.thunks;
 const store_cmd = cli.store;
 const eval_cmd = cli.eval;
+const parse_cmd = cli.parse;
 const instantiate_cmd = cli.instantiate;
 const build_cmd = cli.build;
 const run_cmd = cli.runcmd;
@@ -28,6 +29,7 @@ const Subcommand = struct {
 
 const subcommands = [_]Subcommand{
     .{ .name = "eval", .summary = "evaluate an expression, file, or flake output and print the value", .run = eval_cmd.run_cmd },
+    .{ .name = "parse", .summary = "parse an expression and print its AST as JSON", .run = parse_cmd.run_cmd },
     .{ .name = "instantiate", .summary = "evaluate to a derivation and add its .drv closure to the store", .run = instantiate_cmd.run_cmd },
     .{ .name = "build", .summary = "evaluate to a derivation, build its outputs, and link ./result", .run = build_cmd.run_cmd },
     .{ .name = "run", .summary = "build a derivation and run a program from its output", .run = run_cmd.run_cmd },

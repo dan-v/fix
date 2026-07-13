@@ -17,6 +17,10 @@ const std = @import("std");
 /// Store-path realization for `path`/`filterSource`-style source imports.
 pub const source_path = @import("derivation/source_path.zig");
 
+/// The one pure store-path name predicate shared by `builtins.path`,
+/// `builtins.toFile`, and derivation construction.
+pub const store_name = @import("derivation/store_name.zig");
+
 pub const Output = dtypes.Output;
 pub const DrvOutput = dtypes.DrvOutput;
 pub const DrvInput = dtypes.DrvInput;

@@ -67,12 +67,12 @@ test "end-to-end: duplicate let bindings are rejected" {
     var ev = try Evaluator.init(alloc, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; x = 2; in x"));
-    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; inherit x; in x"));
-    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let inherit ({ x = 1; }) x; x = 2; in x"));
-    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let or = 1; inherit ({ or = 2; }) or; in ({ inherit or; }).or"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("let a = 1; a.b = 2; in a"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("let a.b = 1; a.b.c = 2; in a.b"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let x = 1; inherit x; in x"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let inherit ({ x = 1; }) x; x = 2; in x"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let or = 1; inherit ({ or = 2; }) or; in ({ inherit or; }).or"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let a = 1; a.b = 2; in a"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let a.b = 1; a.b.c = 2; in a.b"));
 }
 
 test "end-to-end: undefined variables are rejected with source diagnostics" {

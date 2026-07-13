@@ -21,8 +21,55 @@ const NodeTag = ast.NodeTag;
 const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const Scanner = @import("scanner.zig").Scanner;
+const string_syntax = @import("string_syntax.zig");
 const grammar = @import("grammar.zig");
 const lr = @import("lr.zig");
+
+/// A node in the attribute-merge tree used to reject duplicate definitions at
+/// parse time (see `Parser.checkDuplicateAttrs`). A name maps either to a leaf
+/// (a value definition) or to a subtree (an attribute set — whether formed by a
+/// nested path `a.b = …` or a set literal).
+const DupTree = struct {
+    map: std.StringHashMapUnmanaged(Def) = .{},
+
+    const Def = struct {
+        pos: Node.Atom, // where this name was first defined
+        sub: ?*DupTree, // non-null => this name is a (mergeable) attribute set
+    };
+};
+
+/// A deprecated-syntax warning recorded during parsing. The parser is
+/// feature-agnostic (like `used_pipe_operators`): it records every occurrence,
+/// and the consumer (`fix parse`, the eval chokepoint) emits the ones whose
+/// deprecated feature is not enabled. `message`/`feature` are semantic, not
+/// byte-identical to Nix's prose.
+pub const DeprecationWarning = struct {
+    pub const Kind = enum {
+        or_as_identifier,
+        floating_without_zero,
+        rec_set_dynamic_attrs,
+    };
+    kind: Kind,
+    offset: u32,
+    len: u32,
+
+    pub fn message(kind: Kind) []const u8 {
+        return switch (kind) {
+            .or_as_identifier => "using `or` as an identifier is deprecated; use --extra-deprecated-features or-as-identifier to silence this warning",
+            .floating_without_zero => "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
+            .rec_set_dynamic_attrs => "dynamic attributes in a recursive set are deprecated; use --extra-deprecated-features rec-set-dynamic-attrs to silence this warning",
+        };
+    }
+
+    /// The deprecated-feature name that silences this warning.
+    pub fn feature(kind: Kind) []const u8 {
+        return switch (kind) {
+            .or_as_identifier => "or-as-identifier",
+            .floating_without_zero => "floating-without-zero",
+            .rec_set_dynamic_attrs => "rec-set-dynamic-attrs",
+        };
+    }
+};
 
 /// Comptime-generated LALR tables (see `gen_parser_tables.zig`). Unit `pass`
 /// productions are eliminated during generation, so the driver never performs a
@@ -114,6 +161,13 @@ pub const Parser = struct {
     /// The earliest pipe operator token seen, for a precise "disabled"
     /// diagnostic.
     first_pipe_token: ?Token,
+    /// Offset of the first structural CR (`\r`) line ending, or null. Set from
+    /// the scanner after driving. The compile chokepoint gates it on the
+    /// `cr-line-endings` deprecated feature, like `used_pipe_operators`.
+    first_cr_offset: ?u32 = null,
+    /// Deprecated-syntax warnings recorded during parsing (feature-agnostic);
+    /// the consumer emits the ones whose feature is disabled.
+    warnings: std.ArrayListUnmanaged(DeprecationWarning) = .empty,
     /// Body-span elision (lazy parsing): when enabled, a bind body inside a
     /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
     /// earlier clauses in the same brace, (b) spans at least
@@ -150,6 +204,15 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         self.diagnostics.deinit(self.allocator);
+        self.warnings.deinit(self.allocator);
+    }
+
+    fn noteWarning(self: *Parser, kind: DeprecationWarning.Kind, tok: Token) void {
+        self.noteWarningAt(kind, tok.offset, tok.len);
+    }
+
+    fn noteWarningAt(self: *Parser, kind: DeprecationWarning.Kind, offset: u32, len: u32) void {
+        self.warnings.append(self.allocator, .{ .kind = kind, .offset = offset, .len = len }) catch {};
     }
 
     pub fn span(self: *const Parser, tok: Token) []const u8 {
@@ -196,11 +259,127 @@ pub const Parser = struct {
         }) catch {};
     }
 
+    /// Report a semantic parse error anchored at an AST atom (an attribute or
+    /// formal name), rather than a live token — the position Nix points at for
+    /// duplicate-attribute / duplicate-formal errors.
+    fn reportAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
+        self.had_error = true;
+        self.appendAtomDiagnostic(.err, at, msg);
+    }
+
+    /// A follow-up note (e.g. "first attribute defined here"); does not itself
+    /// mark the parse failed — the paired error already did.
+    fn noteAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
+        self.appendAtomDiagnostic(.note, at, msg);
+    }
+
+    fn appendAtomDiagnostic(self: *Parser, severity: Diagnostic.Severity, at: Node.Atom, msg: []const u8) void {
+        self.diagnostics.append(self.allocator, .{
+            .severity = severity,
+            .line = diagnostic.lineForOffset(self.source, at.offset),
+            .column = diagnostic.columnForOffset(self.source, at.offset),
+            .offset = at.offset,
+            .len = at.len,
+            .token_type = null,
+            .message = msg,
+        }) catch {};
+    }
+
+    fn atomText(self: *Parser, at: Node.Atom) []const u8 {
+        return self.source[at.offset..][0..at.len];
+    }
+
+    /// Reject duplicate attribute definitions the way Nix does at parse time,
+    /// following its attrpath-merge rule: nested paths (`a.b`, `a.c`) and set
+    /// literals merge; only a genuinely repeated leaf, or a leaf clashing with a
+    /// set, is an error — reported at the later occurrence. Dynamic keys
+    /// (`${e} = …`) aren't statically checkable and are skipped. An entry whose
+    /// value was body-elided is also skipped (the parser cannot see whether it
+    /// is a mergeable set), and remains covered by the compiler's own check.
+    fn checkDuplicateAttrs(self: *Parser, entries: []const Node.AttrSetEntry, is_binding: bool) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var root: DupTree = .{};
+        for (entries) |entry| try self.addAttrDef(a, &root, "", entry, is_binding);
+    }
+
+    fn addAttrDef(self: *Parser, a: std.mem.Allocator, tree: *DupTree, prefix: []const u8, entry: Node.AttrSetEntry, is_binding: bool) !void {
+        if (entry.dynamic_name != null or entry.path.len == 0) return; // dynamic key: skip
+        const val = ast.unwrapParens(entry.expr);
+        if (val.tag == .elided) return; // body-elided: parser can't see it — compiler covers it
+        var cur = tree;
+        var pfx = prefix;
+        // Descend prefix segments, creating/merging subtrees. Meeting a leaf
+        // where a set is required is a conflict.
+        for (entry.path[0 .. entry.path.len - 1]) |seg| {
+            const name = self.atomText(seg);
+            pfx = try dotJoin(a, pfx, name);
+            const gop = try cur.map.getOrPut(a, name);
+            if (!gop.found_existing) {
+                const sub = try a.create(DupTree);
+                sub.* = .{};
+                gop.value_ptr.* = .{ .pos = seg, .sub = sub };
+                cur = sub;
+            } else if (gop.value_ptr.sub) |sub| {
+                cur = sub;
+            } else {
+                return self.dupConflict(seg, gop.value_ptr.pos, pfx, is_binding);
+            }
+        }
+        const last = entry.path[entry.path.len - 1];
+        const name = self.atomText(last);
+        const full = try dotJoin(a, pfx, name);
+        // Any set literal (recursive or not) merges into the tree; anything else
+        // is a leaf.
+        const set_entries: ?[]const Node.AttrSetEntry =
+            if (val.tag == .attr_set) val.data.attr_set.entries else null;
+        const gop = try cur.map.getOrPut(a, name);
+        if (!gop.found_existing) {
+            if (set_entries) |es| {
+                const sub = try a.create(DupTree);
+                sub.* = .{};
+                gop.value_ptr.* = .{ .pos = last, .sub = sub };
+                for (es) |e| try self.addAttrDef(a, sub, full, e, is_binding);
+            } else {
+                gop.value_ptr.* = .{ .pos = last, .sub = null };
+            }
+        } else if (gop.value_ptr.sub) |sub| {
+            if (set_entries) |es| {
+                for (es) |e| try self.addAttrDef(a, sub, full, e, is_binding);
+            } else {
+                return self.dupConflict(last, gop.value_ptr.pos, full, is_binding);
+            }
+        } else {
+            return self.dupConflict(last, gop.value_ptr.pos, full, is_binding);
+        }
+    }
+
+    /// Report a duplicate definition: an error at the later occurrence plus a
+    /// note at the first. `is_binding` selects `let`-binding vs attribute
+    /// wording, matching Nix.
+    fn dupConflict(self: *Parser, dup: Node.Atom, first: Node.Atom, full: []const u8, is_binding: bool) error{ParseError} {
+        const noun = if (is_binding) "variable" else "attribute";
+        const msg = std.fmt.allocPrint(self.arenaAllocator(), "{s} '{s}' already defined", .{ noun, full }) catch "duplicate definition";
+        self.reportAtom(dup, msg);
+        self.noteAtom(first, if (is_binding) "first binding defined here" else "first attribute defined here");
+        return error.ParseError;
+    }
+
+    fn dotJoin(a: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]const u8 {
+        if (prefix.len == 0) return name;
+        return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, name });
+    }
+
     // ---- entry point ----
 
     pub fn parse(self: *Parser) !*Node {
         var scanner = Scanner.init(self.source);
         const root = try self.drive(&scanner);
+        self.first_cr_offset = scanner.first_cr;
+        if (scanner.first_float_no_zero) |f| {
+            self.warnings.append(self.allocator, .{ .kind = .floating_without_zero, .offset = f.offset, .len = f.len }) catch {};
+        }
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
@@ -560,16 +739,29 @@ pub const Parser = struct {
             } }) },
             .let_in => {
                 var entries = rhs[1].entries;
+                try self.checkDuplicateAttrs(entries.items, true);
                 const bindings = try a.alloc(Node.Binding, entries.items.len);
                 for (entries.items, bindings) |entry, *b| {
-                    if (entry.path.len == 0) {
-                        self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
-                        return error.ParseError;
+                    var path = entry.path;
+                    if (path.len == 0) {
+                        // A dynamic attr in a let. Nix folds a constant-string
+                        // key (`${"x"}`) to the static attr `x` before checking
+                        // for dynamic bindings, so it's allowed; a genuine
+                        // dynamic key (`${var}`) is not. The folded name reuses
+                        // the string token (quotes included), exactly as a plain
+                        // `"x" = ...;` binding would.
+                        const folded = self.constStringAttrAtom(entry.dynamic_name) orelse {
+                            self.report(rhs[2].tok, "Dynamic attributes are not allowed in let bindings.");
+                            return error.ParseError;
+                        };
+                        const single = try a.alloc(Node.Atom, 1);
+                        single[0] = folded;
+                        path = single;
                     }
                     b.* = .{
-                        .name_offset = entry.path[0].offset,
-                        .name_len = entry.path[0].len,
-                        .path = entry.path,
+                        .name_offset = path[0].offset,
+                        .name_len = path[0].len,
+                        .path = path,
                         .expr = entry.expr,
                         .inherit_outer = entry.inherit_outer,
                     };
@@ -639,6 +831,7 @@ pub const Parser = struct {
 
             // ---- application of the bare `or` identifier (`f or` → `f (or)`) ----
             .apply_or => {
+                self.noteWarning(.or_as_identifier, rhs[1].tok);
                 const or_var = try self.atom(.identifier, rhs[1].tok);
                 return .{ .node = try self.arena.createNode(.apply, .{ .apply = .{
                     .func = rhs[0].node,
@@ -662,7 +855,17 @@ pub const Parser = struct {
             .integer => return self.atom(.integer, rhs[0].tok),
             .float_val => return self.atom(.float_val, rhs[0].tok),
             .string => return self.atom(.string, rhs[0].tok),
-            .path => return self.atom(.path, rhs[0].tok),
+            .path => {
+                // Nix rejects a path literal with a trailing slash (`/nix/store/`).
+                // A lone `/` is the division operator, never a path token, so any
+                // path token ending in `/` is a genuine trailing slash.
+                const tok = rhs[0].tok;
+                if (tok.len >= 1 and self.source[tok.offset + tok.len - 1] == '/') {
+                    self.report(tok, "path has a trailing slash");
+                    return error.ParseError;
+                }
+                return self.atom(.path, tok);
+            },
             .uri => return self.atom(.uri, rhs[0].tok),
             .search_path => return self.atom(.search_path, rhs[0].tok),
             // Real token atoms (not {0,0} placeholders): a zero offset would
@@ -676,6 +879,14 @@ pub const Parser = struct {
             .attrset_from_brace => return self.buildAttrSet(rhs[0].brace),
             .rec_attr_set => {
                 var entries = rhs[2].entries;
+                try self.checkDuplicateAttrs(entries.items, false);
+                // A dynamic attribute (`${e} = …`) in a recursive set is
+                // deprecated — it is evaluated outside the recursive scope.
+                for (entries.items) |entry| {
+                    if (entry.dynamic_name) |dyn| {
+                        if (dyn.span) |s| self.noteWarningAt(.rec_set_dynamic_attrs, s.offset, s.len);
+                    }
+                }
                 return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
@@ -686,6 +897,7 @@ pub const Parser = struct {
             // the select segment reads the right name).
             .let_attrs => {
                 var entries = rhs[2].entries;
+                try self.checkDuplicateAttrs(entries.items, false);
                 const rec = try self.arena.createNode(.attr_set, .{ .attr_set = .{
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
@@ -725,7 +937,12 @@ pub const Parser = struct {
                 try segs.push(a, rhs[2].seg);
                 return .{ .segs = segs };
             },
-            .attr_static => return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } },
+            .attr_static => {
+                // `or` used as an attribute name (`let or = 1;`, `x.or`) is the
+                // deprecated `or`-as-identifier syntax.
+                if (rhs[0].tok.type == .kw_or) self.noteWarning(.or_as_identifier, rhs[0].tok);
+                return .{ .seg = .{ .static = .{ .offset = rhs[0].tok.offset, .len = rhs[0].tok.len } } };
+            },
             .attr_dynamic => return .{ .seg = .{ .dynamic = rhs[1].node } },
 
             // ---- brace / clauses (unified attrset-or-pattern body) ----
@@ -852,6 +1069,25 @@ pub const Parser = struct {
                 },
             }
         }
+        // Reject duplicate formal argument names (Nix: "duplicate formal
+        // function argument 'x'"), including one that collides with the
+        // `@`-bound name. Report at the later (offending) occurrence.
+        for (params.items, 0..) |p, i| {
+            const name = self.atomText(p.name);
+            var dup = bind_name != null and std.mem.eql(u8, name, self.atomText(bind_name.?));
+            if (!dup) for (params.items[0..i]) |q| {
+                if (std.mem.eql(u8, name, self.atomText(q.name))) {
+                    dup = true;
+                    break;
+                }
+            };
+            if (dup) {
+                const msg = try std.fmt.allocPrint(a, "duplicate formal function argument '{s}'", .{name});
+                self.reportAtom(p.name, msg);
+                return error.ParseError;
+            }
+        }
+
         const la = try a.create(Node.LambdaAttrs);
         la.* = .{
             .bind_name = bind_name,
@@ -878,6 +1114,7 @@ pub const Parser = struct {
                 },
             }
         }
+        try self.checkDuplicateAttrs(entries.items, false);
         return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
             .entries = try entries.toOwnedSlice(a),
             .recursive = false,
@@ -981,11 +1218,10 @@ pub const Parser = struct {
     fn inheritEntries(self: *Parser, source: ?*Node, names_in: std.ArrayListUnmanaged(Node.Atom), inherit_tok: Token) ![]Node.AttrSetEntry {
         var names = names_in;
         defer names.deinit(self.arenaAllocator());
-        if (names.items.len == 0) {
-            // `inherit ;` / `inherit (src) ;` — nothing named.
-            self.report(inherit_tok, "Expected inherited variable name.");
-            return error.ParseError;
-        }
+        // `inherit ;` / `inherit (src) ;` — an empty inherit is a valid no-op in
+        // Nix (it names nothing), so it contributes no entries rather than being
+        // a parse error.
+        _ = inherit_tok;
         const a = self.arenaAllocator();
         const entries = try a.alloc(Node.AttrSetEntry, names.items.len);
         for (names.items, entries) |name, *entry| {
@@ -1002,6 +1238,26 @@ pub const Parser = struct {
             };
         }
         return entries;
+    }
+
+    /// If `node` is a constant (non-interpolating) string literal, its source
+    /// atom (quotes included) — usable directly as a static attribute name, the
+    /// same way a plain `"x" = ...;` binding stores it. Otherwise null (a
+    /// genuine dynamic key). Drives Nix's `${"x"}` → static fold for let
+    /// bindings, where a real dynamic attribute is rejected.
+    fn constStringAttrAtom(self: *Parser, node: ?*Node) ?Node.Atom {
+        const n = node orelse return null;
+        if (n.tag != .string) return null;
+        const str_atom = n.data.atom;
+        const parsed = string_syntax.parseLiteral(self.allocator, self.source, .{
+            .start = str_atom.offset,
+            .end = str_atom.offset + str_atom.len,
+        }) catch return null;
+        defer parsed.deinit();
+        for (parsed.parts) |part| {
+            if (part == .interpolation) return null;
+        }
+        return str_atom;
     }
 
     fn inheritSourceAttr(self: *Parser, source: *Node, name: Node.Atom) !*Node {

@@ -475,6 +475,17 @@ pub const Evaluator = struct {
     /// `floor`/`ceil` of an integer that loses precision as f64 returns the
     /// corrupted value rather than erroring. Default false (error).
     allow_floor_ceil_corrupt: bool = false,
+    /// `rec-set-overrides` deprecated feature: when true, a top-level
+    /// `__overrides` attribute in a `rec { … }` applies overrides; default
+    /// false (compile error, matching Lix's deprecation).
+    allow_rec_set_overrides: bool = false,
+    /// `rec-set-merges` deprecated feature: when true, merging attr paths where
+    /// one definition is `rec` and another isn't is allowed (first-definition
+    /// recursiveness wins); default false (compile error, matching Lix).
+    allow_rec_set_merges: bool = false,
+    /// `cr-line-endings` deprecated feature: when true, CR/CRLF line endings are
+    /// accepted; default false (compile error, matching Lix).
+    allow_cr_line_endings: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -979,6 +990,26 @@ pub const Evaluator = struct {
             return error.PipeOperatorsDisabled;
         }
 
+        // Lix deprecated CR/CRLF line endings: rejected by default, re-permitted
+        // by `cr-line-endings`. The scanner records the first structural CR; the
+        // parse still succeeds (CR is treated as a line ending) so enabling the
+        // feature Just Works.
+        if (parser.first_cr_offset) |cr_off| {
+            if (!self.allow_cr_line_endings) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, cr_off),
+                    .column = diagnostic.columnForOffset(source, cr_off),
+                    .offset = cr_off,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported. Please inspect the file and normalize it to use LF (`\\n`) line endings instead. Use --extra-deprecated-features cr-line-endings to silence this warning.",
+                }}, source, source_path);
+                return error.CrLineEndingsDisabled;
+            }
+        }
+
         // Per-compilation-unit scratch arena: all of the compiler's
         // transient structures (builder buffers, locals/captures, strictness
         // and name-resolution maps, diagnostics) allocate here and are freed
@@ -1006,6 +1037,8 @@ pub const Evaluator = struct {
         compiler.source_path = source_path;
         compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
         compiler.allow_nul_bytes = self.allow_nul_bytes;
+        compiler.allow_rec_set_overrides = self.allow_rec_set_overrides;
+        compiler.allow_rec_set_merges = self.allow_rec_set_merges;
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
         // their file in the disasm sidecar.

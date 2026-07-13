@@ -22,11 +22,11 @@ test "evaluate exposes duplicate binding diagnostics" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateBinding, ev.evaluate("let x = 1; x = 2; in x"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("let x = 1; x = 2; in x"));
     const diagnostics = ev.getDiagnostics();
     try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
     try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
-    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
+    try std.testing.expectEqual(Diagnostic.Kind.parse, diagnostics[0].kind);
     try std.testing.expectEqualStrings("variable 'x' already defined", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 11), diagnostics[0].offset);
     try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
@@ -38,12 +38,12 @@ test "evaluate exposes duplicate attribute diagnostics" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
     const diagnostics = ev.getDiagnostics();
     try std.testing.expectEqual(@as(usize, 2), diagnostics.len);
     try std.testing.expectEqual(Diagnostic.Severity.err, diagnostics[0].severity);
-    try std.testing.expectEqual(Diagnostic.Kind.compile, diagnostics[0].kind);
-    try std.testing.expectEqualStrings("duplicate attribute", diagnostics[0].message);
+    try std.testing.expectEqual(Diagnostic.Kind.parse, diagnostics[0].kind);
+    try std.testing.expectEqualStrings("attribute 'a' already defined", diagnostics[0].message);
     try std.testing.expectEqual(@as(u32, 9), diagnostics[0].offset);
     try std.testing.expectEqual(Diagnostic.Severity.note, diagnostics[1].severity);
     try std.testing.expectEqualStrings("first attribute defined here", diagnostics[1].message);

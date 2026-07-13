@@ -9,11 +9,11 @@ test "compiles a plain attribute set with two entries" {
     try std.testing.expectEqual(@as(i64, 3), result.asInt());
 }
 
-test "reports duplicate attribute as a compile error" {
+test "reports duplicate attribute as a parse error" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
 }
 
 test "compiles a recursive attribute set referencing a sibling" {
@@ -36,7 +36,7 @@ test "reports duplicate attribute inside a nested static path" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a.b = 1; a.b = 2; }"));
 }
 
 test "attr segments equal compares underlying source text" {
