@@ -188,11 +188,15 @@ pub const Fiber = struct {
 
     /// Per-fiber stack reservation. Provisioned as a virtual mapping
     /// (PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE) — the kernel
-    /// demand-pages it, so RSS scales with actual depth touched, not
-    /// the full reservation. 8 MiB gives every worker thousands of
-    /// frames of headroom on any realistic workload while costing ~0
-    /// physical memory until the fiber recurses deeply.
-    pub const min_stack_bytes: usize = 8 * 1024 * 1024;
+    /// demand-pages it, so RSS scales with actual depth touched, not the
+    /// full reservation. Only virtual address space is reserved up front
+    /// (physical grows as the stack is touched, at zero hot-path cost), so
+    /// this can be generous. 16 MiB gives ~tens of thousands of native
+    /// frames — comfortably past `DEFAULT_MAX_CALL_DEPTH` (10000) so deep
+    /// *forcing* (which max-call-depth doesn't bound) has room before the
+    /// `forceThunkImpl` guard trips a graceful "stack overflow". Raising it
+    /// costs virtual address space × peak fiber count, not memory.
+    pub const min_stack_bytes: usize = 16 * 1024 * 1024;
 
     /// Sentinel byte pattern written to a freshly-allocated stack when
     /// `-Dfiber-stack-probe` is on so `maxStackUsedBytes` can find the

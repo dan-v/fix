@@ -22,6 +22,7 @@ const worker_mod = @import("worker.zig");
 
 const access = @import("access.zig");
 const closures = @import("closures.zig");
+const vm_trace = @import("trace.zig");
 const trace_log = @import("trace_log.zig");
 const BuiltinId = @import("runtime").builtins.BuiltinId;
 const prof = @import("probe").prof;
@@ -1105,6 +1106,19 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     if (scav_chunk < SCAV_CHUNK_CAP and scav_demand_n[scav_chunk] != std.math.maxInt(u16))
                         scav_demand_n[scav_chunk] += 1;
                 }
+                // Native-stack guard, checked right before we run the body (the
+                // recursion point). Forcing recurses on the fiber's fixed stack
+                // — one native frame nest per link of a deep lazy chain (e.g. a
+                // lazy left-fold accumulator's `+` thunks) — and, unlike function
+                // application, is NOT bounded by `max-call-depth`: thunk bodies
+                // run with `is_call = false`, so `pushFrame` never counts them.
+                // Without this the recursion runs off the low end of the
+                // (guardless) fiber stack into an unmapped page → raw SIGSEGV.
+                // Trip a graceful error `stack_guard_margin` short of that end.
+                // Placed on the claimed-run path (not at entry) so the
+                // resolved/busy/memo early returns stay lean; `stack_limit` is 0
+                // for VMs not bound to a fiber, so it never fires there.
+                if (@frameAddress() < self.ctx.stack_limit) return vm_trace.stackOverflow(self);
                 // We own this thunk now; compute and publish (or
                 // sticky-error / reset on failure).
                 const result = evalThunkTarget(self, &thunk.payload.target, thunk.targetKind()) catch |err| {

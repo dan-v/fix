@@ -24,6 +24,19 @@ pub fn callDepthExceeded(self: *VM) error{CallDepthExceeded} {
     return error.CallDepthExceeded;
 }
 
+/// The running fiber's native stack is near exhaustion. Deep thunk *forcing*
+/// (a lazy chain reduced to WHNF) recurses on the fiber's fixed stack but,
+/// unlike function application, is NOT bounded by `max-call-depth` — thunk
+/// bodies run with `is_call = false`. Raise a graceful error a margin short of
+/// the mapping's end so we never run into the guardless unmapped page below it
+/// (a raw SIGSEGV). See `exec_context.stack_limit` and `force.forceThunkImpl`.
+pub fn stackOverflow(self: *VM) error{StackOverflow} {
+    if (self.trace) |trace| {
+        trace.setMessage("stack overflow (possible infinite recursion)") catch {};
+    }
+    return error.StackOverflow;
+}
+
 pub fn clearErrorTrace(self: *VM) void {
     if (self.trace) |trace| trace.clear();
 }

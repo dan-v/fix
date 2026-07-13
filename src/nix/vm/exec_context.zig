@@ -28,6 +28,13 @@
 const thunk_mod = @import("runtime").thunk;
 const eval_progress = @import("observ").progress;
 
+/// Native-stack headroom reserved below `stack_limit`: the guard trips this
+/// far from the mapping's end so the deepest single force step between two
+/// guard checks — plus the error-capture/unwind that follows — completes
+/// without running off the stack. 512 KiB is generous against the few-KiB
+/// force-frame nest; the check is per `forceThunkImpl` (once per chain link).
+pub const stack_guard_margin: usize = 512 * 1024;
+
 pub const ExecutionContext = struct {
     /// Globally-unique claim identity for thunk forces — `makeClaimer` of
     /// the owning fiber's id. Baked once at fiber allocation and permanent
@@ -35,6 +42,13 @@ pub const ExecutionContext = struct {
     /// fields below). `INVALID_CLAIMER` only in the static default (VMs not
     /// bound to any fiber).
     claimer_id: thunk_mod.ClaimerId = thunk_mod.INVALID_CLAIMER,
+    /// Lowest native stack address the running fiber may touch before the
+    /// thunk-force guard trips a graceful "stack overflow" (`= stack base +
+    /// stack_guard_margin`). Baked once at fiber allocation from the fiber's
+    /// own stack, like `claimer_id`. 0 for VMs not bound to a fiber (tools,
+    /// standalone test VMs on the main thread) — a real address is always
+    /// ≥ 0, so the `frameAddress() < stack_limit` compare never fires there.
+    stack_limit: usize = 0,
     /// True only on the top-level DEMAND fiber for the duration of one
     /// top-level entry: its blocking waits on busy thunks are the serial
     /// critical path (crit track, "waiting on" line). Set by

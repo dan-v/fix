@@ -961,6 +961,12 @@ pub const Worker = struct {
         errdefer f.vm.deinit();
 
         f.inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
+        // Bake the native-stack guard limit now that the fiber owns its stack.
+        // The stack grows DOWN from the high end of `inner.stack`, so the guard
+        // trips when the SP descends within `stack_guard_margin` of the low
+        // (base) address. Permanent for the fiber's life (the stack never moves),
+        // like `claimer_id`. See `exec_context.stack_limit` / `forceThunkImpl`.
+        f.ctx.stack_limit = @intFromPtr(f.inner.stack.ptr) + exec_context.stack_guard_margin;
         // RSS attribution: the owner (this worker) registers the fiber stack —
         // fiber.zig no longer does it, keeping the primitive free of the tag
         // taxonomy. Registered when the stack is committed, unregistered when

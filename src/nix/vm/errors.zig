@@ -108,6 +108,7 @@ pub fn sameSourceSpan(left: chunk.Chunk.SourceSpan, right: chunk.Chunk.SourceSpa
 pub fn defaultErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.TypeError => "type error",
+        error.StackOverflow => "stack overflow (possible infinite recursion)",
         error.NotCallable => "value is not callable",
         error.MissingAttribute => "missing attribute",
         error.UndefinedVariable => "undefined variable",
