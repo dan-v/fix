@@ -310,9 +310,36 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
             }
             thunk.markDemanded();
         }
-        return thunk.payload.result;
+        const r = thunk.payload.result;
+        // A resolved thunk should hold WHNF, but a tail `call`/functor/builtin
+        // can publish a *forwarding* thunk as its result — e.g. returning a
+        // value read straight from an attr binding cell — so no caller must
+        // observe a thunk where it expects WHNF (the "got thunk" bug). The
+        // guard is one predictable branch, almost always not taken; the cold
+        // helper follows the chain (non-inline, so this stays `inline`-safe).
+        if (r.isThunk()) return derefForwarder(self, r, demand);
+        return r;
     }
     return forceThunkImpl(self, value, demand);
+}
+
+/// Follow a chain of *forwarding* thunks (a resolved thunk whose payload is
+/// itself a thunk) to the WHNF at its end. Only ALREADY-RESOLVED links are
+/// followed, reading each published value behind the acquire-load of its state
+/// — the same read `Thunk.tryForce` does on its `.already_resolved` path. An
+/// unresolved/busy forwardee is returned as-is rather than forced: forcing it
+/// here would evaluate a thunk (often a fixpoint binding cell) out of order and
+/// race the fiber that owns it. Cold: reached only when a resolved thunk's
+/// payload is unexpectedly another thunk.
+fn derefForwarder(self: *VM, start: Value, demand: bool) Value {
+    var r = start;
+    while (r.isThunk()) {
+        const t = self.heap.getThunkAssumeValid(r.asObjectId());
+        if (t.future.state.load(.acquire) != @intFromEnum(thunk_mod.FutureState.resolved)) return r;
+        if (demand) t.markDemanded();
+        r = t.payload.result;
+    }
+    return r;
 }
 
 pub fn forceDeep(self: *VM, value: Value) !void {
@@ -1085,6 +1112,14 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, false);
                     return err;
                 };
+                // A tail `call`/functor/builtin can leave a *forwarding* thunk
+                // on the stack, which plain `ret` returns un-forced — so the
+                // computed result may itself be a thunk rather than WHNF. It is
+                // published as-is (dereferencing it here would either force
+                // mid-resolution, re-entering the operand stack unsafely, or
+                // read a `payload.result` a concurrent `publishCellBinding` can
+                // flip). The forwarding chain is followed safely on the read
+                // path instead, via `derefForwarder`.
                 if (scav_t0 != 0 and scav_chunk < SCAV_CHUNK_CAP and
                     scavRdtsc() - scav_t0 > scav_hot_threshold_cy)
                 {
@@ -1092,18 +1127,26 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 }
                 resolveDispatch(self, thunk, result);
                 self.heap.gcRecordEdge(thunk_id, result); // old→young barrier
+                // If a tail call/functor/builtin left a *forwarding* thunk as
+                // the result (see above), hand back — and memoize — the WHNF at
+                // the end of the resolved chain, not the thunk wrapper, so the
+                // caller (e.g. `getAttrValue`) never sees a thunk. The published
+                // `thunk.payload` keeps the wrapper; later reads deref it the
+                // same way via the resolved fast path. Almost always not a
+                // thunk → no work.
+                const whnf = if (result.isThunk()) derefForwarder(self, result, demand) else result;
                 if (memo_key) |k| thunk_memo[k.idx] = .{
                     .token = self.heap.token,
                     .chunk = k.chunk,
                     .count = k.count,
                     .up0 = k.up0,
                     .up1 = k.up1,
-                    .value = result,
+                    .value = whnf,
                 };
-                recordResolve(self, thunk_id, result);
+                recordResolve(self, thunk_id, whnf);
                 trace_log.forceExit(self.vm_trace, self.workerId(), thunk_id, true);
                 if (demand) thunk.markDemanded();
-                return result;
+                return whnf;
             },
             .busy => {
                 // Discovery probe: main (a demand fiber) blocked on a
