@@ -48,6 +48,7 @@ pub const DeprecationWarning = struct {
         or_as_identifier,
         floating_without_zero,
         rec_set_dynamic_attrs,
+        cr_line_endings,
     };
     kind: Kind,
     offset: u32,
@@ -58,15 +59,19 @@ pub const DeprecationWarning = struct {
             .or_as_identifier => "using `or` as an identifier is deprecated; use --extra-deprecated-features or-as-identifier to silence this warning",
             .floating_without_zero => "floating point literal without a leading zero; use --extra-deprecated-features floating-without-zero to silence this warning",
             .rec_set_dynamic_attrs => "dynamic attributes in a recursive set are deprecated; use --extra-deprecated-features rec-set-dynamic-attrs to silence this warning",
+            .cr_line_endings => "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported; normalize the file to LF",
         };
     }
 
-    /// The deprecated-feature name that silences this warning.
+    /// The deprecated-feature name that silences this warning. `cr_line_endings`
+    /// is inverted (the feature *enables* the syntax, downgrading the error to a
+    /// warning), so it is emitted directly rather than through the shared gate.
     pub fn feature(kind: Kind) []const u8 {
         return switch (kind) {
             .or_as_identifier => "or-as-identifier",
             .floating_without_zero => "floating-without-zero",
             .rec_set_dynamic_attrs => "rec-set-dynamic-attrs",
+            .cr_line_endings => "cr-line-endings",
         };
     }
 };

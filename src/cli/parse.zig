@@ -94,6 +94,24 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // enabled (to stderr, semantically — not Nix's exact prose).
     try emitWarnings(init, allocator, &parser, options, source, source_path);
 
+    // A surviving CR line ending means cr-line-endings is enabled (otherwise
+    // compileSource would have errored above); Lix still warns in that case.
+    // This gate is inverted (the feature enables rather than silences), so it
+    // is emitted directly, not through emitWarnings.
+    if (parser.first_cr_offset) |off| {
+        try writeDiagnostics(init, source, &.{.{
+            .severity = .warning,
+            .line = syntax.diagnostic.lineForOffset(source, off),
+            .column = syntax.diagnostic.columnForOffset(source, off),
+            .offset = off,
+            .len = 1,
+            .token_type = null,
+            .message = DeprecationWarning.message(.cr_line_endings),
+            .source = source,
+            .source_path = source_path,
+        }});
+    }
+
     // 3. Emit the AST as JSON.
     var buf: [64 * 1024]u8 = undefined;
     var w = std.Io.File.stdout().writerStreaming(init.io, &buf);
