@@ -68,11 +68,11 @@ const Ser = struct {
             .path => self.literal("Path", .{ .str = self.atomText(n.data.atom) }),
             // URL literals are ordinary strings in Nix.
             .uri => self.literal("String", .{ .str = self.atomText(n.data.atom) }),
-            .search_path => self.searchPath(n.data.atom),
-            .identifier => self.identifier(self.atomText(n.data.atom)),
-            .bool_true => self.exprVar("true"),
-            .bool_false => self.exprVar("false"),
-            .null => self.exprVar("null"),
+            .search_path => try self.searchPath(n.data.atom),
+            .identifier => try self.identifier(self.atomText(n.data.atom)),
+            .bool_true => try self.exprVar("true"),
+            .bool_false => try self.exprVar("false"),
+            .null => try self.exprVar("null"),
 
             .unary_op => try self.unary(n.data.unary),
             .binary_op => try self.binary(n.data.binary),
@@ -137,14 +137,24 @@ const Ser = struct {
         });
     }
 
-    fn exprVar(self: *Ser, name: []const u8) J {
+    /// A string or name value: a JSON string when valid UTF-8, else a JSON
+    /// array of byte values (`[97, 255, 98]`) — matching how Nix's parse JSON
+    /// represents an invalid-UTF-8 string/name.
+    fn strOrBytes(self: *Ser, bytes: []const u8) !J {
+        if (std.unicode.utf8ValidateSlice(bytes)) return .{ .str = bytes };
+        const out = try self.arena.alloc(J, bytes.len);
+        for (bytes, out) |b, *j| j.* = .{ .int = b };
+        return .{ .array = out };
+    }
+
+    fn exprVar(self: *Ser, name: []const u8) !J {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprVar" } },
-            .{ .key = "value", .val = .{ .str = name } },
+            .{ .key = "value", .val = try self.strOrBytes(name) },
         });
     }
 
-    fn identifier(self: *Ser, name: []const u8) J {
+    fn identifier(self: *Ser, name: []const u8) !J {
         // The magic `__curPos` identifier is Nix's `ExprPos`.
         if (std.mem.eql(u8, name, "__curPos")) {
             return self.obj(&.{.{ .key = "_type", .val = .{ .str = "ExprPos" } }});
@@ -152,7 +162,7 @@ const Ser = struct {
         return self.exprVar(name);
     }
 
-    fn searchPath(self: *Ser, atom: Node.Atom) J {
+    fn searchPath(self: *Ser, atom: Node.Atom) !J {
         // `<x>` → __findFile __nixPath "x"
         const text = self.atomText(atom);
         const inner = if (text.len >= 2 and text[0] == '<' and text[text.len - 1] == '>')
@@ -161,9 +171,9 @@ const Ser = struct {
             text;
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
-            .{ .key = "fun", .val = self.exprVar("__findFile") },
+            .{ .key = "fun", .val = try self.exprVar("__findFile") },
             .{ .key = "args", .val = self.arr(&.{
-                self.exprVar("__nixPath"),
+                try self.exprVar("__nixPath"),
                 self.literal("String", .{ .str = inner }),
             }) },
         });
@@ -196,7 +206,7 @@ const Ser = struct {
             // `nul-bytes` feature only decides whether that is also an error).
             const bytes = buf.items;
             const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
-            return self.literal("String", .{ .str = try self.arena.dupe(u8, bytes[0..end]) });
+            return self.literal("String", try self.strOrBytes(bytes[0..end]));
         }
 
         var es: std.ArrayListUnmanaged(J) = .empty;
@@ -204,7 +214,7 @@ const Ser = struct {
             switch (part) {
                 .text => |t| {
                     if (t.bytes.len == 0) continue; // drop empty text chunks
-                    try es.append(self.arena, self.literal("String", .{ .str = try self.arena.dupe(u8, t.bytes) }));
+                    try es.append(self.arena, self.literal("String", try self.strOrBytes(try self.arena.dupe(u8, t.bytes))));
                 },
                 .interpolation => |span| try es.append(self.arena, try self.interpolation(span)),
             }
@@ -239,7 +249,7 @@ const Ser = struct {
                 .{ .key = "e", .val = try self.node(u.expr) },
             }),
             // -x  →  __sub 0 x
-            .negate => self.primopCall("__sub", &.{
+            .negate => try self.primopCall("__sub", &.{
                 self.literal("Int", .{ .int = 0 }),
                 try self.node(u.expr),
             }),
@@ -252,13 +262,13 @@ const Ser = struct {
         return switch (b.op) {
             // `+` is string/path/int concat → ExprConcatStrings
             .add => self.concatStrings(&.{ l, r }, false),
-            .sub => self.primopCall("__sub", &.{ l, r }),
-            .mul => self.primopCall("__mul", &.{ l, r }),
-            .div => self.primopCall("__div", &.{ l, r }),
-            .lt => self.primopCall("__lessThan", &.{ l, r }),
-            .gt => self.primopCall("__lessThan", &.{ r, l }), // a > b → __lessThan b a
-            .lte => self.opNot(self.primopCall("__lessThan", &.{ r, l })), // a <= b → !(b < a)
-            .gte => self.opNot(self.primopCall("__lessThan", &.{ l, r })), // a >= b → !(a < b)
+            .sub => try self.primopCall("__sub", &.{ l, r }),
+            .mul => try self.primopCall("__mul", &.{ l, r }),
+            .div => try self.primopCall("__div", &.{ l, r }),
+            .lt => try self.primopCall("__lessThan", &.{ l, r }),
+            .gt => try self.primopCall("__lessThan", &.{ r, l }), // a > b → __lessThan b a
+            .lte => self.opNot(try self.primopCall("__lessThan", &.{ r, l })), // a <= b → !(b < a)
+            .gte => self.opNot(try self.primopCall("__lessThan", &.{ l, r })), // a >= b → !(a < b)
             .eq => self.binOp("ExprOpEq", l, r),
             .neq => self.binOp("ExprOpNEq", l, r),
             .and_ => self.binOp("ExprOpAnd", l, r),
@@ -284,10 +294,10 @@ const Ser = struct {
         });
     }
 
-    fn primopCall(self: *Ser, name: []const u8, args: []const J) J {
+    fn primopCall(self: *Ser, name: []const u8, args: []const J) !J {
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprCall" } },
-            .{ .key = "fun", .val = self.exprVar(name) },
+            .{ .key = "fun", .val = try self.exprVar(name) },
             .{ .key = "args", .val = self.arr(args) },
         });
     }
@@ -376,7 +386,7 @@ const Ser = struct {
             .attr_path => {
                 const base = try self.collectSelect(n.data.attr_path.root, attrs);
                 for (n.data.attr_path.segments) |seg| {
-                    try attrs.append(self.arena, .{ .str = self.attrNameText(seg) });
+                    try attrs.append(self.arena, try self.strOrBytes(self.attrNameText(seg)));
                 }
                 return base;
             },
@@ -392,7 +402,7 @@ const Ser = struct {
     fn hasAttr(self: *Ser, n: *const Node) !J {
         const ha = n.data.has_attr;
         const attrs = try self.arena.alloc(J, ha.segments.len);
-        for (ha.segments, attrs) |seg, *out| out.* = .{ .str = self.attrNameText(seg) };
+        for (ha.segments, attrs) |seg, *out| out.* = try self.strOrBytes(self.attrNameText(seg));
         return self.obj(&.{
             .{ .key = "_type", .val = .{ .str = "ExprOpHasAttr" } },
             .{ .key = "attrs", .val = .{ .array = attrs } },
@@ -405,7 +415,7 @@ const Ser = struct {
         const attrs = try self.arena.alloc(J, ha.segments.len);
         for (ha.segments, attrs) |seg, *out| {
             out.* = switch (seg) {
-                .static => |a| .{ .str = self.attrNameText(a) },
+                .static => |a| try self.strOrBytes(self.attrNameText(a)),
                 .dynamic => |d| try self.node(d),
             };
         }
@@ -588,14 +598,29 @@ const Ser = struct {
             try fields.append(self.arena, .{ .key = "recursive", .val = .{ .boolean = set.recursive } });
         }
 
-        // attrs
+        // attrs — a valid-UTF-8 name is a JSON object key; an invalid one can't
+        // be, so it moves to a sibling `binary_attrs` list (Nix's shape).
         if (set.attrs.count() != 0) {
             var attr_fields: std.ArrayListUnmanaged(J.Field) = .empty;
+            var bin_list: std.ArrayListUnmanaged(J) = .empty;
             var it = set.attrs.iterator();
             while (it.next()) |kv| {
-                try attr_fields.append(self.arena, .{ .key = kv.key_ptr.*, .val = try self.emitValue(kv.value_ptr.*) });
+                const val = try self.emitValue(kv.value_ptr.*);
+                if (std.unicode.utf8ValidateSlice(kv.key_ptr.*)) {
+                    try attr_fields.append(self.arena, .{ .key = kv.key_ptr.*, .val = val });
+                } else {
+                    try bin_list.append(self.arena, self.obj(&.{
+                        .{ .key = "name", .val = try self.strOrBytes(kv.key_ptr.*) },
+                        .{ .key = "value", .val = val },
+                    }));
+                }
             }
-            try fields.append(self.arena, .{ .key = "attrs", .val = .{ .object = try attr_fields.toOwnedSlice(self.arena) } });
+            if (attr_fields.items.len != 0)
+                try fields.append(self.arena, .{ .key = "attrs", .val = .{ .object = try attr_fields.toOwnedSlice(self.arena) } });
+            if (bin_list.items.len != 0)
+                try fields.append(self.arena, .{ .key = "binary_attrs", .val = self.obj(&.{
+                    .{ .key = "attrs", .val = .{ .array = try bin_list.toOwnedSlice(self.arena) } },
+                }) });
         }
         // dynamicAttrs (never present for let)
         if (set.dynamic.items.len != 0) {
@@ -608,20 +633,33 @@ const Ser = struct {
             }
             try fields.append(self.arena, .{ .key = "dynamicAttrs", .val = .{ .array = dyn } });
         }
-        // inherit
+        // inherit — invalid-UTF-8 names move to a `binary_inherit` list.
         if (set.inherits.items.len != 0) {
             var inh: std.ArrayListUnmanaged(J.Field) = .empty;
+            var bin_list: std.ArrayListUnmanaged(J) = .empty;
             for (set.inherits.items) |name| {
-                try inh.append(self.arena, .{ .key = name, .val = self.exprVar(name) });
+                if (std.unicode.utf8ValidateSlice(name)) {
+                    try inh.append(self.arena, .{ .key = name, .val = try self.exprVar(name) });
+                } else {
+                    try bin_list.append(self.arena, self.obj(&.{
+                        .{ .key = "name", .val = try self.strOrBytes(name) },
+                        .{ .key = "value", .val = try self.exprVar(name) },
+                    }));
+                }
             }
-            try fields.append(self.arena, .{ .key = "inherit", .val = .{ .object = try inh.toOwnedSlice(self.arena) } });
+            if (inh.items.len != 0)
+                try fields.append(self.arena, .{ .key = "inherit", .val = .{ .object = try inh.toOwnedSlice(self.arena) } });
+            if (bin_list.items.len != 0)
+                try fields.append(self.arena, .{ .key = "binary_inherit", .val = self.obj(&.{
+                    .{ .key = "inherit", .val = .{ .array = try bin_list.toOwnedSlice(self.arena) } },
+                }) });
         }
         // inheritFrom
         if (set.inherit_from.items.len != 0) {
             const groups = try self.arena.alloc(J, set.inherit_from.items.len);
             for (set.inherit_from.items, groups) |g, *out| {
                 const names = try self.arena.alloc(J, g.names.items.len);
-                for (g.names.items, names) |name, *nn| nn.* = .{ .str = name };
+                for (g.names.items, names) |name, *nn| nn.* = try self.strOrBytes(name);
                 out.* = self.obj(&.{
                     .{ .key = "attrs", .val = .{ .array = names } },
                     .{ .key = "from", .val = try self.node(g.from) },
