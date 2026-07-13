@@ -32,7 +32,7 @@ test "end-to-end: simple inherit in attrsets" {
     const recursive_inherit = try ev.evaluate("let config = 1; in (rec { inherit config; }).config");
     try std.testing.expectEqual(@as(i64, 1), recursive_inherit.asInt());
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("rec { x = 1; inherit x; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("rec { x = 1; inherit x; }"));
 }
 
 test "end-to-end: dynamic attribute selection" {
@@ -179,10 +179,10 @@ test "end-to-end: nested attribute declarations" {
     const duplicate_rec_scope = try ev.evaluate("({ a = rec { x = y; }; a = { y = 1; }; }).a.x");
     try std.testing.expectEqual(@as(i64, 1), duplicate_rec_scope.asInt());
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a.b = 2; }"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a.b = 1; a.b = 2; }"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = { }; }"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = { x = 1; }; a = { x = 1; }; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a.b = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a.b = 1; a.b = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = { }; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = { x = 1; }; a = { x = 1; }; }"));
 }
 
 test "end-to-end: attrset update operator" {
@@ -272,8 +272,8 @@ test "end-to-end: duplicate attributes are rejected" {
     var ev = try Evaluator.init(alloc, 0);
     defer ev.deinit();
 
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1; a = 2; }"));
-    try std.testing.expectError(error.DuplicateAttribute, ev.evaluate("{ a = 1 / 0; a = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1; a = 2; }"));
+    try std.testing.expectError(error.ParseError, ev.evaluate("{ a = 1 / 0; a = 2; }"));
 }
 
 test "end-to-end: quoted attribute access" {

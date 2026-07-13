@@ -25,6 +25,19 @@ const string_syntax = @import("string_syntax.zig");
 const grammar = @import("grammar.zig");
 const lr = @import("lr.zig");
 
+/// A node in the attribute-merge tree used to reject duplicate definitions at
+/// parse time (see `Parser.checkDuplicateAttrs`). A name maps either to a leaf
+/// (a value definition) or to a subtree (an attribute set — whether formed by a
+/// nested path `a.b = …` or a set literal).
+const DupTree = struct {
+    map: std.StringHashMapUnmanaged(Def) = .{},
+
+    const Def = struct {
+        pos: Node.Atom, // where this name was first defined
+        sub: ?*DupTree, // non-null => this name is a (mergeable) attribute set
+    };
+};
+
 /// Comptime-generated LALR tables (see `gen_parser_tables.zig`). Unit `pass`
 /// productions are eliminated during generation, so the driver never performs a
 /// do-nothing chain reduction — every reduce runs a real semantic action.
@@ -202,7 +215,18 @@ pub const Parser = struct {
     /// duplicate-attribute / duplicate-formal errors.
     fn reportAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
         self.had_error = true;
+        self.appendAtomDiagnostic(.err, at, msg);
+    }
+
+    /// A follow-up note (e.g. "first attribute defined here"); does not itself
+    /// mark the parse failed — the paired error already did.
+    fn noteAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
+        self.appendAtomDiagnostic(.note, at, msg);
+    }
+
+    fn appendAtomDiagnostic(self: *Parser, severity: Diagnostic.Severity, at: Node.Atom, msg: []const u8) void {
         self.diagnostics.append(self.allocator, .{
+            .severity = severity,
             .line = diagnostic.lineForOffset(self.source, at.offset),
             .column = diagnostic.columnForOffset(self.source, at.offset),
             .offset = at.offset,
@@ -214,6 +238,88 @@ pub const Parser = struct {
 
     fn atomText(self: *Parser, at: Node.Atom) []const u8 {
         return self.source[at.offset..][0..at.len];
+    }
+
+    /// Reject duplicate attribute definitions the way Nix does at parse time,
+    /// following its attrpath-merge rule: nested paths (`a.b`, `a.c`) and set
+    /// literals merge; only a genuinely repeated leaf, or a leaf clashing with a
+    /// set, is an error — reported at the later occurrence. Dynamic keys
+    /// (`${e} = …`) aren't statically checkable and are skipped. An entry whose
+    /// value was body-elided is also skipped (the parser cannot see whether it
+    /// is a mergeable set), and remains covered by the compiler's own check.
+    fn checkDuplicateAttrs(self: *Parser, entries: []const Node.AttrSetEntry, is_binding: bool) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var root: DupTree = .{};
+        for (entries) |entry| try self.addAttrDef(a, &root, "", entry, is_binding);
+    }
+
+    fn addAttrDef(self: *Parser, a: std.mem.Allocator, tree: *DupTree, prefix: []const u8, entry: Node.AttrSetEntry, is_binding: bool) !void {
+        if (entry.dynamic_name != null or entry.path.len == 0) return; // dynamic key: skip
+        const val = ast.unwrapParens(entry.expr);
+        if (val.tag == .elided) return; // body-elided: parser can't see it — compiler covers it
+        var cur = tree;
+        var pfx = prefix;
+        // Descend prefix segments, creating/merging subtrees. Meeting a leaf
+        // where a set is required is a conflict.
+        for (entry.path[0 .. entry.path.len - 1]) |seg| {
+            const name = self.atomText(seg);
+            pfx = try dotJoin(a, pfx, name);
+            const gop = try cur.map.getOrPut(a, name);
+            if (!gop.found_existing) {
+                const sub = try a.create(DupTree);
+                sub.* = .{};
+                gop.value_ptr.* = .{ .pos = seg, .sub = sub };
+                cur = sub;
+            } else if (gop.value_ptr.sub) |sub| {
+                cur = sub;
+            } else {
+                return self.dupConflict(seg, gop.value_ptr.pos, pfx, is_binding);
+            }
+        }
+        const last = entry.path[entry.path.len - 1];
+        const name = self.atomText(last);
+        const full = try dotJoin(a, pfx, name);
+        // Any set literal (recursive or not) merges into the tree; anything else
+        // is a leaf.
+        const set_entries: ?[]const Node.AttrSetEntry =
+            if (val.tag == .attr_set) val.data.attr_set.entries else null;
+        const gop = try cur.map.getOrPut(a, name);
+        if (!gop.found_existing) {
+            if (set_entries) |es| {
+                const sub = try a.create(DupTree);
+                sub.* = .{};
+                gop.value_ptr.* = .{ .pos = last, .sub = sub };
+                for (es) |e| try self.addAttrDef(a, sub, full, e, is_binding);
+            } else {
+                gop.value_ptr.* = .{ .pos = last, .sub = null };
+            }
+        } else if (gop.value_ptr.sub) |sub| {
+            if (set_entries) |es| {
+                for (es) |e| try self.addAttrDef(a, sub, full, e, is_binding);
+            } else {
+                return self.dupConflict(last, gop.value_ptr.pos, full, is_binding);
+            }
+        } else {
+            return self.dupConflict(last, gop.value_ptr.pos, full, is_binding);
+        }
+    }
+
+    /// Report a duplicate definition: an error at the later occurrence plus a
+    /// note at the first. `is_binding` selects `let`-binding vs attribute
+    /// wording, matching Nix.
+    fn dupConflict(self: *Parser, dup: Node.Atom, first: Node.Atom, full: []const u8, is_binding: bool) error{ParseError} {
+        const noun = if (is_binding) "variable" else "attribute";
+        const msg = std.fmt.allocPrint(self.arenaAllocator(), "{s} '{s}' already defined", .{ noun, full }) catch "duplicate definition";
+        self.reportAtom(dup, msg);
+        self.noteAtom(first, if (is_binding) "first binding defined here" else "first attribute defined here");
+        return error.ParseError;
+    }
+
+    fn dotJoin(a: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]const u8 {
+        if (prefix.len == 0) return name;
+        return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, name });
     }
 
     // ---- entry point ----
@@ -580,6 +686,7 @@ pub const Parser = struct {
             } }) },
             .let_in => {
                 var entries = rhs[1].entries;
+                try self.checkDuplicateAttrs(entries.items, true);
                 const bindings = try a.alloc(Node.Binding, entries.items.len);
                 for (entries.items, bindings) |entry, *b| {
                     var path = entry.path;
@@ -718,6 +825,7 @@ pub const Parser = struct {
             .attrset_from_brace => return self.buildAttrSet(rhs[0].brace),
             .rec_attr_set => {
                 var entries = rhs[2].entries;
+                try self.checkDuplicateAttrs(entries.items, false);
                 return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
@@ -728,6 +836,7 @@ pub const Parser = struct {
             // the select segment reads the right name).
             .let_attrs => {
                 var entries = rhs[2].entries;
+                try self.checkDuplicateAttrs(entries.items, false);
                 const rec = try self.arena.createNode(.attr_set, .{ .attr_set = .{
                     .entries = try entries.toOwnedSlice(a),
                     .recursive = true,
@@ -939,6 +1048,7 @@ pub const Parser = struct {
                 },
             }
         }
+        try self.checkDuplicateAttrs(entries.items, false);
         return .{ .node = try self.arena.createNode(.attr_set, .{ .attr_set = .{
             .entries = try entries.toOwnedSlice(a),
             .recursive = false,
