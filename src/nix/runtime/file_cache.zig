@@ -445,10 +445,13 @@ test "FileCache aliases share blob pointers and metadata" {
     counting.trackPayload(owned);
 
     var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
-    const alias_seed = payload.retain();
+    var alias_seed = payload.retain();
 
     try cache.provideRegular("/virtual/cache-alpha", payload);
     try cache.provideRegular("/virtual/cache-beta", alias_seed);
+    payload.release();
+    alias_seed.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
 
     try std.testing.expect(try cache.pathExists("/virtual/cache-alpha"));
     try std.testing.expect(try cache.pathExists("/virtual/cache-beta"));
@@ -505,10 +508,13 @@ test "FileCache provideRegular idempotent seeding preserves payload pointer with
     counting.trackPayload(owned);
 
     var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
-    const duplicate_seed = payload.retain();
+    var duplicate_seed = payload.retain();
 
     try cache.provideRegular("/virtual/cache-dup", payload);
     try cache.provideRegular("/virtual/cache-dup", duplicate_seed);
+    payload.release();
+    duplicate_seed.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
 
     const read_back = try cache.readFile("/virtual/cache-dup");
     try std.testing.expectEqual(original_ptr, @intFromPtr(read_back.ptr));
