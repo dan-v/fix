@@ -512,8 +512,17 @@ pub const DerivationStore = struct {
         const io = self.io orelse return error.StoreUnavailable;
         const d = try rstore.DaemonStore.connect(self.allocator, io, self.daemon_socket);
         errdefer d.deinit();
-        // Apply per-connection settings once, before any build op.
-        if (self.daemon_options) |opts| try d.setOptions(opts);
+        // Apply per-connection settings once, before any build op — but only for
+        // store-writing commands (build/instantiate/run/shell). Plain `eval` that
+        // realizes on demand (import-from-derivation) must NOT push fix's resolved
+        // config: fix lacks Nix's compiled-in defaults (e.g. `sandbox-paths`'s
+        // `/bin/sh=<busybox>`), so its `extra-sandbox-paths`-only value would
+        // *replace* the daemon's richer default and strip `/bin/sh` from the build
+        // sandbox. The daemon already reads the same nix.conf, so its own config is
+        // authoritative here.
+        if (self.store_writes_enabled) {
+            if (self.daemon_options) |opts| try d.setOptions(opts);
+        }
         self.daemon = d;
         return d;
     }
@@ -595,8 +604,8 @@ pub const DerivationStore = struct {
         return daemon.isValidPath(store_path);
     }
 
-    /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon,
-    /// forwarding the build activity/log stream to `sink` if given.
+    /// Realize `derived_paths` (`<drvpath>!<outputs>`, legacy format) via the
+    /// daemon, forwarding the build activity/log stream to `sink` if given.
     pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
@@ -1051,7 +1060,11 @@ pub const DerivationStore = struct {
         var rendered: std.ArrayListUnmanaged(u8) = .empty;
         errdefer rendered.deinit(self.allocator);
         try rendered.appendSlice(self.allocator, drv_path);
-        try rendered.append(self.allocator, '^');
+        // The classic `buildPaths` worker op parses each request with Nix/Lix's
+        // legacy `DerivedPath::parseLegacy`, which splits on `!` (a `^` is not
+        // recognized and the whole string is parsed as a store path — the daemon
+        // then rejects the `^` as an illegal character). So render `<drv>!<outs>`.
+        try rendered.append(self.allocator, '!');
         if (outputs.len == 0) {
             try rendered.append(self.allocator, '*');
         } else {

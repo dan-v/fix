@@ -264,8 +264,8 @@ pub const DaemonStore = struct {
         try wire.writeInt(self.w(), 0);
     }
 
-    /// Realize `derived_paths` (each a `<drvpath>^<outputs>` string, e.g.
-    /// `/nix/store/xxx.drv^*` for all outputs). The daemon builds or substitutes
+    /// Realize `derived_paths` (each a legacy `<drvpath>!<outputs>` string, e.g.
+    /// `/nix/store/xxx.drv!*` for all outputs). The daemon builds or substitutes
     /// the outputs; build logs stream over STDERR_NEXT and are forwarded to our
     /// stderr while this runs. Errors (with the daemon's message) on failure.
     pub fn buildPaths(self: *DaemonStore, derived_paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) !void {

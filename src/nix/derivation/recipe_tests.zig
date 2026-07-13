@@ -331,7 +331,7 @@ test "successful realization releases recipe payload and realizes requested outp
         try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
         try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
         try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
-        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "^out"));
+        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "!out"));
     } else return error.MissingRecipeRealizationApi;
 }
 
@@ -346,7 +346,7 @@ test "realizeOutput canonicalizes unsorted duplicate output names" {
 
         try store.realizeOutput(root_path, &.{ "out", "dev", "out", "dev" });
         try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
-        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "^dev,out"));
+        try std.testing.expect(fake.nthSubjectEquals(.build, 0, root_path ++ "!dev,out"));
     } else return error.MissingRecipeRealizationApi;
 }
 

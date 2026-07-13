@@ -523,8 +523,8 @@ test "fake derivation daemon supports the concrete DaemonStore protocol subset" 
 
     var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
     defer fake.deinit();
-    try fake.registerBuildDirectory("/nix/store/example.drv^out", output_dir);
-    try fake.registerBuildFile("/nix/store/example.drv^out", output_file, "built payload");
+    try fake.registerBuildDirectory("/nix/store/example.drv!out", output_dir);
+    try fake.registerBuildFile("/nix/store/example.drv!out", output_file, "built payload");
 
     const daemon = try runtime_store.DaemonStore.connect(std.testing.allocator, std.testing.io, fake.socketPath());
     defer daemon.deinit();
@@ -535,7 +535,7 @@ test "fake derivation daemon supports the concrete DaemonStore protocol subset" 
     defer std.testing.allocator.free(nar_path);
     const flat_path = try daemon.addFlatFile(std.testing.allocator, "flat-example", "flat payload", &.{});
     defer std.testing.allocator.free(flat_path);
-    try daemon.buildPaths(&.{"/nix/store/example.drv^out"}, null, .normal);
+    try daemon.buildPaths(&.{"/nix/store/example.drv!out"}, null, .normal);
     try std.testing.expectEqual(@as(usize, 1), fake.count(.query));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.nar));

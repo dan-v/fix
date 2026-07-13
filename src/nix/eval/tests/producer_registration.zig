@@ -335,7 +335,7 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
         try expectRecipeFlat(&fixture.ev.derivations, flat_store_path, @intFromPtr(retained.bytes().ptr), "flat dep payload");
         try expectRecipeText(&fixture.ev.derivations, drv_path, records[0].drv_aterm, records[0].drv_text_references);
 
-        const build_subject = try std.fmt.allocPrint(fixture.allocator, "{s}^out", .{drv_path});
+        const build_subject = try std.fmt.allocPrint(fixture.allocator, "{s}!out", .{drv_path});
         defer fixture.allocator.free(build_subject);
         try fixture.ev.derivations.realizeOutput(drv_path, &.{"out"});
 

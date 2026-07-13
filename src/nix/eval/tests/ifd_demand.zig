@@ -112,7 +112,7 @@ const DemandFixture = struct {
 
     fn registerOutputTree(self: *DemandFixture, output: Value) ![]u8 {
         const info = try self.outputInfo(output);
-        const subject = try std.fmt.allocPrint(self.allocator, "{s}^out", .{info.drv_path});
+        const subject = try std.fmt.allocPrint(self.allocator, "{s}!out", .{info.drv_path});
         errdefer self.allocator.free(subject);
 
         const nested = try std.fs.path.resolve(self.allocator, &.{ info.path, "nested" });
