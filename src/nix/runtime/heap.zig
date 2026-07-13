@@ -1377,6 +1377,7 @@ pub const ObjectHeap = struct {
     /// bitmap access is compile-time absent from non-test and non-GC builds.
     pub fn isObjectAllocatedForTest(self: *const ObjectHeap, id: ObjectId) bool {
         if (comptime !builtin.is_test or !build_options.gc) return false;
+        if (id < self.gcSweepFloor()) return true;
         return self.gcAllocBitSet(id);
     }
 

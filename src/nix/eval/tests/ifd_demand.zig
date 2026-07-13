@@ -145,8 +145,10 @@ const DemandFixture = struct {
 
     fn assertOneRealization(self: *DemandFixture, output: Value, subject: []const u8) !void {
         const info = try self.outputInfo(output);
+        const drv_basename = std.fs.path.basename(info.drv_path);
+        try std.testing.expect(drv_basename.len > 33 and drv_basename[32] == '-');
         try std.testing.expectEqual(@as(usize, 1), self.fake.count(.text));
-        try std.testing.expect(self.fake.nthSubjectEquals(.text, 0, info.drv_path));
+        try std.testing.expect(self.fake.nthSubjectEquals(.text, 0, drv_basename[33..]));
         try std.testing.expectEqual(@as(usize, 1), self.fake.count(.build));
         try std.testing.expect(self.fake.nthSubjectEquals(.build, 0, subject));
     }
@@ -234,6 +236,14 @@ test "cold output demand survives a major GC with only output context rooted" {
     if (comptime sharedDemandIntegrationAvailable()) {
         var fixture = try DemandFixture.init(std.testing.allocator, 1);
         defer fixture.deinit();
+
+        // The first explicit collection establishes the pinned old floor and
+        // arms alloc-bit tracking. Construct the shape only after that floor so
+        // the second major can prove this exact ObjectId was reclaimed.
+        _ = try fixture.ev.evaluate("1");
+        const armed = fixture.ev.collectMajorNow();
+        if (comptime build_options.gc) try std.testing.expect(armed.ran);
+
         const produced = try fixture.makeDerivationAndOutput();
         const output = produced.output;
         const subject = try fixture.registerOutputTree(output);
