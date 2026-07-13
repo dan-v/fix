@@ -128,6 +128,10 @@ pub const EnvVar = struct {
 pub const ComputedPaths = struct {
     drv_path: []u8,
     hash_modulo: HashModulo,
+    /// Exact final ATerm allocation used to derive `drv_path`; caller owns it.
+    drv_aterm: []u8,
+    /// Slice allocation only; entries borrow from the Drv. Caller owns the slice.
+    drv_text_references: []const []const u8,
 };
 
 pub const Spec = struct {

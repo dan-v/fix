@@ -63,6 +63,5 @@ pub fn buildStrictValue(
 pub const isSyntheticName = value_builder.isSyntheticName;
 
 test {
-    _ = @import("derivation/tests.zig");
     _ = hash_codec;
 }

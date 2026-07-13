@@ -739,6 +739,7 @@ pub const Evaluator = struct {
         self.search_paths.deinit(self.allocator);
         self.fetchers.deinit();
         self.regexes.deinit();
+        self.derivations.releaseRecipePayloads();
         self.files.deinit();
         self.heap.deinit();
         // Free deferred-compile state after the heap (whose thunks

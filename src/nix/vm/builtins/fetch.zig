@@ -75,11 +75,18 @@ pub fn builtinToFile(self: anytype, name_arg: Value, contents_arg: Value) !Value
     for (ref_ids.items, refs) |ref_id, *ref| ref.* = self.intern.get(ref_id);
 
     const name = self.intern.get(name_id);
-    const contents = self.intern.get(contents_id);
-    const path = try derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs);
+    const contents = try self.derivations.allocator.dupe(u8, self.intern.get(contents_id));
+    const path = derivation.textPath(self.allocator, self.derivations.store_dir, name, contents, refs) catch |err| {
+        self.derivations.allocator.free(contents);
+        return err;
+    };
     defer self.allocator.free(path);
-    // When a daemon is attached, populate the text object in the real store.
-    try self.derivations.instantiateText(path, contents, refs);
+    self.derivations.noteProducerPayloadForTest(path, contents) catch |err| {
+        self.derivations.allocator.free(contents);
+        return err;
+    };
+    // recordOwnedTextRecipe consumes contents on success and error.
+    try self.derivations.recordOwnedTextRecipe(path, contents, refs);
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
@@ -437,19 +444,14 @@ const FetchUrlSpec = struct {
 pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
-
-    // Fast path: an explicit `sha256`/`hash` fixes the flat fixed-output store
-    // path from name+hash, so Nix returns it (as a context string) without ever
-    // dereferencing the URL. No network needed.
-    if (try hashedFodPath(self, arg, spec.name, false)) |path| {
-        defer self.allocator.free(path);
-        return contextStringWithPath(self, try self.intern.intern(path));
-    }
+    const expected_hash = try expectedFetchSha256Hex(self, arg);
+    defer if (expected_hash) |hash| self.allocator.free(hash);
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
     defer result.deinit(self.fetchers.allocator);
+    try validateFetchedSha256(self, "file", spec.url, expected_hash, result.hash);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
     defer self.allocator.free(path);
     // The flat fixed-output store path is fully determined by the fetched
@@ -458,24 +460,30 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-/// If `arg` is an attrset carrying an explicit `sha256`, return the
-/// deterministic fixed-output store path it names — flat (`recursive=false`,
-/// like `fetchurl`) or recursive/NAR (`recursive=true`, like `fetchTarball`) —
-/// computed from `name`+hash, without fetching. Matches Nix, which returns this
-/// path lazily and never touches the URL when the hash is known upfront. Null
-/// when there is no hash attr (caller falls back to the real fetch).
-fn hashedFodPath(self: anytype, arg: Value, name: []const u8, recursive: bool) !?[]u8 {
+fn expectedFetchSha256Hex(self: anytype, arg: Value) !?[]u8 {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return null;
-    const id = value.asObjectId();
-    // Only `sha256` fixes the path here — `builtins.fetchurl`/`fetchTarball`
-    // reject a bare `hash` attr (see the `invalid-attrs` conformance case).
-    const hash = (try optionalStringAttr(self, id, "sha256")) orelse return null;
-    defer self.allocator.free(hash);
-    const hex = try derivation.hashToBase16(self.allocator, "sha256", hash);
-    defer self.allocator.free(hex);
-    const algo = if (recursive) "r:sha256" else "sha256";
-    return try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", algo, hex);
+    const expected = (try optionalStringAttr(self, value.asObjectId(), "sha256")) orelse return null;
+    defer self.allocator.free(expected);
+    return derivation.hashToBase16(self.allocator, "sha256", expected) catch {
+        const message = try std.fmt.allocPrint(self.allocator, "invalid sha256 hash '{s}'", .{expected});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    };
+}
+
+fn validateFetchedSha256(self: anytype, noun: []const u8, url: []const u8, expected_hex: ?[]const u8, actual_hex: []const u8) !void {
+    const expected = expected_hex orelse return;
+    if (std.ascii.eqlIgnoreCase(expected, actual_hex)) return;
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "hash mismatch in {s} downloaded from '{s}': expected sha256 '{s}', got '{s}'",
+        .{ noun, url, expected, actual_hex },
+    );
+    defer self.allocator.free(message);
+    try vm_trace.setErrorMessage(self, message);
+    return error.HashMismatch;
 }
 
 /// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
@@ -488,14 +496,14 @@ fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const u8,
     // writes; only the store instantiation is gated on them.
     const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", "sha256", hash_hex);
     errdefer self.allocator.free(store_path);
-    if (self.derivations.store_writes_enabled) {
-        try self.derivations.instantiateFlat(store_path, try self.files.readFile(cache_path));
-    } else {
+    var contents = try self.files.retainFile(cache_path);
+    defer contents.release();
+    if (!self.derivations.store_writes_enabled) {
         // Plain eval has no store to materialize the file; seed the cache so
-        // `readFile`/`import` on the returned store path still work, as they do
-        // in Nix (where the fetched content is added to the store).
-        try self.files.registerFile(store_path, try self.files.readFile(cache_path));
+        // `readFile`/`import` on the returned store path stays zero-copy.
+        try self.files.provideRegular(store_path, contents);
     }
+    try self.derivations.recordFlatRecipe(store_path, contents);
     return store_path;
 }
 
@@ -546,26 +554,43 @@ fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]con
 }
 
 pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
-    // Fast path: an explicit `sha256`/`hash` fixes the recursive (NAR)
-    // fixed-output store path from the tree name (default "source") + hash, so
-    // Nix returns it (as a context string) without fetching the archive.
     const tree_name = try tarballTreeName(self, arg);
     defer self.allocator.free(tree_name);
-    if (try hashedFodPath(self, arg, tree_name, true)) |path| {
-        defer self.allocator.free(path);
-        return contextStringWithPath(self, try self.intern.intern(path));
-    }
-
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
+    const expected_hash = try expectedFetchSha256Hex(self, arg);
+    defer if (expected_hash) |hash| self.allocator.free(hash);
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
-    const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
-    defer self.fetchers.allocator.free(path);
+    const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+        .url = spec.url,
+        .name = spec.name,
+        .serialize_nar = expected_hash != null,
+    }, span);
+    defer result.deinit(self.fetchers.allocator);
+
+    if (expected_hash) |expected| {
+        const payload = result.nar_payload orelse unreachable;
+        const actual_hash = std.fmt.bytesToHex(payload.digest, .lower);
+        try validateFetchedSha256(self, "tarball", spec.url, expected, &actual_hash);
+        if (self.derivations.store_writes_enabled) {
+            const ingested = try source_paths.ingestSerializedNar(
+                self.allocator,
+                self.derivations,
+                tree_name,
+                payload.bytes,
+                &payload.digest,
+            );
+            defer ingested.deinit(self.allocator);
+            return fetchedPathValue(self, ingested.store_path);
+        }
+        return fetchedPathValue(self, result.path);
+    }
+
     // The unpacked tree is named "source" by default (Nix), independent of the
     // archive's URL basename which named the download (`tree_name`, above).
-    const out = try ingestFetchedTree(self, path, tree_name, "", null);
+    const out = try ingestFetchedTree(self, result.path, tree_name, "", null);
     defer out.deinit(self.allocator);
     return fetchedPathValue(self, out.out_path);
 }
@@ -757,9 +782,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
     if (std.mem.eql(u8, type_value, "tarball")) {
         const spec = try fetchUrlSpecFromAttrs(self, attrs_id, "source");
         defer spec.deinit(self.allocator);
-        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
-        defer self.fetchers.allocator.free(path);
-        const out = try ingestFetchedTree(self, path, spec.name, "", null);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
+        defer result.deinit(self.fetchers.allocator);
+        const out = try ingestFetchedTree(self, result.path, spec.name, "", null);
         defer out.deinit(self.allocator);
         return pathTreeValue(self, out.out_path, out.nar_hash);
     }
@@ -783,9 +808,9 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
             .gitlab
         else
             .sourcehut;
-        const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
-        defer self.fetchers.allocator.free(path);
-        const out = try ingestFetchedTree(self, path, spec.name, spec.rev orelse "", null);
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name, .forge = forge }, span);
+        defer result.deinit(self.fetchers.allocator);
+        const out = try ingestFetchedTree(self, result.path, spec.name, spec.rev orelse "", null);
         defer out.deinit(self.allocator);
         return githubTreeValue(self, out.out_path, out.nar_hash, spec.rev);
     }

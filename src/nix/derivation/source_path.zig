@@ -72,18 +72,40 @@ pub fn ingestReport(
     filter: ?nar.Filter,
     unsupported: ?*nar.Unsupported,
 ) !Ingested {
-    const nar_bytes = try nar.serializeReport(allocator, files, path, filter, unsupported);
-    defer allocator.free(nar_bytes);
+    const payload_allocator = derivations.allocator;
+    const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
+    var nar_owned = true;
+    defer if (nar_owned) payload_allocator.free(nar_bytes);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
+    const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
+    errdefer allocator.free(store_path);
+    const nar_hash = try sriHash(allocator, &digest);
+    errdefer allocator.free(nar_hash);
+    try derivations.noteProducerPayloadForTest(store_path, nar_bytes);
+    nar_owned = false; // recordOwnedNarRecipe consumes on success and error.
+    try derivations.recordOwnedNarRecipe(store_path, nar_bytes);
+    return .{ .store_path = store_path, .nar_hash = nar_hash };
+}
 
+/// Ingest an already serialized and SHA-256-hashed NAR without repeating
+/// either operation. The NAR bytes and digest are borrowed for the duration of
+/// the synchronous daemon operation; the returned paths remain caller-owned.
+pub fn ingestSerializedNar(
+    allocator: std.mem.Allocator,
+    derivations: *DerivationStore,
+    name: []const u8,
+    nar_bytes: []const u8,
+    digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) !Ingested {
+    const hex = std.fmt.bytesToHex(digest.*, .lower);
     const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
     errdefer allocator.free(store_path);
     try derivations.instantiatePath(store_path, nar_bytes);
 
-    return .{ .store_path = store_path, .nar_hash = try sriHash(allocator, &digest) };
+    return .{ .store_path = store_path, .nar_hash = try sriHash(allocator, digest) };
 }
 
 /// Encode a sha256 digest as a Nix SRI hash: `sha256-<standard base64>`.
@@ -148,15 +170,16 @@ pub fn flatStorePathForFile(
     path: []const u8,
     name: []const u8,
 ) !FlatIngested {
-    const bytes = try files.readFile(path);
+    var contents = try files.retainFile(path);
+    defer contents.release();
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(contents.bytes(), &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
 
     const store_path = try drv_paths.fixedOutputPath(allocator, derivations.store_dir, name, "out", "sha256", hex[0..]);
     errdefer allocator.free(store_path);
-    try derivations.instantiateFlat(store_path, bytes);
+    try derivations.recordFlatRecipe(store_path, contents);
 
     return .{ .store_path = store_path, .hash_hex = hex };
 }
@@ -165,4 +188,19 @@ pub fn isStoreRootPath(path: []const u8, store_dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, store_dir)) return false;
     if (path.len <= store_dir.len or path[store_dir.len] != '/') return false;
     return std.mem.indexOfScalar(u8, path[store_dir.len + 1 ..], '/') == null;
+}
+
+test "ingestSerializedNar uses the supplied digest without rehashing" {
+    const testing = std.testing;
+    var derivations = DerivationStore.init(testing.allocator);
+    defer derivations.deinit();
+
+    const digest = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const ingested = try ingestSerializedNar(testing.allocator, &derivations, "source", "borrowed NAR bytes", &digest);
+    defer ingested.deinit(testing.allocator);
+
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const expected_path = try drv_paths.sourcePath(testing.allocator, derivations.store_dir, "source", &hex);
+    defer testing.allocator.free(expected_path);
+    try testing.expectEqualStrings(expected_path, ingested.store_path);
 }

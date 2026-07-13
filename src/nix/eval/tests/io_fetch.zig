@@ -3,6 +3,8 @@ const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
+const FileCache = @import("runtime").file_cache.FileCache;
+const DerivationStore = @import("derivation").DerivationStore;
 const path_ops = @import("runtime").paths;
 const helpers = @import("../test_helpers.zig");
 const renderForTest = helpers.renderForTest;
@@ -337,6 +339,150 @@ test "evaluate fetchTarball builtin through fetch cache" {
 
     const contents = try ev.evaluate(source);
     try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
+test "hashed fetchurl reads content with the specified sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "payload.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
+test "hashed fetchurl reports mismatched and malformed sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "payload.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const file_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "payload.txt" });
+    defer std.testing.allocator.free(file_path);
+
+    const malformed_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"sha256-not-a-hash\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(malformed_source);
+    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer malformed_ev.deinit();
+    malformed_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
+    try std.testing.expect(malformed_ev.getTrace().message != null);
+
+    const mismatch_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile (builtins.fetchurl {{ url = \"file://{s}\"; name = \"payload.txt\"; sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"; }})",
+        .{file_path},
+    );
+    defer std.testing.allocator.free(mismatch_source);
+    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer mismatch_ev.deinit();
+    mismatch_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
+    const mismatch_message = mismatch_ev.getTrace().message orelse return error.MissingHashDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "0000000000000000000000000000000000000000000000000000000000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5") != null);
+}
+
+test "hashed fetchTarball reads a subpath with the specified sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer std.testing.allocator.free(archive_path);
+
+    const tar = try std.process.run(std.testing.allocator, std.testing.io, .{ .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" } });
+    defer std.testing.allocator.free(tar.stdout);
+    defer std.testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    const source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"e7836a3c011cee6b24037385323b9883d4657e2fb7c44bc18b6c166eac5555d0\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(source);
+
+    var ev = try Evaluator.init(std.testing.allocator, 0);
+    defer ev.deinit();
+    ev.setFileIo(std.testing.io);
+    const contents = try ev.evaluate(source);
+    try std.testing.expectEqualStrings("payload", ev.intern.get(contents.asInternId()));
+}
+
+test "hashed fetchTarball reports mismatched and malformed sha256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "archive-root", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-root/file.txt", .data = "payload" });
+
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const base_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(base_path);
+    const archive_path = try std.fs.path.resolve(std.testing.allocator, &.{ base_path, "archive.tar.gz" });
+    defer std.testing.allocator.free(archive_path);
+    const tar = try std.process.run(std.testing.allocator, std.testing.io, .{ .argv = &.{ "tar", "-czf", archive_path, "-C", base_path, "archive-root" } });
+    defer std.testing.allocator.free(tar.stdout);
+    defer std.testing.allocator.free(tar.stderr);
+    switch (tar.term) {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.UnexpectedTarFailure,
+    }
+
+    const malformed_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"sha256-not-a-hash\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(malformed_source);
+    var malformed_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer malformed_ev.deinit();
+    malformed_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.InvalidHash, malformed_ev.evaluate(malformed_source));
+    try std.testing.expect(malformed_ev.getTrace().message != null);
+
+    const mismatch_source = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "builtins.readFile ((builtins.fetchTarball {{ url = \"file://{s}\"; name = \"src\"; sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"; }}) + \"/file.txt\")",
+        .{archive_path},
+    );
+    defer std.testing.allocator.free(mismatch_source);
+    var mismatch_ev = try Evaluator.init(std.testing.allocator, 0);
+    defer mismatch_ev.deinit();
+    mismatch_ev.setFileIo(std.testing.io);
+    try std.testing.expectError(error.HashMismatch, mismatch_ev.evaluate(mismatch_source));
+    const mismatch_message = mismatch_ev.getTrace().message orelse return error.MissingHashDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "0000000000000000000000000000000000000000000000000000000000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_message, "e7836a3c011cee6b24037385323b9883d4657e2fb7c44bc18b6c166eac5555d0") != null);
 }
 
 test "evaluate fetchTree builtin through fetch cache" {
@@ -788,4 +934,79 @@ test "detect recursive imports" {
     ev.setFileIo(std.testing.io);
 
     try std.testing.expectError(error.ImportCycle, ev.evaluate(source));
+}
+
+const LifecycleTrackingAllocator = struct {
+    child: std.mem.Allocator,
+    tracked_ptr: std.atomic.Value(usize) = .init(0),
+    frees: std.atomic.Value(usize) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn init(child: std.mem.Allocator) LifecycleTrackingAllocator {
+        return .{ .child = child };
+    }
+
+    fn allocator(self: *LifecycleTrackingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn track(self: *LifecycleTrackingAllocator, bytes: []u8) void {
+        self.tracked_ptr.store(@intFromPtr(bytes.ptr), .seq_cst);
+    }
+
+    fn freeCount(self: *LifecycleTrackingAllocator) usize {
+        return self.frees.load(.seq_cst);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        const tracked = @intFromPtr(memory.ptr) == self.tracked_ptr.load(.seq_cst);
+        self.child.rawFree(memory, alignment, return_address);
+        if (tracked) _ = self.frees.fetchAdd(1, .monotonic);
+    }
+};
+
+test "releaseEvalState releases retained flat recipe payload" {
+    if (comptime @hasDecl(DerivationStore, "recordFlatRecipe") and @hasDecl(DerivationStore, "releaseRecipePayloads")) {
+        var tracking = LifecycleTrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var ev = try Evaluator.init(allocator, 0);
+        defer ev.deinit();
+        const payload = try allocator.dupe(u8, "shared evaluator recipe payload");
+        const payload_ptr = @intFromPtr(payload.ptr);
+        tracking.track(payload);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, payload);
+
+        try ev.derivations.recordFlatRecipe("/nix/store/44444444444444444444444444444444-flat", handle);
+        try std.testing.expectEqual(payload_ptr, @intFromPtr(handle.bytes().ptr));
+        handle.release();
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+
+        // DerivationStore remains alive after this call. The payload can be
+        // freed here only if releaseEvalState explicitly drops its recipe
+        // reference; review separately enforces that call precedes files.deinit.
+        ev.releaseEvalState();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
 }

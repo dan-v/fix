@@ -1373,6 +1373,14 @@ pub const ObjectHeap = struct {
         return w & (@as(u64, 1) << @intCast(id & 63)) != 0;
     }
 
+    /// Test-only liveness observation after an explicit collection. The GC
+    /// bitmap access is compile-time absent from non-test and non-GC builds.
+    pub fn isObjectAllocatedForTest(self: *const ObjectHeap, id: ObjectId) bool {
+        if (comptime !builtin.is_test or !build_options.gc) return false;
+        if (id < self.gcSweepFloor()) return true;
+        return self.gcAllocBitSet(id);
+    }
+
     /// Detector: trap if a *tracked* slot is read after being freed.
     inline fn gcAssertLive(self: *const ObjectHeap, id: ObjectId) void {
         if (comptime !gc_debug) return;

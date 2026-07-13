@@ -53,6 +53,52 @@ pub const FileCache = struct {
         kind: FileKind,
     };
 
+    /// Shared ownership of an immutable byte allocation. Handles are cheap to
+    /// copy explicitly with `retain`; reading the bytes does not touch the
+    /// refcount.
+    pub const ImmutableBytes = struct {
+        blob: *Blob,
+
+        const Blob = struct {
+            allocator: std.mem.Allocator,
+            refs: std.atomic.Value(usize),
+            owned: []u8,
+        };
+
+        /// Takes ownership of `owned` without copying it. On blob allocation
+        /// failure, ownership is still consumed and the bytes are freed.
+        pub fn fromOwned(allocator: std.mem.Allocator, owned: []u8) !ImmutableBytes {
+            const blob = allocator.create(Blob) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
+            blob.* = .{
+                .allocator = allocator,
+                .refs = .init(1),
+                .owned = owned,
+            };
+            return .{ .blob = blob };
+        }
+
+        pub fn bytes(self: ImmutableBytes) []const u8 {
+            return self.blob.owned;
+        }
+
+        pub fn retain(self: ImmutableBytes) ImmutableBytes {
+            const previous = self.blob.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+            return self;
+        }
+
+        pub fn release(self: *ImmutableBytes) void {
+            if (self.blob.refs.fetchSub(1, .acq_rel) != 1) return;
+            const blob = self.blob;
+            const allocator = blob.allocator;
+            allocator.free(blob.owned);
+            allocator.destroy(blob);
+        }
+    };
+
     const Entry = struct {
         path: []u8,
         /// Guards the populated-fields below. Held during I/O so a
@@ -63,7 +109,7 @@ pub const FileCache = struct {
         exists_known: bool = false,
         exists: bool = false,
         kind: ?FileKind = null,
-        contents: ?[]u8 = null,
+        contents: ?ImmutableBytes = null,
         dir_entries: ?[]DirEntry = null,
     };
 
@@ -80,7 +126,7 @@ pub const FileCache = struct {
         while (iter.next()) |kv| {
             const entry = kv.value_ptr.*;
             self.allocator.free(entry.path);
-            if (entry.contents) |contents| self.allocator.free(contents);
+            if (entry.contents) |*contents| contents.release();
             if (entry.dir_entries) |entries| self.freeDirEntries(entries);
             self.allocator.destroy(entry);
         }
@@ -112,21 +158,6 @@ pub const FileCache = struct {
         return true;
     }
 
-    /// Seed the cache with `contents` for `path` as a regular file, so
-    /// `readFile`/`pathExists` on it succeed without hitting disk. Used for a
-    /// fetched fixed-output store path in plain eval (no real store to hold the
-    /// file), matching Nix where the fetched content lives in the store. A no-op
-    /// if the path is already populated.
-    pub fn registerFile(self: *FileCache, path: []const u8, contents: []const u8) !void {
-        const entry = try self.entryFor(path);
-        entry.mu.lock();
-        defer entry.mu.unlock();
-        if (entry.contents == null) entry.contents = try self.allocator.dupe(u8, contents);
-        entry.exists_known = true;
-        entry.exists = true;
-        entry.kind = .regular;
-    }
-
     /// Trap: deliberately UNcached existence probe. Used by import-from-
     /// derivation to decide whether a demanded store path still needs building,
     /// WITHOUT memoizing the result — a path that becomes valid after an
@@ -145,7 +176,7 @@ pub const FileCache = struct {
         const entry = try self.entryFor(path);
         entry.mu.lock();
         defer entry.mu.unlock();
-        if (entry.contents) |contents| return contents;
+        if (entry.contents) |contents| return contents.bytes();
 
         const io = self.io orelse return error.FileIoUnavailable;
         // RSS attribution: cached source texts live for the evaluator's
@@ -158,13 +189,39 @@ pub const FileCache = struct {
             self.allocator,
             .limited(max_read_bytes),
         );
-        errdefer self.allocator.free(contents);
+        const handle = try ImmutableBytes.fromOwned(self.allocator, contents);
 
         entry.exists_known = true;
         entry.exists = true;
-        entry.contents = contents;
+        entry.contents = handle;
         entry.kind = .regular;
-        return contents;
+        return handle.bytes();
+    }
+
+    /// Return a retained immutable handle for a file, populating the same
+    /// cache entry used by `readFile` on a cold miss.
+    pub fn retainFile(self: *FileCache, path: []const u8) !ImmutableBytes {
+        const entry = try self.entryFor(path);
+        entry.mu.lock();
+        defer entry.mu.unlock();
+        if (entry.contents) |contents| return contents.retain();
+
+        const io = self.io orelse return error.FileIoUnavailable;
+        const prev_tag = vma.setAllocTag(.file_cache);
+        defer _ = vma.setAllocTag(prev_tag);
+        const owned = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            entry.path,
+            self.allocator,
+            .limited(max_read_bytes),
+        );
+        const handle = try ImmutableBytes.fromOwned(self.allocator, owned);
+
+        entry.exists_known = true;
+        entry.exists = true;
+        entry.contents = handle;
+        entry.kind = .regular;
+        return handle.retain();
     }
 
     /// Seed the cache so `path` resolves to `contents` as a regular file,
@@ -173,13 +230,12 @@ pub const FileCache = struct {
     /// fetch — so `builtins.readFile`/`readFileType` on a `fetchurl` result
     /// behave as they would against Nix's realized store. A no-op if the entry
     /// is already populated.
-    pub fn provideRegular(self: *FileCache, path: []const u8, contents: []const u8) !void {
+    pub fn provideRegular(self: *FileCache, path: []const u8, contents: ImmutableBytes) !void {
         const entry = try self.entryFor(path);
         entry.mu.lock();
         defer entry.mu.unlock();
         if (entry.contents != null) return;
-        const owned = try self.allocator.dupe(u8, contents);
-        entry.contents = owned;
+        entry.contents = contents.retain();
         entry.exists_known = true;
         entry.exists = true;
         entry.kind = .regular;
@@ -333,3 +389,198 @@ pub const FileCache = struct {
         };
     }
 };
+
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+    tracked_payload_ptr: std.atomic.Value(usize) = .init(0),
+    payload_free_count: std.atomic.Value(usize) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn init(child: std.mem.Allocator) CountingAllocator {
+        return .{ .child = child };
+    }
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn trackPayload(self: *CountingAllocator, payload: []u8) void {
+        std.debug.assert(self.tracked_payload_ptr.load(.seq_cst) == 0);
+        self.tracked_payload_ptr.store(@intFromPtr(payload.ptr), .seq_cst);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const is_payload = @intFromPtr(buf.ptr) == self.tracked_payload_ptr.load(.seq_cst);
+        self.child.rawFree(buf, alignment, ret_addr);
+        if (is_payload) _ = self.payload_free_count.fetchAdd(1, .monotonic);
+    }
+};
+
+fn makeOwnedBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const owned = try allocator.alloc(u8, bytes.len);
+    @memcpy(owned, bytes);
+    return owned;
+}
+
+fn hammerRetainRelease(shared: *FileCache.ImmutableBytes, iterations: usize) void {
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var retained = shared.retain();
+        std.debug.assert(std.mem.eql(u8, retained.bytes(), "thread-safe"));
+        retained.release();
+    }
+}
+
+test "FileCache.ImmutableBytes.fromOwned preserves pointer and frees once" {
+    var counting = CountingAllocator.init(std.testing.allocator);
+    const payload_allocator = counting.allocator();
+    const original = "payload-transfer";
+    const owned = try makeOwnedBytes(payload_allocator, original);
+    const original_ptr = @intFromPtr(owned.ptr);
+    counting.trackPayload(owned);
+
+    var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
+    try std.testing.expectEqual(original_ptr, @intFromPtr(payload.bytes().ptr));
+    try std.testing.expectEqualStrings(original, payload.bytes());
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+
+    payload.release();
+    try std.testing.expectEqual(@as(usize, 1), counting.payload_free_count.load(.seq_cst));
+}
+
+test "FileCache.ImmutableBytes retain release holds bytes until final release" {
+    var counting = CountingAllocator.init(std.testing.allocator);
+    const payload_allocator = counting.allocator();
+    const original = "retained-payload";
+    const owned = try makeOwnedBytes(payload_allocator, original);
+    const original_ptr = @intFromPtr(owned.ptr);
+    counting.trackPayload(owned);
+
+    var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
+    var retained = payload.retain();
+
+    try std.testing.expectEqual(original_ptr, @intFromPtr(payload.bytes().ptr));
+    try std.testing.expectEqual(@intFromPtr(payload.bytes().ptr), @intFromPtr(retained.bytes().ptr));
+    payload.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+    try std.testing.expectEqualStrings(original, retained.bytes());
+
+    retained.release();
+    try std.testing.expectEqual(@as(usize, 1), counting.payload_free_count.load(.seq_cst));
+}
+
+test "FileCache aliases share blob pointers and metadata" {
+    var counting = CountingAllocator.init(std.testing.allocator);
+    const payload_allocator = counting.allocator();
+    var cache = FileCache.init(std.testing.allocator);
+    const original = "shared-alias-payload";
+    const owned = try makeOwnedBytes(payload_allocator, original);
+    const original_ptr = @intFromPtr(owned.ptr);
+    counting.trackPayload(owned);
+
+    var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
+    var alias_seed = payload.retain();
+
+    try cache.provideRegular("/virtual/cache-alpha", payload);
+    try cache.provideRegular("/virtual/cache-beta", alias_seed);
+    payload.release();
+    alias_seed.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+
+    try std.testing.expect(try cache.pathExists("/virtual/cache-alpha"));
+    try std.testing.expect(try cache.pathExists("/virtual/cache-beta"));
+    try std.testing.expectEqual(FileCache.FileKind.regular, try cache.fileType("/virtual/cache-alpha"));
+    try std.testing.expectEqual(FileCache.FileKind.regular, try cache.fileType("/virtual/cache-beta"));
+
+    const alpha_read = try cache.readFile("/virtual/cache-alpha");
+    const beta_read = try cache.readFile("/virtual/cache-beta");
+    try std.testing.expectEqual(original_ptr, @intFromPtr(alpha_read.ptr));
+    try std.testing.expectEqual(@intFromPtr(alpha_read.ptr), @intFromPtr(beta_read.ptr));
+    try std.testing.expectEqualStrings(original, alpha_read);
+    try std.testing.expectEqualStrings(original, beta_read);
+
+    var retained_alpha = try cache.retainFile("/virtual/cache-alpha");
+    var retained_beta = try cache.retainFile("/virtual/cache-beta");
+    try std.testing.expectEqual(original_ptr, @intFromPtr(retained_alpha.bytes().ptr));
+    try std.testing.expectEqual(@intFromPtr(retained_alpha.bytes().ptr), @intFromPtr(retained_beta.bytes().ptr));
+
+    retained_alpha.release();
+    retained_beta.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counting.payload_free_count.load(.seq_cst));
+}
+
+test "FileCache.ImmutableBytes concurrent retain release frees once" {
+    var counting = CountingAllocator.init(std.testing.allocator);
+    const payload_allocator = counting.allocator();
+    const owned = try makeOwnedBytes(payload_allocator, "thread-safe");
+    const original_ptr = @intFromPtr(owned.ptr);
+    counting.trackPayload(owned);
+    var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
+    try std.testing.expectEqual(original_ptr, @intFromPtr(payload.bytes().ptr));
+
+    const thread_count = 4;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| {
+        thread.* = try std.Thread.spawn(.{}, hammerRetainRelease, .{ &payload, 2_000 + index });
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+    payload.release();
+    try std.testing.expectEqual(@as(usize, 1), counting.payload_free_count.load(.seq_cst));
+}
+
+test "FileCache provideRegular idempotent seeding preserves payload pointer without leaks" {
+    var counting = CountingAllocator.init(std.testing.allocator);
+    const payload_allocator = counting.allocator();
+    var cache = FileCache.init(std.testing.allocator);
+    const original = "idempotent-payload";
+    const owned = try makeOwnedBytes(payload_allocator, original);
+    const original_ptr = @intFromPtr(owned.ptr);
+    counting.trackPayload(owned);
+
+    var payload = try FileCache.ImmutableBytes.fromOwned(payload_allocator, owned);
+    var duplicate_seed = payload.retain();
+
+    try cache.provideRegular("/virtual/cache-dup", payload);
+    try cache.provideRegular("/virtual/cache-dup", duplicate_seed);
+    payload.release();
+    duplicate_seed.release();
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+
+    const read_back = try cache.readFile("/virtual/cache-dup");
+    try std.testing.expectEqual(original_ptr, @intFromPtr(read_back.ptr));
+    try std.testing.expectEqualStrings(original, read_back);
+
+    var retained = try cache.retainFile("/virtual/cache-dup");
+    try std.testing.expectEqual(original_ptr, @intFromPtr(retained.bytes().ptr));
+    retained.release();
+
+    try std.testing.expectEqual(@as(usize, 0), counting.payload_free_count.load(.seq_cst));
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counting.payload_free_count.load(.seq_cst));
+}

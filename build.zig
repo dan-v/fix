@@ -119,6 +119,18 @@ pub fn build(b: *std.Build) void {
     derivation_mod.addImport("runtime", runtime_mod);
     derivation_mod.addImport("base", base_mod);
 
+    // Test-only imports live behind a dedicated root, not on the production
+    // derivation module consumed by the evaluator/CLI.
+    const derivation_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/nix/derivation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    derivation_tests_mod.addImport("runtime", runtime_mod);
+    derivation_tests_mod.addImport("base", base_mod);
+
     // Evaluation observability sinks (progress protocol + error-trace collector).
     // Leaf types the interpreter writes to; the evaluator/CLI implement them.
     const observ_mod = b.addModule("observ", .{
@@ -303,7 +315,7 @@ pub fn build(b: *std.Build) void {
     const run_scheduler_tests = b.addRunArtifact(scheduler_tests);
 
     const derivation_tests = b.addTest(.{
-        .root_module = derivation_mod,
+        .root_module = derivation_tests_mod,
         .use_llvm = true,
     });
     const run_derivation_tests = b.addRunArtifact(derivation_tests);
