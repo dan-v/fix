@@ -316,6 +316,10 @@ pub const Scanner = struct {
         while (self.pos < self.source.len and hasClass(self.source[self.pos], C_IDENT_CONT)) {
             self.pos += 1;
         }
+        // A `/` abutting the identifier's characters makes the whole token a
+        // path literal, not an identifier — flex's maximal munch, where PATH
+        // outranks IDENT (`common/user-account.nix`, `let/foo`, `a/${x}`).
+        if (self.atPathSegment()) return self.lexPath(start);
         const len = self.pos - start;
         const tt = keywordType(self.source[start..][0..len]);
         // Unquoted URI literal (deprecated Nix syntax): a plain identifier
@@ -355,9 +359,15 @@ pub const Scanner = struct {
             const is_float = (first >= '1' and first <= '9') or (int_len == 1 and first == '0' and frac_digit);
             if (is_float) {
                 self.pos += 1;
-                return self.lexFractionAndExponent(start);
+                const tok = self.lexFractionAndExponent(start);
+                // A `/` abutting the number is a path segment, not division:
+                // maximal munch makes `6.5/foo` a path, mirroring the ident case.
+                if (self.atPathSegment()) return self.lexPath(start);
+                return tok;
             }
         }
+        // Likewise for an integer prefix: `6/2`, `123/foo` are paths, not `/`.
+        if (self.atPathSegment()) return self.lexPath(start);
         return self.makeToken(.integer, start, self.pos - start);
     }
 
@@ -442,6 +452,19 @@ pub const Scanner = struct {
 
     fn isPathContinue(c: u8) bool {
         return hasClass(c, C_PATH_CONT);
+    }
+
+    /// True when `self.pos` sits at a `/` that opens a further path segment,
+    /// i.e. the slash abuts a segment char (`[A-Za-z0-9._+-]`, never another
+    /// `/`) or a `${` interpolation. After an initial run of path chars — an
+    /// identifier or a number — this promotes the token to a path literal per
+    /// flex maximal munch. It excludes `a//b` (the char after `/` is `/`, an
+    /// update op) and `a / b` / `a/ b` (whitespace, division / syntax error).
+    fn atPathSegment(self: *Scanner) bool {
+        if (self.peek() != '/') return false;
+        const c = self.peekAhead(1);
+        if (c == '$' and self.peekAhead(2) == '{') return true;
+        return c != '/' and hasClass(c, C_PATH_CONT);
     }
 
 
