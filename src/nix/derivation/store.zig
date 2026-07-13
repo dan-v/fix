@@ -99,6 +99,14 @@ pub const DerivationStore = struct {
     recipes: std.StringHashMapUnmanaged(*Recipe) = .empty,
     realization_claims: std.StringHashMapUnmanaged(*RealizationClaim) = .empty,
     realized_outputs: std.StringHashMapUnmanaged(void) = .empty,
+    /// Deferred fetch specs, keyed by the fixed-output store path a
+    /// `builtins.fetchurl`/`fetchTarball` with a known hash resolves to. In
+    /// plain eval the path is fully determined by (name, sha256), so it is
+    /// returned without touching the network; the download runs lazily only if
+    /// the path's *content* is later demanded (readFile/import/realization),
+    /// keeping path-only use offline while preserving import-from-derivation.
+    /// Guarded by `recipe_mu`.
+    pending_fetches: std.StringHashMapUnmanaged(PendingFetch) = .empty,
     recipe_mu: stable.BlockingMutex = .{},
     /// Test-only deterministic scheduling hook. This field is zero-bit `void`
     /// and all access is compiled out of production builds.
@@ -238,6 +246,66 @@ pub const DerivationStore = struct {
         }
     };
 
+    /// A deferred `fetchurl`/`fetchTarball`: the download spec plus the expected
+    /// content hash, materialized on demand. `recursive` distinguishes a flat
+    /// file (fetchurl) from an unpacked tree (fetchTarball).
+    pub const PendingFetch = struct {
+        url: []u8,
+        name: []u8,
+        recursive: bool,
+        hash_hex: []u8,
+
+        pub fn deinit(self: PendingFetch, allocator: std.mem.Allocator) void {
+            allocator.free(self.url);
+            allocator.free(self.name);
+            allocator.free(self.hash_hex);
+        }
+
+        fn clone(self: PendingFetch, allocator: std.mem.Allocator) !PendingFetch {
+            const url = try allocator.dupe(u8, self.url);
+            errdefer allocator.free(url);
+            const name = try allocator.dupe(u8, self.name);
+            errdefer allocator.free(name);
+            const hash_hex = try allocator.dupe(u8, self.hash_hex);
+            return .{ .url = url, .name = name, .recursive = self.recursive, .hash_hex = hash_hex };
+        }
+    };
+
+    /// Register a deferred fetch for `store_path` (no-op if one already exists).
+    pub fn recordPendingFetch(self: *DerivationStore, store_path: []const u8, url: []const u8, name: []const u8, recursive: bool, hash_hex: []const u8) !void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        if (self.pending_fetches.contains(store_path)) return;
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        const url_copy = try self.allocator.dupe(u8, url);
+        errdefer self.allocator.free(url_copy);
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const hash_copy = try self.allocator.dupe(u8, hash_hex);
+        errdefer self.allocator.free(hash_copy);
+        try self.pending_fetches.put(self.allocator, key, .{ .url = url_copy, .name = name_copy, .recursive = recursive, .hash_hex = hash_copy });
+    }
+
+    /// Return an owned copy of the deferred fetch for exactly `store_path`, or
+    /// null. The entry is left in place — concurrent demands each materialize
+    /// against the (memoized) fetch cache; `removePendingFetch` drops it once a
+    /// flat file is seeded. Caller owns the copy and must `deinit` it.
+    pub fn peekPendingFetch(self: *DerivationStore, store_path: []const u8) !?PendingFetch {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        const entry = self.pending_fetches.get(store_path) orelse return null;
+        return try entry.clone(self.allocator);
+    }
+
+    pub fn removePendingFetch(self: *DerivationStore, store_path: []const u8) void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+        const removed = self.pending_fetches.fetchRemove(store_path) orelse return;
+        self.allocator.free(removed.key);
+        removed.value.deinit(self.allocator);
+    }
+
     const Recipe = struct {
         payload: Payload,
 
@@ -360,6 +428,12 @@ pub const DerivationStore = struct {
         var realized = self.realized_outputs.keyIterator();
         while (realized.next()) |key| self.allocator.free(key.*);
         self.realized_outputs.deinit(self.allocator);
+        var pending = self.pending_fetches.iterator();
+        while (pending.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.pending_fetches.deinit(self.allocator);
         if (comptime builtin.is_test) {
             var producer_pointers = self.test_producer_payload_pointers.iterator();
             while (producer_pointers.next()) |entry| {

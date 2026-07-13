@@ -9,6 +9,7 @@ const heap_mod = @import("runtime").heap;
 const path_ops = @import("runtime").paths;
 const FileCache = @import("runtime").file_cache.FileCache;
 const strings = @import("strings.zig");
+const fetch = @import("fetch.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_trace = @import("../trace.zig");
@@ -66,6 +67,11 @@ pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
     // Deliberately uncached: recording a pre-build false in FileCache would
     // make pathExists contradict the successful realization below.
     if (try self.files.existsUncached(path)) return path;
+
+    // A deferred fetchurl/fetchTarball (hash known, download skipped) whose
+    // content is now demanded: run the fetch lazily and seed the cache. Path-only
+    // uses never get here, so they stay offline.
+    if (try fetch.materializePendingFetch(self, path)) return path;
 
     const context = (try demandContext(self, value)) orelse return path;
     defer context.deinit(self.allocator);

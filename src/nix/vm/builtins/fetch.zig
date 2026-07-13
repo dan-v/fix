@@ -440,6 +440,20 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     const expected_hash = try expectedFetchSha256Hex(self, arg);
     defer if (expected_hash) |hash| self.allocator.free(hash);
 
+    // Plain eval with a known hash: the flat fixed-output path is fully
+    // determined by (name, sha256), so return it without fetching. The download
+    // is deferred (registered as a pending fetch) and runs only if the path's
+    // content is later demanded — offline for path-only use, still correct for
+    // import-from-derivation. Store writes keep the eager fetch+materialize path.
+    if (expected_hash) |expected| {
+        if (!self.derivations.store_writes_enabled) {
+            const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, spec.name, "out", "sha256", expected);
+            defer self.allocator.free(store_path);
+            try self.derivations.recordPendingFetch(store_path, spec.url, spec.name, false, expected);
+            return contextStringWithPath(self, try self.intern.intern(store_path));
+        }
+    }
+
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
@@ -554,6 +568,19 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     const expected_hash = try expectedFetchSha256Hex(self, arg);
     defer if (expected_hash) |hash| self.allocator.free(hash);
 
+    // Plain eval with a known hash: the recursive fixed-output path is fully
+    // determined by (name, sha256), so return it without fetching (deferred like
+    // fetchurl above). Content demand (readFile into the tree, import) triggers
+    // the fetch+unpack lazily. Store writes keep the eager ingest path.
+    if (expected_hash) |expected| {
+        if (!self.derivations.store_writes_enabled) {
+            const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, tree_name, expected);
+            defer self.allocator.free(store_path);
+            try self.derivations.recordPendingFetch(store_path, spec.url, tree_name, true, expected);
+            return contextStringWithPath(self, try self.intern.intern(store_path));
+        }
+    }
+
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
@@ -592,6 +619,67 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     const out = try ingestFetchedTree(self, result.path, tree_name, "", null);
     defer out.deinit(self.allocator);
     return fetchedPathValue(self, out.out_path);
+}
+
+/// Materialize a deferred `fetchurl`/`fetchTarball` when its content is demanded
+/// (readFile/import). `demanded_path` is the store path being read, or a
+/// `store_path/sub` inside a fetched tree. Runs the download now, validates it
+/// against the recorded hash, and seeds the file cache so the read succeeds.
+/// Returns true iff a pending fetch was found and materialized. Called from the
+/// path-demand seam so path-only uses never reach here (and never fetch).
+pub fn materializePendingFetch(self: anytype, demanded_path: []const u8) !bool {
+    const store_root = storeRootOf(demanded_path, self.derivations.store_dir) orelse return false;
+    // `peekPendingFetch` clones with the store's allocator; free with the same.
+    var pending = (try self.derivations.peekPendingFetch(store_root)) orelse return false;
+    defer pending.deinit(self.derivations.allocator);
+
+    const span = fetchSpanBegin(self, pending.url);
+    defer fetchSpanEnd(self, span);
+
+    if (pending.recursive) {
+        const result = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{
+            .url = pending.url,
+            .name = pending.name,
+            .serialize_nar = true,
+        }, span);
+        defer result.deinit(self.fetchers.allocator);
+        const payload = result.nar_payload orelse unreachable;
+        const actual_hash = std.fmt.bytesToHex(payload.digest, .lower);
+        try validateFetchedSha256(self, "tarball", pending.url, pending.hash_hex, &actual_hash);
+        // Seed the specific file demanded from the unpacked tree; the entry
+        // stays registered so sibling reads materialize too (the fetch cache
+        // memoizes the download + unpack, so repeats are cheap).
+        const rel_raw = demanded_path[store_root.len..];
+        const rel = if (rel_raw.len > 0 and rel_raw[0] == '/') rel_raw[1..] else rel_raw;
+        const src = try std.fs.path.join(self.allocator, &.{ result.path, rel });
+        defer self.allocator.free(src);
+        var contents = try self.files.retainFile(src);
+        defer contents.release();
+        try self.files.provideRegular(demanded_path, contents);
+        return true;
+    }
+
+    const result = try offloadFetch(self, FetchCache.fetchUrl, FetchCache.UrlSpec{
+        .url = pending.url,
+        .name = pending.name,
+    }, span);
+    defer result.deinit(self.fetchers.allocator);
+    try validateFetchedSha256(self, "file", pending.url, pending.hash_hex, result.hash);
+    var contents = try self.files.retainFile(result.path);
+    defer contents.release();
+    try self.files.provideRegular(store_root, contents);
+    self.derivations.removePendingFetch(store_root);
+    return true;
+}
+
+/// The `/nix/store/<name>` root of a store path (stripping any `/sub…`), or null
+/// if `path` isn't under the store directory.
+fn storeRootOf(path: []const u8, store_dir: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, store_dir)) return null;
+    if (path.len <= store_dir.len or path[store_dir.len] != '/') return null;
+    const after = store_dir.len + 1;
+    const rel_end = std.mem.indexOfScalarPos(u8, path, after, '/') orelse return path;
+    return path[0..rel_end];
 }
 
 /// The store name for a `fetchTarball` unpacked tree: an explicit `name` attr,
