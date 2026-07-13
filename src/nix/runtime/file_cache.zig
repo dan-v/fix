@@ -144,8 +144,11 @@ pub const FileCache = struct {
         if (entry.exists_known) return entry.exists;
 
         const io = self.io orelse return error.FileIoUnavailable;
-        std.Io.Dir.accessAbsolute(io, entry.path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
+        // lstat-based existence (matching Nix): the final path component exists
+        // even if it is a broken symlink, and a trailing `/`/`/.` on a
+        // non-directory does not exist.
+        _ = std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
                 entry.exists_known = true;
                 entry.exists = false;
                 return false;
@@ -156,6 +159,16 @@ pub const FileCache = struct {
         entry.exists_known = true;
         entry.exists = true;
         return true;
+    }
+
+    /// Whether `path`, following symlinks, is a directory. A trailing `/`/`/.`
+    /// in `pathExists` requires a directory, and (unlike `fileType`'s lstat)
+    /// must resolve a final symlink to its target.
+    pub fn isDirectoryFollowing(self: *FileCache, path: []const u8) !bool {
+        const io = self.io orelse return error.FileIoUnavailable;
+        const entry = try self.entryFor(path);
+        const stat = std.Io.Dir.cwd().statFile(io, entry.path, .{ .follow_symlinks = true }) catch return false;
+        return stat.kind == .directory;
     }
 
     /// Trap: deliberately UNcached existence probe. Used by import-from-

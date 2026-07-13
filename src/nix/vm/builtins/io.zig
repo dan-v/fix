@@ -18,7 +18,15 @@ const stringTextInternId = strings.stringTextInternId;
 const isPlainString = strings.isPlainString;
 
 pub fn builtinPathExists(self: anytype, arg: Value) !Value {
-    return Value.boolVal(try self.files.pathExists(try demandPathArg(self, arg)));
+    const path = try demandPathArg(self, arg);
+    if (!try self.files.pathExists(path)) return Value.boolVal(false);
+    // A trailing `/` or `/.` requires the target to be a directory (Nix): the
+    // path model canonicalizes those away, so check the resolved type (a final
+    // symlink is followed here, so `<symlink-to-dir>/.` counts as a directory).
+    if (std.mem.endsWith(u8, path, "/") or std.mem.endsWith(u8, path, "/.")) {
+        return Value.boolVal(try self.files.isDirectoryFollowing(path));
+    }
+    return Value.boolVal(true);
 }
 
 pub fn builtinReadFile(self: anytype, arg: Value) !Value {
