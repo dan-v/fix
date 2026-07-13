@@ -437,19 +437,14 @@ const FetchUrlSpec = struct {
 pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
-
-    // Fast path: an explicit `sha256`/`hash` fixes the flat fixed-output store
-    // path from name+hash, so Nix returns it (as a context string) without ever
-    // dereferencing the URL. No network needed.
-    if (try hashedFodPath(self, arg, spec.name, false)) |path| {
-        defer self.allocator.free(path);
-        return contextStringWithPath(self, try self.intern.intern(path));
-    }
+    const expected_hash = try expectedFetchSha256Hex(self, arg);
+    defer if (expected_hash) |hash| self.allocator.free(hash);
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const result = try offloadFetch(self, FetchCache.fetchUrl, spec.borrowed(), span);
     defer result.deinit(self.fetchers.allocator);
+    try validateFetchedSha256(self, "file", spec.url, expected_hash, result.hash);
     const path = try flatFetchOutPath(self, result.path, result.hash, spec.name);
     defer self.allocator.free(path);
     // The flat fixed-output store path is fully determined by the fetched
@@ -458,24 +453,40 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     return contextStringWithPath(self, try self.intern.intern(path));
 }
 
-/// If `arg` is an attrset carrying an explicit `sha256`, return the
-/// deterministic fixed-output store path it names — flat (`recursive=false`,
-/// like `fetchurl`) or recursive/NAR (`recursive=true`, like `fetchTarball`) —
-/// computed from `name`+hash, without fetching. Matches Nix, which returns this
-/// path lazily and never touches the URL when the hash is known upfront. Null
-/// when there is no hash attr (caller falls back to the real fetch).
-fn hashedFodPath(self: anytype, arg: Value, name: []const u8, recursive: bool) !?[]u8 {
+fn expectedFetchSha256Hex(self: anytype, arg: Value) !?[]u8 {
     const value = try vm_force.forceValue(self, arg);
     if (!value.isAttrs()) return null;
-    const id = value.asObjectId();
-    // Only `sha256` fixes the path here — `builtins.fetchurl`/`fetchTarball`
-    // reject a bare `hash` attr (see the `invalid-attrs` conformance case).
-    const hash = (try optionalStringAttr(self, id, "sha256")) orelse return null;
-    defer self.allocator.free(hash);
-    const hex = try derivation.hashToBase16(self.allocator, "sha256", hash);
-    defer self.allocator.free(hex);
-    const algo = if (recursive) "r:sha256" else "sha256";
-    return try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, name, "out", algo, hex);
+    const expected = (try optionalStringAttr(self, value.asObjectId(), "sha256")) orelse return null;
+    defer self.allocator.free(expected);
+    return derivation.hashToBase16(self.allocator, "sha256", expected) catch {
+        const message = try std.fmt.allocPrint(self.allocator, "invalid sha256 hash '{s}'", .{expected});
+        defer self.allocator.free(message);
+        try vm_trace.setErrorMessage(self, message);
+        return error.InvalidHash;
+    };
+}
+
+fn validateFetchedSha256(self: anytype, noun: []const u8, url: []const u8, expected_hex: ?[]const u8, actual_hex: []const u8) !void {
+    const expected = expected_hex orelse return;
+    if (std.ascii.eqlIgnoreCase(expected, actual_hex)) return;
+    const message = try std.fmt.allocPrint(
+        self.allocator,
+        "hash mismatch in {s} downloaded from '{s}': expected sha256 '{s}', got '{s}'",
+        .{ noun, url, expected, actual_hex },
+    );
+    defer self.allocator.free(message);
+    try vm_trace.setErrorMessage(self, message);
+    return error.HashMismatch;
+}
+
+fn fetchedTreeNarSha256Hex(self: anytype, path: []const u8) ![]u8 {
+    const nar_bytes = try nar.serialize(self.allocator, self.files, path, null);
+    defer self.allocator.free(nar_bytes);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(nar_bytes, &digest, .{});
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return self.allocator.dupe(u8, &encoded);
 }
 
 /// Realize a fetched single file to its flat (`fixed:sha256`) fixed-output
@@ -548,23 +559,20 @@ fn fetchUrlSpecFromAttrs(self: anytype, attrs_id: ObjectId, default_name: ?[]con
 }
 
 pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
-    // Fast path: an explicit `sha256`/`hash` fixes the recursive (NAR)
-    // fixed-output store path from the tree name (default "source") + hash, so
-    // Nix returns it (as a context string) without fetching the archive.
     const tree_name = try tarballTreeName(self, arg);
     defer self.allocator.free(tree_name);
-    if (try hashedFodPath(self, arg, tree_name, true)) |path| {
-        defer self.allocator.free(path);
-        return contextStringWithPath(self, try self.intern.intern(path));
-    }
-
     const spec = try fetchUrlSpec(self, arg);
     defer spec.deinit(self.allocator);
+    const expected_hash = try expectedFetchSha256Hex(self, arg);
+    defer if (expected_hash) |hash| self.allocator.free(hash);
 
     const span = fetchSpanBegin(self, spec.url);
     defer fetchSpanEnd(self, span);
     const path = try offloadFetch(self, FetchCache.fetchTarball, FetchCache.TarballSpec{ .url = spec.url, .name = spec.name }, span);
     defer self.fetchers.allocator.free(path);
+    const actual_hash = try fetchedTreeNarSha256Hex(self, path);
+    defer self.allocator.free(actual_hash);
+    try validateFetchedSha256(self, "tarball", spec.url, expected_hash, actual_hash);
     // The unpacked tree is named "source" by default (Nix), independent of the
     // archive's URL basename which named the download (`tree_name`, above).
     const out = try ingestFetchedTree(self, path, tree_name, "", null);
