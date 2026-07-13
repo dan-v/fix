@@ -7,7 +7,7 @@ const heap_mod = @import("runtime").heap;
 const vm = @import("vm");
 const vm_builtins = vm.builtins;
 const vm_force = vm.force;
-const FakeDaemon = @import("test_daemon").FakeDaemon;
+const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
 
 /// Task 5 GREEN exposes the one shared path-demand integration through the VM
 /// builtin facade. Until then every regression below reports this exact RED,
@@ -24,6 +24,11 @@ const DemandCase = enum {
     import_file,
     scoped_import,
     interpolated_subpath,
+};
+
+const ProducedOutput = struct {
+    output: Value,
+    derivation_id: @import("runtime").types.ObjectId,
 };
 
 const DemandFixture = struct {
@@ -67,17 +72,29 @@ const DemandFixture = struct {
         self.tmp.cleanup();
     }
 
-    /// Return only the context-bearing output. The derivation-shaped attrset
-    /// created while evaluating this expression is deliberately not retained.
-    fn makeOutputOnly(self: *DemandFixture) !Value {
-        return self.ev.evaluate(
-            \\(builtins.derivation {
+    /// Construct the derivation-shaped attrset explicitly, capture its exact
+    /// ObjectId, then return only that id and the forced context-bearing output.
+    /// No Value retaining the attrset escapes this frame.
+    fn makeDerivationAndOutput(self: *DemandFixture) !ProducedOutput {
+        const derived = try self.ev.evaluate(
+            \\builtins.derivation {
             \\  name = "cold-path-demand";
             \\  system = "x86_64-linux";
             \\  builder = "/bin/sh";
             \\  args = [ ];
-            \\}).outPath
+            \\}
         );
+        if (!derived.isAttrs()) return error.ExpectedDerivationAttrs;
+        const derivation_id = derived.asObjectId();
+        const output = try self.ev.forceValue(try self.ev.heap.getAttrValue(
+            derivation_id,
+            try self.ev.intern.intern("outPath"),
+        ));
+        return .{ .output = output, .derivation_id = derivation_id };
+    }
+
+    fn makeOutputOnly(self: *DemandFixture) !Value {
+        return (try self.makeDerivationAndOutput()).output;
     }
 
     fn outputInfo(self: *DemandFixture, output: Value) !struct { path: []const u8, drv_path: []const u8 } {
@@ -126,8 +143,10 @@ const DemandFixture = struct {
         return Value.attrs(try self.ev.heap.addAttrs(&entries));
     }
 
-    fn assertOneRealization(self: *DemandFixture, subject: []const u8) !void {
+    fn assertOneRealization(self: *DemandFixture, output: Value, subject: []const u8) !void {
+        const info = try self.outputInfo(output);
         try std.testing.expectEqual(@as(usize, 1), self.fake.count(.text));
+        try std.testing.expect(self.fake.nthSubjectEquals(.text, 0, info.drv_path));
         try std.testing.expectEqual(@as(usize, 1), self.fake.count(.build));
         try std.testing.expect(self.fake.nthSubjectEquals(.build, 0, subject));
     }
@@ -168,7 +187,7 @@ fn runDemandCase(case: DemandCase) !void {
         .import_file => try std.testing.expectEqual(@as(i64, 42), (try fixture.ev.forceValue(result)).asInt()),
         .scoped_import => try std.testing.expectEqual(@as(i64, 3), (try fixture.ev.forceValue(result)).asInt()),
     }
-    try fixture.assertOneRealization(subject);
+    try fixture.assertOneRealization(output, subject);
 }
 
 fn guardedDemandCase(case: DemandCase) !void {
@@ -215,19 +234,24 @@ test "cold output demand survives a major GC with only output context rooted" {
     if (comptime sharedDemandIntegrationAvailable()) {
         var fixture = try DemandFixture.init(std.testing.allocator, 1);
         defer fixture.deinit();
-        const output = try fixture.makeOutputOnly();
+        const produced = try fixture.makeDerivationAndOutput();
+        const output = produced.output;
         const subject = try fixture.registerOutputTree(output);
         defer fixture.allocator.free(subject);
+        try std.testing.expect((try fixture.ev.heap.getAttrs(produced.derivation_id)).len != 0);
 
         try fixture.ev.gcSetExternalRoots(&.{output});
         defer fixture.ev.gcSetExternalRoots(&.{}) catch {};
         const collected = fixture.ev.collectMajorNow();
-        if (comptime build_options.gc) try std.testing.expect(collected.ran);
+        if (comptime build_options.gc) {
+            try std.testing.expect(collected.ran);
+            try std.testing.expect(!fixture.ev.heap.isObjectAllocatedForTest(produced.derivation_id));
+        }
 
         const scope = try fixture.scopeWithOutput(output);
         const result = try fixture.ev.evaluateWithScope("builtins.readFile (p + \"/payload.txt\")", scope);
         try std.testing.expectEqualStrings("cold payload", try valueText(&fixture, result));
-        try fixture.assertOneRealization(subject);
+        try fixture.assertOneRealization(output, subject);
     } else return error.MissingSharedDemandPathIntegration;
 }
 
@@ -262,6 +286,6 @@ test "concurrent cold output demands issue exactly one daemon build" {
         for (try fixture.ev.heap.getAttrs(demands.asObjectId())) |entry| {
             try std.testing.expectEqualStrings("cold payload", try valueText(&fixture, entry.value));
         }
-        try fixture.assertOneRealization(subject);
+        try fixture.assertOneRealization(output, subject);
     } else return error.MissingSharedDemandPathIntegration;
 }

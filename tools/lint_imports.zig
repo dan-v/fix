@@ -129,6 +129,10 @@ fn owningModule(rel: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, rel, "cli/")) return "cli";
     // Strip the `nix/` tier segment (if present) before matching subsystem dirs.
     const inner = if (std.mem.startsWith(u8, rel, "nix/")) rel["nix/".len..] else rel;
+    // Dedicated test root for the derivation module. It lives one level up so
+    // its relative imports can include both derivation internals and the shared
+    // core fake daemon without attaching either to production module imports.
+    if (std.mem.eql(u8, inner, "derivation_test_root.zig")) return "derivation";
     for (module_dirs) |m| {
         if (std.mem.startsWith(u8, inner, m) and inner.len > m.len and inner[m.len] == '/') return m;
         if (inner.len == m.len + 4 and std.mem.startsWith(u8, inner, m) and std.mem.eql(u8, inner[m.len..], ".zig")) return m;
