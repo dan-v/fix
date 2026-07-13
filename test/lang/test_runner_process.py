@@ -60,11 +60,15 @@ class ProcessCleanupTests(unittest.TestCase):
         else:
             self.assertEqual(["fix", "eval"], command[:2])
         term = ("killpg", process.pid, signal.SIGTERM)
+        grace_wait = ("wait", 1.0)
         kill = ("killpg", process.pid, signal.SIGKILL)
-        self.assertIn(term, process.events)
-        self.assertIn(kill, process.events)
-        self.assertLess(process.events.index(term), process.events.index(kill))
-        self.assertEqual("wait", process.events[-1][0])
+        final_reap = ("wait", None)
+        term_index = process.events.index(term)
+        self.assertEqual(
+            [term, grace_wait, kill, final_reap],
+            process.events[term_index:term_index + 4],
+        )
+        self.assertEqual(final_reap, process.events[-1])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
     def test_direct_fix_timeout_terminates_kills_and_reaps_group(self):
