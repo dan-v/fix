@@ -65,6 +65,6 @@ pub const isSyntheticName = value_builder.isSyntheticName;
 test {
     _ = @import("derivation/tests.zig");
     _ = @import("derivation/recipe_tests.zig");
-    _ = @import("derivation/test_daemon.zig");
+    _ = @import("test_daemon");
     _ = hash_codec;
 }

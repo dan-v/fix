@@ -2,7 +2,7 @@ const std = @import("std");
 const stable = @import("base").sync;
 const DerivationStore = @import("store.zig").DerivationStore;
 const FileCache = @import("runtime").file_cache.FileCache;
-const FakeDaemon = @import("test_daemon.zig").FakeDaemon;
+const FakeDaemon = @import("test_daemon").FakeDaemon;
 
 const root_path = "/nix/store/00000000000000000000000000000000-root.drv";
 const dep_text_path = "/nix/store/11111111111111111111111111111111-dep-text";

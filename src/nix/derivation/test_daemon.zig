@@ -18,6 +18,7 @@ pub const FakeDaemon = struct {
     mu: stable.BlockingMutex = .{},
     valid_paths: std.StringHashMapUnmanaged(void) = .empty,
     operations: std.ArrayListUnmanaged(Operation) = .empty,
+    materializations: std.ArrayListUnmanaged(Materialization) = .empty,
     fail_next_add: bool = false,
     fail_next_build: bool = false,
     server_error: ?anyerror = null,
@@ -35,6 +36,18 @@ pub const FakeDaemon = struct {
             allocator.free(self.payload);
             for (self.references) |reference| allocator.free(reference);
             allocator.free(self.references);
+        }
+    };
+
+    const Materialization = struct {
+        subject: []u8,
+        path: []u8,
+        payload: ?[]u8,
+
+        fn deinit(self: Materialization, allocator: std.mem.Allocator) void {
+            allocator.free(self.subject);
+            allocator.free(self.path);
+            if (self.payload) |payload| allocator.free(payload);
         }
     };
 
@@ -91,6 +104,8 @@ pub const FakeDaemon = struct {
         self.valid_paths.deinit(self.allocator);
         for (self.operations.items) |operation| operation.deinit(self.allocator);
         self.operations.deinit(self.allocator);
+        for (self.materializations.items) |materialization| materialization.deinit(self.allocator);
+        self.materializations.deinit(self.allocator);
         self.mu.unlock();
         self.allocator.free(self.socket_path);
         self.allocator.destroy(self);
@@ -110,6 +125,35 @@ pub const FakeDaemon = struct {
             return;
         }
         try self.valid_paths.put(self.allocator, owned, {});
+    }
+
+    /// Configure an exact build subject to create `path` as a directory before
+    /// the fake reports build success. Register parent directories before
+    /// children; this fixture deliberately does not emulate a general store.
+    pub fn registerBuildDirectory(self: *FakeDaemon, subject: []const u8, path: []const u8) !void {
+        try self.registerMaterialization(subject, path, null);
+    }
+
+    /// Configure an exact build subject to write `payload` to absolute `path`
+    /// before the fake reports build success.
+    pub fn registerBuildFile(self: *FakeDaemon, subject: []const u8, path: []const u8, payload: []const u8) !void {
+        try self.registerMaterialization(subject, path, payload);
+    }
+
+    fn registerMaterialization(self: *FakeDaemon, subject: []const u8, path: []const u8, payload: ?[]const u8) !void {
+        const owned_subject = try self.allocator.dupe(u8, subject);
+        errdefer self.allocator.free(owned_subject);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_payload = if (payload) |bytes| try self.allocator.dupe(u8, bytes) else null;
+        errdefer if (owned_payload) |bytes| self.allocator.free(bytes);
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.materializations.append(self.allocator, .{
+            .subject = owned_subject,
+            .path = owned_path,
+            .payload = owned_payload,
+        });
     }
 
     pub fn failNextAdd(self: *FakeDaemon) void {
@@ -305,9 +349,26 @@ pub const FakeDaemon = struct {
         self.mu.unlock();
         if (fail) return writeDaemonError(output, "scripted permanent build failure");
 
+        for (paths) |path| try self.materialize(path);
         try wire.writeInt(output, wire.stderr_last);
         try wire.writeInt(output, 0);
         try output.flush();
+    }
+
+    fn materialize(self: *FakeDaemon, subject: []const u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.materializations.items) |materialization| {
+            if (!std.mem.eql(u8, materialization.subject, subject)) continue;
+            if (materialization.payload) |payload| {
+                try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = materialization.path, .data = payload });
+            } else {
+                std.Io.Dir.createDirAbsolute(self.io, materialization.path, .default_dir) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+            }
+        }
     }
 
     fn appendOperation(self: *FakeDaemon, kind: Kind, subject: []const u8, payload: []const u8, references: []const []const u8) !void {
@@ -385,8 +446,20 @@ fn writeValidPathInfo(output: *std.Io.Writer, path: []const u8) !void {
 // Keep the protocol helper independently compiled: Task 4's guarded RED tests
 // must not hide syntax or framing mistakes in test-only infrastructure.
 test "fake derivation daemon supports the concrete DaemonStore protocol subset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "materialized", .default_dir);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const output_dir = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "materialized", "out" });
+    defer std.testing.allocator.free(output_dir);
+    const output_file = try std.fs.path.resolve(std.testing.allocator, &.{ output_dir, "result.txt" });
+    defer std.testing.allocator.free(output_file);
+
     var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
     defer fake.deinit();
+    try fake.registerBuildDirectory("/nix/store/example.drv^out", output_dir);
+    try fake.registerBuildFile("/nix/store/example.drv^out", output_file, "built payload");
 
     const daemon = try runtime_store.DaemonStore.connect(std.testing.allocator, std.testing.io, fake.socketPath());
     defer daemon.deinit();
@@ -406,4 +479,7 @@ test "fake derivation daemon supports the concrete DaemonStore protocol subset" 
     try std.testing.expect(fake.nthPayloadEquals(.nar, 0, "nix-archive-1"));
     try std.testing.expect(fake.nthPayloadEquals(.flat, 0, "flat payload"));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
+    const materialized = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, output_file, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(materialized);
+    try std.testing.expectEqualStrings("built payload", materialized);
 }
