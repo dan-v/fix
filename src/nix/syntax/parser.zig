@@ -197,6 +197,25 @@ pub const Parser = struct {
         }) catch {};
     }
 
+    /// Report a semantic parse error anchored at an AST atom (an attribute or
+    /// formal name), rather than a live token — the position Nix points at for
+    /// duplicate-attribute / duplicate-formal errors.
+    fn reportAtom(self: *Parser, at: Node.Atom, msg: []const u8) void {
+        self.had_error = true;
+        self.diagnostics.append(self.allocator, .{
+            .line = diagnostic.lineForOffset(self.source, at.offset),
+            .column = diagnostic.columnForOffset(self.source, at.offset),
+            .offset = at.offset,
+            .len = at.len,
+            .token_type = null,
+            .message = msg,
+        }) catch {};
+    }
+
+    fn atomText(self: *Parser, at: Node.Atom) []const u8 {
+        return self.source[at.offset..][0..at.len];
+    }
+
     // ---- entry point ----
 
     pub fn parse(self: *Parser) !*Node {
@@ -675,7 +694,17 @@ pub const Parser = struct {
             .integer => return self.atom(.integer, rhs[0].tok),
             .float_val => return self.atom(.float_val, rhs[0].tok),
             .string => return self.atom(.string, rhs[0].tok),
-            .path => return self.atom(.path, rhs[0].tok),
+            .path => {
+                // Nix rejects a path literal with a trailing slash (`/nix/store/`).
+                // A lone `/` is the division operator, never a path token, so any
+                // path token ending in `/` is a genuine trailing slash.
+                const tok = rhs[0].tok;
+                if (tok.len >= 1 and self.source[tok.offset + tok.len - 1] == '/') {
+                    self.report(tok, "path has a trailing slash");
+                    return error.ParseError;
+                }
+                return self.atom(.path, tok);
+            },
             .uri => return self.atom(.uri, rhs[0].tok),
             .search_path => return self.atom(.search_path, rhs[0].tok),
             // Real token atoms (not {0,0} placeholders): a zero offset would
@@ -865,6 +894,25 @@ pub const Parser = struct {
                 },
             }
         }
+        // Reject duplicate formal argument names (Nix: "duplicate formal
+        // function argument 'x'"), including one that collides with the
+        // `@`-bound name. Report at the later (offending) occurrence.
+        for (params.items, 0..) |p, i| {
+            const name = self.atomText(p.name);
+            var dup = bind_name != null and std.mem.eql(u8, name, self.atomText(bind_name.?));
+            if (!dup) for (params.items[0..i]) |q| {
+                if (std.mem.eql(u8, name, self.atomText(q.name))) {
+                    dup = true;
+                    break;
+                }
+            };
+            if (dup) {
+                const msg = try std.fmt.allocPrint(a, "duplicate formal function argument '{s}'", .{name});
+                self.reportAtom(p.name, msg);
+                return error.ParseError;
+            }
+        }
+
         const la = try a.create(Node.LambdaAttrs);
         la.* = .{
             .bind_name = bind_name,
