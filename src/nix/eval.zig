@@ -483,6 +483,9 @@ pub const Evaluator = struct {
     /// one definition is `rec` and another isn't is allowed (first-definition
     /// recursiveness wins); default false (compile error, matching Lix).
     allow_rec_set_merges: bool = false,
+    /// `cr-line-endings` deprecated feature: when true, CR/CRLF line endings are
+    /// accepted; default false (compile error, matching Lix).
+    allow_cr_line_endings: bool = false,
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -985,6 +988,26 @@ pub const Evaluator = struct {
                 .message = "pipe operators are disabled; pass --extra-experimental-features pipe-operators to enable them",
             }}, source, source_path);
             return error.PipeOperatorsDisabled;
+        }
+
+        // Lix deprecated CR/CRLF line endings: rejected by default, re-permitted
+        // by `cr-line-endings`. The scanner records the first structural CR; the
+        // parse still succeeds (CR is treated as a line ending) so enabling the
+        // feature Just Works.
+        if (parser.first_cr_offset) |cr_off| {
+            if (!self.allow_cr_line_endings) {
+                try self.copyDiagnostics(&.{.{
+                    .severity = .err,
+                    .kind = .compile,
+                    .line = diagnostic.lineForOffset(source, cr_off),
+                    .column = diagnostic.columnForOffset(source, cr_off),
+                    .offset = cr_off,
+                    .len = 1,
+                    .token_type = null,
+                    .message = "CR (`\\r`) and CRLF (`\\r\\n`) line endings are not supported. Please inspect the file and normalize it to use LF (`\\n`) line endings instead. Use --extra-deprecated-features cr-line-endings to silence this warning.",
+                }}, source, source_path);
+                return error.CrLineEndingsDisabled;
+            }
         }
 
         // Per-compilation-unit scratch arena: all of the compiler's

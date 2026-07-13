@@ -128,6 +128,10 @@ pub const Parser = struct {
     /// The earliest pipe operator token seen, for a precise "disabled"
     /// diagnostic.
     first_pipe_token: ?Token,
+    /// Offset of the first structural CR (`\r`) line ending, or null. Set from
+    /// the scanner after driving. The compile chokepoint gates it on the
+    /// `cr-line-endings` deprecated feature, like `used_pipe_operators`.
+    first_cr_offset: ?u32 = null,
     /// Body-span elision (lazy parsing): when enabled, a bind body inside a
     /// plain `{ ... }` that (a) appears after `elide_min_prior_clauses`
     /// earlier clauses in the same brace, (b) spans at least
@@ -327,6 +331,7 @@ pub const Parser = struct {
     pub fn parse(self: *Parser) !*Node {
         var scanner = Scanner.init(self.source);
         const root = try self.drive(&scanner);
+        self.first_cr_offset = scanner.first_cr;
 
         if (self.had_error) return error.ParseError;
         return root orelse error.ParseError;
