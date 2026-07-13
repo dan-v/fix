@@ -13,7 +13,9 @@ fn recipeInspectionAvailable() bool {
         @hasDecl(DerivationStore, "recipeVariantForTest") and
         @hasDecl(DerivationStore, "recipePayloadPointerForTest") and
         @hasDecl(DerivationStore, "recipePayloadBytesForTest") and
-        @hasDecl(DerivationStore, "recipeReferencesForTest");
+        @hasDecl(DerivationStore, "recipeReferencesForTest") and
+        @hasDecl(DerivationStore, "noteProducerPayloadForTest") and
+        @hasDecl(DerivationStore, "producerPayloadPointerForTest");
 }
 
 const Fixture = struct {
@@ -97,6 +99,7 @@ fn storePathSubject(path: []const u8) []const u8 {
 fn expectRecipeText(store: *DerivationStore, store_path: []const u8, payload: []const u8, refs: []const []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
         try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.text, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
         try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
         try expectRefsEqual(store.recipeReferencesForTest(store_path).?, refs);
     } else unreachable;
@@ -105,6 +108,7 @@ fn expectRecipeText(store: *DerivationStore, store_path: []const u8, payload: []
 fn expectRecipeNar(store: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
         try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.nar, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(store.producerPayloadPointerForTest(store_path).?, store.recipePayloadPointerForTest(store_path).?);
         try std.testing.expectEqualStrings(payload, store.recipePayloadBytesForTest(store_path).?);
         try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});
     } else unreachable;

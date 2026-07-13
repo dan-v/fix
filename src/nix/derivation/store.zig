@@ -112,6 +112,11 @@ pub const DerivationStore = struct {
     /// Test-only deterministic scheduling hook. This field is zero-bit `void`
     /// and all access is compiled out of production builds.
     test_root_claim_hook: if (builtin.is_test) ?RootClaimHook else void = if (builtin.is_test) null else {},
+    /// Original payload allocations observed at Task 5 producer boundaries.
+    /// Future producer registration records here immediately before transferring
+    /// ownership to a recipe. The field is zero-bit and every operation compiles
+    /// away outside tests, so production has no storage or runtime cost.
+    test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(usize) else void = if (builtin.is_test) .empty else {},
 
     /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
     /// on the IO thread and blocks the calling fiber until it returns.
@@ -129,6 +134,36 @@ pub const DerivationStore = struct {
         if (comptime builtin.is_test) {
             self.test_root_claim_hook = hook;
         } else unreachable;
+    }
+
+    /// Test-only producer-boundary seam for Task 5 GREEN. Producers call this
+    /// with their original owned ATerm, toFile text, or serialized NAR slice
+    /// immediately before passing that same allocation to `recordOwned*Recipe`.
+    pub fn noteProducerPayloadForTest(self: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            const owned_path = try self.allocator.dupe(u8, store_path);
+            errdefer self.allocator.free(owned_path);
+            const result = try self.test_producer_payload_pointers.getOrPut(self.allocator, owned_path);
+            const pointer = @intFromPtr(payload.ptr);
+            if (result.found_existing) {
+                self.allocator.free(owned_path);
+                if (result.value_ptr.* != pointer) return error.ProducerPayloadPointerConflict;
+            } else {
+                result.value_ptr.* = pointer;
+            }
+        }
+    }
+
+    /// Pointer captured by `noteProducerPayloadForTest`; test-only and absent
+    /// from production storage/code paths.
+    pub fn producerPayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
+        if (comptime builtin.is_test) {
+            self.recipe_mu.lock();
+            defer self.recipe_mu.unlock();
+            return self.test_producer_payload_pointers.get(store_path);
+        } else return null;
     }
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
@@ -255,6 +290,11 @@ pub const DerivationStore = struct {
             entry.value_ptr.*.release(self.allocator);
         }
         self.realization_claims.deinit(self.allocator);
+        if (comptime builtin.is_test) {
+            var producer_pointers = self.test_producer_payload_pointers.keyIterator();
+            while (producer_pointers.next()) |key| self.allocator.free(key.*);
+            self.test_producer_payload_pointers.deinit(self.allocator);
+        }
         self.recipe_mu.unlock();
         self.clearDebugRecords();
         self.debug_records.deinit(self.allocator);
