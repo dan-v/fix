@@ -1,10 +1,12 @@
 # Minimal NixOS system closure (drvPath of the toplevel).
 #
-# `<nixpkgs>` is supplied through NIX_PATH by the benchmark runner so every
-# evaluator resolves the same pinned tree. Returning `.drvPath` forces the full
-# module fixpoint plus instantiation of the toplevel derivation.
+# `@nixpkgs@` is substituted with the pinned nixpkgs store path by nix/bench.nix
+# so the file is self-contained — every evaluator reads the same tree with no
+# search-path / NIX_PATH setup. Returning `.drvPath` forces the full module
+# fixpoint plus instantiation of the toplevel derivation (but not a build), and
+# yields a string, so `--strict` does not recurse into the derivation graph.
 let
-  nixpkgs = <nixpkgs>;
+  nixpkgs = @nixpkgs@;
 in
   ((import (nixpkgs + "/nixos") {
     system = "x86_64-linux";

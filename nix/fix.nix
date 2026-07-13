@@ -12,7 +12,17 @@ in
   {
     pname = "fix";
     version = "0.0.1";
-    src = ../.;
+    # Only the files the build actually consumes (mirrors build.zig.zon's
+    # `.paths`), so unrelated churn — .git, .zig-cache, zig-out, result*,
+    # bench/, docs/ — does not invalidate the build or bloat the src copy.
+    src = lib.fileset.toSource {
+      root = ../.;
+      fileset = lib.fileset.unions [
+        ../build.zig
+        ../build.zig.zon
+        ../src
+      ];
+    };
 
     nativeBuildInputs = [zig.hook pkg-config];
 

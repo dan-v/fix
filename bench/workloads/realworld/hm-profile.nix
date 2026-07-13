@@ -1,12 +1,12 @@
 # Standalone home-manager profile (drvPath of the activation package).
-#
-# `<nixpkgs>` and `<home-manager>` come from NIX_PATH (set by the runner).
+# `@nixpkgs@` / `@homeManager@` are substituted with pinned store paths by
+# nix/bench.nix.
 let
-  pkgs = import <nixpkgs> {
+  pkgs = import @nixpkgs@ {
     system = "x86_64-linux";
     config = { allowUnfree = true; };
   };
-  home-manager = import <home-manager> { };
+  home-manager = import @homeManager@ { };
   cfg = home-manager.lib.homeManagerConfiguration {
     inherit pkgs;
     modules = [
