@@ -44,6 +44,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1229,6 +1230,115 @@ def run_snix_case(fix: Path, c: SnixCase) -> Result:
 # reporting
 # --------------------------------------------------------------------------
 
+class _ZigProgress:
+    """Low-level writer for Zig's std.Progress IPC pipe, used when this harness
+    is a child of `zig build test-lang`. The parent passes the write end of a
+    pipe as a file descriptor in `ZIG_PROGRESS`; each `emit` writes one packet
+    describing a whole node tree:
+
+        [u8 node_count] [node_count × Storage] [node_count × Parent]
+
+    where Storage is `extern struct { completed: u32 LE; total: u32 LE;
+    name: [120]u8 }` (NUL-padded; total 0 renders as an unbounded spinner) and
+    each Parent byte is 255 for the root, else the 0-based index of the parent
+    node within this packet. Node 0 is the subtree root: the parent grafts it
+    onto its own node for this child (keeping its label if node 0's name is
+    empty) and mounts the rest beneath it. The parent only ever reads the last
+    complete packet, so dropping a write (a full pipe) is harmless.
+    """
+
+    _NAME_LEN = 120  # std.Progress.Node.max_name_len
+    # Keep every packet <= PIPE_BUF (4096) so that, even on a non-blocking pipe,
+    # POSIX writes it all-or-nothing (never a torn packet). 31 nodes = 4000 B.
+    _MAX_NODES = 31
+
+    def __init__(self):
+        self.fd = None
+        v = os.environ.get("ZIG_PROGRESS")
+        if v is not None:
+            try:
+                self.fd = int(v)
+            except ValueError:
+                self.fd = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.fd is not None
+
+    def emit(self, nodes: list[tuple[str, int, int, int]]):
+        # nodes: (name, completed, total, parent_index); parent_index < 0 = root.
+        if self.fd is None:
+            return
+        nodes = nodes[: self._MAX_NODES]
+        storage = bytearray()
+        parents = bytearray()
+        for name, completed, total, parent in nodes:
+            nb = name.encode("utf-8", "replace")[: self._NAME_LEN]
+            storage += struct.pack("<II", completed & 0xFFFFFFFF, total & 0xFFFFFFFF)
+            storage += nb + b"\x00" * (self._NAME_LEN - len(nb))
+            parents.append(255 if parent < 0 else parent & 0xFF)
+        packet = bytes([len(nodes)]) + bytes(storage) + bytes(parents)
+        try:
+            os.write(self.fd, packet)  # <= PIPE_BUF, so a single atomic write
+        except BlockingIOError:
+            pass  # pipe full; the parent reads the last packet, so dropping is fine
+        except OSError:
+            self.fd = None  # pipe closed — stop trying
+
+
+class _ProgressTree:
+    """Builds the Zig std.Progress node tree for a conformance run: a root whose
+    children are the suites (lix, snix), each bumping its completed/total as
+    cases finish, and under each suite the cases currently executing shown as
+    live leaf nodes. Thread-safe (cases run on a pool) and a no-op unless the
+    harness runs under `zig build` (ZIG_PROGRESS set)."""
+
+    def __init__(self, zig: _ZigProgress):
+        self.zig = zig
+        self.lock = threading.Lock()
+        self.suites: list[dict] = []  # ordered {name, total, done, running: {idx: ident}}
+
+    def begin_suite(self, name: str, total: int):
+        if not self.zig.enabled:
+            return None
+        with self.lock:
+            suite = {"name": name, "total": total, "done": 0, "running": {}}
+            self.suites.append(suite)
+        self._emit()
+        return suite
+
+    def start_case(self, suite, idx: int, ident: str):
+        if suite is None:
+            return
+        with self.lock:
+            suite["running"][idx] = ident
+        self._emit()
+
+    def finish_case(self, suite, idx: int):
+        if suite is None:
+            return
+        with self.lock:
+            suite["running"].pop(idx, None)
+            suite["done"] += 1
+        self._emit()
+
+    def _emit(self):
+        with self.lock:
+            done_all = sum(s["done"] for s in self.suites)
+            total_all = sum(s["total"] for s in self.suites)
+            nodes: list[tuple[str, int, int, int]] = [("", done_all, total_all, -1)]
+            for suite in self.suites:
+                sidx = len(nodes)
+                nodes.append((suite["name"], suite["done"], suite["total"], 0))
+                for ident in suite["running"].values():
+                    nodes.append((ident, 0, 0, sidx))
+        self.zig.emit(nodes)
+
+
+_zig_progress = _ZigProgress()
+_progress_tree = _ProgressTree(_zig_progress)
+
+
 def _progress(suite: str, i: int, total: int, n_pass: int, n_fail: int, n_block: int):
     msg = f"[{suite}] {i}/{total}  {n_pass} pass  {n_fail} fail  {n_block} blocked"
     if sys.stderr.isatty():
@@ -1254,8 +1364,14 @@ def run_suite(name: str, fix: Path):
     total = len(cases)
     results: list[Result] = [None] * total
     done = n_pass = n_fail = n_block = 0
+    suite_node = _progress_tree.begin_suite(name, total)
+
+    def tracked(idx, c):
+        _progress_tree.start_case(suite_node, idx, c.ident)
+        return runner(c)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
-        futs = {pool.submit(runner, c): idx for idx, c in enumerate(cases)}
+        futs = {pool.submit(tracked, idx, c): idx for idx, c in enumerate(cases)}
         for fut in concurrent.futures.as_completed(futs):
             idx = futs[fut]
             r = fut.result()
@@ -1267,6 +1383,7 @@ def run_suite(name: str, fix: Path):
                 n_block += 1
             else:
                 n_fail += 1
+            _progress_tree.finish_case(suite_node, idx)
             _progress(name, done, total, n_pass, n_fail, n_block)
     if sys.stderr.isatty():
         sys.stderr.write("\n")
