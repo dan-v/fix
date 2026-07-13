@@ -327,10 +327,19 @@ pub const Fiber = struct {
         self.caller_ctx = &here;
         self.state = .running;
         fix_swap_context(&here, &self.ctx);
-        // Back from the swap: the fiber either yielded (state == .suspended)
-        // or completed (state == .finished). Either way, current resumer
-        // is no longer in the picture.
-        self.caller_ctx = null;
+        // Back from the swap: the fiber either yielded (state == .suspended) or
+        // completed (state == .finished).
+        //
+        // Do NOT clear `self.caller_ctx` here. After a *yield* the fiber can
+        // already have been re-enqueued (its awaited resolved before it parked —
+        // the ".suspended, already resolved" handoff) and resumed on another
+        // worker, whose `resume_` has set `caller_ctx` to *its own* frame. Nulling
+        // it here would race that store (both are plain writes from two threads)
+        // and strand the fiber with no back-context — observed as "finished fiber
+        // has no caller_ctx" on weakly-ordered aarch64, where the window is wide.
+        // The clear is also unnecessary: the next `resume_` sets `caller_ctx`
+        // afresh before the fiber runs again, and `reset` nulls it for a recycled
+        // fiber, so no stale/dangling value is ever read.
         current = prev;
     }
 
