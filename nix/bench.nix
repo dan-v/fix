@@ -16,18 +16,20 @@
 # recording a misleading fast-failure time. `RUNS=N` overrides the run count.
 {
   pkgs,
+  lib,
   sources ? import ../npins,
-  fix ? pkgs.callPackage ./fix.nix { release = "fast"; },
+  fix ? pkgs.callPackage ./fix.nix {release = "fast";},
   nix ? pkgs.nixVersions.latest,
   lix ? pkgs.lix,
-  snix ? (import sources.snix { }).snix.cli.eval,
+  snix ? null, #(import sources.snix { }).snix.cli.eval,
 }: let
+  inherit (lib) optional optionals;
   nixpkgs = sources.nixpkgs;
   hm = pkgs.home-manager.src; # home-manager source, no extra pin needed
 
   # Store copy of the workloads with the pinned tree paths baked into the
   # real-world fixtures, so every evaluator reads a self-contained file.
-  workloads = pkgs.runCommand "fix-bench-workloads" { } ''
+  workloads = pkgs.runCommand "fix-bench-workloads" {} ''
     cp -r ${../bench/workloads} $out
     chmod -R +w $out
     for f in $out/realworld/*.nix; do
@@ -36,23 +38,29 @@
         --replace-quiet '@homeManager@' '${hm}'
     done
   '';
+
+  tools =
+    # name|command-prefix (the workload file is appended to each).
+    optional (nix != null) "nix|${nix}/bin/nix-instantiate --eval --strict"
+    ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
+    ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qq --strict"
+    ++ optionals (fix != null) [
+      "fix|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
+      "fix-par|${fix}/bin/fix eval --strict --no-progress --file"
+    ];
+
+  quote = s: "\"${s}\"";
+  spaceSep = builtins.concatStringsSep " ";
+  toolsStr = spaceSep (map quote tools);
 in
   pkgs.writeShellApplication {
     name = "fix-bench";
-    runtimeInputs = [ pkgs.hyperfine pkgs.coreutils ];
+    runtimeInputs = [pkgs.hyperfine pkgs.coreutils];
     text = ''
       runs="''${RUNS:-10}"
-      workers="$(nproc)"
       out="$(mktemp -d /tmp/fix-bench.XXXXXX)"
 
-      # name|command-prefix (the workload file is appended to each).
-      tools=(
-        "nix|${nix}/bin/nix-instantiate --eval --strict"
-        "lix|${lix}/bin/nix-instantiate --eval --strict"
-        "snix|${snix}/bin/snix-eval -qq --strict"
-        "fix|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
-        "fix-par|${fix}/bin/fix eval --strict --workers=$workers --no-progress --file"
-      )
+      tools=( ${toolsStr} )
 
       for f in ${workloads}/torture/*.nix ${workloads}/realworld/*.nix; do
         name="$(basename "$f" .nix)"
