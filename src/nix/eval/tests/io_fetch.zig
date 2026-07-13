@@ -3,6 +3,8 @@ const eval_mod = @import("../../eval.zig");
 const Evaluator = eval_mod.Evaluator;
 const Diagnostic = eval_mod.Diagnostic;
 const Value = @import("runtime").value.Value;
+const FileCache = @import("runtime").file_cache.FileCache;
+const DerivationStore = @import("derivation").DerivationStore;
 const path_ops = @import("runtime").paths;
 const helpers = @import("../test_helpers.zig");
 const renderForTest = helpers.renderForTest;
@@ -932,4 +934,79 @@ test "detect recursive imports" {
     ev.setFileIo(std.testing.io);
 
     try std.testing.expectError(error.ImportCycle, ev.evaluate(source));
+}
+
+const LifecycleTrackingAllocator = struct {
+    child: std.mem.Allocator,
+    tracked_ptr: std.atomic.Value(usize) = .init(0),
+    frees: std.atomic.Value(usize) = .init(0),
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn init(child: std.mem.Allocator) LifecycleTrackingAllocator {
+        return .{ .child = child };
+    }
+
+    fn allocator(self: *LifecycleTrackingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn track(self: *LifecycleTrackingAllocator, bytes: []u8) void {
+        self.tracked_ptr.store(@intFromPtr(bytes.ptr), .seq_cst);
+    }
+
+    fn freeCount(self: *LifecycleTrackingAllocator) usize {
+        return self.frees.load(.seq_cst);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, return_address);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *LifecycleTrackingAllocator = @ptrCast(@alignCast(ctx));
+        const tracked = @intFromPtr(memory.ptr) == self.tracked_ptr.load(.seq_cst);
+        self.child.rawFree(memory, alignment, return_address);
+        if (tracked) _ = self.frees.fetchAdd(1, .monotonic);
+    }
+};
+
+test "releaseEvalState releases retained flat recipe payload" {
+    if (comptime @hasDecl(DerivationStore, "recordFlatRecipe") and @hasDecl(DerivationStore, "releaseRecipePayloads")) {
+        var tracking = LifecycleTrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var ev = try Evaluator.init(allocator, 0);
+        defer ev.deinit();
+        const payload = try allocator.dupe(u8, "shared evaluator recipe payload");
+        const payload_ptr = @intFromPtr(payload.ptr);
+        tracking.track(payload);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, payload);
+
+        try ev.derivations.recordFlatRecipe("/nix/store/44444444444444444444444444444444-flat", handle);
+        try std.testing.expectEqual(payload_ptr, @intFromPtr(handle.bytes().ptr));
+        handle.release();
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+
+        // DerivationStore remains alive after this call. The payload can be
+        // freed here only if releaseEvalState explicitly drops its recipe
+        // reference; review separately enforces that call precedes files.deinit.
+        ev.releaseEvalState();
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRegistryApi;
 }

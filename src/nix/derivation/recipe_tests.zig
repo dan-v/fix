@@ -116,6 +116,54 @@ test "recordOwnedNarRecipe consumes the original serializer allocation" {
     } else return error.MissingRecipeRegistryApi;
 }
 
+test "duplicate identical NAR recipe consumes incoming allocation and preserves original" {
+    if (comptime realizationApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedNarRecipe(dep_nar_path, try owned(allocator, "same nar payload"));
+        const duplicate = try owned(allocator, "same nar payload");
+        const duplicate_ptr = @intFromPtr(duplicate.ptr);
+        tracking.track(duplicate);
+
+        try store.recordOwnedNarRecipe(dep_nar_path, duplicate);
+        try std.testing.expectEqual(duplicate_ptr, tracking.tracked_ptr.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        try store.ensureClosure(dep_nar_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.nar));
+        try std.testing.expect(fake.nthPayloadEquals(.nar, 0, "same nar payload"));
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingRecipeRealizationApi;
+}
+
+test "conflicting NAR recipe frees rejected allocation and realizes original" {
+    if (comptime realizationApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        try store.recordOwnedNarRecipe(dep_nar_path, try owned(allocator, "original nar payload"));
+        const rejected = try owned(allocator, "conflicting nar payload");
+        const rejected_ptr = @intFromPtr(rejected.ptr);
+        tracking.track(rejected);
+
+        try std.testing.expectError(error.RecipeConflict, store.recordOwnedNarRecipe(dep_nar_path, rejected));
+        try std.testing.expectEqual(rejected_ptr, tracking.tracked_ptr.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+        try store.ensureClosure(dep_nar_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.nar));
+        try std.testing.expect(fake.nthPayloadEquals(.nar, 0, "original nar payload"));
+        try std.testing.expect(!fake.nthPayloadEquals(.nar, 0, "conflicting nar payload"));
+    } else return error.MissingRecipeRealizationApi;
+}
+
 test "recordFlatRecipe retains the same ImmutableBytes blob" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
@@ -136,6 +184,32 @@ test "recordFlatRecipe retains the same ImmutableBytes blob" {
     } else return error.MissingRecipeRegistryApi;
 }
 
+test "ensureClosure realizes flat recipe bytes and releases retained ownership" {
+    if (comptime realizationApiAvailable()) {
+        var tracking = TrackingAllocator.init(std.testing.allocator);
+        const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+        const bytes = try owned(allocator, "flat closure payload");
+        const original_ptr = @intFromPtr(bytes.ptr);
+        tracking.track(bytes);
+        var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
+
+        try store.recordFlatRecipe(dep_text_path, handle);
+        try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
+        handle.release();
+        try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
+        try store.ensureClosure(dep_text_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.flat));
+        try std.testing.expect(fake.nthSubjectEquals(.flat, 0, "dep-text"));
+        try std.testing.expect(fake.nthPayloadEquals(.flat, 0, "flat closure payload"));
+        try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
+    } else return error.MissingClosureRealizationApi;
+}
+
 test "duplicate identical owned recipe registration releases incoming ownership" {
     if (comptime recipeApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
@@ -151,25 +225,71 @@ test "duplicate identical owned recipe registration releases incoming ownership"
     } else return error.MissingRecipeRegistryApi;
 }
 
-test "duplicate identical flat recipe does not leak an incoming retain" {
-    if (comptime recipeApiAvailable()) {
+test "duplicate identical flat recipe keeps original blob without leaking a retain" {
+    if (comptime realizationApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
         var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
         const bytes = try owned(allocator, "same flat bytes");
+        const original_ptr = @intFromPtr(bytes.ptr);
         tracking.track(bytes);
         var handle = try FileCache.ImmutableBytes.fromOwned(allocator, bytes);
 
         try store.recordFlatRecipe(dep_text_path, handle);
         try store.recordFlatRecipe(dep_text_path, handle);
+        try std.testing.expectEqual(original_ptr, @intFromPtr(handle.bytes().ptr));
         handle.release();
         try std.testing.expectEqual(@as(usize, 0), tracking.freeCount());
-        store.deinit();
+        try store.ensureClosure(dep_text_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.flat));
+        try std.testing.expect(fake.nthPayloadEquals(.flat, 0, "same flat bytes"));
         try std.testing.expectEqual(@as(usize, 1), tracking.freeCount());
-    } else return error.MissingRecipeRegistryApi;
+    } else return error.MissingRecipeRealizationApi;
 }
 
-test "conflicting recipe preserves the original and consumes the rejected payload" {
+test "conflicting flat recipe releases rejected retain and realizes original blob" {
+    if (comptime realizationApiAvailable()) {
+        var original_tracking = TrackingAllocator.init(std.testing.allocator);
+        const original_allocator = original_tracking.allocator();
+        var rejected_tracking = TrackingAllocator.init(std.testing.allocator);
+        const rejected_allocator = rejected_tracking.allocator();
+        var fake = try FakeDaemon.start(std.testing.allocator, std.testing.io);
+        defer fake.deinit();
+        var store = DerivationStore.init(std.testing.allocator);
+        defer store.deinit();
+        attachFake(&store, fake);
+
+        const original_bytes = try owned(original_allocator, "original flat payload");
+        const original_ptr = @intFromPtr(original_bytes.ptr);
+        original_tracking.track(original_bytes);
+        var original = try FileCache.ImmutableBytes.fromOwned(original_allocator, original_bytes);
+        const rejected_bytes = try owned(rejected_allocator, "conflicting flat payload");
+        const rejected_ptr = @intFromPtr(rejected_bytes.ptr);
+        rejected_tracking.track(rejected_bytes);
+        var rejected = try FileCache.ImmutableBytes.fromOwned(rejected_allocator, rejected_bytes);
+
+        try store.recordFlatRecipe(dep_text_path, original);
+        try std.testing.expectError(error.RecipeConflict, store.recordFlatRecipe(dep_text_path, rejected));
+        try std.testing.expectEqual(original_ptr, @intFromPtr(original.bytes().ptr));
+        try std.testing.expectEqual(rejected_ptr, @intFromPtr(rejected.bytes().ptr));
+        rejected.release();
+        try std.testing.expectEqual(@as(usize, 1), rejected_tracking.freeCount());
+        original.release();
+        try std.testing.expectEqual(@as(usize, 0), original_tracking.freeCount());
+
+        try store.ensureClosure(dep_text_path);
+        try std.testing.expectEqual(@as(usize, 1), fake.count(.flat));
+        try std.testing.expect(fake.nthPayloadEquals(.flat, 0, "original flat payload"));
+        try std.testing.expect(!fake.nthPayloadEquals(.flat, 0, "conflicting flat payload"));
+        try std.testing.expectEqual(@as(usize, 1), original_tracking.freeCount());
+    } else return error.MissingRecipeRealizationApi;
+}
+
+test "conflicting text recipe preserves the original and consumes the rejected payload" {
     if (comptime realizationApiAvailable()) {
         var tracking = TrackingAllocator.init(std.testing.allocator);
         const allocator = tracking.allocator();
@@ -330,7 +450,7 @@ test "permanent realization failure is replayed without a second writer" {
 
 test "transient connection failure resets claim state and permits retry" {
     if (comptime realizationApiAvailable()) {
-        const socket_path = try FakeDaemon.makeSocketPath(std.testing.allocator);
+        const socket_path = try FakeDaemon.makeFilesystemSocketPath(std.testing.allocator);
         defer std.testing.allocator.free(socket_path);
         var fake: ?*FakeDaemon = null;
         defer if (fake) |daemon| daemon.deinit();
@@ -340,11 +460,7 @@ test "transient connection failure resets claim state and permits retry" {
         store.daemon_socket = socket_path;
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "retry succeeds"), &.{});
 
-        var failed = false;
-        store.ensureClosure(root_path) catch {
-            failed = true;
-        };
-        try std.testing.expect(failed);
+        try std.testing.expectError(error.FileNotFound, store.ensureClosure(root_path));
         fake = try FakeDaemon.startAt(std.testing.allocator, std.testing.io, socket_path);
         try store.ensureClosure(root_path);
         try std.testing.expectEqual(@as(usize, 1), fake.?.count(.text));

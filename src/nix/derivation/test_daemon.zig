@@ -5,6 +5,7 @@
 //! buildPaths. It is not a general nix-daemon emulator.
 
 const std = @import("std");
+const stable = @import("base").sync;
 const runtime_store = @import("runtime").store;
 const wire = runtime_store.wire;
 
@@ -14,7 +15,7 @@ pub const FakeDaemon = struct {
     socket_path: []u8,
     server: std.Io.net.Server,
     thread: std.Thread,
-    mu: std.Thread.Mutex = .{},
+    mu: stable.BlockingMutex = .{},
     valid_paths: std.StringHashMapUnmanaged(void) = .empty,
     operations: std.ArrayListUnmanaged(Operation) = .empty,
     fail_next_add: bool = false,
@@ -42,6 +43,11 @@ pub const FakeDaemon = struct {
     pub fn makeSocketPath(allocator: std.mem.Allocator) ![]u8 {
         const id = next_socket_id.fetchAdd(1, .monotonic);
         return std.fmt.allocPrint(allocator, "\x00fix-ifd-test-{d}-{d}", .{ std.Thread.getCurrentId(), id });
+    }
+
+    pub fn makeFilesystemSocketPath(allocator: std.mem.Allocator) ![]u8 {
+        const id = next_socket_id.fetchAdd(1, .monotonic);
+        return std.fmt.allocPrint(allocator, "/tmp/fix-ifd-test-{d}-{d}.sock", .{ std.Thread.getCurrentId(), id });
     }
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io) !*FakeDaemon {
@@ -76,6 +82,9 @@ pub const FakeDaemon = struct {
         // Also cancels a still-blocked accept if a test fails before connecting.
         self.server.socket.close(self.io);
         self.thread.join();
+        if (self.socket_path.len != 0 and self.socket_path[0] != 0) {
+            std.Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
+        }
         self.mu.lock();
         var valid = self.valid_paths.keyIterator();
         while (valid.next()) |path| self.allocator.free(path.*);
@@ -229,7 +238,7 @@ pub const FakeDaemon = struct {
                 error.EndOfStream => return,
                 else => return err,
             };
-            const op: wire.Op = std.meta.intToEnum(wire.Op, raw_op) catch return error.UnsupportedWorkerOperation;
+            const op = std.enums.fromInt(wire.Op, raw_op) orelse return error.UnsupportedWorkerOperation;
             switch (op) {
                 .is_valid_path => try self.handleIsValid(input, output),
                 .add_to_store => try self.handleAdd(input, output),
@@ -382,10 +391,19 @@ test "fake derivation daemon supports the concrete DaemonStore protocol subset" 
     const daemon = try runtime_store.DaemonStore.connect(std.testing.allocator, std.testing.io, fake.socketPath());
     defer daemon.deinit();
     try std.testing.expect(!(try daemon.isValidPath("/nix/store/missing")));
-    const written = try daemon.addTextToStore(std.testing.allocator, "example", "payload", &.{});
-    defer std.testing.allocator.free(written);
+    const text_path = try daemon.addTextToStore(std.testing.allocator, "example", "text payload", &.{});
+    defer std.testing.allocator.free(text_path);
+    const nar_path = try daemon.addPath(std.testing.allocator, "nar-example", "nix-archive-1", &.{});
+    defer std.testing.allocator.free(nar_path);
+    const flat_path = try daemon.addFlatFile(std.testing.allocator, "flat-example", "flat payload", &.{});
+    defer std.testing.allocator.free(flat_path);
     try daemon.buildPaths(&.{"/nix/store/example.drv^out"}, null, .normal);
     try std.testing.expectEqual(@as(usize, 1), fake.count(.query));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.text));
+    try std.testing.expectEqual(@as(usize, 1), fake.count(.nar));
+    try std.testing.expectEqual(@as(usize, 1), fake.count(.flat));
+    try std.testing.expect(fake.nthPayloadEquals(.text, 0, "text payload"));
+    try std.testing.expect(fake.nthPayloadEquals(.nar, 0, "nix-archive-1"));
+    try std.testing.expect(fake.nthPayloadEquals(.flat, 0, "flat payload"));
     try std.testing.expectEqual(@as(usize, 1), fake.count(.build));
 }
