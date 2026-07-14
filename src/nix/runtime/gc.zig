@@ -146,6 +146,10 @@ pub const Tracer = struct {
     /// iff this reaches `marker_count` — which can only happen when every
     /// deque is empty and no scan is in flight (a producing marker is active,
     /// hence not offering). Bumped per idle-transition, NOT per object.
+    /// INVARIANT: a marker must count itself ACTIVE (retracted) for the entire
+    /// window in which it holds or scans stolen work — see `drainParallel`'s
+    /// idle loop, which retracts before probing. Scanning while counted idle
+    /// would let a peer observe a spurious all-idle and abandon pushed children.
     active_idle: std.atomic.Value(u32) = .init(0),
     /// When non-null, `markObject`/`markValue` seed into this marker's deque
     /// (atomic bitmap) instead of the serial `stack`. Set only by the lone
@@ -338,14 +342,32 @@ pub const Tracer = struct {
             // Phase A: drain everything in our own deque first (LIFO).
             while (me.deque.pop()) |oid| scanObject(Marker, me, heap, oid);
             // Phase B: our deque is empty. Try to steal one item and scan it;
-            // if that fails, offer termination.
+            // if that fails, offer termination. We are still ACTIVE here (not
+            // yet counted idle), so scanning the stolen item — which pushes
+            // children into our deque — is safe.
             if (self.stealOneAndScan(heap, id)) continue;
             _ = self.active_idle.fetchAdd(1, .acq_rel); // announce idle
             while (true) {
                 if (self.active_idle.load(.acquire) == self.marker_count) return; // all done
-                if (self.stealOneAndScan(heap, id)) {
-                    _ = self.active_idle.fetchSub(1, .acq_rel); // retract: found work
-                    break; // re-enter Phase A to drain any children we pushed
+                // CORRECTNESS: while offering termination we only PEEK peers for
+                // work (a non-removing size probe) — we never steal-and-scan
+                // here. A scan pushes children; doing it while counted idle let
+                // a peer observe `active_idle == marker_count` mid-scan and
+                // terminate the whole mark, abandoning those children — a live
+                // object left unmarked, then swept by the minor (the w>1 UAF /
+                // free-list corruption). On seeing work we RETRACT to active
+                // first, then break back to the active steal-and-scan path
+                // (Phase B above), so no scan is ever in flight while we're
+                // idle. Invariant restored: termination observed ⇒ every deque
+                // empty (an idle marker drained its own in Phase A; a non-empty
+                // deque belongs to an active, non-offering marker) AND no scan
+                // in flight. A stale peek (item stolen before we re-steal) just
+                // costs a retract + re-idle; peeking (not stealing) keeps us
+                // counted idle so all-idle alignment — hence termination —
+                // converges promptly even at high marker counts.
+                if (self.anyPeerHasWork(id)) {
+                    _ = self.active_idle.fetchSub(1, .acq_rel); // retract to active
+                    break; // re-enter Phase A/B and steal-and-scan while active
                 }
                 std.atomic.spinLoopHint();
             }
@@ -354,7 +376,8 @@ pub const Tracer = struct {
 
     /// Steal one object from some peer's deque and scan it into marker `id`'s
     /// own deque. Returns true iff an item was stolen (and scanned). Visits
-    /// peers in a rotated order to spread steal contention.
+    /// peers in a rotated order to spread steal contention. Caller must be
+    /// counted ACTIVE (not offering termination) — the scan produces work.
     fn stealOneAndScan(self: *Tracer, heap: *const ObjectHeap, id: usize) bool {
         const n = self.marker_count;
         var k: usize = 1;
@@ -364,6 +387,23 @@ pub const Tracer = struct {
                 scanObject(Marker, &self.markers[id], heap, oid);
                 return true;
             }
+        }
+        return false;
+    }
+
+    /// Non-removing probe: does any peer's deque appear to hold stealable work?
+    /// Used only by the idle loop to decide whether to retract to active and
+    /// re-enter the steal path — it never removes an item, so it cannot leave
+    /// unscanned work "in flight" while the marker is counted idle. A false
+    /// positive (item gone by the time we re-steal) is harmless; a false
+    /// negative (a just-pushed item not yet visible) is safe too, because the
+    /// pushing marker is still active and drains its own deque in Phase A.
+    fn anyPeerHasWork(self: *Tracer, id: usize) bool {
+        const n = self.marker_count;
+        var k: usize = 1;
+        while (k < n) : (k += 1) {
+            const j = (id + k) % n;
+            if (self.markers[j].deque.approxLen() > 0) return true;
         }
         return false;
     }
