@@ -368,11 +368,22 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
     try stack.push(self, Value.thunk(id));
 }
 
-/// `FIX_NO_EAGER=1` disables the eager strictness submit above (A/B
-/// experiment: the w=8 task census measured 81% of these tasks arriving
-/// at an already-resolved thunk, and a useful-work median of ~2K cycles
-/// — below the per-task scheduling round-trip).
-pub var eager_submit_enabled: bool = true;
+/// OFF BY DEFAULT. The strictness-driven eager submit triggers a
+/// `--workers>1` GC use-after-free: it force-resolves a binding's thunk on a
+/// PEER concurrently with the creating worker still building the surrounding
+/// `rec`/let fixpoint, and under memory pressure the minor collector frees a
+/// still-live young object produced by that interleaving (reproduced on the
+/// NixOS / home-manager module eval; a live attrs/closure/thunk swept, its
+/// slot reused → segv in the mutator or in the mark itself). Empirically,
+/// disabling the submit eliminates it (35+ runs clean vs ~1/6 with it on),
+/// while gating the collector to depth 0 only halved the rate — so the submit
+/// is the trigger, not just an amplifier. It is also a marginal-to-negative
+/// optimization to begin with: the w=8 task census measured 81% of these
+/// tasks arriving at an ALREADY-resolved thunk and a useful-work median of
+/// ~2K cycles, below the per-task scheduling round-trip. So it earns its
+/// keep neither in wall time nor in correctness. `FIX_NO_EAGER=0` re-enables
+/// it for A/B measurement (see `eval/tuning.zig`).
+pub var eager_submit_enabled: bool = false;
 
 inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const Frame, chunk_id: ChunkId) void {
     if (comptime !vm_mod.thunks_log_enabled) return;

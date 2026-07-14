@@ -97,8 +97,10 @@ pub fn apply(
     if (env) |em| if (em.get("FIX_FIBER_MADV")) |s| {
         worker_mod.stack_release_lazy = !std.mem.eql(u8, s, "dontneed");
     };
-    // FIX_NO_EAGER: disable the strictness-driven eager thunk submit
-    // (see closures.zig makeBytecodeThunkFromCapturesEager) — A/B knob.
+    // FIX_NO_EAGER: the strictness-driven eager thunk submit (see closures.zig
+    // makeBytecodeThunkFromCapturesEager) is OFF by default — it triggers a w>1
+    // GC UAF and is measured net-negative. `FIX_NO_EAGER=0` re-enables it for
+    // A/B measurement; any other value keeps it off.
     if (env) |em| if (em.get("FIX_NO_EAGER")) |s| {
         vm_closures.eager_submit_enabled = std.mem.eql(u8, s, "0");
     };
