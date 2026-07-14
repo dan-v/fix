@@ -45,6 +45,13 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     // on transient-root gates are exercised. `armTracking` sets gc_root_active.
     heap.gc_bootstrap_end = heap.objects.count();
     heap.gc_root_always = true;
+    // Detector: presize the alloc bitmap here, like the constrained `enableBudget`
+    // path. `armTracking` only presizes when `!gc_root_always`, so without this
+    // the eager step path would arm with a ZERO-length bitmap — every per-fill
+    // `gcSetAllocBit` would silently drop its bit (word >= len) and the very
+    // first tracked read would false-trap "read after sweep". (`armTracking`
+    // below then skips its own presize, preserving this freshly-zeroed map.)
+    if (comptime gc_debug) heap.gcPresizeAllocBits();
     armTracking(heap);
 }
 
