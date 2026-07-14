@@ -959,6 +959,9 @@ pub const Worker = struct {
         // sit at its final address (`f.scratch`) before the VM captures it.
         f.vm = try self.init_vm_fn(self.init_vm_ctx, self.worker_id, fiber_id, f.scratch.allocator());
         errdefer f.vm.deinit();
+        // Priority inheritance (`FIX_RESCUE`): expose this fiber's rescue flag
+        // under its id so a peer blocking on its work can promote it.
+        self.scheduler.registerRescue(fiber_id, &f.vm.demand_rescue);
 
         f.inner = try InnerFiber.init(self.allocator, InnerFiber.min_stack_bytes, slotEntry, undefined);
         // Bake the native-stack guard limit now that the fiber owns its stack.
@@ -1054,6 +1057,9 @@ fn slotEntry(arg: *anyopaque) void {
     const f: *WorkerFiber = @ptrCast(@alignCast(arg));
     f.vm.sp = 0;
     f.vm.frames_len = 0;
+    // Priority inheritance (`FIX_RESCUE`): a rescue flag applies only to the
+    // task it was granted for — clear it at each task boundary.
+    f.vm.demand_rescue.store(0, .monotonic);
     const task = f.current_task orelse return;
     f.current_task = null;
     // Speculative work must NOT touch the user-facing error trace. A

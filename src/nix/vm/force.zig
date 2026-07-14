@@ -980,7 +980,10 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // speculative guess (see docs/plans/parallel-redesign-plan.md).
                 // Speculative path only — demand never bails — and the
                 // atomic load is off the resolved fast path.
-                if (self.in_speculation) {
+                // A rescued fiber (`FIX_RESCUE`) is on a demand fiber's critical
+                // path — bailing here would strand the waiter and force a
+                // recompute, so it runs its speculation to completion.
+                if (self.in_speculation and self.demand_rescue.load(.monotonic) == 0) {
                     if (self.scheduler.backgroundSuppressed()) {
                         publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
                         return error.SpeculativeBail;
@@ -1192,6 +1195,20 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         if (disc_spec) prof_census.disc.busy_spec_cycles += dt;
                     }
                 };
+                // Priority inheritance (`FIX_RESCUE`): this fiber — the demand
+                // thread, or itself already rescued — is blocking on a thunk a
+                // peer is computing speculatively. Mark it demanded and promote
+                // the computing fiber so its subtree runs at URGENT priority
+                // (spread across the idle workers) instead of competing with
+                // junk in the spec lane. Transitive: a rescued fiber that
+                // blocks here promotes the next link down the critical chain.
+                if (self.scheduler.spec_rescue and
+                    (self.ctx.is_demand or self.demand_rescue.load(.monotonic) != 0) and
+                    !thunk.isDemanded())
+                {
+                    thunk.markDemanded();
+                    self.scheduler.promoteFiber(thunk.future.claimer.load(.monotonic));
+                }
                 // Spin-before-enroll: a helper that is nearly done publishes
                 // within a few hundred ns. Catching the resolve here skips the
                 // whole enroll→suspend→yield→resume→re-tryForce cycle (µs of

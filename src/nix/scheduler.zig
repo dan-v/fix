@@ -818,6 +818,16 @@ pub const Scheduler = struct {
     /// creation-time speculation). `FIX_SIBLING_URGENT=0` reverts to
     /// spec priority.
     sibling_urgent: bool = true,
+    /// `FIX_RESCUE`: demand priority inheritance. When a demand fiber blocks
+    /// on a spec-owned thunk, promote the fiber computing it (see
+    /// `promoteFiber` / `VM.demand_rescue`). Default off pending A/B.
+    spec_rescue: bool = false,
+    /// Priority-inheritance registry: `fiber_id -> &VM.demand_rescue`, so a
+    /// blocking fiber can flip its blocker's flag without the scheduler
+    /// importing the vm layer. Indexed by fiber id (monotonic from 0, bounded
+    /// by the fiber high-water mark — a few hundred); ids past the array are
+    /// skipped (promotion is advisory). Populated by workers as fibers alloc.
+    fiber_rescue: []?*std.atomic.Value(u8) = &.{},
     /// `FIX_SIBLING_LOG`: per-sweep stderr diagnostics (attrs id, size,
     /// member body locations, heap-growth delta). Debug-only.
     sibling_log: bool = false,
@@ -1013,6 +1023,12 @@ pub const Scheduler = struct {
         errdefer allocator.free(worker_counters);
         for (worker_counters) |*c| c.* = .{};
 
+        // Priority-inheritance registry (`FIX_RESCUE`). Sized to a generous
+        // fiber high-water bound; ids beyond it skip promotion (advisory).
+        const fiber_rescue = try allocator.alloc(?*std.atomic.Value(u8), 4096);
+        errdefer allocator.free(fiber_rescue);
+        @memset(fiber_rescue, null);
+
         const gc_worker_parked = if (gc.enabled) blk: {
             const ws = try allocator.alloc(std.atomic.Value(bool), safe_worker_count);
             for (ws) |*w| w.* = .init(false);
@@ -1042,6 +1058,7 @@ pub const Scheduler = struct {
             .novel_mask = .init(0),
             .spec_mask = .init(0),
             .worker_counters = worker_counters,
+            .fiber_rescue = fiber_rescue,
             .n_max_fiber_stack = .init(0),
             .n_max_vm_sp = .init(0),
             .n_idle_ns = .init(0),
@@ -1073,6 +1090,24 @@ pub const Scheduler = struct {
     /// the worker that happened to create the fiber.
     pub fn allocFiberId(self: *Scheduler) u32 {
         return self.next_fiber_id.v.fetchAdd(1, .monotonic);
+    }
+
+    /// Register a fiber's `demand_rescue` flag under its id, so a peer that
+    /// blocks on a thunk this fiber is computing can promote it. Called once
+    /// per fiber allocation (`FIX_RESCUE`).
+    pub fn registerRescue(self: *Scheduler, fiber_id: u32, flag: *std.atomic.Value(u8)) void {
+        if (fiber_id < self.fiber_rescue.len) self.fiber_rescue[fiber_id] = flag;
+    }
+
+    /// Promote the fiber currently computing a demanded thunk into rescue
+    /// mode: its sub-forces go urgent and it stops bailing. Advisory — if the
+    /// id is stale (fiber moved on) the flag just over-prioritises one task,
+    /// and it's cleared at the next task boundary. Id extracted from the
+    /// thunk's `ClaimerId` (== fiber id).
+    pub fn promoteFiber(self: *Scheduler, fiber_id: u32) void {
+        if (fiber_id < self.fiber_rescue.len) {
+            if (self.fiber_rescue[fiber_id]) |flag| flag.store(1, .release);
+        }
     }
 
     pub fn stats(self: *const Scheduler) Stats {
@@ -1161,6 +1196,7 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         self.shutdown();
+        if (self.fiber_rescue.len != 0) self.allocator.free(self.fiber_rescue);
         self.allocator.free(self.wake_words);
         for (self.urgent_queues) |*q| q.deinit(self.allocator);
         self.allocator.free(self.urgent_queues);

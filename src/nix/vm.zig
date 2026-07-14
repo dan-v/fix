@@ -295,6 +295,18 @@ pub const VM = struct {
     /// fiber-lifetime identity.
     in_speculation: bool,
 
+    /// Demand priority inheritance (`FIX_RESCUE`): set on a SPECULATIVE
+    /// fiber's VM when a demand (or already-rescued) fiber blocks waiting on
+    /// a thunk THIS fiber is computing (see `Scheduler.promoteFiber`, driven
+    /// from the `.busy` wait in `forceThunkImpl`). While set, this fiber's
+    /// sub-forces route to the URGENT lane (so the awaited subtree spreads
+    /// across idle workers instead of competing with junk in the spec lane)
+    /// and it never `SpeculativeBail`s (a bail would strand the demand
+    /// waiter). Cleared at each task boundary (`slotEntry`). Written from a
+    /// peer thread, read here — hence atomic; advisory (a stale set only
+    /// over-prioritises one task).
+    demand_rescue: std.atomic.Value(u8) = .init(0),
+
     /// Single-worker mode (`Scheduler.worker_count == 1`, captured at VM
     /// construction — before any helper thread can exist). When set, the
     /// thunk force protocol takes the plain-load/store claim + publish

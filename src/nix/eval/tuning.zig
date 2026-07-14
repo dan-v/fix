@@ -88,6 +88,13 @@ pub fn apply(
     // FIX_WORK_FIRST: route strict collection-force acceleration through the
     // work-first split-and-steal primitive instead of the eager fan-out.
     if (env) |em| sched.setWorkFirst(em.get("FIX_WORK_FIRST") != null);
+    // FIX_RESCUE: demand priority inheritance (see scheduler.spec_rescue) —
+    // when a demand fiber blocks on a spec-owned thunk, promote the fiber
+    // computing it (urgent sub-forces + no bail). Needs helpers; default off
+    // pending A/B.
+    if (env) |em| if (em.get("FIX_RESCUE")) |s| {
+        sched.spec_rescue = worker_count > 1 and !std.mem.eql(u8, s, "0");
+    };
     // FIX_FIBER_MADV=dontneed: eager (visible-RSS) comparator for the
     // overflow-fiber stack release; default is MADV_FREE (lazy reclaim).
     if (env) |em| if (em.get("FIX_FIBER_MADV")) |s| {
