@@ -106,6 +106,18 @@ pub fn mergeAttrLiteralObjects(self: *VM, left_id: types.ObjectId, right_id: typ
             // range — the merge target is its own segment of the
             // attr store, not the inputs we're reading.
             const value = try mergeAttrLiteralValue(self, l.value, r.value);
+            // GC: `value` is a freshly-merged young object held ONLY in the
+            // reserved-but-unpublished `dst` slice — which `markVm` cannot
+            // scan (it is neither on the operand stack, nor in temp-roots,
+            // nor reachable through `left`/`right`, nor via the remembered
+            // set, since no owning object exists until `publishMergedAttrs`).
+            // A later iteration's `mergeAttrLiteralValue` forces (and may
+            // park for a collection), so root `value` for the rest of the
+            // merge — same discipline as concatMap/foldl'/genericClosure.
+            // Without this, a collection between here and publish sweeps
+            // `value` (and its subtree); its slot is reused and a stale
+            // reference in the published merge later corrupts it (w>1 UAF).
+            force.rootKeep(self, value);
             dst[out] = .{ .name = l.name, .value = value };
             out += 1;
             left_i += 1;
