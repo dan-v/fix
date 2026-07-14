@@ -529,6 +529,10 @@ const work_first_grain: u32 = 16;
 /// or the eager `fanOutListShallow`, per the scheduler flag. Drop-in at
 /// demand-safe strict sites — the caller's own loop stays authoritative.
 pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const Value) void {
+    if (comptime prof.enabled) {
+        if (self.ctx.is_demand and self.workerId() == 0)
+            prof_census.recordStrictWalk(&prof_census.list_walks, items.len, fan_out_min_items);
+    }
     // Solo: no helper can ever drain the fan-out; every submit would be
     // rejected per batch. One predictable branch spares the whole loop.
     if (self.solo) return;
@@ -544,6 +548,10 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
 /// module-system option-merge work lives, so this is the path that actually
 /// exposes the previously-serial merge to idle workers.
 pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
+    if (comptime prof.enabled) {
+        if (self.ctx.is_demand and self.workerId() == 0)
+            prof_census.recordStrictWalk(&prof_census.attrs_walks, entries.len, fan_out_min_items);
+    }
     if (self.solo) return; // see forceListAccelerate
     if (self.scheduler.workFirst()) {
         forceCollectionWorkFirst(self, attrs_id, .attrs, @intCast(entries.len));

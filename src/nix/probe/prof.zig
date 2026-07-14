@@ -342,6 +342,10 @@ pub fn report(registry: anytype, intern: anytype) void {
     prof_task.report();
     // Discovery-serialization breakdown of main's demand forces.
     prof_census.reportDiscovery();
+    // Strict-collection-walk size census: are main's walks mostly small
+    // (unfannable, sub-threshold) — aggregate parallelism fan-out can't reach?
+    prof_census.reportStrictWalks(&prof_census.list_walks, "list");
+    prof_census.reportStrictWalks(&prof_census.attrs_walks, "attrs");
     // Age-at-force breakdown of main's claimed demand-forces.
     prof_age.report(registry, intern);
 }

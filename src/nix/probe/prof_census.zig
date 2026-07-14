@@ -28,6 +28,48 @@ pub const Disc = struct {
 };
 pub var disc: Disc = .{};
 
+/// Strict-collection-walk size census (piggybacks on `-Dprof-main`): sizes
+/// the collections MAIN (worker 0, demand context) strictly walks via
+/// `forceListAccelerate` / `forceAttrsAccelerate`. `fan_out_min_items` (=4)
+/// is the fan-out floor, so walks below it are UNFANNABLE — main forces their
+/// elements serially, one at a time. Tests whether the module-merge mass is
+/// many SMALL (sub-threshold) lists — aggregate parallelism that per-list
+/// fan-out structurally cannot reach — versus a few large ones. Worker-0-only.
+pub const StrictWalks = struct {
+    walks: u64 = 0, // total demand strict walks
+    items: u64 = 0, // total elements across them
+    small_walks: u64 = 0, // walks with < fan_out_min_items elements (unfannable)
+    small_items: u64 = 0, // elements in those unfannable walks
+    // size histogram: [0]=1 [1]=2-3 [2]=4-7 [3]=8-15 [4]=16-31 [5]=32-63 [6]=64+
+    buckets: [7]u64 = @splat(0),
+};
+pub var list_walks: StrictWalks = .{};
+pub var attrs_walks: StrictWalks = .{};
+
+pub inline fn recordStrictWalk(w: *StrictWalks, len: usize, fan_min: usize) void {
+    w.walks += 1;
+    w.items += len;
+    if (len < fan_min) {
+        w.small_walks += 1;
+        w.small_items += len;
+    }
+    const b: usize = if (len <= 1) 0 else if (len <= 3) 1 else if (len <= 7) 2 else if (len <= 15) 3 else if (len <= 31) 4 else if (len <= 63) 5 else 6;
+    w.buckets[b] += 1;
+}
+
+pub fn reportStrictWalks(w: *const StrictWalks, label: []const u8) void {
+    if (w.walks == 0) return;
+    std.debug.print(
+        "prof strict-{s} walks (main demand): n={d} items={d} | UNFANNABLE(<4) walks={d} ({d:.1}%) items={d} ({d:.1}%) | sizes 1={d} 2-3={d} 4-7={d} 8-15={d} 16-31={d} 32-63={d} 64+={d}\n",
+        .{
+            label, w.walks, w.items,
+            w.small_walks, pct(w.small_walks, w.walks),
+            w.small_items, pct(w.small_items, w.items),
+            w.buckets[0], w.buckets[1], w.buckets[2], w.buckets[3], w.buckets[4], w.buckets[5], w.buckets[6],
+        },
+    );
+}
+
 /// Attr inline-cache hit/miss census (piggybacks on `-Dprof-main`).
 /// Main-thread-only writes (guarded at the call site); zero-cost off.
 pub var attr_cache_hits: u64 = 0;
