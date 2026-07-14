@@ -44,11 +44,19 @@ pub fn callAttrFunctor(self: *VM, callee: Value) !Value {
 
 pub fn applyBuiltin(self: *VM, builtin_id: u16, args: []const Value) !Value {
     // GC (`-Dgc`): raise the per-thread native depth for the duration of the
-    // builtin. Collections only fire at depth 0, so while any builtin is
-    // active none of its Zig-local heap refs can be observed by a collection
-    // — builtins need no GC-rooting of their own (correct-by-default). The
-    // one exception, `import`/`scopedImport`, drops back to the caller's
-    // depth for the imported eval (see `Evaluator.evaluateSource`).
+    // builtin. This gates only the PEER stop-the-world park (`force.zig`,
+    // `native_depth == 0`), NOT collection initiation: a demand `forceValue`
+    // that resolves a thunk runs mark+sweep at ANY native depth (the RSS
+    // lever, `force.zig` self-collect). So a builtin's own Zig-local heap refs
+    // CAN be observed mid-builtin. Args are safe (they stay rooted for the
+    // call — on the operand stack / in the in-flight `builtin_closure`), and a
+    // value reachable through a rooted arg is fine. But a builtin (or VM op)
+    // that produces a FRESH heap value, holds it only in a Zig local / slice /
+    // ArrayList, and then FORCES (a thunk) or `callValue`s while it's still
+    // needed MUST `force.rootKeep` it first — else the collection sweeps it
+    // (w>1 UAF). See concatMap/foldl'/mergeAttrLiteralObjects for the pattern.
+    // `import`/`scopedImport` drop back to the caller's depth for the imported
+    // eval (see `Evaluator.evaluateSource`).
     if (comptime build_options.gc) self.native_depth += 1;
     defer if (comptime build_options.gc) {
         self.native_depth -= 1;

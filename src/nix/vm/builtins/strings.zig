@@ -190,6 +190,12 @@ pub fn builtinReplaceStrings(self: anytype, from_arg: Value, to_arg: Value, stri
     var index: usize = 0;
     while (index <= input.len) {
         if (firstReplacementIdAt(self, input[index..], from_ids)) |replacement_index| {
+            // GC: `ctx` may hold merged context values (fresh young attrs from
+            // a prior replacement's context collision) reachable only through
+            // this Zig list; the `to[i]` force below can collect. Re-root them.
+            const iter_roots = vm_force.rootsBegin(self);
+            defer vm_force.rootsEnd(self, iter_roots);
+            for (ctx.items) |e| vm_force.rootKeep(self, e.value);
             const needle = self.intern.get(from_ids[replacement_index]);
             const replacement = try vm_force.forceValue(self, try self.heap.getListItem(to_id, replacement_index));
             if (!isPlainString(replacement)) return error.TypeError;
@@ -351,6 +357,12 @@ pub fn coerceListToStringValue(self: anytype, list_id: ObjectId) !Value {
         first = false;
         trailing_empty_list = false;
         const item_value = try coerceToStringValue(self, forced);
+        // GC: `item_value` may be a FRESH context string (nested-list/attrs
+        // coercion), reachable only through this Zig local — not the rooted
+        // list arg. `appendContextEntry` below forces (context merge), which
+        // can collect; root `item_value` so its context slice isn't swept
+        // mid-iteration (w>1 UAF). Same discipline as concatStringsSep.
+        vm_force.rootKeep(self, item_value);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {
@@ -446,6 +458,12 @@ pub fn coerceDerivationListToStringValue(self: anytype, list_id: ObjectId) !Valu
         first = false;
         trailing_empty_list = false;
         const item_value = try coerceDerivationStringValue(self, forced);
+        // GC: `item_value` may be a FRESH context string (nested-list/attrs
+        // coercion) held only in this Zig local — not the rooted list arg.
+        // `appendContextEntry` forces (context merge) and can collect; root
+        // `item_value` so its context slice survives (w>1 UAF on the drv
+        // env-building hot path). Same discipline as concatStringsSep.
+        vm_force.rootKeep(self, item_value);
         const item_id = try stringTextInternId(self, item_value);
         try out.appendSlice(self.allocator, self.intern.get(item_id));
         for (try string_context.contextEntriesForValue(self, item_value)) |entry| {

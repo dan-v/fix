@@ -126,6 +126,13 @@ fn writeJsonStringValue(
     if (!std.unicode.utf8ValidateSlice(text)) return error.TypeError;
     try std.json.Stringify.encodeJsonString(text, .{}, writer);
     if (context) |entries| {
+        // GC: `value` may be a FRESH context string (path/attrs coercion by the
+        // caller) reachable only through this Zig local. `appendContextEntry`
+        // forces (context merge) and can collect; root `value` so the context
+        // slice being iterated isn't swept mid-loop (w>1 UAF).
+        const gc_roots = vm_force.rootsBegin(self);
+        defer vm_force.rootsEnd(self, gc_roots);
+        vm_force.rootKeep(self, value);
         for (try contextEntriesForValue(self, value)) |entry| {
             try appendContextEntry(self, entries, entry.name, entry.value);
         }
