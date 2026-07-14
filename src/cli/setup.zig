@@ -15,12 +15,23 @@ const hugetlb = @import("base").hugetlb;
 const Evaluator = fix.Evaluator;
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
-/// `min(8, cpu_count)` (1 when single-threaded).
+/// `min(12, cpu_count)` (1 when single-threaded).
+///
+/// The cap is the measured parallelism knee for real Nix eval: an interleaved
+/// static sweep of the realworld workloads (nixos-hm/desktop/hm-profile/minimal)
+/// puts the wall minimum at ~10-12 workers and regresses past 16 — demand
+/// parallelism saturates around there and wider pools spend the surplus on
+/// junk speculation + idle-thread overhead (see memory fix-perf-dynamic-pool /
+/// fix-perf-w32-work-starvation). 12 wins ~5% over the old 8 on the heavier
+/// workloads and is within noise on the lighter ones. Boxes with <12 cores are
+/// unaffected. A dynamic (float-the-active-count) pool was prototyped and
+/// rejected: provisioning beyond the knee costs more than a controller can
+/// claw back, since deep-parking can't remove the OS threads' existence cost.
 pub fn workerCount(options: args.Options) !u8 {
     return options.workers orelse if (builtin.single_threaded)
         1
     else
-        @intCast(@min(@as(u32, 8), @as(u32, @intCast(try std.Thread.getCpuCount()))));
+        @intCast(@min(@as(u32, 12), @as(u32, @intCast(try std.Thread.getCpuCount()))));
 }
 
 pub const Terminal = struct {
