@@ -267,14 +267,6 @@ pub fn builtinAny(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     return Value.boolVal(false);
 }
 
-/// Below this length `filter` uses its plain serial predicate loop; at or above
-/// it (and with work-first on) the per-element predicate applications — the
-/// expensive part when the predicate forces deep config (e.g. `filter (f:
-/// f.enable) (attrValues config.environment.etc)`) — are exposed as work-first
-/// split-and-steal so idle workers evaluate them in parallel. `filter` has no
-/// short-circuit, so it forces every predicate anyway → demand-safe, no waste.
-const filter_work_first_min: usize = 16;
-
 pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const list = try vm_force.forceValue(self, list_arg);
@@ -282,37 +274,6 @@ pub fn builtinFilter(self: anytype, pred_arg: Value, list_arg: Value) !Value {
 
     const list_id = list.asObjectId();
     const n = try self.heap.getListLen(list_id);
-
-    if (self.scheduler.workFirst() and n >= filter_work_first_min) {
-        // GC: root the input list + the predicate-application list across the
-        // work-first forces (raw slices held over allocation/collection).
-        const gc_roots = vm_force.rootsBegin(self);
-        defer vm_force.rootsEnd(self, gc_roots);
-        vm_force.rootKeep(self, list);
-        // One apply-thunk per element: `genlist_apply` = `call_tail pred item`.
-        const preds = try self.allocator.alloc(Value, n);
-        defer self.allocator.free(preds);
-        const apply_chunk_id = self.registry.well_known.genlist_apply;
-        var b: usize = 0;
-        while (b < n) : (b += 1) {
-            const item = try self.heap.getListItem(list_id, b);
-            preds[b] = Value.thunk(try self.heap.addBytecodeThunk(apply_chunk_id, &.{ pred, item }));
-        }
-        const preds_id = try self.heap.addList(preds);
-        vm_force.rootKeep(self, Value.list(preds_id));
-        // Expose the predicate evaluations as stealable work, then read the
-        // (now often already-computed) results in order to preserve output order.
-        vm_force.forceListAccelerate(self, preds_id, try self.heap.getList(preds_id));
-        var out: std.ArrayListUnmanaged(Value) = .empty;
-        defer out.deinit(self.allocator);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const result = try vm_force.forceValue(self, try self.heap.getListItem(preds_id, i));
-            if (!result.isBool()) return error.TypeError;
-            if (result.asBool()) try out.append(self.allocator, try self.heap.getListItem(list_id, i));
-        }
-        return Value.list(try self.heap.addList(out.items));
-    }
 
     var out: std.ArrayListUnmanaged(Value) = .empty;
     defer out.deinit(self.allocator);

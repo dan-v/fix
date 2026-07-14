@@ -40,7 +40,6 @@ const arena_mod = @import("base").arena;
 const scheduler_mod = @import("scheduler");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
-const Continuation = scheduler_mod.Continuation;
 const vm_mod = @import("../vm.zig");
 const VM = vm_mod.VM;
 const exec_context = @import("exec_context.zig");
@@ -152,10 +151,6 @@ pub const WorkerFiber = struct {
     /// on first run; nil'd before processing so a recycled fiber sees a
     /// fresh assignment on its next reset.
     current_task: ?Task,
-    /// Work-first continuation assigned to this fiber (mutually exclusive with
-    /// `current_task` — set only for a stolen continuation run via
-    /// `contEntry`). Nil'd before processing, like `current_task`.
-    current_cont: ?Continuation = null,
     /// Timeline (`--timeline`): flow-arrow id for a STOLEN task's quantum,
     /// so the run emits a `flowIn` matching the steal's `flowOut` (→ a
     /// victim→stealer arrow). Set by `drainStep` (0 = not stolen / no arrow);
@@ -502,23 +497,6 @@ pub const Worker = struct {
                 }
             }
             f.inner.reset(slotEntry, @ptrCast(f));
-            if (comptime census_on) {
-                self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
-                self.census.tasks += 1;
-                prof.fiberLiveInc();
-            }
-            f.state = .running;
-            self.runFiber(f);
-            return true;
-        }
-        if (self.pickCont()) |cont| {
-            const tc: u64 = if (comptime census_on) fiber_mod.censusNow() else 0;
-            const f = try self.acquireFreeFiber();
-            f.current_cont = cont;
-            f.current_task = null;
-            if (comptime census_on) f.census_class = .cont;
-            f.flow_in_id = 0;
-            f.inner.reset(contEntry, @ptrCast(f));
             if (comptime census_on) {
                 self.census.cy_dispatch += fiber_mod.censusNow() -| tc;
                 self.census.tasks += 1;
@@ -897,15 +875,6 @@ pub const Worker = struct {
         return null;
     }
 
-    /// Steal a work-first continuation from another worker (this worker's own
-    /// continuations are reclaimed inline by `forceRangeWorkFirst`'s pop-back,
-    /// never here). Suppressed once a top-level result is ready, like
-    /// `pickTask` — no need to start new parallel collection work past the answer.
-    fn pickCont(self: *Worker) ?Continuation {
-        if (self.scheduler.backgroundSuppressed()) return null;
-        return self.scheduler.stealCont(self.worker_id);
-    }
-
     /// Pop a fiber from the free list (LIFO — best cache locality), or
     /// allocate a fresh one if the list is empty. The new fiber has its
     /// own stack + VM; the caller must `reset` it with the actual entry.
@@ -945,7 +914,6 @@ pub const Worker = struct {
             .in_runfiber = .init(0),
             .run_mu = .{},
             .current_task = null,
-            .current_cont = null,
             .next_free = null,
             .ready_node = .{},
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },
@@ -1350,62 +1318,6 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                 // table is append-only and global, so this is invisible
                 // beyond timing.
                 for (listing) |le| _ = f.vm.intern.intern(le.name) catch break;
-            }
-        },
-    }
-}
-
-/// Fiber entry for a STOLEN work-first continuation. Mirrors `slotEntry`'s
-/// setup (reset VM stack, point at the local scratch trace so a speculative
-/// throw can't pollute the user trace) then forces the continuation's range,
-/// re-splitting onto this worker's own cont deque.
-fn contEntry(arg: *anyopaque) void {
-    const f: *WorkerFiber = @ptrCast(@alignCast(arg));
-    f.vm.sp = 0;
-    f.vm.frames_len = 0;
-    const cont = f.current_cont orelse return;
-    f.current_cont = null;
-    const saved_trace = f.vm.trace;
-    f.local_trace.clear();
-    f.vm.trace = &f.local_trace;
-    defer f.vm.trace = saved_trace;
-    if (comptime census_on) {
-        var live: u64 = 0;
-        var total: u64 = 0;
-        censusScanCont(f, cont, &live, &total);
-        const t0 = fiber_mod.censusNow();
-        vm_force.forceContinuation(&f.vm, cont);
-        prof.taskCensusRecord(.cont, live, total, false, fiber_mod.censusNow() -| t0);
-    } else {
-        vm_force.forceContinuation(&f.vm, cont);
-    }
-}
-
-/// Census pre-scan for a stolen work-first continuation (see
-/// `censusScanTask`): thunk-typed items in `[lo, hi)` and how many are
-/// still unresolved on arrival.
-fn censusScanCont(f: *WorkerFiber, cont: Continuation, live: *u64, total: *u64) void {
-    const heap = f.vm.heap;
-    const unresolved = @intFromEnum(thunk_mod.FutureState.unresolved);
-    switch (cont.kind) {
-        .list => {
-            const items = heap.getList(cont.id) catch return;
-            const end = @min(@as(usize, cont.hi), items.len);
-            var i: usize = cont.lo;
-            while (i < end) : (i += 1) {
-                if (!items[i].isThunk()) continue;
-                total.* += 1;
-                if (heap.getThunkAssumeValid(items[i].asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
-            }
-        },
-        .attrs => {
-            const entries = heap.getAttrs(cont.id) catch return;
-            const end = @min(@as(usize, cont.hi), entries.len);
-            var i: usize = cont.lo;
-            while (i < end) : (i += 1) {
-                if (!entries[i].value.isThunk()) continue;
-                total.* += 1;
-                if (heap.getThunkAssumeValid(entries[i].value.asObjectId()).future.state.load(.monotonic) == unresolved) live.* += 1;
             }
         },
     }

@@ -39,8 +39,6 @@ pub const TaskClass = enum(u8) {
     attrs_sweep,
     /// `force_attrs_range` batch (urgent lane).
     attrs_range,
-    /// Stolen work-first continuation (FIX_WORK_FIRST).
-    cont,
     /// Speculative import prefetch (FIX_IMPORT_PREFETCH; spec lane).
     import_prefetch,
     /// Speculative readDir-children prefetch (FIX_READDIR_PREFETCH;

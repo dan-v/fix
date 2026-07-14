@@ -62,9 +62,6 @@ pub const ScanCensus = struct {
     spec_steal_cy: u64 = 0,
     spec_steal_calls: u64 = 0,
     spec_steal_hits: u64 = 0,
-    cont_steal_cy: u64 = 0,
-    cont_steal_calls: u64 = 0,
-    cont_steal_hits: u64 = 0,
 };
 
 threadlocal var scan_local: if (scan_census_on) ScanCensus else void = if (scan_census_on) ScanCensus{} else {};
@@ -109,10 +106,10 @@ pub fn reportScanCensus() void {
     scanFlush(); // caller's (worker 0's) residue
     const t = &scan_totals;
     const total = t.ready_pop_cy + t.ready_steal_cy + t.pop_own_cy +
-        t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy + t.cont_steal_cy;
+        t.urgent_steal_cy + t.novel_steal_cy + t.spec_steal_cy;
     if (total == 0) return;
     std.debug.print("prof scan-census (all workers, drain-loop probe cycles, total={d}):\n", .{total});
-    inline for (.{ "ready_pop", "ready_steal", "pop_own", "urgent_steal", "novel_steal", "spec_steal", "cont_steal" }) |name| {
+    inline for (.{ "ready_pop", "ready_steal", "pop_own", "urgent_steal", "novel_steal", "spec_steal" }) |name| {
         const cy = @field(t, name ++ "_cy");
         const calls = @field(t, name ++ "_calls");
         const hits = @field(t, name ++ "_hits");
@@ -201,20 +198,6 @@ pub const ForceAttrsRange = struct {
 };
 
 /// Work-first (Cilk/sparks) split-and-steal continuation — a half-open range
-/// `[lo, hi)` of a collection's items exposed on the per-worker continuation
-/// deque (`cont_queues`). `kind` distinguishes a list slot walk from an attr
-/// slot walk (the heap stores each as a positional slice, so the range is
-/// index-based either way). Owner-pushed/popped LIFO on the fast (unstolen)
-/// path; FIFO-stolen by an idle worker that re-splits it. See
-/// `force.forceRangeWorkFirst`.
-pub const ContKind = enum(u8) { list, attrs };
-pub const Continuation = struct {
-    id: types.ObjectId,
-    lo: u32,
-    hi: u32,
-    kind: ContKind,
-};
-
 /// Embeddable linked-list node for the per-worker ready queue.
 /// Each Fiber struct (in worker.zig) inlines one of these; the
 /// scheduler holds queues of `*ReadyNode` and the worker recovers
@@ -454,9 +437,6 @@ const SpecQueue = struct {
     }
 };
 
-/// Per-worker deque of work-first split-and-steal continuations (see
-/// `Continuation`). Same Chase-Lev engine as `TaskQueue`, distinct payload.
-const ContQueue = containers.Deque(Continuation);
 
 /// GC (`-Dgc`): mark the objects referenced by pending tasks. A queued
 /// `force_thunk`/`force_list_range` is a live reference (a helper — or,
@@ -510,10 +490,6 @@ fn monotonicNs() u64 {
 // back onto the critical path at 32 workers.
 const urgent_queue_capacity: u32 = 4096;
 const spec_queue_capacity: u32 = 4096;
-/// Work-first continuation deque capacity (power of two). A full push just
-/// stops splitting (the range is forced inline), so this only bounds how much
-/// parallelism is exposed at once, not correctness.
-const cont_queue_capacity: u32 = 4096;
 /// Per-helper speculation backlog cap. `var` (not `const`) so `FIX_SPEC_BACKLOG`
 /// can sweep it — it's the primary control on how much speculative garbage runs
 /// ahead of demand, i.e. the peak-RSS↔wall knob.
@@ -561,8 +537,6 @@ pub const Scheduler = struct {
         urgent_rej: u64 = 0,
         pops: u64 = 0,
         steals: u64 = 0,
-        cont_steals: u64 = 0,
-        cont_pushes: u64 = 0,
         parks: u64 = 0,
         scavenges: u64 = 0,
         sweeps: u64 = 0,
@@ -668,11 +642,6 @@ pub const Scheduler = struct {
     /// exempt from the bulk backlog cap (volume is bounded at one task
     /// per chunk). Empty (and therefore free) when the knob is off.
     novel_queues: []SpecQueue,
-    /// Per-worker deque of work-first split-and-steal continuations. Owner
-    /// pushes/pops LIFO on the unstolen fast path; idle workers take FIFO.
-    /// Separate from the eager task queues so the work-first pop-back never
-    /// races the drain loop's task picks. Gated by `work_first`.
-    cont_queues: []ContQueue,
     /// Per-worker ready-fiber queues. Producers are any thread waking a
     /// fiber (via thunk resolve → `Fiber.wakeImpl`); consumers are the
     /// owning worker (most often) or any worker stealing when its own
@@ -714,11 +683,6 @@ pub const Scheduler = struct {
     /// the cap park on their futex immediately and are re-engaged by
     /// submit-side wakes. Worker 0 is exempt (it's the demand thread).
     spinners: containers.Isolated(u32),
-    /// Net work-first continuations currently sitting on all `cont_queues`
-    /// (pushed − popped/stolen). A single shared counter the pre-park spin
-    /// reads to decide whether to keep spinning for stealable continuation
-    /// work, without per-queue CAS probes (same design as `pending_tasks`).
-    cont_pending: containers.Isolated(u32),
     /// Per-lane stealable-work summaries (scan-census-driven, see the
     /// w=32 idle-churn fix): net tasks currently sitting in each queue
     /// class across all workers. `pending_tasks` says work EXISTS but not
@@ -765,12 +729,6 @@ pub const Scheduler = struct {
     /// work contributes how much to wall time.
     disable_speculation: bool,
     disable_fanout: bool,
-
-    /// `FIX_WORK_FIRST`: route strict collection-force acceleration through the
-    /// work-first split-and-steal primitive (`forceRangeWorkFirst`) instead of
-    /// the eager `fanOut*Shallow`. Set once before helpers start, read-only
-    /// during eval (plain bool — no atomic needed). Default off while landing.
-    work_first: bool,
 
     /// `FIX_SCAVENGE`: idle helpers pre-force old unresolved thunks from
     /// the per-worker creation rings (`ObjectHeap.scavengeSteal`) —
@@ -998,15 +956,6 @@ pub const Scheduler = struct {
             novel_init += 1;
         }
 
-        const cont_queues = try allocator.alloc(ContQueue, safe_worker_count);
-        errdefer allocator.free(cont_queues);
-        var cont_init: usize = 0;
-        errdefer for (cont_queues[0..cont_init]) |*q| q.deinit(allocator);
-        for (cont_queues) |*q| {
-            q.* = try ContQueue.init(allocator, cont_queue_capacity);
-            cont_init += 1;
-        }
-
         const ready_queues = try allocator.alloc(ReadyQueue, safe_worker_count);
         errdefer allocator.free(ready_queues);
         for (ready_queues) |*r| r.* = ReadyQueue.init();
@@ -1042,7 +991,6 @@ pub const Scheduler = struct {
             .urgent_queues = urgent_queues,
             .spec_queues = spec_queues,
             .novel_queues = novel_queues,
-            .cont_queues = cont_queues,
             .ready_queues = ready_queues,
             .threads = threads,
             .wake_words = wake_words,
@@ -1052,7 +1000,6 @@ pub const Scheduler = struct {
             .started = .init(false),
             .pending_tasks = .init(0),
             .spinners = .init(0),
-            .cont_pending = .init(0),
             .ready_pending = .init(0),
             .urgent_pending = .init(0),
             .novel_mask = .init(0),
@@ -1065,7 +1012,6 @@ pub const Scheduler = struct {
             .n_busy_ns = .init(0),
             .disable_speculation = false,
             .disable_fanout = false,
-            .work_first = false,
             .suppress_background = .init(false),
             .gc_stop_requested = if (gc.enabled) .init(false) else {},
             .gc_worker_parked = gc_worker_parked,
@@ -1121,8 +1067,6 @@ pub const Scheduler = struct {
             c.urgent_rej += w.urgent_rej;
             c.pops += w.pops;
             c.steals += w.steals;
-            c.cont_steals += w.cont_steals;
-            c.cont_pushes += w.cont_pushes;
             c.parks += w.parks;
             c.scavenges += w.scavenges;
             c.sweeps += w.sweeps;
@@ -1137,8 +1081,6 @@ pub const Scheduler = struct {
             .urgent_rejected = c.urgent_rej,
             .pops = c.pops,
             .steals = c.steals,
-            .cont_steals = c.cont_steals,
-            .cont_pushes = c.cont_pushes,
             .parks = c.parks,
             .scavenges = c.scavenges,
             .sweeps = c.sweeps,
@@ -1184,14 +1126,6 @@ pub const Scheduler = struct {
         for (self.urgent_queues) |*q| taskQueueGcMark(q, tr, heap);
         for (self.spec_queues) |*q| specQueueGcMark(q, tr, heap);
         for (self.novel_queues) |*q| specQueueGcMark(q, tr, heap);
-        // Work-first continuations reference a live collection each; mark it
-        // (the range's items are reachable through the list/attrs). STW-only.
-        for (self.cont_queues) |*q| {
-            const t = q.top.v.load(.monotonic);
-            const b = q.bottom.v.load(.monotonic);
-            var i = t;
-            while (i != b) : (i +%= 1) tr.markObject(heap, q.items[@intCast(i & q.mask)].id);
-        }
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -1204,8 +1138,6 @@ pub const Scheduler = struct {
         self.allocator.free(self.spec_queues);
         for (self.novel_queues) |*q| q.deinit(self.allocator);
         self.allocator.free(self.novel_queues);
-        for (self.cont_queues) |*q| q.deinit(self.allocator);
-        self.allocator.free(self.cont_queues);
         self.allocator.free(self.ready_queues);
         self.allocator.free(self.threads);
         self.allocator.free(self.worker_counters);
@@ -1328,15 +1260,6 @@ pub const Scheduler = struct {
         self.trace_flows = on;
     }
 
-    /// Enable/disable the work-first collection-force path. Set once before
-    /// helpers start (from `FIX_WORK_FIRST`); read-only during eval.
-    pub fn setWorkFirst(self: *Scheduler, v: bool) void {
-        self.work_first = v;
-    }
-    pub inline fn workFirst(self: *const Scheduler) bool {
-        return self.work_first;
-    }
-
     /// Enable/configure the idle-helper thunk scavenger. Set once before
     /// helpers start (from `FIX_SCAVENGE` / `FIX_SCAV_MARGIN`).
     pub fn setScavenge(self: *Scheduler, on: bool, margin: u64) void {
@@ -1378,68 +1301,6 @@ pub const Scheduler = struct {
             const grant = @min(cur, want);
             cur = self.readdir_prefetch_budget.v.cmpxchgWeak(cur, cur - grant, .monotonic, .monotonic) orelse return grant;
         }
-    }
-
-    /// Push a work-first continuation onto `worker_id`'s own continuation deque
-    /// (owner-only). Returns false when full — the caller then forces the range
-    /// inline. Bumps `cont_pending` and, at the start of a burst, wakes one
-    /// worker so a parked helper picks up continuation work even without other
-    /// traffic (bounded, like `pushOwn`).
-    pub fn pushCont(self: *Scheduler, worker_id: u8, cont: Continuation) bool {
-        if (worker_id >= self.worker_count) return false;
-        if (!self.cont_queues[worker_id].push(cont)) return false;
-        self.bump(worker_id, "cont_pushes");
-        const prev = self.cont_pending.v.fetchAdd(1, .release);
-        if (self.worker_count > 1) {
-            const wake_budget = @min(@as(u32, self.worker_count - 1), burst_wake_budget);
-            if (prev < wake_budget) {
-                const wake_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
-                const target = if (wake_idx == worker_id) (wake_idx + 1) % self.worker_count else wake_idx;
-                self.wakeWorker(target);
-            }
-        }
-        return true;
-    }
-
-    /// Pop the newest continuation from `worker_id`'s own deque (LIFO), or null
-    /// if empty (all were stolen / never pushed).
-    pub fn popCont(self: *Scheduler, worker_id: u8) ?Continuation {
-        if (worker_id >= self.worker_count) return null;
-        const c = self.cont_queues[worker_id].pop() orelse return null;
-        _ = self.cont_pending.v.fetchSub(1, .monotonic);
-        return c;
-    }
-
-    /// Steal one continuation from another worker's deque (FIFO — takes the
-    /// oldest/biggest exposed range for best load balancing), excluding the
-    /// caller's own. Null if none available.
-    pub fn stealCont(self: *Scheduler, worker_id: u8) ?Continuation {
-        if (self.worker_count < 2) return null;
-        // Stealable-work summary: `cont_pending` (already maintained for
-        // the pre-park spin) now also short-circuits the scan itself —
-        // with `work_first` off it is permanently zero, yet the walk was
-        // ~8% of all idle-scan cycles at w=32.
-        if (self.cont_pending.v.load(.monotonic) == 0) return null;
-        const t0 = rdtscScan();
-        const start_idx: u8 = @intCast(self.next_victim.v.fetchAdd(1, .monotonic) % self.worker_count);
-        var i: u8 = 0;
-        while (i < self.worker_count) : (i += 1) {
-            const idx = (start_idx + i) % self.worker_count;
-            if (idx == worker_id) continue;
-            if (self.cont_queues[idx].steal()) |c| {
-                _ = self.cont_pending.v.fetchSub(1, .monotonic);
-                self.bump(worker_id, "cont_steals");
-                scanEnd("cont_steal", t0, true);
-                return c;
-            }
-        }
-        scanEnd("cont_steal", t0, false);
-        return null;
-    }
-
-    /// Pre-park spin probe: is there stealable continuation work outstanding?
-    pub inline fn contPending(self: *const Scheduler) u32 {
-        return self.cont_pending.v.load(.monotonic);
     }
 
     /// Try to become one of the `max_spinners` idle spinners. Returns
@@ -1739,13 +1600,12 @@ pub const Scheduler = struct {
     /// allowed to take? For workers within the bulk-spec cap this is the
     /// historical single `pending_tasks` load; workers past the cap must
     /// not busy-spin on a bulk backlog they cannot drain, so they probe
-    /// the urgent counter, the novel mask, and the cont counter instead.
+    /// the urgent counter and the novel mask instead.
     pub inline fn takableWork(self: *const Scheduler, worker_id: u8) bool {
         if (worker_id <= self.spec_helper_cap)
-            return self.pending_tasks.v.load(.monotonic) > 0 or self.contPending() > 0;
+            return self.pending_tasks.v.load(.monotonic) > 0;
         return self.urgent_pending.v.load(.monotonic) != 0 or
-            self.novel_mask.v.load(.monotonic) != 0 or
-            self.contPending() > 0;
+            self.novel_mask.v.load(.monotonic) != 0;
     }
 
     /// Spec-lane steal: newest-first when `lifo` (demand-head-adjacent
@@ -1939,7 +1799,7 @@ pub const Scheduler = struct {
         // lands inside one. Layout is otherwise the compiler's business,
         // so this is what keeps a future field-shuffle honest.
         @setEvalBranchQuota(8000);
-        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "cont_pending", "ready_pending", "urgent_pending", "novel_mask", "spec_mask" };
+        const hot = .{ "next_victim", "next_fiber_id", "pending_tasks", "spinners", "ready_pending", "urgent_pending", "novel_mask", "spec_mask" };
         const blk = std.atomic.cache_line;
         for (@typeInfo(Scheduler).@"struct".fields) |f| {
             if (@sizeOf(f.type) == 0) continue;

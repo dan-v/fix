@@ -16,8 +16,6 @@ const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const fiber_mod = @import("base").fiber;
 const sched_mod = @import("scheduler");
-const ContKind = sched_mod.ContKind;
-const Continuation = sched_mod.Continuation;
 const worker_mod = @import("worker.zig");
 
 const access = @import("access.zig");
@@ -507,27 +505,12 @@ pub fn fanOutAttrsShallow(self: *VM, attrs_id: ObjectId, entries: []const heap_m
     }
 }
 
-// ---- Work-first split-and-steal (Cilk/sparks) collection force ----
-//
-// The lazy-task-creation counterpart to the eager `fanOut*Shallow`: instead of
-// pushing ⌈N/grain⌉ tasks up front, expose only the tail half of a range as ONE
-// stealable continuation on the per-worker cont deque and descend the head
-// inline. Idle peers steal the tail (FIFO) and re-split; unstolen it degrades
-// to an inline recursive walk whose only overhead is owner-only deque push/pop.
-// Advisory — the caller's own strict loop stays the authoritative demand walk,
-// so a stranded/stolen continuation never loses work and the result is
-// byte-identical to the eager path. Uses `forceValueSpeculative` (no demand
-// mark, bail-able). Generalised over lists and attrsets (both are positional
-// slices in the heap; `ContKind` selects which).
+// ---- Strict-collection-force acceleration (eager fan-out) ----
 
-/// Grain: ranges at or below this many items are forced inline without exposing
-/// a stealable continuation. Coarse enough that the deque push/pop + reclaim
-/// overhead stays well under the per-item force cost.
-const work_first_grain: u32 = 16;
-
-/// Accelerate a strict list walk: work-first split-and-steal (`FIX_WORK_FIRST`)
-/// or the eager `fanOutListShallow`, per the scheduler flag. Drop-in at
-/// demand-safe strict sites — the caller's own loop stays authoritative.
+/// Accelerate a strict list walk by eagerly fanning the elements out to idle
+/// helpers (`fanOutListShallow`). Drop-in at demand-safe strict sites — the
+/// caller's own loop stays the authoritative demand walk, so this only
+/// pre-forces; a helper that loses the race sees `.already_resolved`.
 pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const Value) void {
     if (comptime prof.enabled) {
         if (self.ctx.is_demand and self.workerId() == 0)
@@ -536,110 +519,20 @@ pub inline fn forceListAccelerate(self: *VM, list_id: ObjectId, items: []const V
     // Solo: no helper can ever drain the fan-out; every submit would be
     // rejected per batch. One predictable branch spares the whole loop.
     if (self.solo) return;
-    if (self.scheduler.workFirst()) {
-        forceCollectionWorkFirst(self, list_id, .list, @intCast(items.len));
-    } else {
-        fanOutListShallow(self, list_id, items);
-    }
+    fanOutListShallow(self, list_id, items);
 }
 
 /// Attrset analogue of `forceListAccelerate` — the strict attrset walks
 /// (`attrValues`/`filter`/`mapAttrsToList`/forceDeep-attrs) are where the
-/// module-system option-merge work lives, so this is the path that actually
-/// exposes the previously-serial merge to idle workers.
+/// module-system option-merge work lives, so this exposes the previously-
+/// serial merge to idle workers.
 pub inline fn forceAttrsAccelerate(self: *VM, attrs_id: ObjectId, entries: []const heap_mod.AttrEntry) void {
     if (comptime prof.enabled) {
         if (self.ctx.is_demand and self.workerId() == 0)
             prof_census.recordStrictWalk(&prof_census.attrs_walks, entries.len, fan_out_min_items);
     }
     if (self.solo) return; // see forceListAccelerate
-    if (self.scheduler.workFirst()) {
-        forceCollectionWorkFirst(self, attrs_id, .attrs, @intCast(entries.len));
-    } else {
-        fanOutAttrsShallow(self, attrs_id, entries);
-    }
-}
-
-inline fn rootKeepCollection(self: *VM, id: ObjectId, kind: ContKind) void {
-    switch (kind) {
-        .list => rootKeep(self, Value.list(id)),
-        .attrs => rootKeep(self, Value.attrs(id)),
-    }
-}
-
-fn forceCollectionWorkFirst(self: *VM, id: ObjectId, kind: ContKind, len: u32) void {
-    if (len < fan_out_min_items) return;
-    // GC: root the collection across the recursive forces (a mid-walk collection
-    // must not sweep it). No-op without -Dgc.
-    const gc_roots = rootsBegin(self);
-    defer rootsEnd(self, gc_roots);
-    rootKeepCollection(self, id, kind);
-    forceRangeWorkFirst(self, id, kind, 0, len);
-}
-
-/// Run a STOLEN continuation on the stealing worker: root the collection (the
-/// owner's root scope may be gone), then force its range — re-splitting onto
-/// THIS worker's own cont deque so idle peers can peel off further sub-ranges.
-pub fn forceContinuation(self: *VM, cont: Continuation) void {
-    const gc_roots = rootsBegin(self);
-    defer rootsEnd(self, gc_roots);
-    rootKeepCollection(self, cont.id, cont.kind);
-    forceRangeWorkFirst(self, cont.id, cont.kind, cont.lo, cont.hi);
-}
-
-fn forceRangeWorkFirst(self: *VM, id: ObjectId, kind: ContKind, lo_in: u32, hi_in: u32) void {
-    const wid = self.workerId();
-    const lo = lo_in;
-    var hi = hi_in;
-    var pushed: u32 = 0;
-    // Expose the tail half as a stealable continuation, descend the head inline.
-    // A full deque just stops splitting (rest falls to the leaf) — best-effort.
-    while (hi - lo > work_first_grain) {
-        const mid = lo + (hi - lo) / 2;
-        if (!self.scheduler.pushCont(wid, .{ .id = id, .lo = mid, .hi = hi, .kind = kind })) break;
-        pushed += 1;
-        hi = mid;
-    }
-    forceRangeLeaf(self, id, kind, lo, hi);
-    // Reclaim LIFO. A hit un-stolen → run inline; a miss → it was stolen. The
-    // popped continuation is USUALLY ours, but a fiber can suspend mid-leaf
-    // (busy thunk) and this worker then runs another fiber whose work-first push
-    // lands on the SAME per-worker deque, so a pop-back can surface a foreign
-    // call's continuation. Re-split only when it's for OUR (id,kind); otherwise
-    // drain it FLAT (its own caller loop backstops) so the reclaim recursion
-    // stays bounded by our O(log N) split depth, not by chained foreign pops.
-    while (pushed > 0) : (pushed -= 1) {
-        const c = self.scheduler.popCont(wid) orelse break;
-        if (c.id == id and c.kind == kind) {
-            forceRangeWorkFirst(self, id, kind, c.lo, c.hi);
-        } else {
-            forceRangeLeaf(self, c.id, c.kind, c.lo, c.hi);
-        }
-    }
-}
-
-/// Shallow-force items `[lo, hi)` of a collection inline (no split, no deque).
-/// Re-fetches the slice from the id (bounded: one lookup per ≤grain-sized leaf)
-/// and clamps defensively so a foreign/stale range never indexes out of bounds.
-fn forceRangeLeaf(self: *VM, id: ObjectId, kind: ContKind, lo: u32, hi: u32) void {
-    switch (kind) {
-        .list => {
-            const items = self.heap.getList(id) catch return;
-            const end = @min(@as(usize, hi), items.len);
-            var i: usize = lo;
-            while (i < end) : (i += 1) {
-                if (items[i].isThunk()) _ = forceValueSpeculative(self, items[i]) catch {};
-            }
-        },
-        .attrs => {
-            const entries = self.heap.getAttrs(id) catch return;
-            const end = @min(@as(usize, hi), entries.len);
-            var i: usize = lo;
-            while (i < end) : (i += 1) {
-                if (entries[i].value.isThunk()) _ = forceValueSpeculative(self, entries[i].value) catch {};
-            }
-        },
-    }
+    fanOutAttrsShallow(self, attrs_id, entries);
 }
 
 pub fn enterDeep(self: *VM, kind: SeenDeepKind, id: ObjectId, seen: *std.ArrayListUnmanaged(SeenDeepObject)) !bool {
