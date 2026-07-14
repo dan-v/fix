@@ -94,7 +94,17 @@ pub fn collect(ev: anytype, collector_id: u8) void {
     // Escalate to a full collection once enough has tenured that a young-gated
     // minor can't recover the accumulated old-generation garbage (see
     // `gc_major_gate`). Same STW; the major reclaims old dead objects too.
-    if (ev.heap.gcShouldMajor()) {
+    //
+    // MAJOR IS `--workers=1`-ONLY: the sweep's `gcReconstructAllocBits` assumes
+    // a dense id space (no gaps but per-worker current-chunk tails), true only
+    // at w=1. At w>1 each worker owns disjoint object chunks, so the rebuild
+    // mis-marks live/free slots, corrupts the free lists, and the eval then
+    // LIVELOCKS on bad reuse (all workers churn, no STW, no progress — a real
+    // hang under a tight `--max-memory` at w>1). The copying MINOR below is
+    // parallel-safe at any worker count, so at w>1 we simply never escalate:
+    // the minor still bounds young churn; old garbage just isn't reclaimed
+    // (accumulates, but never corrupts). The major was always wrong at w>1.
+    if (ev.worker_count == 1 and ev.heap.gcShouldMajor()) {
         collectMajor(ev, collector_id);
         return;
     }
