@@ -1,0 +1,457 @@
+//! WorkGraph: a concurrent dependency-DAG executor for daemon store work —
+//! `.drv` writes AND builds, in one graph.
+//!
+//! Two node kinds:
+//!  - **write** — one `addTextToStore` of a `.drv`. Edge X -> Y (X refs Y) means
+//!    Y must be written before X; the daemon enforces referential integrity, so
+//!    honoring the edges is what lets writes run in PARALLEL across a pool of
+//!    connections (dispatch order no longer has to be topological). Correctness
+//!    is in the edges, not in force order.
+//!  - **build** — one `buildPaths([drv!*])`. A build depends on exactly one node:
+//!    the write of its `.drv` (a build can't start until its `.drv` — and, via
+//!    the write's own edges, its whole `.drv` closure — is in the store). So
+//!    build-gating is not special-cased: it is the same decrement-on-dep-done
+//!    rule as everything else.
+//!
+//! Writes and builds have very different cost (short vs minutes), so each kind
+//! has its own connection pool + ready queue; scheduling is otherwise uniform.
+//!
+//! A build node may carry a `wait_future` (`runtime/thunk.zig` `Future`): the
+//! fiber that demanded it (IFD, or the final CLI build) parks on that future and
+//! the graph `publish()`es it on completion, writing the build result into the
+//! caller's `result` slot first. Eager builds pass no future (fire-and-forget);
+//! their first failure is surfaced by `finish`.
+//!
+//! `Backend` is a vtable so the scheduler is unit-testable with mock apply fns
+//! (see tests); the real backends open a `DaemonStore` per worker.
+
+const std = @import("std");
+const stable = @import("base").sync;
+const Future = @import("thunk.zig").Future;
+
+/// Per-worker connection lifecycle + the apply op for one node kind. `open` runs
+/// once per worker thread (its own connection); `apply` performs one node.
+pub const Backend = struct {
+    ctx: *anyopaque,
+    open: *const fn (ctx: *anyopaque) anyerror!*anyopaque,
+    close: *const fn (ctx: *anyopaque, conn: *anyopaque) void,
+    /// For a write node: (store_path, text, refs). For a build node: store_path =
+    /// the drv path, text/refs empty.
+    apply: *const fn (ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, text: []const u8, refs: []const []const u8) anyerror!void,
+};
+
+const NodeKind = enum { write, build };
+const State = enum { blocked, ready, running, done, failed };
+
+const Node = struct {
+    kind: NodeKind,
+    /// write: the store path; build: the drv path.
+    store_path: []u8,
+    text: []u8 = &.{},
+    references: [][]u8 = &.{},
+    /// build only: parked-fiber wakeup + result slot (both null for eager builds).
+    wait_future: ?*Future = null,
+    result: ?*(anyerror!void) = null,
+    pending: u32 = 0,
+    dependents: std.ArrayListUnmanaged(u32) = .empty,
+    state: State = .blocked,
+
+    fn deinit(self: *Node, alloc: std.mem.Allocator) void {
+        alloc.free(self.store_path);
+        alloc.free(self.text);
+        for (self.references) |r| alloc.free(r);
+        alloc.free(self.references);
+        self.dependents.deinit(alloc);
+    }
+};
+
+pub const WorkGraph = struct {
+    allocator: std.mem.Allocator,
+    write_backend: Backend,
+    build_backend: Backend,
+    write_worker_count: usize,
+    build_worker_count: usize,
+
+    mu: stable.BlockingMutex = .{},
+    seq: std.atomic.Value(u32) = .init(0),
+    nodes: std.ArrayListUnmanaged(Node) = .empty,
+    /// store path -> WRITE node id (build nodes are not indexed; they look their
+    /// drv's write node up here for their single dependency).
+    index: std.StringHashMapUnmanaged(u32) = .empty,
+    /// drv paths that already have a build node (dedup eager re-submits).
+    build_submitted: std.StringHashMapUnmanaged(void) = .empty,
+    write_ready: std.ArrayListUnmanaged(u32) = .empty,
+    build_ready: std.ArrayListUnmanaged(u32) = .empty,
+    threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    started: bool = false,
+    done: bool = false,
+    /// Submitted-but-not-yet-completed nodes. A worker whose ready queue is empty
+    /// must keep waiting while this is >0 (a node in another queue / in flight may
+    /// still enqueue work for it — e.g. a build becomes ready when its write
+    /// completes). Only `done and outstanding == 0` means truly finished.
+    outstanding: usize = 0,
+    /// First write failure and first eager-build failure, surfaced by `finish`.
+    first_error: ?anyerror = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        write_backend: Backend,
+        build_backend: Backend,
+        write_worker_count: usize,
+        build_worker_count: usize,
+    ) WorkGraph {
+        return .{
+            .allocator = allocator,
+            .write_backend = write_backend,
+            .build_backend = build_backend,
+            .write_worker_count = @max(write_worker_count, 1),
+            .build_worker_count = @max(build_worker_count, 1),
+        };
+    }
+
+    /// Submit a `.drv` write. Takes ownership of `text` (moved); copies
+    /// `store_path`/`references`. Dedupes by store path. Never blocks. Edges: the
+    /// still-pending write node of each reference.
+    pub fn submitWrite(self: *WorkGraph, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.index.contains(store_path)) {
+            self.allocator.free(text);
+            return;
+        }
+        const owned_path = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(owned_path);
+        const owned_refs = try self.allocator.alloc([]u8, references.len);
+        var nrefs: usize = 0;
+        errdefer {
+            for (owned_refs[0..nrefs]) |r| self.allocator.free(r);
+            self.allocator.free(owned_refs);
+        }
+        for (references) |r| {
+            owned_refs[nrefs] = try self.allocator.dupe(u8, r);
+            nrefs += 1;
+        }
+        const id: u32 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.allocator, .{ .kind = .write, .store_path = owned_path, .text = text, .references = owned_refs });
+        errdefer _ = self.nodes.pop();
+        try self.index.put(self.allocator, owned_path, id);
+
+        var pending: u32 = 0;
+        for (references) |r| {
+            const dep_id = self.index.get(r) orelse continue;
+            if (self.nodes.items[dep_id].state == .done) continue;
+            try self.nodes.items[dep_id].dependents.append(self.allocator, id);
+            pending += 1;
+        }
+        self.nodes.items[id].pending = pending;
+        self.outstanding += 1;
+        if (pending == 0) try self.enqueueReady(id);
+    }
+
+    /// Submit a build of `drv_path`. It depends on the write node of `drv_path`
+    /// (if that write is still pending). INVARIANT: the drv's write is always
+    /// submitted before its build (instantiation writes the `.drv`, then the same
+    /// fiber submits the build), so the write node is already in `index` here.
+    /// `wait_future`/`result` non-null =>
+    /// a fiber is parked; the graph writes `result` then `publish()`es the future
+    /// on completion. Both null => fire-and-forget (eager). Dedupes by drv path.
+    pub fn submitBuild(self: *WorkGraph, drv_path: []const u8, wait_future: ?*Future, result: ?*(anyerror!void)) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.build_submitted.contains(drv_path)) {
+            // A build is already queued for this drv. A second waiter can't attach
+            // to it here; callers that must wait (IFD) never double-submit the
+            // same drv on the same fiber, and eager submits are fire-and-forget.
+            if (wait_future) |f| {
+                if (result) |r| r.* = {};
+                f.publish();
+            }
+            return;
+        }
+        const owned_drv = try self.allocator.dupe(u8, drv_path);
+        errdefer self.allocator.free(owned_drv);
+        const id: u32 = @intCast(self.nodes.items.len);
+        try self.nodes.append(self.allocator, .{ .kind = .build, .store_path = owned_drv, .wait_future = wait_future, .result = result });
+        errdefer _ = self.nodes.pop();
+        try self.build_submitted.put(self.allocator, owned_drv, {});
+
+        var pending: u32 = 0;
+        if (self.index.get(drv_path)) |wid| {
+            if (self.nodes.items[wid].state != .done) {
+                try self.nodes.items[wid].dependents.append(self.allocator, id);
+                pending = 1;
+            }
+        }
+        self.nodes.items[id].pending = pending;
+        self.outstanding += 1;
+        if (pending == 0) try self.enqueueReady(id);
+    }
+
+    fn enqueueReady(self: *WorkGraph, id: u32) !void {
+        self.nodes.items[id].state = .ready;
+        switch (self.nodes.items[id].kind) {
+            .write => try self.write_ready.append(self.allocator, id),
+            .build => try self.build_ready.append(self.allocator, id),
+        }
+        self.wakeAll();
+    }
+
+    pub fn start(self: *WorkGraph) !void {
+        self.started = true;
+        errdefer self.stopThreads();
+        var i: usize = 0;
+        while (i < self.write_worker_count) : (i += 1) {
+            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.write }));
+        }
+        i = 0;
+        while (i < self.build_worker_count) : (i += 1) {
+            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.build }));
+        }
+    }
+
+    /// Drain all pending work, join the pool, return the first error. Idempotent.
+    pub fn finish(self: *WorkGraph) ?anyerror {
+        if (self.started) {
+            self.mu.lock();
+            self.done = true;
+            self.mu.unlock();
+            self.wakeAll();
+            self.stopThreads();
+        }
+        const err = self.first_error;
+        self.freeGraph();
+        return err;
+    }
+
+    fn stopThreads(self: *WorkGraph) void {
+        for (self.threads.items) |t| t.join();
+        self.threads.clearRetainingCapacity();
+        self.started = false;
+    }
+
+    fn wakeAll(self: *WorkGraph) void {
+        _ = self.seq.fetchAdd(1, .release);
+        stable.Futex.wake(&self.seq, std.math.maxInt(u32));
+    }
+
+    fn readyQueue(self: *WorkGraph, kind: NodeKind) *std.ArrayListUnmanaged(u32) {
+        return switch (kind) {
+            .write => &self.write_ready,
+            .build => &self.build_ready,
+        };
+    }
+
+    fn worker(self: *WorkGraph, kind: NodeKind) void {
+        const backend = switch (kind) {
+            .write => self.write_backend,
+            .build => self.build_backend,
+        };
+        const conn = backend.open(backend.ctx) catch |err| {
+            self.mu.lock();
+            if (self.first_error == null) self.first_error = err;
+            self.mu.unlock();
+            self.drainDead(kind);
+            return;
+        };
+        defer backend.close(backend.ctx, conn);
+
+        const q = self.readyQueue(kind);
+        while (true) {
+            self.mu.lock();
+            while (q.items.len == 0 and !(self.done and self.outstanding == 0)) {
+                const s = self.seq.load(.acquire);
+                self.mu.unlock();
+                stable.Futex.wait(&self.seq, s);
+                self.mu.lock();
+            }
+            if (q.items.len == 0) {
+                self.mu.unlock();
+                return; // done and outstanding == 0
+            }
+            const id = q.orderedRemove(0);
+            self.nodes.items[id].state = .running;
+            const failed = self.first_error != null;
+            const sp = self.nodes.items[id].store_path;
+            const tx = self.nodes.items[id].text;
+            const refs = self.nodes.items[id].references;
+            self.mu.unlock();
+
+            var apply_err: ?anyerror = null;
+            if (!failed) {
+                const refs_const: []const []const u8 = refs;
+                backend.apply(backend.ctx, conn, sp, tx, refs_const) catch |err| {
+                    apply_err = err;
+                };
+            } else {
+                apply_err = error.Aborted;
+            }
+            self.complete(id, apply_err);
+        }
+    }
+
+    /// Mark node `id` finished, propagate to dependents, wake a parked fiber (for
+    /// a build with a `wait_future`), record the first error.
+    fn complete(self: *WorkGraph, id: u32, apply_err: ?anyerror) void {
+        self.mu.lock();
+        const node = &self.nodes.items[id];
+        if (apply_err) |err| {
+            if (self.first_error == null and err != error.Aborted) self.first_error = err;
+            node.state = .failed;
+        } else {
+            node.state = .done;
+        }
+        for (node.dependents.items) |dep| {
+            self.nodes.items[dep].pending -= 1;
+            if (self.nodes.items[dep].pending == 0) self.enqueueReady(dep) catch {};
+        }
+        self.outstanding -= 1;
+        // Wake all workers so an idle one re-checks the `done and outstanding==0`
+        // exit condition even when this completion enqueued nothing.
+        self.wakeAll();
+        // Capture the wakeup fields before unlocking (the parked fiber may resume
+        // and reuse its stack the instant we publish).
+        const fut = node.wait_future;
+        const res = node.result;
+        self.mu.unlock();
+
+        if (fut) |f| {
+            if (res) |r| r.* = if (apply_err) |e| e else {};
+            f.publish();
+        }
+    }
+
+    fn drainDead(self: *WorkGraph, kind: NodeKind) void {
+        const q = self.readyQueue(kind);
+        while (true) {
+            self.mu.lock();
+            while (q.items.len == 0 and !(self.done and self.outstanding == 0)) {
+                const s = self.seq.load(.acquire);
+                self.mu.unlock();
+                stable.Futex.wait(&self.seq, s);
+                self.mu.lock();
+            }
+            if (q.items.len == 0) {
+                self.mu.unlock();
+                return;
+            }
+            const id = q.orderedRemove(0);
+            self.mu.unlock();
+            self.complete(id, error.StoreUnavailable);
+        }
+    }
+
+    fn freeGraph(self: *WorkGraph) void {
+        for (self.nodes.items) |*n| n.deinit(self.allocator);
+        self.nodes.deinit(self.allocator);
+        self.index.deinit(self.allocator);
+        self.build_submitted.deinit(self.allocator);
+        self.write_ready.deinit(self.allocator);
+        self.build_ready.deinit(self.allocator);
+        self.threads.deinit(self.allocator);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests — mock backends recording apply order + asserting the deps-first
+// invariant (references applied before a write; write applied before its build).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const Mock = struct {
+    mu: stable.BlockingMutex = .{},
+    seen: std.StringHashMapUnmanaged(void) = .empty, // applied write paths
+    built: std.ArrayListUnmanaged([]const u8) = .empty,
+    applied_writes: usize = 0,
+    violation: bool = false,
+    allocator: std.mem.Allocator,
+
+    fn writeBackend(self: *Mock) Backend {
+        return .{ .ctx = self, .open = openMock, .close = closeMock, .apply = applyWrite };
+    }
+    fn buildBackend(self: *Mock) Backend {
+        return .{ .ctx = self, .open = openMock, .close = closeMock, .apply = applyBuild };
+    }
+    fn openMock(ctx: *anyopaque) anyerror!*anyopaque {
+        return ctx;
+    }
+    fn closeMock(_: *anyopaque, _: *anyopaque) void {}
+    fn applyWrite(ctx: *anyopaque, _: *anyopaque, store_path: []const u8, _: []const u8, refs: []const []const u8) anyerror!void {
+        const self: *Mock = @ptrCast(@alignCast(ctx));
+        stable.sleepNs(50_000);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (refs) |r| {
+            if (!self.seen.contains(r)) self.violation = true;
+        }
+        self.seen.put(self.allocator, store_path, {}) catch {};
+        self.applied_writes += 1;
+    }
+    fn applyBuild(ctx: *anyopaque, _: *anyopaque, drv_path: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
+        const self: *Mock = @ptrCast(@alignCast(ctx));
+        stable.sleepNs(50_000);
+        self.mu.lock();
+        defer self.mu.unlock();
+        // Invariant: a build's drv must have been written first.
+        if (!self.seen.contains(drv_path)) self.violation = true;
+        self.built.append(self.allocator, drv_path) catch {};
+    }
+    fn deinit(self: *Mock) void {
+        self.seen.deinit(self.allocator);
+        self.built.deinit(self.allocator);
+    }
+};
+
+fn td(alloc: std.mem.Allocator, s: []const u8) []u8 {
+    return alloc.dupe(u8, s) catch unreachable;
+}
+
+test "work graph: diamond writes bottom-up, builds gated on their write" {
+    const alloc = testing.allocator;
+    var mock: Mock = .{ .allocator = alloc };
+    defer mock.deinit();
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 4, 4);
+    try g.start();
+    // Diamond A -> {B,C} -> D, submitted in force order.
+    try g.submitWrite("D", td(alloc, "d"), &.{});
+    try g.submitWrite("B", td(alloc, "b"), &.{"D"});
+    try g.submitWrite("C", td(alloc, "c"), &.{"D"});
+    try g.submitWrite("A", td(alloc, "a"), &.{ "B", "C" });
+    // Eager-build A immediately (its write may not be done yet).
+    try g.submitBuild("A", null, null);
+    try testing.expect(g.finish() == null);
+    try testing.expect(!mock.violation);
+    try testing.expectEqual(@as(usize, 4), mock.applied_writes);
+    try testing.expectEqual(@as(usize, 1), mock.built.items.len);
+}
+
+test "work graph: build waits for its (slow) write" {
+    const alloc = testing.allocator;
+    var mock: Mock = .{ .allocator = alloc };
+    defer mock.deinit();
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2);
+    try g.start();
+    // Real ordering: write submitted, then the build of the same drv. The build
+    // must not run until the (sleeping) write completes.
+    try g.submitWrite("X", td(alloc, "x"), &.{});
+    try g.submitBuild("X", null, null);
+    try testing.expect(g.finish() == null);
+    try testing.expect(!mock.violation);
+    try testing.expectEqual(@as(usize, 1), mock.built.items.len);
+}
+
+test "work graph: parked build future is published with result" {
+    const alloc = testing.allocator;
+    var mock: Mock = .{ .allocator = alloc };
+    defer mock.deinit();
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2);
+    try g.start();
+    try g.submitWrite("W", td(alloc, "w"), &.{});
+    var fut = Future.initClaimed(1);
+    var result: anyerror!void = error.Unset;
+    try g.submitBuild("W", &fut, &result);
+    // The graph publishes the future on completion; drain to make it deterministic.
+    try testing.expect(g.finish() == null);
+    result catch |e| try testing.expect(e != error.Unset);
+    try testing.expect(!mock.violation);
+}
