@@ -1,12 +1,5 @@
 {
   "pins": {
-    "nixpkgs": {
-      "type": "Channel",
-      "name": "nixpkgs-unstable",
-      "artifact": "nixexprs.tar.xz",
-      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1006043.4100e830e085/nixexprs.tar.xz",
-      "hash": "sha256-24YGUZ9p3uLeDBGS5Nc8V7Rt5PaRg1vZ+rnfSuBW7hM="
-    },
     "lix": {
       "type": "Git",
       "repository": {
@@ -15,9 +8,16 @@
       },
       "branch": "main",
       "submodules": false,
-      "revision": "527ecba696e2648a62fce9528a543333ef13e779",
+      "revision": "f51148a75bd991fcf9545bb11a0626879795537c",
       "url": null,
-      "hash": "sha256-oqR+vyunpMgRdNvQf97DK4lQvQlEJsSigu4D53WrqZs="
+      "hash": "sha256-Ax+ETbOHatrUnnQqLEwFMAlb+MwJrIjN88c5gTSDRc8="
+    },
+    "nixpkgs": {
+      "type": "Channel",
+      "name": "nixpkgs-unstable",
+      "artifact": "nixexprs.tar.xz",
+      "url": "https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1034759.3889d66586e6/nixexprs.tar.xz",
+      "hash": "sha256-eAzdn9jDRvDx+B0WIQmgDV9Z81w6rgtDtf8eRNU6kgI="
     },
     "snix": {
       "type": "Git",
