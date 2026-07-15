@@ -234,16 +234,27 @@ pub const WorkGraph = struct {
         self.wakeAll();
     }
 
+    /// Workers per pool that connect eagerly at spawn ("warm"), rather than
+    /// lazily on their first node. Each daemon connection is a worker fork
+    /// (~tens of ms); warming a couple per pool concurrently at graph start —
+    /// which is before eval — pays that latency up front, overlapped with eval,
+    /// so a small/no-op build finds a ready connection instead of forking one on
+    /// the critical path. The rest stay lazy (a big build fills them during eval;
+    /// a tiny build never opens the whole pool).
+    const warm_per_pool: usize = 2;
+
     pub fn start(self: *WorkGraph) !void {
         self.started = true;
         errdefer self.stopThreads();
+        const warm_w = @min(warm_per_pool, self.write_worker_count);
+        const warm_b = @min(warm_per_pool, self.build_worker_count);
         var i: usize = 0;
         while (i < self.write_worker_count) : (i += 1) {
-            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.write }));
+            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.write, i < warm_w }));
         }
         i = 0;
         while (i < self.build_worker_count) : (i += 1) {
-            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.build }));
+            try self.threads.append(self.allocator, try std.Thread.spawn(.{}, worker, .{ self, NodeKind.build, i < warm_b }));
         }
     }
 
@@ -279,18 +290,19 @@ pub const WorkGraph = struct {
         };
     }
 
-    fn worker(self: *WorkGraph, kind: NodeKind) void {
+    fn worker(self: *WorkGraph, kind: NodeKind, warm: bool) void {
         const backend = switch (kind) {
             .write => self.write_backend,
             .build => self.build_backend,
         };
-        // Connect lazily on the first node so a small build (which never fills a
-        // pool) only opens as many connections as it has concurrent work for —
-        // each connection makes the daemon fork a worker, so we don't open the
-        // whole pool for one drv. On a build with real eval, these connects
-        // overlap eval anyway. `open_failed` sticks: once a worker can't connect,
-        // it fails its remaining nodes.
-        var conn: ?*anyopaque = null;
+        // `warm` workers connect eagerly here (concurrently with each other + with
+        // eval) so a connection is ready before the first node. Best-effort: a
+        // failed warm connect just falls back to the lazy path (conn stays null)
+        // rather than aborting the graph — the daemon might be transiently busy.
+        // Non-warm workers stay lazy: a small build never opens the whole pool
+        // (each connection is a daemon worker fork). `open_failed` sticks once a
+        // lazy connect fails.
+        var conn: ?*anyopaque = if (warm) (backend.open(backend.ctx) catch null) else null;
         var open_failed = false;
         defer if (conn) |c| backend.close(backend.ctx, c);
 
