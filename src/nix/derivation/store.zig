@@ -861,16 +861,12 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
-        if (self.store_writes_enabled) {
-            // The `.drv` write is offloaded onto the serial IO thread while this
-            // fiber parks (other fibers run meanwhile). Inputs are forced — and so
-            // their `.drv`s written — before this dependent derivation, and the IO
-            // thread drains its queue in submission (= reverse-topological) order,
-            // so a `.drv`'s referenced inputs are always in the store before it.
-            defer self.allocator.free(text);
-            return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
-        }
-
+        // Always record a recipe — never write eagerly, even in store-write mode.
+        // A derivation forced during eval (including speculatively) is not
+        // necessarily demanded; its `.drv` is materialized only when something
+        // asks for it (`ensureClosure`/IFD/the terminal realize), deps-first via
+        // `references`. That makes write ordering explicit (the recipe graph),
+        // not a reverse-topological force-order coincidence.
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 
@@ -893,11 +889,7 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordOwnedNarRecipe(self: *DerivationStore, store_path: []const u8, nar_bytes: []u8) !void {
-        if (self.store_writes_enabled) {
-            defer self.allocator.free(nar_bytes);
-            return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
-        }
-
+        // Deferred like `recordOwnedTextRecipe`: materialized on demand, deps-first.
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 
@@ -918,10 +910,7 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes) !void {
-        if (self.store_writes_enabled) {
-            return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = handle.bytes() } });
-        }
-
+        // Deferred like `recordOwnedTextRecipe`: materialized on demand, deps-first.
         self.recipe_mu.lock();
         defer self.recipe_mu.unlock();
 

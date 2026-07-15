@@ -1567,6 +1567,14 @@ pub const Evaluator = struct {
         return self.derivations.buildPaths(derived_paths, sink, mode);
     }
 
+    /// Write `drv_path`'s `.drv` closure to the store on demand (deps-first via
+    /// the recipe graph). Since forcing only records recipes, this is how a `.drv`
+    /// is materialized — for `instantiate`, and before a build. Must run before
+    /// eval state is released (it reads the recipe graph).
+    pub fn ensureDerivationClosure(self: *Evaluator, drv_path: []const u8) !void {
+        return self.derivations.ensureClosure(drv_path);
+    }
+
     /// Like `buildDerivations`, but tears down the language heap
     /// (`releaseEvalState`) *concurrently* with the build instead of before
     /// it. Evaluation is done and its results are copied out, so the ~2 GB
@@ -1581,8 +1589,17 @@ pub const Evaluator = struct {
     /// against it during builds). The single build-phase entry point for the
     /// realizing subcommands — no caller should sequence release-then-build.
     pub fn buildDerivationsReleasing(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
-        // Release on a helper thread so the build launches immediately. If the
-        // thread can't spawn, fall back to the old serial release-then-build.
+        // Writes are demand-driven: materialize each target's `.drv` closure now,
+        // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
+        // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
+        // daemon can't build a `.drv` whose closure isn't on disk yet.)
+        for (derived_paths) |derived| {
+            const drv = derived[0..(std.mem.indexOfScalar(u8, derived, '!') orelse derived.len)];
+            try self.derivations.ensureClosure(drv);
+        }
+        // Now release on a helper thread so the build launches immediately and
+        // the ~2 GB heap teardown overlaps it. If the thread can't spawn, fall
+        // back to serial release-then-build.
         const releaser = std.Thread.spawn(.{}, releaseEvalState, .{self}) catch blk: {
             self.releaseEvalState();
             break :blk null;

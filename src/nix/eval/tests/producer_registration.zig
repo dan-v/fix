@@ -356,7 +356,7 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
     } else return error.MissingRecipeInspectionApi;
 }
 
-test "global store-writing mode leaves no producer recipe after immediate instantiation" {
+test "store-writing mode defers writes; ensureClosure materializes the drv closure deps-first" {
     if (comptime recipeInspectionAvailable()) {
         var fixture = try Fixture.init(std.testing.allocator, true);
         defer fixture.deinit();
@@ -394,29 +394,28 @@ test "global store-writing mode leaves no producer recipe after immediate instan
         defer fixture.allocator.free(source);
         const attrs_id = try fixture.evaluateAttrs(source);
 
-        const text_path = try fixture.forceAttrText(attrs_id, "text");
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
-        try expectEffect(fixture.fake, 0, .text, storePathSubject(text_path), "write text payload", &.{});
-
-        const src_store_path = try fixture.forceAttrText(attrs_id, "src");
-        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.files, src_path, null);
-        defer fixture.allocator.free(nar_bytes);
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
-        try expectEffect(fixture.fake, 1, .nar, storePathSubject(src_store_path), nar_bytes, &.{});
-
-        const flat_store_path = try fixture.forceAttrText(attrs_id, "flat");
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
-        try expectEffect(fixture.fake, 2, .flat, storePathSubject(flat_store_path), "write flat payload", &.{});
-
-        const fetch_store_path = try fixture.forceAttrText(attrs_id, "fetched");
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
-        try expectEffect(fixture.fake, 3, .flat, storePathSubject(fetch_store_path), "write fetch payload", &.{});
-
+        // Forcing only RECORDS recipes — even in store-writing mode, nothing is
+        // written to the daemon eagerly (a forced-but-undemanded derivation must
+        // not pollute the store). So no effects yet, and a recipe per producer.
+        _ = try fixture.forceAttrText(attrs_id, "text");
+        _ = try fixture.forceAttrText(attrs_id, "src");
+        _ = try fixture.forceAttrText(attrs_id, "flat");
+        _ = try fixture.forceAttrText(attrs_id, "fetched");
         const drv_path = try fixture.forceAttrText(attrs_id, "drv");
+        try std.testing.expectEqual(@as(usize, 0), fixture.fake.effectCount());
+        const recipes = fixture.ev.derivations.recipeCountForTest();
+        try std.testing.expect(recipes >= 5); // text, src, flat, fetched, drv (+ any transitive)
+
+        // Demanding the drv closure materializes it deps-first: every referenced
+        // input source is written before the `.drv`, and the recipes are released
+        // as they are consumed.
+        try fixture.ev.ensureDerivationClosure(drv_path);
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
+        try std.testing.expectEqual(recipes, fixture.fake.effectCount());
+
+        // The `.drv` itself is written LAST (after its whole reference closure).
         const records = fixture.ev.derivationDebugRecords();
         try std.testing.expectEqual(@as(usize, 1), records.len);
-        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
-        try std.testing.expectEqual(@as(usize, 5), fixture.fake.effectCount());
-        try expectEffect(fixture.fake, 4, .text, storePathSubject(drv_path), records[0].drv_aterm, records[0].drv_text_references);
+        try expectEffect(fixture.fake, recipes - 1, .text, storePathSubject(drv_path), records[0].drv_aterm, records[0].drv_text_references);
     } else return error.MissingRecipeInspectionApi;
 }

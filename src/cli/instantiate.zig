@@ -68,15 +68,18 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
-    // Each derivation's `.drv` write was offloaded + awaited as it was forced, so
-    // by the time eval returns the full `.drv` closure is already on disk —
-    // instantiate's contract — with no separate drain step.
-
     const drv_path = ev.derivationDrvPath(result) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     } orelse {
         std.debug.print("error: expression did not evaluate to a derivation\n", .{});
         return 1;
+    };
+
+    // Writes are demand-driven: materialize the `.drv` closure now (deps-first
+    // via the recipe graph). This IS instantiate's contract — nix-instantiate
+    // writes the whole `.drv` closure to the store, but nothing is built.
+    ev.ensureDerivationClosure(drv_path) catch |err| {
+        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
 
     ok = true;
