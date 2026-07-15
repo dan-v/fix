@@ -80,7 +80,7 @@ const Cell = struct {
 pub fn runOnPool(ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void {
     const pool: *DaemonPool = @ptrCast(@alignCast(ctx));
 
-    const inner = fiber_mod.currentFiber() orelse return runPoolBlocking(pool, work, work_ctx);
+    const inner = fiber_mod.currentFiber() orelse return pool.submitBlocking(work, work_ctx);
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
 
     wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
@@ -105,28 +105,6 @@ const PoolCell = struct {
         const self: *PoolCell = @ptrCast(@alignCast(p));
         self.work(conn, self.work_ctx);
         self.future.publish();
-    }
-};
-
-/// Pool submit for a caller with no fiber to park (the main thread, post-eval):
-/// block this thread on a `ResetEvent` the worker sets. The thread would
-/// otherwise be idle, so blocking it costs nothing.
-fn runPoolBlocking(pool: *DaemonPool, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void {
-    var cell: BlockingCell = .{ .work = work, .work_ctx = work_ctx };
-    var job: DaemonPool.Job = .{ .run = BlockingCell.run, .ctx = &cell };
-    pool.submit(&job);
-    cell.done.wait();
-}
-
-const BlockingCell = struct {
-    work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void,
-    work_ctx: *anyopaque,
-    done: std.Thread.ResetEvent = .{},
-
-    fn run(conn: ?*anyopaque, p: *anyopaque) void {
-        const self: *BlockingCell = @ptrCast(@alignCast(p));
-        self.work(conn, self.work_ctx);
-        self.done.set();
     }
 };
 

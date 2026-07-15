@@ -14,6 +14,19 @@ const stable = @import("base").sync;
 const runtime = @import("runtime");
 const rstore = runtime.store;
 const FileCache = runtime.file_cache.FileCache;
+const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
+
+/// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
+/// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
+const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void;
+
+/// The daemon connection the current thread's in-flight op runs against. Set at
+/// each offload boundary (a pool worker running one op, or the inline dispatch)
+/// so the whole nested closure walk — `ensureClosure` → writes/queries — reaches
+/// its connection without threading a `conn` parameter through every function.
+/// Per-thread: each pool worker has its own, concurrent walks never collide, and
+/// the parked submitting fiber never runs the closure itself.
+threadlocal var active_conn: ?*rstore.DaemonStore = null;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -73,12 +86,13 @@ pub const DerivationStore = struct {
     source_memo: std.StringHashMapUnmanaged(SourceMemoEntry) = .empty,
     source_memo_mu: stable.SpinMutex = .{},
 
-    /// The nix-daemon connection, connected lazily on the first store write and
-    /// owned/closed here (like Nix, which only touches the store on demand).
-    /// Guarded by `daemon_mu` so parallel forcing fibers serialize on the one
-    /// socket; `instantiated` de-dupes writes across re-forces.
-    daemon: ?*rstore.DaemonStore = null,
+    /// Guards the small shared state every pool worker touches: the `instantiated`
+    /// cache and `last_error_msg`. Held only for brief in-memory updates, never
+    /// across a daemon round-trip (those run on the worker's own connection).
     daemon_mu: stable.BlockingMutex = .{},
+    /// First failing daemon op's message, copied out of its (transient) pool
+    /// connection so `lastStoreError` can surface it after the op is gone.
+    last_error_msg: ?[]u8 = null,
     /// Store paths we've already ensured are present this run — either because
     /// we wrote them, or because a pre-write `isValidPath` confirmed the daemon
     /// already has them. Both cases mean a re-force can skip re-sending the
@@ -104,12 +118,22 @@ pub const DerivationStore = struct {
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
 
-    /// Optional off-thread executor for blocking daemon ops. When set (by the
-    /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
-    /// on the shared IO thread while the calling fiber parks — keeping the
-    /// socket syscalls off the compute workers. Null → ops run inline on the
-    /// caller (the `fix store` CLI and tests, which have no fiber to park).
-    offload: ?Offload = null,
+    /// The pool-offload entry (`vm.io_offload.runOnPool`), injected by the eval
+    /// layer: submits one daemon op to `pool` and parks the caller (fiber yields).
+    /// Null → no fiber machinery (tests): the pool's `submitBlocking` runs the op
+    /// on a worker and blocks the caller. Either way every op goes to the pool.
+    offload_run: ?OffloadFn = null,
+    /// The Evaluator- (or test-) owned runtime that owns the connection pool.
+    daemon_runtime: ?*DaemonRuntime = null,
+    /// The hot-connection pool, obtained from `daemon_runtime` — started eagerly
+    /// by `enableStoreWrites` (store-writing commands) so connections warm while
+    /// eval runs, or lazily on the first daemon op for plain-eval IFD. Guarded by
+    /// `pool_mu`.
+    pool: ?*rstore.DaemonPool = null,
+    pool_mu: stable.BlockingMutex = .{},
+    /// Test-only: a `DaemonRuntime` the test harness had this store own (so tests
+    /// don't manage its lifetime separately). Deinitialized + freed in `deinit`.
+    test_owned_runtime: if (builtin.is_test) ?*DaemonRuntime else void = if (builtin.is_test) null else {},
 
     /// Store-owned IFD recipes, keyed by full store path. Separate from the
     /// derivation/debug registry so unrelated eval hot paths add no recipe
@@ -134,13 +158,6 @@ pub const DerivationStore = struct {
     /// until recipe identity is compared and then consume the whole entry. The
     /// field is zero-bit and all calls compile away outside tests.
     test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) else void = if (builtin.is_test) .empty else {},
-
-    /// Vtable injected by the vm/eval layer (`vm.io_offload.run`). Runs `work`
-    /// on the IO thread and blocks the calling fiber until it returns.
-    pub const Offload = struct {
-        ctx: *anyopaque,
-        run: *const fn (ctx: *anyopaque, work: *const fn (*anyopaque) void, work_ctx: *anyopaque) void,
-    };
 
     pub const RootClaimHook = struct {
         ctx: *anyopaque,
@@ -444,6 +461,15 @@ pub const DerivationStore = struct {
     }
 
     pub fn deinit(self: *DerivationStore) void {
+        // Tear down a test-owned runtime first (joins pool workers → closes their
+        // connections), before the fake daemon it talks to is stopped.
+        if (comptime builtin.is_test) {
+            if (self.test_owned_runtime) |rt| {
+                rt.deinit();
+                self.allocator.destroy(rt);
+                self.test_owned_runtime = null;
+            }
+        }
         self.releaseRecipePayloads();
         self.recipes.deinit(self.allocator);
         self.recipe_mu.lock();
@@ -496,7 +522,7 @@ pub const DerivationStore = struct {
         }
         self.daemon_overrides.deinit(self.allocator);
         if (self.daemon_socket_owned) |owned| self.allocator.free(owned);
-        if (self.daemon) |d| d.deinit();
+        if (self.last_error_msg) |msg| self.allocator.free(msg);
     }
 
     /// Set the per-connection daemon settings to apply on connect. Dupes the
@@ -535,49 +561,86 @@ pub const DerivationStore = struct {
 
     /// Enable writing forced derivations + their sources to the store
     /// (`fix instantiate`/`build`). Off by default so plain eval stays pure.
+    /// Eagerly starts the connection pool (io + socket + options are configured
+    /// by now) so its connections warm concurrently with eval instead of on a
+    /// compute fiber's critical path at the first store op.
     pub fn enableStoreWrites(self: *DerivationStore) void {
         self.store_writes_enabled = true;
+        _ = self.ensurePool() catch {};
     }
 
-    /// Install the off-thread daemon-op executor. Must be called before any
-    /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
-    /// torn down.
-    pub fn setOffload(self: *DerivationStore, off: Offload) void {
-        self.offload = off;
+    /// Install the pool-offload entry (from the vm layer). Must be set before any
+    /// forcing begins, and cleared (`clearOffload`) before the runtime is torn
+    /// down. `rt` owns the connection pool this store submits to.
+    pub fn setOffload(self: *DerivationStore, rt: *DaemonRuntime, run: OffloadFn) void {
+        self.daemon_runtime = rt;
+        self.offload_run = run;
     }
 
     pub fn clearOffload(self: *DerivationStore) void {
-        self.offload = null;
+        self.offload_run = null;
+        self.daemon_runtime = null;
+        self.pool = null;
     }
 
-    /// Connect to the daemon on first use and return it (owned here). Errors if
-    /// no IO handle was set or the daemon is unreachable — matching Nix, which
-    /// fails a store op when the daemon is down. Caller must hold `daemon_mu`.
-    fn ensureDaemon(self: *DerivationStore) !*rstore.DaemonStore {
-        if (self.daemon) |d| return d;
+    /// Test-only: hand this store a `DaemonRuntime` to use (as its pool source)
+    /// and own (torn down in `deinit`). No `offload_run`, so ops go through the
+    /// pool's blocking submit. See `recipe_tests`.
+    pub fn setTestRuntime(self: *DerivationStore, rt: *DaemonRuntime) void {
+        if (comptime !builtin.is_test) unreachable;
+        self.daemon_runtime = rt;
+        self.test_owned_runtime = rt;
+    }
+
+    /// The connection pool, starting it on first need (idempotent). Errors if no
+    /// runtime/io was installed (tests / `fix store`, which use the inline path).
+    fn ensurePool(self: *DerivationStore) !*rstore.DaemonPool {
+        self.pool_mu.lock();
+        defer self.pool_mu.unlock();
+        if (self.pool) |p| return p;
+        const rt = self.daemon_runtime orelse return error.StoreUnavailable;
         const io = self.io orelse return error.StoreUnavailable;
-        const d = try rstore.DaemonStore.connect(self.allocator, io, self.daemon_socket);
-        errdefer d.deinit();
-        // Apply per-connection settings once, before any build op — but only for
-        // store-writing commands (build/instantiate/run/shell). Plain `eval` that
-        // realizes on demand (import-from-derivation) must NOT push fix's resolved
-        // config: fix lacks Nix's compiled-in defaults (e.g. `sandbox-paths`'s
-        // `/bin/sh=<busybox>`), so its `extra-sandbox-paths`-only value would
-        // *replace* the daemon's richer default and strip `/bin/sh` from the build
-        // sandbox. The daemon already reads the same nix.conf, so its own config is
-        // authoritative here.
-        if (self.store_writes_enabled) {
-            if (self.daemon_options) |opts| try d.setOptions(opts);
-        }
-        self.daemon = d;
-        return d;
+        const p = try rt.ensurePool(self.allocator, io, self.daemon_socket, self.daemon_options, self.store_writes_enabled);
+        self.pool = p;
+        return p;
     }
 
-    /// Read the last daemon error message (for surfacing `error.DaemonError`).
-    /// All store I/O — writes, IFD realization, and the terminal build — drives
-    /// the one `daemon` connection, so its `last_error` is authoritative.
+    /// The connection the current op runs against (see `active_conn`). A null
+    /// means the pool worker could not open a connection — surface it as the
+    /// store being unavailable rather than dereferencing null.
+    fn currentConn(_: *DerivationStore) !*rstore.DaemonStore {
+        return active_conn orelse error.StoreUnavailable;
+    }
+
+    /// Run one daemon op: submit it to the pool and park the caller (a compute
+    /// fiber yields; the main thread / tests block). `work(conn)` reads its
+    /// connection through `active_conn`, set by whichever pool worker runs it.
+    fn runOnDaemon(self: *DerivationStore, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
+        const p = try self.ensurePool();
+        if (self.offload_run) |offload| {
+            offload(p, work, work_ctx);
+        } else {
+            p.submitBlocking(work, work_ctx);
+        }
+    }
+
+    /// Copy a failing op's daemon message out of its (transient) pool connection
+    /// so `lastStoreError` can surface it after the connection is reused. First
+    /// writer wins.
+    fn captureDaemonError(self: *DerivationStore, conn: *rstore.DaemonStore) void {
+        const msg = conn.last_error orelse return;
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        if (self.last_error_msg != null) return;
+        self.last_error_msg = self.allocator.dupe(u8, msg) catch null;
+    }
+
+    /// Read the last daemon error message (for surfacing `error.DaemonError`),
+    /// captured from the pool connection whose op failed.
     pub fn lastStoreError(self: *DerivationStore) ?[]const u8 {
-        return if (self.daemon) |d| d.last_error else null;
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        return self.last_error_msg;
     }
 
     /// Write `drv_path`'s `.drv` to the store (text-addressed), gated on
@@ -620,13 +683,10 @@ pub const DerivationStore = struct {
     }
 
     fn queryPathValid(self: *DerivationStore, store_path: []const u8) !bool {
-        if (self.offload) |off| {
-            var cell: QueryCell = .{ .store = self, .store_path = store_path };
-            off.run(off.ctx, QueryCell.run, &cell);
-            if (cell.err) |e| return e;
-            return cell.valid;
-        }
-        return self.applyIsValid(store_path);
+        var cell: QueryCell = .{ .store = self, .store_path = store_path };
+        try self.runOnDaemon(QueryCell.run, &cell);
+        if (cell.err) |e| return e;
+        return cell.valid;
     }
 
     const QueryCell = struct {
@@ -635,8 +695,11 @@ pub const DerivationStore = struct {
         valid: bool = false,
         err: ?anyerror = null,
 
-        fn run(p: *anyopaque) void {
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const c: *QueryCell = @ptrCast(@alignCast(p));
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
             c.valid = c.store.applyIsValid(c.store_path) catch |e| {
                 c.err = e;
                 return;
@@ -644,66 +707,86 @@ pub const DerivationStore = struct {
         }
     };
 
+    /// `isValidPath` against the current connection (`active_conn`), consulting +
+    /// populating the `instantiated` cache. The daemon round-trip runs without
+    /// `daemon_mu` held (it guards only the brief cache touches), so concurrent
+    /// pool workers don't serialize on it.
     fn applyIsValid(self: *DerivationStore, store_path: []const u8) !bool {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        if (self.instantiated.contains(store_path)) return true;
-        const daemon = try self.ensureDaemon();
-        const valid = try daemon.isValidPath(store_path);
-        // Cache a positive result: a path valid now stays valid for the eval
-        // (same assumption `instantiated` already makes for writes), so a later
-        // demand of the same path skips the round-trip.
-        if (valid) self.markInstantiated(store_path) catch {};
+        if (self.cacheContains(store_path)) return true;
+        const conn = try self.currentConn();
+        const valid = try conn.isValidPath(store_path);
+        // A path valid now stays valid for the eval (same assumption the cache
+        // already makes for writes), so a later demand skips the round-trip.
+        if (valid) self.cacheMark(store_path);
         return valid;
     }
 
     /// Realize `derived_paths` (`<drvpath>!<outputs>`, legacy format) via the
     /// daemon, forwarding the build activity/log stream to `sink` if given.
+    /// Dispatched to the pool (fiber parks / main thread blocks) so the whole
+    /// build runs on a warm worker connection, not a compute worker.
     pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
-        // The terminal build reuses `self.daemon` — already warm + options-applied
-        // from the `.drv` writes / `isValidPath` queries eval drove through it, so
-        // there's no fresh connection fork on the critical path here.
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        const daemon = try self.ensureDaemon();
-        try daemon.buildPaths(derived_paths, sink, mode);
+        var cell: BuildCell = .{ .store = self, .paths = derived_paths, .sink = sink, .mode = mode };
+        try self.runOnDaemon(BuildCell.run, &cell);
+        return cell.err;
     }
 
-    /// Realize `derived_paths` for import-from-derivation: like `buildPaths`,
-    /// but dispatched onto the IO thread (when an offload is installed and we're
-    /// on a fiber) so the demand fiber parks rather than blocking a compute
-    /// worker on the daemon socket for the whole build. Inline otherwise (the
-    /// `run`/`shell` main-thread callers). The borrowed `derived_paths` stay
-    /// valid because the parked fiber's stack is preserved for the transfer.
+    /// Realize `derived_paths` for import-from-derivation. Same as `buildPaths`;
+    /// kept as a distinct entry for the `run`/`shell` realize call sites.
     pub fn realizePaths(self: *DerivationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
-        if (self.offload) |off| {
-            var cell: BuildCell = .{ .store = self, .paths = derived_paths, .mode = mode };
-            off.run(off.ctx, BuildCell.run, &cell);
-            return cell.err;
-        }
         return self.buildPaths(derived_paths, null, mode);
+    }
+
+    /// Build against the current connection (used both by `BuildCell` and, inside
+    /// an already-active op, by `realizeOutputInline`'s build step).
+    fn buildOnConn(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+        const conn = try self.currentConn();
+        conn.buildPaths(derived_paths, sink, mode) catch |err| {
+            self.captureDaemonError(conn);
+            return err;
+        };
     }
 
     const BuildCell = struct {
         store: *DerivationStore,
         paths: []const []const u8,
+        sink: ?rstore.BuildSink = null,
         mode: rstore.BuildMode,
         err: anyerror!void = {},
 
-        fn run(p: *anyopaque) void {
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *BuildCell = @ptrCast(@alignCast(p));
-            self.err = self.store.buildPaths(self.paths, null, self.mode);
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
+            self.err = self.store.buildOnConn(self.paths, self.sink, self.mode);
         }
     };
 
     /// Register `link_path` (an existing absolute symlink into the store) as an
     /// indirect GC root via the daemon.
     pub fn addIndirectRoot(self: *DerivationStore, link_path: []const u8) !void {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        const daemon = try self.ensureDaemon();
-        try daemon.addIndirectRoot(link_path);
+        var cell: RootCell = .{ .store = self, .link_path = link_path };
+        try self.runOnDaemon(RootCell.run, &cell);
+        return cell.err;
     }
+
+    const RootCell = struct {
+        store: *DerivationStore,
+        link_path: []const u8,
+        err: anyerror!void = {},
+
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
+            const self: *RootCell = @ptrCast(@alignCast(p));
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
+            self.err = blk: {
+                const c = self.store.currentConn() catch |e| break :blk e;
+                break :blk c.addIndirectRoot(self.link_path);
+            };
+        }
+    };
 
     const DaemonOp = union(enum) {
         text: struct { store_path: []const u8, text: []const u8, references: []const []const u8 },
@@ -711,18 +794,13 @@ pub const DerivationStore = struct {
         flat: struct { store_path: []const u8, bytes: []const u8 },
     };
 
-    /// Dispatch a store write onto the IO thread (when an offload is installed
-    /// and we're on a fiber) or inline on the caller. The op's args are borrowed
-    /// and, in the offloaded path, stay valid because the calling fiber parks —
-    /// its stack (holding the non-GC NAR/text buffers) is preserved for the
-    /// whole transfer, so no copy is needed.
+    /// Dispatch a store write to the pool (parking the caller) or inline. The op's
+    /// args are borrowed and stay valid across the transfer because the calling
+    /// fiber parks (its stack — holding the NAR/text buffers — is preserved).
     fn runDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
-        if (self.offload) |off| {
-            var cell: OpCell = .{ .store = self, .op = op };
-            off.run(off.ctx, OpCell.run, &cell);
-            return cell.err;
-        }
-        return self.applyDaemonOp(op);
+        var cell: OpCell = .{ .store = self, .op = op };
+        try self.runOnDaemon(OpCell.run, &cell);
+        return cell.err;
     }
 
     const OpCell = struct {
@@ -730,32 +808,50 @@ pub const DerivationStore = struct {
         op: DaemonOp,
         err: anyerror!void = {},
 
-        fn run(p: *anyopaque) void {
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *OpCell = @ptrCast(@alignCast(p));
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
             self.err = self.store.applyDaemonOp(self.op);
         }
     };
 
-    /// Perform a store write against the daemon. Runs on the IO thread when
-    /// offloaded (the single serial consumer of the connection), else inline;
-    /// `daemon_mu` still guards against a concurrent inline `buildPaths`. Skips
-    /// the transfer when the path is already valid (see `instantiated`).
+    /// Perform a store write against the current connection. Skips the transfer
+    /// when the path is already valid (cache or a daemon check). Cache touches are
+    /// briefly guarded; the daemon round-trips run without `daemon_mu`.
     fn applyDaemonOp(self: *DerivationStore, op: DaemonOp) !void {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
         const store_path = switch (op) {
             inline else => |o| o.store_path,
         };
-        if (self.instantiated.contains(store_path)) return;
-        const daemon = try self.ensureDaemon();
-        if (try daemon.isValidPath(store_path)) return self.markInstantiated(store_path);
+        if (self.cacheContains(store_path)) return;
+        const daemon = try self.currentConn();
+        if (try daemon.isValidPath(store_path)) return self.cacheMark(store_path);
         const written = switch (op) {
-            .text => |o| try daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
-            .path => |o| try daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),
-            .flat => |o| try daemon.addFlatFile(self.allocator, storePathName(store_path), o.bytes, &.{}),
+            .text => |o| daemon.addTextToStore(self.allocator, storePathName(store_path), o.text, o.references),
+            .path => |o| daemon.addPath(self.allocator, storePathName(store_path), o.nar_bytes, &.{}),
+            .flat => |o| daemon.addFlatFile(self.allocator, storePathName(store_path), o.bytes, &.{}),
+        } catch |err| {
+            self.captureDaemonError(daemon);
+            return err;
         };
         self.allocator.free(written);
-        try self.markInstantiated(store_path);
+        self.cacheMark(store_path);
+    }
+
+    /// Is `store_path` known present this run? Guarded read of `instantiated`.
+    fn cacheContains(self: *DerivationStore, store_path: []const u8) bool {
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        return self.instantiated.contains(store_path);
+    }
+
+    /// Record `store_path` as present (a write landed, or a query confirmed it).
+    /// Best-effort: a cache-insert OOM just means a later redundant round-trip.
+    fn cacheMark(self: *DerivationStore, store_path: []const u8) void {
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        self.markInstantiated(store_path) catch {};
     }
 
     fn markInstantiated(self: *DerivationStore, store_path: []const u8) !void {
@@ -864,12 +960,9 @@ pub const DerivationStore = struct {
     };
 
     pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
-        if (self.offload) |off| {
-            var cell: EnsureClosureCell = .{ .store = self, .store_path = store_path };
-            off.run(off.ctx, EnsureClosureCell.run, &cell);
-            return cell.err;
-        }
-        return self.ensureClosureInner(store_path, null);
+        var cell: EnsureClosureCell = .{ .store = self, .store_path = store_path };
+        try self.runOnDaemon(EnsureClosureCell.run, &cell);
+        return cell.err;
     }
 
     const EnsureClosureCell = struct {
@@ -877,18 +970,22 @@ pub const DerivationStore = struct {
         store_path: []const u8,
         err: anyerror!void = {},
 
-        fn run(pointer: *anyopaque) void {
+        fn run(conn: ?*anyopaque, pointer: *anyopaque) void {
             const self: *EnsureClosureCell = @ptrCast(@alignCast(pointer));
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
             self.err = self.store.ensureClosureInner(self.store_path, null);
         }
     };
 
     fn ensureClosureInner(self: *DerivationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
         while (true) {
-            // This runs inside the one outer realization offload when an I/O
-            // executor is installed. Keep nested daemon operations inline on
-            // that I/O thread so concurrent realization jobs cannot enqueue
-            // work behind themselves.
+            // The whole closure walk runs on one pool worker connection
+            // (`active_conn`): nested writes/queries reuse it directly and, being
+            // deps-first, land a path's references before the path itself. A
+            // concurrent walk on another worker deduplicates via realization
+            // claims, so there is no cross-connection ordering hazard.
             if (try self.applyIsValid(store_path)) return;
             if (visitContains(parent, store_path)) return error.RecipeCycle;
 
@@ -917,6 +1014,17 @@ pub const DerivationStore = struct {
                 }
             }
 
+            // Double-check now that we hold the writer claim. Another writer may
+            // have realized (and cached) this path between our top-of-loop
+            // validity check and claiming — its claim (and single-use recipe) is
+            // gone now, so without this we'd become a spurious second writer and
+            // hit MissingStoreRecipe. It marks the cache before releasing its
+            // claim, so a cache hit here means it finished.
+            if (self.cacheContains(store_path)) {
+                self.finishSuccessfulClaim(store_path, claim);
+                return;
+            }
+
             const visit: Visit = .{ .path = store_path, .claim = claim, .parent = parent };
             self.ensureClosureWriter(store_path, &visit) catch |err| {
                 if (retryableRealizationError(err)) {
@@ -932,12 +1040,9 @@ pub const DerivationStore = struct {
     }
 
     pub fn realizeOutput(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
-        if (self.offload) |off| {
-            var cell: RealizeOutputCell = .{ .store = self, .drv_path = drv_path, .outputs = outputs };
-            off.run(off.ctx, RealizeOutputCell.run, &cell);
-            return cell.err;
-        }
-        return self.realizeOutputInline(drv_path, outputs);
+        var cell: RealizeOutputCell = .{ .store = self, .drv_path = drv_path, .outputs = outputs };
+        try self.runOnDaemon(RealizeOutputCell.run, &cell);
+        return cell.err;
     }
 
     const RealizeOutputCell = struct {
@@ -946,8 +1051,11 @@ pub const DerivationStore = struct {
         outputs: []const []const u8,
         err: anyerror!void = {},
 
-        fn run(pointer: *anyopaque) void {
+        fn run(conn: ?*anyopaque, pointer: *anyopaque) void {
             const self: *RealizeOutputCell = @ptrCast(@alignCast(pointer));
+            const prev = active_conn;
+            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
+            defer active_conn = prev;
             self.err = self.store.realizeOutputInline(self.drv_path, self.outputs);
         }
     };
@@ -975,7 +1083,10 @@ pub const DerivationStore = struct {
                 }
             }
 
-            self.buildPaths(&.{derived}, null, .normal) catch |err| {
+            // Build on THIS walk's connection (`active_conn`), not a re-dispatch:
+            // re-entering the pool from a worker with no fiber would block the
+            // worker on itself.
+            self.buildOnConn(&.{derived}, null, .normal) catch |err| {
                 if (retryableRealizationError(err)) {
                     self.finishRetryableClaim(derived, claim, err);
                 } else {
@@ -1171,6 +1282,10 @@ pub const DerivationStore = struct {
 
     fn retryableRealizationError(err: anyerror) bool {
         return switch (err) {
+            // A null pool connection (the worker could not reach the daemon) —
+            // transient, like the raw connect errors below (which the pool
+            // surfaces as this once it abstracts the per-connection open).
+            error.StoreUnavailable,
             error.OutOfMemory,
             error.FileNotFound,
             error.ConnectionRefused,

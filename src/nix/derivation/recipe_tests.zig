@@ -2,6 +2,7 @@ const std = @import("std");
 const stable = @import("base").sync;
 const DerivationStore = @import("store.zig").DerivationStore;
 const FileCache = @import("runtime").file_cache.FileCache;
+const DaemonRuntime = @import("runtime").daemon_runtime.DaemonRuntime;
 const FakeDaemon = @import("../test_daemon.zig").FakeDaemon;
 
 const root_path = "/nix/store/00000000000000000000000000000000-root.drv";
@@ -22,9 +23,17 @@ fn realizationApiAvailable() bool {
         @hasDecl(DerivationStore, "realizeOutput");
 }
 
+/// Point the store at the fake daemon and give it a small pool (2 workers is
+/// enough for the concurrent-claim tests: at most two distinct claims coexist).
+/// The store owns the runtime and tears it down in `deinit`, before the caller's
+/// `fake.deinit()` (declared first, so it runs last).
 fn attachFake(store: *DerivationStore, fake: *FakeDaemon) void {
     store.setIo(std.testing.io);
     store.daemon_socket = fake.socketPath();
+    const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
+    rt.* = DaemonRuntime.init();
+    rt.pool_workers = 2;
+    store.setTestRuntime(rt);
 }
 
 fn owned(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -561,9 +570,15 @@ test "transient connection failure resets claim state and permits retry" {
         defer store.deinit();
         store.setIo(std.testing.io);
         store.daemon_socket = socket_path;
+        const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
+        rt.* = DaemonRuntime.init();
+        rt.pool_workers = 2;
+        store.setTestRuntime(rt);
         try store.recordOwnedTextRecipe(root_path, try owned(std.testing.allocator, "retry succeeds"), &.{});
 
-        try std.testing.expectError(error.FileNotFound, store.ensureClosure(root_path));
+        // No daemon yet: the pool can't open a connection, surfaced as
+        // StoreUnavailable (a retryable transient — the claim state resets).
+        try std.testing.expectError(error.StoreUnavailable, store.ensureClosure(root_path));
         fake = try FakeDaemon.startAt(std.testing.allocator, std.testing.io, socket_path);
         try store.ensureClosure(root_path);
         try std.testing.expectEqual(@as(usize, 1), fake.?.count(.text));

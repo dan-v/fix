@@ -14,7 +14,11 @@ pub const FakeDaemon = struct {
     io: std.Io,
     socket_path: []u8,
     server: std.Io.net.Server,
+    /// The accept loop; it spawns one `serveConn` thread per client connection
+    /// (the connection pool opens several), collected in `conn_threads`.
     thread: std.Thread,
+    conn_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    shutdown: std.atomic.Value(bool) = .init(false),
     mu: stable.BlockingMutex = .{},
     valid_paths: std.StringHashMapUnmanaged(void) = .empty,
     operations: std.ArrayListUnmanaged(Operation) = .empty,
@@ -89,12 +93,22 @@ pub const FakeDaemon = struct {
         return self;
     }
 
-    /// The connected DerivationStore must be deinitialized before this helper,
-    /// so closing the client stream lets the server thread leave its read loop.
+    /// The connected DerivationStore (and its connection pool) must be
+    /// deinitialized before this helper, so closing the client streams lets the
+    /// per-connection serve threads leave their read loops.
     pub fn deinit(self: *FakeDaemon) void {
-        // Also cancels a still-blocked accept if a test fails before connecting.
-        self.server.socket.close(self.io);
+        // Stop the accept loop. Closing the listening socket does NOT reliably
+        // interrupt a blocked `accept()` (Linux), so signal shutdown and unblock
+        // the loop with a throwaway self-connection; it accepts that, sees the
+        // flag, and returns. Then join it (so `conn_threads` is final) and join
+        // the per-connection serve threads (already ending — the client pool
+        // connections were closed when the store's runtime was torn down).
+        self.shutdown.store(true, .release);
+        self.wakeAccept();
         self.thread.join();
+        for (self.conn_threads.items) |t| t.join();
+        self.conn_threads.deinit(self.allocator);
+        self.server.socket.close(self.io);
         if (self.socket_path.len != 0 and self.socket_path[0] != 0) {
             std.Io.Dir.deleteFileAbsolute(self.io, self.socket_path) catch {};
         }
@@ -314,14 +328,41 @@ pub const FakeDaemon = struct {
         if (self.server_error) |err| return err;
     }
 
+    /// Accept loop: one `serveConn` thread per client connection (the pool opens
+    /// several). Ends when `deinit` sets `shutdown` and self-connects to unblock.
     fn serve(self: *FakeDaemon) void {
-        self.serveFallible() catch |err| {
-            self.server_error = err;
+        while (true) {
+            const stream = self.server.accept(self.io) catch return;
+            if (self.shutdown.load(.acquire)) {
+                stream.close(self.io);
+                return;
+            }
+            const t = std.Thread.spawn(.{}, serveConn, .{ self, stream }) catch {
+                stream.close(self.io);
+                continue;
+            };
+            self.conn_threads.append(self.allocator, t) catch {
+                t.detach();
+            };
+        }
+    }
+
+    /// Unblock the accept loop with a throwaway connection (see `deinit`).
+    fn wakeAccept(self: *FakeDaemon) void {
+        const address = std.Io.net.UnixAddress.init(self.socket_path) catch return;
+        const stream = address.connect(self.io) catch return;
+        stream.close(self.io);
+    }
+
+    fn serveConn(self: *FakeDaemon, stream: std.Io.net.Stream) void {
+        self.serveFallible(stream) catch |err| {
+            self.mu.lock();
+            if (self.server_error == null) self.server_error = err;
+            self.mu.unlock();
         };
     }
 
-    fn serveFallible(self: *FakeDaemon) !void {
-        const stream = try self.server.accept(self.io);
+    fn serveFallible(self: *FakeDaemon, stream: std.Io.net.Stream) !void {
         defer stream.close(self.io);
         var read_buffer: [64 * 1024]u8 = undefined;
         var write_buffer: [64 * 1024]u8 = undefined;

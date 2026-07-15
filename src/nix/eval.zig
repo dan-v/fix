@@ -672,7 +672,7 @@ pub const Evaluator = struct {
         // Route daemon store ops (writes, IFD realization, the terminal build)
         // through the fast lane. `offload` is plain movable data (a stable heap
         // ptr + a fn ptr), so it survives the by-value return of `ev`.
-        ev.derivations.setOffload(.{ .ctx = daemon_rt.fastRuntime(), .run = io_offload.run });
+        ev.derivations.setOffload(daemon_rt, io_offload.runOnPool);
         return ev;
     }
 

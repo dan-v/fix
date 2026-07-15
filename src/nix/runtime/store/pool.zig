@@ -87,6 +87,29 @@ pub const DaemonPool = struct {
         self.wake();
     }
 
+    /// Submit `work(conn)` and block the CALLING thread until a worker has run it.
+    /// For callers with no fiber to park — the main-thread terminal build, and
+    /// tests — which have nothing else to do meanwhile. (Fiber callers park
+    /// instead; see `vm/io_offload.runOnPool`.)
+    pub fn submitBlocking(self: *DaemonPool, work: *const fn (conn: ?*anyopaque, ctx: *anyopaque) void, ctx: *anyopaque) void {
+        var cell: BlockingCell = .{ .work = work, .ctx = ctx };
+        var job: Job = .{ .run = BlockingCell.run, .ctx = &cell };
+        self.submit(&job);
+        cell.done.acquire();
+    }
+
+    const BlockingCell = struct {
+        work: *const fn (conn: ?*anyopaque, ctx: *anyopaque) void,
+        ctx: *anyopaque,
+        done: stable.Semaphore = stable.Semaphore.init(0),
+
+        fn run(conn: ?*anyopaque, p: *anyopaque) void {
+            const self: *BlockingCell = @ptrCast(@alignCast(p));
+            self.work(conn, self.ctx);
+            self.done.release();
+        }
+    };
+
     /// Stop the workers after draining queued jobs, join, and close connections.
     /// Callers must ensure no caller is still parked on an unsubmitted job (drive
     /// the compute pool to quiescence first). Idempotent.

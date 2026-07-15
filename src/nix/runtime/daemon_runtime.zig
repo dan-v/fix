@@ -38,6 +38,9 @@ pub const DaemonRuntime = struct {
     pool_started: bool = false,
     pool_mu: sync.BlockingMutex = .{},
     cfg: ConnConfig = .{},
+    /// Hot-connection count (see `default_pool_workers`). Overridable — tests set
+    /// a small value against the fake daemon.
+    pool_workers: usize = default_pool_workers,
 
     /// How the pool opens a connection. `apply_options` is on only for store-
     /// writing commands (build/instantiate/run/shell): plain `eval` that realizes
@@ -80,7 +83,7 @@ pub const DaemonRuntime = struct {
         defer self.pool_mu.unlock();
         if (self.pool_started) return &self.pool;
         self.cfg = .{ .allocator = allocator, .io = io, .socket = socket, .options = options, .apply_options = apply_options };
-        self.pool = DaemonPool.init(allocator, .{ .ctx = self, .open = openConn, .close = closeConn }, default_pool_workers);
+        self.pool = DaemonPool.init(allocator, .{ .ctx = self, .open = openConn, .close = closeConn }, self.pool_workers);
         try self.pool.start();
         self.pool_started = true;
         return &self.pool;
