@@ -5,6 +5,7 @@
 //! Concurrency: the call IC is per-worker thread-local, heap-token-gated across evaluator instances.
 const std = @import("std");
 const vm_mod = @import("../vm.zig");
+const rt_builtins = @import("runtime").builtins;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ChunkId = types.ChunkId;
@@ -689,6 +690,21 @@ pub fn doCallN(self: *VM, n: u16) !void {
             return stack.pushFrame(self, ch, closure.chunk_id, n, closure.upvalues, true);
         }
     }
+    // Saturated (or under-applied) builtin: hand all n args to applyBuiltin
+    // in one shot instead of folding one at a time — the fold allocates n-1
+    // throwaway partial builtin-closures (e.g. `builtins.bitAnd x 3` per
+    // filter element). applyBuiltin computes directly when n == arity and
+    // makes a single partial when n < arity. The args stay on the operand
+    // stack at [base, base+n) — precise GC roots — for the call's duration.
+    if (callee.isBuiltin()) {
+        const builtin_id = callee.asBuiltinId();
+        if (n <= rt_builtins.arity(@enumFromInt(builtin_id))) {
+            const result = try access.applyBuiltin(self, builtin_id, self.stack[base .. base + n]);
+            self.sp = base - 1;
+            try stack.push(self, result);
+            return;
+        }
+    }
     // General fold: reduce one arg at a time to a value (run-to-completion),
     // then replace [callee, args] with the result. `callValue` is
     // stack-neutral, so the not-yet-consumed args stay put at `base+i`.
@@ -717,6 +733,17 @@ pub fn doTailCallN(self: *VM, n: u16) !void {
         if (ch.arity == n) {
             try forceStrictArgs(self, ch, base, n);
             return replaceCurrentFrameMulti(self, ch, closure.chunk_id, base, n, closure.upvalues);
+        }
+    }
+    // Same saturated/under-applied builtin shortcut as doCallN — skip the
+    // one-arg-at-a-time fold and its throwaway partials.
+    if (callee.isBuiltin()) {
+        const builtin_id = callee.asBuiltinId();
+        if (n <= rt_builtins.arity(@enumFromInt(builtin_id))) {
+            const result = try access.applyBuiltin(self, builtin_id, self.stack[base .. base + n]);
+            self.sp = base - 1;
+            try stack.push(self, result);
+            return;
         }
     }
     var acc = callee;
