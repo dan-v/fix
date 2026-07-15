@@ -695,6 +695,23 @@ pub const DerivationStore = struct {
     /// Realize `derived_paths` (`<drvpath>!<outputs>`, legacy format) via the
     /// daemon, forwarding the build activity/log stream to `sink` if given.
     pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+        // If the work graph ran, its build workers left warm (options-applied)
+        // connections in the runtime's pool. Reuse one for the terminal build
+        // instead of forking a fresh `self.daemon` on the critical path. The
+        // graph is finished by now (finishEagerBuilds joined its workers), so the
+        // pool is idle and stable.
+        if (self.daemon_runtime) |rt| {
+            if (rt.hasBuildPool()) {
+                rt.buildOnPool(derived_paths, sink, mode) catch |err| {
+                    if (rt.takeErrorMsg()) |msg| {
+                        if (self.eager_error_msg) |old| self.allocator.free(old);
+                        self.eager_error_msg = msg;
+                    }
+                    return err;
+                };
+                return;
+            }
+        }
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
         const daemon = try self.ensureDaemon();

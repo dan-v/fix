@@ -36,6 +36,14 @@ pub const DaemonRuntime = struct {
     cfg: GraphConfig = .{},
     graph: ?WorkGraph = null,
     graph_active: bool = false,
+    /// Warm build connections, decoupled from the graph's lifetime. A build
+    /// worker returns its connection here at graph shutdown instead of closing
+    /// it (it already forked a daemon worker + applied build settings); the
+    /// terminal authoritative build then borrows one instead of forking a fresh
+    /// connection on its critical path. `buildOnPool` acquires/releases; drained
+    /// at `deinit`. Guarded by `build_pool_mu`.
+    build_pool: std.ArrayListUnmanaged(*rstore.DaemonStore) = .empty,
+    build_pool_mu: @import("base").sync.BlockingMutex = .{},
 
     /// Thread-safe per-build progress span, provided by the CLI. `begin` opens a
     /// span for a build and returns an opaque token; `end` closes it. Backed by
@@ -102,8 +110,8 @@ pub const DaemonRuntime = struct {
         const keep_going = if (options) |o| o.keep_going else false;
         self.graph = WorkGraph.init(
             allocator,
-            .{ .ctx = self, .open = openWriteConn, .close = closeConn, .apply = applyWrite },
-            .{ .ctx = self, .open = openBuildConn, .close = closeConn, .apply = applyBuild },
+            .{ .ctx = self, .open = openWriteConn, .close = closeWriteConn, .apply = applyWrite },
+            .{ .ctx = self, .open = openBuildConn, .close = releaseBuildConn, .apply = applyBuild },
             write_workers,
             build_workers,
             keep_going,
@@ -133,6 +141,50 @@ pub const DaemonRuntime = struct {
         return false;
     }
 
+    /// Are there warm build connections to borrow? True once the graph has run
+    /// and its build workers returned their connections here — the signal for
+    /// `DerivationStore.buildPaths` to route the terminal build onto the pool
+    /// instead of forking its own `self.daemon`.
+    pub fn hasBuildPool(self: *DaemonRuntime) bool {
+        self.build_pool_mu.lock();
+        defer self.build_pool_mu.unlock();
+        return self.build_pool.items.len > 0;
+    }
+
+    /// Run an authoritative build on a warm pooled build connection, borrowing
+    /// one from the pool (or opening one if the pool is empty) and returning it
+    /// after. The connection already had build settings applied when it was
+    /// opened, so this matches the `ensureDaemon` build path exactly — just on a
+    /// warm connection. On error the daemon's message is captured for
+    /// `takeErrorMsg`.
+    pub fn buildOnPool(self: *DaemonRuntime, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+        const d = try self.acquireBuildConn();
+        defer self.stashBuildConn(d);
+        d.buildPaths(derived_paths, sink, mode) catch |err| {
+            self.captureErrForce(d);
+            return err;
+        };
+    }
+
+    fn acquireBuildConn(self: *DaemonRuntime) !*rstore.DaemonStore {
+        self.build_pool_mu.lock();
+        if (self.build_pool.pop()) |d| {
+            self.build_pool_mu.unlock();
+            return d;
+        }
+        self.build_pool_mu.unlock();
+        // Pool empty (e.g. every warm conn is in flight): fork a fresh one with
+        // build settings, same as a build worker would.
+        const conn = try openBuildConn(self);
+        return @ptrCast(@alignCast(conn));
+    }
+
+    fn stashBuildConn(self: *DaemonRuntime, d: *rstore.DaemonStore) void {
+        self.build_pool_mu.lock();
+        defer self.build_pool_mu.unlock();
+        self.build_pool.append(self.cfg.allocator, d) catch d.deinit();
+    }
+
     /// Drain + join the work graph. Returns the first error. Idempotent.
     pub fn finishGraph(self: *DaemonRuntime) ?anyerror {
         if (!self.graph_active) return null;
@@ -153,6 +205,12 @@ pub const DaemonRuntime = struct {
 
     pub fn deinit(self: *DaemonRuntime) void {
         _ = self.finishGraph();
+        // Drain the warm build pool. A non-zero capacity implies `startGraph`
+        // ran (so `cfg.allocator` is valid); an untouched runtime never allocated.
+        if (self.build_pool.capacity > 0) {
+            for (self.build_pool.items) |d| d.deinit();
+            self.build_pool.deinit(self.cfg.allocator);
+        }
         if (self.cfg.err_msg) |msg| self.cfg.allocator.free(msg);
         self.fast.deinit();
     }
@@ -177,9 +235,20 @@ pub const DaemonRuntime = struct {
         return d;
     }
 
-    fn closeConn(_: *anyopaque, conn: *anyopaque) void {
+    /// Write workers own their connection for the run and close it at shutdown —
+    /// write conns never serve the terminal build, so there's nothing to retain.
+    fn closeWriteConn(_: *anyopaque, conn: *anyopaque) void {
         const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
         d.deinit();
+    }
+
+    /// Build workers hand their (warm, options-applied) connection back to the
+    /// pool at shutdown instead of closing it, so the terminal authoritative
+    /// build can reuse it. Same signature as the vtable `close` slot.
+    fn releaseBuildConn(ctx: *anyopaque, conn: *anyopaque) void {
+        const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
+        const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
+        self.stashBuildConn(d);
     }
 
     fn applyWrite(ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, text: []const u8, refs: []const []const u8) anyerror!void {
@@ -221,6 +290,19 @@ pub const DaemonRuntime = struct {
         defer self.cfg.err_mu.unlock();
         if (self.cfg.err_set) return;
         if (d.last_error) |msg| {
+            self.cfg.err_msg = self.cfg.allocator.dupe(u8, msg) catch null;
+            self.cfg.err_set = true;
+        }
+    }
+
+    /// Like `captureErr` but overwrites — the terminal build runs after the graph
+    /// (its error, if any, is the authoritative one to surface, not a stale
+    /// eager-build message).
+    fn captureErrForce(self: *DaemonRuntime, d: *rstore.DaemonStore) void {
+        self.cfg.err_mu.lock();
+        defer self.cfg.err_mu.unlock();
+        if (d.last_error) |msg| {
+            if (self.cfg.err_msg) |old| self.cfg.allocator.free(old);
             self.cfg.err_msg = self.cfg.allocator.dupe(u8, msg) catch null;
             self.cfg.err_set = true;
         }
