@@ -277,13 +277,18 @@ pub const DaemonRuntime = struct {
         const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
         const derived = try std.fmt.allocPrint(self.cfg.allocator, "{s}!*", .{store_path});
         defer self.cfg.allocator.free(derived);
-        // One thread-safe span per build (see BuildSpans); the daemon's per-
-        // activity stream goes to a silent sink so build logs don't spam stderr.
-        const tok: ?u64 = if (self.cfg.spans) |s| s.begin(s.ctx, storePathName(store_path)) else null;
-        defer if (self.cfg.spans) |s| {
-            if (tok) |t| s.end(s.ctx, t);
-        };
-        d.buildPaths(&.{derived}, silent_sink, self.cfg.mode) catch |err| {
+        // Surface the whole build in progress: one `.build` span per realization
+        // activity the daemon reports (every path built or substituted in the
+        // closure — not just the top `.drv`), so a build's transitive deps show
+        // up. `ActivitySpans` keys spans by the daemon's per-connection activity
+        // id; it's local to this call so ids can't collide with another build
+        // worker's, and `buildPaths` invokes its callbacks synchronously on this
+        // thread. When progress isn't drawn (`spans == null`), the silent sink
+        // just keeps the wire drained.
+        var act: ActivitySpans = if (self.cfg.spans) |s| .{ .spans = s, .allocator = self.cfg.allocator } else undefined;
+        defer if (self.cfg.spans != null) act.deinit();
+        const sink: rstore.BuildSink = if (self.cfg.spans != null) act.sink() else silent_sink;
+        d.buildPaths(&.{derived}, sink, self.cfg.mode) catch |err| {
             self.captureErr(d);
             return err;
         };
@@ -311,6 +316,58 @@ pub const DaemonRuntime = struct {
             self.cfg.err_set = true;
         }
     }
+};
+
+/// Nix `ActivityType` values for the two top-level realization activities. Each
+/// is one store path being realized (a `Substitute` is the umbrella for a path
+/// fetched from a cache; its `FileTransfer`/`CopyPath` children are skipped so
+/// the `.build [done/total]` count stays one-per-path). Stable protocol
+/// constants; see Lix `lib/nix/util/logging.hh`.
+const act_build: u64 = 105;
+const act_substitute: u64 = 108;
+
+/// Bridges one build connection's daemon activity stream to the `.build` span
+/// group: a span per build/substitute activity so a build's whole transitive
+/// closure shows in progress, not just the submitted `.drv`. Local to one
+/// `applyBuild` call — the daemon's activity ids are unique per connection and
+/// `buildPaths` drives these callbacks synchronously on the build-worker thread,
+/// so the id→token map needs no locking. The span channel (`BuildSpans`) is
+/// itself thread-safe across build workers.
+const ActivitySpans = struct {
+    spans: DaemonRuntime.BuildSpans,
+    allocator: std.mem.Allocator,
+    /// daemon activity id -> open `.build` span token
+    map: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+
+    fn sink(self: *ActivitySpans) rstore.BuildSink {
+        return .{ .context = self, .on_start = onStart, .on_stop = onStop, .on_progress = onProgress, .on_log = onLog };
+    }
+
+    /// End any spans the daemon left open (build aborted mid-activity) and free.
+    fn deinit(self: *ActivitySpans) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |tok| self.spans.end(self.spans.ctx, tok.*);
+        self.map.deinit(self.allocator);
+    }
+
+    fn onStart(ctx: *anyopaque, id: u64, activity_type: u64, text: []const u8) void {
+        if (activity_type != act_build and activity_type != act_substitute) return;
+        const self: *ActivitySpans = @ptrCast(@alignCast(ctx));
+        const tok = self.spans.begin(self.spans.ctx, text);
+        // On map-insert failure just drop the span (end it now) rather than leak.
+        self.map.put(self.allocator, id, tok) catch self.spans.end(self.spans.ctx, tok);
+    }
+
+    fn onStop(ctx: *anyopaque, id: u64) void {
+        const self: *ActivitySpans = @ptrCast(@alignCast(ctx));
+        if (self.map.fetchRemove(id)) |kv| self.spans.end(self.spans.ctx, kv.value);
+    }
+
+    // Byte progress arrives on child FileTransfer activities, which we don't
+    // track; the substitute/build span is begin/end only. (Log lines go to
+    // `nix log`, not the progress bar.)
+    fn onProgress(_: *anyopaque, _: u64, _: u64, _: u64) void {}
+    fn onLog(_: *anyopaque, _: []const u8) void {}
 };
 
 /// A `BuildSink` that discards everything — passed to pooled builds so their
