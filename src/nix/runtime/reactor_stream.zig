@@ -19,6 +19,39 @@ const Reactor = @import("reactor.zig").Reactor;
 
 const max_iovecs = 8;
 
+/// Non-blocking connect to a Unix socket, driven by the reactor: create the
+/// socket non-blocking, `connect` (which returns EINPROGRESS), `waitWritable`
+/// until it settles, then check `SO_ERROR`. MUST run inside a reactor task.
+/// Returns the connected non-blocking fd (caller closes it).
+pub fn connectUnix(reactor: *Reactor, path: []const u8) !posix.fd_t {
+    const rc_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc_fd) != .SUCCESS) return error.SocketFailed;
+    const fd: posix.fd_t = @intCast(rc_fd);
+    errdefer _ = linux.close(fd);
+
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+    const salen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+
+    while (true) {
+        switch (linux.errno(linux.connect(fd, @ptrCast(&addr), salen))) {
+            .SUCCESS => return fd,
+            .INPROGRESS, .AGAIN => {
+                reactor.waitWritable(fd);
+                var so_err: u32 = 0;
+                var len: linux.socklen_t = @sizeOf(u32);
+                _ = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, @ptrCast(&so_err), &len);
+                if (so_err != 0) return error.ConnectFailed;
+                return fd;
+            },
+            .INTR => {},
+            else => return error.ConnectFailed,
+        }
+    }
+}
+
 pub const Reader = struct {
     reactor: *Reactor,
     fd: posix.fd_t,
@@ -205,6 +238,63 @@ const ReadTask = struct {
         while (self.matched.load(.acquire) == 0) stable.Futex.wait(&self.matched, 0);
     }
 };
+
+const daemon_socket = "/nix/var/nix/daemon-socket/socket";
+const worker_magic_1: u64 = 0x6e697863;
+const worker_magic_2: u64 = 0x6478696f;
+
+const DaemonHandshake = struct {
+    reactor: *Reactor,
+    magic2: u64 = 0,
+    connect_err: bool = false,
+    ready: std.atomic.Value(u32) = .init(0),
+    fn signal(self: *DaemonHandshake) void {
+        _ = self.ready.fetchAdd(1, .release);
+        stable.Futex.wake(&self.ready, 1);
+    }
+    fn run(ctx: *anyopaque) void {
+        const self: *DaemonHandshake = @ptrCast(@alignCast(ctx));
+        const fd = connectUnix(self.reactor, daemon_socket) catch {
+            self.connect_err = true;
+            self.signal();
+            return;
+        };
+        defer _ = linux.close(fd);
+        var rbuf: [256]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var r = Reader.init(self.reactor, fd, &rbuf);
+        var w = Writer.init(self.reactor, fd, &wbuf);
+        w.interface.writeInt(u64, worker_magic_1, .little) catch {
+            self.signal();
+            return;
+        };
+        w.interface.flush() catch {
+            self.signal();
+            return;
+        };
+        self.magic2 = r.interface.takeInt(u64, .little) catch 0;
+        self.signal();
+    }
+    fn await1(self: *DaemonHandshake) void {
+        while (self.ready.load(.acquire) == 0) stable.Futex.wait(&self.ready, 0);
+    }
+};
+
+test "reactor stream: connect + handshake against the live nix-daemon" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    // Skip if no daemon socket (CI).
+    if (linux.errno(linux.access(daemon_socket, linux.F_OK)) != .SUCCESS) return error.SkipZigTest;
+
+    const r = try Reactor.init(testing.allocator);
+    defer r.deinit();
+    try r.start();
+
+    var hs: DaemonHandshake = .{ .reactor = r };
+    try r.submit(DaemonHandshake.run, &hs);
+    hs.await1();
+    if (hs.connect_err) return error.SkipZigTest; // daemon present but unreachable
+    try testing.expectEqual(worker_magic_2, hs.magic2);
+}
 
 test "reactor stream: reader + writer exchange a message over one reactor thread" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
