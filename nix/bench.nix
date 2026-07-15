@@ -45,8 +45,9 @@
     ++ optional (lix != null) "lix|${lix}/bin/nix-instantiate --eval --strict"
     ++ optional (snix != null) "snix|${snix}/bin/snix-eval -qq --strict"
     ++ optionals (fix != null) [
-      "fix|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
-      "fix-par|${fix}/bin/fix eval --strict --no-progress --file"
+      "fix-w1|${fix}/bin/fix eval --strict --workers=1 --no-progress --file"
+      "fix-w2|${fix}/bin/fix eval --strict --workers=2 --no-progress --file"
+      "fix|${fix}/bin/fix eval --strict --no-progress --file"
     ];
 
   quote = s: "\"${s}\"";
