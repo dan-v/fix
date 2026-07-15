@@ -353,6 +353,15 @@ fn opEq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) 
     // Operands stay on the stack across valuesEqual (which forces deeply, a
     // GC safepoint) so they remain precise roots; drop only after.
     const ops = stack.binTop(vm);
+    // Fast path: two immediate (unboxed) ints — by far the most common `==`
+    // (loop counters, filter predicates like `bitAnd x 3 == 0`). Skip the
+    // seen-list alloc, the two forceValue calls, and the recursive dispatch.
+    if (ops.left.isInt() and ops.right.isInt()) {
+        const result = ops.left.asInt() == ops.right.asInt();
+        stack.dropBin(vm);
+        try stack.push(vm, Value.boolVal(result));
+        return dispatch(vm, frame, code, ip, stop_depth);
+    }
     const result = try equality.valuesEqual(vm, ops.left, ops.right);
     stack.dropBin(vm);
     try stack.push(vm, Value.boolVal(result));
@@ -362,6 +371,12 @@ fn opEq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) 
 fn opNeq(vm: *VM, frame: *Frame, code: []const u8, ip: usize, stop_depth: usize) anyerror!void {
     frame.ip = ip;
     const ops = stack.binTop(vm);
+    if (ops.left.isInt() and ops.right.isInt()) {
+        const result = ops.left.asInt() == ops.right.asInt();
+        stack.dropBin(vm);
+        try stack.push(vm, Value.boolVal(!result));
+        return dispatch(vm, frame, code, ip, stop_depth);
+    }
     const result = try equality.valuesEqual(vm, ops.left, ops.right);
     stack.dropBin(vm);
     try stack.push(vm, Value.boolVal(!result));
