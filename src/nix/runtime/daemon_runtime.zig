@@ -1,261 +1,224 @@
 //! DaemonRuntime: the single owner of every background thread + daemon
-//! connection `fix` uses to talk to the nix-daemon during a run. It folds the
-//! two previously-separate mechanisms into one object:
+//! connection `fix` uses. Two mechanisms:
 //!
-//!  - the **fast lane** — a single serial executor thread (the `IoRuntime`) that
-//!    runs short offloaded daemon ops (store writes, `isValidPath` queries, IFD
-//!    realizes) while the calling fiber parks (see `vm/io_offload.zig`). One op
-//!    at a time, matching the blocking serial daemon socket.
+//!  - the **fast lane** — a single serial executor thread (`IoRuntime`) that runs
+//!    short offloaded daemon ops while the calling fiber parks (`vm/io_offload`):
+//!    source/flat writes, `isValidPath` queries, and `.drv` writes when the work
+//!    graph is not active (plain `instantiate`).
 //!
-//!  - the **build lane** — a dedicated thread with its OWN daemon connection that
-//!    realizes derivations fire-and-forget as they are instantiated (eval/build
-//!    pipelining). A build holds its connection for the whole build, so it must
-//!    NOT share the fast lane's connection (it would starve eval's own writes);
-//!    the daemon is the cross-connection serialization point (commits added
-//!    paths on write; per-output build locks prevent double-building).
-//!
-//! Phase 1 (this file) is a behavior-preserving consolidation: the fast lane is
-//! the unchanged `IoRuntime`; the build lane is the former `BuildPump`, decoupled
-//! from `*DerivationStore` (it takes allocator/io/socket/options as primitives so
-//! it can live in the runtime layer). Phase 2 replaces both lanes' ad-hoc
-//! ordering with an explicit dependency graph.
+//!  - the **work graph** — a dependency-DAG executor (`work_graph.zig`) that runs
+//!    `.drv` writes AND builds across pools of their own connections, ordered by
+//!    explicit reference edges instead of force order (so writes parallelize and
+//!    a build waits for its `.drv`'s write). Started on demand by the realizing
+//!    commands (`startGraph`); `.drv` writes then go here (async, fiber doesn't
+//!    park), eager builds are fire-and-forget nodes, and IFD parks on a node.
 
 const std = @import("std");
-const stable = @import("base").sync;
 const io_runtime = @import("io_runtime.zig");
+const wg = @import("work_graph.zig");
 const rstore = @import("store.zig");
+const Future = @import("thunk.zig").Future;
 
-pub const Job = io_runtime.Job;
+pub const WorkGraph = wg.WorkGraph;
+
+/// The name portion of a store path (`/nix/store/<hash>-<name>` -> `<name>`),
+/// the `name` arg `addTextToStore` recomputes the path from.
+fn storePathName(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    if (base.len > 33 and base[32] == '-') return base[33..];
+    return base;
+}
 
 pub const DaemonRuntime = struct {
-    /// Serial executor for offloaded short daemon ops; `io_offload.run` submits
-    /// `Job`s here and parks the fiber. Started at construction, torn down last.
     fast: io_runtime.IoRuntime = .{},
-    /// Fire-and-forget eager-build lane (own connection). Started on demand by
-    /// the realizing commands (`startBuilds`).
-    build: BuildLane = .{},
+    /// Config for the graph's per-worker connections + build progress. Populated
+    /// by `startGraph`; the backend `open`/`apply` fns read it.
+    cfg: GraphConfig = .{},
+    graph: ?WorkGraph = null,
+    graph_active: bool = false,
+
+    /// Thread-safe per-build progress span, provided by the CLI. `begin` opens a
+    /// span for a build and returns an opaque token; `end` closes it. Backed by
+    /// the concurrent-span channel (lock-free node ops + a span mutex), so it is
+    /// safe to call from every build-worker thread concurrently — unlike a
+    /// shared per-activity `BuildSink`, whose hashmap raced and whose per-
+    /// connection activity ids collided across the pool.
+    pub const BuildSpans = struct {
+        ctx: *anyopaque,
+        begin: *const fn (ctx: *anyopaque, name: []const u8) u64,
+        end: *const fn (ctx: *anyopaque, token: u64) void,
+    };
+
+    pub const GraphConfig = struct {
+        allocator: std.mem.Allocator = undefined,
+        io: std.Io = undefined,
+        socket: []const u8 = "",
+        options: ?rstore.BuildSettings = null,
+        spans: ?BuildSpans = null,
+        mode: rstore.BuildMode = .normal,
+        /// First daemon error message (write or build), guarded, surfaced on finish.
+        err_mu: @import("base").sync.BlockingMutex = .{},
+        err_msg: ?[]u8 = null,
+        err_set: bool = false,
+    };
 
     pub fn init() DaemonRuntime {
         return .{};
     }
 
-    /// Start the always-on fast lane. Must be called once the runtime is at its
-    /// final address (heap-allocate it — the fast thread captures `&self.fast`).
     pub fn start(self: *DaemonRuntime) !void {
         try self.fast.start();
     }
 
-    /// The fast-lane executor, handed to `DerivationStore.setOffload` as the
-    /// offload context (`io_offload.run` submits Jobs to it).
     pub fn fastRuntime(self: *DaemonRuntime) *io_runtime.IoRuntime {
         return &self.fast;
     }
 
-    /// Spawn the eager-build lane (its own daemon connection). `sink` drives live
-    /// build progress (may be null for silent).
-    pub fn startBuilds(
+    /// Start the work graph (per-worker daemon connections). `.drv` writes and
+    /// builds route here until `finishGraph`.
+    pub fn startGraph(
         self: *DaemonRuntime,
         allocator: std.mem.Allocator,
         io: std.Io,
         socket: []const u8,
         options: ?rstore.BuildSettings,
-        sink: ?rstore.BuildSink,
+        spans: ?BuildSpans,
         mode: rstore.BuildMode,
     ) !void {
-        try self.build.start(allocator, io, socket, options, sink, mode);
+        self.cfg = .{ .allocator = allocator, .io = io, .socket = socket, .options = options, .spans = spans, .mode = mode };
+        self.graph = WorkGraph.init(
+            allocator,
+            .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyWrite },
+            .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyBuild },
+            write_workers,
+            build_workers,
+        );
+        try self.graph.?.start();
+        self.graph_active = true;
     }
 
-    /// Fire a freshly instantiated `.drv` at the build lane. Never blocks.
+    pub fn graphActive(self: *DaemonRuntime) bool {
+        return self.graph_active;
+    }
+
+    /// Submit a `.drv` write (async; takes ownership of `text`). Graph must be active.
+    pub fn submitWrite(self: *DaemonRuntime, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+        try self.graph.?.submitWrite(store_path, text, references);
+    }
+
+    /// Submit a fire-and-forget eager build (gated on the drv's write node).
     pub fn submitBuild(self: *DaemonRuntime, drv_path: []const u8) !void {
-        try self.build.submit(drv_path);
+        try self.graph.?.submitBuild(drv_path, null, null);
     }
 
-    /// Drain + join the build lane; returns the first build error (its message is
-    /// available via `takeBuildErrorMsg`). Idempotent.
-    pub fn finishBuilds(self: *DaemonRuntime) ?anyerror {
-        return self.build.stopAndJoin();
+    /// Park `future` on the write of `drv_path` (IFD): true if attached/already
+    /// done, false if there is no such write node (caller proceeds).
+    pub fn awaitWrite(self: *DaemonRuntime, drv_path: []const u8, future: *Future, result: ?*(anyerror!void)) !bool {
+        if (self.graph) |*g| return g.awaitWrite(drv_path, future, result);
+        return false;
     }
 
-    /// Transfer ownership of the first build failure's daemon message (or null).
-    pub fn takeBuildErrorMsg(self: *DaemonRuntime) ?[]u8 {
-        const msg = self.build.error_msg;
-        self.build.error_msg = null;
+    /// Drain + join the work graph. Returns the first error. Idempotent.
+    pub fn finishGraph(self: *DaemonRuntime) ?anyerror {
+        if (!self.graph_active) return null;
+        self.graph_active = false;
+        const err = if (self.graph) |*g| g.finish() else null;
+        self.graph = null;
+        return err;
+    }
+
+    /// Transfer ownership of the first daemon error message (write or build).
+    pub fn takeErrorMsg(self: *DaemonRuntime) ?[]u8 {
+        self.cfg.err_mu.lock();
+        defer self.cfg.err_mu.unlock();
+        const msg = self.cfg.err_msg;
+        self.cfg.err_msg = null;
         return msg;
     }
 
-    /// Join the build lane (safety net) then stop the fast lane. Callers must
-    /// ensure the compute pool is quiesced (no fiber parked on a fast-lane op).
     pub fn deinit(self: *DaemonRuntime) void {
-        _ = self.build.stopAndJoin();
-        if (self.build.error_msg) |msg| {
-            self.build.allocator.?.free(msg);
-            self.build.error_msg = null;
-        }
+        _ = self.finishGraph();
+        if (self.cfg.err_msg) |msg| self.cfg.allocator.free(msg);
         self.fast.deinit();
     }
-};
 
-/// The eager-build lane: a dedicated thread with its own daemon connection,
-/// draining a queue of drv paths in waves (`buildPaths(batch)` per wave). Ported
-/// from the former `derivation/build_pump.zig`, decoupled from `*DerivationStore`
-/// (takes allocator/io/socket/options directly). Wait/wake mirrors `IoRuntime`
-/// (BlockingMutex + a `seq` futex as a condvar-by-sequence).
-pub const BuildLane = struct {
-    allocator: ?std.mem.Allocator = null,
-    io: ?std.Io = null,
-    socket: []const u8 = "",
-    options: ?rstore.BuildSettings = null,
-    /// This lane's OWN daemon connection, opened lazily on the lane thread.
-    daemon: ?*rstore.DaemonStore = null,
+    // -- work-graph backend (per-worker connections) --
 
-    mu: stable.BlockingMutex = .{},
-    seq: std.atomic.Value(u32) = .init(0),
-    queue: std.ArrayListUnmanaged([]u8) = .empty,
-    submitted: std.StringHashMapUnmanaged(void) = .empty,
-    done: bool = false,
-
-    thread: ?std.Thread = null,
-    sink: ?rstore.BuildSink = null,
-    mode: rstore.BuildMode = .normal,
-
-    /// First build failure (surfaced by `stopAndJoin`) + an owned copy of the
-    /// daemon's message. Once set, later waves are dropped but still drained.
-    first_error: ?anyerror = null,
-    error_msg: ?[]u8 = null,
-
-    pub fn start(
-        self: *BuildLane,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        socket: []const u8,
-        options: ?rstore.BuildSettings,
-        sink: ?rstore.BuildSink,
-        mode: rstore.BuildMode,
-    ) !void {
-        self.allocator = allocator;
-        self.io = io;
-        self.socket = socket;
-        self.options = options;
-        self.sink = sink;
-        self.mode = mode;
-        self.thread = try std.Thread.spawn(.{}, loop, .{self});
-    }
-
-    /// Enqueue a bare `.drv` path for building. Dedupes + dupes into lane memory.
-    /// No-op after `done`; never blocks on a build.
-    pub fn submit(self: *BuildLane, drv_path: []const u8) !void {
-        const alloc = self.allocator orelse return;
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.done) return;
-        if (self.submitted.contains(drv_path)) return;
-        const key = try alloc.dupe(u8, drv_path);
-        errdefer alloc.free(key);
-        try self.submitted.put(alloc, key, {});
-        // A separate queue dupe so `stopAndJoin` frees queue + dedup entries
-        // independently (a drained entry leaves `submitted` intact).
-        const qcopy = try alloc.dupe(u8, drv_path);
-        errdefer alloc.free(qcopy);
-        try self.queue.append(alloc, qcopy);
-        self.wake();
-    }
-
-    /// Signal drain-and-exit, join the thread, close the connection, free the
-    /// queue/dedup storage. Returns the first build error. Idempotent (gated on a
-    /// live thread — once joined, a second call is a no-op).
-    pub fn stopAndJoin(self: *BuildLane) ?anyerror {
-        const t = self.thread orelse return self.first_error;
-        self.mu.lock();
-        self.done = true;
-        self.mu.unlock();
-        self.wake();
-        t.join();
-        self.thread = null;
-
-        if (self.daemon) |d| {
-            d.deinit();
-            self.daemon = null;
-        }
-        const alloc = self.allocator.?;
-        for (self.queue.items) |q| alloc.free(q);
-        self.queue.deinit(alloc);
-        var it = self.submitted.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        self.submitted.deinit(alloc);
-        return self.first_error;
-    }
-
-    fn wake(self: *BuildLane) void {
-        _ = self.seq.fetchAdd(1, .release);
-        stable.Futex.wake(&self.seq, 1);
-    }
-
-    fn loop(self: *BuildLane) void {
-        const alloc = self.allocator.?;
-        while (true) {
-            self.mu.lock();
-            while (self.queue.items.len == 0 and !self.done) {
-                const s = self.seq.load(.acquire);
-                self.mu.unlock();
-                stable.Futex.wait(&self.seq, s);
-                self.mu.lock();
-            }
-            if (self.queue.items.len == 0 and self.done) {
-                self.mu.unlock();
-                return;
-            }
-            const batch = self.queue.toOwnedSlice(alloc) catch {
-                self.mu.unlock();
-                stable.sleepNs(1_000_000);
-                continue;
-            };
-            const already_failed = self.first_error != null;
-            self.mu.unlock();
-
-            defer {
-                for (batch) |b| alloc.free(b);
-                alloc.free(batch);
-            }
-            if (already_failed) continue; // stop building, just drain
-
-            self.buildBatch(alloc, batch) catch |err| self.recordError(err);
-        }
-    }
-
-    fn buildBatch(self: *BuildLane, alloc: std.mem.Allocator, batch: []const []u8) !void {
-        const daemon = try self.ensureDaemon();
-        const derived = try alloc.alloc([]const u8, batch.len);
-        var n: usize = 0;
-        defer {
-            for (derived[0..n]) |d| alloc.free(d);
-            alloc.free(derived);
-        }
-        for (batch) |drv| {
-            derived[n] = try std.fmt.allocPrint(alloc, "{s}!*", .{drv});
-            n += 1;
-        }
-        try daemon.buildPaths(derived, self.sink, self.mode);
-    }
-
-    fn ensureDaemon(self: *BuildLane) !*rstore.DaemonStore {
-        if (self.daemon) |d| return d;
-        const io = self.io orelse return error.StoreUnavailable;
-        const d = try rstore.DaemonStore.connect(self.allocator.?, io, self.socket);
+    fn openConn(ctx: *anyopaque) anyerror!*anyopaque {
+        const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
+        const d = try rstore.DaemonStore.connect(self.cfg.allocator, self.cfg.io, self.cfg.socket);
         errdefer d.deinit();
-        // The lane only runs for store-writing commands, so pushing fix's
-        // resolved daemon options (max-jobs/cores/…) is correct here.
-        if (self.options) |opts| try d.setOptions(opts);
-        self.daemon = d;
+        if (self.cfg.options) |opts| try d.setOptions(opts);
         return d;
     }
 
-    fn recordError(self: *BuildLane, err: anyerror) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        if (self.first_error != null) return;
-        self.first_error = err;
-        if (self.daemon) |d| {
-            if (d.last_error) |msg| self.error_msg = self.allocator.?.dupe(u8, msg) catch null;
+    fn closeConn(_: *anyopaque, conn: *anyopaque) void {
+        const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
+        d.deinit();
+    }
+
+    fn applyWrite(ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, text: []const u8, refs: []const []const u8) anyerror!void {
+        const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
+        const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
+        if (try d.isValidPath(store_path)) return;
+        const written = d.addTextToStore(self.cfg.allocator, storePathName(store_path), text, refs) catch |err| {
+            self.captureErr(d);
+            return err;
+        };
+        self.cfg.allocator.free(written);
+    }
+
+    fn applyBuild(ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
+        const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
+        const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
+        const derived = try std.fmt.allocPrint(self.cfg.allocator, "{s}!*", .{store_path});
+        defer self.cfg.allocator.free(derived);
+        // One thread-safe span per build (see BuildSpans); the daemon's per-
+        // activity stream goes to a silent sink so build logs don't spam stderr.
+        const tok: ?u64 = if (self.cfg.spans) |s| s.begin(s.ctx, storePathName(store_path)) else null;
+        defer if (self.cfg.spans) |s| {
+            if (tok) |t| s.end(s.ctx, t);
+        };
+        d.buildPaths(&.{derived}, silent_sink, self.cfg.mode) catch |err| {
+            self.captureErr(d);
+            return err;
+        };
+    }
+
+    fn captureErr(self: *DaemonRuntime, d: *rstore.DaemonStore) void {
+        self.cfg.err_mu.lock();
+        defer self.cfg.err_mu.unlock();
+        if (self.cfg.err_set) return;
+        if (d.last_error) |msg| {
+            self.cfg.err_msg = self.cfg.allocator.dupe(u8, msg) catch null;
+            self.cfg.err_set = true;
         }
     }
 };
+
+/// A `BuildSink` that discards everything — passed to pooled builds so their
+/// per-activity log/progress stream is consumed (keeping the wire in sync)
+/// without printing to stderr; the per-build span carries the progress instead.
+const silent_sink: rstore.BuildSink = .{
+    .context = undefined,
+    .on_start = struct {
+        fn f(_: *anyopaque, _: u64, _: u64, _: []const u8) void {}
+    }.f,
+    .on_stop = struct {
+        fn f(_: *anyopaque, _: u64) void {}
+    }.f,
+    .on_progress = struct {
+        fn f(_: *anyopaque, _: u64, _: u64, _: u64) void {}
+    }.f,
+    .on_log = struct {
+        fn f(_: *anyopaque, _: []const u8) void {}
+    }.f,
+};
+
+/// Write-connection pool size: writes are short (a few-KB `addTextToStore`), so a
+/// small pool overlaps their round-trips without flooding the daemon.
+const write_workers: usize = 4;
+/// Build-connection pool size: each build holds its connection for the whole
+/// build, so this bounds concurrent client-driven builds (the daemon also
+/// parallelizes each build's closure internally per max-jobs).
+const build_workers: usize = 8;

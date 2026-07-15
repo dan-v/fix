@@ -1570,12 +1570,12 @@ pub const Evaluator = struct {
         return self.derivations.buildPaths(derived_paths, sink, mode);
     }
 
-    /// Start eval/build pipelining: spawn the background build pump so
-    /// derivations build as they are instantiated (see `DerivationStore`).
-    /// Call after `enableStoreWrites`, before evaluation. `sink` drives live
-    /// build progress. No-op if `FIX_NO_EAGER_BUILD` is set.
-    pub fn startEagerBuilds(self: *Evaluator, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
-        return self.derivations.startEagerBuilds(self.env_map, sink, mode);
+    /// Start eval/build pipelining: launch the work graph so `.drv`s are written
+    /// and derivations build as they are instantiated (see `DerivationStore`).
+    /// Call after `enableStoreWrites`, before evaluation. `spans` drives live
+    /// per-build progress. No-op if `FIX_NO_EAGER_BUILD` is set.
+    pub fn startEagerBuilds(self: *Evaluator, spans: ?runtime.daemon_runtime.DaemonRuntime.BuildSpans, mode: runtime.store.BuildMode) !void {
+        return self.derivations.startEagerBuilds(self.env_map, spans, mode);
     }
 
     /// Drain + join the build pump once evaluation is done (before the final

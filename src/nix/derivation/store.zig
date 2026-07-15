@@ -526,17 +526,17 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
-    /// Start eval/build pipelining: spawn the background build pump (its own
-    /// daemon connection) that realizes derivations as they are instantiated.
-    /// `sink` drives live build progress (may be null for silent). Requires
-    /// store writes enabled and a daemon socket reachable via `setIo`. A no-op
-    /// if `FIX_NO_EAGER_BUILD` is set in `env`.
-    pub fn startEagerBuilds(self: *DerivationStore, env: ?*const std.process.Environ.Map, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+    /// Start eval/build pipelining: launch the work graph (its own pool of daemon
+    /// connections) that writes `.drv`s + realizes derivations as they are
+    /// instantiated. `spans` drives live per-build progress (may be null).
+    /// Requires store writes enabled and a daemon socket via `setIo`. A no-op if
+    /// `FIX_NO_EAGER_BUILD` is set in `env`.
+    pub fn startEagerBuilds(self: *DerivationStore, env: ?*const std.process.Environ.Map, spans: ?DaemonRuntime.BuildSpans, mode: rstore.BuildMode) !void {
         if (!self.store_writes_enabled) return;
         if (env) |em| if (em.get("FIX_NO_EAGER_BUILD") != null) return;
         const rt = self.daemon_runtime orelse return;
         const io = self.io orelse return;
-        try rt.startBuilds(self.allocator, io, self.daemon_socket, self.daemon_options, sink, mode);
+        try rt.startGraph(self.allocator, io, self.daemon_socket, self.daemon_options, spans, mode);
         self.eager_build_enabled = true;
     }
 
@@ -554,8 +554,8 @@ pub const DerivationStore = struct {
         if (!self.eager_build_enabled) return;
         self.eager_build_enabled = false;
         const rt = self.daemon_runtime orelse return;
-        const err = rt.finishBuilds();
-        if (rt.takeBuildErrorMsg()) |msg| {
+        const err = rt.finishGraph();
+        if (rt.takeErrorMsg()) |msg| {
             if (self.eager_error_msg) |old| self.allocator.free(old);
             self.eager_error_msg = msg;
         }
@@ -782,6 +782,14 @@ pub const DerivationStore = struct {
 
     pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
         if (self.store_writes_enabled) {
+            // With the work graph active (build/run/shell/switch), the `.drv`
+            // write is asynchronous + dependency-ordered: hand `text` to the
+            // graph (which owns it) and DON'T park — the graph writes it, ordered
+            // after its referenced `.drv` writes, on a pool of connections. Plain
+            // `instantiate` (no graph) keeps the synchronous parked write.
+            if (self.eager_build_enabled) {
+                return self.daemon_runtime.?.submitWrite(store_path, text, references);
+            }
             defer self.allocator.free(text);
             return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
         }

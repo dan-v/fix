@@ -60,15 +60,13 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionBegin(label);
     ev.startProgressSampler();
 
-    // Eval/build pipelining: build derivations as they're instantiated, on a
-    // background pump with its own daemon connection (see cli.realize). The
-    // realize helpers finish it before their final build; the defers are the
-    // safety net for early error returns, joining the pump before its sink
-    // `egbp` and the progress tree are torn down.
-    var egbp = cli.build_progress.EagerBuildSink.init(allocator, progress.sink().spans);
-    defer egbp.deinit();
-    const eager_sink = if (term.show_progress) egbp.sink() else null;
-    ev.startEagerBuilds(eager_sink, run.buildMode(options)) catch {};
+    // Eval/build pipelining: write `.drv`s + build derivations as they're
+    // instantiated, on the work graph (see cli.realize). The realize helpers
+    // finish it before their final build; the defer is the safety net for early
+    // error returns, joining the graph before the progress tree is torn down.
+    var egbp = cli.build_progress.EagerBuildSpans.init(progress.sink().spans);
+    const eager_spans = if (term.show_progress) egbp.provider() else null;
+    ev.startEagerBuilds(eager_spans, run.buildMode(options)) catch {};
     defer ev.finishEagerBuilds() catch {};
 
     // Collect the output paths whose bin/ dirs go on PATH. Owned copies —
@@ -85,11 +83,10 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     else
         try realizeSource(allocator, init, &ev, term, options, build_sink, &out_paths);
 
-    // Join the build pump before tearing down its sink + the progress tree
-    // (idempotent — the realize helpers already finish it on success; this
-    // covers the eval-error path, which returns a code without finishing).
+    // Join the work graph before tearing down the progress tree (idempotent —
+    // the realize helpers already finish it on success; this covers the
+    // eval-error path, which returns a code without finishing).
     ev.finishEagerBuilds() catch {};
-    egbp.deinit();
 
     // Tear the progress bar down before the shell/command takes over.
     build_progress.deinit();

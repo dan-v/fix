@@ -13,6 +13,7 @@ const fetch = @import("fetch.zig");
 const vm_force = @import("../force.zig");
 const vm_strings = @import("../strings.zig");
 const vm_trace = @import("../trace.zig");
+const io_offload = @import("../io_offload.zig");
 
 const pathArg = strings.pathArg;
 const stringTextInternId = strings.stringTextInternId;
@@ -75,6 +76,12 @@ pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
 
     const context = (try demandContext(self, value)) orelse return path;
     defer context.deinit(self.allocator);
+    // With the work graph active, this derivation's `.drv` write may still be in
+    // flight (async). Park until it (and, via its edges, the whole `.drv`
+    // closure) is written, so the realize below finds it on disk.
+    if (self.derivations.eager_build_enabled) {
+        if (self.derivations.daemon_runtime) |rt| io_offload.awaitGraphWrite(rt, context.drv_path);
+    }
     if (std.mem.eql(u8, path, context.drv_path)) {
         try self.derivations.ensureClosure(context.drv_path);
     } else {

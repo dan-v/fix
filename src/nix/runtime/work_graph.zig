@@ -43,15 +43,19 @@ pub const Backend = struct {
 const NodeKind = enum { write, build };
 const State = enum { blocked, ready, running, done, failed };
 
+/// A parked fiber awaiting a node's completion: `future` wakes it, `result`
+/// (if any) receives the node's error-or-ok. A node may have several — e.g. two
+/// fibers importing the same derivation output, or importing a `.drv`'s text.
+const Waiter = struct { future: *Future, result: ?*(anyerror!void) };
+
 const Node = struct {
     kind: NodeKind,
     /// write: the store path; build: the drv path.
     store_path: []u8,
     text: []u8 = &.{},
     references: [][]u8 = &.{},
-    /// build only: parked-fiber wakeup + result slot (both null for eager builds).
-    wait_future: ?*Future = null,
-    result: ?*(anyerror!void) = null,
+    /// Fibers parked on this node's completion (empty for fire-and-forget).
+    waiters: std.ArrayListUnmanaged(Waiter) = .empty,
     pending: u32 = 0,
     dependents: std.ArrayListUnmanaged(u32) = .empty,
     state: State = .blocked,
@@ -61,6 +65,7 @@ const Node = struct {
         alloc.free(self.text);
         for (self.references) |r| alloc.free(r);
         alloc.free(self.references);
+        self.waiters.deinit(alloc);
         self.dependents.deinit(alloc);
     }
 };
@@ -78,8 +83,9 @@ pub const WorkGraph = struct {
     /// store path -> WRITE node id (build nodes are not indexed; they look their
     /// drv's write node up here for their single dependency).
     index: std.StringHashMapUnmanaged(u32) = .empty,
-    /// drv paths that already have a build node (dedup eager re-submits).
-    build_submitted: std.StringHashMapUnmanaged(void) = .empty,
+    /// drv path -> its build node id (dedup re-submits; a second waiter attaches
+    /// to the existing node).
+    build_submitted: std.StringHashMapUnmanaged(u32) = .empty,
     write_ready: std.ArrayListUnmanaged(u32) = .empty,
     build_ready: std.ArrayListUnmanaged(u32) = .empty,
     threads: std.ArrayListUnmanaged(std.Thread) = .empty,
@@ -158,22 +164,20 @@ pub const WorkGraph = struct {
     pub fn submitBuild(self: *WorkGraph, drv_path: []const u8, wait_future: ?*Future, result: ?*(anyerror!void)) !void {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.build_submitted.contains(drv_path)) {
-            // A build is already queued for this drv. A second waiter can't attach
-            // to it here; callers that must wait (IFD) never double-submit the
-            // same drv on the same fiber, and eager submits are fire-and-forget.
-            if (wait_future) |f| {
-                if (result) |r| r.* = {};
-                f.publish();
-            }
+        if (self.build_submitted.get(drv_path)) |existing| {
+            // A build for this drv already exists: attach a second waiter to it
+            // (concurrent IFD of the same output), or — if it already finished —
+            // wake this fiber now.
+            try self.attachWaiter(existing, wait_future, result);
             return;
         }
         const owned_drv = try self.allocator.dupe(u8, drv_path);
         errdefer self.allocator.free(owned_drv);
         const id: u32 = @intCast(self.nodes.items.len);
-        try self.nodes.append(self.allocator, .{ .kind = .build, .store_path = owned_drv, .wait_future = wait_future, .result = result });
+        try self.nodes.append(self.allocator, .{ .kind = .build, .store_path = owned_drv });
         errdefer _ = self.nodes.pop();
-        try self.build_submitted.put(self.allocator, owned_drv, {});
+        if (wait_future) |f| try self.nodes.items[id].waiters.append(self.allocator, .{ .future = f, .result = result });
+        try self.build_submitted.put(self.allocator, owned_drv, id);
 
         var pending: u32 = 0;
         if (self.index.get(drv_path)) |wid| {
@@ -185,6 +189,31 @@ pub const WorkGraph = struct {
         self.nodes.items[id].pending = pending;
         self.outstanding += 1;
         if (pending == 0) try self.enqueueReady(id);
+    }
+
+    /// Park the caller on the write of `drv_path`: returns false if there is no
+    /// write node for it (already valid / not written via the graph — caller
+    /// proceeds without waiting), true if a waiter was attached or the write was
+    /// already done (in which case the future is published immediately).
+    pub fn awaitWrite(self: *WorkGraph, drv_path: []const u8, future: *Future, result: ?*(anyerror!void)) !bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const wid = self.index.get(drv_path) orelse return false;
+        try self.attachWaiter(wid, future, result);
+        return true;
+    }
+
+    /// Attach a waiter to node `id`, or publish immediately if it's already
+    /// terminal. Caller holds `mu`. A null future is a no-op (fire-and-forget).
+    fn attachWaiter(self: *WorkGraph, id: u32, future: ?*Future, result: ?*(anyerror!void)) !void {
+        const f = future orelse return;
+        const st = self.nodes.items[id].state;
+        if (st == .done or st == .failed) {
+            if (result) |r| r.* = if (st == .failed) error.StoreWriteFailed else {};
+            f.publish();
+            return;
+        }
+        try self.nodes.items[id].waiters.append(self.allocator, .{ .future = f, .result = result });
     }
 
     fn enqueueReady(self: *WorkGraph, id: u32) !void {
@@ -246,14 +275,12 @@ pub const WorkGraph = struct {
             .write => self.write_backend,
             .build => self.build_backend,
         };
-        const conn = backend.open(backend.ctx) catch |err| {
-            self.mu.lock();
-            if (self.first_error == null) self.first_error = err;
-            self.mu.unlock();
-            self.drainDead(kind);
-            return;
-        };
-        defer backend.close(backend.ctx, conn);
+        // Connect lazily on the first node so idle workers (a small build that
+        // never fills a pool) never open a connection. `open_failed` sticks: once
+        // a worker can't connect, it fails its remaining nodes.
+        var conn: ?*anyopaque = null;
+        var open_failed = false;
+        defer if (conn) |c| backend.close(backend.ctx, c);
 
         const q = self.readyQueue(kind);
         while (true) {
@@ -270,23 +297,40 @@ pub const WorkGraph = struct {
             }
             const id = q.orderedRemove(0);
             self.nodes.items[id].state = .running;
-            const failed = self.first_error != null;
+            const aborted = self.first_error != null;
             const sp = self.nodes.items[id].store_path;
             const tx = self.nodes.items[id].text;
             const refs = self.nodes.items[id].references;
             self.mu.unlock();
 
             var apply_err: ?anyerror = null;
-            if (!failed) {
-                const refs_const: []const []const u8 = refs;
-                backend.apply(backend.ctx, conn, sp, tx, refs_const) catch |err| {
-                    apply_err = err;
-                };
-            } else {
+            if (aborted) {
                 apply_err = error.Aborted;
+            } else {
+                if (conn == null and !open_failed) {
+                    conn = backend.open(backend.ctx) catch |err| blk: {
+                        open_failed = true;
+                        self.recordErr(err);
+                        break :blk null;
+                    };
+                }
+                if (open_failed) {
+                    apply_err = error.StoreUnavailable;
+                } else {
+                    const refs_const: []const []const u8 = refs;
+                    backend.apply(backend.ctx, conn.?, sp, tx, refs_const) catch |err| {
+                        apply_err = err;
+                    };
+                }
             }
             self.complete(id, apply_err);
         }
+    }
+
+    fn recordErr(self: *WorkGraph, err: anyerror) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.first_error == null) self.first_error = err;
     }
 
     /// Mark node `id` finished, propagate to dependents, wake a parked fiber (for
@@ -308,35 +352,18 @@ pub const WorkGraph = struct {
         // Wake all workers so an idle one re-checks the `done and outstanding==0`
         // exit condition even when this completion enqueued nothing.
         self.wakeAll();
-        // Capture the wakeup fields before unlocking (the parked fiber may resume
-        // and reuse its stack the instant we publish).
-        const fut = node.wait_future;
-        const res = node.result;
+        // Snapshot the waiter list before unlocking: publishing wakes a parked
+        // fiber that may resume and (for a build) even free the future's frame,
+        // but the futures live on stable WorkerFibers, and the list memory is the
+        // node's (freed only in `finish`, after all workers join). Take the slice
+        // out so we can publish after releasing the lock.
+        const waiters = node.waiters.items;
+        const outcome: anyerror!void = if (apply_err) |e| e else {};
         self.mu.unlock();
 
-        if (fut) |f| {
-            if (res) |r| r.* = if (apply_err) |e| e else {};
-            f.publish();
-        }
-    }
-
-    fn drainDead(self: *WorkGraph, kind: NodeKind) void {
-        const q = self.readyQueue(kind);
-        while (true) {
-            self.mu.lock();
-            while (q.items.len == 0 and !(self.done and self.outstanding == 0)) {
-                const s = self.seq.load(.acquire);
-                self.mu.unlock();
-                stable.Futex.wait(&self.seq, s);
-                self.mu.lock();
-            }
-            if (q.items.len == 0) {
-                self.mu.unlock();
-                return;
-            }
-            const id = q.orderedRemove(0);
-            self.mu.unlock();
-            self.complete(id, error.StoreUnavailable);
+        for (waiters) |w| {
+            if (w.result) |r| r.* = outcome;
+            w.future.publish();
         }
     }
 

@@ -514,10 +514,9 @@ pub fn realize(
     // is JOINED before its sink `egbp` and the progress tree are torn down — on
     // every return, including the eval-error paths — so no wave calls into freed
     // state. Best-effort: a start failure just disables pipelining.
-    var egbp = build_progress.EagerBuildSink.init(allocator, progress.sink().spans);
-    defer egbp.deinit();
-    const eager_sink = if (term.show_progress) egbp.sink() else null;
-    ev.startEagerBuilds(eager_sink, run.buildMode(options)) catch {};
+    var egbp = build_progress.EagerBuildSpans.init(progress.sink().spans);
+    const eager_spans = if (term.show_progress) egbp.provider() else null;
+    ev.startEagerBuilds(eager_spans, run.buildMode(options)) catch {};
     defer ev.finishEagerBuilds() catch {};
 
     const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {

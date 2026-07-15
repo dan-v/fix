@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const store = @import("runtime").store;
+const daemon_runtime = @import("runtime").daemon_runtime;
 const eval_progress = @import("fix").eval_progress;
 const EvalProgress = @import("cli.zig").EvalProgress;
 
@@ -65,58 +66,31 @@ pub const BuildProgress = struct {
     }
 };
 
-/// Build progress for the eager build pump, which runs off the demand fiber on
-/// its own thread. Unlike `BuildProgress` (which drives the demand-path child
-/// nodes), this routes every activity through the thread-safe *concurrent-span*
-/// channel (`SpanSink`, the `.build` group) — the only progress path an
-/// off-demand thread may touch without corrupting the demand fiber's
-/// single-writer stage stack. Driven solely by the pump thread (one connection
-/// = one serial stderr stream), so its `id -> Span` map needs no lock.
-pub const EagerBuildSink = struct {
+/// Live per-build progress for the work-graph build pool. Each build worker runs
+/// on its own thread + connection, so this hands the graph a thread-safe
+/// `DaemonRuntime.BuildSpans`: one span per build via the *concurrent-span*
+/// channel (`SpanSink`, the `.build` group) — the only progress path off-demand
+/// threads may touch (lock-free node ops + a span mutex). One span per build
+/// (not per daemon activity) means no shared per-activity map and no
+/// cross-connection id collisions.
+pub const EagerBuildSpans = struct {
     spans: eval_progress.SpanSink,
-    allocator: std.mem.Allocator,
-    nodes: std.AutoHashMapUnmanaged(u64, eval_progress.Span) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, spans: eval_progress.SpanSink) EagerBuildSink {
-        return .{ .spans = spans, .allocator = allocator };
+    pub fn init(spans: eval_progress.SpanSink) EagerBuildSpans {
+        return .{ .spans = spans };
     }
 
-    pub fn deinit(self: *EagerBuildSink) void {
-        var it = self.nodes.valueIterator();
-        while (it.next()) |span| self.spans.endSpan(span.*);
-        self.nodes.deinit(self.allocator);
-        self.nodes = .empty;
+    pub fn provider(self: *EagerBuildSpans) daemon_runtime.DaemonRuntime.BuildSpans {
+        return .{ .ctx = self, .begin = begin, .end = end };
     }
 
-    pub fn sink(self: *EagerBuildSink) store.BuildSink {
-        return .{
-            .context = self,
-            .on_start = onStart,
-            .on_stop = onStop,
-            .on_progress = onProgress,
-            .on_log = onLog,
-        };
+    fn begin(ctx: *anyopaque, name: []const u8) u64 {
+        const self: *EagerBuildSpans = @ptrCast(@alignCast(ctx));
+        return self.spans.beginSpan(.build, name).token;
     }
 
-    fn onStart(context: *anyopaque, id: u64, activity_type: u64, text: []const u8) void {
-        _ = activity_type;
-        const self: *EagerBuildSink = @ptrCast(@alignCast(context));
-        const span = self.spans.beginSpan(.build, text);
-        self.nodes.put(self.allocator, id, span) catch self.spans.endSpan(span);
-    }
-
-    fn onStop(context: *anyopaque, id: u64) void {
-        const self: *EagerBuildSink = @ptrCast(@alignCast(context));
-        if (self.nodes.fetchRemove(id)) |kv| self.spans.endSpan(kv.value);
-    }
-
-    fn onProgress(context: *anyopaque, id: u64, done: u64, expected: u64) void {
-        const self: *EagerBuildSink = @ptrCast(@alignCast(context));
-        if (self.nodes.get(id)) |span| self.spans.updateSpan(span, done, expected);
-    }
-
-    fn onLog(context: *anyopaque, line: []const u8) void {
-        _ = context;
-        _ = line;
+    fn end(ctx: *anyopaque, token: u64) void {
+        const self: *EagerBuildSpans = @ptrCast(@alignCast(ctx));
+        self.spans.endSpan(.{ .token = @intCast(token) });
     }
 };
