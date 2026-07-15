@@ -30,7 +30,7 @@ pub fn storePathForSourceName(
     path: []const u8,
     name: []const u8,
 ) ![]u8 {
-    return storePathForFilteredSource(allocator, derivations, files, path, name, null);
+    return storePathForFilteredSource(allocator, derivations, files, path, name, null, null);
 }
 
 /// A source added to (or computed for) the store.
@@ -46,9 +46,22 @@ pub const Ingested = struct {
     }
 };
 
+/// Identity of the Nix `filter` predicate for a filtered ingest, so the source
+/// memo can reuse a repeated `(path, name, filter)` result. `object_id` is the
+/// predicate lambda's heap ObjectId; `token` is the heap GC token — a GC can
+/// reuse the id for a different lambda, so the memo entry stores the token and a
+/// mismatch is a miss (mirrors `DerivationStore.lookupLazyDerivation`). Built
+/// only for heap-object predicates (closures/partial-apps); a bare primop
+/// predicate has no such identity and is passed `null` (never memoized).
+pub const FilterKey = struct { object_id: u32, token: u64 };
+
 /// Compute the store path + NAR hash for `path` (serialized under `filter`)
 /// and, when a daemon is attached, add the content to the store. Serializing to
 /// hash is what the hasher already did, so the add costs only the socket write.
+///
+/// `filter_key` names the predicate's identity so a repeated identical filter is
+/// memoized; pass `null` for unfiltered ingests or predicates without a stable
+/// heap identity.
 pub fn ingest(
     allocator: std.mem.Allocator,
     derivations: *DerivationStore,
@@ -56,8 +69,9 @@ pub fn ingest(
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
+    filter_key: ?FilterKey,
 ) !Ingested {
-    return ingestReport(allocator, derivations, files, path, name, filter, null);
+    return ingestReport(allocator, derivations, files, path, name, filter, filter_key, null);
 }
 
 /// `ingest`, but records the offending path into `unsupported` (when non-null)
@@ -70,9 +84,47 @@ pub fn ingestReport(
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
+    filter_key: ?FilterKey,
     unsupported: ?*nar.Unsupported,
 ) !Ingested {
+    // In-eval source memo (Nix's `srcToStore`): an ingest of the same (path,
+    // name[, filter]) is fully determined by content, which `FileCache` freezes
+    // for the eval — so reuse the first coercion's store path + NAR hash instead
+    // of re-serializing + re-hashing the tree. An unfiltered ingest is always
+    // memoizable (content-stable key). A *filtered* ingest is memoized only when
+    // we have the predicate's identity (`filter_key`), keyed on its ObjectId +
+    // guarded by the GC token; a filter without a stable identity is recomputed.
+    const filter_id: ?u32 = if (filter == null) null else if (filter_key) |k| k.object_id else null;
+    const token: ?u64 = if (filter_key) |k| k.token else null;
+    const memoizable = filter == null or filter_id != null;
+    if (memoizable) {
+        if (try derivations.lookupSourceMemo(allocator, path, name, true, filter_id, token)) |hit| {
+            return .{ .store_path = hit.store_path, .nar_hash = hit.nar_hash };
+        }
+    }
+
     const payload_allocator = derivations.allocator;
+
+    // Plain-eval fast path: for an unfiltered source we only need the digest
+    // (the store path). Stream the NAR straight into the hash — never
+    // materializing the whole-tree buffer — and register a `lazy_source` recipe
+    // that re-serializes from disk only if the content is later demanded (IFD /
+    // realization, which run mid-eval while FileCache still holds the frozen
+    // content). Gated on the store having a FileCache handle to replay through.
+    if (filter == null and !derivations.store_writes_enabled and derivations.files != null) {
+        var digest = try nar.hashStreamingReport(payload_allocator, files, path, null, unsupported);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
+        errdefer allocator.free(store_path);
+        const nar_hash = try sriHash(allocator, &digest);
+        errdefer allocator.free(nar_hash);
+        try derivations.recordLazySourceRecipe(store_path, path, name);
+        if (memoizable) {
+            derivations.storeSourceMemo(path, name, true, filter_id, token orelse 0, store_path, nar_hash) catch {};
+        }
+        return .{ .store_path = store_path, .nar_hash = nar_hash };
+    }
+
     const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
     var nar_owned = true;
     defer if (nar_owned) payload_allocator.free(nar_bytes);
@@ -87,6 +139,13 @@ pub fn ingestReport(
     try derivations.noteProducerPayloadForTest(store_path, nar_bytes);
     nar_owned = false; // recordOwnedNarRecipe consumes on success and error.
     try derivations.recordOwnedNarRecipe(store_path, nar_bytes);
+    // Memoize the result so later coercions of this source skip the serialize +
+    // hash above. A memo-insert failure is non-fatal — worst case a future
+    // coercion recomputes. `token` is only consulted for filtered entries; pass
+    // 0 for the unfiltered case.
+    if (memoizable) {
+        derivations.storeSourceMemo(path, name, true, filter_id, token orelse 0, store_path, nar_hash) catch {};
+    }
     return .{ .store_path = store_path, .nar_hash = nar_hash };
 }
 
@@ -127,8 +186,9 @@ pub fn storePathForFilteredSource(
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
+    filter_key: ?FilterKey,
 ) ![]u8 {
-    return storePathForFilteredSourceReport(allocator, derivations, files, path, name, filter, null);
+    return storePathForFilteredSourceReport(allocator, derivations, files, path, name, filter, filter_key, null);
 }
 
 /// `storePathForFilteredSource`, but records the offending path into
@@ -140,9 +200,10 @@ pub fn storePathForFilteredSourceReport(
     path: []const u8,
     name: []const u8,
     filter: ?nar.Filter,
+    filter_key: ?FilterKey,
     unsupported: ?*nar.Unsupported,
 ) ![]u8 {
-    const ingested = try ingestReport(allocator, derivations, files, path, name, filter, unsupported);
+    const ingested = try ingestReport(allocator, derivations, files, path, name, filter, filter_key, unsupported);
     allocator.free(ingested.nar_hash);
     return ingested.store_path;
 }

@@ -5,6 +5,7 @@ const DerivationStore = @import("derivation").DerivationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
 const nar = @import("runtime").nar;
+const FileCache = @import("runtime").file_cache.FileCache;
 const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
 
 fn recipeInspectionAvailable() bool {
@@ -114,6 +115,18 @@ fn expectRecipeNar(store: *DerivationStore, store_path: []const u8, payload: []c
     } else unreachable;
 }
 
+/// A plain-eval unfiltered source now defers to a `lazy_source` recipe (no
+/// retained NAR bytes); it re-serializes from disk on realization. Assert the
+/// deferred shape here — the correct NAR bytes are checked at the realization
+/// effect, which exercises the replay end to end.
+fn expectRecipeLazySource(store: *DerivationStore, store_path: []const u8) !void {
+    if (comptime recipeInspectionAvailable()) {
+        try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.lazy_source, store.recipeVariantForTest(store_path).?);
+        try std.testing.expectEqual(@as(?[]const u8, null), store.recipePayloadBytesForTest(store_path));
+        try expectRefsEqual(store.recipeReferencesForTest(store_path).?, &.{});
+    } else unreachable;
+}
+
 fn expectRecipeFlat(store: *DerivationStore, store_path: []const u8, expected_ptr: usize, payload: []const u8) !void {
     if (comptime recipeInspectionAvailable()) {
         try std.testing.expectEqual(DerivationStore.RecipeVariantForTest.flat, store.recipeVariantForTest(store_path).?);
@@ -208,11 +221,59 @@ test "storeless builtins.path recursive source records the serialized NAR" {
         const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.files, tree_path, null);
         defer fixture.allocator.free(nar_bytes);
 
+        // Plain eval defers the source: a lazy_source recipe, not retained NAR.
+        try std.testing.expectEqual(@as(usize, 1), fixture.ev.derivations.recipeCountForTest());
+        try expectRecipeLazySource(&fixture.ev.derivations, store_path);
+
+        // Realizing it re-serializes from disk and hands the daemon the exact
+        // same NAR bytes the store path was computed from — the lazy round-trip.
+        try fixture.ev.derivations.ensureClosure(store_path);
+        try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
+        try expectEffect(fixture.fake, 0, .nar, storePathSubject(store_path), nar_bytes, &.{});
+        try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
+    } else return error.MissingRecipeInspectionApi;
+}
+
+test "storeless builtins.path with a filter records the serialized NAR eagerly (not deferred)" {
+    if (comptime recipeInspectionAvailable()) {
+        var fixture = try Fixture.init(std.testing.allocator, false);
+        defer fixture.deinit();
+        try fixture.tmp.dir.createDir(std.testing.io, "tree", .default_dir);
+        try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tree/keep.txt", .data = "keep me" });
+        try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tree/drop.dat", .data = "drop me" });
+
+        const cwd = try std.process.currentPathAlloc(std.testing.io, fixture.allocator);
+        defer fixture.allocator.free(cwd);
+        const tree_path = try std.fs.path.resolve(fixture.allocator, &.{ cwd, ".zig-cache", "tmp", &fixture.tmp.sub_path, "tree" });
+        defer fixture.allocator.free(tree_path);
+        // A filter makes the result depend on a Nix predicate, so it can't take
+        // the deferred lazy_source path — it must serialize + retain the NAR now.
+        const source = try std.fmt.allocPrint(
+            fixture.allocator,
+            "builtins.path {{ path = \"{s}\"; name = \"filtered-tree\"; filter = (p: t: (builtins.match \".*[.]dat\" p) == null); }}",
+            .{tree_path},
+        );
+        defer fixture.allocator.free(source);
+
+        const store_path = try valueText(&fixture, try fixture.ev.evaluate(source));
+
+        // Reconstruct the expected NAR under the same filter (drop *.dat).
+        const Ctx = struct {
+            fn accept(_: *anyopaque, path: []const u8, _: FileCache.FileKind) anyerror!bool {
+                return !std.mem.endsWith(u8, path, ".dat");
+            }
+        };
+        var ctx: u8 = 0;
+        const nar_bytes = try nar.serialize(fixture.allocator, &fixture.ev.files, tree_path, .{
+            .context = &ctx,
+            .accept = Ctx.accept,
+        });
+        defer fixture.allocator.free(nar_bytes);
+
         try std.testing.expectEqual(@as(usize, 1), fixture.ev.derivations.recipeCountForTest());
         try expectRecipeNar(&fixture.ev.derivations, store_path, nar_bytes);
 
         try fixture.ev.derivations.ensureClosure(store_path);
-        try std.testing.expectEqual(@as(usize, 1), fixture.fake.effectCount());
         try expectEffect(fixture.fake, 0, .nar, storePathSubject(store_path), nar_bytes, &.{});
         try std.testing.expectEqual(@as(usize, 0), fixture.ev.derivations.recipeCountForTest());
     } else return error.MissingRecipeInspectionApi;
@@ -331,7 +392,7 @@ test "realizeOutput realizes a mixed producer closure before the root derivation
 
         try std.testing.expectEqual(@as(usize, 4), fixture.ev.derivations.recipeCountForTest());
         try expectRecipeText(&fixture.ev.derivations, text_path, "text dep payload", &.{});
-        try expectRecipeNar(&fixture.ev.derivations, src_store_path, nar_bytes);
+        try expectRecipeLazySource(&fixture.ev.derivations, src_store_path);
         try expectRecipeFlat(&fixture.ev.derivations, flat_store_path, @intFromPtr(retained.bytes().ptr), "flat dep payload");
         try expectRecipeText(&fixture.ev.derivations, drv_path, records[0].drv_aterm, records[0].drv_text_references);
 

@@ -196,7 +196,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
 /// in `unsupported` when the source contains an unsupported node (fifo/socket).
 fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filter_value: Value, unsupported: *nar.Unsupported) !source_paths.Ingested {
     if (filter_value.isNull()) {
-        return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, null, unsupported);
+        return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, null, null, unsupported);
     }
     const pred = try vm_force.forceValue(self, filter_value);
     const Context = struct {
@@ -212,5 +212,5 @@ fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filt
     return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, .{
         .context = &context,
         .accept = Context.accept,
-    }, unsupported);
+    }, fetch.filterKeyOf(self, pred), unsupported);
 }

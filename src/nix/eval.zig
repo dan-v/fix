@@ -1255,6 +1255,12 @@ pub const Evaluator = struct {
     }
 
     fn evaluateTop(self: *Evaluator, source: []const u8, source_path: ?[]const u8, scope: ?Value) !Value {
+        // Bind the store's FileCache handle to our *current* address every eval.
+        // The store keeps it only to re-serialize deferred `lazy_source` recipes
+        // on demand (IFD / realization, which run within this pinned call). Doing
+        // it here — not at setup time — is robust to the Evaluator being moved
+        // after construction (e.g. test fixtures build it locally then return it).
+        self.derivations.setFileCache(&self.files);
         // Build the builtins attrset on the main thread before any helpers
         // can race on it. `buildAttrSet` predicts the next ObjectId for
         // the self-reference `builtins.builtins`; that prediction is only

@@ -13,6 +13,7 @@ const clone = @import("clone.zig");
 const stable = @import("base").sync;
 const runtime = @import("runtime");
 const rstore = runtime.store;
+const nar = runtime.nar;
 const FileCache = runtime.file_cache.FileCache;
 const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
 
@@ -60,6 +61,20 @@ pub const DerivationStore = struct {
     lazy_drv_cache: std.AutoHashMapUnmanaged(u32, LazyDrvEntry) = .empty,
     lazy_drv_mu: stable.SpinMutex = .{},
 
+    /// In-eval source-copy memo — fix's analogue of Nix's `EvalState::srcToStore`.
+    /// Maps an *unfiltered* source ingestion (keyed by `<r|f><name>\x00<abs-path>`)
+    /// to its computed store path + NAR hash, so repeatedly coercing the same
+    /// source (`src = ./.` referenced many times) NAR-serializes + hashes the tree
+    /// once instead of on every coercion. Only unfiltered ingests are memoized: a
+    /// `filter` makes the result depend on a Nix predicate whose behavior can't be
+    /// keyed cheaply (and would need the GC-id-reuse guard `lazy_drv_cache` uses).
+    /// The source content is frozen for the eval by `FileCache`, so this makes the
+    /// same immutability assumption Nix's `srcToStore` does. Guarded by
+    /// `source_memo_mu`. Both the key and the stored slices are owned by
+    /// `allocator`, freed in `deinit`.
+    source_memo: std.StringHashMapUnmanaged(SourceMemoEntry) = .empty,
+    source_memo_mu: stable.SpinMutex = .{},
+
     /// The nix-daemon connection, connected lazily on the first store write and
     /// owned/closed here (like Nix, which only touches the store on demand).
     /// Guarded by `daemon_mu` so parallel forcing fibers serialize on the one
@@ -73,6 +88,13 @@ pub const DerivationStore = struct {
     /// path pays one cheap `isValidPath` round-trip instead of streaming the
     /// whole text/NAR the daemon would just hash and discard.
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
+    /// The evaluator's FileCache, set alongside the runtime. Lets a deferred
+    /// `lazy_source` recipe re-serialize its source from disk on demand (IFD /
+    /// closure write) instead of retaining the NAR bytes from eval. Safe because
+    /// FileCache freezes source content for the eval's lifetime, and lazy_source
+    /// recipes are only produced (and only replayed) during eval. Null in tests
+    /// and the `fix store` CLI → sources fall back to eager NAR retention.
+    files: ?*FileCache = null,
     io: ?std.Io = null,
     /// Path to the nix-daemon socket. Defaults to Nix's well-known location;
     /// `setDaemonSocket` (from `$NIX_DAEMON_SOCKET_PATH`) overrides it, pointing
@@ -202,7 +224,7 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub const RecipeVariantForTest = enum { text, nar, flat };
+    pub const RecipeVariantForTest = enum { text, nar, flat, lazy_source };
 
     pub fn recipeCountForTest(self: *DerivationStore) usize {
         if (comptime builtin.is_test) {
@@ -221,6 +243,7 @@ pub const DerivationStore = struct {
                 .text => .text,
                 .nar => .nar,
                 .flat => .flat,
+                .lazy_source => .lazy_source,
             };
         } else return null;
     }
@@ -242,6 +265,7 @@ pub const DerivationStore = struct {
                 .text => |text| text.bytes,
                 .nar => |bytes| bytes,
                 .flat => |bytes| bytes.bytes(),
+                .lazy_source => null, // no eval-time bytes; re-serialized on demand
             };
         } else return null;
     }
@@ -255,6 +279,16 @@ pub const DerivationStore = struct {
     }
 
     const LazyDrvEntry = struct { token: u64, bits: u64 };
+
+    /// A memoized source ingestion. Both slices are owned by the
+    /// `DerivationStore.allocator` and freed in `deinit`. `token` is the heap GC
+    /// token at store time — only meaningful for filtered entries (whose key
+    /// includes a reusable ObjectId); unfiltered entries ignore it.
+    const SourceMemoEntry = struct { store_path: []u8, nar_hash: []u8, token: u64 };
+
+    /// A source-memo hit, with slices duplicated into the *caller's* allocator
+    /// so it can be dropped into an `Ingested` (which is caller-owned).
+    pub const SourceMemoHit = struct { store_path: []u8, nar_hash: []u8 };
 
     const Record = struct {
         hash_modulo: HashModulo,
@@ -335,10 +369,21 @@ pub const DerivationStore = struct {
             references: [][]u8,
         };
 
+        /// A deferred source: re-serialize the NAR from `path` (a filesystem
+        /// source) on demand rather than retaining the eval-time bytes. Used only
+        /// in plain eval for unfiltered sources; replayed via the store's
+        /// FileCache (which holds the frozen content), so the re-serialized bytes
+        /// match the store path computed at eval time.
+        const LazySource = struct {
+            path: []u8,
+            name: []u8,
+        };
+
         const Payload = union(enum) {
             text: TextPayload,
             nar: []u8,
             flat: FileCache.ImmutableBytes,
+            lazy_source: LazySource,
         };
 
         fn deinit(self: *Recipe, allocator: std.mem.Allocator) void {
@@ -350,6 +395,10 @@ pub const DerivationStore = struct {
                 },
                 .nar => |nar_bytes| allocator.free(nar_bytes),
                 .flat => |*bytes| bytes.release(),
+                .lazy_source => |src| {
+                    allocator.free(src.path);
+                    allocator.free(src.name);
+                },
             }
             allocator.destroy(self);
         }
@@ -386,6 +435,16 @@ pub const DerivationStore = struct {
                 else => &.{},
             };
         }
+
+        /// Whether this is a deferred (re-serialize-on-demand) source. A store
+        /// path is content-addressed, so a second recording of the same path —
+        /// even by a different ingest route (e.g. `filterSource (_: true)` on a
+        /// single file yields the same NAR as the bare coercion) — represents
+        /// identical content; recording sites treat an existing lazy_source as
+        /// compatible rather than a `RecipeConflict`, keeping the deferred form.
+        fn isLazySource(self: *const Recipe) bool {
+            return self.payload == .lazy_source;
+        }
     };
 
     fn recipePayloadPointer(recipe: *const Recipe) usize {
@@ -393,6 +452,7 @@ pub const DerivationStore = struct {
             .text => |text| @intFromPtr(text.bytes.ptr),
             .nar => |bytes| @intFromPtr(bytes.ptr),
             .flat => |bytes| @intFromPtr(bytes.bytes().ptr),
+            .lazy_source => |src| @intFromPtr(src.path.ptr),
         };
     }
 
@@ -476,6 +536,13 @@ pub const DerivationStore = struct {
         }
         self.records.deinit(self.allocator);
         self.lazy_drv_cache.deinit(self.allocator);
+        var src_memo = self.source_memo.iterator();
+        while (src_memo.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.store_path);
+            self.allocator.free(entry.value_ptr.nar_hash);
+        }
+        self.source_memo.deinit(self.allocator);
         var inst = self.instantiated.keyIterator();
         while (inst.next()) |key| self.allocator.free(key.*);
         self.instantiated.deinit(self.allocator);
@@ -520,6 +587,12 @@ pub const DerivationStore = struct {
     /// Provide the IO handle used to connect to the daemon on demand.
     pub fn setIo(self: *DerivationStore, io: std.Io) void {
         self.io = io;
+    }
+
+    /// Provide the evaluator's FileCache so deferred `lazy_source` recipes can
+    /// re-serialize from disk on demand (see the `files` field).
+    pub fn setFileCache(self: *DerivationStore, files: *FileCache) void {
+        self.files = files;
     }
 
     /// Enable writing forced derivations + their sources to the store
@@ -834,7 +907,7 @@ pub const DerivationStore = struct {
 
         if (self.recipes.get(store_path)) |recipe| {
             defer self.allocator.free(text);
-            if (recipe.textMatches(text, references)) return;
+            if (recipe.isLazySource() or recipe.textMatches(text, references)) return;
             return error.RecipeConflict;
         }
 
@@ -861,7 +934,7 @@ pub const DerivationStore = struct {
 
         if (self.recipes.get(store_path)) |recipe| {
             defer self.allocator.free(nar_bytes);
-            if (recipe.narMatches(nar_bytes)) return;
+            if (recipe.isLazySource() or recipe.narMatches(nar_bytes)) return;
             return error.RecipeConflict;
         }
 
@@ -869,6 +942,30 @@ pub const DerivationStore = struct {
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
         recipe.* = .{ .payload = .{ .nar = nar_bytes } };
+
+        const key = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(key);
+        try self.recipes.put(self.allocator, key, recipe);
+    }
+
+    /// Record a deferred plain-eval source: instead of retaining the eval-time
+    /// NAR bytes, remember the (path, name) and re-serialize on demand (see
+    /// `LazySource`). `store_path` is content-addressed, so an existing recipe of
+    /// any kind for it already yields the same bytes — keep it. Only valid off
+    /// the store-writes path (plain eval); the caller gates on `store_writes_enabled`.
+    pub fn recordLazySourceRecipe(self: *DerivationStore, store_path: []const u8, path: []const u8, name: []const u8) !void {
+        self.recipe_mu.lock();
+        defer self.recipe_mu.unlock();
+
+        if (self.recipes.contains(store_path)) return;
+
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const recipe = try self.allocator.create(Recipe);
+        errdefer self.allocator.destroy(recipe);
+        recipe.* = .{ .payload = .{ .lazy_source = .{ .path = owned_path, .name = owned_name } } };
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
@@ -886,7 +983,7 @@ pub const DerivationStore = struct {
         var retained = handle.retain();
         if (self.recipes.get(store_path)) |recipe| {
             defer retained.release();
-            if (recipe.flatMatches(handle)) return;
+            if (recipe.isLazySource() or recipe.flatMatches(handle)) return;
             return error.RecipeConflict;
         }
         errdefer retained.release();
@@ -1067,6 +1164,15 @@ pub const DerivationStore = struct {
             .text => |text| try self.applyDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
             .nar => |nar_bytes| try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
             .flat => |bytes| try self.applyDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
+            .lazy_source => |src| {
+                // Deferred plain-eval source: re-serialize the NAR from disk now
+                // (FileCache holds the eval-time content, so the bytes — and thus
+                // the hash — match the store path computed at eval time), then add.
+                const files = self.files orelse return error.MissingStoreRecipe;
+                const nar_bytes = try nar.serialize(self.allocator, files, src.path, null);
+                defer self.allocator.free(nar_bytes);
+                try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
+            },
         }
         self.releaseRecipeForPath(store_path);
     }
@@ -1238,6 +1344,94 @@ pub const DerivationStore = struct {
             => true,
             else => false,
         };
+    }
+
+    /// Build the composite source-memo key, owned by `key_allocator`.
+    /// Unfiltered: `<r|f><name>\x00<abs-path>`. Filtered: the same, plus
+    /// `\x00<filter-object-id>` — so a filtered ingest can never collide with the
+    /// unfiltered one (or a different filter) for the same path+name. `name` is a
+    /// validated store-path name (no NUL) and `path` is a filesystem path (no
+    /// NUL), so the NUL separators are unambiguous.
+    fn sourceMemoKey(
+        key_allocator: std.mem.Allocator,
+        path: []const u8,
+        name: []const u8,
+        recursive: bool,
+        filter_id: ?u32,
+    ) ![]u8 {
+        const rf: u8 = if (recursive) 'r' else 'f';
+        if (filter_id) |fid| {
+            return std.fmt.allocPrint(key_allocator, "{c}{s}\x00{s}\x00{d}", .{ rf, name, path, fid });
+        }
+        return std.fmt.allocPrint(key_allocator, "{c}{s}\x00{s}", .{ rf, name, path });
+    }
+
+    /// Look up a memoized ingestion. On a hit, the store path + NAR hash are
+    /// duplicated into `out_allocator` (caller-owned, for an `Ingested`).
+    ///
+    /// `filter_id`/`token` are null for unfiltered ingests (keyed purely on
+    /// content-stable path+name, so they survive GCs). For a *filtered* ingest
+    /// the key includes the filter lambda's ObjectId, which a GC can reuse for a
+    /// different lambda — so `token` (the heap GC token) is stored per entry and
+    /// a mismatch is treated as a miss, exactly like `lookupLazyDerivation`.
+    pub fn lookupSourceMemo(
+        self: *DerivationStore,
+        out_allocator: std.mem.Allocator,
+        path: []const u8,
+        name: []const u8,
+        recursive: bool,
+        filter_id: ?u32,
+        token: ?u64,
+    ) !?SourceMemoHit {
+        const key = try sourceMemoKey(self.allocator, path, name, recursive, filter_id);
+        defer self.allocator.free(key);
+        self.source_memo_mu.lock();
+        defer self.source_memo_mu.unlock();
+        const entry = self.source_memo.get(key) orelse return null;
+        if (token) |t| if (entry.token != t) return null; // filter-id reused after GC
+        const store_path = try out_allocator.dupe(u8, entry.store_path);
+        errdefer out_allocator.free(store_path);
+        const nar_hash = try out_allocator.dupe(u8, entry.nar_hash);
+        return SourceMemoHit{ .store_path = store_path, .nar_hash = nar_hash };
+    }
+
+    /// Record a computed ingestion for reuse this eval. Dupes the key and both
+    /// slices into `self.allocator`. On a key collision: an unfiltered entry (or
+    /// a filtered entry whose token still matches) is a genuine race — drop the
+    /// new copy; a filtered entry whose token differs is stale (the filter's
+    /// ObjectId was reused after a GC) — replace it.
+    pub fn storeSourceMemo(
+        self: *DerivationStore,
+        path: []const u8,
+        name: []const u8,
+        recursive: bool,
+        filter_id: ?u32,
+        token: u64,
+        store_path: []const u8,
+        nar_hash: []const u8,
+    ) !void {
+        const key = try sourceMemoKey(self.allocator, path, name, recursive, filter_id);
+        errdefer self.allocator.free(key);
+        const owned_store_path = try self.allocator.dupe(u8, store_path);
+        errdefer self.allocator.free(owned_store_path);
+        const owned_nar_hash = try self.allocator.dupe(u8, nar_hash);
+        errdefer self.allocator.free(owned_nar_hash);
+
+        self.source_memo_mu.lock();
+        defer self.source_memo_mu.unlock();
+        const gop = try self.source_memo.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            const stale = filter_id != null and gop.value_ptr.token != token;
+            if (!stale) {
+                self.allocator.free(owned_store_path);
+                self.allocator.free(owned_nar_hash);
+                return;
+            }
+            self.allocator.free(gop.value_ptr.store_path);
+            self.allocator.free(gop.value_ptr.nar_hash);
+        }
+        gop.value_ptr.* = .{ .store_path = owned_store_path, .nar_hash = owned_nar_hash, .token = token };
     }
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.

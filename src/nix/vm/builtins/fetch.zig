@@ -94,6 +94,18 @@ fn validateStorePathName(name: []const u8) !void {
     if (!derivation.store_name.isValid(name)) return error.InvalidStorePathName;
 }
 
+/// The source-memo identity of a `filter`/`filterSource` predicate. Only a
+/// heap-object predicate (closure, builtin-closure, partial application) has a
+/// stable ObjectId to key on; a bare primop has no GC identity, so it returns
+/// `null` and its filtered ingest is never memoized (recomputed each time). The
+/// GC token pins the id against post-collection reuse (see `FilterKey`).
+pub fn filterKeyOf(self: anytype, pred: Value) ?source_paths.FilterKey {
+    if (pred.isClosure() or pred.isBuiltinClosure() or pred.isPartialApp()) {
+        return .{ .object_id = pred.asObjectId(), .token = self.heap.token };
+    }
+    return null;
+}
+
 pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Value {
     const pred = try vm_force.forceValue(self, pred_arg);
     const root_arg = try pathArg(self, path_arg);
@@ -118,7 +130,7 @@ pub fn builtinFilterSource(self: anytype, pred_arg: Value, path_arg: Value) !Val
     const store_path = source_paths.storePathForFilteredSourceReport(self.allocator, self.derivations, self.files, root, path_ops.baseName(root), .{
         .context = &context,
         .accept = Context.accept,
-    }, &unsupported) catch |err| return reportUnsupportedType(self, &unsupported, err);
+    }, filterKeyOf(self, pred), &unsupported) catch |err| return reportUnsupportedType(self, &unsupported, err);
     defer self.allocator.free(store_path);
     return contextStringWithPath(self, try self.intern.intern(store_path));
 }
@@ -181,7 +193,9 @@ const FetchedOut = struct {
 fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
     _ = rev;
     if (self.derivations.store_writes_enabled) {
-        const ingested = try source_paths.ingest(self.allocator, self.derivations, self.files, cache_path, name, filter);
+        // Fetched trees carry no user-lambda filter identity, so they are never
+        // filter-memoized (pass null); a null `filter` is unfiltered-memoized.
+        const ingested = try source_paths.ingest(self.allocator, self.derivations, self.files, cache_path, name, filter, null);
         return .{ .out_path = ingested.store_path, .nar_hash = ingested.nar_hash };
     }
     // Plain eval: keep the on-disk cache path (readable) and defer the NAR hash
