@@ -24,6 +24,7 @@ pub const fetch_cache = @import("runtime/fetch_cache.zig");
 pub const store = @import("runtime/store.zig");
 pub const io_runtime = @import("runtime/io_runtime.zig");
 pub const daemon_runtime = @import("runtime/daemon_runtime.zig");
+pub const write_graph = @import("runtime/write_graph.zig");
 pub const mem_tag = @import("runtime/mem_tag.zig");
 
 // Common flat re-exports for the most-used types.
@@ -50,5 +51,6 @@ test {
     _ = fetch_cache;
     _ = io_runtime;
     _ = daemon_runtime;
+    _ = write_graph;
     _ = mem_tag;
 }
