@@ -26,6 +26,7 @@ pub const io_runtime = @import("runtime/io_runtime.zig");
 pub const daemon_runtime = @import("runtime/daemon_runtime.zig");
 pub const work_graph = @import("runtime/work_graph.zig");
 pub const reactor = @import("runtime/reactor.zig");
+pub const reactor_stream = @import("runtime/reactor_stream.zig");
 pub const mem_tag = @import("runtime/mem_tag.zig");
 
 // Common flat re-exports for the most-used types.
@@ -54,5 +55,6 @@ test {
     _ = daemon_runtime;
     _ = work_graph;
     _ = reactor;
+    _ = reactor_stream;
     _ = mem_tag;
 }
