@@ -55,17 +55,6 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     // Forcing a derivation now writes its `.drv` (and sources) to the store.
     // The daemon connects lazily on the first write.
     ev.enableStoreWrites();
-    // Run the work graph so the `.drv` closure writes fan out async +
-    // dependency-ordered across a pool of daemon connections — a toplevel
-    // instantiation writes a large `.drv` closure, and the synchronous path would
-    // serialize every write on one connection. IFD demanded mid-eval realizes
-    // through the graph too. Instantiate never builds the top-level output (no
-    // eager instantiation build, no final authoritative build), matching
-    // nix-instantiate. Best-effort: a start failure falls back to synchronous
-    // writes. The deferred finish is a no-op safety net for eval-error paths — the
-    // explicit finish below drains the writes on success.
-    ev.startEagerBuilds(null, run.buildMode(options)) catch {};
-    defer ev.finishEagerBuilds() catch {};
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     var ok = false;
@@ -79,13 +68,9 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);
     };
-
-    // Drain the graph: flush all pending `.drv` writes so the full closure is on
-    // disk before we report success (instantiate's contract). Surfaces the first
-    // write failure.
-    ev.finishEagerBuilds() catch |err| {
-        return storeOrEvalFailure(init, term, options, &ev, source.text, err);
-    };
+    // Each derivation's `.drv` write was offloaded + awaited as it was forced, so
+    // by the time eval returns the full `.drv` closure is already on disk —
+    // instantiate's contract — with no separate drain step.
 
     const drv_path = ev.derivationDrvPath(result) catch |err| {
         return storeOrEvalFailure(init, term, options, &ev, source.text, err);

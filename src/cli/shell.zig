@@ -60,15 +60,6 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     ev.progressSessionBegin(label);
     ev.startProgressSampler();
 
-    // Eval/build pipelining: write `.drv`s + build derivations as they're
-    // instantiated, on the work graph (see cli.realize). The realize helpers
-    // finish it before their final build; the defer is the safety net for early
-    // error returns, joining the graph before the progress tree is torn down.
-    var egbp = cli.build_progress.EagerBuildSpans.init(progress.sink().spans);
-    const eager_spans = if (term.show_progress) egbp.provider() else null;
-    ev.startEagerBuilds(eager_spans, run.buildMode(options)) catch {};
-    defer ev.finishEagerBuilds() catch {};
-
     // Collect the output paths whose bin/ dirs go on PATH. Owned copies —
     // they must survive the evaluator's build-phase memory release (which
     // frees the intern table the raw attr strings borrow).
@@ -82,11 +73,6 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         try realizePackages(allocator, init, &ev, term, options, build_sink, &out_paths)
     else
         try realizeSource(allocator, init, &ev, term, options, build_sink, &out_paths);
-
-    // Join the work graph before tearing down the progress tree (idempotent —
-    // the realize helpers already finish it on success; this covers the
-    // eval-error path, which returns a code without finishing).
-    ev.finishEagerBuilds() catch {};
 
     // Tear the progress bar down before the shell/command takes over.
     build_progress.deinit();
@@ -134,9 +120,6 @@ fn realizePackages(allocator: std.mem.Allocator, init: std.process.Init, ev: *Ev
     }
 
     ev.stopProgressSampler();
-    // Join the build pump and surface any eager-build failure before the final
-    // authoritative build (which the pipelined waves have mostly completed).
-    ev.finishEagerBuilds() catch |err| return run.buildFailure(ev, err);
     // Evaluation is done and its results are copied out: drop the language
     // heap (see build.zig) concurrently with the build phase, which can run
     // for minutes and needs only the daemon connection.
@@ -176,9 +159,6 @@ fn realizeSource(allocator: std.mem.Allocator, init: std.process.Init, ev: *Eval
     ev.stopProgressSampler();
     const derived = try std.fmt.allocPrint(allocator, "{s}!*", .{drv_path});
     defer allocator.free(derived);
-    // Join the build pump and surface any eager-build failure before the final
-    // authoritative build (see realizePackages).
-    ev.finishEagerBuilds() catch |err| return run.buildFailure(ev, err);
     // See realizePackages: results are copied out, so free the language heap
     // concurrently with the build phase.
     ev.buildDerivationsReleasing(&.{derived}, sink, run.buildMode(options)) catch |err| {

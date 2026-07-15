@@ -248,15 +248,15 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         computed.drv_text_references,
     );
 
-    // Instantiation WRITES the `.drv` (above, pipelined through the work graph)
-    // but deliberately does NOT build it. Instantiating a derivation only means it
+    // Instantiation WRITES the `.drv` (above, offloaded onto the IO thread) but
+    // deliberately does NOT build it. Instantiating a derivation only means it
     // was evaluated — not that its output is needed. Building is reserved for
     // exactly what a stock `nix build` realizes: the requested output's closure
     // (the final authoritative `buildPaths`) plus any output demanded mid-eval via
-    // IFD (routed through the graph in `demandPathArg`). Eagerly building every
-    // instantiated `.drv` here also built derivations OUTSIDE the output closure,
-    // and nondeterministically so — which instantiation won the demand-vs-
-    // speculation race decided the set — burning builder time for no output.
+    // IFD (`demandPathArg`). Eagerly building every instantiated `.drv` here also
+    // built derivations OUTSIDE the output closure, and nondeterministically so —
+    // which instantiation won the demand-vs-speculation race decided the set —
+    // burning builder time for no output.
 
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);

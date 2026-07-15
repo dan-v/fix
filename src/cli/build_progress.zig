@@ -5,8 +5,6 @@
 
 const std = @import("std");
 const store = @import("runtime").store;
-const daemon_runtime = @import("runtime").daemon_runtime;
-const eval_progress = @import("fix").eval_progress;
 const EvalProgress = @import("cli.zig").EvalProgress;
 
 pub const BuildProgress = struct {
@@ -63,34 +61,5 @@ pub const BuildProgress = struct {
         // via `nix log`) are dropped so they don't fight the progress bar.
         _ = context;
         _ = line;
-    }
-};
-
-/// Live per-build progress for the work-graph build pool. Each build worker runs
-/// on its own thread + connection, so this hands the graph a thread-safe
-/// `DaemonRuntime.BuildSpans`: one span per build via the *concurrent-span*
-/// channel (`SpanSink`, the `.build` group) — the only progress path off-demand
-/// threads may touch (lock-free node ops + a span mutex). One span per build
-/// (not per daemon activity) means no shared per-activity map and no
-/// cross-connection id collisions.
-pub const EagerBuildSpans = struct {
-    spans: eval_progress.SpanSink,
-
-    pub fn init(spans: eval_progress.SpanSink) EagerBuildSpans {
-        return .{ .spans = spans };
-    }
-
-    pub fn provider(self: *EagerBuildSpans) daemon_runtime.DaemonRuntime.BuildSpans {
-        return .{ .ctx = self, .begin = begin, .end = end };
-    }
-
-    fn begin(ctx: *anyopaque, name: []const u8) u64 {
-        const self: *EagerBuildSpans = @ptrCast(@alignCast(ctx));
-        return self.spans.beginSpan(.build, name).token;
-    }
-
-    fn end(ctx: *anyopaque, token: u64) void {
-        const self: *EagerBuildSpans = @ptrCast(@alignCast(ctx));
-        self.spans.endSpan(.{ .token = @intCast(token) });
     }
 };

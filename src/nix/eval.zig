@@ -422,10 +422,10 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
-    /// Owns every background thread + daemon connection: the fast lane (blocking
-    /// daemon store ops off the compute fibers) and the eager-build lane (see
-    /// `runtime.daemon_runtime`). Heap-allocated so its address is stable — the
-    /// threads capture it, and the Evaluator itself is returned by value.
+    /// Owns the fast IO lane — the background thread that runs blocking daemon
+    /// store ops off the compute fibers (see `runtime.daemon_runtime`).
+    /// Heap-allocated so its address is stable — the thread captures it, and the
+    /// Evaluator itself is returned by value.
     daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
     /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
     regexes: regex_mod.PatternCache,
@@ -669,12 +669,10 @@ pub const Evaluator = struct {
             .gc_import_vms_mu = if (gc.enabled) .{} else {},
             .gc_workers = gc_workers,
         };
-        // Route daemon store writes through the fast lane. `offload` is plain
-        // movable data (a stable heap ptr + a fn ptr), so it survives the
-        // by-value return of `ev`. The store also reaches the runtime directly
-        // for eager builds.
+        // Route daemon store ops (writes, IFD realization, the terminal build)
+        // through the fast lane. `offload` is plain movable data (a stable heap
+        // ptr + a fn ptr), so it survives the by-value return of `ev`.
         ev.derivations.setOffload(.{ .ctx = daemon_rt.fastRuntime(), .run = io_offload.run });
-        ev.derivations.daemon_runtime = daemon_rt;
         return ev;
     }
 
@@ -682,12 +680,11 @@ pub const Evaluator = struct {
         if (self.breakpoints) |*bp| bp.deinit();
         self.releaseEvalState();
         if (self.base_path) |path| self.allocator.free(path);
-        // Stop the daemon runtime (fast + build lanes) before the store's own
+        // Stop the daemon runtime (the fast IO lane) before the store's own
         // connection is closed. Safe here: the scheduler + main worker are
         // already joined (in `releaseEvalState`), so no fiber is still parked on
         // an in-flight fast-lane op.
         self.derivations.clearOffload();
-        self.derivations.daemon_runtime = null;
         self.daemon_runtime.deinit();
         self.allocator.destroy(self.daemon_runtime);
         self.derivations.deinit();
@@ -1568,20 +1565,6 @@ pub const Evaluator = struct {
     /// forwarding the build activity/log stream to `sink` if given.
     pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
         return self.derivations.buildPaths(derived_paths, sink, mode);
-    }
-
-    /// Start eval/build pipelining: launch the work graph so `.drv`s are written
-    /// and derivations build as they are instantiated (see `DerivationStore`).
-    /// Call after `enableStoreWrites`, before evaluation. `spans` drives live
-    /// per-build progress. No-op if `FIX_NO_EAGER_BUILD` is set.
-    pub fn startEagerBuilds(self: *Evaluator, spans: ?runtime.daemon_runtime.DaemonRuntime.BuildSpans, mode: runtime.store.BuildMode) !void {
-        return self.derivations.startEagerBuilds(self.env_map, spans, mode);
-    }
-
-    /// Drain + join the build pump once evaluation is done (before the final
-    /// authoritative build). Returns the first eager-build failure, if any.
-    pub fn finishEagerBuilds(self: *Evaluator) !void {
-        return self.derivations.finishEagerBuilds();
     }
 
     /// Like `buildDerivations`, but tears down the language heap

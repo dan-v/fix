@@ -15,7 +15,6 @@
 const std = @import("std");
 const io_runtime = @import("runtime").io_runtime;
 const thunk_mod = @import("runtime").thunk;
-const daemon_runtime = @import("runtime").daemon_runtime;
 const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("worker.zig");
@@ -48,52 +47,6 @@ pub fn run(ctx: *anyopaque, work: *const fn (*anyopaque) void, work_ctx: *anyopa
         fiber_mod.Fiber.yield();
         wf.state = .running;
     }
-}
-
-/// Park the current fiber until the work graph has written `drv`'s `.drv` (and,
-/// via its edges, the whole `.drv` closure). Used before IFD realizes a
-/// derivation whose `.drv` write is still in flight (async). Reuses the exact
-/// busy-thunk park machinery: the graph `publish()`es the fiber's `io_future`
-/// when the write completes. No-op off a fiber, or if the graph has no write
-/// node for `drv` (already valid / not written via the graph).
-pub fn awaitGraphWrite(rt: *daemon_runtime.DaemonRuntime, drv: []const u8) void {
-    const inner = fiber_mod.currentFiber() orelse return;
-    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
-    var result: anyerror!void = {};
-    const attached = rt.awaitWrite(drv, &wf.io_future, &result) catch return;
-    if (!attached) return;
-    if (wf.io_future.enrollWaiter(&wf.waiter)) {
-        wf.state = .suspended;
-        fiber_mod.Fiber.yield();
-        wf.state = .running;
-    }
-    // `result` holds ok/err; a write error is surfaced by the realize that follows.
-    result catch {};
-}
-
-/// Park the current fiber until the work graph has BUILT `drv` (all outputs,
-/// `<drv>!*`). The build node is gated on `drv`'s `.drv` write, so this awaits
-/// the write landing AND the build finishing. Used by IFD when a derivation
-/// output is demanded mid-eval: routes the realize through the one graph builder
-/// + its warm connection pool instead of driving the daemon directly. Reuses the
-/// busy-thunk park machinery — the graph `publish()`es the fiber's `io_future`
-/// when the build completes. Returns false (having done nothing) when not on a
-/// worker fiber, so the caller can fall back to a direct realize; during eval IFD
-/// is always on a fiber. A build error is surfaced to the caller.
-pub fn awaitGraphBuild(rt: *daemon_runtime.DaemonRuntime, drv: []const u8) anyerror!bool {
-    const inner = fiber_mod.currentFiber() orelse return false;
-    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
-    var result: anyerror!void = {};
-    try rt.buildAwait(drv, &wf.io_future, &result);
-    if (wf.io_future.enrollWaiter(&wf.waiter)) {
-        wf.state = .suspended;
-        fiber_mod.Fiber.yield();
-        wf.state = .running;
-    }
-    try result;
-    return true;
 }
 
 const Cell = struct {

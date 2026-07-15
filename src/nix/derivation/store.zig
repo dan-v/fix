@@ -14,7 +14,6 @@ const stable = @import("base").sync;
 const runtime = @import("runtime");
 const rstore = runtime.store;
 const FileCache = runtime.file_cache.FileCache;
-const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -104,22 +103,6 @@ pub const DerivationStore = struct {
     /// plain `eval` so the hot eval path never does store I/O per derivation
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
-
-    /// Eval/build pipelining: when enabled (build/run/shell/switch, unless
-    /// `FIX_NO_EAGER_BUILD`), the DaemonRuntime's work graph is running. It makes
-    /// `.drv` writes async + dependency-ordered (overlapping the rest of eval) and
-    /// serves as the single builder for IFD-demanded outputs (`demandPathArg`).
-    /// It does NOT build derivations merely because they were instantiated — only
-    /// IFD and the final authoritative closure build realize outputs. Off for
-    /// `eval`/`instantiate` (no realization) and plain eval. See `graphActive`.
-    eager_build_enabled: bool = false,
-    /// The Evaluator-owned runtime that hosts the eager-build lane (set by the
-    /// Evaluator alongside `offload`); `null` outside an Evaluator (tests).
-    daemon_runtime: ?*DaemonRuntime = null,
-    /// Owned copy of the first eager-build failure message, surfaced through
-    /// `lastStoreError` (the build lane has its own connection, so its error is
-    /// not on `daemon.last_error`).
-    eager_error_msg: ?[]u8 = null,
 
     /// Optional off-thread executor for blocking daemon ops. When set (by the
     /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
@@ -461,9 +444,6 @@ pub const DerivationStore = struct {
     }
 
     pub fn deinit(self: *DerivationStore) void {
-        // The build lane is owned + joined by the Evaluator's DaemonRuntime
-        // (before this runs); here we only free our own retained error message.
-        if (self.eager_error_msg) |msg| self.allocator.free(msg);
         self.releaseRecipePayloads();
         self.recipes.deinit(self.allocator);
         self.recipe_mu.lock();
@@ -559,58 +539,6 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
-    /// Start eval/build pipelining: launch the work graph (its own pool of daemon
-    /// connections) that writes `.drv`s + realizes derivations as they are
-    /// instantiated. `spans` drives live per-build progress (may be null).
-    /// Requires store writes enabled and a daemon socket via `setIo`. A no-op if
-    /// `FIX_NO_EAGER_BUILD` is set in `env`.
-    pub fn startEagerBuilds(self: *DerivationStore, env: ?*const std.process.Environ.Map, spans: ?DaemonRuntime.BuildSpans, mode: rstore.BuildMode) !void {
-        if (!self.store_writes_enabled) return;
-        if (env) |em| if (em.get("FIX_NO_EAGER_BUILD") != null) return;
-        const rt = self.daemon_runtime orelse return;
-        const io = self.io orelse return;
-        const dedup: DaemonRuntime.Dedup = .{ .ctx = self, .known = dedupKnown, .mark = dedupMark };
-        try rt.startGraph(self.allocator, io, self.daemon_socket, self.daemon_options, spans, dedup, mode);
-        self.eager_build_enabled = true;
-    }
-
-    /// Thread-safe views of the `instantiated` cache for the work graph's write
-    /// workers (guarded by `daemon_mu`, like every other `instantiated` access).
-    fn dedupKnown(ctx: *anyopaque, path: []const u8) bool {
-        const self: *DerivationStore = @ptrCast(@alignCast(ctx));
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        return self.instantiated.contains(path);
-    }
-    fn dedupMark(ctx: *anyopaque, path: []const u8) void {
-        const self: *DerivationStore = @ptrCast(@alignCast(ctx));
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        self.markInstantiated(path) catch {};
-    }
-
-    /// Is the pipelining work graph running? When true, `.drv` writes are async
-    /// graph nodes and IFD realizes route through the graph builder; when false
-    /// there is no graph and callers drive the daemon directly (`instantiate`).
-    pub fn graphActive(self: *const DerivationStore) bool {
-        return self.eager_build_enabled;
-    }
-
-    /// Drain and join the build lane (call once evaluation has finished, before
-    /// the final authoritative build). Returns the first eager-build error, if
-    /// any — its message is retained in `eager_error_msg` for `lastStoreError`.
-    pub fn finishEagerBuilds(self: *DerivationStore) !void {
-        if (!self.eager_build_enabled) return;
-        self.eager_build_enabled = false;
-        const rt = self.daemon_runtime orelse return;
-        const err = rt.finishGraph();
-        if (rt.takeErrorMsg()) |msg| {
-            if (self.eager_error_msg) |old| self.allocator.free(old);
-            self.eager_error_msg = msg;
-        }
-        if (err) |e| return e;
-    }
-
     /// Install the off-thread daemon-op executor. Must be called before any
     /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
     /// torn down.
@@ -646,10 +574,9 @@ pub const DerivationStore = struct {
     }
 
     /// Read the last daemon error message (for surfacing `error.DaemonError`).
-    /// Prefers an eager-build failure (the pump has its own connection, so its
-    /// error is not on the eval `daemon`), else the eval connection's last error.
+    /// All store I/O — writes, IFD realization, and the terminal build — drives
+    /// the one `daemon` connection, so its `last_error` is authoritative.
     pub fn lastStoreError(self: *DerivationStore) ?[]const u8 {
-        if (self.eager_error_msg) |msg| return msg;
         return if (self.daemon) |d| d.last_error else null;
     }
 
@@ -722,29 +649,20 @@ pub const DerivationStore = struct {
         defer self.daemon_mu.unlock();
         if (self.instantiated.contains(store_path)) return true;
         const daemon = try self.ensureDaemon();
-        return daemon.isValidPath(store_path);
+        const valid = try daemon.isValidPath(store_path);
+        // Cache a positive result: a path valid now stays valid for the eval
+        // (same assumption `instantiated` already makes for writes), so a later
+        // demand of the same path skips the round-trip.
+        if (valid) self.markInstantiated(store_path) catch {};
+        return valid;
     }
 
     /// Realize `derived_paths` (`<drvpath>!<outputs>`, legacy format) via the
     /// daemon, forwarding the build activity/log stream to `sink` if given.
     pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
-        // If the work graph ran, its build workers left warm (options-applied)
-        // connections in the runtime's pool. Reuse one for the terminal build
-        // instead of forking a fresh `self.daemon` on the critical path. The
-        // graph is finished by now (finishEagerBuilds joined its workers), so the
-        // pool is idle and stable.
-        if (self.daemon_runtime) |rt| {
-            if (rt.hasBuildPool()) {
-                rt.buildOnPool(derived_paths, sink, mode) catch |err| {
-                    if (rt.takeErrorMsg()) |msg| {
-                        if (self.eager_error_msg) |old| self.allocator.free(old);
-                        self.eager_error_msg = msg;
-                    }
-                    return err;
-                };
-                return;
-            }
-        }
+        // The terminal build reuses `self.daemon` — already warm + options-applied
+        // from the `.drv` writes / `isValidPath` queries eval drove through it, so
+        // there's no fresh connection fork on the critical path here.
         self.daemon_mu.lock();
         defer self.daemon_mu.unlock();
         const daemon = try self.ensureDaemon();
@@ -848,14 +766,11 @@ pub const DerivationStore = struct {
 
     pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
         if (self.store_writes_enabled) {
-            // With the work graph active (build/run/shell/switch), the `.drv`
-            // write is asynchronous + dependency-ordered: hand `text` to the
-            // graph (which owns it) and DON'T park — the graph writes it, ordered
-            // after its referenced `.drv` writes, on a pool of connections. Plain
-            // `instantiate` (no graph) keeps the synchronous parked write.
-            if (self.eager_build_enabled) {
-                return self.daemon_runtime.?.submitWrite(store_path, text, references);
-            }
+            // The `.drv` write is offloaded onto the serial IO thread while this
+            // fiber parks (other fibers run meanwhile). Inputs are forced — and so
+            // their `.drv`s written — before this dependent derivation, and the IO
+            // thread drains its queue in submission (= reverse-topological) order,
+            // so a `.drv`'s referenced inputs are always in the store before it.
             defer self.allocator.free(text);
             return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } });
         }

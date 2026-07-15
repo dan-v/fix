@@ -507,18 +507,6 @@ pub fn realize(
     ev.progressSessionBegin(run.sourceLabel(source_arg));
     ev.startProgressSampler();
 
-    // Eval/build pipelining: realize derivations as they are instantiated, on a
-    // background pump with its own daemon connection, so builds overlap the rest
-    // of evaluation. Its progress renders via the thread-safe concurrent-span
-    // channel (`EagerBuildSink`). The two defers below (LIFO) guarantee the pump
-    // is JOINED before its sink `egbp` and the progress tree are torn down — on
-    // every return, including the eval-error paths — so no wave calls into freed
-    // state. Best-effort: a start failure just disables pipelining.
-    var egbp = build_progress.EagerBuildSpans.init(progress.sink().spans);
-    const eager_spans = if (term.show_progress) egbp.provider() else null;
-    ev.startEagerBuilds(eager_spans, run.buildMode(options)) catch {};
-    defer ev.finishEagerBuilds() catch {};
-
     const result = ev.evaluatePath(source.text, run.sourcePathOf(source_arg, source)) catch |err| {
         ev.stopProgressSampler();
         ev.progressSessionEnd();
@@ -555,14 +543,6 @@ pub fn realize(
         .program = if (program_borrowed) |p| try allocator.dupe(u8, p) else null,
     };
     errdefer realized.deinit(allocator);
-
-    // Evaluation is done: join the build pump (its waves have overlapped eval)
-    // and surface any eager-build failure before the final authoritative build.
-    // The deferred finish is now a no-op (idempotent).
-    ev.finishEagerBuilds() catch |err| {
-        ev.progressSessionEnd();
-        return .{ .failed = run.buildFailure(ev, err) };
-    };
 
     // Drop the language heap (~2 GB on a NixOS eval) concurrently with the
     // build phase — the build starts immediately, cleanup runs alongside it.
