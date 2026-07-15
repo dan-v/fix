@@ -8,6 +8,39 @@ const types = @import("types.zig");
 
 const DrvInput = types.DrvInput;
 
+// SIMD find-first escape byte: derivation env values (build scripts, PATH
+// lists, dependency closures) are long runs of escape-free bytes, so jump
+// straight to the next char that needs escaping instead of testing every
+// byte with a switch. Same shape as the string-literal scanner's skipToAnyOf.
+const vec_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 0;
+const EscVec = @Vector(vec_len, u8);
+const EscMask = std.meta.Int(.unsigned, if (vec_len == 0) 1 else vec_len);
+
+inline fn escMaskEq(v: EscVec, comptime c: u8) EscMask {
+    return @bitCast(v == @as(EscVec, @splat(c)));
+}
+
+/// Index of the first escape-needing byte (`"`, `\`, `\n`, `\r`, `\t`) at or
+/// after `start`, or `string.len` if the SIMD-reachable prefix has none (the
+/// scalar tail loop finishes the rest).
+inline fn nextEscape(string: []const u8, start: usize) usize {
+    var i = start;
+    if (comptime vec_len > 0) {
+        while (i + vec_len <= string.len) {
+            const v: EscVec = string[i..][0..vec_len].*;
+            var m: EscMask = 0;
+            m |= escMaskEq(v, '"');
+            m |= escMaskEq(v, '\\');
+            m |= escMaskEq(v, '\n');
+            m |= escMaskEq(v, '\r');
+            m |= escMaskEq(v, '\t');
+            if (m != 0) return i + @ctz(m);
+            i += vec_len;
+        }
+    }
+    return i;
+}
+
 pub fn toATerm(drv: anytype, allocator: std.mem.Allocator, mask_outputs: bool, actual_inputs: ?[]const DrvInput) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -107,22 +140,28 @@ fn appendString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     // capacity check). Derivation env values (build scripts, dependency
     // lists) are large and almost entirely escape-free, so this is one
     // `appendSlice` per value in the common case rather than N appends —
-    // and this runs on the w=32 critical path (drv ATerm hashing).
+    // and this runs on the w=32 critical path (drv ATerm hashing). A SIMD
+    // scan (`nextEscape`) jumps straight over the escape-free runs.
     var start: usize = 0;
-    for (string, 0..) |char, i| {
-        const esc: ?[]const u8 = switch (char) {
+    var i: usize = nextEscape(string, 0);
+    while (i < string.len) : (i = nextEscape(string, i)) {
+        const esc: []const u8 = switch (string[i]) {
             '"' => "\\\"",
             '\\' => "\\\\",
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            else => null,
+            // A non-escape byte only appears here as the SIMD tail's scalar
+            // fallthrough handoff; skip it — it stays in the current run.
+            else => {
+                i += 1;
+                continue;
+            },
         };
-        if (esc) |e| {
-            if (i > start) try out.appendSlice(allocator, string[start..i]);
-            try out.appendSlice(allocator, e);
-            start = i + 1;
-        }
+        if (i > start) try out.appendSlice(allocator, string[start..i]);
+        try out.appendSlice(allocator, esc);
+        start = i + 1;
+        i += 1;
     }
     if (start < string.len) try out.appendSlice(allocator, string[start..]);
     try out.append(allocator, '"');
