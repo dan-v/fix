@@ -15,9 +15,12 @@
 const std = @import("std");
 const io_runtime = @import("runtime").io_runtime;
 const thunk_mod = @import("runtime").thunk;
+const rstore = @import("runtime").store;
 const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("worker.zig");
+
+const DaemonPool = rstore.DaemonPool;
 
 /// Matches `DerivationStore.Offload.run`. `ctx` is the `*IoRuntime`.
 pub fn run(ctx: *anyopaque, work: *const fn (*anyopaque) void, work_ctx: *anyopaque) void {
@@ -63,6 +66,67 @@ const Cell = struct {
         // `future`, which lives on the stable WorkerFiber.
         self.work(self.work_ctx);
         self.future.publish();
+    }
+};
+
+/// Submit one daemon op to the connection pool and park the caller until a
+/// worker has run it on a warm connection. `work` receives that worker's
+/// connection (null if the worker could not open one — the op must surface that
+/// as unavailable). On a compute fiber this parks the fiber (yielding its worker,
+/// exactly like forcing a `.busy` thunk); off a fiber (the main-thread terminal
+/// build / `fix store`) it blocks the calling thread — which has nothing else to
+/// do — via `runPoolBlocking`. Matches `DerivationStore.Offload.run`; `ctx` is
+/// the `*DaemonPool`.
+pub fn runOnPool(ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void {
+    const pool: *DaemonPool = @ptrCast(@alignCast(ctx));
+
+    const inner = fiber_mod.currentFiber() orelse return runPoolBlocking(pool, work, work_ctx);
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+
+    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
+
+    var cell: PoolCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future };
+    var job: DaemonPool.Job = .{ .run = PoolCell.run, .ctx = &cell };
+    pool.submit(&job);
+
+    if (wf.io_future.enrollWaiter(&wf.waiter)) {
+        wf.state = .suspended;
+        fiber_mod.Fiber.yield();
+        wf.state = .running;
+    }
+}
+
+const PoolCell = struct {
+    work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void,
+    work_ctx: *anyopaque,
+    future: *thunk_mod.Future,
+
+    fn run(conn: ?*anyopaque, p: *anyopaque) void {
+        const self: *PoolCell = @ptrCast(@alignCast(p));
+        self.work(conn, self.work_ctx);
+        self.future.publish();
+    }
+};
+
+/// Pool submit for a caller with no fiber to park (the main thread, post-eval):
+/// block this thread on a `ResetEvent` the worker sets. The thread would
+/// otherwise be idle, so blocking it costs nothing.
+fn runPoolBlocking(pool: *DaemonPool, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void {
+    var cell: BlockingCell = .{ .work = work, .work_ctx = work_ctx };
+    var job: DaemonPool.Job = .{ .run = BlockingCell.run, .ctx = &cell };
+    pool.submit(&job);
+    cell.done.wait();
+}
+
+const BlockingCell = struct {
+    work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void,
+    work_ctx: *anyopaque,
+    done: std.Thread.ResetEvent = .{},
+
+    fn run(conn: ?*anyopaque, p: *anyopaque) void {
+        const self: *BlockingCell = @ptrCast(@alignCast(p));
+        self.work(conn, self.work_ctx);
+        self.done.set();
     }
 };
 
