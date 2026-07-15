@@ -14,6 +14,7 @@ const stable = @import("base").sync;
 const runtime = @import("runtime");
 const rstore = runtime.store;
 const FileCache = runtime.file_cache.FileCache;
+const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -89,6 +90,20 @@ pub const DerivationStore = struct {
     /// plain `eval` so the hot eval path never does store I/O per derivation
     /// and fetches stay local/offline (returning their download-cache path).
     store_writes_enabled: bool = false,
+
+    /// Eval/build pipelining: when enabled (build/run/shell/switch, unless
+    /// `FIX_NO_EAGER_BUILD`), each derivation instantiated on the demand path is
+    /// fired at the DaemonRuntime's build lane — a background thread with its OWN
+    /// daemon connection — so its build overlaps the rest of evaluation. Off for
+    /// `eval`/`instantiate` (no realization) and plain eval.
+    eager_build_enabled: bool = false,
+    /// The Evaluator-owned runtime that hosts the eager-build lane (set by the
+    /// Evaluator alongside `offload`); `null` outside an Evaluator (tests).
+    daemon_runtime: ?*DaemonRuntime = null,
+    /// Owned copy of the first eager-build failure message, surfaced through
+    /// `lastStoreError` (the build lane has its own connection, so its error is
+    /// not on `daemon.last_error`).
+    eager_error_msg: ?[]u8 = null,
 
     /// Optional off-thread executor for blocking daemon ops. When set (by the
     /// Evaluator, once the worker pool + IoRuntime exist), each store write runs
@@ -420,6 +435,9 @@ pub const DerivationStore = struct {
     }
 
     pub fn deinit(self: *DerivationStore) void {
+        // The build lane is owned + joined by the Evaluator's DaemonRuntime
+        // (before this runs); here we only free our own retained error message.
+        if (self.eager_error_msg) |msg| self.allocator.free(msg);
         self.releaseRecipePayloads();
         self.recipes.deinit(self.allocator);
         self.recipe_mu.lock();
@@ -508,6 +526,42 @@ pub const DerivationStore = struct {
         self.store_writes_enabled = true;
     }
 
+    /// Start eval/build pipelining: spawn the background build pump (its own
+    /// daemon connection) that realizes derivations as they are instantiated.
+    /// `sink` drives live build progress (may be null for silent). Requires
+    /// store writes enabled and a daemon socket reachable via `setIo`. A no-op
+    /// if `FIX_NO_EAGER_BUILD` is set in `env`.
+    pub fn startEagerBuilds(self: *DerivationStore, env: ?*const std.process.Environ.Map, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+        if (!self.store_writes_enabled) return;
+        if (env) |em| if (em.get("FIX_NO_EAGER_BUILD") != null) return;
+        const rt = self.daemon_runtime orelse return;
+        const io = self.io orelse return;
+        try rt.startBuilds(self.allocator, io, self.daemon_socket, self.daemon_options, sink, mode);
+        self.eager_build_enabled = true;
+    }
+
+    /// Fire a freshly instantiated derivation at the build lane. No-op unless
+    /// pipelining is enabled; never blocks on the build.
+    pub fn submitEagerBuild(self: *DerivationStore, drv_path: []const u8) !void {
+        if (!self.eager_build_enabled) return;
+        try self.daemon_runtime.?.submitBuild(drv_path);
+    }
+
+    /// Drain and join the build lane (call once evaluation has finished, before
+    /// the final authoritative build). Returns the first eager-build error, if
+    /// any — its message is retained in `eager_error_msg` for `lastStoreError`.
+    pub fn finishEagerBuilds(self: *DerivationStore) !void {
+        if (!self.eager_build_enabled) return;
+        self.eager_build_enabled = false;
+        const rt = self.daemon_runtime orelse return;
+        const err = rt.finishBuilds();
+        if (rt.takeBuildErrorMsg()) |msg| {
+            if (self.eager_error_msg) |old| self.allocator.free(old);
+            self.eager_error_msg = msg;
+        }
+        if (err) |e| return e;
+    }
+
     /// Install the off-thread daemon-op executor. Must be called before any
     /// forcing begins, and cleared (`clearOffload`) before the IO runtime is
     /// torn down.
@@ -543,7 +597,10 @@ pub const DerivationStore = struct {
     }
 
     /// Read the last daemon error message (for surfacing `error.DaemonError`).
+    /// Prefers an eager-build failure (the pump has its own connection, so its
+    /// error is not on the eval `daemon`), else the eval connection's last error.
     pub fn lastStoreError(self: *DerivationStore) ?[]const u8 {
+        if (self.eager_error_msg) |msg| return msg;
         return if (self.daemon) |d| d.last_error else null;
     }
 

@@ -47,7 +47,7 @@ const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("vm").worker;
 const io_offload = @import("vm").io_offload;
-const io_runtime_mod = @import("runtime").io_runtime;
+const daemon_runtime_mod = @import("runtime").daemon_runtime;
 const eval_gc = @import("eval/gc.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe").prof;
@@ -422,11 +422,11 @@ pub const Evaluator = struct {
     files: FileCache,
     fetchers: FetchCache,
     derivations: DerivationStore,
-    /// Single background thread that runs blocking daemon store ops off the
-    /// compute fibers (see `runtime.io_runtime`). Heap-allocated so its address
-    /// is stable — the thread captures it, and the Evaluator itself is returned
-    /// by value from `init`.
-    io_runtime: *io_runtime_mod.IoRuntime,
+    /// Owns every background thread + daemon connection: the fast lane (blocking
+    /// daemon store ops off the compute fibers) and the eager-build lane (see
+    /// `runtime.daemon_runtime`). Heap-allocated so its address is stable — the
+    /// threads capture it, and the Evaluator itself is returned by value.
+    daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
     /// Compiled-regex cache shared by every VM (`builtins.match`/`split`).
     regexes: regex_mod.PatternCache,
     imports: imports_mod.Registry,
@@ -631,11 +631,11 @@ pub const Evaluator = struct {
         } else {};
         errdefer if (gc.enabled) allocator.free(gc_workers);
 
-        const io_rt = try allocator.create(io_runtime_mod.IoRuntime);
-        errdefer allocator.destroy(io_rt);
-        io_rt.* = io_runtime_mod.IoRuntime.init();
-        try io_rt.start();
-        errdefer io_rt.deinit();
+        const daemon_rt = try allocator.create(daemon_runtime_mod.DaemonRuntime);
+        errdefer allocator.destroy(daemon_rt);
+        daemon_rt.* = daemon_runtime_mod.DaemonRuntime.init();
+        try daemon_rt.start();
+        errdefer daemon_rt.deinit();
 
         var ev: Evaluator = .{
             .allocator = allocator,
@@ -646,7 +646,7 @@ pub const Evaluator = struct {
             .files = FileCache.init(allocator),
             .fetchers = FetchCache.init(allocator),
             .derivations = DerivationStore.init(allocator),
-            .io_runtime = io_rt,
+            .daemon_runtime = daemon_rt,
             .regexes = regex_mod.PatternCache.init(allocator),
             .imports = .{},
             .search_paths = .{},
@@ -669,10 +669,12 @@ pub const Evaluator = struct {
             .gc_import_vms_mu = if (gc.enabled) .{} else {},
             .gc_workers = gc_workers,
         };
-        // Route daemon store writes through the IO thread. `offload` is plain
+        // Route daemon store writes through the fast lane. `offload` is plain
         // movable data (a stable heap ptr + a fn ptr), so it survives the
-        // by-value return of `ev`.
-        ev.derivations.setOffload(.{ .ctx = io_rt, .run = io_offload.run });
+        // by-value return of `ev`. The store also reaches the runtime directly
+        // for eager builds.
+        ev.derivations.setOffload(.{ .ctx = daemon_rt.fastRuntime(), .run = io_offload.run });
+        ev.derivations.daemon_runtime = daemon_rt;
         return ev;
     }
 
@@ -680,13 +682,14 @@ pub const Evaluator = struct {
         if (self.breakpoints) |*bp| bp.deinit();
         self.releaseEvalState();
         if (self.base_path) |path| self.allocator.free(path);
-        // Stop the IO thread before the daemon connection it drives is closed.
-        // Safe here: the scheduler + main worker are already joined (in
-        // `releaseEvalState`), so no fiber is still parked on an in-flight
-        // store op.
+        // Stop the daemon runtime (fast + build lanes) before the store's own
+        // connection is closed. Safe here: the scheduler + main worker are
+        // already joined (in `releaseEvalState`), so no fiber is still parked on
+        // an in-flight fast-lane op.
         self.derivations.clearOffload();
-        self.io_runtime.deinit();
-        self.allocator.destroy(self.io_runtime);
+        self.derivations.daemon_runtime = null;
+        self.daemon_runtime.deinit();
+        self.allocator.destroy(self.daemon_runtime);
         self.derivations.deinit();
     }
 
@@ -1565,6 +1568,44 @@ pub const Evaluator = struct {
     /// forwarding the build activity/log stream to `sink` if given.
     pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
         return self.derivations.buildPaths(derived_paths, sink, mode);
+    }
+
+    /// Start eval/build pipelining: spawn the background build pump so
+    /// derivations build as they are instantiated (see `DerivationStore`).
+    /// Call after `enableStoreWrites`, before evaluation. `sink` drives live
+    /// build progress. No-op if `FIX_NO_EAGER_BUILD` is set.
+    pub fn startEagerBuilds(self: *Evaluator, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
+        return self.derivations.startEagerBuilds(self.env_map, sink, mode);
+    }
+
+    /// Drain + join the build pump once evaluation is done (before the final
+    /// authoritative build). Returns the first eager-build failure, if any.
+    pub fn finishEagerBuilds(self: *Evaluator) !void {
+        return self.derivations.finishEagerBuilds();
+    }
+
+    /// Like `buildDerivations`, but tears down the language heap
+    /// (`releaseEvalState`) *concurrently* with the build instead of before
+    /// it. Evaluation is done and its results are copied out, so the ~2 GB
+    /// eval heap is dead — but freeing it (worker join + segment sweep +
+    /// arena teardown) is real wall-time. Doing it before the build is
+    /// head-of-line blocking: the build should start the moment eval
+    /// finishes, not wait on cleanup. The teardown touches only eval state
+    /// (heap, scheduler, arenas, caches) plus the recipe cache under its own
+    /// `recipe_mu`; `buildPaths` drives the daemon connection under
+    /// `daemon_mu` and never reads recipes, so the two never contend, and
+    /// the base allocator is already thread-safe (the IO thread allocates
+    /// against it during builds). The single build-phase entry point for the
+    /// realizing subcommands — no caller should sequence release-then-build.
+    pub fn buildDerivationsReleasing(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
+        // Release on a helper thread so the build launches immediately. If the
+        // thread can't spawn, fall back to the old serial release-then-build.
+        const releaser = std.Thread.spawn(.{}, releaseEvalState, .{self}) catch blk: {
+            self.releaseEvalState();
+            break :blk null;
+        };
+        defer if (releaser) |t| t.join();
+        return self.buildDerivations(derived_paths, sink, mode);
     }
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via

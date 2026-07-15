@@ -117,12 +117,14 @@ pub const SpanGroup = enum {
     fetch,
     store,
     source,
+    build,
 
     pub fn label(self: SpanGroup) []const u8 {
         return switch (self) {
             .fetch => "fetching",
             .store => "writing to store",
             .source => "copying sources",
+            .build => "building",
         };
     }
 };

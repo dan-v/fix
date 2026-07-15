@@ -248,6 +248,15 @@ fn buildForcedDerivationValue(self: anytype, attrs_id: ObjectId, mode: Derivatio
         computed.drv_text_references,
     );
 
+    // Eval/build pipelining: fire this freshly instantiated `.drv` at the build
+    // pump so its build overlaps the rest of evaluation. Demand-path only —
+    // speculative instantiations aren't necessarily needed, and the demand fiber
+    // self-computes almost all of its own path anyway; anything missed here is
+    // still built by the final authoritative `buildPaths`. No-op unless eager
+    // builds are enabled (build/run/shell/switch). `submitEagerBuild` dups the
+    // path, which is freed on return from this function.
+    if (self.ctx.is_demand) try self.derivations.submitEagerBuild(computed.drv_path);
+
     const outputs = try self.allocator.alloc(derivation.Output, output_names.names.len);
     defer self.allocator.free(outputs);
     for (output_names.names, outputs) |output_name, *output| {
