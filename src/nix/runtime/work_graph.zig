@@ -59,6 +59,9 @@ const Node = struct {
     pending: u32 = 0,
     dependents: std.ArrayListUnmanaged(u32) = .empty,
     state: State = .blocked,
+    /// Under `keep_going`: a dependency failed, so this node can't run (its input
+    /// isn't in the store) — it is skipped-as-failed instead of aborting the graph.
+    dep_failed: bool = false,
 
     fn deinit(self: *Node, alloc: std.mem.Allocator) void {
         alloc.free(self.store_path);
@@ -96,8 +99,12 @@ pub const WorkGraph = struct {
     /// still enqueue work for it — e.g. a build becomes ready when its write
     /// completes). Only `done and outstanding == 0` means truly finished.
     outstanding: usize = 0,
-    /// First write failure and first eager-build failure, surfaced by `finish`.
+    /// First failure, surfaced by `finish`. Without `keep_going` it also aborts
+    /// the rest of the graph; with it, only this node's dependents are skipped.
     first_error: ?anyerror = null,
+    /// `--keep-going`: on a failure, keep running nodes that don't depend on the
+    /// failed one instead of aborting the whole graph.
+    keep_going: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -105,6 +112,7 @@ pub const WorkGraph = struct {
         build_backend: Backend,
         write_worker_count: usize,
         build_worker_count: usize,
+        keep_going: bool,
     ) WorkGraph {
         return .{
             .allocator = allocator,
@@ -112,6 +120,7 @@ pub const WorkGraph = struct {
             .build_backend = build_backend,
             .write_worker_count = @max(write_worker_count, 1),
             .build_worker_count = @max(build_worker_count, 1),
+            .keep_going = keep_going,
         };
     }
 
@@ -297,7 +306,9 @@ pub const WorkGraph = struct {
             }
             const id = q.orderedRemove(0);
             self.nodes.items[id].state = .running;
-            const aborted = self.first_error != null;
+            // Skip this node if (keep_going) a dependency of it failed, else if
+            // ANY failure has occurred (abort the whole graph).
+            const aborted = if (self.keep_going) self.nodes.items[id].dep_failed else self.first_error != null;
             const sp = self.nodes.items[id].store_path;
             const tx = self.nodes.items[id].text;
             const refs = self.nodes.items[id].references;
@@ -338,6 +349,7 @@ pub const WorkGraph = struct {
     fn complete(self: *WorkGraph, id: u32, apply_err: ?anyerror) void {
         self.mu.lock();
         const node = &self.nodes.items[id];
+        const failed = apply_err != null;
         if (apply_err) |err| {
             if (self.first_error == null and err != error.Aborted) self.first_error = err;
             node.state = .failed;
@@ -345,6 +357,10 @@ pub const WorkGraph = struct {
             node.state = .done;
         }
         for (node.dependents.items) |dep| {
+            // A dependent of a failed node can't run (its input isn't in the
+            // store); under keep_going it's skipped-as-failed, cascading down the
+            // dependency subtree while independent nodes keep going.
+            if (failed and self.keep_going) self.nodes.items[dep].dep_failed = true;
             self.nodes.items[dep].pending -= 1;
             if (self.nodes.items[dep].pending == 0) self.enqueueReady(dep) catch {};
         }
@@ -391,6 +407,8 @@ const Mock = struct {
     built: std.ArrayListUnmanaged([]const u8) = .empty,
     applied_writes: usize = 0,
     violation: bool = false,
+    /// If set, a write of this path fails (to test keep-going).
+    fail_write: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     fn writeBackend(self: *Mock) Backend {
@@ -406,6 +424,9 @@ const Mock = struct {
     fn applyWrite(ctx: *anyopaque, _: *anyopaque, store_path: []const u8, _: []const u8, refs: []const []const u8) anyerror!void {
         const self: *Mock = @ptrCast(@alignCast(ctx));
         stable.sleepNs(50_000);
+        if (self.fail_write) |fp| {
+            if (std.mem.eql(u8, fp, store_path)) return error.WriteFailed;
+        }
         self.mu.lock();
         defer self.mu.unlock();
         for (refs) |r| {
@@ -421,10 +442,13 @@ const Mock = struct {
         defer self.mu.unlock();
         // Invariant: a build's drv must have been written first.
         if (!self.seen.contains(drv_path)) self.violation = true;
-        self.built.append(self.allocator, drv_path) catch {};
+        // Dupe: `drv_path` borrows graph-node memory that `finish` frees, but
+        // tests read `built` afterwards.
+        self.built.append(self.allocator, self.allocator.dupe(u8, drv_path) catch return) catch {};
     }
     fn deinit(self: *Mock) void {
         self.seen.deinit(self.allocator);
+        for (self.built.items) |b| self.allocator.free(b);
         self.built.deinit(self.allocator);
     }
 };
@@ -437,7 +461,7 @@ test "work graph: diamond writes bottom-up, builds gated on their write" {
     const alloc = testing.allocator;
     var mock: Mock = .{ .allocator = alloc };
     defer mock.deinit();
-    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 4, 4);
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 4, 4, false);
     try g.start();
     // Diamond A -> {B,C} -> D, submitted in force order.
     try g.submitWrite("D", td(alloc, "d"), &.{});
@@ -456,7 +480,7 @@ test "work graph: build waits for its (slow) write" {
     const alloc = testing.allocator;
     var mock: Mock = .{ .allocator = alloc };
     defer mock.deinit();
-    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2);
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2, false);
     try g.start();
     // Real ordering: write submitted, then the build of the same drv. The build
     // must not run until the (sleeping) write completes.
@@ -471,7 +495,7 @@ test "work graph: parked build future is published with result" {
     const alloc = testing.allocator;
     var mock: Mock = .{ .allocator = alloc };
     defer mock.deinit();
-    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2);
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 2, 2, false);
     try g.start();
     try g.submitWrite("W", td(alloc, "w"), &.{});
     var fut = Future.initClaimed(1);
@@ -481,4 +505,40 @@ test "work graph: parked build future is published with result" {
     try testing.expect(g.finish() == null);
     result catch |e| try testing.expect(e != error.Unset);
     try testing.expect(!mock.violation);
+}
+
+test "work graph: keep-going builds independent nodes past a failed write" {
+    const alloc = testing.allocator;
+    var mock: Mock = .{ .allocator = alloc, .fail_write = "Xd" };
+    defer mock.deinit();
+    // keep_going = true.
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 4, 4, true);
+    try g.start();
+    // Subtree X: write Xd (FAILS) -> build X (depends on Xd, must be skipped).
+    try g.submitWrite("Xd", td(alloc, "xd"), &.{});
+    try g.submitBuild("Xd", null, null);
+    // Independent subtree Y: write Yd (ok) -> build Y (must still run).
+    try g.submitWrite("Yd", td(alloc, "yd"), &.{});
+    try g.submitBuild("Yd", null, null);
+    // A failure occurred, so finish returns an error...
+    try testing.expect(g.finish() != null);
+    // ...but the independent Y was built and X was NOT (its write failed).
+    try testing.expectEqual(@as(usize, 1), mock.built.items.len);
+    try testing.expectEqualStrings("Yd", mock.built.items[0]);
+    try testing.expect(!mock.violation);
+}
+
+test "work graph: without keep-going, a failed write aborts the rest" {
+    const alloc = testing.allocator;
+    var mock: Mock = .{ .allocator = alloc, .fail_write = "Ad" };
+    defer mock.deinit();
+    var g = WorkGraph.init(alloc, mock.writeBackend(), mock.buildBackend(), 1, 1, false);
+    try g.start();
+    // One write worker: Ad fails first, so Bd's write + both builds are aborted.
+    try g.submitWrite("Ad", td(alloc, "ad"), &.{});
+    try g.submitBuild("Ad", null, null);
+    try g.submitWrite("Bd", td(alloc, "bd"), &.{});
+    try g.submitBuild("Bd", null, null);
+    try testing.expect(g.finish() != null);
+    try testing.expectEqual(@as(usize, 0), mock.built.items.len);
 }

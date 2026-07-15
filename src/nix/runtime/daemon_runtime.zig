@@ -49,12 +49,24 @@ pub const DaemonRuntime = struct {
         end: *const fn (ctx: *anyopaque, token: u64) void,
     };
 
+    /// Shared "already in the store" cache, provided by `DerivationStore` (its
+    /// `instantiated` set). The graph consults + populates it so a `.drv` written
+    /// on the pool is visible to every other daemon path (queries, IFD closure
+    /// walks) as a cache hit instead of a redundant `isValidPath` round-trip. Both
+    /// callbacks are thread-safe (guarded on the store side).
+    pub const Dedup = struct {
+        ctx: *anyopaque,
+        known: *const fn (ctx: *anyopaque, path: []const u8) bool,
+        mark: *const fn (ctx: *anyopaque, path: []const u8) void,
+    };
+
     pub const GraphConfig = struct {
         allocator: std.mem.Allocator = undefined,
         io: std.Io = undefined,
         socket: []const u8 = "",
         options: ?rstore.BuildSettings = null,
         spans: ?BuildSpans = null,
+        dedup: ?Dedup = null,
         mode: rstore.BuildMode = .normal,
         /// First daemon error message (write or build), guarded, surfaced on finish.
         err_mu: @import("base").sync.BlockingMutex = .{},
@@ -83,15 +95,18 @@ pub const DaemonRuntime = struct {
         socket: []const u8,
         options: ?rstore.BuildSettings,
         spans: ?BuildSpans,
+        dedup: ?Dedup,
         mode: rstore.BuildMode,
     ) !void {
-        self.cfg = .{ .allocator = allocator, .io = io, .socket = socket, .options = options, .spans = spans, .mode = mode };
+        self.cfg = .{ .allocator = allocator, .io = io, .socket = socket, .options = options, .spans = spans, .dedup = dedup, .mode = mode };
+        const keep_going = if (options) |o| o.keep_going else false;
         self.graph = WorkGraph.init(
             allocator,
             .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyWrite },
             .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyBuild },
             write_workers,
             build_workers,
+            keep_going,
         );
         try self.graph.?.start();
         self.graph_active = true;
@@ -160,12 +175,18 @@ pub const DaemonRuntime = struct {
     fn applyWrite(ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, text: []const u8, refs: []const []const u8) anyerror!void {
         const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
         const d: *rstore.DaemonStore = @ptrCast(@alignCast(conn));
-        if (try d.isValidPath(store_path)) return;
-        const written = d.addTextToStore(self.cfg.allocator, storePathName(store_path), text, refs) catch |err| {
-            self.captureErr(d);
-            return err;
-        };
-        self.cfg.allocator.free(written);
+        // Cache hit (some path already confirmed it in the store): skip the round
+        // trip + the write entirely.
+        if (self.cfg.dedup) |dd| if (dd.known(dd.ctx, store_path)) return;
+        if (!(try d.isValidPath(store_path))) {
+            const written = d.addTextToStore(self.cfg.allocator, storePathName(store_path), text, refs) catch |err| {
+                self.captureErr(d);
+                return err;
+            };
+            self.cfg.allocator.free(written);
+        }
+        // Record it as present so later queries / closure walks hit the cache.
+        if (self.cfg.dedup) |dd| dd.mark(dd.ctx, store_path);
     }
 
     fn applyBuild(ctx: *anyopaque, conn: *anyopaque, store_path: []const u8, _: []const u8, _: []const []const u8) anyerror!void {

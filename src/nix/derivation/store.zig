@@ -536,8 +536,24 @@ pub const DerivationStore = struct {
         if (env) |em| if (em.get("FIX_NO_EAGER_BUILD") != null) return;
         const rt = self.daemon_runtime orelse return;
         const io = self.io orelse return;
-        try rt.startGraph(self.allocator, io, self.daemon_socket, self.daemon_options, spans, mode);
+        const dedup: DaemonRuntime.Dedup = .{ .ctx = self, .known = dedupKnown, .mark = dedupMark };
+        try rt.startGraph(self.allocator, io, self.daemon_socket, self.daemon_options, spans, dedup, mode);
         self.eager_build_enabled = true;
+    }
+
+    /// Thread-safe views of the `instantiated` cache for the work graph's write
+    /// workers (guarded by `daemon_mu`, like every other `instantiated` access).
+    fn dedupKnown(ctx: *anyopaque, path: []const u8) bool {
+        const self: *DerivationStore = @ptrCast(@alignCast(ctx));
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        return self.instantiated.contains(path);
+    }
+    fn dedupMark(ctx: *anyopaque, path: []const u8) void {
+        const self: *DerivationStore = @ptrCast(@alignCast(ctx));
+        self.daemon_mu.lock();
+        defer self.daemon_mu.unlock();
+        self.markInstantiated(path) catch {};
     }
 
     /// Fire a freshly instantiated derivation at the build lane. No-op unless

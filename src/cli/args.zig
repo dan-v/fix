@@ -343,6 +343,7 @@ const Opt = enum {
     cores,
     fallback,
     keep_failed,
+    keep_going,
     max_silent_time,
     timeout,
     verbose,
@@ -480,6 +481,7 @@ const specs = [_]Spec{
     .{ .id = .cores, .long = "--cores", .arg = .req, .metavar = "N", .help = "build cores per job (0 = all available)", .show_in = realize_cmds },
     .{ .id = .fallback, .long = "--fallback", .help = "build from source if a substitute fails", .show_in = realize_cmds },
     .{ .id = .keep_failed, .short = "-K", .long = "--keep-failed", .help = "keep the build tree of failed builds", .show_in = realize_cmds },
+    .{ .id = .keep_going, .short = "-k", .long = "--keep-going", .help = "keep building other derivations if one fails", .show_in = realize_cmds },
     .{ .id = .max_silent_time, .long = "--max-silent-time", .arg = .req, .metavar = "SECS", .help = "abort a build silent for SECS seconds (0 = no limit)", .show_in = realize_cmds },
     .{ .id = .timeout, .long = "--timeout", .arg = .req, .metavar = "SECS", .help = "abort a build running longer than SECS (0 = no limit)", .show_in = realize_cmds },
     .{ .id = .verbose, .short = "-v", .long = "--verbose", .help = "increase daemon build verbosity (repeatable)", .show_in = realize_cmds },
@@ -686,6 +688,7 @@ fn apply(options: *Options, allocator: std.mem.Allocator, id: Opt, v0: ?[:0]cons
         .timeout => try options.option_overrides.append(allocator, .{ .name = "timeout", .value = v0.? }),
         .fallback => try options.option_overrides.append(allocator, .{ .name = "fallback", .value = "true" }),
         .keep_failed => try options.option_overrides.append(allocator, .{ .name = "keep-failed", .value = "true" }),
+        .keep_going => try options.option_overrides.append(allocator, .{ .name = "keep-going", .value = "true" }),
         .verbose => options.verbose +|= 1,
 
         .show_trace => options.show_trace = true,
