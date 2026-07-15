@@ -102,8 +102,8 @@ pub const DaemonRuntime = struct {
         const keep_going = if (options) |o| o.keep_going else false;
         self.graph = WorkGraph.init(
             allocator,
-            .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyWrite },
-            .{ .ctx = self, .open = openConn, .close = closeConn, .apply = applyBuild },
+            .{ .ctx = self, .open = openWriteConn, .close = closeConn, .apply = applyWrite },
+            .{ .ctx = self, .open = openBuildConn, .close = closeConn, .apply = applyBuild },
             write_workers,
             build_workers,
             keep_going,
@@ -159,7 +159,17 @@ pub const DaemonRuntime = struct {
 
     // -- work-graph backend (per-worker connections) --
 
-    fn openConn(ctx: *anyopaque) anyerror!*anyopaque {
+    /// Write connections do only `addTextToStore` / `isValidPath`, which don't
+    /// use build settings — so skip the `setOptions` round-trip (one fewer daemon
+    /// round-trip per write connection).
+    fn openWriteConn(ctx: *anyopaque) anyerror!*anyopaque {
+        const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
+        const d = try rstore.DaemonStore.connect(self.cfg.allocator, self.cfg.io, self.cfg.socket);
+        return d;
+    }
+
+    /// Build connections need the build settings (max-jobs/cores/keep-going/…).
+    fn openBuildConn(ctx: *anyopaque) anyerror!*anyopaque {
         const self: *DaemonRuntime = @ptrCast(@alignCast(ctx));
         const d = try rstore.DaemonStore.connect(self.cfg.allocator, self.cfg.io, self.cfg.socket);
         errdefer d.deinit();
@@ -237,7 +247,8 @@ const silent_sink: rstore.BuildSink = .{
 };
 
 /// Write-connection pool size: writes are short (a few-KB `addTextToStore`), so a
-/// small pool overlaps their round-trips without flooding the daemon.
+/// small pool overlaps their round-trips. (Connections are opened lazily, so a
+/// small build only ever opens as many as it has concurrent work for.)
 const write_workers: usize = 4;
 /// Build-connection pool size: each build holds its connection for the whole
 /// build, so this bounds concurrent client-driven builds (the daemon also

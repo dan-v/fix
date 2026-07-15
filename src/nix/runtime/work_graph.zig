@@ -284,9 +284,12 @@ pub const WorkGraph = struct {
             .write => self.write_backend,
             .build => self.build_backend,
         };
-        // Connect lazily on the first node so idle workers (a small build that
-        // never fills a pool) never open a connection. `open_failed` sticks: once
-        // a worker can't connect, it fails its remaining nodes.
+        // Connect lazily on the first node so a small build (which never fills a
+        // pool) only opens as many connections as it has concurrent work for —
+        // each connection makes the daemon fork a worker, so we don't open the
+        // whole pool for one drv. On a build with real eval, these connects
+        // overlap eval anyway. `open_failed` sticks: once a worker can't connect,
+        // it fails its remaining nodes.
         var conn: ?*anyopaque = null;
         var open_failed = false;
         defer if (conn) |c| backend.close(backend.ctx, c);
