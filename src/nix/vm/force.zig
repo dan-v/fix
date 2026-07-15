@@ -904,8 +904,15 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 }
                 // Thunk-result memo: reuse a previous identical pure
                 // computation on this worker, skipping re-running the body.
+                // Skip the map/genList application stub: its second upvalue is
+                // the per-element index/item, so the key is unique every time
+                // and the probe/store is pure overhead (never hits) that also
+                // evicts genuinely-reusable entries.
                 const memo_key: ?MemoKey = switch (thunk.targetKind()) {
-                    .bytecode => memoKeyForBytecode(&thunk.payload.target.bytecode),
+                    .bytecode => if (thunk.payload.target.bytecode.chunk_id == self.registry.well_known.genlist_apply)
+                        null
+                    else
+                        memoKeyForBytecode(&thunk.payload.target.bytecode),
                     else => null,
                 };
                 if (comptime prof.enabled) {
@@ -1186,6 +1193,16 @@ pub fn evalThunkTarget(self: *VM, target: *const ThunkTarget, kind: thunk_mod.Ta
         // copy. `target` points into the heap's stable thunk store.
         .bytecode => blk: {
             const bytecode = &target.bytecode;
+            // Fast path for the shared single-arg application stub that
+            // backs every map/genList element thunk. Its body is exactly
+            // `up_grab 0; up_grab 1; call_tail` — call func on the arg — so
+            // skip pushing the stub frame and dispatching those ops and call
+            // directly. This halves the per-element frame/dispatch work on
+            // list-bound workloads (map/genList are the hottest list ops).
+            if (bytecode.chunk_id == self.registry.well_known.genlist_apply) {
+                const ups = bytecode.upvalues();
+                break :blk closures.callValue(self, ups[0], ups[1]);
+            }
             const ch = self.registry.get(bytecode.chunk_id) orelse return error.InvalidChunk;
             break :blk runBytecodeChunk(self, ch, bytecode.chunk_id, bytecode.upvalues());
         },
