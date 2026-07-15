@@ -13,7 +13,6 @@ const clone = @import("clone.zig");
 const stable = @import("base").sync;
 const runtime = @import("runtime");
 const rstore = runtime.store;
-const nar = runtime.nar;
 const FileCache = runtime.file_cache.FileCache;
 const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
 
@@ -88,13 +87,6 @@ pub const DerivationStore = struct {
     /// path pays one cheap `isValidPath` round-trip instead of streaming the
     /// whole text/NAR the daemon would just hash and discard.
     instantiated: std.StringHashMapUnmanaged(void) = .empty,
-    /// The evaluator's FileCache, set alongside the runtime. Lets a deferred
-    /// `lazy_source` recipe re-serialize its source from disk on demand (IFD /
-    /// closure write) instead of retaining the NAR bytes from eval. Safe because
-    /// FileCache freezes source content for the eval's lifetime, and lazy_source
-    /// recipes are only produced (and only replayed) during eval. Null in tests
-    /// and the `fix store` CLI → sources fall back to eager NAR retention.
-    files: ?*FileCache = null,
     io: ?std.Io = null,
     /// Path to the nix-daemon socket. Defaults to Nix's well-known location;
     /// `setDaemonSocket` (from `$NIX_DAEMON_SOCKET_PATH`) overrides it, pointing
@@ -224,7 +216,7 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub const RecipeVariantForTest = enum { text, nar, flat, lazy_source };
+    pub const RecipeVariantForTest = enum { text, nar, flat };
 
     pub fn recipeCountForTest(self: *DerivationStore) usize {
         if (comptime builtin.is_test) {
@@ -243,7 +235,6 @@ pub const DerivationStore = struct {
                 .text => .text,
                 .nar => .nar,
                 .flat => .flat,
-                .lazy_source => .lazy_source,
             };
         } else return null;
     }
@@ -265,7 +256,6 @@ pub const DerivationStore = struct {
                 .text => |text| text.bytes,
                 .nar => |bytes| bytes,
                 .flat => |bytes| bytes.bytes(),
-                .lazy_source => null, // no eval-time bytes; re-serialized on demand
             };
         } else return null;
     }
@@ -369,21 +359,10 @@ pub const DerivationStore = struct {
             references: [][]u8,
         };
 
-        /// A deferred source: re-serialize the NAR from `path` (a filesystem
-        /// source) on demand rather than retaining the eval-time bytes. Used only
-        /// in plain eval for unfiltered sources; replayed via the store's
-        /// FileCache (which holds the frozen content), so the re-serialized bytes
-        /// match the store path computed at eval time.
-        const LazySource = struct {
-            path: []u8,
-            name: []u8,
-        };
-
         const Payload = union(enum) {
             text: TextPayload,
             nar: []u8,
             flat: FileCache.ImmutableBytes,
-            lazy_source: LazySource,
         };
 
         fn deinit(self: *Recipe, allocator: std.mem.Allocator) void {
@@ -395,10 +374,6 @@ pub const DerivationStore = struct {
                 },
                 .nar => |nar_bytes| allocator.free(nar_bytes),
                 .flat => |*bytes| bytes.release(),
-                .lazy_source => |src| {
-                    allocator.free(src.path);
-                    allocator.free(src.name);
-                },
             }
             allocator.destroy(self);
         }
@@ -435,16 +410,6 @@ pub const DerivationStore = struct {
                 else => &.{},
             };
         }
-
-        /// Whether this is a deferred (re-serialize-on-demand) source. A store
-        /// path is content-addressed, so a second recording of the same path —
-        /// even by a different ingest route (e.g. `filterSource (_: true)` on a
-        /// single file yields the same NAR as the bare coercion) — represents
-        /// identical content; recording sites treat an existing lazy_source as
-        /// compatible rather than a `RecipeConflict`, keeping the deferred form.
-        fn isLazySource(self: *const Recipe) bool {
-            return self.payload == .lazy_source;
-        }
     };
 
     fn recipePayloadPointer(recipe: *const Recipe) usize {
@@ -452,7 +417,6 @@ pub const DerivationStore = struct {
             .text => |text| @intFromPtr(text.bytes.ptr),
             .nar => |bytes| @intFromPtr(bytes.ptr),
             .flat => |bytes| @intFromPtr(bytes.bytes().ptr),
-            .lazy_source => |src| @intFromPtr(src.path.ptr),
         };
     }
 
@@ -587,12 +551,6 @@ pub const DerivationStore = struct {
     /// Provide the IO handle used to connect to the daemon on demand.
     pub fn setIo(self: *DerivationStore, io: std.Io) void {
         self.io = io;
-    }
-
-    /// Provide the evaluator's FileCache so deferred `lazy_source` recipes can
-    /// re-serialize from disk on demand (see the `files` field).
-    pub fn setFileCache(self: *DerivationStore, files: *FileCache) void {
-        self.files = files;
     }
 
     /// Enable writing forced derivations + their sources to the store
@@ -907,7 +865,7 @@ pub const DerivationStore = struct {
 
         if (self.recipes.get(store_path)) |recipe| {
             defer self.allocator.free(text);
-            if (recipe.isLazySource() or recipe.textMatches(text, references)) return;
+            if (recipe.textMatches(text, references)) return;
             return error.RecipeConflict;
         }
 
@@ -934,7 +892,7 @@ pub const DerivationStore = struct {
 
         if (self.recipes.get(store_path)) |recipe| {
             defer self.allocator.free(nar_bytes);
-            if (recipe.isLazySource() or recipe.narMatches(nar_bytes)) return;
+            if (recipe.narMatches(nar_bytes)) return;
             return error.RecipeConflict;
         }
 
@@ -942,30 +900,6 @@ pub const DerivationStore = struct {
         const recipe = try self.allocator.create(Recipe);
         errdefer self.allocator.destroy(recipe);
         recipe.* = .{ .payload = .{ .nar = nar_bytes } };
-
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        try self.recipes.put(self.allocator, key, recipe);
-    }
-
-    /// Record a deferred plain-eval source: instead of retaining the eval-time
-    /// NAR bytes, remember the (path, name) and re-serialize on demand (see
-    /// `LazySource`). `store_path` is content-addressed, so an existing recipe of
-    /// any kind for it already yields the same bytes — keep it. Only valid off
-    /// the store-writes path (plain eval); the caller gates on `store_writes_enabled`.
-    pub fn recordLazySourceRecipe(self: *DerivationStore, store_path: []const u8, path: []const u8, name: []const u8) !void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-
-        if (self.recipes.contains(store_path)) return;
-
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        const owned_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned_name);
-        const recipe = try self.allocator.create(Recipe);
-        errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .lazy_source = .{ .path = owned_path, .name = owned_name } } };
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
@@ -983,7 +917,7 @@ pub const DerivationStore = struct {
         var retained = handle.retain();
         if (self.recipes.get(store_path)) |recipe| {
             defer retained.release();
-            if (recipe.isLazySource() or recipe.flatMatches(handle)) return;
+            if (recipe.flatMatches(handle)) return;
             return error.RecipeConflict;
         }
         errdefer retained.release();
@@ -1164,15 +1098,6 @@ pub const DerivationStore = struct {
             .text => |text| try self.applyDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
             .nar => |nar_bytes| try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
             .flat => |bytes| try self.applyDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
-            .lazy_source => |src| {
-                // Deferred plain-eval source: re-serialize the NAR from disk now
-                // (FileCache holds the eval-time content, so the bytes — and thus
-                // the hash — match the store path computed at eval time), then add.
-                const files = self.files orelse return error.MissingStoreRecipe;
-                const nar_bytes = try nar.serialize(self.allocator, files, src.path, null);
-                defer self.allocator.free(nar_bytes);
-                try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } });
-            },
         }
         self.releaseRecipeForPath(store_path);
     }

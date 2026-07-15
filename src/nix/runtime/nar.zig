@@ -41,41 +41,16 @@ pub fn serializeReport(
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    const sink = BufSink{ .allocator = allocator, .out = &out };
-    try appendString(sink, "nix-archive-1");
+    try appendString(allocator, &out, "nix-archive-1");
     // Nix resolves the *root* source object before serializing: a top-level
     // symlink is followed to its target, which is then dumped as that target's
     // type (e.g. a directory). Only the root is resolved — symlinks encountered
     // as directory entries are still serialized as symlink nodes (below).
     const root = try resolveRootSymlink(allocator, files, path);
     defer allocator.free(root);
-    try appendNode(allocator, files, sink, root, filter, unsupported);
+    try appendNode(allocator, files, &out, root, filter, unsupported);
 
     return out.toOwnedSlice(allocator);
-}
-
-/// Compute the sha256 digest of the NAR of `path` (under `filter`) by streaming
-/// the serialization straight into the hash, never materializing the full NAR
-/// buffer. Byte-for-byte identical to `hashSerialized(serializeReport(...))`,
-/// but with no whole-tree allocation — used on the plain-eval source path where
-/// only the digest (store path) is needed, not the bytes. Per-file contents are
-/// still read (FileCache-cached), just not accumulated into one buffer.
-pub fn hashStreamingReport(
-    allocator: std.mem.Allocator,
-    files: *FileCache,
-    path: []const u8,
-    filter: ?Filter,
-    unsupported: ?*Unsupported,
-) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    const sink = HashSink{ .hasher = &hasher };
-    try appendString(sink, "nix-archive-1");
-    const root = try resolveRootSymlink(allocator, files, path);
-    defer allocator.free(root);
-    try appendNode(allocator, files, sink, root, filter, unsupported);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&digest);
-    return digest;
 }
 
 /// Follow a chain of symlinks at the *root* of a source path, returning the
@@ -133,22 +108,22 @@ pub fn hashSerialized(allocator: std.mem.Allocator, nar_bytes: []const u8) ![]u8
     return allocator.dupe(u8, &encoded);
 }
 
-fn appendNode(allocator: std.mem.Allocator, files: *FileCache, sink: anytype, path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
-    try appendString(sink, "(");
+fn appendNode(allocator: std.mem.Allocator, files: *FileCache, out: *std.ArrayListUnmanaged(u8), path: []const u8, filter: ?Filter, unsupported: ?*Unsupported) !void {
+    try appendString(allocator, out, "(");
     switch (try files.fileType(path)) {
         .regular => {
-            try appendString(sink, "type");
-            try appendString(sink, "regular");
+            try appendString(allocator, out, "type");
+            try appendString(allocator, out, "regular");
             if (try files.isExecutable(path)) {
-                try appendString(sink, "executable");
-                try appendString(sink, "");
+                try appendString(allocator, out, "executable");
+                try appendString(allocator, out, "");
             }
-            try appendString(sink, "contents");
-            try appendString(sink, try files.readFile(path));
+            try appendString(allocator, out, "contents");
+            try appendString(allocator, out, try files.readFile(path));
         },
         .directory => {
-            try appendString(sink, "type");
-            try appendString(sink, "directory");
+            try appendString(allocator, out, "type");
+            try appendString(allocator, out, "directory");
             const entries = try sortedDirEntries(allocator, try files.readDir(path));
             defer allocator.free(entries);
             for (entries) |entry| {
@@ -162,22 +137,22 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, sink: anytype, pa
                     const kind = files.fileType(child) catch entry.kind;
                     if (!try f.accept(f.context, child, kind)) continue;
                 }
-                try appendString(sink, "entry");
-                try appendString(sink, "(");
-                try appendString(sink, "name");
-                try appendString(sink, entry.name);
-                try appendString(sink, "node");
-                try appendNode(allocator, files, sink, child, filter, unsupported);
-                try appendString(sink, ")");
+                try appendString(allocator, out, "entry");
+                try appendString(allocator, out, "(");
+                try appendString(allocator, out, "name");
+                try appendString(allocator, out, entry.name);
+                try appendString(allocator, out, "node");
+                try appendNode(allocator, files, out, child, filter, unsupported);
+                try appendString(allocator, out, ")");
             }
         },
         .symlink => {
             const target = try files.readLink(path);
             defer allocator.free(target);
-            try appendString(sink, "type");
-            try appendString(sink, "symlink");
-            try appendString(sink, "target");
-            try appendString(sink, target);
+            try appendString(allocator, out, "type");
+            try appendString(allocator, out, "symlink");
+            try appendString(allocator, out, "target");
+            try appendString(allocator, out, target);
         },
         .unknown => {
             if (unsupported) |u| {
@@ -186,38 +161,16 @@ fn appendNode(allocator: std.mem.Allocator, files: *FileCache, sink: anytype, pa
             return error.UnsupportedPathType;
         },
     }
-    try appendString(sink, ")");
+    try appendString(allocator, out, ")");
 }
 
-/// A NAR byte sink. `appendNode`/`appendString` are generic over it so the same
-/// tree walk drives either materialization (`BufSink`, retaining the NAR bytes)
-/// or streaming hash (`HashSink`, feeding a running Sha256 with no buffer) —
-/// guaranteeing both produce a byte-identical stream and thus the same hash.
-const BufSink = struct {
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    fn writeAll(self: BufSink, bytes: []const u8) !void {
-        try self.out.appendSlice(self.allocator, bytes);
-    }
-};
-
-const HashSink = struct {
-    hasher: *std.crypto.hash.sha2.Sha256,
-    fn writeAll(self: HashSink, bytes: []const u8) !void {
-        self.hasher.update(bytes);
-    }
-};
-
-fn appendString(sink: anytype, text: []const u8) !void {
+fn appendString(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, text.len, .little);
-    try sink.writeAll(&len);
-    try sink.writeAll(text);
+    try out.appendSlice(allocator, &len);
+    try out.appendSlice(allocator, text);
     const padding = (8 - text.len % 8) % 8;
-    if (padding != 0) {
-        const zeros = [_]u8{0} ** 8;
-        try sink.writeAll(zeros[0..padding]);
-    }
+    try out.appendNTimes(allocator, 0, padding);
 }
 
 fn sortedDirEntries(allocator: std.mem.Allocator, entries: []const FileCache.DirEntry) ![]FileCache.DirEntry {

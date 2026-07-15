@@ -104,27 +104,6 @@ pub fn ingestReport(
     }
 
     const payload_allocator = derivations.allocator;
-
-    // Plain-eval fast path: for an unfiltered source we only need the digest
-    // (the store path). Stream the NAR straight into the hash — never
-    // materializing the whole-tree buffer — and register a `lazy_source` recipe
-    // that re-serializes from disk only if the content is later demanded (IFD /
-    // realization, which run mid-eval while FileCache still holds the frozen
-    // content). Gated on the store having a FileCache handle to replay through.
-    if (filter == null and !derivations.store_writes_enabled and derivations.files != null) {
-        var digest = try nar.hashStreamingReport(payload_allocator, files, path, null, unsupported);
-        const hex = std.fmt.bytesToHex(digest, .lower);
-        const store_path = try drv_paths.sourcePath(allocator, derivations.store_dir, name, hex[0..]);
-        errdefer allocator.free(store_path);
-        const nar_hash = try sriHash(allocator, &digest);
-        errdefer allocator.free(nar_hash);
-        try derivations.recordLazySourceRecipe(store_path, path, name);
-        if (memoizable) {
-            derivations.storeSourceMemo(path, name, true, filter_id, token orelse 0, store_path, nar_hash) catch {};
-        }
-        return .{ .store_path = store_path, .nar_hash = nar_hash };
-    }
-
     const nar_bytes = try nar.serializeReport(payload_allocator, files, path, filter, unsupported);
     var nar_owned = true;
     defer if (nar_owned) payload_allocator.free(nar_bytes);
