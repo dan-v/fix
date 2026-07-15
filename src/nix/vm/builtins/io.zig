@@ -76,18 +76,32 @@ pub fn demandPathArg(self: anytype, arg: Value) ![]const u8 {
 
     const context = (try demandContext(self, value)) orelse return path;
     defer context.deinit(self.allocator);
-    // With the work graph active, this derivation's `.drv` write may still be in
-    // flight (async). Park until it (and, via its edges, the whole `.drv`
-    // closure) is written, so the realize below finds it on disk.
-    if (self.derivations.eager_build_enabled) {
-        if (self.derivations.daemon_runtime) |rt| io_offload.awaitGraphWrite(rt, context.drv_path);
-    }
     if (std.mem.eql(u8, path, context.drv_path)) {
+        // Demanding the `.drv` itself (not an output): it — and, via its edges, its
+        // referenced `.drv` closure — just needs to be on disk. No output build.
+        // With the graph active the `.drv` write may still be in flight, so park on
+        // the write node first, then ensure the recipe closure (input sources,
+        // substitutions).
+        if (self.derivations.graphActive()) {
+            io_offload.awaitGraphWrite(self.derivations.daemon_runtime.?, context.drv_path);
+        }
         try self.derivations.ensureClosure(context.drv_path);
+    } else if (self.derivations.graphActive()) {
+        // Demanding a derivation OUTPUT (IFD): realize it through the work graph —
+        // a build node gated on the `.drv` write, so every realization funnels
+        // through the one dependency-ordered builder and its warm connection pool
+        // instead of driving the daemon directly. The demand fiber parks until the
+        // build lands; a write/build error propagates here. `awaitGraphBuild`
+        // returns false only off a worker fiber (never during eval) — fall back to
+        // the direct realize then.
+        if (!try io_offload.awaitGraphBuild(self.derivations.daemon_runtime.?, context.drv_path)) {
+            try self.derivations.realizeOutput(context.drv_path, context.outputs);
+        }
     } else {
-        // realizeOutput includes dependency-first closure realization; the
-        // whole operation is one existing daemon-I/O offload job so concurrent
-        // fibers park rather than blocking every compute worker on claim waits.
+        // No work graph (plain `instantiate`): drive the daemon directly.
+        // realizeOutput includes dependency-first closure realization; the whole
+        // operation is one existing daemon-I/O offload job so concurrent fibers
+        // park rather than blocking every compute worker on claim waits.
         try self.derivations.realizeOutput(context.drv_path, context.outputs);
     }
     return path;

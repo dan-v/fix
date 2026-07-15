@@ -129,9 +129,13 @@ pub const DaemonRuntime = struct {
         try self.graph.?.submitWrite(store_path, text, references);
     }
 
-    /// Submit a fire-and-forget eager build (gated on the drv's write node).
-    pub fn submitBuild(self: *DaemonRuntime, drv_path: []const u8) !void {
-        try self.graph.?.submitBuild(drv_path, null, null);
+    /// Submit a graph build of `drv_path` (a build node gated on its `.drv` write)
+    /// with `future`/`result` registered as a waiter, so the caller can park until
+    /// it finishes. The single entry point for IFD realization; graph must be
+    /// active. Dedupes by drv path (concurrent IFD of the same output shares one
+    /// build node).
+    pub fn buildAwait(self: *DaemonRuntime, drv_path: []const u8, future: *Future, result: *(anyerror!void)) !void {
+        try self.graph.?.submitBuild(drv_path, future, result);
     }
 
     /// Park `future` on the write of `drv_path` (IFD): true if attached/already

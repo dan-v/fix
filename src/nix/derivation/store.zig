@@ -92,10 +92,12 @@ pub const DerivationStore = struct {
     store_writes_enabled: bool = false,
 
     /// Eval/build pipelining: when enabled (build/run/shell/switch, unless
-    /// `FIX_NO_EAGER_BUILD`), each derivation instantiated on the demand path is
-    /// fired at the DaemonRuntime's build lane — a background thread with its OWN
-    /// daemon connection — so its build overlaps the rest of evaluation. Off for
-    /// `eval`/`instantiate` (no realization) and plain eval.
+    /// `FIX_NO_EAGER_BUILD`), the DaemonRuntime's work graph is running. It makes
+    /// `.drv` writes async + dependency-ordered (overlapping the rest of eval) and
+    /// serves as the single builder for IFD-demanded outputs (`demandPathArg`).
+    /// It does NOT build derivations merely because they were instantiated — only
+    /// IFD and the final authoritative closure build realize outputs. Off for
+    /// `eval`/`instantiate` (no realization) and plain eval. See `graphActive`.
     eager_build_enabled: bool = false,
     /// The Evaluator-owned runtime that hosts the eager-build lane (set by the
     /// Evaluator alongside `offload`); `null` outside an Evaluator (tests).
@@ -556,11 +558,11 @@ pub const DerivationStore = struct {
         self.markInstantiated(path) catch {};
     }
 
-    /// Fire a freshly instantiated derivation at the build lane. No-op unless
-    /// pipelining is enabled; never blocks on the build.
-    pub fn submitEagerBuild(self: *DerivationStore, drv_path: []const u8) !void {
-        if (!self.eager_build_enabled) return;
-        try self.daemon_runtime.?.submitBuild(drv_path);
+    /// Is the pipelining work graph running? When true, `.drv` writes are async
+    /// graph nodes and IFD realizes route through the graph builder; when false
+    /// there is no graph and callers drive the daemon directly (`instantiate`).
+    pub fn graphActive(self: *const DerivationStore) bool {
+        return self.eager_build_enabled;
     }
 
     /// Drain and join the build lane (call once evaluation has finished, before
