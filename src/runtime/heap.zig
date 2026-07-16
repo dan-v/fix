@@ -698,7 +698,7 @@ pub const ObjectHeap = struct {
                     // Split resolved thunks by whether a real caller ever
                     // demanded the value (vs. pre-forced and unobserved).
                     if (s_index == 2) {
-                        if (t.future.isDemanded()) {
+                        if (t.isDemanded()) {
                             result.resolved_demanded += 1;
                         } else {
                             result.resolved_undemanded += 1;

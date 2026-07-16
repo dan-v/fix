@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const eval_progress = @import("nix").observ.progress;
-const Mutex = std.Thread.Mutex;
+const Mutex = @import("base").sync.BlockingMutex;
 
 pub const EvalProgress = struct {
     const max_active = 128;

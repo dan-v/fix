@@ -99,6 +99,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     cli_mod.addImport("nix", nix_mod);
+    cli_mod.addImport("base", base_mod);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const presentation = @import("presentation.zig");
-const diagnostic = @import("nix").diagnostic;
+const diagnostic = @import("nix").syntax.diagnostic;
 const eval = @import("nix").eval;
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
