@@ -5,6 +5,7 @@
 //! statements push/discard as needed.
 
 const std = @import("std");
+const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 pub const literals = @import("compiler/literals.zig");
 pub const ops = @import("compiler/ops.zig");
 pub const control = @import("compiler/control.zig");
@@ -77,15 +78,7 @@ pub const Compiler = struct {
     /// $HOME, for expanding `~/…` home-relative path literals at compile time
     /// (Nix resolves the tilde at parse time). Null when unset in the env.
     home_dir: ?[]const u8,
-    /// `nul-bytes` deprecated feature: when true a NUL in a string literal
-    /// truncates at the NUL; when false (default) it is a compile error.
-    allow_nul_bytes: bool = false,
-    /// `rec-set-overrides` deprecated feature: a top-level `__overrides` in a
-    /// `rec` set is a compile error unless enabled.
-    allow_rec_set_overrides: bool = false,
-    /// `rec-set-merges` deprecated feature: a rec/non-rec attr-path merge
-    /// conflict is a compile error unless enabled.
-    allow_rec_set_merges: bool = false,
+    policy: LanguagePolicy = .{},
     source_file_id: ?InternId,
     locals: std.ArrayListUnmanaged(Local),
     captures: std.ArrayListUnmanaged(Capture),
@@ -235,9 +228,7 @@ pub const Compiler = struct {
         child.base_path = self.base_path;
         child.source_path = self.source_path;
         child.home_dir = self.home_dir;
-        child.allow_nul_bytes = self.allow_nul_bytes;
-        child.allow_rec_set_overrides = self.allow_rec_set_overrides;
-        child.allow_rec_set_merges = self.allow_rec_set_merges;
+        child.policy = self.policy;
         child.source_file_id = self.source_file_id;
         // Qualified-name tree: the first child spun up for a named bound value
         // claims the pending name as a child node of this compiler's name and

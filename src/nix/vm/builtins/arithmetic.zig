@@ -55,7 +55,7 @@ pub fn builtinCeil(self: anytype, arg: Value) !Value {
 /// deprecated feature enabled, return the (corrupted) f64-round-tripped value
 /// as Nix historically did; otherwise raise the diagnostic error.
 fn floorCeilResult(self: anytype, err: anyerror, v: Value, name: []const u8) anyerror!Value {
-    if (err == error.FloorCeilCorruptsInteger and self.allow_floor_ceil_corrupt) {
+    if (err == error.FloorCeilCorruptsInteger and self.policy.allow_floor_ceil_corrupt) {
         const i: i64 = switch (v.kind()) {
             .int => v.asInt(),
             .boxed_int => try self.heap.getBoxedInt(v.asObjectId()),

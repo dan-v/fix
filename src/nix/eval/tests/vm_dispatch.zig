@@ -54,24 +54,18 @@ const Harness = struct {
         scratch.* = std.heap.ArenaAllocator.init(testing.allocator);
         errdefer scratch.deinit();
 
-        const vm = try VM.init(
-            scratch.allocator(),
-            null,
-            &ev.registry,
-            &ev.intern,
-            &ev.heap,
-            &ev.files,
-            &ev.fetchers,
-            &ev.derivations,
-            &ev.scheduler,
-            null,
-            null,
-            null,
-            if (vm_mod.thunks_log_enabled) null else {},
-            null,
-            ev.builtins_value.?,
-            if (vm_mod.opcode_profile_enabled) unreachable else {},
-        );
+        const vm = try VM.init(.{
+            .allocator = scratch.allocator(),
+            .registry = &ev.registry,
+            .intern = &ev.intern,
+            .heap = &ev.heap,
+            .files = &ev.files,
+            .fetchers = &ev.fetchers,
+            .derivations = &ev.derivations,
+            .scheduler = &ev.scheduler,
+            .builtins_value = ev.builtins_value.?,
+            .opcode_profile_sink = if (vm_mod.opcode_profile_enabled) unreachable else {},
+        });
         return .{ .ev = ev, .scratch = scratch, .vm = vm };
     }
 

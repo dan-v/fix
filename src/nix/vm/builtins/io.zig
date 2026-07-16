@@ -290,7 +290,7 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
 
         if (is_corepkgs) {
             if (std.mem.eql(u8, prefix, "nix")) {
-                if (!self.allow_nix_path_shadow) {
+                if (!self.policy.allow_nix_path_shadow) {
                     try vm_trace.setErrorMessage(self, "the prefix 'nix' is reserved for internal use in the Nix search path; use --extra-deprecated-features nix-path-shadow to silence this error");
                     return error.NixPathShadow;
                 }
@@ -299,7 +299,7 @@ pub fn builtinFindFile(self: anytype, search_path_arg: Value, name_arg: Value) !
             if (prefix.len == 0) {
                 if (try findFileCandidate(self, base, "", name)) |candidate| {
                     defer self.allocator.free(candidate);
-                    if (!self.allow_nix_path_shadow) {
+                    if (!self.policy.allow_nix_path_shadow) {
                         try vm_trace.setErrorMessage(self, "shadowing '<nix/...>' by configuring the nix-path is deprecated; use --extra-deprecated-features nix-path-shadow to silence this error");
                         return error.NixPathShadow;
                     }

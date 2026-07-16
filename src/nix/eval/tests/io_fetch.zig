@@ -512,7 +512,7 @@ test "evaluate fetchTree builtin through fetch cache" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
-    ev.fetch_tree_enabled = true;
+    ev.policy.fetch_tree_enabled = true;
 
     const out_path = try ev.evaluate(path_source);
     try std.testing.expectEqualStrings(cwd, ev.intern.get(out_path.asInternId()));
@@ -635,7 +635,7 @@ test "evaluate getFlake builtin for local path ref" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
-    ev.flakes_enabled = true;
+    ev.policy.flakes_enabled = true;
 
     try std.testing.expectEqual(@as(i64, 7), (try ev.evaluate(value_source)).asInt());
     try std.testing.expectEqual(@as(i64, 7), (try ev.evaluate(output_source)).asInt());
@@ -680,7 +680,7 @@ test "getFlake resolves inputs from flake.lock (transitive + follows + diamond)"
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
-    ev.flakes_enabled = true;
+    ev.policy.flakes_enabled = true;
 
     inline for (.{ .{ "bVal", 2 }, .{ "bTransitiveC", 3 }, .{ "cVal", 3 } }) |q| {
         const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").{s}", .{ dir_r, q[0] });
@@ -713,7 +713,7 @@ test "getFlake resolves inputs from flake.nix when there is no lock" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
     ev.setFileIo(std.testing.io);
-    ev.flakes_enabled = true;
+    ev.policy.flakes_enabled = true;
 
     const src = try std.fmt.allocPrint(std.testing.allocator, "(builtins.getFlake \"path:{s}\").x", .{dir_r});
     defer std.testing.allocator.free(src);

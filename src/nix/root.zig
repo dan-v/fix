@@ -20,6 +20,7 @@ pub const chunk = bytecode.chunk;
 pub const heap = runtime.heap;
 pub const gc = runtime.gc;
 pub const compiler = @import("compiler.zig");
+pub const policy = @import("policy.zig");
 pub const intern = runtime.intern;
 pub const thunk = runtime.thunk;
 pub const scheduler = @import("scheduler.zig");

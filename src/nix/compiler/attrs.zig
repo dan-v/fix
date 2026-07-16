@@ -320,6 +320,7 @@ fn deferLeaf(self: *Compiler, body: *const Node, name: InternId, snapshot: Defer
         .base_path = snapshot.base_path,
         .source_path = snapshot.source_path,
         .source_file_id = self.source_file_id,
+        .policy = self.policy,
         // Qualified name of the deferred body: this compiler's name, extended
         // by the attr it binds. Always on (real binding), like eager bodies.
         .name_id = self.registry.childName(self.name_id, name, false) catch self.name_id,
@@ -476,7 +477,7 @@ fn maybeEmitRecursiveOverrides(self: *Compiler, groups: []const AttrEntryGroup) 
             // Lix deprecated `__overrides`: an error by default, re-permitted by
             // the `rec-set-overrides` feature. Scoped to top-level static keys
             // of a rec set, so nested/non-rec/dynamic `__overrides` don't trip.
-            if (!self.allow_rec_set_overrides) {
+            if (!self.policy.allow_rec_set_overrides) {
                 try diagnostics.reportCompileError(self, group.first.offset, group.first.len, "__overrides attributes are deprecated and will be removed in the future. Use --extra-deprecated-features rec-set-overrides to silence this warning.");
                 return error.RecSetOverridesDeprecated;
             }
@@ -614,7 +615,7 @@ pub fn compileExtendedAttrSetLiteralThunk(self: *Compiler, leaves: []const AttrE
     // recursiveness (a `rec` set with a non-rec set or a path continuation)
     // discards a `rec` modifier, so it errors by default and is re-permitted by
     // the feature.
-    if (has_rec and has_nonrec and !self.allow_rec_set_merges) {
+    if (has_rec and has_nonrec and !self.policy.allow_rec_set_merges) {
         const name = self.source[leaves[0].path[0].offset..][0..leaves[0].path[0].len];
         const message = try std.fmt.allocPrint(self.allocator, "attribute '{s}' cannot be merged, because one set is marked as recursive and the other isn't. Use --extra-deprecated-features rec-set-merges to disable this error and make the expression parse as-is with implementation-defined semantics.", .{name});
         try self.owned_diagnostic_messages.append(self.allocator, message);

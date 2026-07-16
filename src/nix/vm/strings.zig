@@ -263,7 +263,7 @@ pub fn coerceLanguageStringValueOpt(self: *VM, value: Value, allow_int: bool) !V
     return switch (forced.kind()) {
         .string, .string_context => forced,
         .path => try sourcePathStringValue(self, forced.asInternId()),
-        .int, .boxed_int => if (allow_int and self.coerce_integers_enabled) blk: {
+        .int, .boxed_int => if (allow_int and self.policy.coerce_integers_enabled) blk: {
             const s = try std.fmt.allocPrint(self.allocator, "{}", .{int_mod.get(forced, self.heap)});
             defer self.allocator.free(s);
             break :blk Value.string(try self.intern.intern(s));

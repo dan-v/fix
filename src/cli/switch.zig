@@ -158,7 +158,7 @@ fn buildAndSwitch(allocator: std.mem.Allocator, init: std.process.Init, target: 
     defer ev.deinit();
     const term = try setup.configure(&ev, init, options.*);
 
-    if (source_arg == .flake and !ev.flakes_enabled) {
+    if (source_arg == .flake and !ev.policy.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }

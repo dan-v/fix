@@ -329,8 +329,6 @@ inline fn shortCircuitClosureCaptures(
     return makeClosure(self, cl_chunk_id, @intCast(k));
 }
 
-
-
 /// Like `makeBytecodeThunkFromCaptures` but submits the thunk to the
 /// urgent queue at creation time. Used by `thunk_eag` —
 /// the compiler emits that op when strictness analysis confirms the
@@ -599,7 +597,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
     // self-application like `(x: x x)(x: x x)`) bounded, exactly as Nix's
     // `max-call-depth` does.
     const new_depth = frame.call_depth + 1;
-    if (new_depth > self.max_call_depth) return trace.callDepthExceeded(self);
+    if (new_depth > self.policy.max_call_depth) return trace.callDepthExceeded(self);
     const frame_base = frame.frame_base;
     const arg_end = frame_base + 1;
     if (arg_end > stack_cap) return error.StackOverflow;
@@ -637,7 +635,7 @@ fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId
     const frame = stack.currentFrame(self);
     // Tail call — see `replaceCurrentFrame`: reused frame, logical depth +1.
     const new_depth = frame.call_depth + 1;
-    if (new_depth > self.max_call_depth) return trace.callDepthExceeded(self);
+    if (new_depth > self.policy.max_call_depth) return trace.callDepthExceeded(self);
     const frame_base = frame.frame_base;
     // Copy the n args down to the frame base. dst (frame_base) <= src
     // (args_base) and we copy ascending, so any overlap is safe.

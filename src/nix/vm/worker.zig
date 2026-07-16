@@ -1005,7 +1005,9 @@ pub const Worker = struct {
 
     fn countSuspended(self: *Worker) usize {
         var c: usize = 0;
-        for (self.fibers.items) |f| if (f.state == .suspended) { c += 1; };
+        for (self.fibers.items) |f| if (f.state == .suspended) {
+            c += 1;
+        };
         return c;
     }
 
@@ -1243,8 +1245,8 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                 std.debug.print("sweep attrs={d} n={d} t_us={d} worker={d} claimer={d} first_attr={s} member={s}\n", .{
                     attrs_id,             entries.len,
                     vm_force.diagNowUs(), worker_id_mod.current,
-                    f.ctx.claimer_id,
-                    f.vm.intern.get(entries[0].name), label,
+                    f.ctx.claimer_id,     f.vm.intern.get(entries[0].name),
+                    label,
                 });
             }
             // Arm the per-member cascade bounds (claimed forces AND thunk
@@ -1366,24 +1368,17 @@ test "Worker basic init/deinit" {
 
         fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            return VM.init(
-                scratch,
-                null,
-                &self.registry,
-                &self.intern,
-                &self.heap,
-                &self.files,
-                &self.fetchers,
-                &self.derivations,
-                self.sched,
-                null,
-                null,
-                null,
-                if (comptime vm_mod.thunks_log_enabled) null else {},
-                null,
-                Value.null_val,
-                if (comptime vm_mod.opcode_profile_enabled) &self.opcode_counts else {},
-            );
+            return VM.init(.{
+                .allocator = scratch,
+                .registry = &self.registry,
+                .intern = &self.intern,
+                .heap = &self.heap,
+                .files = &self.files,
+                .fetchers = &self.fetchers,
+                .derivations = &self.derivations,
+                .scheduler = self.sched,
+                .opcode_profile_sink = if (comptime vm_mod.opcode_profile_enabled) &self.opcode_counts else {},
+            });
         }
     };
 

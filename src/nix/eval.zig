@@ -17,6 +17,7 @@ const ChunkId = types.ChunkId;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const vm_mod = @import("vm.zig");
 const VM = vm_mod.VM;
+const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 const vm_force = @import("vm.zig").force;
 const vm_builtins = @import("vm.zig").builtins;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
@@ -443,58 +444,9 @@ pub const Evaluator = struct {
     /// Propagated to every VM via `initVm`; gates `thunk_shell`.
     /// Default false — the CLI sets it true only for `--xml`.
     lazy_shells_visible: bool = false,
-    /// Whether the `|>`/`<|` pipe operators are permitted. They always
-    /// parse; when this is false, `parseAndCompile` rejects any source that
-    /// used one (matching Nix, which gates the feature on presence). The CLI
-    /// sets it true for `--extra-experimental-features pipe-operators`.
-    /// Default false.
-    pipe_operators_enabled: bool = false,
-    /// Whether `builtins.fetchTree` may be called. Like Nix, the builtin is
-    /// gated on the `fetch-tree` experimental feature: the implementation is
-    /// always present, but a direct `builtins.fetchTree` call errors unless
-    /// this is set. The CLI sets it true for
-    /// `--extra-experimental-features fetch-tree`. Propagated to each VM in
-    /// `initVm`. Default false. (`getFlake` calls the fetcher directly and is
-    /// unaffected by this gate.)
-    fetch_tree_enabled: bool = false,
-    /// Whether the flake builtins (`getFlake`, `parseFlakeRef`,
-    /// `flakeRefToString`) may be called, and whether `--flake` is accepted.
-    /// Gated on the `flakes` experimental feature, like Nix. The CLI sets it
-    /// true for `--extra-experimental-features flakes` (which also implies
-    /// `fetch-tree`). Propagated to each VM in `initVm`. Default false.
-    flakes_enabled: bool = false,
-    /// Logical call-depth cap (Nix's `max-call-depth`, default 10000).
-    /// Propagated to each VM in `initVm`; the CLI overrides it from
-    /// `--option max-call-depth N`. See `vm.Frame.call_depth`.
-    max_call_depth: u32 = types.DEFAULT_MAX_CALL_DEPTH,
-    /// `coerce-integers` experimental feature (Lix): allow coercing ints/bools
-    /// to strings in `${…}`/`+`. Propagated to each VM. Default false.
-    coerce_integers_enabled: bool = false,
-    /// `nul-bytes` deprecated feature: when true, a NUL in a string literal
-    /// truncates at the NUL rather than erroring. Default false (error).
-    allow_nul_bytes: bool = false,
-    /// `floor-ceil-corrupt-integers` deprecated feature: when true,
-    /// `floor`/`ceil` of an integer that loses precision as f64 returns the
-    /// corrupted value rather than erroring. Default false (error).
-    allow_floor_ceil_corrupt: bool = false,
-    /// `rec-set-overrides` deprecated feature: when true, a top-level
-    /// `__overrides` attribute in a `rec { … }` applies overrides; default
-    /// false (compile error, matching Lix's deprecation).
-    allow_rec_set_overrides: bool = false,
-    /// `rec-set-merges` deprecated feature: when true, merging attr paths where
-    /// one definition is `rec` and another isn't is allowed (first-definition
-    /// recursiveness wins); default false (compile error, matching Lix).
-    allow_rec_set_merges: bool = false,
-    /// `cr-line-endings` deprecated feature: when true, CR/CRLF line endings are
-    /// accepted; default false (compile error, matching Lix).
-    allow_cr_line_endings: bool = false,
-    /// `tokens-no-whitespace` deprecated feature: when true, a value token stuck
-    /// to the next token with no whitespace (`0a`, `1.a`, `"x"2`) is accepted;
-    /// default false (compile error, matching Lix).
-    allow_tokens_no_whitespace: bool = false,
-    /// `nix-path-shadow` deprecated feature: allow shadowing `<nix/...>` or a
-    /// reserved `nix=` search-path prefix; default false (error, matching Lix).
-    allow_nix_path_shadow: bool = false,
+    /// Feature gates and deprecated compatibility behavior shared unchanged by
+    /// parsing, every nested compiler, and every VM.
+    policy: LanguagePolicy = .{},
     /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
     /// default) means no debugger: `builtins.break` is a plain identity and the
     /// break sink is never installed on VMs. See `DebugSession`.
@@ -1013,7 +965,7 @@ pub const Evaluator = struct {
         // reject on *presence* — the parser records whether any `|>`/`<|`
         // was seen, so a pipe anywhere in the file (even an unused/deferred
         // attr body) fails here, before any compilation runs.
-        if (parser.used_pipe_operators and !self.pipe_operators_enabled) {
+        if (parser.used_pipe_operators and !self.policy.pipe_operators_enabled) {
             const tok = parser.first_pipe_token.?;
             try self.copyDiagnostics(&.{.{
                 .severity = .err,
@@ -1033,7 +985,7 @@ pub const Evaluator = struct {
         // parse still succeeds (CR is treated as a line ending) so enabling the
         // feature Just Works.
         if (parser.first_cr_offset) |cr_off| {
-            if (!self.allow_cr_line_endings) {
+            if (!self.policy.allow_cr_line_endings) {
                 try self.copyDiagnostics(&.{.{
                     .severity = .err,
                     .kind = .compile,
@@ -1052,7 +1004,7 @@ pub const Evaluator = struct {
         // token without whitespace is rejected by default. The tokenization
         // still succeeds, so enabling the feature Just Works.
         if (parser.first_tokens_no_ws_offset) |off| {
-            if (!self.allow_tokens_no_whitespace) {
+            if (!self.policy.allow_tokens_no_whitespace) {
                 try self.copyDiagnostics(&.{.{
                     .severity = .err,
                     .kind = .compile,
@@ -1093,9 +1045,7 @@ pub const Evaluator = struct {
         compiler.base_path = base_path;
         compiler.source_path = source_path;
         compiler.home_dir = if (self.env_map) |env| env.get("HOME") else null;
-        compiler.allow_nul_bytes = self.allow_nul_bytes;
-        compiler.allow_rec_set_overrides = self.allow_rec_set_overrides;
-        compiler.allow_rec_set_merges = self.allow_rec_set_merges;
+        compiler.policy = self.policy;
         // Set eagerly (not lazily on first position record, see sourceFileId):
         // chunks registered before any position record would otherwise miss
         // their file in the disasm sidecar.
@@ -1443,20 +1393,20 @@ pub const Evaluator = struct {
         // stack/frames go through the shared pool) get the worker bucket.
         const prev_tag = vma_mod.setAllocTag(.worker_arena);
         defer _ = vma_mod.setAllocTag(prev_tag);
-        var vm = try VM.init(
-            scratch,
-            &self.vm_buffers,
-            &self.registry,
-            &self.intern,
-            &self.heap,
-            &self.files,
-            &self.fetchers,
-            &self.derivations,
-            &self.scheduler,
+        var vm = try VM.init(.{
+            .allocator = scratch,
+            .buffer_pool = &self.vm_buffers,
+            .registry = &self.registry,
+            .intern = &self.intern,
+            .heap = &self.heap,
+            .files = &self.files,
+            .fetchers = &self.fetchers,
+            .derivations = &self.derivations,
+            .scheduler = &self.scheduler,
             // Helpers (worker_id != 0) don't write to the shared trace —
             // it's a side effect of *real* evaluation, so speculative force
             // stays invisible to it.
-            if (worker_id == 0) &self.run.trace else null,
+            .trace_sink = if (worker_id == 0) &self.run.trace else null,
             // All workers get the *concurrent span* half of the progress
             // protocol (`beginSpan`/`endSpan` — store writes, fetches), whose
             // std.Progress nodes are independent and lock-free-safe from any
@@ -1465,17 +1415,23 @@ pub const Evaluator = struct {
             // the demand fiber's ExecutionContext (installed by
             // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
             // below), so a helper has no way to touch `active[]`.
-            if (self.progress) |p| p.spans else null,
-            if (worker_id == 0) self.vm_trace else null,
+            .progress_spans = if (self.progress) |p| p.spans else null,
+            .vm_trace = if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
             // concurrency-shaped wrong-result bugs needs to see every
             // helper's resolves, not just main's. The trace handles
             // its own locking.
-            self.thunk_trace,
-            .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
-            try self.ensureBuiltins(),
-            if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
-        );
+            .thunk_trace = self.thunk_trace,
+            .import_host = .{ .context = self, .import_value = importValue, .scoped_import = scopedImportValue, .find_file = findFile, .get_env = getEnv },
+            .builtins_value = try self.ensureBuiltins(),
+            .opcode_profile_sink = if (comptime vm_mod.opcode_profile_enabled) &self.vm_opcode_counts else {},
+            .deferred_table = &self.deferred_table,
+            .regexes = &self.regexes,
+            .break_sink = if (self.debug_ui != null) .{ .ctx = self, .fire = fireBreak } else null,
+            .breakpoints = if (self.breakpoints != null) &self.breakpoints.? else null,
+            .policy = self.policy,
+            .lazy_shells_visible = self.lazy_shells_visible,
+        });
         // A nested VM runs on the surrounding fiber, so it borrows that
         // fiber's execution identity wholesale: claim id (any thunk it
         // claims is attributed to the fiber, not to a default that would
@@ -1492,20 +1448,6 @@ pub const Evaluator = struct {
             const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
             vm.ctx = &wf.ctx;
         }
-        vm.lazy_shells_visible = self.lazy_shells_visible;
-        vm.fetch_tree_enabled = self.fetch_tree_enabled;
-        vm.flakes_enabled = self.flakes_enabled;
-        vm.max_call_depth = self.max_call_depth;
-        vm.coerce_integers_enabled = self.coerce_integers_enabled;
-        vm.allow_floor_ceil_corrupt = self.allow_floor_ceil_corrupt;
-        vm.allow_nix_path_shadow = self.allow_nix_path_shadow;
-        vm.deferred_table = &self.deferred_table;
-        vm.regexes = &self.regexes;
-        // Attach the debugger only when the CLI installed a UI: every VM (main
-        // and nested) then routes `builtins.break` through `fireBreak` and
-        // consults the source-line breakpoint table.
-        if (self.debug_ui != null) vm.break_sink = .{ .ctx = self, .fire = fireBreak };
-        if (self.breakpoints != null) vm.breakpoints = &self.breakpoints.?;
         return vm;
     }
 

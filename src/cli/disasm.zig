@@ -65,7 +65,7 @@ pub fn run(allocator: std.mem.Allocator, init: std.process.Init, args_iter: *std
     // `chunk #42 fetchGit`. Safe here — disasm compiles single-threaded.
     ev.setCaptureChunkNames(true);
 
-    if (source_arg == .flake and !ev.flakes_enabled) {
+    if (source_arg == .flake and !ev.policy.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }

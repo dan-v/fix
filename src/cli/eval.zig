@@ -54,7 +54,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
         console.install(&ev);
     }
 
-    if (source_arg == .flake and !ev.flakes_enabled) {
+    if (source_arg == .flake and !ev.policy.flakes_enabled) {
         std.debug.print("error: {s}\n\n{s}\n", .{ args.errorMessage(error.FlakesFeatureRequired), synopsis });
         return 2;
     }

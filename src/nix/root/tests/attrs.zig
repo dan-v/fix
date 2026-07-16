@@ -170,7 +170,7 @@ test "end-to-end: nested attribute declarations" {
     // Merging a rec set with a path/non-rec set is Lix's deprecated
     // `rec-set-merges`: an error by default, so exercise the semantics with the
     // feature enabled.
-    ev.allow_rec_set_merges = true;
+    ev.policy.allow_rec_set_merges = true;
     const rec_scope = try ev.evaluate("({ a = rec { x = y; }; a.y = 1; }).a.x");
     try std.testing.expectEqual(@as(i64, 1), rec_scope.asInt());
 

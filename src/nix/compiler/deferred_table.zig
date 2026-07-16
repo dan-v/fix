@@ -22,6 +22,7 @@ const stable = @import("base").segments;
 const sync = @import("base").sync;
 const diagnostic = @import("syntax").diagnostic;
 const Parser = @import("syntax").parser.Parser;
+const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
 
 const InternId = types.InternId;
 const NameId = @import("../bytecode.zig").NameId;
@@ -98,6 +99,9 @@ pub const Entry = struct {
     base_path: ?[]const u8,
     source_path: ?[]const u8,
     source_file_id: ?InternId,
+    /// Policy captured with the source so force-time compilation is identical
+    /// to eager compilation even after the originating compiler is gone.
+    policy: LanguagePolicy = .{},
     /// Compile cache: 0 = not yet compiled, else `ChunkId + 1`. Published
     /// once via CAS on the force path; concurrent racers converge on one
     /// canonical ChunkId (the loser's chunk is orphaned-but-correct).

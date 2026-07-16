@@ -93,23 +93,23 @@ pub fn configure(ev: *Evaluator, init: std.process.Init, options: args.Options) 
     }
     http_conn = settings.getUint("http-connections") orelse 25;
 
-    ev.pipe_operators_enabled = features.contains(.pipe_operators);
-    ev.flakes_enabled = features.contains(.flakes);
-    ev.coerce_integers_enabled = features.contains(.coerce_integers);
+    ev.policy.pipe_operators_enabled = features.contains(.pipe_operators);
+    ev.policy.flakes_enabled = features.contains(.flakes);
+    ev.policy.coerce_integers_enabled = features.contains(.coerce_integers);
     // Deprecated features (Lix `--extra-deprecated-features`) re-permit
     // behaviour fix rejects by default.
-    ev.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
-    ev.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
-    ev.allow_rec_set_overrides = options.deprecated_features.contains(.rec_set_overrides);
-    ev.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
-    ev.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
-    ev.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
-    ev.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
+    ev.policy.allow_nul_bytes = options.deprecated_features.contains(.nul_bytes);
+    ev.policy.allow_floor_ceil_corrupt = options.deprecated_features.contains(.floor_ceil_corrupt_integers);
+    ev.policy.allow_rec_set_overrides = options.deprecated_features.contains(.rec_set_overrides);
+    ev.policy.allow_rec_set_merges = options.deprecated_features.contains(.rec_set_merges);
+    ev.policy.allow_cr_line_endings = options.deprecated_features.contains(.cr_line_endings);
+    ev.policy.allow_tokens_no_whitespace = options.deprecated_features.contains(.tokens_no_whitespace);
+    ev.policy.allow_nix_path_shadow = options.deprecated_features.contains(.nix_path_shadow);
     // `--option max-call-depth N` (Nix's call-recursion bound). Clamp to u32.
     if (settings.getUint("max-call-depth")) |n|
-        ev.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
+        ev.policy.max_call_depth = @intCast(@min(n, @as(u64, std.math.maxInt(u32))));
     // `flakes` implies `fetch-tree` (as in Nix).
-    ev.fetch_tree_enabled = features.contains(.fetch_tree) or ev.flakes_enabled;
+    ev.policy.fetch_tree_enabled = features.contains(.fetch_tree) or ev.policy.flakes_enabled;
     ev.setFetchConnections(@intCast(@min(http_conn, @as(u64, std.math.maxInt(u32)))));
     if (settings.getUint("download-attempts")) |n|
         ev.setDownloadAttempts(@intCast(@min(n, @as(u64, std.math.maxInt(u32)))));

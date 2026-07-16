@@ -53,7 +53,7 @@ pub fn renderStrictForTest(source: []const u8) ![]u8 {
 pub fn renderWithPipeOperators(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
-    ev.pipe_operators_enabled = true;
+    ev.policy.pipe_operators_enabled = true;
 
     const result = try ev.evaluate(source);
 
@@ -67,7 +67,7 @@ pub fn renderWithPipeOperators(source: []const u8) ![]u8 {
 pub fn renderWithFetchTree(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
-    ev.fetch_tree_enabled = true;
+    ev.policy.fetch_tree_enabled = true;
 
     const result = try ev.evaluate(source);
 
@@ -81,7 +81,7 @@ pub fn renderWithFetchTree(source: []const u8) ![]u8 {
 pub fn renderWithFlakes(source: []const u8) ![]u8 {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
-    ev.flakes_enabled = true;
+    ev.policy.flakes_enabled = true;
 
     const result = try ev.evaluate(source);
 

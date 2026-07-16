@@ -101,7 +101,7 @@ pub fn compileStringAtom(self: *Compiler, atom: Node.Atom) !void {
                 // deprecated feature is on, in which case the string is
                 // truncated at the NUL (fix/Nix strings are NUL-terminated).
                 if (std.mem.indexOfScalar(u8, bytes, 0)) |nul_idx| {
-                    if (!self.allow_nul_bytes) {
+                    if (!self.policy.allow_nul_bytes) {
                         try diagnostics.reportCompileError(self, atom.offset, atom.len, "NUL bytes (`\\0`) are currently not well supported, because internally strings are NUL-terminated, which may lead to unexpected truncation. Use --extra-deprecated-features nul-bytes to disable this error.");
                         return error.NulByteInString;
                     }

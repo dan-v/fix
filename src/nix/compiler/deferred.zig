@@ -60,6 +60,7 @@ pub fn compile(
     parent.base_path = entry.base_path;
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
+    parent.policy = entry.policy;
     // Shared line index — avoid rebuilding it over the whole source per body.
     // Take a by-value copy: `line_starts` is immutable and safely shared, but
     // `positionForOffset` mutates the embedded last-lookup cache, and
@@ -103,6 +104,7 @@ pub fn compile(
     child.base_path = entry.base_path;
     child.source_path = entry.source_path;
     child.source_file_id = entry.source_file_id;
+    child.policy = entry.policy;
     child.name_id = entry.name_id; // qualified name (traces/errors/disasm)
     defer child.deinit();
     for (entry.scope, 0..) |cap, i| {

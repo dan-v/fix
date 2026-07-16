@@ -47,7 +47,7 @@ const fetchSpanEnd = fetch.fetchSpanEnd;
 /// calling `builtinFetchTree` directly, matching Nix where flake fetching does
 /// not additionally require the user to enable `fetch-tree`.
 pub fn builtinFetchTreeEntry(self: anytype, arg: Value) !Value {
-    if (!self.fetch_tree_enabled) {
+    if (!self.policy.fetch_tree_enabled) {
         // A hard eval error, like Nix: not catchable by `builtins.tryEval`
         // (which only intercepts NixThrow/NixAbort/AssertionFailed/FileNotFound).
         try vm_trace.setErrorMessage(self, "builtins.fetchTree is disabled; pass --extra-experimental-features fetch-tree to enable it");
@@ -155,7 +155,7 @@ pub fn builtinFetchTree(self: anytype, arg: Value) !Value {
 /// `builtins.tryEval`. `getFlake`/`parseFlakeRef` call each other and the
 /// fetcher via their un-suffixed impls, so those internal calls bypass this.
 fn requireFlakes(self: anytype) !void {
-    if (!self.flakes_enabled) {
+    if (!self.policy.flakes_enabled) {
         try vm_trace.setErrorMessage(self, "flakes are disabled; pass --extra-experimental-features flakes to enable them");
         return error.MissingExperimentalFeature;
     }

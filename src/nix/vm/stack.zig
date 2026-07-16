@@ -33,7 +33,7 @@ pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_coun
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const parent_depth: u32 = if (self.frames_len > 0) self.frames[self.frames_len - 1].call_depth else 0;
     const new_depth: u32 = if (is_call) parent_depth + 1 else parent_depth;
-    if (is_call and new_depth > self.max_call_depth) return trace.callDepthExceeded(self);
+    if (is_call and new_depth > self.policy.max_call_depth) return trace.callDepthExceeded(self);
     const frame_base = self.sp - arg_count;
     const reserved = @as(u32, ch.local_count) - arg_count;
 

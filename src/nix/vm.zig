@@ -34,6 +34,7 @@ const VmTrace = @import("vm/trace_log.zig").VmTrace;
 const worker_id_mod = @import("base").worker_id;
 const DeferredTable = @import("compiler.zig").deferred_table.Table;
 const ThunkTrace = @import("probe.zig").thunk_trace.ThunkTrace;
+const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 
 pub const exec_context = @import("vm/exec_context.zig");
 pub const ExecutionContext = exec_context.ExecutionContext;
@@ -368,26 +369,8 @@ pub const VM = struct {
     /// directly. Set per-eval from `Evaluator.lazy_shells_visible`.
     lazy_shells_visible: bool,
 
-    /// Whether a direct `builtins.fetchTree` call is permitted (Nix's
-    /// `fetch-tree` experimental feature). Set per-eval from
-    /// `Evaluator.fetch_tree_enabled`; checked in the builtin dispatch.
-    fetch_tree_enabled: bool,
-
-    /// Whether the flake builtins (`getFlake`, `parseFlakeRef`,
-    /// `flakeRefToString`) are permitted (Nix's `flakes` experimental
-    /// feature). Set per-eval from `Evaluator.flakes_enabled`; checked in the
-    /// builtin dispatch.
-    flakes_enabled: bool,
-
-    /// Logical call-depth cap (Nix's `max-call-depth`, default 10000). See
-    /// `Frame.call_depth`. Set per-eval from `Evaluator.max_call_depth`.
-    max_call_depth: u32,
-    /// `coerce-integers` experimental feature — allow int/bool→string coercion.
-    coerce_integers_enabled: bool = false,
-    /// `floor-ceil-corrupt-integers` deprecated feature — `floor`/`ceil` of a
-    /// precision-losing integer returns the corrupted value instead of erroring.
-    allow_floor_ceil_corrupt: bool = false,
-    allow_nix_path_shadow: bool = false,
+    /// The same compatibility policy used to parse and compile this code.
+    policy: LanguagePolicy,
 
     /// GC (`-Dgc`): the value currently being forced, rooted across a
     /// safepoint collection because it may be off the VM stack. `null_val`
@@ -411,9 +394,9 @@ pub const VM = struct {
     /// `force.gcRootsMark`/`gcRootsRestore`. `void` in normal builds.
     gc_temp_roots: if (build_options.gc) std.ArrayListUnmanaged(Value) else void = if (build_options.gc) .empty else {},
 
-    pub fn init(
+    pub const Init = struct {
         allocator: std.mem.Allocator,
-        buffer_pool: ?*BufferPool,
+        buffer_pool: ?*BufferPool = null,
         registry: *ChunkRegistry,
         intern: *InternTable,
         heap: *ObjectHeap,
@@ -421,61 +404,71 @@ pub const VM = struct {
         fetchers: *FetchCache,
         derivations: *DerivationStore,
         scheduler: *Scheduler,
-        trace_sink: ?*eval_trace.Trace,
-        progress_spans: ?eval_progress.SpanSink,
-        vm_trace: ?*VmTrace,
-        thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void,
-        import_host: ?ImportHost,
-        builtins_value: Value,
+        trace_sink: ?*eval_trace.Trace = null,
+        progress_spans: ?eval_progress.SpanSink = null,
+        vm_trace: ?*VmTrace = null,
+        thunk_trace: if (thunks_log_enabled) ?*ThunkTrace else void = if (thunks_log_enabled) null else {},
+        import_host: ?ImportHost = null,
+        builtins_value: Value = Value.null_val,
         opcode_profile_sink: OpcodeProfileSink,
-    ) !VM {
-        const bufs: BufferPool.Buffers = if (buffer_pool) |bp| try bp.acquire() else blk: {
-            const value_stack = try allocator.alloc(Value, types.VM_STACK_CAP);
-            errdefer allocator.free(value_stack);
-            const frames = try allocator.alloc(Frame, types.MAX_FRAMES);
+        deferred_table: ?*DeferredTable = null,
+        regexes: ?*PatternCache = null,
+        break_sink: ?BreakSink = null,
+        breakpoints: ?*bytecode_mod.BreakpointTable = null,
+        policy: LanguagePolicy = .{},
+        lazy_shells_visible: bool = false,
+    };
+
+    pub fn init(options: Init) !VM {
+        const bufs: BufferPool.Buffers = if (options.buffer_pool) |bp| try bp.acquire() else blk: {
+            const value_stack = try options.allocator.alloc(Value, types.VM_STACK_CAP);
+            errdefer options.allocator.free(value_stack);
+            const frames = try options.allocator.alloc(Frame, types.MAX_FRAMES);
             break :blk .{ .stack = value_stack, .frames = frames };
         };
         const value_stack = bufs.stack;
         const frames = bufs.frames;
 
         return .{
-            .allocator = allocator,
-            .registry = registry,
-            .intern = intern,
-            .heap = heap,
-            .files = files,
-            .fetchers = fetchers,
-            .derivations = derivations,
-            .scheduler = scheduler,
-            .trace = trace_sink,
-            .progress_spans = progress_spans,
-            .vm_trace = vm_trace,
-            .thunk_trace = thunk_trace,
-            .import_host = import_host,
-            .builtins = builtins_value,
+            .allocator = options.allocator,
+            .registry = options.registry,
+            .deferred_table = options.deferred_table,
+            .regexes = options.regexes,
+            .break_sink = options.break_sink,
+            .breakpoints = options.breakpoints,
+            .intern = options.intern,
+            .heap = options.heap,
+            .files = options.files,
+            .fetchers = options.fetchers,
+            .derivations = options.derivations,
+            .scheduler = options.scheduler,
+            .trace = options.trace_sink,
+            .progress_spans = options.progress_spans,
+            .vm_trace = options.vm_trace,
+            .thunk_trace = options.thunk_trace,
+            .import_host = options.import_host,
+            .builtins = options.builtins_value,
             // `ctx` keeps its neutral default here; Worker.allocateFiber
             // repoints it at the fiber's own context (with the fiber's
             // claim id baked in) before the VM runs anything, and
             // Evaluator.initVm repoints nested VMs at the surrounding
             // fiber's context.
-            .buffer_pool = buffer_pool,
+            .buffer_pool = options.buffer_pool,
             .stack = value_stack,
             .sp = 0,
             .sp_high_water = 0,
             .frames = frames,
             .frames_len = 0,
             .opcode_counts = if (opcode_profile_enabled) [_]u64{0} ** opcode.count else {},
-            .opcode_profile_sink = opcode_profile_sink,
+            .opcode_profile_sink = options.opcode_profile_sink,
             .in_speculation = false,
-            .solo = scheduler.worker_count == 1,
+            .solo = options.scheduler.worker_count == 1,
             .spec_budget = NO_SPEC_BUDGET,
             .spec_create_left = NO_SPEC_BUDGET,
             .spec_create_snapshot = 0,
             .spec_create_worker = 0,
-            .lazy_shells_visible = false,
-            .fetch_tree_enabled = false,
-            .flakes_enabled = false,
-            .max_call_depth = types.DEFAULT_MAX_CALL_DEPTH,
+            .lazy_shells_visible = options.lazy_shells_visible,
+            .policy = options.policy,
         };
     }
 
