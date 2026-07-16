@@ -111,8 +111,8 @@ pub const DebugSession = struct {
         // `frameSpan` (inclusive end + body_span fallback) so a caller frame,
         // whose ip sits past the call it's suspended on, still resolves to a
         // source location instead of showing nothing.
-        const span = bytecode.disasm.frameSpan(f.chunk_ptr, f.ip);
-        const file_id = if (span) |s| s.file else bytecode.disasm.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols);
+        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip);
+        const file_id = if (span) |s| s.file else bytecode.inspect.chunkPrimaryFile(f.chunk_ptr, f.chunk_id, symbols.registry);
         return .{
             .chunk_id = f.chunk_id,
             .file = if (file_id) |fid| self.ev.intern.get(fid) else null,
@@ -134,7 +134,7 @@ pub const DebugSession = struct {
     /// the pause.
     pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
         const f = &self.vm.frames[i];
-        const span = bytecode.disasm.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debug_source;
+        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debug_source;
         if (span.file) |fid| {
             return self.ev.files.readFile(self.ev.intern.get(fid)) catch self.ev.debug_source;
         }
@@ -257,7 +257,7 @@ pub const DebugSession = struct {
 
         // Next-line sites in the current chunk (not for a pure step-out).
         if (kind != .out) {
-            const cur_line: u32 = if (bytecode.disasm.frameSpan(cur.chunk_ptr, cur.ip)) |s| s.line else 0;
+            const cur_line: u32 = if (bytecode.inspect.frameSpan(cur.chunk_ptr, cur.ip)) |s| s.line else 0;
             for (cur.chunk_ptr.source_map) |entry| {
                 if (entry.span.line == cur_line) continue;
                 try sites.append(self.ev.allocator, .{ .chunk_id = cur.chunk_id, .offset = entry.start });
@@ -275,7 +275,7 @@ pub const DebugSession = struct {
         if (kind == .into) {
             var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
             defer refs.deinit(self.ev.allocator);
-            bytecode.disasm.collectRefs(self.ev.allocator, cur.chunk_ptr, &refs) catch {};
+            bytecode.inspect.collectRefs(self.ev.allocator, cur.chunk_ptr, &refs) catch {};
             for (refs.items) |rid| {
                 const rc = self.ev.registry.get(rid) orelse continue;
                 if (firstMappedOffset(rc)) |off| {

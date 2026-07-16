@@ -9,7 +9,6 @@ const engine = @import("nix");
 const cli = @import("cli.zig");
 const eval = engine.eval;
 const bytecode = engine.bytecode;
-const intern_mod = engine.intern;
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;
@@ -181,7 +180,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
         reg_stats.speculatable_with_strictness,
         percent(reg_stats.speculatable_with_strictness, reg_stats.speculatable),
     });
-    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry(), ev.internTable());
+    try writeCodeDedupCensus(writer, ev.allocator, ev.chunkRegistry());
 
     try writeSchedulerStats(writer, workers, sched_stats);
 
@@ -194,7 +193,7 @@ fn writeReport(writer: *std.Io.Writer, ev: *Evaluator, top_n: u32) !void {
 /// collapse onto one shared body. Reports two fingerprints: code+constants (what
 /// a naive split shares) and code-only (the upper bound if constants were also
 /// interned).
-fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry, intern: *const intern_mod.InternTable) !void {
+fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, reg: *const bytecode.chunk.ChunkRegistry) !void {
     var by_full: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer by_full.deinit(allocator);
     var by_code: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -245,7 +244,6 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
 
     // Capture-list interning potential: duplicated capture descriptors within
     // chunks (attrset values sharing an environment).
-    const symbols: bytecode.disasm.Symbols = .{ .intern = intern, .registry = reg };
     var cap_total: usize = 0;
     var cap_dup: usize = 0;
     var cap_ops: usize = 0;
@@ -258,7 +256,7 @@ fn writeCodeDedupCensus(writer: *std.Io.Writer, allocator: std.mem.Allocator, re
     id = 0;
     while (id < n) : (id += 1) {
         const c = reg.get(id) orelse continue;
-        const cc = bytecode.disasm.captureCensus(allocator, c, symbols) catch continue;
+        const cc = bytecode.inspect.captureCensus(allocator, c) catch continue;
         cap_total += cc.total;
         cap_dup += cc.duplicated;
         cap_ops += cc.ops;

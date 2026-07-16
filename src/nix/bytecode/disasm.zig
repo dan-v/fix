@@ -12,6 +12,7 @@ const ChunkRegistry = @import("chunk.zig").ChunkRegistry;
 const opcode_mod = @import("opcode.zig");
 const OpCode = opcode_mod.OpCode;
 const encoding = @import("encoding.zig");
+const inspect = @import("inspect.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const intern_mod = @import("runtime").intern;
@@ -47,159 +48,11 @@ pub const Options = struct {
     max_depth: u8 = 4,
     /// Optional cross-reference graph; when set, each chunk header lists its
     /// incoming and outgoing chunk references.
-    refs: ?*const RefGraph = null,
+    refs: ?*const inspect.RefGraph = null,
     /// Terminal width, for extending the zebra row background across the whole
     /// line. 0 disables the extension (background stops at the content).
     line_width: u16 = 0,
 };
-
-/// Chunk cross-reference graph over the whole registry: for each chunk, which
-/// chunks it references (outgoing) and which reference it (incoming). Built once
-/// per disassembly; scanning is O(total bytecode). All allocations use the
-/// caller's allocator (stored so `deinit` frees with the same one).
-pub const RefGraph = struct {
-    out: []std.ArrayListUnmanaged(ChunkId),
-    inc: []std.ArrayListUnmanaged(ChunkId),
-    allocator: std.mem.Allocator,
-
-    pub fn build(allocator: std.mem.Allocator, registry: *const ChunkRegistry, symbols: Symbols) !RefGraph {
-        const a = allocator;
-        const n = registry.count();
-        const out = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
-        const inc = try a.alloc(std.ArrayListUnmanaged(ChunkId), n);
-        for (out) |*l| l.* = .empty;
-        for (inc) |*l| l.* = .empty;
-        var scratch: std.Io.Writer.Allocating = .init(a);
-        defer scratch.deinit();
-        // One refs set reused across all chunks (cleared, capacity retained):
-        // a fresh map per chunk is an alloc+free pair per chunk, pure overhead.
-        var refs: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-        defer refs.deinit(a);
-        var id: ChunkId = 0;
-        while (id < n) : (id += 1) {
-            const chunk = registry.get(id) orelse continue;
-            refs.clearRetainingCapacity();
-            collectRefsInto(chunk, symbols, .{ .map = &refs, .allocator = a }, &scratch) catch continue;
-            var it = refs.iterator();
-            while (it.next()) |e| {
-                const t = e.key_ptr.*;
-                out[id].append(a, t) catch {};
-                if (t < n) inc[t].append(a, id) catch {};
-            }
-        }
-        for (out) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
-        for (inc) |*l| std.mem.sort(ChunkId, l.items, {}, std.sort.asc(ChunkId));
-        return .{ .out = out, .inc = inc, .allocator = a };
-    }
-
-    pub fn deinit(self: *RefGraph) void {
-        const a = self.allocator;
-        for (self.out) |*l| l.deinit(a);
-        for (self.inc) |*l| l.deinit(a);
-        a.free(self.out);
-        a.free(self.inc);
-    }
-
-    fn outgoing(self: *const RefGraph, id: ChunkId) []const ChunkId {
-        return if (id < self.out.len) self.out[id].items else &.{};
-    }
-    fn incoming(self: *const RefGraph, id: ChunkId) []const ChunkId {
-        return if (id < self.inc.len) self.inc[id].items else &.{};
-    }
-};
-
-/// Walk a chunk's bytecode, collecting every chunk id it references. Reuses
-/// `writeOperands` (into a throwaway buffer) so the operand-length and
-/// chunk-extraction logic lives in exactly one place.
-fn collectRefsInto(chunk: *const Chunk, symbols: Symbols, sink: RefSink, scratch: *std.Io.Writer.Allocating) !void {
-    var ip: usize = 0;
-    while (ip < chunk.code.len) {
-        const op_byte = chunk.code[ip];
-        if (op_byte >= opcode_mod.count) {
-            ip += 1;
-            continue;
-        }
-        const op: OpCode = @enumFromInt(op_byte);
-        ip += 1;
-        scratch.writer.end = 0;
-        ip = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, sink);
-    }
-}
-
-/// Per-chunk capture-list census: the inline `[count][3×count descriptors]`
-/// list that `thunk`/`closure_cap`/`thunk_defer`/… carry is often identical
-/// across an attrset's values (they capture the same environment). Measures how
-/// many of those bytes are exact duplicates *within one chunk* — i.e. what a
-/// per-chunk capture-list interning table would reclaim.
-pub const CaptureCensus = struct {
-    total: usize = 0,
-    duplicated: usize = 0,
-    ops: usize = 0,
-    dup_defer: usize = 0,
-    dup_thunk: usize = 0,
-    dup_closure: usize = 0,
-    /// Lists with >= 2 captures: the ones where a fixed 6-byte side-table ref
-    /// beats the `2 + 3*M` inline encoding (a dual inline/ref op would ref
-    /// these and leave single-capture lists inline on the hot path).
-    total_ge2: usize = 0,
-    ops_ge2: usize = 0,
-    dup_ge2: usize = 0,
-};
-
-pub fn captureCensus(allocator: std.mem.Allocator, chunk: *const Chunk, symbols: Symbols) !CaptureCensus {
-    var scratch: std.Io.Writer.Allocating = .init(allocator);
-    defer scratch.deinit();
-    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-    defer seen.deinit(allocator);
-
-    var out: CaptureCensus = .{};
-    var ip: usize = 0;
-    while (ip < chunk.code.len) {
-        const op_byte = chunk.code[ip];
-        if (op_byte >= opcode_mod.count) {
-            ip += 1;
-            continue;
-        }
-        const op: OpCode = @enumFromInt(op_byte);
-        ip += 1;
-        // Byte offset of the INLINE capture list (past the op's chunk id).
-        // `thunk_defer` is excluded — its captures are now interned in the side
-        // table, so it carries no inline list to measure.
-        const list_start: ?usize = switch (op) {
-            .thunk, .thunk_eag, .closure_cap => ip + 2, // u16 id
-            .thunk_w, .thunk_eag_w, .closure_cap_w, .thunk_arg => ip + 4, // u32 id
-            else => null,
-        };
-        scratch.writer.end = 0;
-        const next = try writeOperands(&scratch.writer, chunk, op, ip, symbols, null, null);
-        if (list_start) |ls| {
-            if (ls < next) {
-                const region = chunk.code[ls..next];
-                out.total += region.len;
-                out.ops += 1;
-                // region = [count:u16][descriptors:3*M]; M = (len - 2) / 3.
-                const m: usize = if (region.len >= 2) (region.len - 2) / 3 else 0;
-                const ge2 = m >= 2;
-                if (ge2) {
-                    out.total_ge2 += region.len;
-                    out.ops_ge2 += 1;
-                }
-                const h = std.hash.Wyhash.hash(0, region);
-                if ((try seen.getOrPut(allocator, h)).found_existing) {
-                    out.duplicated += region.len;
-                    if (ge2) out.dup_ge2 += region.len;
-                    switch (op) {
-                        .thunk_defer => out.dup_defer += region.len,
-                        .closure_cap, .closure_cap_w => out.dup_closure += region.len,
-                        else => out.dup_thunk += region.len,
-                    }
-                }
-            }
-        }
-        ip = next;
-    }
-    return out;
-}
 
 /// Bytes shown per row: the hex column is a fixed 4 cells wide (so the opcode
 /// byte, operand bytes, mnemonic, and interpretation all align), and longer
@@ -228,25 +81,6 @@ pub fn writeChunk(
     var visited: Visited = .empty;
     defer visited.deinit(allocator);
     try writeChunkAt(allocator, writer, chunk_id, chunk, symbols, options, 0, &visited);
-}
-
-/// Collect the chunk ids this chunk references (closure/thunk/apply
-/// operands), in first-appearance order, deduplicated. Thin adapter over
-/// `collectRefsInto` (the operand decoder run with a throwaway buffer) so
-/// the decode logic exists once. Used by the repl's disasm browser to build
-/// the reference graph.
-pub fn collectRefs(
-    allocator: std.mem.Allocator,
-    chunk: *const Chunk,
-    out: *std.ArrayListUnmanaged(ChunkId),
-) !void {
-    var referenced: std.AutoArrayHashMapUnmanaged(ChunkId, void) = .empty;
-    defer referenced.deinit(allocator);
-    var scratch: std.Io.Writer.Allocating = .init(allocator);
-    defer scratch.deinit();
-    try collectRefsInto(chunk, .{}, .{ .map = &referenced, .allocator = allocator }, &scratch);
-    try out.ensureUnusedCapacity(allocator, referenced.count());
-    for (referenced.keys()) |id| out.appendAssumeCapacity(id);
 }
 
 fn writeChunkAt(
@@ -418,7 +252,7 @@ fn writeChunkAt(
     // mid-chunk. File lines are not striped and don't advance the stripe.
     var last_file: ?InternId = null;
     if (options.show_source) {
-        if (chunkPrimaryFile(chunk, chunk_id, symbols)) |f| {
+        if (inspect.chunkPrimaryFile(chunk, chunk_id, symbols.registry)) |f| {
             try writeGuide(writer, cc, null, options.use_color);
             try writeFileLine(writer, f, symbols, options.use_color);
             last_file = f;
@@ -459,7 +293,7 @@ fn writeChunkAt(
 
         // Find the narrowest source span covering this instruction; hoist its
         // filename onto its own line when it changes from the previous one.
-        const span: ?Chunk.SourceSpan = if (options.show_source) bestSpan(chunk, start) else null;
+        const span: ?Chunk.SourceSpan = if (options.show_source) inspect.bestSpan(chunk, start) else null;
         if (span) |s| {
             if (s.file) |f| {
                 if (last_file == null or last_file.? != f) {
@@ -731,7 +565,6 @@ fn visibleWidth(text: []const u8) u16 {
 fn setCommentFg(writer: *std.Io.Writer, use_color: bool) !void {
     if (use_color) try writer.print("\x1b[38;2;{d};{d};{d}m", .{ comment_color[0], comment_color[1], comment_color[2] });
 }
-
 
 /// Reset the foreground (and any attributes), then — inside a background-tinted
 /// row (`bg` set) — re-establish that background so the tint survives per-cell
@@ -1717,9 +1550,7 @@ fn writeChunkRef(writer: *std.Io.Writer, id: ChunkId, symbols: Symbols) !void {
 
 /// A place to record the chunk ids an instruction references, bundled with the
 /// allocator that owns the map — so `writeOperands` never reaches for a global
-/// allocator to grow a caller's container. `null` means "don't collect refs",
-/// which the length-only walkers (`captureCensus`, `--stats`) use to skip the
-/// allocation entirely.
+/// allocator to grow a caller's container. `null` means "don't collect refs".
 const RefSink = struct {
     map: *std.AutoArrayHashMapUnmanaged(ChunkId, void),
     allocator: std.mem.Allocator,
@@ -1931,52 +1762,6 @@ fn writeInternRef(writer: *std.Io.Writer, id: InternId, symbols: Symbols) !void 
     } else {
         try writer.print("0x{x} ; str[0x{x}]", .{ id, id });
     }
-}
-
-/// The chunk's file, from the first source-map entry that carries one. Used to
-/// print a filename header before the chunk's bytes.
-pub fn chunkPrimaryFile(chunk: *const Chunk, chunk_id: ?ChunkId, symbols: Symbols) ?InternId {
-    for (chunk.source_map) |entry| {
-        if (entry.span.file) |f| return f;
-    }
-    // Wrapper thunks (attrset bodies) have no per-op source map but do carry a
-    // representative body span — use its file so they still get a header.
-    if (chunk.body_span) |bs| if (bs.file) |f| return f;
-    // Last resort: the file the chunk was compiled from (registry sidecar),
-    // which covers chunks that carry no source span at all.
-    if (chunk_id) |id| if (symbols.registry) |reg| if (reg.fileOf(id)) |f| return f;
-    return null;
-}
-
-/// The narrowest source span covering `ip`, or null if none. Narrowest wins so
-/// the annotation points at the tightest sub-expression, not an enclosing one.
-pub fn bestSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
-    var best: ?Chunk.SourceMapEntry = null;
-    for (chunk.source_map) |entry| {
-        if (ip < entry.start or ip >= entry.end) continue;
-        if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
-            best = entry;
-        }
-    }
-    return if (best) |e| e.span else null;
-}
-
-/// Source span for a live call frame's `ip`. Like `bestSpan` but with an
-/// **inclusive** end, because a caller frame's `ip` points *past* the call it's
-/// suspended on — i.e. exactly at the covering span's exclusive end — so
-/// `bestSpan` would miss it and the frame would show no location. Falls back to
-/// the chunk's representative `body_span` when no entry covers `ip` (thunk
-/// bodies with a sparse map). This is the backtrace/step location function.
-pub fn frameSpan(chunk: *const Chunk, ip: usize) ?Chunk.SourceSpan {
-    var best: ?Chunk.SourceMapEntry = null;
-    for (chunk.source_map) |entry| {
-        if (ip < entry.start or ip > entry.end) continue;
-        if (best == null or entry.end - entry.start <= best.?.end - best.?.start) {
-            best = entry;
-        }
-    }
-    if (best) |e| return e.span;
-    return chunk.body_span;
 }
 
 /// A standalone `; <filename>` comment line marking that subsequent instructions

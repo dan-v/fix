@@ -15,6 +15,7 @@ const keys_mod = @import("keys.zig");
 
 const Evaluator = engine.Evaluator;
 const ChunkId = engine.types.ChunkId;
+const bytecode = engine.bytecode;
 const disasm = engine.bytecode.disasm;
 
 const disasm_options: disasm.Options = .{
@@ -34,7 +35,7 @@ pub fn writePlain(allocator: std.mem.Allocator, w: *std.Io.Writer, ev: *Evaluato
 
     var refs: std.ArrayListUnmanaged(ChunkId) = .empty;
     defer refs.deinit(allocator);
-    disasm.collectRefs(allocator, chunk, &refs) catch {};
+    bytecode.inspect.collectRefs(allocator, chunk, &refs) catch {};
     if (refs.items.len > 0) {
         try w.writeAll("\nreferences:");
         for (refs.items) |id| try w.print(" #{d}", .{id});
@@ -179,7 +180,7 @@ const Pager = struct {
                 var out_refs: std.ArrayListUnmanaged(ChunkId) = .empty;
                 defer out_refs.deinit(self.allocator);
                 if (self.ev.getChunk(id)) |chunk| {
-                    disasm.collectRefs(self.allocator, chunk, &out_refs) catch {};
+                    bytecode.inspect.collectRefs(self.allocator, chunk, &out_refs) catch {};
                 }
                 try lines.append(arena, try std.fmt.allocPrint(arena, "outgoing ({d}):", .{out_refs.items.len}));
                 for (out_refs.items) |ref| {
@@ -249,7 +250,7 @@ const Pager = struct {
             while (cid < count) : (cid += 1) {
                 const chunk = self.ev.getChunk(cid) orelse continue;
                 refs.clearRetainingCapacity();
-                disasm.collectRefs(self.allocator, chunk, &refs) catch continue;
+                bytecode.inspect.collectRefs(self.allocator, chunk, &refs) catch continue;
                 for (refs.items) |target| {
                     const gop = try map.getOrPut(arena, target);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
