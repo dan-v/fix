@@ -11,7 +11,7 @@ const path_ops = @import("runtime").paths;
 const nix_hash = @import("runtime").hash;
 const strings = @import("strings.zig");
 const string_context = @import("string_context.zig");
-const fetch = @import("fetch.zig");
+const source_store = @import("source_store.zig");
 const vm_force = @import("../force.zig");
 const vm_trace = @import("../trace.zig");
 
@@ -19,7 +19,7 @@ const stringArg = strings.stringArg;
 const stringTextInternId = strings.stringTextInternId;
 const isPlainString = strings.isPlainString;
 const contextStringWithPath = string_context.contextStringWithPath;
-const filterSourceAccepts = fetch.filterSourceAccepts;
+const filterSourceAccepts = source_store.filterSourceAccepts;
 
 pub fn builtinBaseNameOf(self: anytype, arg: Value) !Value {
     // Coerce like Nix (copyToStore = false): a raw path keeps its text without a
@@ -177,7 +177,7 @@ pub fn builtinPath(self: anytype, arg: Value) !Value {
     var unsupported: nar.Unsupported = .{};
     defer unsupported.deinit(self.allocator);
     const ingested = recursiveIngest(self, path, store_name, filter_value, &unsupported) catch |err|
-        return fetch.reportUnsupportedType(self, &unsupported, err);
+        return source_store.reportUnsupportedType(self, &unsupported, err);
     defer ingested.deinit(self.allocator);
     if (expected_hash) |expected| {
         const actual_hex = try derivation.hashToBase16(self.allocator, "sha256", ingested.nar_hash);
@@ -209,5 +209,5 @@ fn recursiveIngest(self: anytype, path: []const u8, store_name: []const u8, filt
     return source_paths.ingestReport(self.allocator, self.derivations, self.files, path, store_name, .{
         .context = &context,
         .accept = Context.accept,
-    }, fetch.filterKeyOf(self, pred), unsupported);
+    }, source_store.filterKeyOf(self, pred), unsupported);
 }
