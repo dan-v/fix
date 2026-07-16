@@ -29,6 +29,7 @@ pub const eval_gc = @import("eval/gc.zig");
 pub const eval_progress = @import("observ").progress;
 pub const builtins = @import("runtime").builtins;
 pub const derivation = @import("derivation");
+pub const realization = @import("realization");
 pub const diagnostic = @import("syntax").diagnostic;
 
 pub const Evaluator = eval.Evaluator;

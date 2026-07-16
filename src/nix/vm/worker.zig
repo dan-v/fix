@@ -62,7 +62,7 @@ const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;
 const FileCache = @import("host").FileCache;
 const FetchCache = @import("host").FetchCache;
-const DerivationStore = @import("derivation").DerivationStore;
+const DerivationStore = @import("realization").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM
 /// initialised for the given (worker_id, fiber_id). The Worker repoints

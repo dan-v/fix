@@ -6,10 +6,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const debug_record_mod = @import("debug_record.zig");
-const drv_mod = @import("drv.zig");
-const types = @import("types.zig");
-const clone = @import("clone.zig");
+const derivation = @import("derivation");
+const drv_mod = derivation.drv;
+const types = derivation.types;
 const stable = @import("base").sync;
 const runtime = @import("runtime");
 const host = @import("host");
@@ -60,12 +59,8 @@ const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
 const Drv = drv_mod.Drv;
 const DrvOutput = types.DrvOutput;
-const HashModulo = types.HashModulo;
 const HashModuloResolver = types.HashModuloResolver;
 const HashModuloView = types.HashModuloView;
-const cloneHashModulo = clone.cloneHashModulo;
-const cloneOutputNames = clone.cloneOutputNames;
-const freeOutputNames = clone.freeOutputNames;
 
 /// Thread safety: all access to `records` and `debug_records` goes through
 /// `mu`. The store is read-mostly during evaluation but writes (record /
@@ -85,10 +80,7 @@ fn storePathName(path: []const u8) []const u8 {
 pub const DerivationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
-    records: std.StringHashMapUnmanaged(Record) = .empty,
-    debug_enabled: bool = false,
-    debug_records: std.ArrayListUnmanaged(DebugRecord) = .empty,
-    mu: stable.BlockingMutex = .{},
+    registry: derivation.Registry,
     /// Cache of fully-built lazy derivation values keyed by the
     /// input `attrs_id` to `buildForcedDerivationValue(.lazy)`. The
     /// `builtinDerivationLazyAttr` path was rebuilding the entire
@@ -333,17 +325,6 @@ pub const DerivationStore = struct {
     /// so it can be dropped into an `Ingested` (which is caller-owned).
     pub const SourceMemoHit = struct { store_path: []u8, nar_hash: []u8 };
 
-    const Record = struct {
-        hash_modulo: HashModulo,
-        outputs: []const []const u8,
-
-        fn deinit(self: Record, allocator: std.mem.Allocator) void {
-            self.hash_modulo.deinit(allocator);
-            for (self.outputs) |output| allocator.free(output);
-            allocator.free(self.outputs);
-        }
-    };
-
     /// A deferred `fetchurl`/`fetchTarball`: the download spec plus the expected
     /// content hash, materialized on demand. `recursive` distinguishes a flat
     /// file (fetchurl) from an unpacked tree (fetchTarball).
@@ -517,7 +498,7 @@ pub const DerivationStore = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) DerivationStore {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .registry = derivation.Registry.init(allocator) };
     }
 
     pub fn deinit(self: *DerivationStore) void {
@@ -557,14 +538,7 @@ pub const DerivationStore = struct {
             self.test_producer_payload_pointers.deinit(self.allocator);
         }
         self.recipe_mu.unlock();
-        self.clearDebugRecords();
-        self.debug_records.deinit(self.allocator);
-        var it = self.records.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.records.deinit(self.allocator);
+        self.registry.deinit();
         self.lazy_drv_cache.deinit(self.allocator);
         var src_memo = self.source_memo.iterator();
         while (src_memo.next()) |entry| {
@@ -1502,100 +1476,36 @@ pub const DerivationStore = struct {
     }
 
     pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.debug_enabled = enabled;
-        if (!enabled) self.clearDebugRecordsLocked();
+        self.registry.setDebugEnabled(enabled);
+    }
+
+    pub fn debugEnabled(self: *DerivationStore) bool {
+        return self.registry.debugEnabled();
     }
 
     pub fn clearDebugRecords(self: *DerivationStore) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.clearDebugRecordsLocked();
-    }
-
-    fn clearDebugRecordsLocked(self: *DerivationStore) void {
-        for (self.debug_records.items) |debug_record| debug_record.deinit(self.allocator);
-        self.debug_records.clearRetainingCapacity();
+        self.registry.clearDebugRecords();
     }
 
     /// Returns a borrowed slice. Caller must not invoke `record*` concurrently.
     /// Used at end-of-evaluation from the main thread after helpers have quiesced.
     pub fn debugRecords(self: *const DerivationStore) []const DebugRecord {
-        return self.debug_records.items;
+        return self.registry.debugRecords();
     }
 
     pub fn resolver(self: *DerivationStore) HashModuloResolver {
-        return .{ .store_dir = self.store_dir, .context = self, .resolve = resolveHashModulo };
+        return self.registry.resolver(self.store_dir);
     }
 
     pub fn record(self: *DerivationStore, drv_path: []const u8, hash_modulo: HashModuloView, outputs: []const DrvOutput) !void {
-        // Fast path: another thread already recorded this drv_path. Drv paths
-        // are content-addressed by their inputs, so two records for the same
-        // path must carry equal hash_modulos — overwriting would invalidate
-        // any HashModuloView still in flight on another worker.
-        {
-            self.mu.lock();
-            defer self.mu.unlock();
-            if (self.records.contains(drv_path)) return;
-        }
-
-        const value: Record = blk: {
-            const cloned_hash_modulo = try cloneHashModulo(self.allocator, hash_modulo);
-            errdefer cloned_hash_modulo.deinit(self.allocator);
-            const cloned_outputs = try cloneOutputNames(self.allocator, outputs);
-            errdefer freeOutputNames(self.allocator, cloned_outputs);
-            break :blk .{
-                .hash_modulo = cloned_hash_modulo,
-                .outputs = cloned_outputs,
-            };
-        };
-
-        self.mu.lock();
-        defer self.mu.unlock();
-
-        // Recheck under the lock — a racing recorder may have landed between
-        // the optimistic check and now.
-        if (self.records.contains(drv_path)) {
-            value.deinit(self.allocator);
-            return;
-        }
-        const key = try self.allocator.dupe(u8, drv_path);
-        errdefer self.allocator.free(key);
-        try self.records.put(self.allocator, key, value);
+        return self.registry.record(drv_path, hash_modulo, outputs);
     }
 
     pub fn recordDebug(self: *DerivationStore, drv: *const Drv, computed: ComputedPaths) !void {
-        // Read-then-act on debug_enabled needs to hold the lock so a
-        // concurrent setDebugEnabled doesn't tear our decision.
-        self.mu.lock();
-        const enabled = self.debug_enabled;
-        if (!enabled) {
-            self.mu.unlock();
-            return;
-        }
-        self.mu.unlock();
-
-        var new_record = try debug_record_mod.debugRecordFromDrv(self.allocator, drv, computed.drv_path, self.resolver());
-        errdefer new_record.deinit(self.allocator);
-
-        self.mu.lock();
-        defer self.mu.unlock();
-        try self.debug_records.append(self.allocator, new_record);
+        return self.registry.recordDebug(self.store_dir, drv, computed);
     }
 
     pub fn outputNames(self: *DerivationStore, drv_path: []const u8) ?[]const []const u8 {
-        self.mu.lock();
-        defer self.mu.unlock();
-        const value = self.records.getPtr(drv_path) orelse return null;
-        return value.outputs;
-    }
-
-    fn resolveHashModulo(context: *anyopaque, drv_path: []const u8) anyerror!?HashModuloView {
-        const self: *DerivationStore = @ptrCast(@alignCast(context));
-        self.mu.lock();
-        defer self.mu.unlock();
-        const value = self.records.getPtr(drv_path) orelse return null;
-        return value.hash_modulo.view();
+        return self.registry.outputNames(drv_path);
     }
 };

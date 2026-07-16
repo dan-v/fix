@@ -26,7 +26,8 @@ const FetchCache = host.FetchCache;
 const regex_mod = @import("base").regex;
 const block_cache_mod = @import("base").block_cache;
 const vma_mod = @import("runtime").mem_tag.vma;
-const DerivationStore = @import("derivation").DerivationStore;
+const realization = @import("realization");
+const DerivationStore = realization.DerivationStore;
 const derivation = @import("derivation");
 const Value = @import("runtime").value.Value;
 const builtins = @import("runtime").builtins;
@@ -912,7 +913,7 @@ pub const Evaluator = struct {
     /// evaluator's live `SpanSink` (the store can't name observ types), mapping the
     /// store's local `SpanGroup` onto the observ group. `ctx` is the `*Evaluator`;
     /// both no-op if the sink was cleared mid-run.
-    fn drvSpanBegin(ctx: *anyopaque, group: derivation.SpanGroup, label: []const u8) usize {
+    fn drvSpanBegin(ctx: *anyopaque, group: realization.SpanGroup, label: []const u8) usize {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         const spans = (self.progress orelse return 0).spans;
         const observ_group: eval_progress.SpanGroup = switch (group) {

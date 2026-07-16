@@ -123,21 +123,34 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     derivation_mod.addImport("runtime", runtime_mod);
-    derivation_mod.addImport("host", host_mod);
     derivation_mod.addImport("base", base_mod);
 
-    // Test-only imports live behind a dedicated root, not on the production
-    // derivation module consumed by the evaluator/CLI.
-    const derivation_tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/nix/derivation_test_root.zig"),
+    const realization_mod = b.addModule("realization", .{
+        .root_source_file = b.path("src/nix/realization.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    derivation_tests_mod.addImport("runtime", runtime_mod);
-    derivation_tests_mod.addImport("host", host_mod);
-    derivation_tests_mod.addImport("base", base_mod);
+    realization_mod.addImport("runtime", runtime_mod);
+    realization_mod.addImport("host", host_mod);
+    realization_mod.addImport("derivation", derivation_mod);
+    realization_mod.addImport("base", base_mod);
+
+    // Socket-backed realization tests live behind a dedicated root so neither
+    // production module acquires the fake daemon as a member.
+    const realization_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/nix/realization_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    realization_tests_mod.addImport("runtime", runtime_mod);
+    realization_tests_mod.addImport("host", host_mod);
+    realization_tests_mod.addImport("realization", realization_mod);
+    realization_tests_mod.addImport("derivation", derivation_mod);
+    realization_tests_mod.addImport("base", base_mod);
 
     // Evaluation observability sinks (progress protocol + error-trace collector).
     // Leaf types the interpreter writes to; the evaluator/CLI implement them.
@@ -206,6 +219,7 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("build_options", build_options_mod);
     vm_mod.addImport("runtime", runtime_mod);
     vm_mod.addImport("host", host_mod);
+    vm_mod.addImport("realization", realization_mod);
     vm_mod.addImport("base", base_mod);
     vm_mod.addImport("syntax", syntax_mod);
     vm_mod.addImport("scheduler", scheduler_mod);
@@ -227,6 +241,7 @@ pub fn build(b: *std.Build) void {
         .syntax = syntax_mod,
         .runtime = runtime_mod,
         .host = host_mod,
+        .realization = realization_mod,
         .base = base_mod,
         .scheduler = scheduler_mod,
         .derivation = derivation_mod,
@@ -318,6 +333,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_host_tests = b.addRunArtifact(host_tests);
 
+    const realization_tests = b.addTest(.{
+        .root_module = realization_tests_mod,
+        .use_llvm = true,
+    });
+    const run_realization_tests = b.addRunArtifact(realization_tests);
+
     const syntax_tests = b.addTest(.{
         .root_module = syntax_mod,
         .use_llvm = true,
@@ -331,7 +352,7 @@ pub fn build(b: *std.Build) void {
     const run_scheduler_tests = b.addRunArtifact(scheduler_tests);
 
     const derivation_tests = b.addTest(.{
-        .root_module = derivation_tests_mod,
+        .root_module = derivation_mod,
         .use_llvm = true,
     });
     const run_derivation_tests = b.addRunArtifact(derivation_tests);
@@ -381,6 +402,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_host_tests.step);
+    test_step.dependOn(&run_realization_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
@@ -439,6 +461,7 @@ const SharedImports = struct {
     syntax: *std.Build.Module,
     runtime: *std.Build.Module,
     host: *std.Build.Module,
+    realization: *std.Build.Module,
     base: *std.Build.Module,
     scheduler: *std.Build.Module,
     derivation: *std.Build.Module,
@@ -450,6 +473,7 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("syntax", imports.syntax);
     module.addImport("runtime", imports.runtime);
     module.addImport("host", imports.host);
+    module.addImport("realization", imports.realization);
     module.addImport("base", imports.base);
     module.addImport("scheduler", imports.scheduler);
     module.addImport("derivation", imports.derivation);

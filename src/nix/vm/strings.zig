@@ -9,7 +9,7 @@ const InternId = types.InternId;
 const ObjectId = types.ObjectId;
 const heap_mod = @import("runtime").heap;
 const int_mod = @import("runtime").int;
-const source_paths = @import("derivation").source_path;
+const source_paths = @import("realization").source_path;
 
 const closures = @import("closures.zig");
 const force = @import("force.zig");

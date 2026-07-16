@@ -23,7 +23,7 @@ const std = @import("std");
 /// Every build module's name. A file outside a module may not reach into its
 /// files by relative path; see `owningModule` for how physical paths (the
 /// `base/`, `nix/`, `cli/` tiers) map onto these names.
-const module_dirs = [_][]const u8{ "syntax", "runtime", "host", "base", "scheduler", "derivation", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
+const module_dirs = [_][]const u8{ "syntax", "runtime", "host", "base", "scheduler", "derivation", "realization", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
 
 /// Longest-path topological level of each module in the `build.zig` dependency
 /// graph. Imports must point strictly DOWN: a file in module M may only
@@ -41,7 +41,8 @@ const module_levels = [_]ModuleLevel{
     .{ .name = "host", .level = 2 },
     .{ .name = "observ", .level = 2 },
     .{ .name = "scheduler", .level = 2 },
-    .{ .name = "derivation", .level = 3 },
+    .{ .name = "derivation", .level = 2 },
+    .{ .name = "realization", .level = 3 },
     .{ .name = "bytecode", .level = 2 },
     .{ .name = "probe", .level = 3 },
     .{ .name = "compiler", .level = 4 },
@@ -134,12 +135,13 @@ fn owningModule(rel: []const u8) ?[]const u8 {
         std.mem.eql(u8, rel, "nix/runtime/store.zig") or
         std.mem.startsWith(u8, rel, "nix/runtime/store/") or
         std.mem.eql(u8, rel, "nix/runtime/daemon_runtime.zig")) return "host";
+    if (std.mem.eql(u8, rel, "nix/derivation/store.zig") or
+        std.mem.eql(u8, rel, "nix/derivation/source_path.zig")) return "realization";
     // Strip the `nix/` tier segment (if present) before matching subsystem dirs.
     const inner = if (std.mem.startsWith(u8, rel, "nix/")) rel["nix/".len..] else rel;
-    // Dedicated test root for the derivation module. It lives one level up so
-    // its relative imports can include both derivation internals and the shared
-    // core fake daemon without attaching either to production module imports.
-    if (std.mem.eql(u8, inner, "derivation_test_root.zig")) return "derivation";
+    if (std.mem.eql(u8, inner, "realization_test_root.zig") or
+        std.mem.eql(u8, inner, "derivation/tests.zig") or
+        std.mem.eql(u8, inner, "derivation/recipe_tests.zig")) return "realization";
     for (module_dirs) |m| {
         if (std.mem.startsWith(u8, inner, m) and inner.len > m.len and inner[m.len] == '/') return m;
         if (inner.len == m.len + 4 and std.mem.startsWith(u8, inner, m) and std.mem.eql(u8, inner[m.len..], ".zig")) return m;

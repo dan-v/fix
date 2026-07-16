@@ -6,16 +6,21 @@
 const heap_mod = @import("runtime").heap;
 const InternTable = @import("runtime").intern.InternTable;
 const Value = @import("runtime").value.Value;
-const dtypes = @import("derivation/types.zig");
-const drv_mod = @import("derivation/drv.zig");
-const path_mod = @import("derivation/paths.zig");
-const hash_codec = @import("derivation/hash_codec.zig");
-const store_mod = @import("derivation/store.zig");
-const value_builder = @import("derivation/value.zig");
+pub const types = @import("derivation/types.zig");
+pub const drv = @import("derivation/drv.zig");
+pub const paths = @import("derivation/paths.zig");
+pub const hash_codec = @import("derivation/hash_codec.zig");
+pub const value = @import("derivation/value.zig");
+pub const debug_record = @import("derivation/debug_record.zig");
+pub const clone = @import("derivation/clone.zig");
+pub const sort = @import("derivation/sort.zig");
+pub const registry = @import("derivation/registry.zig");
+pub const Registry = registry.Registry;
+const dtypes = types;
+const drv_mod = drv;
+const path_mod = paths;
+const value_builder = value;
 const std = @import("std");
-
-/// Store-path realization for `path`/`filterSource`-style source imports.
-pub const source_path = @import("derivation/source_path.zig");
 
 /// The one pure store-path name predicate shared by `builtins.path`,
 /// `builtins.toFile`, and derivation construction.
@@ -35,12 +40,6 @@ pub const ComputedPaths = dtypes.ComputedPaths;
 pub const Spec = dtypes.Spec;
 
 pub const Drv = drv_mod.Drv;
-pub const DerivationStore = store_mod.DerivationStore;
-
-/// Progress-span groups the store reports into (mapped to observ groups by the
-/// eval layer). See `DerivationStore.beginSpan`.
-pub const SpanGroup = store_mod.SpanGroup;
-
 pub const sourcePath = path_mod.sourcePath;
 pub const textPath = path_mod.textPath;
 pub const fixedOutputPath = path_mod.fixedOutputPath;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const stable = @import("base").sync;
-const DerivationStore = @import("store.zig").DerivationStore;
+const DerivationStore = @import("realization").DerivationStore;
 const FileCache = @import("host").FileCache;
 const DaemonRuntime = @import("host").DaemonRuntime;
 const FakeDaemon = @import("../test_daemon.zig").FakeDaemon;

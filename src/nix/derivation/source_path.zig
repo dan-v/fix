@@ -5,7 +5,7 @@
 //! coercion (`src = ./.`).
 
 const std = @import("std");
-const drv_paths = @import("paths.zig");
+const drv_paths = @import("derivation").paths;
 const DerivationStore = @import("store.zig").DerivationStore;
 const FileCache = @import("host").FileCache;
 const nar = @import("host").nar;

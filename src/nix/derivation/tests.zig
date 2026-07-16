@@ -1,15 +1,16 @@
 const std = @import("std");
-const derivation = @import("../derivation.zig");
-const sort = @import("sort.zig");
-const hash_codec = @import("hash_codec.zig");
+const derivation = @import("derivation");
+const realization = @import("realization");
+const sort = derivation.sort;
+const hash_codec = derivation.hash_codec;
 const runtime = @import("runtime");
 const host = @import("host");
-const debug_record_mod = @import("debug_record.zig");
-const types_mod = @import("types.zig");
-const clone_mod = @import("clone.zig");
-const value_mod = @import("value.zig");
+const debug_record_mod = derivation.debug_record;
+const types_mod = derivation.types;
+const clone_mod = derivation.clone;
+const value_mod = derivation.value;
 
-const DerivationStore = derivation.DerivationStore;
+const DerivationStore = realization.DerivationStore;
 const Drv = derivation.Drv;
 const DrvInput = derivation.DrvInput;
 const DrvOutput = derivation.DrvOutput;
@@ -593,11 +594,11 @@ test "setDebugEnabled(false) clears any accumulated debug records" {
     defer store.deinit();
 
     store.setDebugEnabled(true);
-    try std.testing.expect(store.debug_enabled);
+    try std.testing.expect(store.debugEnabled());
     try std.testing.expectEqual(@as(usize, 0), store.debugRecords().len);
 
     store.setDebugEnabled(false);
-    try std.testing.expect(!store.debug_enabled);
+    try std.testing.expect(!store.debugEnabled());
     try std.testing.expectEqual(@as(usize, 0), store.debugRecords().len);
 }
 
