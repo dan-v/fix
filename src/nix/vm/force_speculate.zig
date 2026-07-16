@@ -3,7 +3,7 @@
 //! (for `FIX_SPEC_NOVEL`) whether a closure is the first speculative instance
 //! of its chunk. Pure predicates over registry/heap state — no forcing.
 
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const VM = vm_mod.VM;
 const Value = @import("runtime").value.Value;
 const BuiltinId = @import("runtime").builtins.BuiltinId;

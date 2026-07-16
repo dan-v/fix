@@ -4,7 +4,7 @@
 //! per-call-site inline cache.
 //! Concurrency: the call IC is per-worker thread-local, heap-token-gated across evaluator instances.
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const rt_builtins = @import("runtime").builtins;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
@@ -16,7 +16,7 @@ const heap_mod = @import("runtime").heap;
 const Closure = heap_mod.Closure;
 const BytecodeThunk = @import("runtime").thunk.BytecodeThunk;
 const Thunk = @import("runtime").thunk.Thunk;
-const deferred_mod = @import("../compiler.zig").deferred_table;
+const deferred_mod = @import("../compiler/deferred_table.zig");
 
 const access = @import("access.zig");
 const debug = @import("debug.zig");
@@ -173,7 +173,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         // ON (gated on body_is_substantial, not eager) — stamp it so the
         // `claimed_by_main` disposition split isn't mis-attributed as
         // never-submitted.
-        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
+        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).noteSpecSubmitted(ok);
     }
     try stack.push(self, Value.thunk(id));
 }

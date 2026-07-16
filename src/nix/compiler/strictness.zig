@@ -772,7 +772,7 @@ pub fn firstForcedName(intern: *InternTable, source: []const u8, body: *const No
     }
 }
 
-const Compiler = @import("../compiler.zig").Compiler;
+const Compiler = @import("context.zig").Compiler;
 
 pub fn stampOnBuilder(c: *Compiler, body: *const Node) !void {
     const _pt = prof.start(.strictness);

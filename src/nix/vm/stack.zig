@@ -1,7 +1,7 @@
 //! The VM operand-stack and call-frame machinery: push/pop, frame reservation
 //! and teardown, and the GC-precise in-place binary-operand peek (`binTop`/`dropBin`).
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const chunk = @import("../bytecode.zig").chunk;

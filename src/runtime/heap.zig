@@ -29,12 +29,6 @@ pub const gc_debug = builtin.mode == .ReleaseSafe;
 const segments = @import("base").segments;
 const sync = @import("base").sync;
 const worker_id_mod = @import("base").worker_id;
-/// GC collector driver: the non-inline mark/sweep/evac/minor-collect
-/// machinery, extracted to keep this file from being a god-file. Free
-/// functions over `*ObjectHeap`; the hot inline alloc-path helpers stay here.
-/// Re-exported (`pub`) so out-of-module callers reach it as
-/// `@import("runtime").heap.heap_gc`.
-pub const heap_gc = @import("heap/gc.zig");
 const Value = @import("value.zig").Value;
 const Thunk = @import("thunk.zig").Thunk;
 const BytecodeThunk = @import("thunk.zig").BytecodeThunk;
@@ -352,11 +346,6 @@ const RangeFreeList = struct {
     }
 };
 
-/// Result of one `sweep`.
-pub const SweepStats = struct {
-    objects_freed: u64 = 0,
-};
-
 pub const ObjectHeap = struct {
     allocator: std.mem.Allocator,
     objects: ObjectStore,
@@ -571,7 +560,7 @@ pub const ObjectHeap = struct {
         variant_counts: [9]u32,
         thunk_states: [5]u32,
         /// Of the `resolved` thunks (thunk_states[2]), the split by
-        /// `Future.demanded`: `resolved_demanded` were observed by a real
+        /// `Thunk.demanded`: `resolved_demanded` were observed by a real
         /// (demand) caller; `resolved_undemanded` were pre-forced by
         /// speculation / fan-out and never observed — the speculative-waste
         /// fraction. See docs/plans/parallel-redesign-plan.md (instrument I1).
@@ -767,11 +756,11 @@ pub const ObjectHeap = struct {
             }
             switch (self.objects.get(id).*) {
                 .thunk => |t| {
-                    const cell = &cells[if (t.future.created_demand) 0 else 1];
+                    const cell = &cells[if (t.created_demand) 0 else 1];
                     cell.n += 1;
                     const state = t.future.state.load(.acquire);
                     if (t.future.isDemanded()) {
-                        if (t.future.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
+                        if (t.demanded_old) cell.dem_old += 1 else cell.dem_young += 1;
                     } else switch (state) {
                         2 => cell.never_resolved_spec += 1, // resolved
                         3, 4 => cell.errored += 1, // blackhole / errored
@@ -851,7 +840,7 @@ pub const ObjectHeap = struct {
                     .thunk => |t| {
                         members += 1;
                         if (t.future.isDemanded()) {
-                            if (t.future.demanded_old) dem_old += 1 else dem_young += 1;
+                            if (t.demanded_old) dem_old += 1 else dem_young += 1;
                         } else if (t.future.state.load(.acquire) == 2) {
                             spec_resolved += 1;
                         } else {
@@ -1164,7 +1153,7 @@ pub const ObjectHeap = struct {
         // Post-fill, pre-publish — no reader can observe the slot yet.
         if (comptime prof_census_enabled) {
             if (object == .thunk)
-                self.objects.getMut(id).thunk.future.created_demand = !self.currentLocal().spec_ctx;
+                self.objects.getMut(id).thunk.created_demand = !self.currentLocal().spec_ctx;
         }
         return id;
     }
@@ -1482,7 +1471,7 @@ pub const ObjectHeap = struct {
     }
 
     /// GC minor-collect statistics; populated by the collector
-    /// driver in `heap/gc.zig`.
+    /// driver in `heap/collector.zig`.
     pub const MinorStats = struct { promoted: u64 = 0, freed: u64 = 0 };
 
     // --- parallel evacuation phase (`--workers>1`) ---------------------------
@@ -1497,45 +1486,9 @@ pub const ObjectHeap = struct {
     /// `>= marker_count` means "don't participate — park idle". Called by both
     /// the collector and the parallel-mark helper hook. (The rest of the evac
     /// phase — beginEvac/openEvac/evacClaimLoop/waitEvacDone/finishEvac — lives
-    /// in the collector driver, `heap/gc.zig`.)
+    /// in the collector driver, `heap/collector.zig`.)
     pub fn gcMarkSlotGrab(self: *ObjectHeap) u32 {
         return self.gc_mark_slot.fetchAdd(1, .acq_rel);
-    }
-
-    /// Sweep: free every filled object that `mark_bits` left unmarked —
-    /// return its owned ranges to the free lists and its slot to the
-    /// object free list. `mark_bits` is the marker's live-bitmap (same
-    /// ObjectId indexing); passed in so the heap needn't import the GC
-    /// tracer. Must run at a safepoint with no concurrent allocation.
-    pub fn sweep(self: *ObjectHeap, mark_bits: []const u64) SweepStats {
-        var st: SweepStats = .{};
-        // Release builds don't maintain the alloc bitmap incrementally —
-        // rebuild it here from the live id range minus the free lists.
-        if (comptime !gc_debug) self.gcReconstructAllocBits();
-        if (comptime gc_debug) heap_gc.verifyMarkClosed(self, mark_bits);
-        const n = self.objects.count();
-        // Round-robin distribution across per-worker free-list shards. STW, so
-        // the collector alone writes every shard (no concurrency); post-sweep
-        // each worker consumes its OWN shard lock-free.
-        const nshards = self.worker_locals.len;
-        var shard: usize = 0;
-        var id: ObjectId = 0;
-        while (id < n) : (id += 1) {
-            const word = id >> 6;
-            if (word >= self.gc_alloc_bits.len) break;
-            const bit = @as(u64, 1) << @intCast(id & 63);
-            if (self.gc_alloc_bits[word] & bit == 0) continue; // unfilled / already free
-            const marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
-            if (marked) continue;
-            const local = &self.worker_locals[shard];
-            heap_gc.freeObjectRanges(self, local, self.objects.get(id));
-            self.gc_alloc_bits[word] &= ~bit;
-            local.gc_free_objects.append(self.allocator, id) catch {};
-            st.objects_freed += 1;
-            shard += 1;
-            if (shard >= nshards) shard = 0;
-        }
-        return st;
     }
 
     /// Post-major-sweep reconciliation of the generational state. A full sweep

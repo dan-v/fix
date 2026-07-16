@@ -4,7 +4,7 @@
 //! builtins/`__curPos`), and materialization of parser-elided bodies.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const builtins = @import("runtime").builtins;

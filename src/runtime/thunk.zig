@@ -1,14 +1,4 @@
-//! Atomic lazy thunk and the `Future` primitive it's built on.
-//!
-//! `Future` is the shared claim+wait state machine: a state word, an
-//! optional result, a waiter list, and the methods that drive
-//! transitions atomically. It's the abstraction `Thunk` is built on
-//! and the one `eval/imports.zig`'s `ImportEntry` also embeds. The
-//! protocol is identical wherever it appears: the first fiber to
-//! CAS-claim runs the work; others enroll a `Waiter` and yield until
-//! the claimer publishes a terminal state. A fiber that tries to
-//! force a future under the *same* claimer id it already holds sees
-//! `.blackhole` — real recursion within one logical evaluation.
+//! Atomic lazy thunk built on the generic `future.zig` claim/wait protocol.
 //!
 //! `Thunk` layers a `ThunkTarget` (what to evaluate) and a
 //! `demanded` flag (was this resolution observed by a real caller?)
@@ -29,7 +19,7 @@
 //!
 //! Memory model:
 //!   - `Future.state` transitions follow release-acquire pairs.
-//!   - `Future.result` is written before the `state → resolved`
+//!   - `Thunk.payload.result` is written before the `state → resolved`
 //!     store-release; readers observe it after acquire-loading
 //!     state == resolved.
 //!   - `Thunk.target` is set at construction and never mutated
@@ -40,25 +30,45 @@
 //!     waiter is drained.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const types = @import("types.zig");
 const Value = @import("value.zig").Value;
 const ChunkId = types.ChunkId;
 const future = @import("future.zig");
 
-// The `Future` one-shot cell and its claim/publish/wait/wake protocol
-// live in `future.zig` (the lock-free concurrency core). They are
-// re-exported here so existing `thunk.Future`, `thunk.FutureState`,
-// `thunk.Waiter`, `thunk.ClaimerId`, … call sites keep resolving.
-pub const Future = future.Future;
-pub const FutureState = future.FutureState;
-pub const Waiter = future.Waiter;
-pub const ClaimResult = future.ClaimResult;
-pub const ClaimerId = future.ClaimerId;
-pub const INVALID_CLAIMER = future.INVALID_CLAIMER;
-pub const makeClaimer = future.makeClaimer;
-pub const created_tsc_enabled = future.created_tsc_enabled;
-pub const CreatedDemand = future.CreatedDemand;
-pub const initCreatedDemand = future.initCreatedDemand;
+const Future = future.Future;
+const FutureState = future.FutureState;
+const Waiter = future.Waiter;
+const ClaimerId = future.ClaimerId;
+const makeClaimer = future.makeClaimer;
+
+/// `-Dprof-main` age-at-force probe support. These fields belong to thunks,
+/// not to the generic synchronization primitive used by imports and I/O.
+pub const created_tsc_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
+const CreatedTsc = if (created_tsc_enabled) u64 else void;
+pub const CreatedDemand = if (created_tsc_enabled) bool else void;
+const SpecDisp = if (created_tsc_enabled) u8 else void;
+
+pub inline fn initCreatedDemand() CreatedDemand {
+    return if (comptime created_tsc_enabled) false else {};
+}
+
+inline fn initSpecDisp() SpecDisp {
+    return if (comptime created_tsc_enabled) @as(u8, 0) else {};
+}
+
+inline fn nowCreatedTsc() CreatedTsc {
+    if (comptime !created_tsc_enabled) return {};
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+        :
+        : .{ .memory = true });
+    return (@as(u64, high) << 32) | @as(u64, low);
+}
 
 pub const BytecodeThunk = struct {
     chunk_id: ChunkId,
@@ -142,16 +152,12 @@ pub const AttrAccess = struct {
     name: types.InternId,
 };
 
-/// Discriminant for `ThunkTarget`. Stored as a plain byte in `Future`'s
-/// padding (`Future.target_kind`) rather than as a `union(enum)` tag —
-/// the union is 8-aligned (it holds `Value`s and pointers), so an inline
-/// tag would round the whole target up by 8 bytes. Externalizing the
-/// 1-byte discriminant into otherwise-wasted padding shrinks the
-/// (millions-live) Thunk by 8 bytes.
+/// Discriminant for `ThunkTarget`. Stored beside the generic future rather
+/// than in the bare target union, avoiding the union's alignment padding.
 pub const TargetKind = enum(u8) { closure, bytecode, pass_through, attr_access, deferred };
 
-/// Bare (untagged) union — the active arm is named by `Future.target_kind`,
-/// set at construction and immutable thereafter (a target is never
+/// Bare (untagged) union — the active arm is named by `Thunk.target_kind`, set
+/// at construction and immutable thereafter (a target is never
 /// mutated after creation except by `publishCellBinding`, which keeps
 /// the same `pass_through` kind).
 pub const ThunkTarget = union {
@@ -203,6 +209,16 @@ pub const ForceOutcome = union(enum) {
 /// lazy renderers can keep speculation invisible.
 pub const Thunk = struct {
     future: Future,
+    /// Whether a real caller observed this thunk's resolution. Speculative
+    /// forcing must remain invisible to lazy renderers.
+    demanded: std.atomic.Value(u8),
+    /// Active arm of `payload.target` while the future is non-terminal.
+    target_kind: TargetKind,
+    /// `-Dprof-main` probe state; all fields are zero-sized in normal builds.
+    created_tsc: CreatedTsc,
+    created_demand: CreatedDemand = initCreatedDemand(),
+    demanded_old: CreatedDemand = initCreatedDemand(),
+    spec_disp: SpecDisp = initSpecDisp(),
     payload: Payload,
 
     /// Bare (untagged) union: `future.state` is the only discriminant.
@@ -214,8 +230,18 @@ pub const Thunk = struct {
         target: ThunkTarget,
     };
 
+    fn initWithFuture(future_cell: Future, kind: TargetKind, payload: Payload) Thunk {
+        return .{
+            .future = future_cell,
+            .demanded = .init(0),
+            .target_kind = kind,
+            .created_tsc = nowCreatedTsc(),
+            .payload = payload,
+        };
+    }
+
     pub fn init(closure: Value) Thunk {
-        return .{ .future = Future.init(), .payload = .{ .target = .{ .closure = closure } } };
+        return initWithFuture(Future.init(), .closure, .{ .target = .{ .closure = closure } });
     }
 
     /// `upvalues` of length <= `BytecodeThunk.INLINE_CAP` are copied
@@ -230,14 +256,11 @@ pub const Thunk = struct {
         } else {
             storage = .{ .spilled = upvalues };
         }
-        return .{
-            .future = Future.initFor(.bytecode),
-            .payload = .{ .target = .{ .bytecode = .{
-                .chunk_id = chunk_id,
-                .upvalue_count = @intCast(upvalues.len),
-                .storage = storage,
-            } } },
-        };
+        return initWithFuture(Future.init(), .bytecode, .{ .target = .{ .bytecode = .{
+            .chunk_id = chunk_id,
+            .upvalue_count = @intCast(upvalues.len),
+            .storage = storage,
+        } } });
     }
 
     /// A deferred-compile thunk (see `DeferredThunk`). `env` of length
@@ -252,27 +275,24 @@ pub const Thunk = struct {
         } else {
             storage = .{ .spilled = env };
         }
-        return .{
-            .future = Future.initFor(.deferred),
-            .payload = .{ .target = .{ .deferred = .{
-                .deferred_id = deferred_id,
-                .env_count = @intCast(env.len),
-                .storage = storage,
-            } } },
-        };
+        return initWithFuture(Future.init(), .deferred, .{ .target = .{ .deferred = .{
+            .deferred_id = deferred_id,
+            .env_count = @intCast(env.len),
+            .storage = storage,
+        } } });
     }
 
     /// A frameless attr-access thunk (see `AttrAccess`). Forcing computes
     /// `getAttrValue(base, name)` with no frame/dispatch.
     pub fn initAttrAccess(base: Value, name: types.InternId) Thunk {
-        return .{ .future = Future.initFor(.attr_access), .payload = .{ .target = .{ .attr_access = .{ .base = base, .name = name } } } };
+        return initWithFuture(Future.init(), .attr_access, .{ .target = .{ .attr_access = .{ .base = base, .name = name } } });
     }
 
     /// A "cell" thunk: holds a Value to be forced lazily. Used by
     /// `builtins.deepSeq`-style memoisation and by `cell_new` where
     /// the wrapped value is known at construction time.
     pub fn initPassThrough(value: Value) Thunk {
-        return .{ .future = Future.initFor(.pass_through), .payload = .{ .target = .{ .pass_through = value } } };
+        return initWithFuture(Future.init(), .pass_through, .{ .target = .{ .pass_through = value } });
     }
 
     /// Pre-resolved "lazy shell" thunk: wraps a value that's already
@@ -287,7 +307,7 @@ pub const Thunk = struct {
     /// wrap the already-built shell. Born `.resolved` with `result`
     /// already live, so there is no target.
     pub fn initLazyShell(value: Value) Thunk {
-        return .{ .future = Future.initResolved(), .payload = .{ .result = value } };
+        return initWithFuture(Future.initResolved(), .closure, .{ .result = value });
     }
 
     /// A "binding cell" thunk: created by `cell_init` for
@@ -304,23 +324,27 @@ pub const Thunk = struct {
     /// the cell to null, freezing the binding before the creator could
     /// publish.
     pub fn initBindingCell(claimer: ClaimerId) Thunk {
-        var f = Future.initClaimed(claimer);
-        f.target_kind = .pass_through;
-        return .{
-            .future = f,
+        return initWithFuture(
+            Future.initClaimed(claimer),
+            .pass_through,
             // Placeholder; never observed since no fiber can CAS-claim
             // an `.evaluating` cell, and `publishCellBinding` overwrites
             // `target` before transitioning back to `.unresolved`.
-            .payload = .{ .target = .{ .pass_through = Value.null_val } },
-        };
+            .{ .target = .{ .pass_through = Value.null_val } },
+        );
     }
 
     pub inline fn markDemanded(self: *Thunk) void {
-        self.future.markDemanded();
+        if (self.demanded.load(.monotonic) == 0) {
+            if (comptime created_tsc_enabled) {
+                self.demanded_old = (nowCreatedTsc() -| self.created_tsc) >= (1 << 21);
+            }
+            self.demanded.store(1, .release);
+        }
     }
 
     pub inline fn isDemanded(self: *const Thunk) bool {
-        return self.future.isDemanded();
+        return self.demanded.load(.acquire) != 0;
     }
 
     /// Non-claiming peek at whether the thunk is still evaluating. See
@@ -333,7 +357,15 @@ pub const Thunk = struct {
     /// while the thunk is unresolved/evaluating (the states in which
     /// `target` is the live union arm).
     pub inline fn targetKind(self: *const Thunk) TargetKind {
-        return self.future.target_kind;
+        return self.target_kind;
+    }
+
+    pub inline fn noteSpecSubmitted(self: *Thunk, admitted: bool) void {
+        if (comptime created_tsc_enabled) self.spec_disp = if (admitted) 1 else 2;
+    }
+
+    pub inline fn specDispValue(self: *const Thunk) u8 {
+        return if (comptime created_tsc_enabled) self.spec_disp else 0;
     }
 
     /// Racy-benign read of the target arm's leading bytes, reinterpreted as
@@ -450,6 +482,10 @@ pub const Thunk = struct {
         return self == other;
     }
 };
+
+test "thunk layout stays compact" {
+    if (!created_tsc_enabled) try std.testing.expectEqual(@as(usize, 80), @sizeOf(Thunk));
+}
 
 test "thunk: cross-worker enroll + resolve signals waiter" {
     var thunk = Thunk.init(Value.null_val);

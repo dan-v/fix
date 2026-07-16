@@ -3,7 +3,7 @@
 //! variants for the tail-call compiler.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const builtins = @import("runtime").builtins;
@@ -17,7 +17,7 @@ const OpCode = bytecode.OpCode;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");
 const thunks = @import("thunks.zig");
-const ops = @import("ops.zig");
+const lambda = @import("lambda.zig");
 
 const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
@@ -50,7 +50,7 @@ pub fn compileIfElseBody(self: *Compiler, node: *const Node, tail_branches: bool
     try emit.emitOp(self, .pop);
 
     if (tail_branches) {
-        try ops.compileTailExpression(self, ife.then_branch);
+        try lambda.compileTailExpression(self, ife.then_branch);
     } else {
         try self.compileNode(ife.then_branch);
     }
@@ -62,7 +62,7 @@ pub fn compileIfElseBody(self: *Compiler, node: *const Node, tail_branches: bool
 
     try emit.emitOp(self, .pop);
     if (tail_branches) {
-        try ops.compileTailExpression(self, ife.else_branch);
+        try lambda.compileTailExpression(self, ife.else_branch);
     } else {
         try self.compileNode(ife.else_branch);
     }
@@ -89,7 +89,7 @@ pub fn compileAssertBody(self: *Compiler, node: *const Node, tail_body: bool) an
     try emit.emitOp(self, .pop);
 
     if (tail_body) {
-        try ops.compileTailExpression(self, assert_node.body);
+        try lambda.compileTailExpression(self, assert_node.body);
     } else {
         try self.compileNode(assert_node.body);
     }
@@ -122,7 +122,7 @@ pub fn compileWithBody(self: *Compiler, node: *const Node, tail_body: bool) anye
     try self.with_scopes.append(self.allocator, .{ .kind = .local, .index = scope_slot });
 
     if (tail_body) {
-        try ops.compileTailExpression(self, with_node.body);
+        try lambda.compileTailExpression(self, with_node.body);
     } else {
         try self.compileNode(with_node.body);
     }

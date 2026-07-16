@@ -55,6 +55,7 @@ const Harness = struct {
         errdefer scratch.deinit();
 
         const vm = try VM.init(.{
+            .driver = &vm_mod.driver,
             .allocator = scratch.allocator(),
             .registry = &ev.registry,
             .intern = &ev.intern,

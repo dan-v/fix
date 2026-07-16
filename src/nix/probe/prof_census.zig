@@ -31,7 +31,7 @@ pub var disc: Disc = .{};
 /// Coverage-miss breakdown (piggybacks on `-Dprof-main`): every thunk MAIN
 /// claims itself is a speculation coverage MISS (helpers didn't pre-resolve
 /// it). This census classifies those misses by (a) whether speculation ever
-/// submitted a force task for the thunk — `Future.spec_disp`: 0 never /
+/// submitted a force task for the thunk — `Thunk.spec_disp`: 0 never /
 /// 1 admitted / 2 rejected — crossed with (b) whether the thunk was OLD
 /// enough at force (>= ~0.5ms) that a helper could in principle have raced
 /// ahead. The decisive cells:
@@ -63,7 +63,7 @@ pub var cov: Coverage = .{};
 /// keep this module import-light.
 const COV_OLD_THRESHOLD: u64 = 1 << 21;
 
-/// Classify one `claimed_by_main` force. `disp` = `Future.spec_disp`,
+/// Classify one `claimed_by_main` force. `disp` = `Thunk.spec_disp`,
 /// `created_tsc` = the thunk's creation stamp (0 = unknown, skipped),
 /// `kind_idx` = its `TargetKind` int. Off-main callers must not call this
 /// (the discovery census already guards worker 0). Zero-cost when off.

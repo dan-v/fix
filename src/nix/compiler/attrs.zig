@@ -7,7 +7,7 @@
 //! over the shared retained AST.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;

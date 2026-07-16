@@ -2,7 +2,7 @@
 //! into a "while evaluating" diagnostic note, plus the span-resolution helpers
 //! (frame / chunk-entry / tightest-span-for-ip) shared with the timeline.
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const chunk = @import("../bytecode.zig").chunk;
 const diagnostic = @import("syntax").diagnostic;
 

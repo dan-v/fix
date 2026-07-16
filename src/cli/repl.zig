@@ -26,6 +26,7 @@ const render_err = @import("render.zig");
 const engine = @import("nix");
 const runtime_value = engine.value;
 const thunk_mod = engine.thunk;
+const future_mod = engine.runtime.future;
 const types = engine.types;
 
 const commands = @import("repl/commands.zig");
@@ -688,7 +689,7 @@ const Repl = struct {
                     try w.writeAll("thunk (unreadable)\n");
                     return;
                 };
-                const state: thunk_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+                const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
                 try w.print("thunk #{d}: {s}", .{ id, @tagName(state) });
                 switch (state) {
                     .resolved => {

@@ -5,7 +5,7 @@
 //! source-span construction.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const chunk = @import("../bytecode.zig").chunk;
 const diagnostic = @import("syntax").diagnostic;

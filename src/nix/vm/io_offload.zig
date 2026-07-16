@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const rstore = @import("../host.zig").store;
 const sync = @import("base").sync;
 const fiber_mod = @import("base").fiber;
@@ -28,7 +29,7 @@ pub fn runOnPool(ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: 
     const inner = fiber_mod.currentFiber() orelse return pool.submitBlocking(work, work_ctx);
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
 
-    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
+    wf.io_future = future_mod.Future.initClaimed(future_mod.makeClaimer(wf.fiber_id));
 
     var cell: PoolCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future };
     var job: DaemonPool.Job = .{ .run = PoolCell.run, .ctx = &cell };
@@ -44,7 +45,7 @@ pub fn runOnPool(ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: 
 const PoolCell = struct {
     work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void,
     work_ctx: *anyopaque,
-    future: *thunk_mod.Future,
+    future: *future_mod.Future,
 
     fn run(conn: ?*anyopaque, p: *anyopaque) void {
         const self: *PoolCell = @ptrCast(@alignCast(p));
@@ -58,7 +59,7 @@ const PoolCell = struct {
 /// instead of blocking). Returns false if not on a fiber — the caller then waits
 /// on the thread itself (the main-thread realize / tests). Enrolls the fiber's
 /// own waiter, exactly like forcing a `.busy` thunk; the publisher wakes it.
-pub fn fiberPark(future: *thunk_mod.Future) bool {
+pub fn fiberPark(future: *future_mod.Future) bool {
     const inner = fiber_mod.currentFiber() orelse return false;
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
     if (future.enrollWaiter(&wf.waiter)) {
@@ -81,7 +82,7 @@ pub fn runFetch(sem: ?*sync.Semaphore, work: *const fn (*anyopaque) void, work_c
         return;
     };
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
-    wf.io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(wf.fiber_id));
+    wf.io_future = future_mod.Future.initClaimed(future_mod.makeClaimer(wf.fiber_id));
 
     var cell: FetchCell = .{ .work = work, .work_ctx = work_ctx, .future = &wf.io_future, .sem = sem };
     var thread = std.Thread.spawn(.{}, FetchCell.run, .{&cell}) catch {
@@ -101,7 +102,7 @@ pub fn runFetch(sem: ?*sync.Semaphore, work: *const fn (*anyopaque) void, work_c
 const FetchCell = struct {
     work: *const fn (*anyopaque) void,
     work_ctx: *anyopaque,
-    future: *thunk_mod.Future,
+    future: *future_mod.Future,
     sem: ?*sync.Semaphore,
 
     fn run(p: *anyopaque) void {

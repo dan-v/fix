@@ -6,7 +6,7 @@
 //! compile reuses the exact eager child-body path.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const chunk = @import("../bytecode.zig").chunk;
 const emit = @import("emit.zig");

@@ -15,7 +15,8 @@
 //! observable in output).
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
+const compiler_driver = @import("driver.zig");
 const ast = @import("syntax").ast;
 const literals = @import("literals.zig");
 const Compiler = compiler_mod.Compiler;
@@ -56,7 +57,7 @@ pub fn compile(
     // (slot i == env index i) and re-established as with-scopes.
     var parent_builder = try ChunkBuilder.init(sa);
     defer parent_builder.deinit(sa);
-    var parent = Compiler.init(sa, allocator, &parent_builder, registry, entry.source, intern, heap);
+    var parent = Compiler.init(&compiler_driver.driver, sa, allocator, &parent_builder, registry, entry.source, intern, heap);
     parent.base_path = entry.base_path;
     parent.source_path = entry.source_path;
     parent.source_file_id = entry.source_file_id;
@@ -99,7 +100,7 @@ pub fn compile(
     // the snapshot names (in order) → upvalue index i == env index i.
     var child_builder = try ChunkBuilder.init(sa);
     defer child_builder.deinit(sa);
-    var child = Compiler.init(sa, allocator, &child_builder, registry, entry.source, intern, heap);
+    var child = Compiler.init(&compiler_driver.driver, sa, allocator, &child_builder, registry, entry.source, intern, heap);
     child.parent = &parent;
     child.base_path = entry.base_path;
     child.source_path = entry.source_path;

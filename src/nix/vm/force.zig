@@ -6,11 +6,12 @@
 //! registries are thread-local, published for the STW collector to mark.
 const std = @import("std");
 const builtin = @import("builtin");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const Thunk = thunk_mod.Thunk;
 const ThunkTarget = thunk_mod.ThunkTarget;
 const fiber_mod = @import("base").fiber;
@@ -33,7 +34,7 @@ const heap_mod = @import("runtime").heap;
 const gc = @import("runtime").gc;
 const thunk_trace = @import("../probe.zig").thunk_trace;
 const ChunkId = types.ChunkId;
-const deferred_compile = @import("../compiler.zig").deferred;
+const deferred_compile = @import("../compiler/deferred.zig");
 const force_label = @import("force_label.zig");
 const speculate = @import("force_speculate.zig");
 
@@ -212,7 +213,7 @@ pub fn forceThunk(self: *VM, thunk_val: Value) !Value {
 pub inline fn profIsResolvedThunk(self: *VM, v: Value) bool {
     if (!v.isThunk()) return false;
     const thunk = self.heap.getThunkAssumeValid(v.asObjectId());
-    return thunk.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved);
+    return thunk.future.state.load(.monotonic) == @intFromEnum(future_mod.FutureState.resolved);
 }
 
 pub inline fn forceValue(self: *VM, value: Value) anyerror!Value {
@@ -253,7 +254,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // because creation-heavy builtins force sub-values far more often
     // than they claim thunks. One predictable `in_speculation` branch on
     // the demand path.
-    if (self.in_speculation and self.spec_create_left != vm_mod.NO_SPEC_BUDGET) {
+    if (self.in_speculation and self.spec_create_left != vm_mod.no_spec_budget) {
         if (specCreateExhausted(self)) return error.SpeculativeBail;
     }
     if (!value.isThunk()) {
@@ -273,7 +274,7 @@ pub inline fn forceValueImpl(self: *VM, value: Value, demand: bool) anyerror!Val
     // a `Thunk`.
     const thunk = self.heap.getThunkAssumeValid(value.asObjectId());
     const state = thunk.future.state.load(.acquire);
-    if (state == @intFromEnum(thunk_mod.FutureState.resolved)) {
+    if (state == @intFromEnum(future_mod.FutureState.resolved)) {
         if (demand) {
             // Discovery probe: main is the first real demander of an
             // already-resolved thunk ⇒ a helper resolved it ahead of demand.
@@ -310,7 +311,7 @@ fn derefForwarder(self: *VM, start: Value, demand: bool) Value {
     var r = start;
     while (r.isThunk()) {
         const t = self.heap.getThunkAssumeValid(r.asObjectId());
-        if (t.future.state.load(.acquire) != @intFromEnum(thunk_mod.FutureState.resolved)) return r;
+        if (t.future.state.load(.acquire) != @intFromEnum(future_mod.FutureState.resolved)) return r;
         if (demand) t.markDemanded();
         r = t.payload.result;
     }
@@ -531,11 +532,11 @@ pub fn forceThunkFallible(self: *VM, thunk_val: Value) anyerror!Value {
 pub inline fn specBailRequested(self: *VM) bool {
     if (!self.in_speculation) return false;
     if (self.scheduler.backgroundSuppressed() or self.spec_budget == 0) return true;
-    return self.spec_create_left != vm_mod.NO_SPEC_BUDGET and specCreateExhausted(self);
+    return self.spec_create_left != vm_mod.no_spec_budget and specCreateExhausted(self);
 }
 
 /// Settle the fiber-accurate creation budget and report exhaustion. Only
-/// call with `spec_create_left != NO_SPEC_BUDGET`. Meters creations as
+/// call with `spec_create_left != no_spec_budget`. Meters creations as
 /// deltas of the per-worker `thunks_created` counter since the last
 /// settle/re-base on the SAME worker; a check that observes a worker
 /// change before `Worker.runFiber`'s resume re-base ran (defensive — the
@@ -608,7 +609,7 @@ pub inline fn forceTop(self: *VM) anyerror!Value {
 /// worst misclassifies, the claim CAS inside the force is authoritative.
 pub fn sweepMemberAdmissible(self: *VM, thunk_id: ObjectId) bool {
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
+    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
     switch (th.targetKind()) {
         .closure => {
             // Racy union read (see `Thunk.targetLeadingRacy`): a concurrent
@@ -684,7 +685,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 const b0 = gc.nowNs();
                 self.scheduler.gcWaitAllParked(self.workerId());
                 const b1 = gc.nowNs();
-                heap_mod.heap_gc.runCollect(self.heap, self.workerId());
+                @import("runtime").heap_collector.runCollect(self.heap, self.workerId());
                 const b2 = gc.nowNs();
                 self.scheduler.gcEndCollection(self.workerId());
                 gc.recordBarrier((b1 - b0) + (gc.nowNs() - b2));
@@ -727,12 +728,12 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                         // whether spec ever aimed here (disposition) crossed
                         // with whether it had time to (age).
                         prof_census.recordCoverage(
-                            thunk.future.specDispValue(),
-                            thunk.future.created_tsc,
+                            thunk.specDispValue(),
+                            thunk.created_tsc,
                             @intFromEnum(thunk.targetKind()),
                         );
                         age_t = prof.ageForceBegin(
-                            thunk.future.created_tsc,
+                            thunk.created_tsc,
                             @intFromEnum(thunk.targetKind()),
                             pathKey(self, &thunk.payload.target, thunk.targetKind()),
                         );
@@ -760,7 +761,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                     // abandon the cascade the same way. Sub-thunks already
                     // resolved below this one stay resolved, so the partial
                     // work is kept if the value is demanded later.
-                    if (self.spec_budget != vm_mod.NO_SPEC_BUDGET) {
+                    if (self.spec_budget != vm_mod.no_spec_budget) {
                         if (self.spec_budget == 0) {
                             publishThunkFailure(self, thunk, thunk_id, error.SpeculativeBail);
                             return error.SpeculativeBail;
@@ -1125,7 +1126,7 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         // Coverage census (`-Dprof-main`): stamp whether this thunk was
         // aimed at by speculation (and admitted), so the `claimed_by_main`
         // site can tell a targeting miss from a lost race.
-        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
+        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).noteSpecSubmitted(ok);
     }
     return Value.thunk(id);
 }

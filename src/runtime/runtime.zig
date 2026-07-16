@@ -10,6 +10,8 @@
 pub const types = @import("types.zig");
 pub const value = @import("value.zig");
 pub const heap = @import("heap.zig");
+pub const heap_collector = @import("heap/collector.zig");
+pub const future = @import("future.zig");
 pub const thunk = @import("thunk.zig");
 pub const intern = @import("intern.zig");
 pub const numeric = @import("numeric.zig");
@@ -31,6 +33,8 @@ test {
     _ = types;
     _ = value;
     _ = heap;
+    _ = heap_collector;
+    _ = future;
     _ = thunk;
     _ = intern;
     _ = numeric;

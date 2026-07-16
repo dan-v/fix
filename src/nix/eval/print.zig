@@ -3,7 +3,7 @@
 const std = @import("std");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
-const FutureState = @import("runtime").thunk.FutureState;
+const FutureState = @import("runtime").future.FutureState;
 
 // Value-coloring palette (SGR), applied when `ev.value_color` is set. Chosen to
 // match the CLI's own styles (green paths, yellow hashes/numbers, magenta

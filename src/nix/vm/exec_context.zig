@@ -26,6 +26,7 @@
 //! when needed, not on the VM.
 
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const eval_progress = @import("../observ.zig").progress;
 
 /// Native-stack headroom reserved below `stack_limit`: the guard trips this
@@ -41,7 +42,7 @@ pub const ExecutionContext = struct {
     /// for the fiber's life (it survives task recycles, unlike the role
     /// fields below). `INVALID_CLAIMER` only in the static default (VMs not
     /// bound to any fiber).
-    claimer_id: thunk_mod.ClaimerId = thunk_mod.INVALID_CLAIMER,
+    claimer_id: future_mod.ClaimerId = future_mod.INVALID_CLAIMER,
     /// Lowest native stack address the running fiber may touch before the
     /// thunk-force guard trips a graceful "stack overflow" (`= stack base +
     /// stack_guard_margin`). Baked once at fiber allocation from the fiber's

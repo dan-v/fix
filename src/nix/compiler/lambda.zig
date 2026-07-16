@@ -6,7 +6,7 @@
 //! forwarding upvalue) that drives eager-vs-lazy argument passing.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const bytecode = @import("../bytecode.zig");
 const chunk = bytecode.chunk;

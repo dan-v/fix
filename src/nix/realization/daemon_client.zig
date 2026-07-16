@@ -6,7 +6,7 @@ const sync = @import("base").sync;
 const host = @import("../host.zig");
 const rstore = host.store;
 const DaemonRuntime = host.DaemonRuntime;
-const Future = @import("runtime").thunk.Future;
+const Future = @import("runtime").future.Future;
 const SpanGroup = @import("recipe_graph.zig").SpanGroup;
 
 pub const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void;

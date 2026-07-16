@@ -21,6 +21,7 @@ const Evaluator = engine.Evaluator;
 const Value = engine.Value;
 const builtins_mod = engine.builtins;
 const thunk_mod = engine.thunk;
+const future_mod = engine.runtime.future;
 
 pub const Ctx = struct {
     ev: *Evaluator,
@@ -169,7 +170,7 @@ fn lookThroughResolved(ctx: *Ctx, value: Value) ?Value {
     var hops: usize = 0;
     while (current.kind() == .thunk and hops < 16) : (hops += 1) {
         const thunk = ctx.ev.heap.getThunk(current.asObjectId()) catch return null;
-        const state: thunk_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
+        const state: future_mod.FutureState = @enumFromInt(thunk.future.state.load(.acquire));
         if (state != .resolved) return null;
         current = thunk.payload.result;
     }

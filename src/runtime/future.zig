@@ -1,6 +1,5 @@
-//! The lock-free one-shot cell that `Thunk` (and `eval/imports.zig`'s
-//! `ImportEntry`) is built on: a futex-shaped `state` word plus a
-//! claimer id and a fiber waiter list.
+//! Generic lock-free one-shot claim cell used by thunks, imports, realization
+//! claims, and asynchronous I/O: a state word, claimer id, and waiter list.
 //!
 //! A `Future` is claimed once — the first fiber to CAS the state word
 //! from `.unresolved` to `.evaluating` runs the work; every other fiber
@@ -14,56 +13,7 @@
 //! orderings here are load-bearing.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const build_options = @import("build_options");
 const sync = @import("base").sync;
-const TargetKind = @import("thunk.zig").TargetKind;
-
-/// `-Dprof-main` age-at-force probe support: every Future carries its
-/// creation TSC so the profiler can measure how long a thunk existed
-/// before main demanded it (the look-ahead speculation ceiling). The
-/// field is `void` (zero bytes) on normal builds.
-pub const created_tsc_enabled: bool = build_options.prof_main and builtin.cpu.arch == .x86_64;
-
-const CreatedTsc = if (created_tsc_enabled) u64 else void;
-
-/// `-Dprof-main` demand-context probe support: was this thunk created by
-/// a DEMAND fiber (main's chain) vs. a speculative helper task? Set by
-/// `ObjectHeap.add` from the per-worker `spec_ctx` flag right after the
-/// slot is filled. Zero bytes on normal builds.
-pub const CreatedDemand = if (created_tsc_enabled) bool else void;
-
-pub inline fn initCreatedDemand() CreatedDemand {
-    return if (comptime created_tsc_enabled) false else {};
-}
-
-/// `-Dprof-main` speculation-disposition probe: did speculation ever
-/// submit a `force_thunk` task for this thunk, and was it admitted?
-///   0 = never submitted (the eligibility predicate said no, or the
-///       thunk kind never passes through `makeThunk`'s spec branch)
-///   1 = submitted AND admitted to a lane (spec aimed here; if main
-///       later claims it itself, speculation lost the race — a LATENCY
-///       gap, not a targeting one)
-///   2 = submitted but REJECTED at admission (backlog full → CAPACITY gap)
-/// Read at the `claimed_by_main` census site to split main's self-computed
-/// forces into targeting / latency / capacity misses. Zero bytes off.
-pub const SpecDisp = if (created_tsc_enabled) u8 else void;
-
-pub inline fn initSpecDisp() SpecDisp {
-    return if (comptime created_tsc_enabled) @as(u8, 0) else {};
-}
-
-inline fn nowCreatedTsc() CreatedTsc {
-    if (comptime !created_tsc_enabled) return {};
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        :
-        : .{ .memory = true });
-    return (@as(u64, high) << 32) | @as(u64, low);
-}
 
 /// `state` is a u32 so it's the right shape for futex-style ops if we
 /// ever need them. The low byte encodes the lifecycle (`FutureState`);
@@ -73,10 +23,8 @@ pub const FutureState = enum(u32) {
     evaluating = 1,
     resolved = 2,
     blackhole = 3,
-    /// The work ran and failed deterministically. The captured error
-    /// (and optional message) is cached in the sidecar `ErrorInfo` so
-    /// subsequent forces don't re-run a body whose outcome is already
-    /// known.
+    /// The work ran and failed deterministically. The embedder owns the
+    /// associated error payload.
     errored = 4,
 };
 
@@ -118,9 +66,9 @@ pub const Waiter = struct {
 /// shrinking the hottest, most-numerous heap object.
 pub const ClaimResult = enum { already_resolved, claimed, blackhole, busy, errored };
 
-/// Shared claim+wait state machine. Both `Thunk` and `ImportEntry`
-/// embed one. A `Future` owns: a 5-state lifecycle, a claimer id, a
-/// `demanded` flag, and a fiber waiter list. It deliberately does NOT
+/// Shared claim+wait state machine. Thunks, imports, realization claims, and
+/// I/O fibers embed one. A `Future` owns a five-state lifecycle, a claimer id,
+/// and a fiber waiter list. It deliberately does NOT
 /// own the result — the embedding struct stores its own typed result
 /// (a `Value`, a `*ErrorInfo`, or in `Thunk`'s case a `result`/`target`
 /// union) and reads/writes it around the state transitions. Keeping the
@@ -141,84 +89,28 @@ pub const ClaimResult = enum { already_resolved, claimed, blackhole, busy, error
 pub const Future = struct {
     state: std.atomic.Value(u32),
     claimer: std.atomic.Value(ClaimerId),
-    /// Was this future's resolution observed by a real caller (vs.
-    /// pre-forced by speculation / fan-out)? Used by lazy renderers
-    /// (XML lazy mode) to treat unobserved resolutions as still
-    /// "unevaluated" so speculation stays invisible.
-    demanded: std.atomic.Value(u8),
-    /// Embedder-owned discriminant, free in `Future`'s padding. `Thunk`
-    /// stores its `ThunkTarget`'s active arm here (see `TargetKind`);
-    /// `ImportEntry` leaves it at the default. Plain (non-atomic): set
-    /// once at construction, immutable thereafter, so the claimer that
-    /// reads it after an acquiring `tryClaim` sees the construction
-    /// store published through whatever made the thunk reachable.
-    target_kind: TargetKind = .closure,
     /// Singly-linked list of fibers parked on this future. Manipulated
     /// only under `waiters_mu`. Empty in the common (uncontended) case
     /// where the claimer resolves before any other fiber tries to force.
     waiters_head: ?*Waiter,
     waiters_mu: sync.SpinMutex,
-    /// Creation TSC for the `-Dprof-main` age-at-force probe; zero bytes
-    /// (`void`) on normal builds. See `created_tsc_enabled`.
-    created_tsc: CreatedTsc,
-    /// Demand-context bit for the `-Dprof-main` creation-context probe;
-    /// zero bytes (`void`) on normal builds. See `CreatedDemand`.
-    created_demand: CreatedDemand = initCreatedDemand(),
-    /// `-Dprof-main` only: was this future OLD (existed >= 2^21 cycles,
-    /// ~0.6ms — the age-at-force probe's offloadable threshold) when the
-    /// first real demand observed it? Distinguishes "prefetchable ahead
-    /// of demand" from "demanded immediately, no headroom" in the exit
-    /// census. Racy-benign (racing first-demanders write ~the same value).
-    demanded_old: CreatedDemand = initCreatedDemand(),
-    /// Speculation disposition (see `SpecDisp`). Set once at the
-    /// `makeThunk` submit site; read at `claimed_by_main`. Zero bytes off.
-    spec_disp: SpecDisp = initSpecDisp(),
-
-    /// Record whether speculation submitted (and whether the scheduler
-    /// admitted) a force task for this thunk. `-Dprof-main` only — compiles
-    /// to nothing on normal builds.
-    pub inline fn noteSpecSubmitted(self: *Future, admitted: bool) void {
-        if (comptime created_tsc_enabled) self.spec_disp = if (admitted) 1 else 2;
-    }
-
-    /// Read the speculation disposition (0 on normal builds).
-    pub inline fn specDispValue(self: *const Future) u8 {
-        return if (comptime created_tsc_enabled) self.spec_disp else 0;
-    }
-
     pub fn init() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.unresolved)),
             .claimer = .init(INVALID_CLAIMER),
-            .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
-            .created_tsc = nowCreatedTsc(),
         };
     }
 
-    /// `init` but stamping the embedder's `target_kind`. Used by the
-    /// `Thunk` constructors so the bare `ThunkTarget` union has its
-    /// active arm recorded.
-    pub fn initFor(kind: TargetKind) Future {
-        var f = init();
-        f.target_kind = kind;
-        return f;
-    }
-
-    /// Construct a Future born in `.resolved` with `demanded = 0`. The
-    /// embedder writes its own result slot before publishing the thunk;
-    /// forcing it then hits the resolved fast path immediately. Lazy
-    /// renderers (XML) see resolved+undemanded and print
-    /// `<unevaluated />`. (See `Thunk.initLazyShell`.)
+    /// Construct a Future born in `.resolved`. The embedder writes its own
+    /// result slot before making the future reachable.
     pub fn initResolved() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.resolved)),
             .claimer = .init(INVALID_CLAIMER),
-            .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
-            .created_tsc = nowCreatedTsc(),
         };
     }
 
@@ -229,49 +121,9 @@ pub const Future = struct {
         return .{
             .state = .init(@intFromEnum(FutureState.evaluating)),
             .claimer = .init(claimer),
-            .demanded = .init(0),
             .waiters_head = null,
             .waiters_mu = .{},
-            .created_tsc = nowCreatedTsc(),
         };
-    }
-
-    /// `initClaimed` with a comptime-known creation stamp (0) instead of the
-    /// runtime `rdtsc` in `nowCreatedTsc`. Needed where a claimed Future is a
-    /// struct-field DEFAULT (e.g. `RealizationClaim.future`): a default value
-    /// must be comptime-known, which the stamping constructor is not under
-    /// `-Dprof-main`. The zero stamp disables age accounting — correct here,
-    /// since the age census only reads thunk futures, never store claim cells.
-    pub fn initClaimedStatic(claimer: ClaimerId) Future {
-        return .{
-            .state = .init(@intFromEnum(FutureState.evaluating)),
-            .claimer = .init(claimer),
-            .demanded = .init(0),
-            .waiters_head = null,
-            .waiters_mu = .{},
-            .created_tsc = if (comptime created_tsc_enabled) @as(u64, 0) else {},
-        };
-    }
-
-    pub inline fn markDemanded(self: *Future) void {
-        // Skip the cache-line-evicting store when the flag is already
-        // set. Hot thunks get re-forced repeatedly; on each re-force
-        // the unconditional store invalidated other workers' copies of
-        // the line even though the value didn't change. Idempotent
-        // write — racing observers all store the same value.
-        if (self.demanded.load(.monotonic) == 0) {
-            // Probe (`-Dprof-main`): record whether the future sat >= 2^21
-            // cycles (~0.6ms) before its first real demand — matches
-            // `prof.AGE_OLD_THRESHOLD` (can't import probe code from runtime).
-            if (comptime created_tsc_enabled) {
-                self.demanded_old = (nowCreatedTsc() -| self.created_tsc) >= (1 << 21);
-            }
-            self.demanded.store(1, .release);
-        }
-    }
-
-    pub inline fn isDemanded(self: *const Future) bool {
-        return self.demanded.load(.acquire) != 0;
     }
 
     /// Non-claiming peek: is this future still being evaluated by *someone*?

@@ -17,8 +17,9 @@ const builtin = @import("builtin");
 const gc = @import("runtime").gc;
 const types = @import("runtime").types;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
-const heap_gc = @import("runtime").heap.heap_gc;
+const heap_collector = @import("runtime").heap_collector;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const vm_force = @import("../vm.zig").force;
 const vm_access = @import("../vm.zig").access;
 const timeline = @import("../probe.zig").timeline;
@@ -68,9 +69,9 @@ pub fn helpMark(ev: anytype, worker_id: u8) void {
     // the collector.
     ev.gc_tracer.drainParallel(&ev.heap, slot);
     if (ev.heap.gc_collecting_major)
-        heap_gc.sweepClaimLoop(&ev.heap, ev.gc_tracer.mark_bits)
+        heap_collector.sweepClaimLoop(&ev.heap, ev.gc_tracer.mark_bits)
     else
-        heap_gc.evacClaimLoop(&ev.heap, ev.gc_tracer.mark_bits);
+        heap_collector.evacClaimLoop(&ev.heap, ev.gc_tracer.mark_bits);
 }
 
 /// GC: one stop-the-world mark-sweep at a safepoint. Mark the
@@ -84,7 +85,7 @@ pub fn collect(ev: anytype, collector_id: u8) void {
     // We are inside the STW (all peers parked), which `armTracking` needs
     // for the TLAB flush + flag publication.
     if (!ev.heap.gc_collect_enabled) {
-        heap_gc.armLazy(&ev.heap);
+        heap_collector.armLazy(&ev.heap);
         return;
     }
     // Escalate to a full collection once enough has tenured that a young-gated
@@ -133,25 +134,25 @@ pub fn collect(ev: anytype, collector_id: u8) void {
         // throttled. Peers over the cap park idle (see gcHelpMarkThunk).
         const marker_count = @min(@as(u32, ev.worker_count), gc_par_cap);
         tr.resetParallelMinor(ev.heap.objects.count(), marker_count) catch {
-            heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
             return;
         };
-        heap_gc.beginEvac(&ev.heap, ev.worker_count); // arm the evac work queue (resets slot dispenser)
+        heap_collector.beginEvac(&ev.heap, ev.worker_count); // arm the evac work queue (resets slot dispenser)
         const collector_slot = ev.heap.gcMarkSlotGrab(); // grabbed before gcOpenMark ⇒ slot 0
         // Seed roots + remset into the collector's own marker deque, open
         // the mark so parked peers help drain it, then drain alongside them.
         tr.beginSeeding(collector_slot);
         markRoots(ev, tr);
-        heap_gc.forEachRemsetSource(&ev.heap, SeedCtx{ .tr = tr, .heap = &ev.heap }, Seed.cb);
+        heap_collector.forEachRemsetSource(&ev.heap, SeedCtx{ .tr = tr, .heap = &ev.heap }, Seed.cb);
         tr.endSeeding();
         ev.scheduler.gcOpenMark();
         tr.drainParallel(&ev.heap, collector_slot); // returns at termination
         // Mark closed. Verify closure while peers spin (no range moves yet),
         // then open the evac phase and evacuate alongside them.
-        heap_gc.verifyMinorClosure(&ev.heap, tr.mark_bits);
-        heap_gc.openEvac(&ev.heap);
-        heap_gc.evacClaimLoop(&ev.heap, tr.mark_bits);
-        heap_gc.waitEvacDone(&ev.heap);
+        heap_collector.verifyMinorClosure(&ev.heap, tr.mark_bits);
+        heap_collector.openEvac(&ev.heap);
+        heap_collector.evacClaimLoop(&ev.heap, tr.mark_bits);
+        heap_collector.waitEvacDone(&ev.heap);
         ev.scheduler.gcCloseMark();
         tr.sumStats();
     } else {
@@ -164,13 +165,13 @@ pub fn collect(ev: anytype, collector_id: u8) void {
             }
         };
         tr.resetMinor(ev.heap.objects.count()) catch {
-            heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
+            heap_collector.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
             return;
         };
         const p0 = nowNs();
         markRoots(ev, tr);
         const p1 = nowNs();
-        heap_gc.forEachRemsetSource(&ev.heap, CountSeedCtx{ .tr = tr, .heap = &ev.heap, .n = &remset_sources }, CountSeed.cb);
+        heap_collector.forEachRemsetSource(&ev.heap, CountSeedCtx{ .tr = tr, .heap = &ev.heap, .n = &remset_sources }, CountSeed.cb);
         const p2 = nowNs();
         tr.drainMinor(&ev.heap);
         const p3 = nowNs();
@@ -180,15 +181,15 @@ pub fn collect(ev: anytype, collector_id: u8) void {
     // w>1 already evacuated in parallel (claim loop); just finish (verify +
     // reset nursery). w=1 runs the whole serial minor here.
     const st = if (ev.worker_count > 1)
-        heap_gc.finishEvac(&ev.heap)
+        heap_collector.finishEvac(&ev.heap)
     else
-        heap_gc.minorCollect(&ev.heap, tr.mark_bits);
+        heap_collector.minorCollect(&ev.heap, tr.mark_bits);
     const t2 = nowNs();
-    heap_gc.remsetClear(&ev.heap);
+    heap_collector.remsetClear(&ev.heap);
     // Charge this minor's tenurings against the major gate: once enough has
     // accumulated in the old generation, the next collection escalates.
     ev.heap.gcNoteMinorPromoted(st.promoted);
-    heap_gc.afterCollect(&ev.heap, tr.stats.bytes);
+    heap_collector.afterCollect(&ev.heap, tr.stats.bytes);
     gc.recordCollection(st.freed, tr.stats.bytes, ev.heap.totalReservedBytes());
     gc.recordTiming(t1 - t0, t2 - t1);
     gc.recordBreakdown(.{
@@ -212,7 +213,7 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
     // Same lazy-arm as the minor: the first crossing arms tracking (everything
     // so far becomes untracked/old) rather than collecting.
     if (!ev.heap.gc_collect_enabled) {
-        heap_gc.armLazy(&ev.heap);
+        heap_collector.armLazy(&ev.heap);
         return;
     }
     timeline.begin(.gc, "major", 0);
@@ -225,7 +226,7 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
     // set IS also seeded below — see the note before `forEachRemsetSource`.)
     ev.gc_chunks_scanned = 0;
     tr.resetMajor(ev.heap.objects.count()) catch {
-        heap_gc.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
+        heap_collector.afterCollect(&ev.heap, ev.heap.totalReservedBytes());
         return;
     };
     markRoots(ev, tr);
@@ -245,22 +246,22 @@ pub fn collectMajor(ev: anytype, collector_id: u8) void {
                 ctx.tr.markRemsetSource(ctx.heap, source);
             }
         };
-        heap_gc.forEachRemsetSource(&ev.heap, SeedCtx{ .tr = tr, .heap = &ev.heap }, Seed.cb);
+        heap_collector.forEachRemsetSource(&ev.heap, SeedCtx{ .tr = tr, .heap = &ev.heap }, Seed.cb);
     }
     tr.drain(&ev.heap);
-    const st = ev.heap.sweep(tr.mark_bits); // serial full sweep
+    const st = heap_collector.sweep(&ev.heap, tr.mark_bits); // serial full sweep
     const t1 = nowNs();
     // Tenure survivors + empty the nursery, then drop the now-stale remset
     // (young generation is empty ⇒ no old→young edges remain). Swept slots stay
     // round-robined across worker shards; the allocation path work-steals across
     // shards, so a demand-concentrated workload still reuses the whole pool.
     ev.heap.gcMajorReconcile(tr.mark_bits);
-    heap_gc.remsetClear(&ev.heap);
+    heap_collector.remsetClear(&ev.heap);
     // Re-arm the major gate to the surviving live set: the next major fires once
     // the old generation has roughly doubled with fresh tenurings again.
     ev.heap.gcNoteMajor(tr.stats.objects);
     const t2 = nowNs();
-    heap_gc.afterCollect(&ev.heap, tr.stats.bytes);
+    heap_collector.afterCollect(&ev.heap, tr.stats.bytes);
     gc.recordCollection(st.objects_freed, tr.stats.bytes, ev.heap.totalReservedBytes());
     gc.recordTiming(t1 - t0, t2 - t1);
 }
@@ -279,7 +280,7 @@ pub const nowNs = clock.monotonicNs;
 //   - the CLAMP scales it: a floor so a tiny box doesn't thrash small evals, a
 //     ceiling so a huge box doesn't sit on absurd garbage (bounded absolute
 //     waste). After a major the collector floats the threshold up toward the
-//     true live set (see `heap_gc.afterCollect`), so a genuinely big heap
+//     true live set (see `heap_collector.afterCollect`), so a genuinely big heap
 //     doesn't thrash the line.
 //
 // Deliberately NOT consulted: swap, hugetlb accounting, RSS-vs-reserved,
@@ -519,7 +520,7 @@ pub fn markRoots(ev: anytype, tr: *gc.Tracer) void {
     var it = ev.imports.entries.iterator();
     while (it.next()) |e| {
         const entry = e.value_ptr.*;
-        if (entry.future.state.load(.monotonic) == @intFromEnum(thunk_mod.FutureState.resolved))
+        if (entry.future.state.load(.monotonic) == @intFromEnum(future_mod.FutureState.resolved))
             tr.markValue(&ev.heap, entry.result);
     }
     // Lazy-derivation cache (Value bits keyed by attrs id). Only current-

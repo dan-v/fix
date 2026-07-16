@@ -18,7 +18,7 @@
 //! and makes adding cases genuinely free at the codegen level.
 
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;

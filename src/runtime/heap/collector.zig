@@ -1,5 +1,5 @@
 //! GC collector driver for `ObjectHeap`: the non-inline mark/sweep/
-//! evac/minor-collect machinery. Extracted out of the `heap.zig` god-file.
+//! evac/minor-collect machinery over the heap's storage model.
 //!
 //! These are free functions over `heap: *ObjectHeap` rather than methods (Zig
 //! can't add methods to a struct from another file), but a sibling file has
@@ -21,6 +21,38 @@ const ObjectId = heap_mod.ObjectId;
 const Value = @import("../value.zig").Value;
 
 const gc_debug = heap_mod.gc_debug;
+
+pub const SweepStats = struct {
+    objects_freed: u64 = 0,
+};
+
+/// Free every filled object that `mark_bits` left unmarked. Must run at a
+/// safepoint with no concurrent allocation.
+pub fn sweep(heap: *ObjectHeap, mark_bits: []const u64) SweepStats {
+    var stats: SweepStats = .{};
+    if (comptime !gc_debug) heap.gcReconstructAllocBits();
+    if (comptime gc_debug) verifyMarkClosed(heap, mark_bits);
+    const object_count = heap.objects.count();
+    const shard_count = heap.worker_locals.len;
+    var shard: usize = 0;
+    var id: ObjectId = 0;
+    while (id < object_count) : (id += 1) {
+        const word = id >> 6;
+        if (word >= heap.gc_alloc_bits.len) break;
+        const bit = @as(u64, 1) << @intCast(id & 63);
+        if (heap.gc_alloc_bits[word] & bit == 0) continue;
+        const is_marked = word < mark_bits.len and (mark_bits[word] & bit != 0);
+        if (is_marked) continue;
+        const local = &heap.worker_locals[shard];
+        freeObjectRanges(heap, local, heap.objects.get(id));
+        heap.gc_alloc_bits[word] &= ~bit;
+        local.gc_free_objects.append(heap.allocator, id) catch {};
+        stats.objects_freed += 1;
+        shard += 1;
+        if (shard >= shard_count) shard = 0;
+    }
+    return stats;
+}
 
 /// Turn on reclaim (alloc-bitmap maintenance + free-list reuse + sweep)
 /// with a memory `budget` (the reserved-bytes ceiling the collector
@@ -233,12 +265,12 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
                 if (flat != heap_mod.NO_FLAT) check(heap, mark_bits, id, Value.attrs(flat), &shown);
             },
             .thunk => |*t| {
-                const FutureState = @import("../thunk.zig").FutureState;
+                const FutureState = @import("../future.zig").FutureState;
                 const fs = @as(FutureState, @enumFromInt(t.future.state.load(.monotonic)));
                 switch (fs) {
                     .resolved => check(heap, mark_bits, id, t.payload.result, &shown),
                     .errored, .blackhole => {},
-                    .unresolved, .evaluating => switch (t.future.target_kind) {
+                    .unresolved, .evaluating => switch (t.targetKind()) {
                         .closure => check(heap, mark_bits, id, t.payload.target.closure, &shown),
                         .pass_through => check(heap, mark_bits, id, t.payload.target.pass_through, &shown),
                         .attr_access => check(heap, mark_bits, id, t.payload.target.attr_access.base, &shown),
@@ -479,7 +511,7 @@ pub fn verifyMarkClosed(heap: *ObjectHeap, mark_bits: []const u64) void {
                 check(heap, mark_bits, id, Value.attrs(m.overlay), &shown);
             },
             .thunk => |*t| {
-                if (@as(@import("../thunk.zig").FutureState, @enumFromInt(t.future.state.load(.monotonic))) == .resolved)
+                if (@as(@import("../future.zig").FutureState, @enumFromInt(t.future.state.load(.monotonic))) == .resolved)
                     check(heap, mark_bits, id, t.payload.result, &shown);
             },
             else => {},

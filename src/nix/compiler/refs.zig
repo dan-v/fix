@@ -6,7 +6,7 @@
 //! bindings alive, never drop a live one.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 
 const fold = @import("fold.zig");
 

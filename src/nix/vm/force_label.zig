@@ -7,13 +7,14 @@
 //! id is dereferenced (see the per-function notes).
 
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const VM = vm_mod.VM;
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const ObjectId = types.ObjectId;
 const ChunkId = types.ChunkId;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const vm_errors = @import("errors.zig");
 const timeline = @import("../probe.zig").timeline;
 const BuiltinId = @import("runtime").builtins.BuiltinId;
@@ -29,7 +30,7 @@ const BuiltinId = @import("runtime").builtins.BuiltinId;
 /// (state-guarded). Best-effort and bounds-safe against a concurrent resolve.
 pub fn thunkLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject {
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) return .{};
+    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return .{};
     return critTargetLabel(self, th, buf, true);
 }
 
@@ -59,7 +60,7 @@ pub fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject 
     // because the thunk RESOLVED mid-read (the race — a short wait, target
     // clobbered) or because it's genuinely source-less; distinguish the two.
     const th = self.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.acquire) > @intFromEnum(thunk_mod.FutureState.evaluating)) return timeline.Subject.lit("resolved");
+    if (th.future.state.load(.acquire) > @intFromEnum(future_mod.FutureState.evaluating)) return timeline.Subject.lit("resolved");
     return timeline.Subject.lit(@tagName(th.targetKind()));
 }
 
@@ -70,7 +71,7 @@ pub fn critWaitLabel(self: *VM, thunk_id: ObjectId, buf: []u8) timeline.Subject 
 /// live when read (state can't go terminal → evaluating), so the ids in them
 /// are real; otherwise discard them unused.
 inline fn stillEvaluating(th: *const thunk_mod.Thunk) bool {
-    return th.future.state.load(.acquire) <= @intFromEnum(thunk_mod.FutureState.evaluating);
+    return th.future.state.load(.acquire) <= @intFromEnum(future_mod.FutureState.evaluating);
 }
 
 /// Snapshot the target arm's bytes as concrete type `T` through a RAW pointer —

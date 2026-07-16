@@ -3,7 +3,7 @@
 //! immediate-container-value emission (the literal-vs-thunk dispatch).
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const types = @import("runtime").types;
 const emit = @import("emit.zig");
@@ -12,7 +12,7 @@ const thunks = @import("thunks.zig");
 const diagnostics = @import("diagnostics.zig");
 const attrs = @import("attrs.zig");
 const literals = @import("literals.zig");
-const ops = @import("ops.zig");
+const lambda = @import("lambda.zig");
 const fold = @import("fold.zig");
 
 const Compiler = compiler_mod.Compiler;
@@ -353,11 +353,11 @@ pub fn compileImmediateContainerValue(self: *Compiler, node: *const Node, option
             try emit.emitOp(self, .thunk_shell);
         },
         .lambda => {
-            try ops.compileLambda(self, unwrapped);
+            try lambda.compileLambda(self, unwrapped);
             try emit.emitOp(self, .thunk_shell);
         },
         .lambda_attrs => {
-            try ops.compileLambdaAttrs(self, unwrapped);
+            try lambda.compileLambdaAttrs(self, unwrapped);
             try emit.emitOp(self, .thunk_shell);
         },
         .identifier => {

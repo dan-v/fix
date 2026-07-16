@@ -102,7 +102,7 @@ test "evaluate records runtime error message and expression trace" {
     // its slot (no binding thunk) — the trace points straight at the
     // erroring RHS `1 + "x"` (col 9) without an extra "while evaluating
     // y" thunk-force wrapper frame. See strictness-driven let elision in
-    // compiler/ops.zig.
+    // compiler/fold.zig.
     try std.testing.expect(trace.frames.items.len >= 1);
     try std.testing.expect(trace.frames.items[0].diagnostic != null);
     try std.testing.expect(trace.frames.items[0].source_path == null);

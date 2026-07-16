@@ -4,9 +4,10 @@
 //! prefetches the set's other members.
 //! Concurrency: the attr cache is per-worker thread-local, registered so the STW collector marks its live entries.
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const Value = @import("runtime").value.Value;
 const InternId = types.InternId;
 const bytecode_mod = @import("../bytecode.zig");
@@ -142,7 +143,7 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     if (self.in_speculation) return;
     if (!member.isThunk()) return;
     const th = self.heap.getThunkAssumeValid(member.asObjectId());
-    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return;
+    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return;
     const sched = self.scheduler;
     if (!self.heap.trySiblingSweep(obj_id, sched.config.sibling_min, sched.config.sibling_max)) return;
     const task: sched_mod.Task = .{ .force_attrs_sweep = obj_id };

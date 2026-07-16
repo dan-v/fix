@@ -2,7 +2,7 @@
 //! operands, the `//` update merge (lazy layered + strict recursive), and list
 //! concatenation.
 const std = @import("std");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const heap_mod = @import("runtime").heap;

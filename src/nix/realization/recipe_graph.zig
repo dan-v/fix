@@ -107,7 +107,7 @@ pub const Recipe = struct {
 
 pub const Claim = struct {
     mu: sync.BlockingMutex = .{},
-    future: runtime.thunk.Future = runtime.thunk.Future.initClaimedStatic(runtime.thunk.makeClaimer(0)),
+    future: runtime.future.Future = runtime.future.Future.initClaimed(runtime.future.makeClaimer(0)),
     refs: std.atomic.Value(usize) = .init(1),
     state: State = .writing,
     err: ?anyerror = null,

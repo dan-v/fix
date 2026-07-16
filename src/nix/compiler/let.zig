@@ -5,7 +5,7 @@
 //! slot with no thunk).
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const types = @import("runtime").types;
 const emit = @import("emit.zig");
 const scope = @import("scope.zig");

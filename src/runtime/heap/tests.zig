@@ -1,5 +1,6 @@
 const std = @import("std");
 const heap_mod = @import("../heap.zig");
+const heap_collector = @import("collector.zig");
 const Value = @import("../value.zig").Value;
 const ObjectHeap = heap_mod.ObjectHeap;
 const InternId = heap_mod.InternId;
@@ -209,7 +210,7 @@ test "object heap supports a single-entry attrs object" {
 test "object heap sweep frees unmarked objects and lets ids be reused" {
     var heap = try ObjectHeap.init(std.testing.allocator, 1);
     defer heap.deinit();
-    heap_mod.heap_gc.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
 
     // Two live (reachable) lists, two dead (unreferenced) lists.
     const live_a = try heap.addList(&.{Value.int(1)});
@@ -224,7 +225,7 @@ test "object heap sweep frees unmarked objects and lets ids be reused" {
     tr.markValue(&heap, Value.list(live_b));
     tr.drain(&heap);
 
-    const st = heap.sweep(tr.mark_bits);
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
     try std.testing.expectEqual(@as(u64, 2), st.objects_freed);
 
     // The marked objects still read back their original contents.

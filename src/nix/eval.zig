@@ -20,7 +20,7 @@ const LanguagePolicy = @import("policy.zig").LanguagePolicy;
 const vm_force = @import("vm.zig").force;
 const vm_builtins = @import("vm.zig").builtins;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
-const heap_gc = @import("runtime").heap.heap_gc;
+const heap_collector = @import("runtime").heap_collector;
 const FileCache = host.FileCache;
 const FetchCache = host.FetchCache;
 const regex_mod = @import("base").regex;
@@ -1044,6 +1044,7 @@ pub const Evaluator = struct {
         defer builder.deinit(scratch_alloc);
 
         var compiler = compiler_mod.Compiler.init(
+            &compiler_mod.driver,
             scratch_alloc,
             self.allocator,
             &builder,
@@ -1398,6 +1399,7 @@ pub const Evaluator = struct {
         const prev_tag = vma_mod.setAllocTag(.worker_arena);
         defer _ = vma_mod.setAllocTag(prev_tag);
         var vm = try VM.init(.{
+            .driver = &vm_mod.driver,
             .allocator = scratch,
             .buffer_pool = &self.vm_buffers,
             .registry = &self.registry,
@@ -1700,14 +1702,14 @@ pub const Evaluator = struct {
         // via `--max-memory`; see `eval_gc.memoryBudget`).
         // On a roomy machine that line dwarfs the eval → never fires: zero
         // pauses AND zero tracking (lazy arming at line/2, see
-        // `heap_gc.enableBudget`); on a tight machine it fires before the
+        // `heap_collector.enableBudget`); on a tight machine it fires before the
         // eval OOMs. Override 0 = never collect (bump-only). FIX_GC_STEP_MB
         // keeps the eager validation path (tracking from the start).
         const budget = eval_gc.memoryBudget(self);
         if (step_bytes > 0)
-            heap_gc.enableCollect(&self.heap, budget, step_bytes)
+            heap_collector.enableCollect(&self.heap, budget, step_bytes)
         else if (budget > 0)
-            heap_gc.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
+            heap_collector.enableBudget(&self.heap, budget, eval_gc.constrainedMode(self, budget));
         return w;
     }
 
@@ -1765,7 +1767,7 @@ pub const Evaluator = struct {
         // Safe here: the world is stopped. In-eval collections instead bump
         // the token after the sweep (`afterCollect`).
         self.heap.token = runtime.heap.next_heap_token.fetchAdd(1, .monotonic);
-        heap_gc.runCollect(&self.heap, 0);
+        heap_collector.runCollect(&self.heap, 0);
         self.scheduler.gcEndCollection(0);
         result.ran = true;
         result.reserved_after = self.heap.totalReservedBytes();

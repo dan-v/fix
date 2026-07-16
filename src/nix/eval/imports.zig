@@ -1,7 +1,7 @@
 //! Path-based import resolution: dedup, cycle detection, file read,
 //! and the back-call into the evaluator for parse+compile+eval.
 //!
-//! Each `ImportEntry` wraps a `runtime.thunk.Future` — the same
+//! Each `ImportEntry` wraps a `runtime.future.Future` — the same
 //! claim+wait state machine `Thunk` uses. The first fiber to claim
 //! runs `compileImportPath` inline; concurrent fibers enroll on the
 //! future's waiter list and yield. Same protocol, same primitive: a
@@ -25,6 +25,7 @@
 const std = @import("std");
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const fiber_mod = @import("base").fiber;
 const worker_mod = @import("../vm.zig").worker;
 const SpinMutex = @import("base").sync.SpinMutex;
@@ -65,14 +66,14 @@ pub const Registry = struct {
         errdefer allocator.free(key);
         const entry = try allocator.create(ImportEntry);
         errdefer allocator.destroy(entry);
-        entry.* = .{ .future = thunk_mod.Future.init() };
+        entry.* = .{ .future = future_mod.Future.init() };
         try self.entries.put(allocator, key, entry);
         return entry;
     }
 };
 
 pub const ImportEntry = struct {
-    future: thunk_mod.Future,
+    future: future_mod.Future,
     /// The resolved import value. `Future` is value-less, so the entry
     /// owns its own result slot, written before `future.publish()`.
     result: Value = Value.null_val,
@@ -197,8 +198,8 @@ fn publishCompileFailure(ev: anytype, entry: *ImportEntry, err: anyerror) void {
     entry.future.publishErrored();
 }
 
-fn currentClaimer() thunk_mod.ClaimerId {
-    const inner = fiber_mod.currentFiber() orelse return thunk_mod.INVALID_CLAIMER;
+fn currentClaimer() future_mod.ClaimerId {
+    const inner = fiber_mod.currentFiber() orelse return future_mod.INVALID_CLAIMER;
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
     return wf.ctx.claimer_id;
 }

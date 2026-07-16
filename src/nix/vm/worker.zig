@@ -35,13 +35,15 @@ const builtin = @import("builtin");
 const types = @import("runtime").types;
 const Value = @import("runtime").value.Value;
 const thunk_mod = @import("runtime").thunk;
+const future_mod = @import("runtime").future;
 const sync = @import("base").sync;
 const arena_mod = @import("base").arena;
 const clock = @import("base").clock;
 const scheduler_mod = @import("../scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Task = scheduler_mod.Task;
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
+const vm_driver = @import("driver.zig").driver;
 const VM = vm_mod.VM;
 const exec_context = @import("exec_context.zig");
 const ExecutionContext = exec_context.ExecutionContext;
@@ -177,13 +179,13 @@ pub const WorkerFiber = struct {
     /// and enqueues the fiber onto its allocator-worker's ready queue.
     /// Reused for IO waits too (a fiber never waits on a thunk and an IO
     /// completion at the same time).
-    waiter: thunk_mod.Waiter,
+    waiter: future_mod.Waiter,
     /// Completion cell for a daemon/fetch IO offload (see `vm/io_offload.zig`).
     /// Lives on the (stable) WorkerFiber rather than the fiber's stack because
     /// the IO thread touches it inside `publish()` *after* the woken fiber may
     /// have already resumed and reused its stack frame. Re-`initClaimed`ed
     /// before each offload; idle otherwise.
-    io_future: thunk_mod.Future,
+    io_future: future_mod.Future,
     /// Scratch trace used during speculative `force_thunk` tasks. Lets
     /// the failing thunk's error message be captured (and copied onto the
     /// thunk's cached error info) without polluting the user's shared
@@ -191,7 +193,7 @@ pub const WorkerFiber = struct {
     /// user-facing code path.
     local_trace: eval_trace.Trace,
 
-    fn wakeImpl(w: *thunk_mod.Waiter) void {
+    fn wakeImpl(w: *future_mod.Waiter) void {
         const self: *WorkerFiber = @fieldParentPtr("waiter", w);
         self.worker.scheduler.enqueueReady(self.worker.worker_id, &self.ready_node);
     }
@@ -623,7 +625,7 @@ pub const Worker = struct {
         // and may belong to a different worker now (migration). Re-base
         // the snapshot so only creations made INSIDE this fiber's own run
         // slices are charged against its budget (see VM.spec_create_left).
-        if (f.vm.spec_create_left != vm_mod.NO_SPEC_BUDGET)
+        if (f.vm.spec_create_left != vm_mod.no_spec_budget)
             vm_force.specCreateArm(&f.vm, f.vm.spec_create_left);
         f.in_runfiber.store(1, .release);
         f.inner.resume_();
@@ -814,7 +816,7 @@ pub const Worker = struct {
             .vm = undefined,
             // Claim identity is baked once, for the fiber's life; the
             // demand-role fields start (and recycle back to) cleared.
-            .ctx = .{ .claimer_id = thunk_mod.makeClaimer(fiber_id) },
+            .ctx = .{ .claimer_id = future_mod.makeClaimer(fiber_id) },
             .scratch = arena_mod.ArenaAllocator.init(self.allocator),
             .state = .free,
             .in_runfiber = .init(0),
@@ -823,7 +825,7 @@ pub const Worker = struct {
             .next_free = null,
             .ready_node = .{},
             .waiter = .{ .wake_fn = WorkerFiber.wakeImpl },
-            .io_future = thunk_mod.Future.initClaimed(thunk_mod.makeClaimer(fiber_id)),
+            .io_future = future_mod.Future.initClaimed(future_mod.makeClaimer(fiber_id)),
             .local_trace = eval_trace.Trace.init(self.allocator),
         };
         errdefer f.scratch.deinit();
@@ -959,13 +961,13 @@ fn slotEntry(arg: *anyopaque) void {
 /// approximate by design.
 fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *bool) void {
     const heap = f.vm.heap;
-    const unresolved = @intFromEnum(thunk_mod.FutureState.unresolved);
+    const unresolved = @intFromEnum(future_mod.FutureState.unresolved);
     switch (task) {
         .force_thunk => |thunk_id| {
             total.* = 1;
             const st = heap.getThunkAssumeValid(thunk_id).future.state.load(.monotonic);
             if (st == unresolved) live.* = 1;
-            if (st == @intFromEnum(thunk_mod.FutureState.evaluating)) busy.* = true;
+            if (st == @intFromEnum(future_mod.FutureState.evaluating)) busy.* = true;
         },
         .force_list_range => |range| {
             const items = heap.getList(range.list_id) catch return;
@@ -1011,7 +1013,7 @@ fn censusScanTask(f: *WorkerFiber, task: Task, live: *u64, total: *u64, busy: *b
 /// fault.
 fn specRootBandSmall(f: *WorkerFiber, thunk_id: types.ObjectId) bool {
     const th = f.vm.heap.getThunkAssumeValid(thunk_id);
-    if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return false;
+    if (th.future.state.load(.monotonic) != @intFromEnum(future_mod.FutureState.unresolved)) return false;
     if (th.targetKind() != .bytecode) return false;
     // Racy union read (see `Thunk.targetLeadingRacy`): a peer may resolve the
     // thunk between the state load above and here, flipping the payload to
@@ -1044,8 +1046,8 @@ fn runTask(f: *WorkerFiber, task: Task) void {
                     vm_force.specCreateArm(&f.vm, band);
             }
             defer {
-                f.vm.spec_create_left = vm_mod.NO_SPEC_BUDGET;
-                f.vm.spec_budget = vm_mod.NO_SPEC_BUDGET;
+                f.vm.spec_create_left = vm_mod.no_spec_budget;
+                f.vm.spec_budget = vm_mod.no_spec_budget;
             }
             const v = Value.thunk(thunk_id);
             _ = vm_force.forceValueSpeculative(&f.vm, v) catch |err| {
@@ -1117,8 +1119,8 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             // creations); restore before the fiber is recycled for tasks
             // that must run unbounded.
             defer {
-                f.vm.spec_budget = vm_mod.NO_SPEC_BUDGET;
-                f.vm.spec_create_left = vm_mod.NO_SPEC_BUDGET;
+                f.vm.spec_budget = vm_mod.no_spec_budget;
+                f.vm.spec_create_left = vm_mod.no_spec_budget;
             }
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
@@ -1232,6 +1234,7 @@ test "Worker basic init/deinit" {
         fn initVm(ctx: *anyopaque, _: u8, _: u32, scratch: std.mem.Allocator) anyerror!VM {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             return VM.init(.{
+                .driver = &vm_driver,
                 .allocator = scratch,
                 .registry = &self.registry,
                 .intern = &self.intern,
@@ -1276,7 +1279,7 @@ test "Worker basic init/deinit" {
     // mapping to position in the worker's fibers list. Each fiber's
     // claimer_id should equal `makeClaimer(fiber_id)`.
     for (worker.fibers.items) |f| {
-        try testing.expectEqual(thunk_mod.makeClaimer(f.fiber_id), f.ctx.claimer_id);
+        try testing.expectEqual(future_mod.makeClaimer(f.fiber_id), f.ctx.claimer_id);
         try testing.expectEqual(FiberState.free, f.state);
     }
     // All fiber ids should be distinct.

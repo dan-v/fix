@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const containers = @import("base");
 const clock = @import("base").clock;
 const heap_mod = @import("heap.zig");
+const heap_collector = @import("heap/collector.zig");
 const value_mod = @import("value.zig");
 const thunk_mod = @import("thunk.zig");
 const types = @import("types.zig");
@@ -26,7 +27,7 @@ const types = @import("types.zig");
 const ObjectHeap = heap_mod.ObjectHeap;
 const Value = value_mod.Value;
 const ObjectId = types.ObjectId;
-const FutureState = thunk_mod.FutureState;
+const FutureState = @import("future.zig").FutureState;
 
 /// A `attrs_merge` whose `flattened` memo equals this has no flattened
 /// object to follow. Single source of truth in `heap.zig`.
@@ -515,7 +516,7 @@ fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *cons
         // out-of-band, swept separately); `.blackhole` is terminal. Neither
         // holds a Value to follow.
         .errored, .blackhole => {},
-        .unresolved, .evaluating => switch (t.future.target_kind) {
+        .unresolved, .evaluating => switch (t.targetKind()) {
             .closure => sink.markValue(heap, t.payload.target.closure),
             .pass_through => sink.markValue(heap, t.payload.target.pass_through),
             .attr_access => sink.markValue(heap, t.payload.target.attr_access.base),
@@ -741,7 +742,7 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
-    heap_mod.heap_gc.enableCollect(&heap, 64 << 20, 0);
+    heap_collector.enableCollect(&heap, 64 << 20, 0);
 
     // Live tree: outer list -> inner list. Garbage: two unreferenced lists.
     const inner = try heap.addList(&.{ Value.int(1), Value.int(2), Value.int(3) });
@@ -760,7 +761,7 @@ test "gc reclaim: sweep frees unreachable objects + ranges, allocator reuses the
     tr.drain(&heap);
     try std.testing.expectEqual(@as(u64, 2), tr.stats.objects); // outer + inner live
 
-    const st = heap.sweep(tr.mark_bits);
+    const st = heap_collector.sweep(&heap, tr.mark_bits);
     try std.testing.expectEqual(@as(u64, 2), st.objects_freed); // g1 + g2 dead
 
     // Live objects survive intact.

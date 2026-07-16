@@ -5,7 +5,7 @@
 //! only forcing `.x` may throw.
 
 const std = @import("std");
-const compiler_mod = @import("../compiler.zig");
+const compiler_mod = @import("context.zig");
 const ast = @import("syntax").ast;
 const Value = @import("runtime").value.Value;
 const emit = @import("emit.zig");

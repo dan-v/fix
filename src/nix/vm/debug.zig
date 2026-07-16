@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const vm_mod = @import("../vm.zig");
+const vm_mod = @import("context.zig");
 const types = @import("runtime").types;
 
 const VM = vm_mod.VM;

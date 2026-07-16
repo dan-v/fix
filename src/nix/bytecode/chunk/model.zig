@@ -57,7 +57,7 @@ pub const Chunk = struct {
     /// 1 for curried/attrset lambdas (the historical default) and for
     /// thunk bodies (which are never "called"). N>1 for an *uncurried*
     /// chunk produced by merging an adjacent `a: b: ...:` value-lambda
-    /// chain (see `compiler/ops.zig compileLambda`): a call site
+    /// chain (see `compiler/lambda.zig compileLambda`): a call site
     /// supplying N args runs the body in one frame, under-application
     /// builds a partial-application (PAP) value. `arity <= local_count`.
     arity: u16 = 1,
