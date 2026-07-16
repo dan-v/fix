@@ -99,7 +99,7 @@ pub fn critTargetLabel(self: *VM, th: *thunk_mod.Thunk, buf: []u8, follow: bool)
             // INLINE-safe to read, its location. `b` is a validated snapshot,
             // so its inline slot is safe to read.
             if (b.chunk_id == self.registry.well_known.mapattrs_apply) break :blk timeline.Subject.lit("mapAttrs"); // 3 ups → spilled
-            if (b.upvalue_count >= 1 and b.upvalue_count <= thunk_mod.BytecodeThunk.INLINE_CAP) {
+            if (b.upvalue_count >= 1 and b.upvalue_count <= thunk_mod.BytecodeThunk.inline_capacity) {
                 const fn_val: Value = @as(*const Value, @ptrCast(@alignCast(&b.storage))).*;
                 const fn_loc = critClosureLabel(self, fn_val, buf);
                 if (!fn_loc.isEmpty()) break :blk fn_loc;

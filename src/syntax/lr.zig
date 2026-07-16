@@ -68,10 +68,10 @@ pub const GrammarDesc = struct {
 /// the table living in L1 is worth real cycles. 14 bits of arg bound the
 /// grammar at 16384 states/productions (asserted in `generate`; the Nix
 /// grammar has ~253/205).
-pub const ACT_ERROR: u32 = 0;
-pub const ACT_SHIFT: u32 = 1;
-pub const ACT_REDUCE: u32 = 2;
-pub const ACT_ACCEPT: u32 = 3;
+pub const action_error: u32 = 0;
+pub const action_shift: u32 = 1;
+pub const action_reduce: u32 = 2;
+pub const action_accept: u32 = 3;
 
 pub const Cell = u16;
 const cell_arg_bits = 14;
@@ -87,16 +87,16 @@ pub inline fn cellArg(c: Cell) u32 {
     return @as(u32, c) & cell_arg_mask;
 }
 
-/// Upper bound on the lookahead-set width `W = num_terminals + 1`. Each LR(1)
+/// Upper bound on the lookahead-set width `lookahead_width = num_terminals + 1`. Each LR(1)
 /// closure item carries a fixed-size lookahead bitset of this width; only the
-/// first `W` slots are ever read, so the cap just has to exceed the grammar's
+/// first `lookahead_width` slots are ever read, so the cap just has to exceed the grammar's
 /// terminal count. The Nix grammar has 55 terminals; 1024 leaves ample room.
 const max_terminals = 1024;
 
 const Item = struct { prod: u32, dot: u32 };
 
 /// An LR(1) closure item: an LR(0) item plus a lookahead bitset. Only
-/// `la[0..W]` is meaningful; the trailing slots are unused padding (never read),
+/// `la[0..lookahead_width]` is meaningful; the trailing slots are unused padding (never read),
 /// which lets the item be a fixed-size value type instead of carrying a slice.
 const LItem = struct { prod: u32, dot: u32, la: [max_terminals]bool };
 
@@ -194,30 +194,30 @@ fn precOfProd(g: GrammarDesc, prods: []const RawProd, p: u32) u16 {
 // Shared grammar data + the two closure helpers that read it. Groups what the
 // old comptime nested-struct methods captured from their enclosing scope.
 const Ctx = struct {
-    NT: u32,
-    W: u32,
+    terminal_count: u32,
+    lookahead_width: u32,
     num_nt_total: u32,
     prods: []const RawProd,
     prods_of: []const []const u32,
-    first: []const bool, // [num_nt_total][NT], flattened as [b*NT + a]
+    first: []const bool, // [num_nt_total][terminal_count], flattened as [b*terminal_count + a]
     nullable: []const bool,
 
-    // FIRST of the sequence `seq` followed by lookahead set `la` (width W),
-    // written into `out[0..W]`.
+    // FIRST of the sequence `seq` followed by lookahead set `la` (width lookahead_width),
+    // written into `out[0..lookahead_width]`.
     fn firstSeq(self: *const Ctx, out: []bool, seq: []const u32, la: []const bool) void {
-        const NT = self.NT;
-        const W = self.W;
-        for (0..W) |k| out[k] = false;
+        const terminal_count = self.terminal_count;
+        const lookahead_width = self.lookahead_width;
+        for (0..lookahead_width) |k| out[k] = false;
         var all_null = true;
         for (seq) |sym| {
-            if (sym < NT) {
+            if (sym < terminal_count) {
                 out[sym] = true;
                 all_null = false;
                 break;
             } else {
-                const b = sym - NT;
-                for (0..NT) |a| {
-                    if (self.first[b * NT + a]) out[a] = true;
+                const b = sym - terminal_count;
+                for (0..terminal_count) |a| {
+                    if (self.first[b * terminal_count + a]) out[a] = true;
                 }
                 if (!self.nullable[b]) {
                     all_null = false;
@@ -226,7 +226,7 @@ const Ctx = struct {
             }
         }
         if (all_null) {
-            for (0..W) |a| {
+            for (0..lookahead_width) |a| {
                 if (la[a]) out[a] = true;
             }
         }
@@ -237,8 +237,8 @@ const Ctx = struct {
     // items, so "find existing" is O(1) via `pos[p]` and the rule lookup uses
     // the by-LHS index.
     fn clo1(self: *const Ctx, seeds: []const LItem, buf: []LItem, pos: []i32) usize {
-        const NT = self.NT;
-        const W = self.W;
+        const terminal_count = self.terminal_count;
+        const lookahead_width = self.lookahead_width;
         var n: usize = 0;
         @memset(pos, -1);
         for (seeds) |it| {
@@ -256,19 +256,19 @@ const Ctx = struct {
                 const rhs = self.prods[it.prod].rhs;
                 if (it.dot >= rhs.len) continue;
                 const sym = rhs[it.dot];
-                if (sym < NT) continue;
+                if (sym < terminal_count) continue;
                 const beta = rhs[it.dot + 1 ..];
-                self.firstSeq(fs[0..W], beta, it.la[0..W]);
-                for (self.prods_of[sym - NT]) |p| {
+                self.firstSeq(fs[0..lookahead_width], beta, it.la[0..lookahead_width]);
+                for (self.prods_of[sym - terminal_count]) |p| {
                     if (pos[p] < 0) {
                         buf[n] = .{ .prod = p, .dot = 0, .la = undefined };
-                        @memcpy(buf[n].la[0..W], fs[0..W]);
+                        @memcpy(buf[n].la[0..lookahead_width], fs[0..lookahead_width]);
                         pos[p] = @intCast(n);
                         n += 1;
                         changed = true;
                     } else {
                         const qi: usize = @intCast(pos[p]);
-                        for (0..W) |a| {
+                        for (0..lookahead_width) |a| {
                             if (fs[a] and !buf[qi].la[a]) {
                                 buf[qi].la[a] = true;
                                 changed = true;
@@ -285,19 +285,19 @@ const Ctx = struct {
 /// Build the LALR(1) tables for `g`. Runs as ordinary native code; all working
 /// state and the returned arrays are allocated from `arena`.
 pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
-    const NT = g.num_terminals;
-    const NN = g.num_nonterminals;
-    const start_sym: u32 = NT + g.start;
-    const num_nt_total = NN + 1; // includes S'
-    const W = NT + 1; // lookahead-set width: real terminals + the '#' marker
-    const HASH = NT; // bit index of the '#' propagation marker
-    std.debug.assert(W <= max_terminals);
+    const terminal_count = g.num_terminals;
+    const nonterminal_count = g.num_nonterminals;
+    const start_sym: u32 = terminal_count + g.start;
+    const num_nt_total = nonterminal_count + 1; // includes S'
+    const lookahead_width = terminal_count + 1; // lookahead-set width: real terminals + the '#' marker
+    const propagation_marker = terminal_count; // bit index of the '#' propagation marker
+    std.debug.assert(lookahead_width <= max_terminals);
 
     // Productions with the augmented rule S' -> start prepended at index 0.
     const prods = try arena.alloc(RawProd, g.productions.len + 1);
-    prods[0] = .{ .lhs = NN, .rhs = try arena.dupe(u32, &[_]u32{start_sym}) };
+    prods[0] = .{ .lhs = nonterminal_count, .rhs = try arena.dupe(u32, &[_]u32{start_sym}) };
     for (g.productions, 0..) |p, i| prods[i + 1] = p;
-    const P = prods.len;
+    const production_count = prods.len;
 
     // Productions grouped by left-hand-side nonterminal.
     const prods_of = try arena.alloc([]const u32, num_nt_total);
@@ -308,10 +308,10 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
         for (0..num_nt_total) |k| prods_of[k] = lists[k].items;
     }
 
-    // ---- FIRST sets and nullability (indexed by nonterminal index 0..NN) ----
+    // ---- FIRST sets and nullability (indexed by nonterminal index 0..nonterminal_count) ----
     const nullable = try arena.alloc(bool, num_nt_total);
     @memset(nullable, false);
-    const first = try arena.alloc(bool, num_nt_total * NT);
+    const first = try arena.alloc(bool, num_nt_total * terminal_count);
     @memset(first, false);
     {
         var changed = true;
@@ -321,18 +321,18 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                 const lhs = p.lhs;
                 var all_null = true;
                 for (p.rhs) |sym| {
-                    if (sym < NT) {
-                        if (!first[lhs * NT + sym]) {
-                            first[lhs * NT + sym] = true;
+                    if (sym < terminal_count) {
+                        if (!first[lhs * terminal_count + sym]) {
+                            first[lhs * terminal_count + sym] = true;
                             changed = true;
                         }
                         all_null = false;
                         break;
                     } else {
-                        const b = sym - NT;
-                        for (0..NT) |a| {
-                            if (first[b * NT + a] and !first[lhs * NT + a]) {
-                                first[lhs * NT + a] = true;
+                        const b = sym - terminal_count;
+                        for (0..terminal_count) |a| {
+                            if (first[b * terminal_count + a] and !first[lhs * terminal_count + a]) {
+                                first[lhs * terminal_count + a] = true;
                                 changed = true;
                             }
                         }
@@ -351,8 +351,8 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
     }
 
     const ctx = Ctx{
-        .NT = NT,
-        .W = W,
+        .terminal_count = terminal_count,
+        .lookahead_width = lookahead_width,
         .num_nt_total = num_nt_total,
         .prods = prods,
         .prods_of = prods_of,
@@ -361,22 +361,22 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
     };
 
     // ---- build the canonical LR(0) collection ----
-    const NSYM = NT + NN;
-    const NB = 8192;
+    const symbol_count = terminal_count + nonterminal_count;
+    const kernel_bucket_count = 8192;
     const start_kernel = try arena.dupe(Item, &[_]Item{.{ .prod = 0, .dot = 0 }});
     var kernels: List([]const Item) = .empty;
     try kernels.append(arena, start_kernel);
     const Trans = struct { from: u32, sym: u32, to: u32 };
     var trans: List(Trans) = .empty;
     // buckets maps a kernel's FNV hash (masked) to the state indices in it.
-    const buckets = try arena.alloc(List(u32), NB);
+    const buckets = try arena.alloc(List(u32), kernel_bucket_count);
     for (buckets) |*bk| bk.* = .empty;
-    try buckets[kernelHash(start_kernel) & (NB - 1)].append(arena, 0);
+    try buckets[kernelHash(start_kernel) & (kernel_bucket_count - 1)].append(arena, 0);
 
     // scratch reused across states
-    const clo0_buf = try arena.alloc(Item, 2 * P + 64);
-    const seen = try arena.alloc(bool, P);
-    const g_items = try arena.alloc(List(Item), NSYM);
+    const clo0_buf = try arena.alloc(Item, 2 * production_count + 64);
+    const seen = try arena.alloc(bool, production_count);
+    const g_items = try arena.alloc(List(Item), symbol_count);
     for (g_items) |*gi| gi.* = .empty;
 
     {
@@ -397,8 +397,8 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                 const rhs = prods[it.prod].rhs;
                 if (it.dot >= rhs.len) continue;
                 const sym = rhs[it.dot];
-                if (sym < NT) continue;
-                for (prods_of[sym - NT]) |p| {
+                if (sym < terminal_count) continue;
+                for (prods_of[sym - terminal_count]) |p| {
                     if (!seen[p]) {
                         seen[p] = true;
                         clo0_buf[nclo] = .{ .prod = p, .dot = 0 };
@@ -407,7 +407,7 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                 }
             }
             // Bucket each advanced closure item by its next symbol.
-            for (0..NSYM) |x| g_items[x].clearRetainingCapacity();
+            for (0..symbol_count) |x| g_items[x].clearRetainingCapacity();
             for (clo0_buf[0..nclo]) |it| {
                 const rhs = prods[it.prod].rhs;
                 if (it.dot >= rhs.len) continue;
@@ -415,11 +415,11 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                 try g_items[sym].append(arena, .{ .prod = it.prod, .dot = it.dot + 1 });
             }
             var x: usize = 0;
-            while (x < NSYM) : (x += 1) { // never GOTO on S'
+            while (x < symbol_count) : (x += 1) { // never GOTO on S'
                 if (g_items[x].items.len == 0) continue;
                 const gk = try sortKernel(arena, g_items[x].items);
                 const h = kernelHash(gk);
-                const b = h & (NB - 1);
+                const b = h & (kernel_bucket_count - 1);
                 var target: i64 = -1;
                 for (buckets[b].items) |ki| {
                     if (kernelEqual(kernels.items[ki], gk)) {
@@ -441,24 +441,24 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
     const num_states = kernels.items.len;
 
     // Dense transition table (state,sym) -> target state or -1.
-    const trans_dense = try arena.alloc(i32, num_states * NSYM);
+    const trans_dense = try arena.alloc(i32, num_states * symbol_count);
     @memset(trans_dense, -1);
-    for (trans.items) |e| trans_dense[e.from * NSYM + e.sym] = @intCast(e.to);
+    for (trans.items) |e| trans_dense[e.from * symbol_count + e.sym] = @intCast(e.to);
 
     // ---- global ids for kernel items: offset[s] + j ----
     const offset = try arena.alloc(u32, num_states + 1);
     offset[0] = 0;
     for (0..num_states) |s| offset[s + 1] = offset[s] + @as(u32, @intCast(kernels.items[s].len));
-    const K = offset[num_states];
+    const kernel_item_count = offset[num_states];
 
     // ---- spontaneous lookaheads + propagation links ----
-    const la_sets = try arena.alloc(bool, K * NT); // [K][NT], flattened
+    const la_sets = try arena.alloc(bool, kernel_item_count * terminal_count); // [kernel_item_count][terminal_count], flattened
     @memset(la_sets, false);
-    const prop = try arena.alloc(List(u32), K); // prop[src] -> dst kernel-item ids
+    const prop = try arena.alloc(List(u32), kernel_item_count); // prop[src] -> dst kernel-item ids
     for (prop) |*pl| pl.* = .empty;
 
-    const cbuf = try arena.alloc(LItem, 2 * P + 64);
-    const pos = try arena.alloc(i32, P);
+    const cbuf = try arena.alloc(LItem, 2 * production_count + 64);
+    const pos = try arena.alloc(i32, production_count);
 
     {
         var s: usize = 0;
@@ -467,8 +467,8 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
             while (j < kernels.items[s].len) : (j += 1) {
                 const kit = kernels.items[s][j];
                 var seed: LItem = .{ .prod = kit.prod, .dot = kit.dot, .la = undefined };
-                for (0..W) |a| seed.la[a] = false;
-                seed.la[HASH] = true;
+                for (0..lookahead_width) |a| seed.la[a] = false;
+                seed.la[propagation_marker] = true;
                 const seeds = [_]LItem{seed};
                 const nc = ctx.clo1(&seeds, cbuf, pos);
                 const src_id = offset[s] + @as(u32, @intCast(j));
@@ -476,22 +476,22 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                     const rhs = prods[ci.prod].rhs;
                     if (ci.dot >= rhs.len) continue;
                     const xsym = rhs[ci.dot];
-                    const t = trans_dense[s * NSYM + xsym];
+                    const t = trans_dense[s * symbol_count + xsym];
                     if (t < 0) continue;
                     const ts: usize = @intCast(t);
                     const dst_j = kidxFind(kernels.items[ts], ci.prod, ci.dot + 1);
                     const dst_id = offset[ts] + dst_j;
-                    for (0..NT) |a| {
-                        if (ci.la[a]) la_sets[dst_id * NT + a] = true;
+                    for (0..terminal_count) |a| {
+                        if (ci.la[a]) la_sets[dst_id * terminal_count + a] = true;
                     }
-                    if (ci.la[HASH]) try prop[src_id].append(arena, dst_id);
+                    if (ci.la[propagation_marker]) try prop[src_id].append(arena, dst_id);
                 }
             }
         }
     }
 
     // start item S'->.S in state 0 has lookahead {eof}
-    la_sets[(offset[0] + kidxFind(kernels.items[0], 0, 0)) * NT + g.eof] = true;
+    la_sets[(offset[0] + kidxFind(kernels.items[0], 0, 0)) * terminal_count + g.eof] = true;
 
     // propagate to fixpoint
     {
@@ -499,11 +499,11 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
         while (changed) {
             changed = false;
             var src: usize = 0;
-            while (src < K) : (src += 1) {
+            while (src < kernel_item_count) : (src += 1) {
                 for (prop[src].items) |dst| {
-                    for (0..NT) |a| {
-                        if (la_sets[src * NT + a] and !la_sets[dst * NT + a]) {
-                            la_sets[dst * NT + a] = true;
+                    for (0..terminal_count) |a| {
+                        if (la_sets[src * terminal_count + a] and !la_sets[dst * terminal_count + a]) {
+                            la_sets[dst * terminal_count + a] = true;
                             changed = true;
                         }
                     }
@@ -513,8 +513,8 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
     }
 
     // ---- build ACTION / GOTO ----
-    const action = try arena.alloc(Cell, num_states * NT);
-    @memset(action, cell(ACT_ERROR, 0));
+    const action = try arena.alloc(Cell, num_states * terminal_count);
+    @memset(action, cell(action_error, 0));
     const goto_table = try arena.alloc(i16, num_states * num_nt_total);
     @memset(goto_table, -1);
 
@@ -530,9 +530,9 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
             var j: usize = 0;
             while (j < kernels.items[s].len) : (j += 1) {
                 var seed: LItem = .{ .prod = kernels.items[s][j].prod, .dot = kernels.items[s][j].dot, .la = undefined };
-                for (0..W) |a| seed.la[a] = false;
+                for (0..lookahead_width) |a| seed.la[a] = false;
                 const gid = offset[s] + @as(u32, @intCast(j));
-                for (0..NT) |a| seed.la[a] = la_sets[gid * NT + a];
+                for (0..terminal_count) |a| seed.la[a] = la_sets[gid * terminal_count + a];
                 seeds_buf[ns] = seed;
                 ns += 1;
             }
@@ -541,23 +541,23 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
                 const rhs = prods[ci.prod].rhs;
                 if (ci.dot < rhs.len) {
                     const xsym = rhs[ci.dot];
-                    const t = trans_dense[s * NSYM + xsym];
+                    const t = trans_dense[s * symbol_count + xsym];
                     if (t < 0) continue;
-                    if (xsym < NT) {
-                        try setAction(g, prods, action, s * NT + xsym, cell(ACT_SHIFT, @intCast(t)), xsym, s);
+                    if (xsym < terminal_count) {
+                        try setAction(g, prods, action, s * terminal_count + xsym, cell(action_shift, @intCast(t)), xsym, s);
                     } else {
-                        goto_table[s * num_nt_total + (xsym - NT)] = @intCast(t);
+                        goto_table[s * num_nt_total + (xsym - terminal_count)] = @intCast(t);
                     }
                 } else {
                     if (ci.prod == 0) {
                         // S' -> start .  : accept on its lookahead (eof)
-                        for (0..NT) |a| {
-                            if (ci.la[a]) action[s * NT + a] = cell(ACT_ACCEPT, 0);
+                        for (0..terminal_count) |a| {
+                            if (ci.la[a]) action[s * terminal_count + a] = cell(action_accept, 0);
                         }
                     } else {
-                        for (0..NT) |a| {
+                        for (0..terminal_count) |a| {
                             if (ci.la[a]) {
-                                try setAction(g, prods, action, s * NT + a, cell(ACT_REDUCE, ci.prod), @intCast(a), s);
+                                try setAction(g, prods, action, s * terminal_count + a, cell(action_reduce, ci.prod), @intCast(a), s);
                             }
                         }
                     }
@@ -566,22 +566,22 @@ pub fn generate(arena: std.mem.Allocator, g: GrammarDesc) GenError!Built {
         }
     }
 
-    const prod_lhs = try arena.alloc(u32, P);
-    const prod_rhs_len = try arena.alloc(u32, P);
-    for (0..P) |p| {
+    const prod_lhs = try arena.alloc(u32, production_count);
+    const prod_rhs_len = try arena.alloc(u32, production_count);
+    for (0..production_count) |p| {
         prod_lhs[p] = prods[p].lhs;
         prod_rhs_len[p] = @intCast(prods[p].rhs.len);
     }
 
     std.debug.assert(num_states <= cell_arg_mask + 1);
-    std.debug.assert(P <= cell_arg_mask + 1);
+    std.debug.assert(production_count <= cell_arg_mask + 1);
     std.debug.assert(num_states <= std.math.maxInt(i16));
 
     return .{
         .num_states = @intCast(num_states),
-        .num_terminals = NT,
+        .num_terminals = terminal_count,
         .num_nonterminals = num_nt_total,
-        .num_productions = @intCast(P),
+        .num_productions = @intCast(production_count),
         .eof = g.eof,
         .start_state = 0,
         .action = action,
@@ -604,7 +604,7 @@ fn setAction(
     state: usize,
 ) GenError!void {
     const cur = action[idx];
-    if (cellKind(cur) == ACT_ERROR) {
+    if (cellKind(cur) == action_error) {
         action[idx] = new_cell;
         return;
     }
@@ -616,26 +616,26 @@ fn setAction(
     // shift/reduce (in either arrival order)
     var shift_target: ?u32 = null;
     var reduce_prod: ?u32 = null;
-    if (cur_kind == ACT_SHIFT) shift_target = cellArg(cur);
-    if (cur_kind == ACT_REDUCE) reduce_prod = cellArg(cur);
-    if (new_kind == ACT_SHIFT) shift_target = cellArg(new_cell);
-    if (new_kind == ACT_REDUCE) reduce_prod = cellArg(new_cell);
+    if (cur_kind == action_shift) shift_target = cellArg(cur);
+    if (cur_kind == action_reduce) reduce_prod = cellArg(cur);
+    if (new_kind == action_shift) shift_target = cellArg(new_cell);
+    if (new_kind == action_reduce) reduce_prod = cellArg(new_cell);
 
     if (shift_target != null and reduce_prod != null) {
         const rlevel = precOfProd(g, prods, reduce_prod.?);
         const tp = precOfTerm(g, term);
         if (rlevel > 0 and tp.level > 0) {
             if (rlevel > tp.level) {
-                action[idx] = cell(ACT_REDUCE, reduce_prod.?);
+                action[idx] = cell(action_reduce, reduce_prod.?);
                 return;
             } else if (rlevel < tp.level) {
-                action[idx] = cell(ACT_SHIFT, shift_target.?);
+                action[idx] = cell(action_shift, shift_target.?);
                 return;
             } else {
                 switch (tp.assoc) {
-                    .left => action[idx] = cell(ACT_REDUCE, reduce_prod.?),
-                    .right => action[idx] = cell(ACT_SHIFT, shift_target.?),
-                    .nonassoc => action[idx] = cell(ACT_ERROR, 0),
+                    .left => action[idx] = cell(action_reduce, reduce_prod.?),
+                    .right => action[idx] = cell(action_shift, shift_target.?),
+                    .nonassoc => action[idx] = cell(action_error, 0),
                     .none => return conflictError(state, term, cur, new_cell),
                 }
                 return;
@@ -674,12 +674,12 @@ fn driveAccepts(tab: Built, terms: []const u32) bool {
         const la = terms[ip];
         const c = tab.action[state * tab.num_terminals + la];
         switch (cellKind(c)) {
-            ACT_SHIFT => {
+            action_shift => {
                 sp += 1;
                 stack[sp] = cellArg(c);
                 ip += 1;
             },
-            ACT_REDUCE => {
+            action_reduce => {
                 const p = cellArg(c);
                 const n = tab.prod_rhs_len[p];
                 sp -= n;
@@ -689,7 +689,7 @@ fn driveAccepts(tab: Built, terms: []const u32) bool {
                 sp += 1;
                 stack[sp] = @intCast(gt);
             },
-            ACT_ACCEPT => return true,
+            action_accept => return true,
             else => return false,
         }
     }

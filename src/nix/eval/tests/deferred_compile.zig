@@ -5,8 +5,8 @@ const Evaluator = fix.Evaluator;
 test "an imported file large enough to defer per-attr compilation evaluates the forced attr correctly" {
     // Lazy per-attr compilation (attrs.zig `shouldDeferSet`) only
     // triggers for file/import compiles (source_path != null) with at
-    // least MIN_ENTRIES (64) entries whose bodies are at least
-    // MIN_BODY_BYTES (100) bytes. This builds such a set, forces exactly
+    // least min_entries (64) entries whose bodies are at least
+    // min_body_bytes (100) bytes. This builds such a set, forces exactly
     // one entry, and checks it round-trips through the deferred
     // force-time compile in `deferred.compile`.
     var tmp = std.testing.tmpDir(.{});
@@ -18,7 +18,7 @@ test "an imported file large enough to defer per-attr compilation evaluates the 
     var i: usize = 0;
     while (i < 80) : (i += 1) {
         // Each body references the enclosing `shared` binding (forcing a
-        // real scope-snapshot capture) and pads past MIN_BODY_BYTES. The
+        // real scope-snapshot capture) and pads past min_body_bytes. The
         // padding must be inside the expression itself (`+ 0` chain):
         // comments and parens are not part of the body node's span.
         const line = try std.fmt.allocPrint(
@@ -76,7 +76,7 @@ test "deferred bodies under enclosing with scopes resolve names like the eager c
     while (i < 80) : (i += 1) {
         // Padding inside the expression (`+ 0` chain): comments/parens are
         // not part of the body node's span, so they don't count toward
-        // MIN_BODY_BYTES.
+        // min_body_bytes.
         const line = try std.fmt.allocPrint(
             std.testing.allocator,
             "  attr{d} = shared + bonus + {d} + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0;\n",
@@ -208,7 +208,7 @@ test "an elided leaf in an extended group materializes for the duplicate check" 
 }
 
 test "elided bodies fall back to eager materialization when the set cannot defer" {
-    // 33 enclosing let bindings exceed MAX_SCOPE (32), so the snapshot
+    // 33 enclosing let bindings exceed max_scope_size (32), so the snapshot
     // bails and the set compiles eagerly — elided bodies must be sub-parsed
     // at compile time and produce the same values.
     var tmp = std.testing.tmpDir(.{});

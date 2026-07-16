@@ -61,60 +61,60 @@ pub const ValueType = enum(u8) {
 
 /// Sign=1 quiet-NaN prefix in bits [63:51]. Any Value whose bits AND this
 /// mask equals this constant is a tagged Value; anything else is a float.
-const QNAN_PREFIX: u64 = 0xFFF8_0000_0000_0000;
-const QNAN_PREFIX_MASK: u64 = QNAN_PREFIX;
+const qnan_prefix: u64 = 0xFFF8_0000_0000_0000;
+const qnan_prefix_mask: u64 = qnan_prefix;
 
 /// High-16-bit mask for primary-tag isolation. Each primary tag's prefix
-/// is `QNAN_PREFIX | (tag << 48)`, and the top 16 bits uniquely identify
-/// the primary tag — so `(bits & HIGH16_MASK) == prefix(tag)` is a single
+/// is `qnan_prefix | (tag << 48)`, and the top 16 bits uniquely identify
+/// the primary tag — so `(bits & high_16_mask) == prefix(tag)` is a single
 /// load + AND + CMP predicate.
-const HIGH16_MASK: u64 = 0xFFFF_0000_0000_0000;
+const high_16_mask: u64 = 0xFFFF_0000_0000_0000;
 
-const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+const payload_mask: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 // Primary tags (3 bits, shifted into bits 50:48).
-const TAG_INT: u64 = 0;
-const TAG_STRING: u64 = 1;
-const TAG_PATH: u64 = 2;
-const TAG_LIST: u64 = 3;
-const TAG_ATTRS: u64 = 4;
-const TAG_THUNK: u64 = 5;
-const TAG_CLOSURE: u64 = 6;
-const TAG_MISC: u64 = 7;
+const tag_int: u64 = 0;
+const tag_string: u64 = 1;
+const tag_path: u64 = 2;
+const tag_list: u64 = 3;
+const tag_attrs: u64 = 4;
+const tag_thunk: u64 = 5;
+const tag_closure: u64 = 6;
+const tag_misc: u64 = 7;
 
 // Misc sub-tags (4 bits, shifted into bits 47:44).
-const MISC_SUB_SHIFT: u6 = 44;
-const MISC_SUB_MASK: u64 = 0xF;
-const MISC_SUB_BUILTIN_CLOSURE: u64 = 0;
-const MISC_SUB_STRING_CONTEXT: u64 = 1;
-const MISC_SUB_BUILTIN: u64 = 2;
-const MISC_SUB_NULL: u64 = 3;
-const MISC_SUB_BOOL_FALSE: u64 = 4;
-const MISC_SUB_BOOL_TRUE: u64 = 5;
-const MISC_SUB_BOXED_INT: u64 = 6;
-const MISC_SUB_PARTIAL_APP: u64 = 7;
+const misc_subtag_shift: u6 = 44;
+const misc_subtag_mask: u64 = 0xF;
+const misc_builtin_closure: u64 = 0;
+const misc_string_context: u64 = 1;
+const misc_builtin: u64 = 2;
+const misc_null: u64 = 3;
+const misc_bool_false: u64 = 4;
+const misc_bool_true: u64 = 5;
+const misc_boxed_int: u64 = 6;
+const misc_partial_app: u64 = 7;
 
 // Mask matching the high 16 bits + the 4-bit misc sub-tag (bits 47:44).
-const MISC_FULL_TAG_MASK: u64 = HIGH16_MASK | (MISC_SUB_MASK << MISC_SUB_SHIFT);
+const misc_full_tag_mask: u64 = high_16_mask | (misc_subtag_mask << misc_subtag_shift);
 
 /// 48-bit sign-extended integer encode (the int payload occupies the
 /// full 48 bits including its own sign bit).
-const I48_SIGN_BIT: u64 = 1 << 47;
-const I48_SIGN_EXT: u64 = 0xFFFF_0000_0000_0000;
-const I48_MIN: i64 = -(@as(i64, 1) << 47);
-const I48_MAX: i64 = (@as(i64, 1) << 47) - 1;
+const i48_sign_bit: u64 = 1 << 47;
+const i48_sign_extension: u64 = 0xFFFF_0000_0000_0000;
+const i48_min: i64 = -(@as(i64, 1) << 47);
+const i48_max: i64 = (@as(i64, 1) << 47) - 1;
 
 /// Positive canonical NaN. Any NaN value passed to `float()` is rewritten
 /// to this bit pattern so it can't be misread as a tagged Value (which
 /// always has sign=1).
-const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0001;
+const canonical_nan: u64 = 0x7FF8_0000_0000_0001;
 
 inline fn tagPrefix(tag: u64) u64 {
-    return QNAN_PREFIX | (tag << 48);
+    return qnan_prefix | (tag << 48);
 }
 
 inline fn miscPrefix(sub: u64) u64 {
-    return tagPrefix(TAG_MISC) | (sub << MISC_SUB_SHIFT);
+    return tagPrefix(tag_misc) | (sub << misc_subtag_shift);
 }
 
 pub const Value = extern struct {
@@ -128,22 +128,22 @@ pub const Value = extern struct {
     // ---- low-level encode helpers ----
 
     inline fn tagged(tag: u64, payload: u64) Value {
-        std.debug.assert(payload & ~PAYLOAD_MASK == 0);
+        std.debug.assert(payload & ~payload_mask == 0);
         return .{ .bits = tagPrefix(tag) | payload };
     }
 
     inline fn miscTagged(sub: u64, payload: u64) Value {
-        const sub_payload_mask: u64 = PAYLOAD_MASK >> 4;
+        const sub_payload_mask: u64 = payload_mask >> 4;
         std.debug.assert(payload & ~sub_payload_mask == 0);
         return .{ .bits = miscPrefix(sub) | payload };
     }
 
     // ---- constructors ----
 
-    pub const null_val: Value = .{ .bits = miscPrefix(MISC_SUB_NULL) };
+    pub const null_val: Value = .{ .bits = miscPrefix(misc_null) };
 
     pub fn boolVal(v: bool) Value {
-        return .{ .bits = miscPrefix(if (v) MISC_SUB_BOOL_TRUE else MISC_SUB_BOOL_FALSE) };
+        return .{ .bits = miscPrefix(if (v) misc_bool_true else misc_bool_false) };
     }
 
     /// Construct an inline integer. Callers that may have an out-of-range
@@ -152,9 +152,9 @@ pub const Value = extern struct {
     /// The debug assert here catches accidental direct calls on
     /// unbounded i64s.
     pub fn int(v: i64) Value {
-        std.debug.assert(v >= I48_MIN and v <= I48_MAX);
-        const masked: u64 = @as(u64, @bitCast(v)) & PAYLOAD_MASK;
-        return .{ .bits = tagPrefix(TAG_INT) | masked };
+        std.debug.assert(v >= i48_min and v <= i48_max);
+        const masked: u64 = @as(u64, @bitCast(v)) & payload_mask;
+        return .{ .bits = tagPrefix(tag_int) | masked };
     }
 
     pub fn float(v: f64) Value {
@@ -164,81 +164,81 @@ pub const Value = extern struct {
         if ((raw & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000 and
             (raw & 0x000F_FFFF_FFFF_FFFF) != 0)
         {
-            return .{ .bits = CANONICAL_NAN };
+            return .{ .bits = canonical_nan };
         }
         return .{ .bits = raw };
     }
 
     pub fn string(id: InternId) Value {
-        return tagged(TAG_STRING, id);
+        return tagged(tag_string, id);
     }
 
     pub fn path(id: InternId) Value {
-        return tagged(TAG_PATH, id);
+        return tagged(tag_path, id);
     }
 
     pub fn list(id: ObjectId) Value {
-        return tagged(TAG_LIST, id);
+        return tagged(tag_list, id);
     }
 
     pub fn attrs(id: ObjectId) Value {
-        return tagged(TAG_ATTRS, id);
+        return tagged(tag_attrs, id);
     }
 
     pub fn closure(id: ObjectId) Value {
-        return tagged(TAG_CLOSURE, id);
+        return tagged(tag_closure, id);
     }
 
     pub fn thunk(id: ObjectId) Value {
-        return tagged(TAG_THUNK, id);
+        return tagged(tag_thunk, id);
     }
 
     pub fn builtin(id: u16) Value {
-        return miscTagged(MISC_SUB_BUILTIN, id);
+        return miscTagged(misc_builtin, id);
     }
 
     pub fn builtinClosure(id: ObjectId) Value {
-        return miscTagged(MISC_SUB_BUILTIN_CLOSURE, id);
+        return miscTagged(misc_builtin_closure, id);
     }
 
     pub fn contextString(id: ObjectId) Value {
-        return miscTagged(MISC_SUB_STRING_CONTEXT, id);
+        return miscTagged(misc_string_context, id);
     }
 
     pub fn boxedInt(id: ObjectId) Value {
-        return miscTagged(MISC_SUB_BOXED_INT, id);
+        return miscTagged(misc_boxed_int, id);
     }
 
     pub fn partialApp(id: ObjectId) Value {
-        return miscTagged(MISC_SUB_PARTIAL_APP, id);
+        return miscTagged(misc_partial_app, id);
     }
 
     // ---- discrimination ----
 
     inline fn isTagged(self: Value) bool {
-        return (self.bits & QNAN_PREFIX_MASK) == QNAN_PREFIX;
+        return (self.bits & qnan_prefix_mask) == qnan_prefix;
     }
 
     pub fn kind(self: Value) ValueType {
         if (!self.isTagged()) return .float;
         const primary: u64 = (self.bits >> 48) & 0x7;
         return switch (primary) {
-            TAG_INT => .int,
-            TAG_STRING => .string,
-            TAG_PATH => .path,
-            TAG_LIST => .list,
-            TAG_ATTRS => .attrs,
-            TAG_THUNK => .thunk,
-            TAG_CLOSURE => .closure,
-            TAG_MISC => switch ((self.bits >> MISC_SUB_SHIFT) & MISC_SUB_MASK) {
-                MISC_SUB_BUILTIN_CLOSURE => .builtin_closure,
-                MISC_SUB_STRING_CONTEXT => .string_context,
-                MISC_SUB_BUILTIN => .builtin,
-                MISC_SUB_NULL => .null,
-                MISC_SUB_BOOL_FALSE => .bool_false,
-                MISC_SUB_BOOL_TRUE => .bool_true,
-                MISC_SUB_BOXED_INT => .boxed_int,
-                MISC_SUB_PARTIAL_APP => .partial_app,
+            tag_int => .int,
+            tag_string => .string,
+            tag_path => .path,
+            tag_list => .list,
+            tag_attrs => .attrs,
+            tag_thunk => .thunk,
+            tag_closure => .closure,
+            tag_misc => switch ((self.bits >> misc_subtag_shift) & misc_subtag_mask) {
+                misc_builtin_closure => .builtin_closure,
+                misc_string_context => .string_context,
+                misc_builtin => .builtin,
+                misc_null => .null,
+                misc_bool_false => .bool_false,
+                misc_bool_true => .bool_true,
+                misc_boxed_int => .boxed_int,
+                misc_partial_app => .partial_app,
                 else => unreachable,
             },
             else => unreachable,
@@ -246,7 +246,7 @@ pub const Value = extern struct {
     }
 
     pub fn rawPayload(self: Value) u64 {
-        return self.bits & PAYLOAD_MASK;
+        return self.bits & payload_mask;
     }
 
     // ---- predicates ----
@@ -256,81 +256,81 @@ pub const Value = extern struct {
     }
 
     pub fn isInt(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_INT);
+        return (self.bits & high_16_mask) == tagPrefix(tag_int);
     }
 
     pub fn isString(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_STRING);
+        return (self.bits & high_16_mask) == tagPrefix(tag_string);
     }
 
     pub fn isPath(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_PATH);
+        return (self.bits & high_16_mask) == tagPrefix(tag_path);
     }
 
     pub fn isList(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_LIST);
+        return (self.bits & high_16_mask) == tagPrefix(tag_list);
     }
 
     pub fn isAttrs(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_ATTRS);
+        return (self.bits & high_16_mask) == tagPrefix(tag_attrs);
     }
 
     pub fn isThunk(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_THUNK);
+        return (self.bits & high_16_mask) == tagPrefix(tag_thunk);
     }
 
     pub fn isClosure(self: Value) bool {
-        return (self.bits & HIGH16_MASK) == tagPrefix(TAG_CLOSURE);
+        return (self.bits & high_16_mask) == tagPrefix(tag_closure);
     }
 
     inline fn isMiscSub(self: Value, sub: u64) bool {
-        return (self.bits & MISC_FULL_TAG_MASK) == miscPrefix(sub);
+        return (self.bits & misc_full_tag_mask) == miscPrefix(sub);
     }
 
     pub fn isBuiltinClosure(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_BUILTIN_CLOSURE);
+        return self.isMiscSub(misc_builtin_closure);
     }
 
     pub fn isContextString(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_STRING_CONTEXT);
+        return self.isMiscSub(misc_string_context);
     }
 
     pub fn isBoxedInt(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_BOXED_INT);
+        return self.isMiscSub(misc_boxed_int);
     }
 
     pub fn isBuiltin(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_BUILTIN);
+        return self.isMiscSub(misc_builtin);
     }
 
     pub fn isPartialApp(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_PARTIAL_APP);
+        return self.isMiscSub(misc_partial_app);
     }
 
     pub fn isNull(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_NULL);
+        return self.isMiscSub(misc_null);
     }
 
     pub fn isBool(self: Value) bool {
         // bool_true and bool_false share the misc tag and live in two
         // adjacent sub-tag slots — check both.
-        const masked = self.bits & MISC_FULL_TAG_MASK;
-        return masked == miscPrefix(MISC_SUB_BOOL_FALSE) or
-            masked == miscPrefix(MISC_SUB_BOOL_TRUE);
+        const masked = self.bits & misc_full_tag_mask;
+        return masked == miscPrefix(misc_bool_false) or
+            masked == miscPrefix(misc_bool_true);
     }
 
     pub fn asBool(self: Value) bool {
-        return self.isMiscSub(MISC_SUB_BOOL_TRUE);
+        return self.isMiscSub(misc_bool_true);
     }
 
     // ---- accessors ----
 
     pub fn asInt(self: Value) i64 {
         std.debug.assert(self.isInt());
-        const masked: u64 = self.bits & PAYLOAD_MASK;
+        const masked: u64 = self.bits & payload_mask;
         // Sign-extend bit 47 into the high 16 bits.
-        if ((masked & I48_SIGN_BIT) != 0) {
-            return @bitCast(masked | I48_SIGN_EXT);
+        if ((masked & i48_sign_bit) != 0) {
+            return @bitCast(masked | i48_sign_extension);
         }
         return @bitCast(masked);
     }
@@ -393,7 +393,7 @@ pub const Value = extern struct {
 };
 
 test "value: tagged int round-trip" {
-    const cases = [_]i64{ 0, 1, -1, 42, -42, I48_MIN, I48_MAX, 1 << 30, -(1 << 30) };
+    const cases = [_]i64{ 0, 1, -1, 42, -42, i48_min, i48_max, 1 << 30, -(1 << 30) };
     for (cases) |v| {
         const x = Value.int(v);
         try std.testing.expect(x.isInt());
@@ -416,7 +416,7 @@ test "value: float round-trip and NaN scrub" {
     const x = Value.float(nan_input);
     try std.testing.expect(x.isFloat());
     try std.testing.expect(std.math.isNan(x.asFloat()));
-    try std.testing.expectEqual(CANONICAL_NAN, x.bits);
+    try std.testing.expectEqual(canonical_nan, x.bits);
 }
 
 test "value: object id and intern id round-trip" {

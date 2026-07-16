@@ -192,8 +192,8 @@ pub const Parser = struct {
     elide_bodies: bool = false,
 
     /// Gate tunables for body-span elision. Mirror the lazy per-attr
-    /// compilation gates (`compiler/deferred_table.zig` MIN_BODY_BYTES /
-    /// MIN_ENTRIES — cross-checked there at comptime): an elided body is
+    /// compilation gates (`compiler/deferred_table.zig` min_body_bytes /
+    /// min_entries — cross-checked there at comptime): an elided body is
     /// only profitable if the compiler would have deferred it anyway.
     pub const elide_min_body_bytes: u32 = 100;
     pub const elide_min_prior_clauses: u32 = 64;
@@ -456,7 +456,7 @@ pub const Parser = struct {
             const la = @intFromEnum(tok.type);
             const c = Tab.action[state * Tab.num_terminals + la];
             switch (lr.cellKind(c)) {
-                lr.ACT_SHIFT => {
+                lr.action_shift => {
                     if (sp + 2 > cap) {
                         cap *= 2;
                         states = try gpa.realloc(states, cap);
@@ -472,7 +472,7 @@ pub const Parser = struct {
                         const top = if (ctx_stack.items.len > 0) ctx_stack.items[ctx_stack.items.len - 1] else break :elide;
                         if (top.kind != .brace or top.clauses < elide_min_prior_clauses) break :elide;
                         const eq_state = lr.cellArg(c);
-                        const g = Tab.goto_table[eq_state * Tab.num_nonterminals + @intFromEnum(grammar.NT.expr)];
+                        const g = Tab.goto_table[eq_state * Tab.num_nonterminals + @intFromEnum(grammar.Nonterminal.expr)];
                         if (g < 0) break :elide;
                         const res = self.scanElidableBody(scanner) orelse break :elide;
                         // Shift the `=`, then splice the elided body onto the
@@ -524,7 +524,7 @@ pub const Parser = struct {
                     tok = self.nextToken(scanner);
                     if (quiet_shifts < cooldown) quiet_shifts += 1;
                 },
-                lr.ACT_REDUCE => {
+                lr.action_reduce => {
                     const p = lr.cellArg(c);
                     const n = Tab.prod_rhs_len[p];
                     const base = sp - n;
@@ -544,7 +544,7 @@ pub const Parser = struct {
                     vals[sp] = result;
                     sp += 1;
                 },
-                lr.ACT_ACCEPT => {
+                lr.action_accept => {
                     return vals[sp - 1].node;
                 },
                 else => {
@@ -571,12 +571,12 @@ pub const Parser = struct {
     /// recorded error forces `parse` to return `ParseError`. Returns false at
     /// EOF (nothing left to resynchronize on).
     fn recover(self: *Parser, top_state: u32, scanner: *Scanner, tok: *Token) bool {
-        const NT = Tab.num_terminals;
+        const terminal_count = Tab.num_terminals;
         while (true) {
             if (tok.type == .eof) return false;
             tok.* = self.nextToken(scanner); // discard a token (starting with the offending one)
             const la = @intFromEnum(tok.type);
-            if (lr.cellKind(Tab.action[top_state * NT + la]) != lr.ACT_ERROR) return true;
+            if (lr.cellKind(Tab.action[top_state * terminal_count + la]) != lr.action_error) return true;
         }
     }
 
@@ -687,7 +687,7 @@ pub const Parser = struct {
             if (first_group_close.? == i - 1) return null; // body is exactly `{..}` / `[..]`
         }
 
-        // Size gate: mirrors the deferral gate's MIN_BODY_BYTES.
+        // Size gate: mirrors the deferral gate's min_body_bytes.
         const len = semi.offset - first.offset;
         if (len < elide_min_body_bytes) return null;
 

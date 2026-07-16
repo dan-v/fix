@@ -346,7 +346,7 @@ pub const Fiber = struct {
     /// full reservation. Only virtual address space is reserved up front
     /// (physical grows as the stack is touched, at zero hot-path cost), so
     /// this can be generous. 16 MiB gives ~tens of thousands of native
-    /// frames — comfortably past `DEFAULT_MAX_CALL_DEPTH` (10000) so deep
+    /// frames — comfortably past `default_max_call_depth` (10000) so deep
     /// *forcing* (which max-call-depth doesn't bound) has room before the
     /// `forceThunkImpl` guard trips a graceful "stack overflow". Raising it
     /// costs virtual address space × peak fiber count, not memory.
@@ -659,12 +659,12 @@ test "fiber resumed by different threads in sequence (migration)" {
     try testing.expectEqual(State.suspended, fiber.state);
 
     // Drive the second resume from a different OS thread.
-    const T = struct {
+    const Runner = struct {
         fn run(f: *Fiber) void {
             f.resume_();
         }
     };
-    var t = try std.Thread.spawn(.{}, T.run, .{&fiber});
+    var t = try std.Thread.spawn(.{}, Runner.run, .{&fiber});
     t.join();
     try testing.expectEqual(@as(u32, 2), ctx.steps.load(.acquire));
     try testing.expectEqual(State.suspended, fiber.state);

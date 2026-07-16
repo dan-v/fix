@@ -47,7 +47,7 @@ pub const thunkLabel = force_label.thunkLabel;
 /// that lands within a few hundred nanoseconds — the common case when the
 /// owner is nearly done — while still falling through to a real yield for
 /// long waits (so the worker can run other fibers). See the `.busy` arm.
-const BUSY_SPIN_BEFORE_ENROLL: u32 = 1024;
+const busy_spin_before_enroll: u32 = 1024;
 
 /// Map a thunk body to a `prof_path` key: the body's `ChunkId` (≈ a Nix
 /// source location) for bytecode/closure thunks, a per-builtin key for
@@ -57,14 +57,14 @@ inline fn pathKey(self: *VM, target: *const ThunkTarget, kind: thunk_mod.TargetK
     return switch (kind) {
         .bytecode => target.bytecode.chunk_id,
         .closure => switch (target.closure.kind()) {
-            .closure => if (self.heap.getClosure(target.closure.asObjectId())) |cl| cl.chunk_id else |_| prof_path.KEY_OTHER,
-            .builtin_closure => if (self.heap.getBuiltinClosure(target.closure.asObjectId())) |bc| prof_path.BUILTIN_BASE + @as(u32, bc.builtin_id) else |_| prof_path.KEY_OTHER,
-            .builtin => prof_path.BUILTIN_BASE + @as(u32, target.closure.asBuiltinId()),
-            else => prof_path.KEY_OTHER,
+            .closure => if (self.heap.getClosure(target.closure.asObjectId())) |cl| cl.chunk_id else |_| prof_path.other_key,
+            .builtin_closure => if (self.heap.getBuiltinClosure(target.closure.asObjectId())) |bc| prof_path.builtin_key_base + @as(u32, bc.builtin_id) else |_| prof_path.other_key,
+            .builtin => prof_path.builtin_key_base + @as(u32, target.closure.asBuiltinId()),
+            else => prof_path.other_key,
         },
-        .pass_through => prof_path.KEY_PASS_THROUGH,
-        .attr_access => prof_path.KEY_OTHER,
-        .deferred => prof_path.KEY_OTHER,
+        .pass_through => prof_path.pass_through_key,
+        .attr_access => prof_path.other_key,
+        .deferred => prof_path.other_key,
     };
 }
 
@@ -86,8 +86,8 @@ const VM = vm_mod.VM;
 // entries across Evaluator instances (same trick as the attr inline
 // cache). Limited to ≤2-upvalue thunks so the key compares exactly with
 // no allocation — that's the inline-storage majority.
-const MEMO_BITS = 14;
-const MEMO_SIZE = 1 << MEMO_BITS;
+const memo_index_bits = 14;
+const memo_size = 1 << memo_index_bits;
 const MemoSlot = struct {
     token: u64 = 0, // 0 = empty (heap tokens start at 1)
     chunk: u32 = 0,
@@ -96,7 +96,7 @@ const MemoSlot = struct {
     up1: u64 = 0,
     value: Value = Value.null_val,
 };
-threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
+threadlocal var thunk_memo: [memo_size]MemoSlot = @splat(.{});
 
 /// GC: the thunk-result memo holds Values keyed by heap token. An
 /// entry can be the momentary sole reference to a shared result, so valid
@@ -104,8 +104,8 @@ threadlocal var thunk_memo: [MEMO_SIZE]MemoSlot = @splat(.{});
 /// so each worker publishes the address of *its* memo into a registry the
 /// stop-the-world collector walks — it can't reach other threads' TLS
 /// otherwise. Bounded by worker id (u8).
-const GC_MAX_WORKERS = 256;
-var thunk_memo_registry: [GC_MAX_WORKERS]?*[MEMO_SIZE]MemoSlot = @splat(null);
+const gc_max_workers = 256;
+var thunk_memo_registry: [gc_max_workers]?*[memo_size]MemoSlot = @splat(null);
 
 /// Called by each worker (on its own thread) before it can allocate, so the
 /// collector can mark this worker's memo entries.
@@ -141,7 +141,7 @@ inline fn memoSlotIndex(chunk: u32, up0: u64, up1: u64) usize {
     var h: u64 = @as(u64, chunk) *% 0x9E3779B97F4A7C15;
     h ^= up0 *% 0xC2B2AE3D27D4EB4F;
     h ^= up1 *% 0x165667B19E3779F9;
-    return @intCast((h ^ (h >> 29)) & (MEMO_SIZE - 1));
+    return @intCast((h ^ (h >> 29)) & (memo_size - 1));
 }
 
 const MemoKey = struct { chunk: u32, count: u8, up0: u64, up1: u64, idx: usize };
@@ -975,7 +975,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // we `continue` to the top where the outer switch handles it.
                 {
                     var spins: u32 = 0;
-                    while (spins < BUSY_SPIN_BEFORE_ENROLL and thunk.isEvaluating()) : (spins += 1) {
+                    while (spins < busy_spin_before_enroll and thunk.isEvaluating()) : (spins += 1) {
                         std.atomic.spinLoopHint();
                     }
                     // Left `.evaluating` during the spin → re-loop so the outer

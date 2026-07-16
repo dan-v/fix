@@ -29,8 +29,8 @@ const Entry = struct {
 const EntryStore = segments.StableSegments(Entry, .{ .first_segment_size = 256 }, mem_tag.vma);
 const ByteStore = segments.StableSegments(u8, .{ .first_segment_size = 4096 }, mem_tag.vma);
 
-const SHARD_COUNT: u32 = 64;
-const SHARD_MASK: u64 = SHARD_COUNT - 1;
+const shard_count: u32 = 64;
+const shard_mask: u64 = shard_count - 1;
 
 const cache_size: usize = 512;
 const cache_max_len: usize = 24;
@@ -104,7 +104,7 @@ pub const InternTable = struct {
     /// Per-shard lookup maps; intern() picks a shard by the low bits of
     /// the input's hash. `entries` and `data` remain global so that ids
     /// stay dense and `get()` doesn't need to know the shard.
-    shards: [SHARD_COUNT]Shard,
+    shards: [shard_count]Shard,
     /// Unique-per-init identifier the thread-local intern cache uses to
     /// avoid stale-hit races when an InternTable is recreated at the
     /// same heap address.
@@ -120,7 +120,7 @@ pub const InternTable = struct {
             .allocator = allocator,
             .entries = .empty,
             .data = .empty,
-            .shards = [_]Shard{.{}} ** SHARD_COUNT,
+            .shards = [_]Shard{.{}} ** shard_count,
             .token = next_table_token.fetchAdd(1, .monotonic),
         };
         // Pre-size each shard's lookup map. A grow rehashes every stored id
@@ -163,7 +163,7 @@ pub const InternTable = struct {
             }
         }
 
-        const shard = &self.shards[h & SHARD_MASK];
+        const shard = &self.shards[h & shard_mask];
 
         if (!self.solo) shard.mu.lock();
         defer if (!self.solo) shard.mu.unlock();
@@ -221,11 +221,11 @@ pub const InternTable = struct {
     pub const Stats = struct {
         entries: u32,
         data_bytes: u32,
-        shard_counts: [SHARD_COUNT]u32,
+        shard_counts: [shard_count]u32,
 
         pub fn shardImbalance(self: Stats) f64 {
             if (self.entries == 0) return 0;
-            const ideal = @as(f64, @floatFromInt(self.entries)) / @as(f64, @floatFromInt(SHARD_COUNT));
+            const ideal = @as(f64, @floatFromInt(self.entries)) / @as(f64, @floatFromInt(shard_count));
             var max: u32 = 0;
             for (self.shard_counts) |c| max = @max(max, c);
             return @as(f64, @floatFromInt(max)) / @max(ideal, 1.0);
@@ -236,7 +236,7 @@ pub const InternTable = struct {
         var result: Stats = .{
             .entries = self.entries.count(),
             .data_bytes = self.data.count(),
-            .shard_counts = [_]u32{0} ** SHARD_COUNT,
+            .shard_counts = [_]u32{0} ** shard_count,
         };
         for (&self.shards, 0..) |*shard, i| {
             // Reading the shard's count is racy under concurrent intern,
@@ -248,7 +248,7 @@ pub const InternTable = struct {
     }
 
     pub fn shardCount() u32 {
-        return SHARD_COUNT;
+        return shard_count;
     }
 
     pub fn eql(_: *const InternTable, a: InternId, b: InternId) bool {

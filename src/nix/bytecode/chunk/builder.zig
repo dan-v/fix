@@ -76,10 +76,10 @@ pub const ChunkBuilder = struct {
     lambda_pattern: LambdaPattern = .none,
 
     pub fn init(allocator: std.mem.Allocator) !ChunkBuilder {
-        var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.CHUNK_CODE_CAP);
+        var code = try std.ArrayListUnmanaged(u8).initCapacity(allocator, types.chunk_code_capacity);
         errdefer code.deinit(allocator);
 
-        var constants = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.CHUNK_CONSTANTS_CAP);
+        var constants = try std.ArrayListUnmanaged(Value).initCapacity(allocator, types.chunk_constants_capacity);
         errdefer constants.deinit(allocator);
 
         return .{
@@ -200,7 +200,7 @@ pub const ChunkBuilder = struct {
     /// attr names used to live inline in the code stream (16 bytes per
     /// position record; 3 bytes per name — a `push_const` op + u16 index).
     /// Extracting them to side tables shrank `code.len`, but the speculation
-    /// threshold (`SPECULATION_MIN_CODE_BYTES`) is tuned against the OLD
+    /// threshold (`speculation_min_code_bytes`) is tuned against the OLD
     /// effective sizes and sits on a sharp cliff — measured 2026-07: dropping
     /// effective chunk size by even 64 bytes cost +52% w=8 wall. These
     /// constants mirror the removed inline encodings so a chunk's perceived
@@ -236,8 +236,8 @@ pub const ChunkBuilder = struct {
             .arity = self.arity,
             .strict_params = self.strict_params,
             .scheduling = .{
-                .body_is_substantial = self.code.items.len + self.fusion_savings + self.sideTableWeight() >= SPECULATION_MIN_CODE_BYTES,
-                .spec_band_small = self.code.items.len + self.fusion_savings + self.sideTableWeight() < SPECULATION_TRUSTED_CODE_BYTES,
+                .body_is_substantial = self.code.items.len + self.fusion_savings + self.sideTableWeight() >= speculation_min_code_bytes,
+                .spec_band_small = self.code.items.len + self.fusion_savings + self.sideTableWeight() < speculation_trusted_code_bytes,
                 .strictness = self.strictness,
                 .trivial = classifyTrivialBody(self.code.items, self.constants.items, local_count),
                 .strict_param = self.strict_param and local_count == 1,
@@ -400,7 +400,7 @@ pub inline fn readU32Inline(buf: []const u8, off: usize) u32 {
 /// Code length at or above which a chunk is considered substantial
 /// enough that submitting its body to a helper at thunk-creation time
 /// pays the scheduler hop. Used by `SchedulingHints.body_is_substantial`.
-pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
+pub const speculation_min_code_bytes: usize = 256;
 
 /// Effective size at or above which a chunk's speculative execution is
 /// trusted to run WITHOUT a creation budget. Deliberately a separate
@@ -408,4 +408,4 @@ pub const SPECULATION_MIN_CODE_BYTES: usize = 256;
 /// a scheduler hop", this one says "safe to run unattended" — see
 /// `SchedulingHints.spec_band_small`. Keep at the 2026-07 sweep's
 /// validated junk cliff (256) even if the admission gate moves.
-pub const SPECULATION_TRUSTED_CODE_BYTES: usize = 256;
+pub const speculation_trusted_code_bytes: usize = 256;

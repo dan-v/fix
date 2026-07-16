@@ -14,7 +14,7 @@ pub const BreakpointTable = breakpoints.BreakpointTable;
 pub const name_tree = @import("bytecode/name_tree.zig");
 pub const NameTree = name_tree.NameTree;
 pub const NameId = name_tree.NameId;
-pub const NAME_ROOT = name_tree.NAME_ROOT;
+pub const root_name_id = name_tree.root_name_id;
 
 // Flat re-exports of the public surface.
 pub const OpCode = opcode.OpCode;

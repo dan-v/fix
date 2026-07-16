@@ -41,7 +41,7 @@ pub const BreakpointTable = struct {
     step_max_depth: u32 = 0,
 
     /// `req_id` sentinel marking a step temp rather than a user breakpoint.
-    pub const STEP_REQ: u32 = 0;
+    pub const step_request_id: u32 = 0;
 
     /// A candidate step-stop location.
     pub const Site = struct { chunk_id: ChunkId, offset: u32 };
@@ -172,7 +172,7 @@ pub const BreakpointTable = struct {
             if (c.code[site.offset] == breakpoint_byte) continue; // already patched (perm or dup)
             if (self.placedAt(site.chunk_id, site.offset)) continue;
             try self.step_temps.append(self.gpa, .{
-                .req_id = STEP_REQ,
+                .req_id = step_request_id,
                 .chunk_id = site.chunk_id,
                 .offset = site.offset,
                 .original = c.code[site.offset],

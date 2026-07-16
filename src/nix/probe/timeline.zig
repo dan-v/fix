@@ -76,7 +76,7 @@ pub const Label = enum(u8) {
     /// — many builtins force args and thus straddle a yield.
     builtin,
     /// The demand fiber blocked on a busy thunk (subject = the thunk's source
-    /// location). Emitted on the dedicated CRIT_TID track = the serial floor's
+    /// location). Emitted on the dedicated critical_thread_id track = the serial floor's
     /// "waiting for someone else to compute X" spans.
     crit_wait,
     /// A worker parked while stealable work was pending (subject = pending
@@ -103,9 +103,9 @@ pub const Label = enum(u8) {
 
 /// Dedicated track id for the demand fiber's blocking-wait spans (the critical
 /// path). Above any real worker id (u8), so it never collides.
-pub const CRIT_TID: u16 = 500;
+pub const critical_thread_id: u16 = 500;
 
-const MAX_DEPTH = 64;
+const max_depth = 64;
 
 const StackEntry = struct {
     ts_ns: u64,
@@ -171,7 +171,7 @@ const Event = struct {
 };
 
 const WorkerStack = struct {
-    items: [MAX_DEPTH]StackEntry = undefined,
+    items: [max_depth]StackEntry = undefined,
     len: u8 = 0,
 };
 
@@ -278,7 +278,7 @@ fn beginImpl(label: Label, subj: Subject, arg: u64, args: []const u8) void {
     const wid = worker_id_mod.current;
     if (wid >= stacks.len) return;
     const st = &stacks[wid];
-    if (st.len >= MAX_DEPTH) return;
+    if (st.len >= max_depth) return;
     // A source-ref subject stores only file+line (no arena); a literal is
     // copied. `storeName("")` returns {0,0}, so pass "" for the source-ref case.
     const nm = storeName(if (subj.file != 0) "" else subj.text);
@@ -467,7 +467,7 @@ pub inline fn critWaitBegin() u64 {
 }
 
 /// Close a demand-fiber wait started by `critWaitBegin`: emit a span on the
-/// dedicated CRIT_TID track from `begin_ns` to now, labelled with `subj` (the
+/// dedicated critical_thread_id track from `begin_ns` to now, labelled with `subj` (the
 /// busy thunk's source location — interned or literal). No-op if tracing off
 /// or begin==0.
 pub fn critWaitEnd(subj: Subject, begin_ns: u64) void {
@@ -477,7 +477,7 @@ pub fn critWaitEnd(subj: Subject, begin_ns: u64) void {
     appendEvent(.{
         .ts_ns = begin_ns,
         .dur_ns = if (now > begin_ns) now - begin_ns else 0,
-        .tid = CRIT_TID,
+        .tid = critical_thread_id,
         .kind = .span,
         .label = .crit_wait,
         .subj_off = nm.off,
@@ -616,7 +616,7 @@ fn dumpImpl(io: std.Io, path: []const u8, n_workers: usize) !void {
     // The dedicated critical-path track (demand-fiber blocking waits).
     try w.print(
         "{{\"ph\":\"M\",\"pid\":1,\"tid\":{d},\"name\":\"thread_name\",\"args\":{{\"name\":\"critical path (demand waits)\"}}}},\n",
-        .{CRIT_TID},
+        .{critical_thread_id},
     );
 
     var i: usize = 0;

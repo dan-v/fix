@@ -26,16 +26,16 @@ const LanguagePolicy = @import("../policy.zig").LanguagePolicy;
 
 const InternId = types.InternId;
 const NameId = @import("../bytecode.zig").NameId;
-const NAME_ROOT = @import("../bytecode.zig").NAME_ROOT;
+const root_name_id = @import("../bytecode.zig").root_name_id;
 
 /// Gate tunables for lazy per-attr compilation (see `compiler/attrs.zig`).
 ///
-/// `MIN_ENTRIES`: coarse pre-filter — only consider deferring in attrsets
+/// `min_entries`: coarse pre-filter — only consider deferring in attrsets
 /// with at least this many entries (skips the snapshot machinery for
 /// small sets entirely).
-pub const MIN_ENTRIES: usize = 64;
+pub const min_entries: usize = 64;
 
-/// `MIN_BODY_BYTES`: the real lever. Defer a value body only if its
+/// `min_body_bytes`: the real lever. Defer a value body only if its
 /// source span is at least this large. Body source-span size is a cheap
 /// proxy for compile cost: deferral pays off only for EXPENSIVE bodies
 /// (measured — 98% of deferred bodies are never forced, so the win is
@@ -45,22 +45,22 @@ pub const MIN_ENTRIES: usize = 64;
 /// `callPackage ({...}: mkDerivation {...}) {}` bodies (hundreds–thousands
 /// of bytes, rarely forced) from all-packages.nix's tiny
 /// `callPackage ../path {}` bodies (mostly forced). Tunable by measurement.
-pub const MIN_BODY_BYTES: usize = 100;
+pub const min_body_bytes: usize = 100;
 
 // The parser's body-span elision gates mirror these tunables (an elided
 // body is only profitable if it would have been deferred anyway); keep
 // them in lock-step.
 comptime {
-    std.debug.assert(Parser.elide_min_body_bytes == MIN_BODY_BYTES);
-    std.debug.assert(Parser.elide_min_prior_clauses == MIN_ENTRIES);
+    std.debug.assert(Parser.elide_min_body_bytes == min_body_bytes);
+    std.debug.assert(Parser.elide_min_prior_clauses == min_entries);
 }
 
-/// `MAX_SCOPE`: cap on the enclosing-scope snapshot size (lexical
+/// `max_scope_size`: cap on the enclosing-scope snapshot size (lexical
 /// bindings + active `with` scopes). Keeps the env gather cheap and
 /// bounds the runtime stack buffer. hackage-packages.nix needs 4;
 /// perl-packages.nix (13 formals + `self:` + a `let` + `with self`)
 /// needs ~16.
-pub const MAX_SCOPE: usize = 32;
+pub const max_scope_size: usize = 32;
 
 /// One deferred value body. Structurally immutable after registration
 /// except for `compiled`, the publish-once compile cache.
@@ -107,7 +107,7 @@ pub const Entry = struct {
     /// canonical ChunkId (the loser's chunk is orphaned-but-correct).
     compiled: std.atomic.Value(u32) = .init(0),
     /// Always-on qualified-name node for the deferred body (see `name_tree`).
-    name_id: NameId = NAME_ROOT,
+    name_id: NameId = root_name_id,
 };
 
 pub const Table = struct {

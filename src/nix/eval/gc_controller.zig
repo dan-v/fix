@@ -315,10 +315,10 @@ pub const nowNs = clock.monotonicNs;
 /// Fraction of RAM the stores may reach before collecting (num/den), and the
 /// default clamp bounds. The bounds are overridable per run via `FIX_GC_FLOOR`
 /// / `FIX_GC_CEILING` (same SIZE syntax as `--max-memory`).
-pub const GC_LINE_NUM: u64 = 1;
-pub const GC_LINE_DEN: u64 = 2; // half of RAM
-pub const GC_LINE_FLOOR: u64 = 256 << 20; // 256 MB — below this, don't bother
-pub const GC_LINE_CEILING: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
+pub const gc_limit_numerator: u64 = 1;
+pub const gc_limit_denominator: u64 = 2; // half of RAM
+pub const gc_limit_floor: u64 = 256 << 20; // 256 MB — below this, don't bother
+pub const gc_limit_ceiling: u64 = 8 << 30; // 8 GB — cap absolute garbage on big boxes
 
 /// Resolve the collection line: `--max-memory` if given, else the automatic
 /// `clamp(fraction × MemTotal, floor, ceiling)`. An explicit
@@ -339,7 +339,7 @@ pub fn memoryBudget(ev: Context) u64 {
 /// arms → stays exactly zero-cost with the reclaim off (moot there anyway).
 pub fn constrainedMode(ev: Context, budget: u64) bool {
     const explicit = ev.max_memory_bytes != null;
-    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse GC_LINE_CEILING;
+    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
     return constrainedFor(budget, explicit, ceiling);
 }
 
@@ -354,7 +354,7 @@ fn constrainedFor(budget: u64, explicit: bool, ceiling: u64) bool {
 }
 
 test "constrained mode: explicit limit or sub-ceiling auto line" {
-    const c = GC_LINE_CEILING;
+    const c = gc_limit_ceiling;
     try std.testing.expect(!constrainedFor(0, false, c)); // never-collect override
     try std.testing.expect(!constrainedFor(0, true, c)); // even explicit 0 = never
     try std.testing.expect(!constrainedFor(c, false, c)); // roomy auto (line == ceiling)
@@ -367,12 +367,12 @@ test "constrained mode: explicit limit or sub-ceiling auto line" {
 
 /// The automatic line: a fraction of physical RAM, clamped. MemTotal (not the
 /// fluctuating MemAvailable) so it's stable and read exactly once. The clamp
-/// bounds default to `GC_LINE_FLOOR`/`GC_LINE_CEILING`, overridable per run via
+/// bounds default to `gc_limit_floor`/`gc_limit_ceiling`, overridable per run via
 /// `FIX_GC_FLOOR`/`FIX_GC_CEILING`. Fallback: a conservative 4 GiB assumption
 /// when /proc/meminfo is unreadable.
 fn autoCollectLine(ev: Context) u64 {
-    const floor = envSize(ev, "FIX_GC_FLOOR") orelse GC_LINE_FLOOR;
-    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse GC_LINE_CEILING;
+    const floor = envSize(ev, "FIX_GC_FLOOR") orelse gc_limit_floor;
+    const ceiling = envSize(ev, "FIX_GC_CEILING") orelse gc_limit_ceiling;
     return lineFor(systemMemoryTotal() orelse (4 << 30), floor, ceiling);
 }
 
@@ -385,12 +385,12 @@ fn envSize(ev: Context, key: []const u8) ?u64 {
 /// `clamp(fraction × ram, floor, ceiling)` — pure, so the policy is testable.
 /// `@max(floor, ceiling)` guards a floor set above the ceiling.
 fn lineFor(ram: u64, floor: u64, ceiling: u64) u64 {
-    return std.math.clamp(ram / GC_LINE_DEN *| GC_LINE_NUM, floor, @max(floor, ceiling));
+    return std.math.clamp(ram / gc_limit_denominator *| gc_limit_numerator, floor, @max(floor, ceiling));
 }
 
 test "auto collection line: fraction of RAM, clamped to [floor, ceiling]" {
-    const f = GC_LINE_FLOOR;
-    const c = GC_LINE_CEILING;
+    const f = gc_limit_floor;
+    const c = gc_limit_ceiling;
     // Floor: tiny boxes don't thrash small evals.
     try std.testing.expectEqual(f, lineFor(256 << 20, f, c)); // ½·256MB=128MB → floor
     try std.testing.expectEqual(f, lineFor(512 << 20, f, c)); // ½·512MB=256MB → floor

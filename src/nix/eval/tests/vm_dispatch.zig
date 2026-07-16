@@ -381,7 +381,7 @@ test "stack push surfaces StackOverflow at capacity" {
     var h = try Harness.init();
     defer h.deinit();
 
-    h.vm.sp = @intCast(types.VM_STACK_CAP);
+    h.vm.sp = @intCast(types.vm_stack_capacity);
     try testing.expectError(error.StackOverflow, stack.push(&h.vm, Value.int(1)));
 }
 
@@ -397,7 +397,7 @@ test "pushFrame surfaces StackOverflow when locals exceed remaining capacity" {
     const ch = try builder.finish(testing.allocator, 4);
     const chunk_id = try h.ev.registry.register(ch);
 
-    h.vm.sp = @intCast(types.VM_STACK_CAP - 1);
+    h.vm.sp = @intCast(types.vm_stack_capacity - 1);
     try testing.expectError(error.StackOverflow, stack.pushFrame(&h.vm, h.ev.registry.get(chunk_id).?, chunk_id, 0, null, false));
 }
 

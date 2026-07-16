@@ -186,14 +186,14 @@ pub fn compileLambda(self: *Compiler, node: *const Node) !void {
     // upvalue) — that's the alloc we drop. A call site supplying N args
     // (`call_n`) then runs the body in one frame. Stops at the first
     // non-value-lambda (attrset-pattern lambda or non-lambda body), at the
-    // `MAX_UNCURRY_ARITY` cap, or at a repeated param name (so we never
+    // `max_uncurry_arity` cap, or at a repeated param name (so we never
     // rely on within-frame shadow ordering of identically-named locals).
-    const MAX = types.MAX_UNCURRY_ARITY;
-    var params: [MAX][]const u8 = undefined;
-    var param_ids: [MAX]InternId = undefined;
+    const max_arity = types.max_uncurry_arity;
+    var params: [max_arity][]const u8 = undefined;
+    var param_ids: [max_arity]InternId = undefined;
     var n: u16 = 0;
     var cur: *const Node = node;
-    while (n < MAX and cur.tag == .lambda) {
+    while (n < max_arity and cur.tag == .lambda) {
         const lam = cur.data.lambda;
         const name = self.source[lam.param_offset .. lam.param_offset + lam.param_len];
         const id = try self.intern.intern(name);

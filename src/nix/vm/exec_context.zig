@@ -40,9 +40,9 @@ pub const ExecutionContext = struct {
     /// Globally-unique claim identity for thunk forces — `makeClaimer` of
     /// the owning fiber's id. Baked once at fiber allocation and permanent
     /// for the fiber's life (it survives task recycles, unlike the role
-    /// fields below). `INVALID_CLAIMER` only in the static default (VMs not
+    /// fields below). `invalid_claimer` only in the static default (VMs not
     /// bound to any fiber).
-    claimer_id: future_mod.ClaimerId = future_mod.INVALID_CLAIMER,
+    claimer_id: future_mod.ClaimerId = future_mod.invalid_claimer,
     /// Lowest native stack address the running fiber may touch before the
     /// thunk-force guard trips a graceful "stack overflow" (`= stack base +
     /// stack_guard_margin`). Baked once at fiber allocation from the fiber's

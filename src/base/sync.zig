@@ -132,7 +132,7 @@ pub const Semaphore = struct {
 pub const BlockingMutex = struct {
     state: std.atomic.Value(u32) = .init(0),
 
-    const SPIN_ATTEMPTS: u32 = 40;
+    const spin_attempts: u32 = 40;
 
     pub fn lock(self: *BlockingMutex) void {
         if (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
@@ -141,7 +141,7 @@ pub const BlockingMutex = struct {
 
     fn lockSlow(self: *BlockingMutex) void {
         var i: u32 = 0;
-        while (i < SPIN_ATTEMPTS) : (i += 1) {
+        while (i < spin_attempts) : (i += 1) {
             if (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) return;
             std.atomic.spinLoopHint();
         }

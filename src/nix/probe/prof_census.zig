@@ -39,7 +39,7 @@ pub var disc: Disc = .{};
 ///                   never aimed here) — the addressable coverage prize.
 ///   admitted + old= LATENCY  gap (aimed + admitted, but main won the race
 ///                   or the task never drained) — a drain/junk-volume problem.
-///   rejected      = CAPACITY gap (aimed, but the backlog was full).
+///   rejected      = capacity gap (aimed, but the backlog was full).
 ///   never + fresh = serial spine (created just-in-time on the demand chain;
 ///                   no helper could get ahead) — structural, unspeculatable.
 /// The TARGETING cell is further split by thunk kind: `closure`/`bytecode`
@@ -59,9 +59,9 @@ pub const Coverage = struct {
 pub var cov: Coverage = .{};
 
 /// "Old enough for a helper to have raced ahead" — mirrors
-/// `prof_age.AGE_OLD_THRESHOLD` (2^21 cy, ~0.5ms at 3.6GHz); duplicated to
+/// `prof_age.age_old_threshold` (2^21 cy, ~0.5ms at 3.6GHz); duplicated to
 /// keep this module import-light.
-const COV_OLD_THRESHOLD: u64 = 1 << 21;
+const coverage_old_threshold: u64 = 1 << 21;
 
 /// Classify one `claimed_by_main` force. `disp` = `Thunk.spec_disp`,
 /// `created_tsc` = the thunk's creation stamp (0 = unknown, skipped),
@@ -71,7 +71,7 @@ pub inline fn recordCoverage(disp: u8, created_tsc: u64, kind_idx: u8) void {
     if (comptime !prof.enabled) return;
     if (created_tsc == 0) return;
     const age = prof.rdtsc() -| created_tsc;
-    const old = age >= COV_OLD_THRESHOLD;
+    const old = age >= coverage_old_threshold;
     switch (disp) {
         1 => if (old) {
             cov.admitted_old += 1;
@@ -113,7 +113,7 @@ pub fn reportCoverage() void {
         .{ admitted, pct(admitted, total), cov.admitted_old, pct(cov.admitted_old, total), cov.admitted_fresh, pct(cov.admitted_fresh, total) },
     );
     std.debug.print(
-        "  submitted-rejected = {d} ({d:.1}%) | old={d} fresh={d}  =CAPACITY gap\n",
+        "  submitted-rejected = {d} ({d:.1}%) | old={d} fresh={d}  =capacity gap\n",
         .{ rejected, pct(rejected, total), cov.rejected_old, cov.rejected_fresh },
     );
     std.debug.print(
@@ -198,9 +198,9 @@ pub var rf_attr_hit: u64 = 0; // attr-cache HIT returning an already-resolved th
 /// Sizes the per-object hash-index headroom (binary-search probes are
 /// dependent cache misses on large sets). `al_merge` counts lookups that
 /// hit an unflattened merge_attrs chain (no single size).
-pub const AL_BUCKETS = 16;
-pub var al_size: [AL_BUCKETS]u64 = @splat(0);
-pub var al_probes: [AL_BUCKETS]u64 = @splat(0); // ~log2(n) per lookup, summed
+pub const allocation_buckets = 16;
+pub var al_size: [allocation_buckets]u64 = @splat(0);
+pub var al_probes: [allocation_buckets]u64 = @splat(0); // ~log2(n) per lookup, summed
 pub var al_merge: u64 = 0;
 
 /// String-machinery census (piggybacks on `-Dprof-main`). Sizes the

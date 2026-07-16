@@ -25,7 +25,7 @@
 //!   - `off`  — never.
 //!   - `on`   — always try; warn once when the pool can't serve a mapping.
 //!   - `auto` — engage only when the 2 MB pool has unreserved capacity for a
-//!     sensible floor (`AUTO_FLOOR_BYTES`) at first use; individual mmap
+//!     sensible floor (`auto_floor_bytes`) at first use; individual mmap
 //!     failures after that fall back silently per-mapping.
 //!
 //! Accounting: hugetlb pages are invisible to VmRSS/VmHWM/statm, so every
@@ -36,16 +36,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const HUGE_PAGE: usize = 2 << 20;
+pub const huge_page_size: usize = 2 << 20;
 
 // Linux 5.14+. Zig's std.os.linux.MADV does not expose this newer value yet.
-const MADV_POPULATE_WRITE: u32 = 23;
+const madv_populate_write: u32 = 23;
 
 /// `auto` engagement floor: the unreserved pool must cover at least this
 /// much before auto turns hugetlb on. Sized to fit the flat store's first
 /// grow-ahead chunk plus a couple of class blocks — below it the win is
 /// negligible and the pool is better left to other consumers.
-pub const AUTO_FLOOR_BYTES: usize = 256 << 20;
+pub const auto_floor_bytes: usize = 256 << 20;
 
 pub const Mode = enum(u8) { auto, on, off };
 
@@ -98,13 +98,13 @@ pub fn wanted() bool {
 }
 
 /// `auto`: resolve once — default huge page size must be 2 MB and the pool
-/// must have `AUTO_FLOOR_BYTES` of unreserved capacity. Cached (the answer
+/// must have `auto_floor_bytes` of unreserved capacity. Cached (the answer
 /// gates a whole run's policy; per-mapping failures degrade gracefully
 /// anyway).
 fn autoEngaged() bool {
     const s = auto_state.load(.monotonic);
     if (s != 0) return s == 1;
-    const ok = defaultHugePageIs2M() and availablePoolBytes() >= AUTO_FLOOR_BYTES;
+    const ok = defaultHugePageIs2M() and availablePoolBytes() >= auto_floor_bytes;
     auto_state.store(if (ok) 1 else 2, .monotonic);
     return ok;
 }
@@ -115,7 +115,7 @@ pub fn availablePoolBytes() usize {
     const free = readSysUint("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages") orelse return 0;
     const resv = readSysUint("/sys/kernel/mm/hugepages/hugepages-2048kB/resv_hugepages") orelse 0;
     if (resv >= free) return 0;
-    return @as(usize, @intCast(free - resv)) * HUGE_PAGE;
+    return @as(usize, @intCast(free - resv)) * huge_page_size;
 }
 
 /// MAP_HUGETLB without a size suffix uses the kernel's *default* huge page
@@ -164,7 +164,7 @@ fn readFileInto(path: [:0]const u8, buf: []u8) ?[]const u8 {
 }
 
 pub fn roundedLen(len: usize) usize {
-    return std.mem.alignForward(usize, len, HUGE_PAGE);
+    return std.mem.alignForward(usize, len, huge_page_size);
 }
 
 /// Map `len` (rounded up to 2 MB) of anonymous private hugetlb memory and make
@@ -172,11 +172,11 @@ pub fn roundedLen(len: usize) usize {
 ///   1. non-NORESERVE mmap commits the pool pages up front;
 ///   2. MADV_DONTFORK prevents a subprocess child from inheriting a private
 ///      mapping whose later COW could need an unreserved extra huge page;
-///   3. MADV_POPULATE_WRITE instantiates every page under the current
+///   3. madv_populate_write instantiates every page under the current
 ///      NUMA/cpuset policy, reporting a would-be SIGBUS as a syscall error.
 /// Any failure unmaps the candidate and returns null so the caller can use its
 /// ordinary allocation path. This intentionally makes Linux <5.14 (which has
-/// no MADV_POPULATE_WRITE) fall back rather than expose a weaker guarantee.
+/// no madv_populate_write) fall back rather than expose a weaker guarantee.
 pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
     if (comptime builtin.os.tag != .linux) return null;
     const rounded = roundedLen(len);
@@ -193,7 +193,7 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
     };
     const ptr: [*]u8 = mem.ptr;
     if (std.os.linux.errno(std.os.linux.madvise(ptr, rounded, std.os.linux.MADV.DONTFORK)) != .SUCCESS or
-        std.os.linux.errno(std.os.linux.madvise(ptr, rounded, MADV_POPULATE_WRITE)) != .SUCCESS)
+        std.os.linux.errno(std.os.linux.madvise(ptr, rounded, madv_populate_write)) != .SUCCESS)
     {
         std.posix.munmap(mem);
         noteFallback();
@@ -228,7 +228,7 @@ pub fn map(len: usize) ?[*]align(std.heap.page_size_min) u8 {
 /// is returned.
 pub fn overlayFixed(target: [*]u8, len: usize) bool {
     if (comptime builtin.os.tag != .linux) return false;
-    std.debug.assert(@intFromPtr(target) % HUGE_PAGE == 0 and len % HUGE_PAGE == 0 and len > 0);
+    std.debug.assert(@intFromPtr(target) % huge_page_size == 0 and len % huge_page_size == 0 and len > 0);
     const src = map(len) orelse return false;
     const rc = std.os.linux.mremap(src, len, len, .{ .MAYMOVE = true, .FIXED = true }, target);
     if (std.os.linux.errno(rc) == .SUCCESS and rc == @intFromPtr(target)) return true;
@@ -325,9 +325,9 @@ test "parseLeadingUint" {
 }
 
 test "roundedLen rounds to 2 MB" {
-    try std.testing.expectEqual(HUGE_PAGE, roundedLen(1));
-    try std.testing.expectEqual(HUGE_PAGE, roundedLen(HUGE_PAGE));
-    try std.testing.expectEqual(2 * HUGE_PAGE, roundedLen(HUGE_PAGE + 1));
+    try std.testing.expectEqual(huge_page_size, roundedLen(1));
+    try std.testing.expectEqual(huge_page_size, roundedLen(huge_page_size));
+    try std.testing.expectEqual(2 * huge_page_size, roundedLen(huge_page_size + 1));
 }
 
 test "map/unmap: accounting balances whether or not the pool serves it" {
@@ -342,7 +342,7 @@ test "map/unmap: accounting balances whether or not the pool serves it" {
         try std.testing.expectEqual(before + (4 << 20), mappedBytes());
         try std.testing.expect(peakMappedBytes() >= mappedBytes());
 
-        // MADV_POPULATE_WRITE made every base page resident before `map`
+        // madv_populate_write made every base page resident before `map`
         // returned, rather than leaving a possible SIGBUS for first touch.
         var resident: [(4 << 20) / std.heap.page_size_min]u8 = @splat(0);
         try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mincore(p, 4 << 20, &resident)));

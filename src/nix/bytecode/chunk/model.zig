@@ -222,7 +222,7 @@ pub const SchedulingHints = struct {
     /// thunk-creation hot path doesn't have to re-read `code.len`.
     body_is_substantial: bool = false,
     /// True when the chunk's effective body size is below
-    /// `SPECULATION_TRUSTED_CODE_BYTES`: its unattended speculative
+    /// `speculation_trusted_code_bytes`: its unattended speculative
     /// execution is NOT trusted (the sub-256 combinator family — small
     /// bodies whose one execution can recursively force multi-million-
     /// thunk never-demanded subgraphs). Speculative `force_thunk` tasks

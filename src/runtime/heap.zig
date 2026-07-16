@@ -64,12 +64,12 @@ pub const AttrPosEntry = struct {
 /// unlike the value/attr stores), so `get(id)` collapses to one load —
 /// `base[id]` — with no segment decode (`clz` + shifts) and no per-access
 /// atomic segment-pointer load. On the NixOS toplevel this access happens
-/// tens of millions of times. `OBJECT_MAX_SLOTS` is a virtual reservation
+/// tens of millions of times. `object_max_slots` is a virtual reservation
 /// (MAP_NORESERVE), so the headroom over the ~6M objects a real eval
 /// produces costs no physical memory.
-pub const OBJECT_MAX_SLOTS: u32 = 1 << 30;
+pub const object_max_slots: u32 = 1 << 30;
 const mem_tag = @import("mem_tag.zig");
-const ObjectStore = segments.FlatStore(Object, .{ .max_slots = OBJECT_MAX_SLOTS, .vma_tag = .objects }, mem_tag.vma);
+const ObjectStore = segments.FlatStore(Object, .{ .max_slots = object_max_slots, .vma_tag = .objects }, mem_tag.vma);
 // `huge_overlay_min`: the ≥64 MB doubling-tail segments get a NORESERVE
 // mapping + chunk-grown hugetlb prefix instead of a fully-mapped hugetlb
 // block — an up-front map bills the whole (mostly empty at peak) tail
@@ -90,7 +90,7 @@ pub const AttrPosRange = AttrPosStore.Range;
 /// A zero-length attr-position range: the attrset carries no source
 /// positions. Sliced only after a `len == 0` guard, so the (possibly
 /// segment-less) store is never indexed.
-pub const EMPTY_ATTR_POS: AttrPosRange = .{ .segment = 0, .offset = 0, .len = 0 };
+pub const empty_attr_positions: AttrPosRange = .{ .segment = 0, .offset = 0, .len = 0 };
 
 pub const Closure = struct {
     chunk_id: ChunkId,
@@ -151,7 +151,7 @@ const ContextStringObject = struct {
 /// positions"; it is never sliced.
 pub const AttrsObject = struct {
     range: AttrRange,
-    positions: AttrPosRange = EMPTY_ATTR_POS,
+    positions: AttrPosRange = empty_attr_positions,
     /// Demand-sibling prefetch (`FIX_SIBLING`): has this set already been
     /// swept? Once-per-attrset dedup for `force_attrs_sweep` submission.
     /// Plain bool in existing union padding (the thunk variant sizes the
@@ -169,9 +169,9 @@ pub const AttrsObject = struct {
 /// large `//` O(1): just record `base`+`overlay`. `//` is *shallow*
 /// right-biased, so lookup checks `overlay` then `base`; the (obj,name)
 /// inline cache absorbs repeated lookups. The chain is flattened (one
-/// real merge) once `depth` exceeds `MERGE_FLATTEN_DEPTH`, bounding both
+/// real merge) once `depth` exceeds `merge_flatten_depth`, bounding both
 /// lookup depth and the chain length any single flatten must walk.
-/// `flattened` memoizes the flattened plain-attrs object (NO_FLAT until
+/// `flattened` memoizes the flattened plain-attrs object (no_flattened_attrs until
 /// first `getAttrs`/iteration forces it).
 pub const MergeAttrsObject = struct {
     base: ObjectId,
@@ -181,16 +181,16 @@ pub const MergeAttrsObject = struct {
 };
 
 /// Sentinel for `MergeAttrsObject.flattened` meaning "not yet flattened".
-pub const NO_FLAT: ObjectId = std.math.maxInt(ObjectId);
+pub const no_flattened_attrs: ObjectId = std.math.maxInt(ObjectId);
 
 /// Only layer `a // b` when `a` is at least this large — small merges
 /// (literal `{..} // {..}`) stay eager so the common cheap case keeps its
 /// flat single-binary-search lookup and pays no indirection.
-const MERGE_LAYER_MIN: u32 = 32;
+const merge_layer_min_size: u32 = 32;
 
 /// Flatten a layer chain once it gets this deep, so `getAttrValue` walks
 /// at most this many overlays and each flatten merges a bounded chain.
-const MERGE_FLATTEN_DEPTH: u16 = 8;
+const merge_flatten_depth: u16 = 8;
 
 pub const Object = union(enum) {
     list: ValueRange,
@@ -217,10 +217,10 @@ pub const Object = union(enum) {
 /// supports reserving a slot up front (`reserveObjectSlot`/`fillObjectSlot`) so
 /// a value can learn its own ObjectId before the object exists — how
 /// `buildAttrSet` builds the `builtins.builtins` self-reference.
-const OBJECT_CHUNK_SIZE: u32 = 256;
-const VALUE_CHUNK_SIZE: u32 = 1024;
-const ATTR_CHUNK_SIZE: u32 = 512;
-const ATTR_POS_CHUNK_SIZE: u32 = 256;
+const object_chunk_size: u32 = 256;
+const value_chunk_size: u32 = 1024;
+const attr_chunk_size: u32 = 512;
+const attr_position_chunk_size: u32 = 256;
 
 // Copying nursery: the low `NURSERY_SEGS_*` segments of each range
 // store are the resettable young generation; the rest is tenured. Capacity =
@@ -228,9 +228,9 @@ const ATTR_POS_CHUNK_SIZE: u32 = 256;
 // attrs 512, attr_pos 512} and N below the nursery is ~16 MB for values and
 // ~16 MB for attrs — a minor fires when whichever store's nursery fills. A
 // young range is one whose `segment < nursery_segs` (no tag bit needed).
-const NURSERY_SEGS_VALUES: u32 = 13;
-const NURSERY_SEGS_ATTRS: u32 = 13;
-const NURSERY_SEGS_ATTR_POS: u32 = 13;
+const nursery_value_segments: u32 = 13;
+const nursery_attr_segments: u32 = 13;
+const nursery_attr_position_segments: u32 = 13;
 
 const LocalSlice = struct { segment: u32, offset: u32, len: u32 };
 
@@ -368,7 +368,7 @@ pub const ObjectHeap = struct {
     /// pointer equality even though it refers to a freed heap.
     token: u64,
     /// Object-store pre-toucher: a background thread that keeps the flat
-    /// reservation populated (`MADV_POPULATE_WRITE`) a few MB ahead of
+    /// reservation populated (`madv_populate_write`) a few MB ahead of
     /// the bump cursor, absorbing the store's first-touch minor faults
     /// (~700 MB / ~170K faults per NixOS toplevel — the single biggest
     /// fault surface) onto an idle core instead of the evaluating
@@ -391,7 +391,7 @@ pub const ObjectHeap = struct {
     /// the next in-eval collection runs a MAJOR (full mark/sweep) instead of a
     /// minor. Reset after each major.
     gc_promoted_since_major: u64 = 0,
-    gc_major_gate: u64 = GC_MAJOR_GATE_FLOOR,
+    gc_major_gate: u64 = gc_major_gate_floor,
     /// GC reclaim state. Inert until `gc_collect_enabled` is set. Before lazy
     /// arming, the allocator hot path remains bump-only.
     gc_collect_enabled: bool = false,
@@ -501,9 +501,9 @@ pub const ObjectHeap = struct {
         // tenured region. Done here, before any allocation, so pre-collect
         // bootstrap (builtins) tenures directly and post-collect allocations
         // bump the nursery.
-        values.enableNursery(gcNurserySegs(NURSERY_SEGS_VALUES, worker_count));
-        attrs.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTRS, worker_count));
-        attr_positions.enableNursery(gcNurserySegs(NURSERY_SEGS_ATTR_POS, worker_count));
+        values.enableNursery(gcNurserySegs(nursery_value_segments, worker_count));
+        attrs.enableNursery(gcNurserySegs(nursery_attr_segments, worker_count));
+        attr_positions.enableNursery(gcNurserySegs(nursery_attr_position_segments, worker_count));
         return .{
             .allocator = allocator,
             .objects = objects,
@@ -1073,7 +1073,7 @@ pub const ObjectHeap = struct {
         if (self.gc_collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_values", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, VALUE_CHUNK_SIZE, n);
+        return self.reserveRangeLocal(ValueStore, &self.values, &local.value, value_chunk_size, n);
     }
 
     /// Reserve `n` slots of attr storage for a merge in progress.
@@ -1114,7 +1114,7 @@ pub const ObjectHeap = struct {
         if (self.gc_collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attrs", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, ATTR_CHUNK_SIZE, n);
+        return self.reserveRangeLocal(AttrStore, &self.attrs, &local.attr, attr_chunk_size, n);
     }
 
     fn reserveAttrPositionsLocal(self: *ObjectHeap, n: u32) !AttrPosRange {
@@ -1122,7 +1122,7 @@ pub const ObjectHeap = struct {
         if (self.gc_collect_enabled) {
             if (self.gcReuseRange(local, "gc_free_attr_pos", n)) |loc| return .{ .segment = loc.segment, .offset = loc.offset, .len = n };
         }
-        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, ATTR_POS_CHUNK_SIZE, n);
+        return self.reserveRangeLocal(AttrPosStore, &self.attr_positions, &local.attr_pos, attr_position_chunk_size, n);
     }
 
     /// Threshold hook: once reserved bytes cross `gc_threshold_bytes`, request a
@@ -1160,11 +1160,11 @@ pub const ObjectHeap = struct {
 
     /// Object count above which the pre-toucher pays for its thread:
     /// ~6 MB of store. Real evals blow far past it; unit tests don't.
-    const TOUCHER_MIN_SLOTS: u32 = 64 * 1024;
+    const toucher_min_slots: u32 = 64 * 1024;
     /// How far past the bump cursor the toucher keeps pages populated.
     /// The store grows ~270 KB/ms at w=1 peak, so 8 MB rides out many
     /// wake-up periods; over-population waste at exit is at most this.
-    const TOUCHER_AHEAD_BYTES: usize = 8 << 20;
+    const toucher_ahead_bytes: usize = 8 << 20;
 
     /// CAS-guarded lazy spawn (racing workers refill TLABs concurrently).
     fn maybeStartToucher(self: *ObjectHeap) void {
@@ -1180,13 +1180,13 @@ pub const ObjectHeap = struct {
         var values_state: ValueStore.PopulateState = .{};
         var attrs_state: AttrStore.PopulateState = .{};
         while (!self.toucher_stop.load(.monotonic)) {
-            const target = self.objects.usedBytes() + TOUCHER_AHEAD_BYTES;
+            const target = self.objects.usedBytes() + toucher_ahead_bytes;
             if (target > populated) {
                 self.objects.populateRange(populated, target);
                 populated = target;
             }
-            self.values.populateAhead(&values_state, TOUCHER_AHEAD_BYTES);
-            self.attrs.populateAhead(&attrs_state, TOUCHER_AHEAD_BYTES);
+            self.values.populateAhead(&values_state, toucher_ahead_bytes);
+            self.attrs.populateAhead(&attrs_state, toucher_ahead_bytes);
             sync.sleepNs(1_000_000);
         }
     }
@@ -1213,14 +1213,14 @@ pub const ObjectHeap = struct {
                 chunk.cursor += 1;
                 break :blk cid;
             }
-            const refilled = try self.objects.reserve(self.allocator, OBJECT_CHUNK_SIZE);
+            const refilled = try self.objects.reserve(self.allocator, object_chunk_size);
             chunk.segment = refilled.segment;
             chunk.cursor = refilled.offset;
             chunk.end = refilled.offset + refilled.len;
-            // TLAB refill = every OBJECT_CHUNK_SIZE objects: cheap spot to
+            // TLAB refill = every object_chunk_size objects: cheap spot to
             // lazily start the pre-toucher once the store is large enough.
             if (comptime builtin.os.tag == .linux) {
-                if (refilled.offset >= TOUCHER_MIN_SLOTS and
+                if (refilled.offset >= toucher_min_slots and
                     self.toucher_state.load(.monotonic) == 0)
                     self.maybeStartToucher();
             }
@@ -1254,16 +1254,16 @@ pub const ObjectHeap = struct {
     // --- GC reclaim (collector, single-threaded for now) ---
 
     /// Floor on the collection threshold.
-    pub const GC_MIN_THRESHOLD: u64 = 256 << 20;
+    pub const gc_min_threshold: u64 = 256 << 20;
     /// Floor on the major-collection gate (see `gc_major_gate`): promote at
     /// least this many objects since the last major before the next one, so a
     /// small heap never major-thrashes. Above the floor the gate tracks the
     /// live set (major when the old gen has roughly doubled with tenurings).
-    pub const GC_MAJOR_GATE_FLOOR: u64 = 1 << 20;
+    pub const gc_major_gate_floor: u64 = 1 << 20;
     /// Headroom of genuinely-fresh committed pages between collections
     /// (additive, anchored to the cursor at last collect — see
     /// `gcAfterCollect`). Keeps peak RSS near live + a constant.
-    pub const GC_HEADROOM: u64 = 1024 << 20;
+    pub const gc_headroom: u64 = 1024 << 20;
 
     /// Validation knob (`FIX_GC_STEP_MB`): when > 0, collect
     /// every this-many MB of fresh allocation instead of the normal additive-
@@ -1355,7 +1355,7 @@ pub const ObjectHeap = struct {
     /// gcEnableBudget in constrained mode (bits go live from eval start there).
     pub fn gcPresizeAllocBits(self: *ObjectHeap) void {
         if (comptime !gc_debug) return;
-        const words = (@as(usize, OBJECT_MAX_SLOTS) + 63) >> 6;
+        const words = (@as(usize, object_max_slots) + 63) >> 6;
         self.gc_alloc_bits = self.allocator.realloc(self.gc_alloc_bits, words) catch self.gc_alloc_bits;
         @memset(self.gc_alloc_bits, 0);
     }
@@ -1544,7 +1544,7 @@ pub const ObjectHeap = struct {
     /// so the next major fires once the old gen has ~doubled again.
     pub fn gcNoteMajor(self: *ObjectHeap, live_objects: u64) void {
         self.gc_promoted_since_major = 0;
-        self.gc_major_gate = @max(GC_MAJOR_GATE_FLOOR, live_objects);
+        self.gc_major_gate = @max(gc_major_gate_floor, live_objects);
     }
 
     pub fn getMut(self: *ObjectHeap, id: ObjectId) *Object {
@@ -1599,7 +1599,7 @@ pub const ObjectHeap = struct {
             .attrs => |a| binarySearchAttr(self.attrs.slice(a.range), name),
             .merge_attrs => |m| {
                 const flat = m.flattened.load(.acquire);
-                if (flat != NO_FLAT) {
+                if (flat != no_flattened_attrs) {
                     return binarySearchAttr(self.attrs.slice(self.get(flat).attrs.range), name);
                 }
                 if (try self.getAttrValueOpt(m.overlay, name)) |v| return v;
@@ -1646,8 +1646,8 @@ pub const ObjectHeap = struct {
         if (r == .attrs and r.attrs.range.len == 0) return left_id;
 
         const next_depth: u16 = switch (self.get(left_id).*) {
-            .attrs => |a| if (a.range.len < MERGE_LAYER_MIN) 0 else 1,
-            .merge_attrs => |m| if (m.depth + 1 > MERGE_FLATTEN_DEPTH) 0 else m.depth + 1,
+            .attrs => |a| if (a.range.len < merge_layer_min_size) 0 else 1,
+            .merge_attrs => |m| if (m.depth + 1 > merge_flatten_depth) 0 else m.depth + 1,
             else => 0,
         };
         if (next_depth == 0) return self.addMergedAttrs(left_id, right_id);
@@ -1655,7 +1655,7 @@ pub const ObjectHeap = struct {
             .base = left_id,
             .overlay = right_id,
             .depth = next_depth,
-            .flattened = .init(NO_FLAT),
+            .flattened = .init(no_flattened_attrs),
         } });
     }
 
@@ -1666,14 +1666,14 @@ pub const ObjectHeap = struct {
     /// flatten would allocate.
     fn flattenMerge(self: *ObjectHeap, id: ObjectId) anyerror!ObjectId {
         const cached = self.getMut(id).merge_attrs.flattened.load(.acquire);
-        if (cached != NO_FLAT) return cached;
+        if (cached != no_flattened_attrs) return cached;
 
         var leaves: std.ArrayListUnmanaged(ObjectId) = .empty;
         defer leaves.deinit(self.allocator);
         try self.collectMergeLeaves(id, &leaves);
         const flat = try self.kwayMergeLeaves(leaves.items);
 
-        const prev = self.getMut(id).merge_attrs.flattened.cmpxchgStrong(NO_FLAT, flat, .acq_rel, .acquire);
+        const prev = self.getMut(id).merge_attrs.flattened.cmpxchgStrong(no_flattened_attrs, flat, .acq_rel, .acquire);
         // old→young barrier: the (possibly old) merge node now points at its
         // flattened attrs object. Only the CAS winner installed the edge.
         if (prev == null) self.gcRecordEdge(id, Value.attrs(flat));
@@ -1688,7 +1688,7 @@ pub const ObjectHeap = struct {
             .attrs => try out.append(self.allocator, id),
             .merge_attrs => |m| {
                 const f = m.flattened.load(.acquire);
-                if (f != NO_FLAT) {
+                if (f != no_flattened_attrs) {
                     try out.append(self.allocator, f);
                     return;
                 }
@@ -2154,10 +2154,10 @@ pub const ObjectHeap = struct {
     }
 
     pub fn addBytecodeThunk(self: *ObjectHeap, chunk_id: ChunkId, upvalues: []const Value) !ObjectId {
-        // Inline-storage thunks (<= INLINE_CAP upvalues) need no
+        // Inline-storage thunks (<= inline_capacity upvalues) need no
         // `values`-store allocation — `initBytecode` copies them into the
         // thunk. Only wider captures spill to a stable slice.
-        if (upvalues.len <= BytecodeThunk.INLINE_CAP) {
+        if (upvalues.len <= BytecodeThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initBytecode(chunk_id, upvalues) });
         }
         // Spilled upvalues are a bare slice held by the thunk AND cached in the
@@ -2169,9 +2169,9 @@ pub const ObjectHeap = struct {
     }
 
     /// A deferred-compile thunk (lazy per-attr compilation). Same inline
-    /// (<= INLINE_CAP) vs. spilled-slice storage split as `addBytecodeThunk`.
+    /// (<= inline_capacity) vs. spilled-slice storage split as `addBytecodeThunk`.
     pub fn addDeferredThunk(self: *ObjectHeap, deferred_id: u32, env: []const Value) !ObjectId {
-        if (env.len <= DeferredThunk.INLINE_CAP) {
+        if (env.len <= DeferredThunk.inline_capacity) {
             return self.add(.{ .thunk = Thunk.initDeferred(deferred_id, env) });
         }
         const range = try self.appendValuesTenured(env); // stable: see addBytecodeThunk
@@ -2201,12 +2201,12 @@ pub const ObjectHeap = struct {
 
     pub fn commitBytecodeThunk(self: *ObjectHeap, pending: PendingBytecodeThunk) !ObjectId {
         errdefer self.values.rollback(pending.range);
-        // Spilled (>INLINE_CAP) upvalues become the thunk's stable backing slice
+        // Spilled (>inline_capacity) upvalues become the thunk's stable backing slice
         // and are cached in executing frames; if the pending range is young it
         // must be copied to the tenured region so it never moves. Inline (<=2)
         // upvalues are copied into the thunk, so the young pending range is
         // harmless (reclaimed by the next nursery reset).
-        if (pending.range.len > BytecodeThunk.INLINE_CAP and self.values.isYoung(pending.range)) {
+        if (pending.range.len > BytecodeThunk.inline_capacity and self.values.isYoung(pending.range)) {
             const t = try self.values.reserve(self.allocator, pending.range.len);
             @memcpy(self.values.sliceMut(t), self.values.slice(pending.range));
             return self.add(.{ .thunk = Thunk.initBytecode(pending.chunk_id, self.values.slice(t)) });
@@ -2233,7 +2233,7 @@ pub const ObjectHeap = struct {
         // as direct tenured reservations (StableSegments never relocates) —
         // use the per-worker TLAB and skip the store's global `write_mu`.
         // This is the thunk/closure spilled-upvalue path (every capture
-        // wider than INLINE_CAP), so at high worker counts the direct
+        // wider than inline_capacity), so at high worker counts the direct
         // `values.reserve` was a spinlock convoy dominating the profile.
         // Mirrors `appendAttrEntriesTenured`'s guard.
         if (!self.gc_collect_enabled) return self.appendValues(items);
@@ -2314,7 +2314,7 @@ pub const ObjectHeap = struct {
     ) !AttrPosRange {
         const left_positions = self.attrPositionsSlice(left_id);
         const right_positions = self.attrPositionsSlice(right_id);
-        if (left_positions.len == 0 and right_positions.len == 0) return EMPTY_ATTR_POS;
+        if (left_positions.len == 0 and right_positions.len == 0) return empty_attr_positions;
 
         var merged = try std.ArrayListUnmanaged(AttrPosEntry).initCapacity(
             self.allocator,
@@ -2333,7 +2333,7 @@ pub const ObjectHeap = struct {
             }
         }
 
-        if (merged.items.len == 0) return EMPTY_ATTR_POS;
+        if (merged.items.len == 0) return empty_attr_positions;
         const range = try self.appendAttrPositions(merged.items);
         self.sortAttrPositions(range);
         return range;
@@ -2382,11 +2382,11 @@ fn binarySearchAttr(entries: []const AttrEntry, name: InternId) ?Value {
 /// Detector sentinel: `poisonYoung` stamps freed young attr entries with this
 /// name. Any name scan that observes it is reading a dangling attr slice held
 /// across a collection — the panic's stack trace names the buggy caller.
-const GC_POISON_NAME: InternId = std.math.maxInt(InternId) - 7;
+const gc_poison_name: InternId = std.math.maxInt(InternId) - 7;
 
 inline fn gcAssertNotPoisonName(name: InternId) void {
     if (comptime !gc_debug) return;
-    if (name == GC_POISON_NAME) @panic("gc: read poisoned attr name — dangling attr slice held across a collection");
+    if (name == gc_poison_name) @panic("gc: read poisoned attr name — dangling attr slice held across a collection");
 }
 
 fn binarySearchAttrIndex(entries: []const AttrEntry, name: InternId) ?usize {

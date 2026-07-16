@@ -155,7 +155,7 @@ pub const Compiler = struct {
     /// child extends it, an anonymous child inherits it. Unlike the `·`/`.`
     /// string naming above (gated on `capture_names`), this is always built —
     /// cheaply, one small node per bound chunk.
-    name_id: bytecode.NameId = bytecode.NAME_ROOT,
+    name_id: bytecode.NameId = bytecode.root_name_id,
     /// This compile's ambient scope REPLACES the base (builtins) scope rather
     /// than overlaying it — the `builtins.scopedImport` semantic, where the
     /// supplied attrset becomes the entire free-identifier environment. When

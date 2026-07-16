@@ -136,8 +136,8 @@ pub var builtin_samples: [max_builtin_id]Sample = @splat(.{});
 pub const ageForceBegin = prof_age.ageForceBegin;
 /// See `prof_age.ageForceEnd`.
 pub const ageForceEnd = prof_age.ageForceEnd;
-/// See `prof_age.AGE_OLD_THRESHOLD`.
-pub const AGE_OLD_THRESHOLD = prof_age.AGE_OLD_THRESHOLD;
+/// See `prof_age.age_old_threshold`.
+pub const age_old_threshold = prof_age.age_old_threshold;
 
 /// See `prof_task.TaskClass`.
 pub const TaskClass = prof_task.TaskClass;
@@ -177,7 +177,7 @@ pub inline fn recordBuiltin(builtin_id: u16, t_start: u64) void {
     s.cycles_inclusive += inclusive;
 }
 
-const NO_BUILTIN: u16 = std.math.maxInt(u16);
+const no_builtin: u16 = std.math.maxInt(u16);
 
 const StackFrame = struct {
     path: Path,
@@ -187,8 +187,8 @@ const StackFrame = struct {
     child_exclusion: u64,
     /// For an `apply_builtin` frame opened via `startBuiltin`, the
     /// builtin whose EXCLUSIVE time this frame should be attributed to
-    /// (`builtin_samples`). `NO_BUILTIN` otherwise.
-    builtin_id: u16 = NO_BUILTIN,
+    /// (`builtin_samples`). `no_builtin` otherwise.
+    builtin_id: u16 = no_builtin,
 };
 
 // Must comfortably exceed the deepest instrumented-region nesting: force
@@ -276,7 +276,7 @@ pub inline fn end(comptime path: Path, t: u64) void {
     s.calls += 1;
     s.cycles += exclusive;
     s.cycles_inclusive += inclusive;
-    if (frame.builtin_id != NO_BUILTIN and frame.builtin_id < max_builtin_id) {
+    if (frame.builtin_id != no_builtin and frame.builtin_id < max_builtin_id) {
         const b = &builtin_samples[frame.builtin_id];
         b.calls += 1;
         b.cycles += exclusive;
@@ -310,25 +310,25 @@ pub fn report(registry: anytype, intern: anytype) void {
     // String-machinery census.
     prof_census.reportStrConcat();
     // Top builtins by inclusive cycles on main.
-    const N = 40;
+    const top_count = 40;
     const BSlot = struct { id: u16, cycles: u64, incl: u64, calls: u64 };
-    var top_b: [N]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** N;
+    var top_b: [top_count]BSlot = .{BSlot{ .id = 0, .cycles = 0, .incl = 0, .calls = 0 }} ** top_count;
     for (builtin_samples, 0..) |samp, id| {
         if (samp.calls == 0) continue;
-        var slot: usize = N;
+        var slot: usize = top_count;
         for (top_b, 0..) |entry, i| {
             if (samp.cycles > entry.cycles) {
                 slot = i;
                 break;
             }
         }
-        if (slot < N) {
-            var j: usize = N - 1;
+        if (slot < top_count) {
+            var j: usize = top_count - 1;
             while (j > slot) : (j -= 1) top_b[j] = top_b[j - 1];
             top_b[slot] = .{ .id = @intCast(id), .cycles = samp.cycles, .incl = samp.cycles_inclusive, .calls = samp.calls };
         }
     }
-    std.debug.print("prof builtins (top-{d} by EXCL cycles — own-body cost):\n", .{N});
+    std.debug.print("prof builtins (top-{d} by EXCL cycles — own-body cost):\n", .{top_count});
     for (top_b) |entry| {
         if (entry.cycles == 0) break;
         const name = @tagName(@as(BuiltinId, @enumFromInt(entry.id)));

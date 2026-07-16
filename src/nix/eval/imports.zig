@@ -227,7 +227,7 @@ fn publishCompileFailure(ev: Host, entry: *ImportEntry, err: anyerror) void {
 }
 
 fn currentClaimer() future_mod.ClaimerId {
-    const inner = fiber_mod.currentFiber() orelse return future_mod.INVALID_CLAIMER;
+    const inner = fiber_mod.currentFiber() orelse return future_mod.invalid_claimer;
     const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
     return wf.ctx.claimer_id;
 }

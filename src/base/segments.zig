@@ -73,9 +73,9 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
     return struct {
         const Self = @This();
 
-        pub const SEGMENT_COUNT = params.segment_count;
-        pub const FIRST_SEGMENT_SIZE = params.first_segment_size;
-        const FIRST_LOG2: u6 = std.math.log2_int(u32, params.first_segment_size);
+        pub const segment_count = params.segment_count;
+        pub const first_segment_size = params.first_segment_size;
+        const first_log2: u6 = std.math.log2_int(u32, params.first_segment_size);
 
         pub const Range = struct {
             segment: u32,
@@ -90,7 +90,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// the store's global `reserve`. Only the final partial chunk per worker
         /// leaks (its unused tail), so the waste is bounded and tiny.
         pub const Tlab = struct { seg: u32 = 0, off: u32 = 0, used: u32 = 0, cap: u32 = 0 };
-        pub const TLAB_CHUNK: u32 = 8192;
+        pub const tlab_chunk_size: u32 = 8192;
 
         /// Reserve `len` slots via `tlab` (tenured). Bumps the local cursor when
         /// the current chunk has room; otherwise refills one chunk under
@@ -104,8 +104,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 tlab.used += len;
                 return r;
             }
-            if (len >= TLAB_CHUNK) return self.reserve(allocator, len); // oversized: direct, keep tlab
-            const chunk = try self.reserve(allocator, TLAB_CHUNK);
+            if (len >= tlab_chunk_size) return self.reserve(allocator, len); // oversized: direct, keep tlab
+            const chunk = try self.reserve(allocator, tlab_chunk_size);
             tlab.* = .{ .seg = chunk.segment, .off = chunk.offset, .used = len, .cap = chunk.len };
             return .{ .segment = chunk.segment, .offset = chunk.offset, .len = len };
         }
@@ -115,8 +115,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// could be plain u64; the atomic wrapper exists so opportunistic
         /// readers (e.g. `count()`) don't tear.
         cursor: std.atomic.Value(u64) = .init(0),
-        segments: [SEGMENT_COUNT]std.atomic.Value(?[*]T) = blk: {
-            var arr: [SEGMENT_COUNT]std.atomic.Value(?[*]T) = undefined;
+        segments: [segment_count]std.atomic.Value(?[*]T) = blk: {
+            var arr: [segment_count]std.atomic.Value(?[*]T) = undefined;
             for (&arr) |*s| s.* = .init(null);
             break :blk arr;
         },
@@ -127,7 +127,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         // When `nursery_segs > 0` the low segments `[0, nursery_segs)` form a
         // resettable young-generation arena (its own bump cursor
         // `young_cursor`), and the tenured region is segments
-        // `[nursery_segs, SEGMENT_COUNT)` (the ordinary `cursor`, pre-positioned
+        // `[nursery_segs, segment_count)` (the ordinary `cursor`, pre-positioned
         // by `enableNursery`). A range is "young" iff `range.segment <
         // nursery_segs` — so `slice`/`get` route by segment index with no tag
         // bit and no per-access branch. `resetYoung` rewinds `young_cursor` to
@@ -144,14 +144,14 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         // scheme, per segment (see `FlatStore.extendHugeFrontier` for the
         // no-SIGBUS/no-data-loss argument). All zero/false when the feature
         // is off or a segment came from the allocator.
-        seg_owned: [SEGMENT_COUNT]bool = @splat(false),
-        seg_huge_frontier: [SEGMENT_COUNT]usize = @splat(0),
-        seg_huge_off: [SEGMENT_COUNT]bool = @splat(false),
+        seg_owned: [segment_count]bool = @splat(false),
+        seg_huge_frontier: [segment_count]usize = @splat(0),
+        seg_huge_off: [segment_count]bool = @splat(false),
 
         const overlay_enabled = params.huge_overlay_min > 0;
         const comptime_linux = builtin.os.tag == .linux;
         /// Overlay grow-ahead granularity (matches `FlatParams.huge_chunk`).
-        const SEG_HUGE_CHUNK: usize = 32 << 20;
+        const segment_huge_chunk_size: usize = 32 << 20;
 
         pub const empty: Self = .{};
 
@@ -193,13 +193,13 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             while (true) {
                 const cap = segmentCapacity(seg);
                 if (len > cap) {
-                    if (seg + 1 >= SEGMENT_COUNT) return error.OutOfMemory;
+                    if (seg + 1 >= segment_count) return error.OutOfMemory;
                     seg += 1;
                     used = 0;
                     continue;
                 }
                 if (used + len <= cap) break;
-                if (seg + 1 >= SEGMENT_COUNT) return error.OutOfMemory;
+                if (seg + 1 >= segment_count) return error.OutOfMemory;
                 seg += 1;
                 used = 0;
             }
@@ -218,12 +218,12 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         }
 
         /// Partition the store into a young nursery (`[0, nursery_segs)`) and a
-        /// tenured region (`[nursery_segs, SEGMENT_COUNT)`). Must be called
+        /// tenured region (`[nursery_segs, segment_count)`). Must be called
         /// before any `reserve` (the tenured cursor is moved to the first
         /// tenured segment so ordinary reservations never land in the nursery).
         /// Idempotent-safe only from a fresh (`empty`) store.
         pub fn enableNursery(self: *Self, nursery_segs: u32) void {
-            std.debug.assert(nursery_segs > 0 and nursery_segs < SEGMENT_COUNT);
+            std.debug.assert(nursery_segs > 0 and nursery_segs < segment_count);
             std.debug.assert(self.count() == 0);
             self.nursery_segs = nursery_segs;
             self.young_cursor.store(0, .monotonic);
@@ -338,7 +338,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 const used = usedOf(cur);
                 const cap = segmentCapacity(seg);
                 if (used >= cap) {
-                    if (seg + 1 >= SEGMENT_COUNT) return error.OutOfMemory;
+                    if (seg + 1 >= segment_count) return error.OutOfMemory;
                     // Advance to the next segment; whoever wins the CAS moves
                     // the cursor, everyone retries and reserves in the new one.
                     _ = self.cursor.cmpxchgWeak(cur, packCursor(seg + 1, 0), .acq_rel, .monotonic);
@@ -365,7 +365,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             var seg = segmentOf(cur);
             var used = usedOf(cur);
             if (used >= segmentCapacity(seg)) {
-                if (seg + 1 >= SEGMENT_COUNT) return error.OutOfMemory;
+                if (seg + 1 >= segment_count) return error.OutOfMemory;
                 seg += 1;
                 used = 0;
             }
@@ -469,7 +469,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         /// Cross-call state for `populateAhead` (segment base + populated-to).
         pub const PopulateState = struct { base: usize = 0, populated: usize = 0 };
 
-        /// Pre-populate (`MADV_POPULATE_WRITE`) the cursor's segment up to
+        /// Pre-populate (`madv_populate_write`) the cursor's segment up to
         /// `ahead` bytes past the current fill point. Kernel-side and
         /// value-preserving, so it is race-free against concurrent
         /// writers; called from the heap's background pre-toucher to
@@ -499,9 +499,9 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
                 }
             }
             if (target <= state.populated) return;
-            const MADV_POPULATE_WRITE: u32 = 23;
+            const madv_populate_write: u32 = 23;
             const addr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(base + state.populated);
-            _ = std.os.linux.madvise(addr, target - state.populated, MADV_POPULATE_WRITE);
+            _ = std.os.linux.madvise(addr, target - state.populated, madv_populate_write);
             state.populated = target;
         }
 
@@ -510,7 +510,7 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             // segment_start(i) = FIRST * (2^i - 1), so the segment containing
             // id is the largest i with segment_start(i) ≤ id. Equivalent:
             //   i = floor(log2((id / FIRST) + 1))
-            const shifted = (id >> FIRST_LOG2) + 1;
+            const shifted = (id >> first_log2) + 1;
             const seg = 31 - @clz(shifted);
             const offset = id - segmentStart(@intCast(seg));
             return .{ .segment = @intCast(seg), .offset = offset, .len = 1 };
@@ -553,26 +553,26 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
         fn mapOwnedSegment(self: *Self, segment: u32) bool {
             const bytes = segmentBytes(segment);
             if (bytes < params.huge_overlay_min) return false;
-            if (bytes % hugetlb.HUGE_PAGE != 0) return false;
+            if (bytes % hugetlb.huge_page_size != 0) return false;
             if (!hugetlb.wanted()) return false;
             // Over-reserve by one huge page and trim to a 2 MB-aligned
             // window (a MAP_FIXED hugetlb overlay needs an aligned target).
             const mem = std.posix.mmap(
                 null,
-                bytes + hugetlb.HUGE_PAGE,
+                bytes + hugetlb.huge_page_size,
                 .{ .READ = true, .WRITE = true },
                 .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
                 -1,
                 0,
             ) catch return false;
             const raw = @intFromPtr(mem.ptr);
-            const base = std.mem.alignForward(usize, raw, hugetlb.HUGE_PAGE);
+            const base = std.mem.alignForward(usize, raw, hugetlb.huge_page_size);
             if (base > raw) {
                 const head: [*]align(page_size_min) u8 = @ptrFromInt(raw);
                 std.posix.munmap(head[0 .. base - raw]);
             }
             const tail_start = base + bytes;
-            const tail_end = raw + bytes + hugetlb.HUGE_PAGE;
+            const tail_end = raw + bytes + hugetlb.huge_page_size;
             if (tail_end > tail_start) {
                 const tail: [*]align(page_size_min) u8 = @ptrFromInt(tail_start);
                 std.posix.munmap(tail[0 .. tail_end - tail_start]);
@@ -598,8 +598,8 @@ pub fn StableSegments(comptime T: type, comptime params_in: anytype, comptime Vm
             const frontier = self.seg_huge_frontier[segment];
             if (need_bytes <= frontier) return;
             const limit = segmentBytes(segment); // whole huge pages by construction
-            const want = @max(need_bytes, frontier +| SEG_HUGE_CHUNK);
-            const target = @min(std.mem.alignForward(usize, want, hugetlb.HUGE_PAGE), limit);
+            const want = @max(need_bytes, frontier +| segment_huge_chunk_size);
+            const target = @min(std.mem.alignForward(usize, want, hugetlb.huge_page_size), limit);
             if (target <= frontier or target < need_bytes) {
                 @atomicStore(bool, &self.seg_huge_off[segment], true, .monotonic);
                 return;
@@ -689,7 +689,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
     return struct {
         const Self = @This();
 
-        pub const MAX_SLOTS = params.max_slots;
+        pub const max_slots = params.max_slots;
 
         /// Range shape mirrors `StableSegments.Range` so the heap's TLAB
         /// code is store-agnostic. `segment` is always 0 here (one flat
@@ -718,10 +718,10 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         /// overlay-never-covers-data invariant (see `extendHugeFrontier`).
         huge_grow_off: bool,
 
-        const BYTES: usize = @as(usize, params.max_slots) * @sizeOf(T);
+        const byte_count: usize = @as(usize, params.max_slots) * @sizeOf(T);
         /// Only whole huge pages can be overlaid; a sub-2 MB tail stays normal.
-        const HUGE_LIMIT: usize = std.mem.alignBackward(usize, BYTES, hugetlb.HUGE_PAGE);
-        const HUGE_CHUNK: usize = params.huge_chunk;
+        const huge_limit: usize = std.mem.alignBackward(usize, byte_count, hugetlb.huge_page_size);
+        const huge_chunk_size: usize = params.huge_chunk;
 
         pub fn init() !Self {
             var self: Self = .{
@@ -731,8 +731,8 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
                 .huge_frontier = 0,
                 .huge_grow_off = true,
             };
-            const use_huge = comptime_linux and HUGE_LIMIT >= hugetlb.HUGE_PAGE and
-                BYTES % page_size_min == 0 and hugetlb.wanted();
+            const use_huge = comptime_linux and huge_limit >= hugetlb.huge_page_size and
+                byte_count % page_size_min == 0 and hugetlb.wanted();
             const mem: [*]align(page_size_min) u8 = if (use_huge) blk: {
                 // A hugetlb overlay (MAP_FIXED) needs a 2 MB-aligned target,
                 // so over-reserve by one huge page and trim to an aligned
@@ -744,7 +744,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
                 }
                 break :blk try plainMap();
             } else try plainMap();
-            if (comptime params.vma_tag) |tag| Vma.registerRegion(mem, BYTES, tag);
+            if (comptime params.vma_tag) |tag| Vma.registerRegion(mem, byte_count, tag);
             self.base = @ptrCast(@alignCast(mem));
             return self;
         }
@@ -754,7 +754,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         fn plainMap() ![*]align(page_size_min) u8 {
             const mem = std.posix.mmap(
                 null,
-                BYTES,
+                byte_count,
                 .{ .READ = true, .WRITE = true },
                 .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
                 -1,
@@ -763,26 +763,26 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             return mem.ptr;
         }
 
-        /// Reserve `BYTES` of ordinary NORESERVE address space whose base is
+        /// Reserve `byte_count` of ordinary NORESERVE address space whose base is
         /// 2 MB-aligned: map one huge page extra, trim the misaligned head
         /// and the surplus tail. Null on mmap failure (caller falls back).
         fn initAligned() ?[*]align(page_size_min) u8 {
             const mem = std.posix.mmap(
                 null,
-                BYTES + hugetlb.HUGE_PAGE,
+                byte_count + hugetlb.huge_page_size,
                 .{ .READ = true, .WRITE = true },
                 .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true },
                 -1,
                 0,
             ) catch return null;
             const raw = @intFromPtr(mem.ptr);
-            const base = std.mem.alignForward(usize, raw, hugetlb.HUGE_PAGE);
+            const base = std.mem.alignForward(usize, raw, hugetlb.huge_page_size);
             if (base > raw) {
                 const head: [*]align(page_size_min) u8 = @ptrFromInt(raw);
                 std.posix.munmap(head[0 .. base - raw]);
             }
-            const tail_start = base + BYTES;
-            const tail_end = raw + BYTES + hugetlb.HUGE_PAGE;
+            const tail_start = base + byte_count;
+            const tail_end = raw + byte_count + hugetlb.huge_page_size;
             if (tail_end > tail_start) {
                 const tail: [*]align(page_size_min) u8 = @ptrFromInt(tail_start);
                 std.posix.munmap(tail[0 .. tail_end - tail_start]);
@@ -800,7 +800,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             // One munmap covers the mixed hugetlb-prefix + normal-tail VMAs
             // (both are whole VMAs within the range); only the accounting
             // needs to know how much of it was hugetlb.
-            std.posix.munmap(bytes[0..BYTES]);
+            std.posix.munmap(bytes[0..byte_count]);
             if (self.huge_frontier > 0) hugetlb.noteUnmapped(self.huge_frontier);
             self.huge_frontier = 0;
             self.huge_grow_off = true;
@@ -837,14 +837,14 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         /// data. The background pre-toucher (`populateRange`) may have
         /// populated pages above the frontier, but only with kernel zeroes —
         /// discarding them is harmless. Any failure (or running past
-        /// `HUGE_LIMIT`) permanently stops growth so the invariant can never
+        /// `huge_limit`) permanently stops growth so the invariant can never
         /// be violated later; the store's tail then lives on normal pages
         /// exactly like a non-hugetlb run.
         fn extendHugeFrontier(self: *Self, need_bytes: usize) void {
-            const want = @max(need_bytes, self.huge_frontier +| HUGE_CHUNK);
-            const target = @min(std.mem.alignForward(usize, want, hugetlb.HUGE_PAGE), HUGE_LIMIT);
+            const want = @max(need_bytes, self.huge_frontier +| huge_chunk_size);
+            const target = @min(std.mem.alignForward(usize, want, hugetlb.huge_page_size), huge_limit);
             if (target <= self.huge_frontier or target < need_bytes) {
-                // Out of overlayable range (the ≥HUGE_LIMIT tail): stop for good.
+                // Out of overlayable range (the ≥huge_limit tail): stop for good.
                 @atomicStore(bool, &self.huge_grow_off, true, .monotonic);
                 return;
             }
@@ -854,7 +854,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             // under-populates.
             if (hugetlb.overlayFixed(basep + self.huge_frontier, target - self.huge_frontier)) {
                 @atomicStore(usize, &self.huge_frontier, target, .monotonic);
-                if (target == HUGE_LIMIT) @atomicStore(bool, &self.huge_grow_off, true, .monotonic);
+                if (target == huge_limit) @atomicStore(bool, &self.huge_grow_off, true, .monotonic);
             } else {
                 // Pool exhausted (or shrank): the tail continues on normal
                 // pages. Data below the frontier stays on reserved huge
@@ -884,16 +884,16 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
         }
 
         /// Fault in (as-if-written) reservation bytes `[from, to)` via
-        /// `MADV_POPULATE_WRITE` — kernel-side pre-population that never
+        /// `madv_populate_write` — kernel-side pre-population that never
         /// modifies data, so it is race-free against concurrent writers.
         /// Clamped to the reservation; best-effort (Linux-only no-op
         /// elsewhere). Lets a background thread absorb the store's
         /// first-touch minor faults off the evaluating thread.
         pub fn populateRange(self: *Self, from: usize, to: usize) void {
             if (comptime builtin.os.tag != .linux) return;
-            const MADV_POPULATE_WRITE: u32 = 23;
-            const lo = std.mem.alignBackward(usize, @min(from, BYTES), page_size_min);
-            var hi = std.mem.alignForward(usize, @min(to, BYTES), page_size_min);
+            const madv_populate_write: u32 = 23;
+            const lo = std.mem.alignBackward(usize, @min(from, byte_count), page_size_min);
+            var hi = std.mem.alignForward(usize, @min(to, byte_count), page_size_min);
             // Never populate past the hugetlb frontier while the prefix is
             // still growing: those would be ordinary 4 KB pages that the next
             // overlay discards and re-faults as huge pages — pure double-fault
@@ -905,7 +905,7 @@ pub fn FlatStore(comptime T: type, comptime params_in: anytype, comptime Vma: ty
             }
             if (hi <= lo) return;
             const bytes: [*]align(page_size_min) u8 = @ptrCast(@alignCast(self.base));
-            _ = std.os.linux.madvise(bytes + lo, hi - lo, MADV_POPULATE_WRITE);
+            _ = std.os.linux.madvise(bytes + lo, hi - lo, madv_populate_write);
         }
 
         /// A flat store has a single region, so the global id IS the

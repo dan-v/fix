@@ -23,7 +23,7 @@ const segments = @import("base").segments;
 /// A name is an index into the node store, biased by 1 so `0` means "no name"
 /// (the root) without storing a sentinel node.
 pub const NameId = u32;
-pub const NAME_ROOT: NameId = 0;
+pub const root_name_id: NameId = 0;
 
 pub const NameTree = struct {
     const Node = struct {
@@ -48,7 +48,7 @@ pub const NameTree = struct {
     }
 
     pub fn isRoot(id: NameId) bool {
-        return id == NAME_ROOT;
+        return id == root_name_id;
     }
 
     /// Write the fully-qualified path for `id` (nothing for the root). Segments
@@ -58,18 +58,18 @@ pub const NameTree = struct {
     }
 
     fn writeNode(self: *const NameTree, w: *std.Io.Writer, id: NameId, intern: *const InternTable) !void {
-        if (id == NAME_ROOT) return;
+        if (id == root_name_id) return;
         if (id - 1 >= self.nodes.count()) return;
         const node = self.nodes.get(id - 1).*;
         try self.writeNode(w, node.parent, intern); // ancestors first
         // A leading separator before every segment except the root-most one.
-        if (node.parent != NAME_ROOT) try w.writeAll(if (node.synthetic) "·" else ".");
+        if (node.parent != root_name_id) try w.writeAll(if (node.synthetic) "·" else ".");
         try w.writeAll(intern.get(node.segment));
     }
 
     /// Whether `id` names anything (has at least one segment).
     pub fn isNamed(self: *const NameTree, id: NameId) bool {
-        return id != NAME_ROOT and id - 1 < self.nodes.count();
+        return id != root_name_id and id - 1 < self.nodes.count();
     }
 };
 
@@ -80,7 +80,7 @@ test "name tree renders qualified paths and shares prefixes" {
     var tree: NameTree = .{};
     defer tree.deinit(testing.allocator);
 
-    const pkgs = try tree.child(testing.allocator, NAME_ROOT, try intern.intern("pkgs"), false);
+    const pkgs = try tree.child(testing.allocator, root_name_id, try intern.intern("pkgs"), false);
     const hello = try tree.child(testing.allocator, pkgs, try intern.intern("hello"), false);
     const world = try tree.child(testing.allocator, pkgs, try intern.intern("world"), false);
     const over = try tree.child(testing.allocator, hello, try intern.intern("override"), false);
@@ -95,6 +95,6 @@ test "name tree renders qualified paths and shares prefixes" {
     try testing.expectEqualStrings("pkgs.world", buf[0..w.end]);
 
     w = .fixed(&buf);
-    try tree.writeQualified(&w, NAME_ROOT, &intern);
+    try tree.writeQualified(&w, root_name_id, &intern);
     try testing.expectEqual(@as(usize, 0), w.end);
 }

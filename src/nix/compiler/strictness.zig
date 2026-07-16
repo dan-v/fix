@@ -161,7 +161,7 @@ const Analyzer = struct {
     fn trySelfCall(self: *Analyzer, node: *const Node, self_name: InternId, out: *Strictness) !bool {
         // Flatten `f a0 a1 …` (right-nested `apply{apply{f, a0}, a1}`) into the
         // call head plus args; `args_rev[0]` is the outermost (last) argument.
-        var args_rev: [types.MAX_UNCURRY_ARITY]*const Node = undefined;
+        var args_rev: [types.max_uncurry_arity]*const Node = undefined;
         var n_args: usize = 0;
         var cur: *const Node = node;
         while (cur.tag == .apply) {

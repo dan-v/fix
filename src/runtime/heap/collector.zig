@@ -67,7 +67,7 @@ pub fn enableCollect(heap: *ObjectHeap, budget: u64, step_bytes: u64) void {
     // requests a collect once the cursor has grown a headroom past the last
     // collect (`gcAfterCollect` re-arms the threshold), so we don't collect
     // every TLAB refill.
-    heap.gc_threshold_bytes = if (step_bytes > 0) ObjectHeap.GC_MIN_THRESHOLD else budget;
+    heap.gc_threshold_bytes = if (step_bytes > 0) ObjectHeap.gc_min_threshold else budget;
     // Validation path arms eagerly (bootstrap_end == the arming count, so the
     // pre-arming region is empty), but turn on constrained mode so the always-
     // on transient-root gates are exercised. `armTracking` sets gc_root_active.
@@ -154,7 +154,7 @@ pub fn armLazy(heap: *ObjectHeap) void {
     armTracking(heap);
     heap.gc_collect_requested = false;
     const budget = ObjectHeap.gc_budget_bytes;
-    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.GC_HEADROOM);
+    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
     heap.gc_threshold_bytes = @max(budget, heap.totalReservedBytes() + headroom);
 }
 
@@ -170,7 +170,7 @@ pub fn runCollect(heap: *ObjectHeap, collector_id: u8) void {
 /// returns freed ranges to the free lists but never lowers
 /// `totalReservedBytes` — so the threshold must be relative to the
 /// CURSOR NOW, not the live set: collect again only once we've committed
-/// another `GC_HEADROOM` of genuinely fresh pages (i.e. the free lists
+/// another `gc_headroom` of genuinely fresh pages (i.e. the free lists
 /// drained and the cursor actually grew). Anchoring to live would leave
 /// the threshold permanently below the cursor → collect every safepoint
 /// (livelock). `live_bytes` is accepted for stats only.
@@ -178,11 +178,11 @@ pub fn afterCollect(heap: *ObjectHeap, live_bytes: u64) void {
     _ = live_bytes;
     heap.gc_collect_requested = false;
     // Post-collect headroom scales with the budget (an eighth, clamped to
-    // [64 MB, GC_HEADROOM]): a small-RAM budget must not grant itself a
+    // [64 MB, gc_headroom]): a small-RAM budget must not grant itself a
     // flat 1 GB of growth per cycle, and a huge budget needn't collect
     // every 64 MB once it has (somehow) been crossed.
     const budget = ObjectHeap.gc_budget_bytes;
-    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.GC_HEADROOM);
+    const headroom = std.math.clamp(budget / 8, 64 << 20, ObjectHeap.gc_headroom);
     heap.gc_threshold_bytes = if (ObjectHeap.gc_step_bytes > 0)
         heap.totalReservedBytes() + ObjectHeap.gc_step_bytes
     else
@@ -262,7 +262,7 @@ pub fn verifyMinorClosure(heap: *ObjectHeap, mark_bits: []const u64) void {
                 check(heap, mark_bits, id, Value.attrs(m.base), &shown);
                 check(heap, mark_bits, id, Value.attrs(m.overlay), &shown);
                 const flat = m.flattened.load(.monotonic);
-                if (flat != heap_mod.NO_FLAT) check(heap, mark_bits, id, Value.attrs(flat), &shown);
+                if (flat != heap_mod.no_flattened_attrs) check(heap, mark_bits, id, Value.attrs(flat), &shown);
             },
             .thunk => |*t| {
                 const FutureState = @import("../future.zig").FutureState;
@@ -414,8 +414,8 @@ pub fn finishEvac(heap: *ObjectHeap) ObjectHeap.MinorStats {
 // disjoint, so the per-slot bit clears need no atomics. Coordinated like the
 // evac phase: the collector reconstructs the alloc bitmap serially, opens the
 // phase, sweeps alongside the peers, then waits for done. A `chunk` never
-// straddles a 64-bit alloc-bit word (SWEEP_CHUNK is a multiple of 64).
-const SWEEP_CHUNK: usize = 1 << 15; // 32768 ids = 512 alloc-bit words
+// straddles a 64-bit alloc-bit word (sweep_chunk_size is a multiple of 64).
+const sweep_chunk_size: usize = 1 << 15; // 32768 ids = 512 alloc-bit words
 
 /// Collector: reconstruct the alloc bitmap (release) — or verify mark closure
 /// (debug) — so the parallel sweep reads a valid filled-set. Call after the
@@ -435,9 +435,9 @@ pub fn sweepClaimLoop(heap: *ObjectHeap, mark_bits: []const u64) void {
     var freed: u64 = 0;
     while (true) {
         const chunk = heap.gc_sweep_next.fetchAdd(1, .monotonic);
-        const lo: usize = @as(usize, chunk) * SWEEP_CHUNK;
+        const lo: usize = @as(usize, chunk) * sweep_chunk_size;
         if (lo >= n) break;
-        const hi: usize = @min(lo + SWEEP_CHUNK, n);
+        const hi: usize = @min(lo + sweep_chunk_size, n);
         var id: ObjectId = @intCast(lo);
         while (id < hi) : (id += 1) {
             const word = id >> 6;
@@ -533,7 +533,7 @@ pub fn freeObjectRanges(heap: *ObjectHeap, local: *HeapLocal, obj: *const Object
     // of silently reading stale-but-valid data. Poison is a thunk to an
     // unallocated id, so forcing/reading a poisoned element hits gcAssertLive.
     if (comptime gc_debug) {
-        const poison = Value.thunk(heap_mod.OBJECT_MAX_SLOTS - 1);
+        const poison = Value.thunk(heap_mod.object_max_slots - 1);
         switch (obj.*) {
             .list => |r| for (heap.values.sliceMut(r)) |*v| {
                 v.* = poison;

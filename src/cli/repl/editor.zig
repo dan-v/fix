@@ -44,12 +44,12 @@ pub const Completer = struct {
     };
 
     pub fn none() Completer {
-        const F = struct {
+        const Callbacks = struct {
             fn complete(_: *anyopaque, _: std.mem.Allocator, _: []const u8, cursor: usize) anyerror!Result {
                 return .{ .start = cursor, .end = cursor, .items = &.{} };
             }
         };
-        return .{ .ctx = undefined, .completeFn = F.complete };
+        return .{ .ctx = undefined, .completeFn = Callbacks.complete };
     }
 };
 
@@ -59,12 +59,12 @@ pub const CompleteCheck = struct {
     isCompleteFn: *const fn (ctx: *anyopaque, text: []const u8) bool,
 
     pub fn always() CompleteCheck {
-        const F = struct {
+        const Callbacks = struct {
             fn is(_: *anyopaque, _: []const u8) bool {
                 return true;
             }
         };
-        return .{ .ctx = undefined, .isCompleteFn = F.is };
+        return .{ .ctx = undefined, .isCompleteFn = Callbacks.is };
     }
 };
 

@@ -31,7 +31,7 @@ const FutureState = @import("future.zig").FutureState;
 
 /// A `attrs_merge` whose `flattened` memo equals this has no flattened
 /// object to follow. Single source of truth in `heap.zig`.
-const NO_FLAT: ObjectId = heap_mod.NO_FLAT;
+const no_flattened_attrs: ObjectId = heap_mod.no_flattened_attrs;
 
 /// Live-set tally accumulated by one mark pass: object slots reached, the
 /// value/attr/attr-pos store slots they own, and the total live bytes
@@ -485,7 +485,7 @@ fn scanObject(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, id: Obj
             sink.markObject(heap, m.base);
             sink.markObject(heap, m.overlay);
             const flat = m.flattened.load(.monotonic);
-            if (flat != NO_FLAT) sink.markObject(heap, flat);
+            if (flat != no_flattened_attrs) sink.markObject(heap, flat);
         },
         .closure => |c| scanValues(Sink, sink, heap, c.upvalues),
         .builtin_closure => |c| scanValues(Sink, sink, heap, c.args),
@@ -525,14 +525,14 @@ fn scanThunk(comptime Sink: type, sink: *Sink, heap: *const ObjectHeap, t: *cons
                 const ups = bt.upvalues();
                 // Spilled upvalues live in the value store and belong to this
                 // thunk; inline ones are inside the slot.
-                if (bt.upvalue_count > thunk_mod.BytecodeThunk.INLINE_CAP)
+                if (bt.upvalue_count > thunk_mod.BytecodeThunk.inline_capacity)
                     sink.countValues(ups.len);
                 for (ups) |v| sink.markValue(heap, v);
             },
             .deferred => {
                 const dt = &t.payload.target.deferred;
                 const env = dt.env();
-                if (dt.env_count > thunk_mod.DeferredThunk.INLINE_CAP)
+                if (dt.env_count > thunk_mod.DeferredThunk.inline_capacity)
                     sink.countValues(env.len);
                 for (env) |v| sink.markValue(heap, v);
             },
@@ -831,25 +831,25 @@ test "tracer markObject ignores objects outside the reset range" {
     try std.testing.expectEqual(@as(usize, 0), live_ids.len);
 }
 
-test "tracer: parallel mark reaches exactly the live set (K markers, stealing)" {
+test "tracer: parallel mark reaches exactly the live set (marker_count markers, stealing)" {
     const allocator = std.testing.allocator;
     var heap = try ObjectHeap.init(allocator, 1);
     defer heap.deinit();
 
-    // Wide + deep graph so stealing is actually exercised: a root list of C
-    // chain-heads, each chain a depth-D spine of 1-element lists. All objects
-    // are distinct (append-only store), so the live set is exactly C*D + 1.
-    const C = 512;
-    const D = 8;
-    var heads: [C]Value = undefined;
+    // Wide + deep graph so stealing is actually exercised: a root list of chain_count
+    // chain-heads, each chain a depth-chain_depth spine of 1-element lists. All objects
+    // are distinct (append-only store), so the live set is exactly chain_count*chain_depth + 1.
+    const chain_count = 512;
+    const chain_depth = 8;
+    var heads: [chain_count]Value = undefined;
     for (&heads) |*h| {
         var node = try heap.addList(&.{Value.int(0)}); // innermost (1 object)
         var d: usize = 1;
-        while (d < D) : (d += 1) node = try heap.addList(&.{Value.list(node)});
+        while (d < chain_depth) : (d += 1) node = try heap.addList(&.{Value.list(node)});
         h.* = Value.list(node);
     }
     const root = try heap.addList(&heads);
-    const live_expected: u64 = @as(u64, C) * D + 1;
+    const live_expected: u64 = @as(u64, chain_count) * chain_depth + 1;
 
     // Garbage the mark must NOT reach.
     const g1 = try heap.addList(&.{Value.int(1)});
@@ -864,17 +864,17 @@ test "tracer: parallel mark reaches exactly the live set (K markers, stealing)" 
     var tr = Tracer.init(allocator);
     defer tr.deinit();
 
-    const K = 4;
+    const marker_count = 4;
     // Repeat: a parallel-mark data race is rare, so hammer it.
     var iter: usize = 0;
     while (iter < 50) : (iter += 1) {
-        try tr.resetParallel(heap.objects.count(), K);
+        try tr.resetParallel(heap.objects.count(), marker_count);
         // Seed the single root into marker 0; stealing spreads the rest.
         tr.beginSeeding(0);
         tr.markValue(&heap, Value.list(root));
         tr.endSeeding();
 
-        var threads: [K]std.Thread = undefined;
+        var threads: [marker_count]std.Thread = undefined;
         for (&threads, 0..) |*th, id|
             th.* = try std.Thread.spawn(.{}, Worker.drain, .{ &tr, &heap, id });
         for (&threads) |th| th.join();

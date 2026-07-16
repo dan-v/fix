@@ -4,45 +4,45 @@
 const std = @import("std");
 
 /// How many worker threads to spawn for the evaluation pool.
-pub const DEFAULT_WORKER_COUNT: u8 = 4;
+pub const default_worker_count: u8 = 4;
 
 /// Maximum value stack slots for a VM.
-pub const VM_STACK_CAP: usize = 65_536;
+pub const vm_stack_capacity: usize = 65_536;
 
 /// Maximum physical call frame depth. Bounds non-tail recursion (tail
-/// calls reuse a frame). Kept comfortably above `DEFAULT_MAX_CALL_DEPTH`
+/// calls reuse a frame). Kept comfortably above `default_max_call_depth`
 /// so the logical call-depth cap (which matches Nix's `max-call-depth`)
 /// fires with a proper "stack overflow" error before the physical frame
 /// array is exhausted on legitimate deep non-tail recursion.
-pub const MAX_FRAMES: usize = 20_000;
+pub const max_frames: usize = 20_000;
 
 /// Default logical call-depth limit, matching Nix/Lix's `max-call-depth`
 /// setting (10000). Incremented on every function application including
 /// tail calls; when it is exceeded the evaluator raises a
 /// "stack overflow; max-call-depth exceeded" error. Overridable via
 /// `--option max-call-depth N`.
-pub const DEFAULT_MAX_CALL_DEPTH: u32 = 10_000;
+pub const default_max_call_depth: u32 = 10_000;
 
 /// Hard cap on how many adjacent value-lambda params the compiler merges
 /// into one uncurried chunk (`compiler/lambda.zig compileLambda`), and thus
 /// the largest `Chunk.arity` / partial-application arg count. Bounds the
 /// on-stack arg buffers in the VM's PAP machinery. Chains longer than
 /// this stay curried beyond the cap.
-pub const MAX_UNCURRY_ARITY: u16 = 4;
+pub const max_uncurry_arity: u16 = 4;
 
 /// Initial capacity for a bytecode chunk constant pool.
-pub const CHUNK_CONSTANTS_CAP: usize = 128;
+pub const chunk_constants_capacity: usize = 128;
 
 /// Initial capacity for bytecode in a chunk.
-pub const CHUNK_CODE_CAP: usize = 256;
+pub const chunk_code_capacity: usize = 256;
 
 /// A small identifier for interned strings.
 pub const InternId = u32;
-pub const INTERN_ID_NONE: InternId = std.math.maxInt(InternId);
+pub const no_intern_id: InternId = std.math.maxInt(InternId);
 
 /// The ID of a bytecode chunk in a global table.
 pub const ChunkId = u32;
-pub const CHUNK_ID_NONE: ChunkId = std.math.maxInt(ChunkId);
+pub const no_chunk_id: ChunkId = std.math.maxInt(ChunkId);
 
 /// An index into a worker's stack.
 pub const StackIdx = u32;
@@ -52,4 +52,4 @@ pub const ConstIdx = u16;
 
 /// An index into the evaluator object heap.
 pub const ObjectId = u32;
-pub const OBJECT_ID_NONE: ObjectId = std.math.maxInt(ObjectId);
+pub const no_object_id: ObjectId = std.math.maxInt(ObjectId);

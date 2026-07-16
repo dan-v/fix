@@ -19,11 +19,11 @@ const ObjectId = heap_mod.ObjectId;
 
 /// Inclusive bound of the inline-int payload. Values strictly outside
 /// this range are heap-boxed via `boxed_int`.
-const I48_MIN: i64 = -(@as(i64, 1) << 47);
-const I48_MAX: i64 = (@as(i64, 1) << 47) - 1;
+const i48_min: i64 = -(@as(i64, 1) << 47);
+const i48_max: i64 = (@as(i64, 1) << 47) - 1;
 
 inline fn fitsInline(v: i64) bool {
-    return v >= I48_MIN and v <= I48_MAX;
+    return v >= i48_min and v <= i48_max;
 }
 
 /// Construct a Value carrying `v`. Inlines when `|v| < 2^47`; boxes

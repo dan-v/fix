@@ -17,8 +17,8 @@ pub const ClosureCaptures = model.ClosureCaptures;
 pub const SchedulingHints = model.SchedulingHints;
 
 pub const ChunkBuilder = builder.ChunkBuilder;
-pub const SPECULATION_MIN_CODE_BYTES = builder.SPECULATION_MIN_CODE_BYTES;
-pub const SPECULATION_TRUSTED_CODE_BYTES = builder.SPECULATION_TRUSTED_CODE_BYTES;
+pub const speculation_min_code_bytes = builder.speculation_min_code_bytes;
+pub const speculation_trusted_code_bytes = builder.speculation_trusted_code_bytes;
 
 pub const WellKnownChunks = registry.WellKnownChunks;
 pub const ChunkRegistry = registry.ChunkRegistry;

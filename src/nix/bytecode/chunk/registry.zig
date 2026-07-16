@@ -62,7 +62,7 @@ pub const ChunkRegistry = struct {
         /// Qualified-name node in `name_tree` (0 = anonymous). Always populated
         /// (not gated), cheap, thread-safe — this is what traces/errors/disasm
         /// read for a chunk's `pkgs.hello`-style name.
-        name: name_tree_mod.NameId = name_tree_mod.NAME_ROOT,
+        name: name_tree_mod.NameId = name_tree_mod.root_name_id,
         trivial: TrivialBody,
         body_is_substantial: bool,
         /// Untrusted-band bit (see `SchedulingHints.spec_band_small`):
@@ -496,7 +496,7 @@ pub const ChunkRegistry = struct {
     }
 
     pub fn register(self: *ChunkRegistry, chunk: Chunk) !ChunkId {
-        return self.registerNamed(chunk, name_tree_mod.NAME_ROOT);
+        return self.registerNamed(chunk, name_tree_mod.root_name_id);
     }
 
     /// `register`, tagging the chunk with its qualified-name node (see
@@ -862,11 +862,11 @@ test "chunk dedup: structurally identical registrations share one id" {
     var registry = try ChunkRegistry.init(allocator);
     defer registry.deinit();
 
-    const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.NAME_ROOT);
+    const first = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.root_name_id);
     try std.testing.expect(!first.reused);
 
     var copy = try buildDedupTestChunk(allocator, 7, 1);
-    const second = try registry.registerDeduped(copy, name_tree_mod.NAME_ROOT);
+    const second = try registry.registerDeduped(copy, name_tree_mod.root_name_id);
     try std.testing.expect(second.reused);
     try std.testing.expectEqual(first.id, second.id);
     // reused=true ⇒ the registry kept the first registration; the caller
@@ -879,9 +879,9 @@ test "chunk dedup: a differing constant or span is a distinct registration" {
     var registry = try ChunkRegistry.init(allocator);
     defer registry.deinit();
 
-    const base = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.NAME_ROOT);
-    const other_const = try registry.registerDeduped(try buildDedupTestChunk(allocator, 8, 1), name_tree_mod.NAME_ROOT);
-    const other_span = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 2), name_tree_mod.NAME_ROOT);
+    const base = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 1), name_tree_mod.root_name_id);
+    const other_const = try registry.registerDeduped(try buildDedupTestChunk(allocator, 8, 1), name_tree_mod.root_name_id);
+    const other_span = try registry.registerDeduped(try buildDedupTestChunk(allocator, 7, 2), name_tree_mod.root_name_id);
 
     try std.testing.expect(!other_const.reused);
     try std.testing.expect(!other_span.reused);
@@ -909,13 +909,13 @@ test "chunk dedup: concurrent registrations converge (equal) and stay distinct (
                 // thread's shard-map insert won the race (`registerDeduped`
                 // returns the winner even for the losing racer).
                 var equal = buildDedupTestChunk(alloc, 4242, 1) catch @panic("chunk build failed");
-                const re = reg.registerDeduped(equal, name_tree_mod.NAME_ROOT) catch @panic("registerDeduped failed");
+                const re = reg.registerDeduped(equal, name_tree_mod.root_name_id) catch @panic("registerDeduped failed");
                 if (re.reused) equal.deinit(alloc);
                 e.* = re.id;
 
                 // Per-(thread, iteration) unique constant: never merged.
                 var distinct = buildDedupTestChunk(alloc, @intCast(t_idx * 100_000 + i), 1) catch @panic("chunk build failed");
-                const rd = reg.registerDeduped(distinct, name_tree_mod.NAME_ROOT) catch @panic("registerDeduped failed");
+                const rd = reg.registerDeduped(distinct, name_tree_mod.root_name_id) catch @panic("registerDeduped failed");
                 if (rd.reused) distinct.deinit(alloc);
                 d.* = rd.id;
             }

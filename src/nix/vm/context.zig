@@ -88,9 +88,9 @@ pub const BufferPool = struct {
         // bucket so the report separates them from transient blocks.
         const prev_tag = vma.setAllocTag(.worker_arena);
         defer _ = vma.setAllocTag(prev_tag);
-        const value_stack = try self.allocator.alloc(Value, types.VM_STACK_CAP);
+        const value_stack = try self.allocator.alloc(Value, types.vm_stack_capacity);
         errdefer self.allocator.free(value_stack);
-        const frames = try self.allocator.alloc(Frame, types.MAX_FRAMES);
+        const frames = try self.allocator.alloc(Frame, types.max_frames);
         return .{ .stack = value_stack, .frames = frames };
     }
 
@@ -250,18 +250,18 @@ pub const VM = struct {
     /// Where `stack`/`frames` came from and where `deinit` returns them:
     /// the evaluator's shared pool, or (null — tests, tools) `allocator`.
     buffer_pool: ?*BufferPool,
-    /// The value stack. Fixed capacity = VM_STACK_CAP; `sp` is the
+    /// The value stack. Fixed capacity = vm_stack_capacity; `sp` is the
     /// logical length.
     stack: []Value,
     /// Stack pointer — index of the next push slot.
     sp: u32,
     /// Max value of `sp` ever observed on this VM since construction.
     /// Updated on every push/pushFrame so we can report stack
-    /// high-water for sizing future VM_STACK_CAP defaults. Not reset
+    /// high-water for sizing future vm_stack_capacity defaults. Not reset
     /// when sp is reset between tasks (so the peak is across all tasks
     /// this VM has executed).
     sp_high_water: u32,
-    /// Call frames. Fixed capacity = MAX_FRAMES; `frames_len` is the
+    /// Call frames. Fixed capacity = max_frames; `frames_len` is the
     /// logical count.
     frames: []Frame,
     frames_len: u32,
@@ -402,9 +402,9 @@ pub const VM = struct {
 
     pub fn init(options: Init) !VM {
         const bufs: BufferPool.Buffers = if (options.buffer_pool) |bp| try bp.acquire() else blk: {
-            const value_stack = try options.allocator.alloc(Value, types.VM_STACK_CAP);
+            const value_stack = try options.allocator.alloc(Value, types.vm_stack_capacity);
             errdefer options.allocator.free(value_stack);
-            const frames = try options.allocator.alloc(Frame, types.MAX_FRAMES);
+            const frames = try options.allocator.alloc(Frame, types.max_frames);
             break :blk .{ .stack = value_stack, .frames = frames };
         };
         const value_stack = bufs.stack;

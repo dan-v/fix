@@ -11,10 +11,10 @@ const Token = token.Token;
 // Branchless character classification: one table lookup + mask instead of a
 // chain of range comparisons, run once per source byte in the identifier /
 // number / path scanning loops.
-const C_IDENT_START: u8 = 1; // a-z A-Z _
-const C_DIGIT: u8 = 2; // 0-9
-const C_IDENT_CONT: u8 = 4; // ident-start, digit, '-', '\'', '_'
-const C_PATH_CONT: u8 = 8; // ident, digit, '/', '.', '-', '_', '+'
+const char_ident_start: u8 = 1; // a-z A-Z _
+const char_digit: u8 = 2; // 0-9
+const char_ident_continue: u8 = 4; // ident-start, digit, '-', '\'', '_'
+const char_path_continue: u8 = 8; // ident, digit, '/', '.', '-', '_', '+'
 
 const class_table = blk: {
     var tbl = [_]u8{0} ** 256;
@@ -23,10 +23,10 @@ const class_table = blk: {
         const alpha = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
         const digit = c >= '0' and c <= '9';
         var f: u8 = 0;
-        if (alpha) f |= C_IDENT_START;
-        if (digit) f |= C_DIGIT;
-        if (alpha or digit or c == '-' or c == '\'' or c == '_') f |= C_IDENT_CONT;
-        if (alpha or digit or c == '/' or c == '.' or c == '-' or c == '_' or c == '+') f |= C_PATH_CONT;
+        if (alpha) f |= char_ident_start;
+        if (digit) f |= char_digit;
+        if (alpha or digit or c == '-' or c == '\'' or c == '_') f |= char_ident_continue;
+        if (alpha or digit or c == '/' or c == '.' or c == '-' or c == '_' or c == '+') f |= char_path_continue;
         tbl[ci] = f;
     }
     break :blk tbl;
@@ -56,7 +56,7 @@ inline fn maskLe(v: Vec, comptime c: u8) VMask {
 }
 
 /// Mask of bytes in the identifier-continue class (a-z A-Z 0-9 - ' _),
-/// mirroring `C_IDENT_CONT` in `class_table`.
+/// mirroring `char_ident_continue` in `class_table`.
 inline fn maskIdentCont(v: Vec) VMask {
     const lower = maskGe(v, 'a') & maskLe(v, 'z');
     const upper = maskGe(v, 'A') & maskLe(v, 'Z');
@@ -313,7 +313,7 @@ pub const Scanner = struct {
                 self.pos += vec_len;
             }
         }
-        while (self.pos < self.source.len and hasClass(self.source[self.pos], C_IDENT_CONT)) {
+        while (self.pos < self.source.len and hasClass(self.source[self.pos], char_ident_continue)) {
             self.pos += 1;
         }
         // A `/` abutting the identifier's characters makes the whole token a
@@ -443,15 +443,15 @@ pub const Scanner = struct {
     }
 
     fn isAlpha(c: u8) bool {
-        return hasClass(c, C_IDENT_START);
+        return hasClass(c, char_ident_start);
     }
 
     fn isDigit(c: u8) bool {
-        return hasClass(c, C_DIGIT);
+        return hasClass(c, char_digit);
     }
 
     fn isPathContinue(c: u8) bool {
-        return hasClass(c, C_PATH_CONT);
+        return hasClass(c, char_path_continue);
     }
 
     /// True when `self.pos` sits at a `/` that opens a further path segment,
@@ -464,15 +464,15 @@ pub const Scanner = struct {
         if (self.peek() != '/') return false;
         const c = self.peekAhead(1);
         if (c == '$' and self.peekAhead(2) == '{') return true;
-        return c != '/' and hasClass(c, C_PATH_CONT);
+        return c != '/' and hasClass(c, char_path_continue);
     }
 
     fn isSearchPathStart(c: u8) bool {
-        return hasClass(c, C_IDENT_START) or c == '.' or c == '-';
+        return hasClass(c, char_ident_start) or c == '.' or c == '-';
     }
 
     fn isSearchPathContinue(c: u8) bool {
-        return hasClass(c, C_PATH_CONT);
+        return hasClass(c, char_path_continue);
     }
 
     // Keyword lookup: dispatch on length (a jump table) then compare the few

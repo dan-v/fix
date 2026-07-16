@@ -84,15 +84,15 @@ fn fiberMergeInto(t: *FiberLocal, local: *const FiberLocal) void {
 /// decremented when the fiber finishes. Sampled into a linear histogram
 /// at each increment — biased toward busy phases, which is exactly the
 /// "does the live count spike past the worker count?" question.
-pub const FIB_LIVE_BUCKETS = 129; // 0..127 exact, last bucket = >=128
+pub const fiber_live_buckets = 129; // 0..127 exact, last bucket = >=128
 pub var fib_live: std.atomic.Value(u32) = .init(0);
 pub var fib_live_max: std.atomic.Value(u32) = .init(0);
-pub var fib_live_hist: [FIB_LIVE_BUCKETS]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+pub var fib_live_hist: [fiber_live_buckets]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
 
 pub inline fn fiberLiveInc() void {
     if (!enabled) return;
     const now = fib_live.fetchAdd(1, .monotonic) + 1;
-    const bucket: usize = @min(now, FIB_LIVE_BUCKETS - 1);
+    const bucket: usize = @min(now, fiber_live_buckets - 1);
     _ = fib_live_hist[bucket].fetchAdd(1, .monotonic);
     var cur = fib_live_max.load(.monotonic);
     while (now > cur) {
@@ -147,7 +147,7 @@ pub fn report() void {
         for (&fib_live_hist, 0..) |*n, i| {
             const v = n.load(.monotonic);
             if (v == 0) continue;
-            if (i == FIB_LIVE_BUCKETS - 1) {
+            if (i == fiber_live_buckets - 1) {
                 std.debug.print(" [>={d}]={d}", .{ i, v });
             } else {
                 std.debug.print(" [{d}]={d}", .{ i, v });

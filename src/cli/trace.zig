@@ -198,9 +198,9 @@ fn runDiff(init: std.process.Init, path_a: []const u8, path_b: []const u8) !u8 {
 
     // We hold a small ring of recent events from each side so we can
     // print context once a divergence is found.
-    const CONTEXT: usize = 8;
-    var ring_a: [CONTEXT]Event = undefined;
-    var ring_b: [CONTEXT]Event = undefined;
+    const context_line_count: usize = 8;
+    var ring_a: [context_line_count]Event = undefined;
+    var ring_b: [context_line_count]Event = undefined;
     var ring_a_len: usize = 0;
     var ring_b_len: usize = 0;
 
@@ -292,7 +292,7 @@ fn canonicalize(
 }
 
 fn canonId(allocator: std.mem.Allocator, map: *std.AutoArrayHashMapUnmanaged(u32, u32), id: u32) !u32 {
-    if (id == std.math.maxInt(u32)) return id; // CHUNK_ID_NONE sentinel
+    if (id == std.math.maxInt(u32)) return id; // no_chunk_id sentinel
     const gop = try map.getOrPut(allocator, id);
     if (!gop.found_existing) gop.value_ptr.* = @intCast(map.count() - 1);
     return gop.value_ptr.*;

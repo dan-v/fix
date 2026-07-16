@@ -337,7 +337,7 @@ fn sortedEntryIndex(entries: []const heap_mod.AttrEntry, name: InternId) ?usize 
 /// `intersectAttrs (functionArgs f) pkgs` intersects ~10 formal args with a
 /// tens-of-thousands-entry package set; the O(left+right) merge walk paid
 /// ~12K cycles per call scanning entries the small side can never match.
-const INTERSECT_SKEW = 8;
+const intersection_skew = 8;
 
 pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Value {
     const left = try vm_force.forceValue(self, left_arg);
@@ -353,11 +353,11 @@ pub fn builtinIntersectAttrs(self: *VM, left_arg: Value, right_arg: Value) !Valu
     // All three paths emit the same set — the RIGHT entry for every name
     // present in both — walking names in ascending order, so the output
     // is identical regardless of which strategy runs.
-    if (left_entries.len / INTERSECT_SKEW > right_entries.len) {
+    if (left_entries.len / intersection_skew > right_entries.len) {
         for (right_entries) |re| {
             if (sortedEntryIndex(left_entries, re.name) != null) entries.appendAssumeCapacity(re);
         }
-    } else if (right_entries.len / INTERSECT_SKEW > left_entries.len) {
+    } else if (right_entries.len / intersection_skew > left_entries.len) {
         for (left_entries) |le| {
             if (sortedEntryIndex(right_entries, le.name)) |ri| entries.appendAssumeCapacity(right_entries[ri]);
         }

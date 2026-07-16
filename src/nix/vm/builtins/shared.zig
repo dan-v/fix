@@ -19,14 +19,14 @@ const vm_trace = @import("../trace.zig");
 /// an integer-valued float gets a ".0" suffix (`1.0`, `100.0`, and `1e10` →
 /// "10000000000.0"). Non-finite values serialize as JSON `null`, as nlohmann
 /// does. Writes into `buf` and returns the slice; `buf` must be large enough
-/// for the fixed-point expansion (use `JSON_FLOAT_BUF`).
+/// for the fixed-point expansion (use `json_float_buffer_size`).
 ///
 /// NB: nlohmann switches to exponent notation at large/small magnitudes
 /// (`1e+20`, `1e-06`); Zig's `{d}` stays fixed-point, so those extremes differ
 /// (and would already have differed — this only adds the missing ".0"). Every
 /// float in normal Nix data, including all module-option docs, lies in the
 /// fixed-point range where this matches Nix exactly.
-pub const JSON_FLOAT_BUF = 512;
+pub const json_float_buffer_size = 512;
 pub fn jsonFloatText(buf: []u8, v: f64) []const u8 {
     if (!std.math.isFinite(v)) return "null";
     const s = std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
@@ -87,7 +87,7 @@ pub const NameIndex = struct {
 
     /// Linear-scan cutoff. Below this the scan is cheaper than hashing;
     /// crossing it pays one O(n) build and then O(1) per lookup.
-    const THRESHOLD: usize = 32;
+    const streaming_threshold: usize = 32;
 
     pub fn deinit(self: *NameIndex, allocator: std.mem.Allocator) void {
         self.map.deinit(allocator);
@@ -98,7 +98,7 @@ pub const NameIndex = struct {
     /// appends (names unique), so the built map stays in sync.
     pub fn find(self: *NameIndex, allocator: std.mem.Allocator, items: anytype, name: InternId) !?usize {
         if (!self.built) {
-            if (items.len < THRESHOLD) return groupIndex(items, name);
+            if (items.len < streaming_threshold) return groupIndex(items, name);
             try self.map.ensureTotalCapacity(allocator, @intCast(items.len));
             for (items, 0..) |item, i| self.map.putAssumeCapacity(item.name, i);
             self.built = true;

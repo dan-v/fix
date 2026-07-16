@@ -51,15 +51,15 @@ const worker_id = @import("base").worker_id;
 pub const enabled: bool = build_options.prof_path and builtin.cpu.arch == .x86_64;
 
 /// Key space (chunk ids on a NixOS toplevel top out in the low
-/// millions, far under BUILTIN_BASE):
-///   key < BUILTIN_BASE        → a real `ChunkId` (bytecode/closure body)
-///   BUILTIN_BASE + builtin_id → a builtin body
-///   KEY_PASS_THROUGH / KEY_OTHER → synthetic
-pub const BUILTIN_BASE: u32 = 0xFF00_0000;
-pub const KEY_PASS_THROUGH: u32 = 0xFFFF_0001;
-pub const KEY_OTHER: u32 = 0xFFFF_0002;
+/// millions, far under builtin_key_base):
+///   key < builtin_key_base        → a real `ChunkId` (bytecode/closure body)
+///   builtin_key_base + builtin_id → a builtin body
+///   pass_through_key / other_key → synthetic
+pub const builtin_key_base: u32 = 0xFF00_0000;
+pub const pass_through_key: u32 = 0xFFFF_0001;
+pub const other_key: u32 = 0xFFFF_0002;
 
-const SENTINEL: u32 = std.math.maxInt(u32);
+const sentinel: u32 = std.math.maxInt(u32);
 
 const Record = struct {
     key: u32,
@@ -67,7 +67,7 @@ const Record = struct {
     span_cy: u64,
     total_cy: u64,
     /// Index of the child with the largest `span_cy` (the next link on
-    /// the critical path), or SENTINEL for a leaf.
+    /// the critical path), or sentinel for a leaf.
     crit_child: u32,
 };
 
@@ -88,7 +88,7 @@ var stack_len: usize = 0;
 /// The top-level force subtree with the largest span — the deepest
 /// single dependency chain we observed. (The top frame triggers many
 /// independent top-level forces; we report the heaviest one.)
-var root_idx: u32 = SENTINEL;
+var root_idx: u32 = sentinel;
 var root_span: u64 = 0;
 var overflowed: bool = false;
 
@@ -118,7 +118,7 @@ pub inline fn enter(key: u32) usize {
         .start = rdtsc(),
         .child_total = 0,
         .max_child_span = 0,
-        .max_child_idx = SENTINEL,
+        .max_child_idx = sentinel,
     };
     stack_len += 1;
     return idx;
@@ -180,18 +180,18 @@ pub fn report(registry: anytype, intern: anytype) void {
     // between siblings aren't captured, so this under-estimates the true
     // critical path. Use the flat profile below for ground-truth self
     // time; use this to see one deep dependency chain by source.
-    if (root_idx != SENTINEL) {
+    if (root_idx != sentinel) {
         const root = records.items[root_idx];
         w.print("prof-path: heaviest force subtree (optimistic span={d} cy; siblings modeled as parallel)\n", .{root.span_cy});
         var idx = root_idx;
         var depth: usize = 0;
-        while (idx != SENTINEL and depth < 80) : (depth += 1) {
+        while (idx != sentinel and depth < 80) : (depth += 1) {
             const r = records.items[idx];
             const pct: u64 = if (root.span_cy == 0) 0 else r.self_cy * 100 / root.span_cy;
             w.print("  {d:>3}. self={d:>12} ({d:>2}%) {s}\n", .{ depth, r.self_cy, pct, locName(registry, intern, r.key) });
             idx = r.crit_child;
         }
-        if (idx != SENTINEL) w.print("  ... (truncated)\n", .{});
+        if (idx != sentinel) w.print("  ... (truncated)\n", .{});
     }
 
     // ---- flat profile: aggregate by key, top-20 by self ----
@@ -205,7 +205,7 @@ pub fn report(registry: anytype, intern: anytype) void {
         gop.value_ptr.calls += 1;
     }
     const Slot = struct { key: u32, agg: Agg };
-    var top: [20]Slot = .{Slot{ .key = SENTINEL, .agg = .{} }} ** 20;
+    var top: [20]Slot = .{Slot{ .key = sentinel, .agg = .{} }} ** 20;
     var it = map.iterator();
     while (it.next()) |e| {
         const self_cy = e.value_ptr.self_cy;
@@ -224,7 +224,7 @@ pub fn report(registry: anytype, intern: anytype) void {
     }
     w.print("prof-path: flat profile (top-20 by self cycles; {d} spans, {d} distinct bodies)\n", .{ records.items.len, map.count() });
     for (top) |t| {
-        if (t.key == SENTINEL) break;
+        if (t.key == sentinel) break;
         w.print("  self={d:>12} total={d:>12} calls={d:>9} {s}\n", .{ t.agg.self_cy, t.agg.total_cy, t.agg.calls, locName(registry, intern, t.key) });
     }
 }
@@ -232,10 +232,10 @@ pub fn report(registry: anytype, intern: anytype) void {
 var name_scratch: [512]u8 = undefined;
 
 pub fn locName(registry: anytype, intern: anytype, key: u32) []const u8 {
-    if (key == KEY_PASS_THROUGH) return "<pass_through cell>";
-    if (key == KEY_OTHER) return "<other>";
-    if (key >= BUILTIN_BASE) {
-        const id: u16 = @intCast(key - BUILTIN_BASE);
+    if (key == pass_through_key) return "<pass_through cell>";
+    if (key == other_key) return "<other>";
+    if (key >= builtin_key_base) {
+        const id: u16 = @intCast(key - builtin_key_base);
         return std.fmt.bufPrint(&name_scratch, "<builtin {s}>", .{@tagName(@as(BuiltinId, @enumFromInt(id)))}) catch "<builtin>";
     }
     const ch = registry.get(key) orelse return "<unknown chunk>";

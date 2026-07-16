@@ -47,7 +47,7 @@ pub fn makeClosure(self: *VM, chunk_id: ChunkId, upvalue_count: u16) !void {
 
 pub fn stageCaptureDescriptors(self: *VM, descriptors: []const u8, frame: *const Frame) !u16 {
     const upvalue_count = descriptors.len / 3;
-    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     if (upvalue_count > @as(usize, stack_cap - self.sp)) return error.StackOverflow;
 
     var current_upvalues: ?[]const Value = null;
@@ -107,8 +107,8 @@ pub fn makeClosureFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: []cons
 /// speculatively submitted — deferred thunks are pull-only.
 pub fn makeDeferredThunkFromCaptures(self: *VM, deferred_id: u32, descriptors: []const u8, frame: *const Frame) !void {
     const count = descriptors.len / 3;
-    if (count > deferred_mod.MAX_SCOPE) return error.InvalidBytecode;
-    var buf: [deferred_mod.MAX_SCOPE]Value = undefined;
+    if (count > deferred_mod.max_scope_size) return error.InvalidBytecode;
+    var buf: [deferred_mod.max_scope_size]Value = undefined;
     try fillCaptureValues(self, descriptors, frame, buf[0..count]);
     const id = try self.heap.addDeferredThunk(deferred_id, buf[0..count]);
     try stack.push(self, Value.thunk(id));
@@ -226,13 +226,13 @@ pub fn evalArgEager(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame
 }
 
 /// Materialise a bytecode thunk from capture descriptors. Small captures
-/// (<= INLINE_CAP) are filled into a stack buffer and stored inline in
+/// (<= inline_capacity) are filled into a stack buffer and stored inline in
 /// the thunk (no `values`-store range); wider captures fill the heap's
 /// reserved range directly.
 fn captureBytecodeThunk(self: *VM, chunk_id: ChunkId, descriptors: []const u8, frame: *const Frame) !types.ObjectId {
     const count = descriptors.len / 3;
-    if (count <= BytecodeThunk.INLINE_CAP) {
-        var buf: [BytecodeThunk.INLINE_CAP]Value = undefined;
+    if (count <= BytecodeThunk.inline_capacity) {
+        var buf: [BytecodeThunk.inline_capacity]Value = undefined;
         try fillCaptureValues(self, descriptors, frame, buf[0..count]);
         return self.heap.addBytecodeThunk(chunk_id, buf[0..count]);
     }
@@ -296,7 +296,7 @@ inline fn shortCircuitClosureCaptures(
     frame: *const Frame,
 ) !void {
     const k = inner_descriptors.len / 3;
-    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     if (k > @as(usize, stack_cap - self.sp)) return error.StackOverflow;
 
     var current_upvalues: ?[]const Value = null;
@@ -390,9 +390,9 @@ inline fn closureChunkViaIC(self: *VM, callee_chunk_id: ChunkId) !*const Chunk {
     return ch;
 }
 
-/// Hard cap on merged-chain arity; see `types.MAX_UNCURRY_ARITY`. Used
+/// Hard cap on merged-chain arity; see `types.max_uncurry_arity`. Used
 /// to size the on-stack arg buffers in the PAP machinery below.
-const MAX_UNCURRY_ARITY: u16 = types.MAX_UNCURRY_ARITY;
+const max_uncurry_arity: u16 = types.max_uncurry_arity;
 
 /// Eagerly force the must-force arg positions (`ch.strict_params`) of a
 /// saturated uncurried call, in place on the stack at `args_base..+n`.
@@ -457,7 +457,7 @@ fn applyToPartial(self: *VM, pap: Value, arg: Value) !void {
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
     const have: u16 = @intCast(pa.args.len);
     if (have + 1 < ch.arity) {
-        var buf: [MAX_UNCURRY_ARITY]Value = undefined;
+        var buf: [max_uncurry_arity]Value = undefined;
         @memcpy(buf[0..pa.args.len], pa.args);
         buf[pa.args.len] = arg;
         const id = try self.heap.addPartialApp(pa.func, buf[0 .. pa.args.len + 1]);
@@ -528,7 +528,7 @@ pub fn doTailCall(self: *VM, callee: Value, arg: Value) !void {
 pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, arg: Value, upvalues: []const Value) !void {
     if (ch.local_count == 0) return error.InvalidCallFrame;
 
-    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     const frame = stack.currentFrame(self);
     // Tail call: the frame is reused rather than unwound, so the logical
     // call chain deepens by one without growing the physical frame stack.
@@ -570,7 +570,7 @@ pub fn replaceCurrentFrame(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId,
 /// reused frame's base and the frame is re-pointed at `ch` with ip=0.
 fn replaceCurrentFrameMulti(self: *VM, ch: *const Chunk, chunk_id: types.ChunkId, args_base: u32, n: u16, upvalues: []const Value) !void {
     if (ch.local_count < n) return error.InvalidCallFrame;
-    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     const frame = stack.currentFrame(self);
     // Tail call — see `replaceCurrentFrame`: reused frame, logical depth +1.
     const new_depth = frame.call_depth + 1;
@@ -746,7 +746,7 @@ fn callValuePartial(self: *VM, pap: Value, arg: Value) anyerror!Value {
     const pa = try self.heap.getPartialApp(pap.asObjectId());
     const closure = try getClosureById(self, pa.func.asObjectId());
     const ch = self.registry.get(closure.chunk_id) orelse return error.InvalidChunk;
-    var buf: [MAX_UNCURRY_ARITY]Value = undefined;
+    var buf: [max_uncurry_arity]Value = undefined;
     @memcpy(buf[0..pa.args.len], pa.args);
     buf[pa.args.len] = arg;
     const total: u16 = @intCast(pa.args.len + 1);

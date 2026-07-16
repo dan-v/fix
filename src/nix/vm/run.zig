@@ -1047,7 +1047,7 @@ inline fn retEpilogue(vm: *VM, stop_depth: usize, result: Value) anyerror!void {
     const finished_frame = stack.popFrame(vm);
     if (comptime trace_log.enabled) {
         if (vm.frames_len == 0) {
-            trace_log.framePop(vm.vm_trace, vm.workerId(), vm.frames_len, types.CHUNK_ID_NONE, 0);
+            trace_log.framePop(vm.vm_trace, vm.workerId(), vm.frames_len, types.no_chunk_id, 0);
         } else {
             const ret_frame = stack.currentFrame(vm);
             trace_log.framePop(vm.vm_trace, vm.workerId(), vm.frames_len, ret_frame.chunk_id, @intCast(ret_frame.ip));

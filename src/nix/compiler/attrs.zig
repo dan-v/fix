@@ -183,7 +183,7 @@ fn rootCompiler(self: *Compiler) *Compiler {
 /// innermost-first — `collectWithScopes` does the cross-chunk capture
 /// plumbing (parent with-subjects become upvalues of this chunk, exactly
 /// as an eager body's with-lookup would). Returns false (fall back to
-/// eager) if the combined snapshot would exceed `MAX_SCOPE`. The
+/// eager) if the combined snapshot would exceed `max_scope_size`. The
 /// force-time compile re-establishes these as with-scopes on the
 /// synthetic parent (see `compiler/deferred.zig`), preserving resolution
 /// order: lexical bindings first, then withs innermost-first.
@@ -191,7 +191,7 @@ fn appendWithSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)) !b
     var wscopes: std.ArrayListUnmanaged(compiler_mod.WithScope) = .empty;
     defer wscopes.deinit(self.allocator);
     try scope.collectWithScopes(self, &wscopes);
-    if (out.items.len + wscopes.items.len > deferred_table.MAX_SCOPE) return false;
+    if (out.items.len + wscopes.items.len > deferred_table.max_scope_size) return false;
     const with_name_id = try self.intern.intern(compiler_mod.with_capture_name);
     for (wscopes.items) |ws| {
         try out.append(self.allocator, .{
@@ -230,7 +230,7 @@ fn bodySpanBytes(node: *const Node) usize {
 fn leafDeferrable(leaf: AttrEntryView) bool {
     if (leaf.path.len != 1 or leaf.inherit_outer) return false;
     if (!isDeferrableBody(leaf.expr)) return false;
-    return bodySpanBytes(leaf.expr) >= deferred_table.MIN_BODY_BYTES;
+    return bodySpanBytes(leaf.expr) >= deferred_table.min_body_bytes;
 }
 
 /// Does this set contain at least one deferrable leaf? Used to avoid
@@ -255,7 +255,7 @@ fn containsNameId(items: []const Capture, name_id: InternId) bool {
 /// snapshotted alongside the lexical bindings — see `appendWithSnapshot`.)
 fn shouldDeferSet(self: *Compiler, group_count: usize) bool {
     if (rootCompiler(self).deferred_table == null) return false;
-    if (group_count < deferred_table.MIN_ENTRIES) return false;
+    if (group_count < deferred_table.min_entries) return false;
     // File/import compiles only: source + (retained) arena are
     // evaluator-lived; sidesteps top-level-string source ownership.
     if (self.source_path == null) return false;
@@ -265,7 +265,7 @@ fn shouldDeferSet(self: *Compiler, group_count: usize) bool {
 /// Build the enclosing-scope snapshot: every lexically visible binding,
 /// each as a `Capture` describing how to fetch it from the CURRENT frame
 /// (`.local` slot / `.upvalue` index). Returns false (and the set falls
-/// back to eager compile) if the scope exceeds `MAX_SCOPE` or any visible
+/// back to eager compile) if the scope exceeds `max_scope_size` or any visible
 /// name can't be resolved. Side effect: resolving up-scope names adds the
 /// corresponding upvalues to this chunk — exactly what a body referencing
 /// them would do, so the deferred thunk can capture them.
@@ -288,7 +288,7 @@ fn buildEnclosingSnapshot(self: *Compiler, out: *std.ArrayListUnmanaged(Capture)
                 .{ .name = local.name, .name_id = local.name_id, .kind = .upvalue, .index = up }
             else
                 return false; // visible but unresolvable — bail conservatively
-            if (out.items.len >= deferred_table.MAX_SCOPE) return false;
+            if (out.items.len >= deferred_table.max_scope_size) return false;
             try out.append(self.allocator, cap);
         }
     }
@@ -444,7 +444,7 @@ fn compilePlainAttrGroup(
     // not an inherit) whose shape is substantial defers its compile to
     // first force instead of emitting bytecode now. An `.elided` body
     // qualifies without inspection: the parser's elision gates guarantee
-    // it is deferral-shaped and over MIN_BODY_BYTES (`isDeferrableBody`
+    // it is deferral-shaped and over min_body_bytes (`isDeferrableBody`
     // returns true for `.elided` via its else branch).
     if (defer_scope) |dscope| {
         if (leafDeferrable(leaf.?)) {

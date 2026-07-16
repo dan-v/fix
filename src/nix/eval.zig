@@ -1098,11 +1098,11 @@ pub const Evaluator = struct {
         // `-e` expression stays anonymous so its trace reads plain. disasm adds
         // its own `(top)` tag for pathless chunks.
         const top_name: bytecode.NameId = if (source_path) |p|
-            (self.registry.childName(bytecode.NAME_ROOT, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.NAME_ROOT)
+            (self.registry.childName(bytecode.root_name_id, try self.intern.intern(std.fs.path.basename(p)), false) catch bytecode.root_name_id)
         else if (self.registry.capture_names)
-            (self.registry.childName(bytecode.NAME_ROOT, try self.intern.intern("(top)"), true) catch bytecode.NAME_ROOT)
+            (self.registry.childName(bytecode.root_name_id, try self.intern.intern("(top)"), true) catch bytecode.root_name_id)
         else
-            bytecode.NAME_ROOT;
+            bytecode.root_name_id;
         const chunk_id = try self.registry.registerNamed(chunk, top_name);
         if (compiler.source_file_id) |f| try self.registry.recordFile(chunk_id, f);
         // Local binding names for the top chunk (child chunks get theirs in

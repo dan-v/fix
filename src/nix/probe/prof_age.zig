@@ -25,13 +25,13 @@ const pct = prof.pct;
 /// `offloadable_incl` counts INCLUSIVE cycles of top-level old forces
 /// only (an old force nested inside another counted old force is
 /// already covered by its parent), so it sums without double counting.
-pub const AGE_BUCKET_SHIFT: u6 = 10; // bucket 0 = age < 2^10 cycles
-pub const AGE_BUCKETS = 26;
+pub const age_bucket_shift: u6 = 10; // bucket 0 = age < 2^10 cycles
+pub const age_bucket_count = 26;
 pub const AgeBucket = struct { n: u64 = 0, excl: u64 = 0, incl_top: u64 = 0 };
-pub var age_buckets: [AGE_BUCKETS]AgeBucket = @splat(.{});
+pub var age_buckets: [age_bucket_count]AgeBucket = @splat(.{});
 /// Ages >= this many cycles count as "old" (~0.5ms at 3.6GHz — plenty
 /// of time for a helper to have picked the thunk up).
-pub const AGE_OLD_THRESHOLD: u64 = 1 << 21;
+pub const age_old_threshold: u64 = 1 << 21;
 pub var age_offloadable_incl: u64 = 0;
 pub var age_old_top_n: u64 = 0;
 /// Old-force counts by thunk target kind (closure/bytecode/pass_through/
@@ -64,9 +64,9 @@ pub var age_max_depth: u64 = 0;
 
 /// Per-body aggregation of top-most old forces: which chunk/builtin
 /// bodies hold the offloadable cycles. Keys follow `prof_path` (ChunkId
-/// or BUILTIN_BASE+id). Open-addressed, fixed; overflow is counted.
-pub const OldAgg = struct { key: u32 = SENTINEL_KEY, n: u64 = 0, sum_min: u64 = 0, sum_incl: u64 = 0 };
-pub const SENTINEL_KEY: u32 = 0xFFFF_FFFF;
+/// or builtin_key_base+id). Open-addressed, fixed; overflow is counted.
+pub const OldAgg = struct { key: u32 = sentinel_key, n: u64 = 0, sum_min: u64 = 0, sum_incl: u64 = 0 };
+pub const sentinel_key: u32 = 0xFFFF_FFFF;
 pub const old_agg_cap = 8192;
 pub var old_agg: [old_agg_cap]OldAgg = @splat(.{});
 pub var old_agg_overflow: u64 = 0;
@@ -83,7 +83,7 @@ fn oldAggAdd(key: u32, contrib: u64, incl: u64) void {
             s.sum_incl += incl;
             return;
         }
-        if (s.key == SENTINEL_KEY) {
+        if (s.key == sentinel_key) {
             s.* = .{ .key = key, .n = 1, .sum_min = contrib, .sum_incl = incl };
             return;
         }
@@ -92,14 +92,14 @@ fn oldAggAdd(key: u32, contrib: u64, incl: u64) void {
     old_agg_overflow += 1;
 }
 
-/// Per-body aggregation of YOUNG forces (age < AGE_OLD_THRESHOLD) — the
+/// Per-body aggregation of YOUNG forces (age < age_old_threshold) — the
 /// just-in-time serial spine that speculation can't reach. Answers whether
 /// thunk-elision has a targetable HEAD: which chunks create the demanded-
 /// young thunks, and how much own-body (exclusive) cost they carry. `n` is
 /// the count of young thunks that body produced (each = one avoidable
 /// create+force pair); `excl` is their summed exclusive cycles. Same
 /// open-addressed engine as `oldAggAdd`.
-pub const YoungAgg = struct { key: u32 = SENTINEL_KEY, n: u64 = 0, excl: u64 = 0 };
+pub const YoungAgg = struct { key: u32 = sentinel_key, n: u64 = 0, excl: u64 = 0 };
 pub var young_agg: [old_agg_cap]YoungAgg = @splat(.{});
 pub var young_agg_overflow: u64 = 0;
 /// young-force counts by TargetKind (0 closure .. 4 deferred).
@@ -116,7 +116,7 @@ fn youngAggAdd(key: u32, excl: u64) void {
             s.excl += excl;
             return;
         }
-        if (s.key == SENTINEL_KEY) {
+        if (s.key == sentinel_key) {
             s.* = .{ .key = key, .n = 1, .excl = excl };
             return;
         }
@@ -140,8 +140,8 @@ pub inline fn ageForceBegin(created_tsc: u64, kind_idx: u8, key: u32) u64 {
     const now = rdtsc();
     const age = now -| created_tsc;
     const lg: u6 = if (age == 0) 0 else @intCast(63 - @clz(age));
-    const bucket: u8 = if (lg <= AGE_BUCKET_SHIFT) 0 else @min(@as(u8, @intCast(lg - AGE_BUCKET_SHIFT)), AGE_BUCKETS - 1);
-    const is_old = age >= AGE_OLD_THRESHOLD;
+    const bucket: u8 = if (lg <= age_bucket_shift) 0 else @min(@as(u8, @intCast(lg - age_bucket_shift)), age_bucket_count - 1);
+    const is_old = age >= age_old_threshold;
     if (is_old) {
         if (kind_idx < age_old_kind.len) age_old_kind[kind_idx] += 1;
     } else {
@@ -228,7 +228,7 @@ pub fn report(registry: anytype, intern: anytype) void {
         );
         for (age_buckets, 0..) |b, i| {
             if (b.n == 0) continue;
-            const lo_shift: u6 = @intCast(AGE_BUCKET_SHIFT + i);
+            const lo_shift: u6 = @intCast(age_bucket_shift + i);
             std.debug.print(
                 "  age<2^{d}cy: n={d} excl_cy={d} ({d:.1}%) incl_top={d}\n",
                 .{ lo_shift + 1, b.n, b.excl, pct(b.excl, total_excl), b.incl_top },
@@ -247,26 +247,26 @@ pub fn report(registry: anytype, intern: anytype) void {
             },
         );
         // Top bodies holding the offloadable cycles.
-        const TOP = 24;
-        var top: [TOP]OldAgg = @splat(.{});
+        const top_count = 24;
+        var top: [top_count]OldAgg = @splat(.{});
         for (old_agg) |agg| {
-            if (agg.key == SENTINEL_KEY) continue;
-            var slot: usize = TOP;
+            if (agg.key == sentinel_key) continue;
+            var slot: usize = top_count;
             for (top, 0..) |t2, i| {
                 if (agg.sum_min > t2.sum_min) {
                     slot = i;
                     break;
                 }
             }
-            if (slot < TOP) {
-                var j: usize = TOP - 1;
+            if (slot < top_count) {
+                var j: usize = top_count - 1;
                 while (j > slot) : (j -= 1) top[j] = top[j - 1];
                 top[slot] = agg;
             }
         }
         std.debug.print("prof age-at-force top offloadable bodies (overflow={d}):\n", .{old_agg_overflow});
         for (top) |agg| {
-            if (agg.key == SENTINEL_KEY or agg.sum_min == 0) continue;
+            if (agg.key == sentinel_key or agg.sum_min == 0) continue;
             std.debug.print("  min_cy={d:>11} incl_cy={d:>11} n={d:>6} {s}\n", .{
                 agg.sum_min, agg.sum_incl, agg.n, prof_path_mod.locName(registry, intern, agg.key),
             });
@@ -289,25 +289,25 @@ pub fn report(registry: anytype, intern: anytype) void {
                 young_kind[3], young_kind[4],    young_agg_overflow,
             },
         );
-        var ytop: [TOP]YoungAgg = @splat(.{});
+        var ytop: [top_count]YoungAgg = @splat(.{});
         for (young_agg) |agg| {
-            if (agg.key == SENTINEL_KEY) continue;
-            var slot: usize = TOP;
+            if (agg.key == sentinel_key) continue;
+            var slot: usize = top_count;
             for (ytop, 0..) |t2, i| {
                 if (agg.excl > t2.excl) {
                     slot = i;
                     break;
                 }
             }
-            if (slot < TOP) {
-                var j: usize = TOP - 1;
+            if (slot < top_count) {
+                var j: usize = top_count - 1;
                 while (j > slot) : (j -= 1) ytop[j] = ytop[j - 1];
                 ytop[slot] = agg;
             }
         }
         std.debug.print("prof age-at-force top young-thunk creators (elision targets):\n", .{});
         for (ytop) |agg| {
-            if (agg.key == SENTINEL_KEY or agg.excl == 0) continue;
+            if (agg.key == sentinel_key or agg.excl == 0) continue;
             std.debug.print("  excl_cy={d:>11} n={d:>7} ({d:.1}% of young) {s}\n", .{
                 agg.excl, agg.n, pct(agg.n, young_total_n), prof_path_mod.locName(registry, intern, agg.key),
             });

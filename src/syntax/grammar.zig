@@ -37,7 +37,7 @@ inline fn t(tt: TokenType) u32 {
 
 // ---- nonterminals ----------------------------------------------------------
 
-pub const NT = enum(u32) {
+pub const Nonterminal = enum(u32) {
     expr,
     expr_if,
     expr_op,
@@ -57,7 +57,7 @@ pub const NT = enum(u32) {
     list_items,
 };
 
-inline fn n(x: NT) u32 {
+inline fn n(x: Nonterminal) u32 {
     return num_terminals + @intFromEnum(x);
 }
 
@@ -165,8 +165,8 @@ pub const Act = enum {
     list_items_append,
 };
 
-const P = struct {
-    lhs: NT,
+const Production = struct {
+    lhs: Nonterminal,
     rhs: []const u32,
     act: Act,
     prec: ?u32 = null,
@@ -176,7 +176,7 @@ const P = struct {
 // Order matters: the production index (offset by +1 for the augmented rule the
 // generator prepends) selects the action in the driver.
 
-const productions = [_]P{
+const productions = [_]Production{
     // Expr
     .{ .lhs = .expr, .rhs = &.{ t(.identifier), t(.colon), n(.expr) }, .act = .lambda_id },
     .{ .lhs = .expr, .rhs = &.{ n(.brace), t(.colon), n(.expr) }, .act = .lambda_no_bind },
@@ -336,17 +336,17 @@ const prec = [_]lr.RawPrec{
 // paid once by the cached codegen step (see gen_parser_tables.zig), not on
 // every build — so it is free at the point of use.
 
-const num_nt = @typeInfo(NT).@"enum".fields.len;
+const num_nt = @typeInfo(Nonterminal).@"enum".fields.len;
 
 /// Eliminate unit productions at comptime. Faster runtime (no chain reductions)
 /// at the cost of a much larger table and slower generation.
 const eliminate_units = true;
 
-fn isUnitPass(p: P) bool {
+fn isUnitPass(p: Production) bool {
     return p.act == .pass and p.rhs.len == 1 and p.rhs[0] >= num_terminals;
 }
 
-const expanded: []const P = if (!eliminate_units) &productions else blk: {
+const expanded: []const Production = if (!eliminate_units) &productions else blk: {
     @setEvalBranchQuota(10_000_000);
     // reach[a][b]: nonterminal a derives b through a chain of unit rules.
     var reach = [_][num_nt]bool{[_]bool{false} ** num_nt} ** num_nt;
@@ -365,12 +365,12 @@ const expanded: []const P = if (!eliminate_units) &productions else blk: {
             };
         };
     }
-    var out: []const P = &.{};
+    var out: []const Production = &.{};
     for (productions) |q| {
         if (isUnitPass(q)) continue; // drop the unit rules themselves
         const b = @intFromEnum(q.lhs);
         for (0..num_nt) |a| {
-            if (reach[a][b]) out = out ++ &[_]P{.{ .lhs = @enumFromInt(a), .rhs = q.rhs, .act = q.act, .prec = q.prec }};
+            if (reach[a][b]) out = out ++ &[_]Production{.{ .lhs = @enumFromInt(a), .rhs = q.rhs, .act = q.act, .prec = q.prec }};
         }
     }
     break :blk out;
@@ -388,9 +388,9 @@ const raw_productions = blk: {
 /// the `syntax` module compiles — the parser imports the generated `.zig`.
 pub const desc = lr.GrammarDesc{
     .num_terminals = num_terminals,
-    .num_nonterminals = @typeInfo(NT).@"enum".fields.len,
+    .num_nonterminals = @typeInfo(Nonterminal).@"enum".fields.len,
     .eof = t_eof,
-    .start = @intFromEnum(NT.expr),
+    .start = @intFromEnum(Nonterminal.expr),
     .productions = &raw_productions,
     .precedence = &prec,
 };

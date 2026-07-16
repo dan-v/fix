@@ -9,7 +9,7 @@
 //! resident (`mincore`) and attribute RSS per subsystem exactly.
 //!
 //! Two mechanisms, one call:
-//!   - `PR_SET_VMA_ANON_NAME` (Linux 5.17+, needs CONFIG_ANON_VMA_NAME):
+//!   - `pr_set_vma_anon_name` (Linux 5.17+, needs CONFIG_ANON_VMA_NAME):
 //!     tags the VMA in /proc/self/smaps for external profilers. Silently
 //!     unavailable on kernels without the config (EINVAL) — best-effort.
 //!   - The in-process table + `mincore`: works everywhere, powers the
@@ -24,7 +24,7 @@ const SpinMutex = @import("sync.zig").SpinMutex;
 
 /// Generic RSS region-tracker, parameterized over the caller's attribution
 /// taxonomy. The mechanism (open-addressed registry, `mincore` residency,
-/// `PR_SET_VMA_ANON_NAME` smaps naming) is app-agnostic; the tag enum and
+/// `pr_set_vma_anon_name` smaps naming) is app-agnostic; the tag enum and
 /// its smaps labels are injected. The evaluator's concrete instantiation
 /// (the `fix:*` buckets) lives in `runtime/mem_tag.zig`.
 ///
@@ -66,7 +66,7 @@ pub fn Vma(
         /// live large regions number in the low thousands (segments + fibers +
         /// in-flight big blocks); overflow just drops the entry (counted, so the
         /// report can flag it) rather than growing under a spinlock.
-        const CAPACITY: usize = 1 << 14; // 16384 slots, power of two
+        const capacity: usize = 1 << 14; // 16384 slots, power of two
 
         const Slot = struct {
             /// 0 = empty, 1 = tombstone, else region base address.
@@ -75,27 +75,27 @@ pub fn Vma(
             tag: Tag = default_tag,
         };
 
-        const TOMBSTONE: usize = 1;
+        const tombstone: usize = 1;
 
         var mu: SpinMutex = .{};
-        var slots: [CAPACITY]Slot = @splat(.{});
+        var slots: [capacity]Slot = @splat(.{});
         var live_count: usize = 0;
         var dropped_count: u32 = 0;
 
         fn hash(addr: usize) usize {
             // Fibonacci hash on the page number; low bits of an mmap base are zero.
-            return ((addr >> 12) *% 0x9E3779B97F4A7C15) & (CAPACITY - 1);
+            return ((addr >> 12) *% 0x9E3779B97F4A7C15) & (capacity - 1);
         }
 
         /// Find the slot holding `addr`, or null. Caller holds `mu`.
         fn find(addr: usize) ?*Slot {
             var i = hash(addr);
             var probes: usize = 0;
-            while (probes < CAPACITY) : (probes += 1) {
+            while (probes < capacity) : (probes += 1) {
                 const s = &slots[i];
                 if (s.addr == addr) return s;
                 if (s.addr == 0) return null;
-                i = (i + 1) & (CAPACITY - 1);
+                i = (i + 1) & (capacity - 1);
             }
             return null;
         }
@@ -106,10 +106,10 @@ pub fn Vma(
         pub fn registerRegion(ptr: *const anyopaque, len: usize, tag: Tag) void {
             nameRegion(ptr, len, tagName(tag));
             const addr = @intFromPtr(ptr);
-            if (addr <= TOMBSTONE) return;
+            if (addr <= tombstone) return;
             mu.lock();
             defer mu.unlock();
-            if (live_count >= CAPACITY / 2) {
+            if (live_count >= capacity / 2) {
                 dropped_count += 1;
                 return;
             }
@@ -121,12 +121,12 @@ pub fn Vma(
                     s.* = .{ .addr = addr, .len = len, .tag = tag };
                     return;
                 }
-                if (s.addr == 0 or s.addr == TOMBSTONE) {
+                if (s.addr == 0 or s.addr == tombstone) {
                     s.* = .{ .addr = addr, .len = len, .tag = tag };
                     live_count += 1;
                     return;
                 }
-                i = (i + 1) & (CAPACITY - 1);
+                i = (i + 1) & (capacity - 1);
             }
         }
 
@@ -135,7 +135,7 @@ pub fn Vma(
             mu.lock();
             defer mu.unlock();
             const s = find(addr) orelse return;
-            s.* = .{ .addr = TOMBSTONE };
+            s.* = .{ .addr = tombstone };
             live_count -= 1;
         }
 
@@ -171,11 +171,11 @@ pub fn Vma(
             // Snapshot under the lock (registrations during the walk are lost,
             // which is fine for a report); mincore outside it.
             mu.lock();
-            var snapshot: [CAPACITY]Slot = slots;
+            var snapshot: [capacity]Slot = slots;
             r.dropped = dropped_count;
             mu.unlock();
             for (&snapshot) |s| {
-                if (s.addr <= TOMBSTONE) continue;
+                if (s.addr <= tombstone) continue;
                 const t = @intFromEnum(s.tag);
                 r.regions[t] += 1;
                 r.reserved_bytes[t] += s.len;
@@ -189,10 +189,10 @@ pub fn Vma(
         /// /proc/self/maps when a subsystem's numbers look off.
         pub fn dumpRegions() void {
             mu.lock();
-            var snapshot: [CAPACITY]Slot = slots;
+            var snapshot: [capacity]Slot = slots;
             mu.unlock();
             for (&snapshot) |s| {
-                if (s.addr <= TOMBSTONE) continue;
+                if (s.addr <= tombstone) continue;
                 const res_mb = @as(f64, @floatFromInt(residentBytes(s.addr, s.len))) / (1024.0 * 1024.0);
                 std.debug.print("  region 0x{x:0>12} len {d:>12} {s:<16} rss {d:>8.1} MB\n", .{
                     s.addr, s.len, tagName(s.tag), res_mb,
@@ -227,13 +227,13 @@ pub fn Vma(
         /// load-bearing. `name` must be static (kernel-copied; ≤80 chars).
         pub fn nameRegion(ptr: *const anyopaque, len: usize, name: [:0]const u8) void {
             if (comptime builtin.os.tag != .linux) return;
-            const PR_SET_VMA = 0x53564d41;
-            const PR_SET_VMA_ANON_NAME = 0;
+            const pr_set_vma = 0x53564d41;
+            const pr_set_vma_anon_name = 0;
             const addr = @intFromPtr(ptr);
             if (addr & (std.heap.page_size_min - 1) != 0) return;
             _ = std.os.linux.prctl(
-                PR_SET_VMA,
-                PR_SET_VMA_ANON_NAME,
+                pr_set_vma,
+                pr_set_vma_anon_name,
                 addr,
                 len,
                 @intFromPtr(name.ptr),
@@ -244,9 +244,9 @@ pub fn Vma(
 
 test "register / residency / retag / unregister round-trip" {
     if (builtin.os.tag != .linux) return;
-    const T = enum { a, b, c };
-    const V = Vma(T, .a, struct {
-        fn n(t: T) [:0]const u8 {
+    const TestTag = enum { a, b, c };
+    const TestVma = Vma(TestTag, .a, struct {
+        fn n(t: TestTag) [:0]const u8 {
             return switch (t) {
                 .a => "a",
                 .b => "b",
@@ -265,23 +265,23 @@ test "register / residency / retag / unregister round-trip" {
     ) catch return;
     defer std.posix.munmap(@alignCast(mem[0..len]));
 
-    const before = V.residency();
-    V.registerRegion(mem.ptr, len, .b);
+    const before = TestVma.residency();
+    TestVma.registerRegion(mem.ptr, len, .b);
     // Touch two pages; residency must see at least those.
     mem[0] = 1;
     mem[std.heap.pageSize()] = 1;
-    var r = V.residency();
-    const fs = @intFromEnum(V.Tag.b);
+    var r = TestVma.residency();
+    const fs = @intFromEnum(TestVma.Tag.b);
     try std.testing.expect(r.regions[fs] == before.regions[fs] + 1);
     try std.testing.expect(r.rss_bytes[fs] >= before.rss_bytes[fs] + 2 * std.heap.pageSize());
     try std.testing.expect(r.reserved_bytes[fs] >= before.reserved_bytes[fs] + len);
 
-    V.retagRegion(mem.ptr, .a);
-    r = V.residency();
+    TestVma.retagRegion(mem.ptr, .a);
+    r = TestVma.residency();
     try std.testing.expectEqual(before.regions[fs], r.regions[fs]);
 
-    V.unregisterRegion(mem.ptr);
-    r = V.residency();
-    const bb = @intFromEnum(V.Tag.a);
+    TestVma.unregisterRegion(mem.ptr);
+    r = TestVma.residency();
+    const bb = @intFromEnum(TestVma.Tag.a);
     try std.testing.expect(r.reserved_bytes[bb] < before.reserved_bytes[bb] + len);
 }

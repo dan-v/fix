@@ -71,16 +71,16 @@ pub inline fn checkVm(self: *VM, site: []const u8) void {
 }
 
 fn checkVmSlow(self: *VM, site: []const u8) void {
-    if (self.frames_len > types.MAX_FRAMES) {
+    if (self.frames_len > types.max_frames) {
         std.debug.panic(
-            "VM invariant: frames_len {d} > MAX_FRAMES {d} at {s}",
-            .{ self.frames_len, types.MAX_FRAMES, site },
+            "VM invariant: frames_len {d} > max_frames {d} at {s}",
+            .{ self.frames_len, types.max_frames, site },
         );
     }
-    if (self.sp > types.VM_STACK_CAP) {
+    if (self.sp > types.vm_stack_capacity) {
         std.debug.panic(
-            "VM invariant: sp {d} > VM_STACK_CAP {d} at {s}",
-            .{ self.sp, types.VM_STACK_CAP, site },
+            "VM invariant: sp {d} > vm_stack_capacity {d} at {s}",
+            .{ self.sp, types.vm_stack_capacity, site },
         );
     }
     if (self.frames_len > 0) {

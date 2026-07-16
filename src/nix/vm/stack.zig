@@ -29,7 +29,7 @@ const ChunkId = types.ChunkId;
 /// threshold, turning every frame push into an out-of-line call (~+9%
 /// instructions on call-heavy code). Forcing inline restores that.
 pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_count: u32, upvalues: ?[]const Value, is_call: bool) !void {
-    if (self.frames_len >= types.MAX_FRAMES) return error.FrameOverflow;
+    if (self.frames_len >= types.max_frames) return error.FrameOverflow;
     if (arg_count > ch.local_count) return error.InvalidCallFrame;
     const parent_depth: u32 = if (self.frames_len > 0) self.frames[self.frames_len - 1].call_depth else 0;
     const new_depth: u32 = if (is_call) parent_depth + 1 else parent_depth;
@@ -37,7 +37,7 @@ pub inline fn pushFrame(self: *VM, ch: *const Chunk, chunk_id: ChunkId, arg_coun
     const frame_base = self.sp - arg_count;
     const reserved = @as(u32, ch.local_count) - arg_count;
 
-    const stack_cap: u32 = @intCast(types.VM_STACK_CAP);
+    const stack_cap: u32 = @intCast(types.vm_stack_capacity);
     if (reserved > stack_cap - self.sp) return error.StackOverflow;
     const start = self.sp;
     const new_sp = start + reserved;
@@ -70,7 +70,7 @@ pub fn currentFrame(self: *VM) *Frame {
 // ---- stack ops ----
 
 pub fn push(self: *VM, val: Value) !void {
-    if (@as(usize, self.sp) >= types.VM_STACK_CAP) return error.StackOverflow;
+    if (@as(usize, self.sp) >= types.vm_stack_capacity) return error.StackOverflow;
     self.stack[self.sp] = val;
     self.sp += 1;
     if (self.sp > self.sp_high_water) self.sp_high_water = self.sp;

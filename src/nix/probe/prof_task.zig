@@ -42,27 +42,27 @@ pub const TaskClass = enum(u8) {
     /// urgent lane).
     readdir_prefetch,
 };
-pub const TASK_CLASS_COUNT = @typeInfo(TaskClass).@"enum".fields.len;
-pub const TC_CY_BUCKETS = 26; // bucket i = task cycles in [2^i, 2^(i+1))
+pub const task_class_count = @typeInfo(TaskClass).@"enum".fields.len;
+pub const task_cycle_buckets = 26; // bucket i = task cycles in [2^i, 2^(i+1))
 
 const AtomicU64 = std.atomic.Value(u64);
 const tc_zero: AtomicU64 = AtomicU64.init(0);
 /// Tasks seen per class.
-pub var tc_n: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_n: [task_class_count]AtomicU64 = @splat(tc_zero);
 /// Of `tc_n`, tasks that found ZERO unresolved work on arrival.
-pub var tc_noop: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_noop: [task_class_count]AtomicU64 = @splat(tc_zero);
 /// force_thunk tasks whose target arrived `.evaluating` (another fiber
 /// owns it — the task can only spin/enroll, never compute).
-pub var tc_busy: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_busy: [task_class_count]AtomicU64 = @splat(tc_zero);
 /// Items covered by range/sweep tasks (1 for force_thunk) and how many
 /// of those were still unresolved thunks on arrival.
-pub var tc_items: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
-pub var tc_items_live: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_items: [task_class_count]AtomicU64 = @splat(tc_zero);
+pub var tc_items_live: [task_class_count]AtomicU64 = @splat(tc_zero);
 /// Task cycles, split by whether the task had any unresolved work.
-pub var tc_cy_useful: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
-pub var tc_cy_noop: [TASK_CLASS_COUNT]AtomicU64 = @splat(tc_zero);
+pub var tc_cy_useful: [task_class_count]AtomicU64 = @splat(tc_zero);
+pub var tc_cy_noop: [task_class_count]AtomicU64 = @splat(tc_zero);
 /// log2 histogram of per-task cycles for tasks WITH work.
-pub var tc_hist: [TASK_CLASS_COUNT][TC_CY_BUCKETS]AtomicU64 = @splat(@splat(tc_zero));
+pub var tc_hist: [task_class_count][task_cycle_buckets]AtomicU64 = @splat(@splat(tc_zero));
 
 pub fn taskCensusRecord(class: TaskClass, live_items: u64, total_items: u64, arrived_busy: bool, cycles: u64) void {
     if (!enabled) return;
@@ -77,7 +77,7 @@ pub fn taskCensusRecord(class: TaskClass, live_items: u64, total_items: u64, arr
         return;
     }
     _ = tc_cy_useful[ci].fetchAdd(cycles, .monotonic);
-    const lg: usize = if (cycles == 0) 0 else @min(63 - @clz(cycles), TC_CY_BUCKETS - 1);
+    const lg: usize = if (cycles == 0) 0 else @min(63 - @clz(cycles), task_cycle_buckets - 1);
     _ = tc_hist[ci][lg].fetchAdd(1, .monotonic);
 }
 
@@ -88,7 +88,7 @@ pub fn report() void {
     if (any != 0) {
         std.debug.print("prof task-census (per scheduled item; cycles incl. suspended wall):\n", .{});
         var ci: usize = 0;
-        while (ci < TASK_CLASS_COUNT) : (ci += 1) {
+        while (ci < task_class_count) : (ci += 1) {
             const n = tc_n[ci].load(.monotonic);
             if (n == 0) continue;
             const noop = tc_noop[ci].load(.monotonic);

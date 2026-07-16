@@ -695,7 +695,7 @@ pub const Worker = struct {
     /// contention destroys cache coherence across 32 workers; reading
     /// one shared counter is much cheaper.
     fn parkAndAccount(self: *Worker) void {
-        const SPIN_ITERATIONS: u32 = spin_iterations;
+        const iterations = spin_iterations;
         // Cap the concurrent idle spinners: at high worker counts the
         // spin-and-rescan churn from every idle helper (O(N) queue
         // probes per rescan) burns the SMT siblings of busy workers.
@@ -706,7 +706,7 @@ pub const Worker = struct {
         if (spin_allowed) {
             defer if (self.worker_id != 0) self.scheduler.endSpin();
             var i: u32 = 0;
-            while (i < SPIN_ITERATIONS) : (i += 1) {
+            while (i < iterations) : (i += 1) {
                 // When background work is suppressed (result ready, draining the
                 // tail), the queued backlog won't be pulled — don't treat it as
                 // available work and busy-spin on it.

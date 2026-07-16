@@ -35,13 +35,13 @@ const hugetlb = @import("hugetlb.zig");
 // instead of risking a later SIGBUS. Ownership is tracked
 // (`huge_ptrs`/`huge_lens`) so free/resize/remap/deinit munmap these blocks
 // instead of handing foreign memory to the backing allocator.
-const HUGE_PAGE: usize = hugetlb.HUGE_PAGE;
+const huge_page_size: usize = hugetlb.huge_page_size;
 
-const MIN_LOG2: u6 = 16; // 64 KB — the smallest block class
-const CLASS_COUNT: usize = 11; // 64 KB .. 64 MB
+const min_size_log2: u6 = 16; // 64 KB — the smallest block class
+const size_class_count: usize = 11; // 64 KB .. 64 MB
 /// Per-class retained-block caps (index = class); bigger classes keep fewer.
-const class_caps: [CLASS_COUNT]u8 = .{ 8, 8, 8, 8, 8, 8, 8, 4, 2, 1, 1 };
-const MAX_PER_CLASS = 8;
+const class_caps: [size_class_count]u8 = .{ 8, 8, 8, 8, 8, 8, 8, 4, 2, 1, 1 };
+const max_blocks_per_class = 8;
 
 /// Anything ABOVE this is direct-mapped by the backing SmpAllocator
 /// (its slab size classes stop at 32 KB; a 33 KB request rounds to the
@@ -51,18 +51,18 @@ const MAX_PER_CLASS = 8;
 /// tail pages are never touched, so they cost nothing — instead of a
 /// fresh mmap/munmap per use (measured ~4.6K such cycles per NixOS
 /// eval at w=1, one ~36-60 KB parse-scratch block per file).
-const DIRECT_MAP_OVER: usize = 32 * 1024;
+const direct_map_threshold: usize = 32 * 1024;
 
 fn classSize(class: usize) usize {
-    return @as(usize, 1) << (MIN_LOG2 + @as(u6, @intCast(class)));
+    return @as(usize, 1) << (min_size_log2 + @as(u6, @intCast(class)));
 }
 
 /// Class index for `len`, or null when `len` is outside the cacheable range.
 fn classOf(len: usize) ?usize {
-    if (len <= DIRECT_MAP_OVER) return null;
-    const log = @max(std.math.log2_int_ceil(usize, len), MIN_LOG2);
-    if (log >= MIN_LOG2 + CLASS_COUNT) return null;
-    return log - MIN_LOG2;
+    if (len <= direct_map_threshold) return null;
+    const log = @max(std.math.log2_int_ceil(usize, len), min_size_log2);
+    if (log >= min_size_log2 + size_class_count) return null;
+    return log - min_size_log2;
 }
 
 /// Bytes currently parked on the free stacks, across instances (in
@@ -95,27 +95,27 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
 
         backing: Allocator,
         mu: SpinMutex = .{},
-        blocks: [CLASS_COUNT][MAX_PER_CLASS][*]u8 = undefined,
-        counts: [CLASS_COUNT]u8 = @splat(0),
+        blocks: [size_class_count][max_blocks_per_class][*]u8 = undefined,
+        counts: [size_class_count]u8 = @splat(0),
 
         /// (ptr, rounded_len) of blocks this cache mmap'd itself with
         /// MAP_HUGETLB. Small fixed table under `mu` — blocks of ≥2 MB
         /// number in the dozens per eval. Full table = fall back to the
         /// backing allocator for further blocks (never lose a free).
-        /// Lookups are guarded by a `len >= HUGE_PAGE` check on every path,
+        /// Lookups are guarded by a `len >= huge_page_size` check on every path,
         /// so sub-2 MB traffic never scans it.
-        huge_ptrs: [HUGE_TRACK_MAX]usize = @splat(0),
-        huge_lens: [HUGE_TRACK_MAX]usize = @splat(0),
+        huge_ptrs: [max_tracked_huge_blocks]usize = @splat(0),
+        huge_lens: [max_tracked_huge_blocks]usize = @splat(0),
         huge_count: usize = 0,
 
-        const HUGE_TRACK_MAX = 512;
+        const max_tracked_huge_blocks = 512;
 
         /// Record a hugetlb-owned block. Returns false (caller must munmap
         /// and fall back) when the table is full.
         fn hugeTrack(self: *Self, ptr: [*]u8, rounded_len: usize) bool {
             self.mu.lock();
             defer self.mu.unlock();
-            if (self.huge_count == HUGE_TRACK_MAX) return false;
+            if (self.huge_count == max_tracked_huge_blocks) return false;
             self.huge_ptrs[self.huge_count] = @intFromPtr(ptr);
             self.huge_lens[self.huge_count] = rounded_len;
             self.huge_count += 1;
@@ -173,10 +173,10 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         /// (~200 MB) for the whole build. Thread-safe: the stacks are drained
         /// under `mu`, the frees run outside it.
         pub fn trim(self: *Self) void {
-            var drained: [CLASS_COUNT][MAX_PER_CLASS][*]u8 = undefined;
-            var drained_counts: [CLASS_COUNT]u8 = undefined;
+            var drained: [size_class_count][max_blocks_per_class][*]u8 = undefined;
+            var drained_counts: [size_class_count]u8 = undefined;
             self.mu.lock();
-            for (0..CLASS_COUNT) |class| {
+            for (0..size_class_count) |class| {
                 drained_counts[class] = self.counts[class];
                 @memcpy(
                     drained[class][0..self.counts[class]],
@@ -185,12 +185,12 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 self.counts[class] = 0;
             }
             self.mu.unlock();
-            for (0..CLASS_COUNT) |class| {
+            for (0..size_class_count) |class| {
                 const size = classSize(class);
                 for (drained[class][0..drained_counts[class]]) |ptr| {
                     Vma.unregisterRegion(ptr);
                     _ = retained_bytes.fetchSub(size, .monotonic);
-                    if (size >= HUGE_PAGE) {
+                    if (size >= huge_page_size) {
                         // `hugeLookup` takes `mu` itself — must run unlocked.
                         if (self.hugeLookup(ptr, true)) |rounded| {
                             hugetlb.unmap(ptr, rounded);
@@ -222,7 +222,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
         /// its own mmap and worth tracking for RSS attribution (see
         /// runtime/vma.zig); below it rides a shared slab.
         fn trackable(len: usize) bool {
-            return len > DIRECT_MAP_OVER;
+            return len > direct_map_threshold;
         }
 
         fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
@@ -236,7 +236,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 // >64 MB pass-through blocks (the biggest store segments)
                 // get their own hugetlb mapping when enabled; a failed mmap
                 // (pool exhausted) or a full tracking table falls back.
-                if (len >= HUGE_PAGE and hugetlb.wanted()) {
+                if (len >= huge_page_size and hugetlb.wanted()) {
                     if (hugetlb.map(len)) |hp| {
                         const rounded = hugetlb.roundedLen(len);
                         if (self.hugeTrack(hp, rounded)) {
@@ -265,7 +265,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             // Fresh class blocks of ≥2 MB come from an explicit hugetlb
             // mapping when enabled (clean fallback on pool exhaustion).
             // Class sizes ≥2 MB are 2 MB multiples already.
-            if (classSize(class) >= HUGE_PAGE and hugetlb.wanted()) {
+            if (classSize(class) >= huge_page_size and hugetlb.wanted()) {
                 if (hugetlb.map(classSize(class))) |hp| {
                     if (self.hugeTrack(hp, classSize(class))) {
                         Vma.registerRegion(hp, classSize(class), Vma.alloc_tag);
@@ -301,7 +301,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             // a hugetlb pass-through (always >64 MB, hence the cheap length
             // guard) resizes in place only when the rounded hugetlb capacity
             // and the pass-through (class-less) routing both hold.
-            if (memory.len >= HUGE_PAGE) {
+            if (memory.len >= huge_page_size) {
                 if (self.hugeLookup(memory.ptr, false)) |rounded| {
                     return classOf(new_len) == null and hugetlb.roundedLen(new_len) == rounded;
                 }
@@ -333,7 +333,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             }
             // See `resize` — the backing allocator must not remap foreign
             // hugetlb mappings.
-            if (memory.len >= HUGE_PAGE) {
+            if (memory.len >= huge_page_size) {
                 if (self.hugeLookup(memory.ptr, false)) |rounded| {
                     const ok = classOf(new_len) == null and hugetlb.roundedLen(new_len) == rounded;
                     return if (ok) memory.ptr else null;
@@ -363,7 +363,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
                 // Blocks this cache mmap'd itself must never reach the
                 // backing allocator's free (guard: hugetlb pass-throughs
                 // are always >64 MB).
-                if (memory.len >= HUGE_PAGE) {
+                if (memory.len >= huge_page_size) {
                     if (self.hugeLookup(memory.ptr, true)) |rounded|
                         return hugetlb.unmap(memory.ptr, rounded);
                 }
@@ -384,7 +384,7 @@ pub fn BlockCacheAllocator(comptime Vma: type) type {
             }
             self.mu.unlock();
             Vma.unregisterRegion(memory.ptr);
-            if (classSize(class) >= HUGE_PAGE) {
+            if (classSize(class) >= huge_page_size) {
                 if (self.hugeLookup(memory.ptr, true)) |rounded|
                     return hugetlb.unmap(memory.ptr, rounded);
             }

@@ -38,7 +38,7 @@ pub const FutureState = enum(u32) {
 /// so a fiber that wakes on a different worker than where it was
 /// allocated still presents the same identity.
 pub const ClaimerId = u32;
-pub const INVALID_CLAIMER: ClaimerId = std.math.maxInt(ClaimerId);
+pub const invalid_claimer: ClaimerId = std.math.maxInt(ClaimerId);
 
 pub fn makeClaimer(fiber_id: u32) ClaimerId {
     return fiber_id;
@@ -97,7 +97,7 @@ pub const Future = struct {
     pub fn init() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.unresolved)),
-            .claimer = .init(INVALID_CLAIMER),
+            .claimer = .init(invalid_claimer),
             .waiters_head = null,
             .waiters_mu = .{},
         };
@@ -108,7 +108,7 @@ pub const Future = struct {
     pub fn initResolved() Future {
         return .{
             .state = .init(@intFromEnum(FutureState.resolved)),
-            .claimer = .init(INVALID_CLAIMER),
+            .claimer = .init(invalid_claimer),
             .waiters_head = null,
             .waiters_mu = .{},
         };
@@ -214,7 +214,7 @@ pub const Future = struct {
     /// observed `.busy` and parked, and its list push is plainly visible
     /// here). Same solo-ness contract as `tryClaimSolo`.
     pub fn publishSolo(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.resolved), .monotonic);
         if (self.waiters_head != null) self.wakeFiberWaiters();
     }
@@ -223,7 +223,7 @@ pub const Future = struct {
     /// contract. Used by the binding-cell publish (`cell_set` runs once per
     /// recursive let binding, which pays the waiter-mutex RMW otherwise).
     pub fn resetSolo(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.unresolved), .monotonic);
         if (self.waiters_head != null) self.wakeFiberWaiters();
     }
@@ -251,7 +251,7 @@ pub const Future = struct {
     /// enrolled fiber waiters. The caller MUST have stored its result
     /// slot before this call; the release-store of `state` publishes it.
     pub fn publish(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .release);
+        self.claimer.store(invalid_claimer, .release);
         self.state.store(@intFromEnum(FutureState.resolved), .release);
         self.wakeFiberWaiters();
     }
@@ -262,7 +262,7 @@ pub const Future = struct {
     /// `publishErrored` instead. The embedder's `target` is left intact
     /// (a transient failure never overwrote it with a result).
     pub fn reset(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.unresolved), .release);
         self.wakeFiberWaiters();
     }
@@ -272,7 +272,7 @@ pub const Future = struct {
     /// and owns it (and any heap-allocated `info.message`) so it can
     /// release it at teardown.
     pub fn publishErrored(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.errored), .release);
         self.wakeFiberWaiters();
     }
@@ -280,7 +280,7 @@ pub const Future = struct {
     /// Mark this future as a blackhole. Wakes waiters so they observe
     /// the new state and return an error.
     pub fn blackhole(self: *Future) void {
-        self.claimer.store(INVALID_CLAIMER, .monotonic);
+        self.claimer.store(invalid_claimer, .monotonic);
         self.state.store(@intFromEnum(FutureState.blackhole), .release);
         self.wakeFiberWaiters();
     }

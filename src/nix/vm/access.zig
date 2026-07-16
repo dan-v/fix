@@ -106,7 +106,7 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
             switch (self.heap.get(obj_id).*) {
                 .attrs => |a| {
                     const n: u64 = a.range.len;
-                    const k: usize = @min(prof_census.AL_BUCKETS - 1, std.math.log2_int(u64, @max(2, n) - 1));
+                    const k: usize = @min(prof_census.allocation_buckets - 1, std.math.log2_int(u64, @max(2, n) - 1));
                     prof_census.al_size[k] += 1;
                     prof_census.al_probes[k] += if (n <= 1) 1 else std.math.log2_int(u64, n) + 1;
                 },
@@ -186,8 +186,8 @@ threadlocal var attr_cache: [attr_cache_size]AttrCacheSlot = @splat(.{});
 /// valid entries (token match) are roots. Thread-local (per worker), so each
 /// worker publishes its cache address into a registry the stop-the-world
 /// collector walks (it can't reach other threads' TLS otherwise).
-const GC_MAX_WORKERS = 256;
-var attr_cache_registry: [GC_MAX_WORKERS]?*[attr_cache_size]AttrCacheSlot = @splat(null);
+const gc_max_workers = 256;
+var attr_cache_registry: [gc_max_workers]?*[attr_cache_size]AttrCacheSlot = @splat(null);
 
 /// Called by each worker (on its own thread) before it can allocate.
 pub fn gcRegisterAttrCache(worker_id: u8) void {
