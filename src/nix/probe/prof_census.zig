@@ -28,6 +28,100 @@ pub const Disc = struct {
 };
 pub var disc: Disc = .{};
 
+/// Coverage-miss breakdown (piggybacks on `-Dprof-main`): every thunk MAIN
+/// claims itself is a speculation coverage MISS (helpers didn't pre-resolve
+/// it). This census classifies those misses by (a) whether speculation ever
+/// submitted a force task for the thunk — `Future.spec_disp`: 0 never /
+/// 1 admitted / 2 rejected — crossed with (b) whether the thunk was OLD
+/// enough at force (>= ~0.5ms) that a helper could in principle have raced
+/// ahead. The decisive cells:
+///   never + old   = TARGETING gap (existed long enough, but speculation
+///                   never aimed here) — the addressable coverage prize.
+///   admitted + old= LATENCY  gap (aimed + admitted, but main won the race
+///                   or the task never drained) — a drain/junk-volume problem.
+///   rejected      = CAPACITY gap (aimed, but the backlog was full).
+///   never + fresh = serial spine (created just-in-time on the demand chain;
+///                   no helper could get ahead) — structural, unspeculatable.
+/// The TARGETING cell is further split by thunk kind: `closure`/`bytecode`
+/// are directly speculatable (a selection heuristic missed them), whereas
+/// `attr_access` are the depth-pull config traversal that needs a
+/// demand-predictive selector (no cheap fix). Worker-0-only; zero-cost off.
+pub const Coverage = struct {
+    never_fresh: u64 = 0,
+    never_old: u64 = 0,
+    admitted_fresh: u64 = 0,
+    admitted_old: u64 = 0,
+    rejected_fresh: u64 = 0,
+    rejected_old: u64 = 0,
+    /// never+old split by TargetKind (0 closure .. 4 deferred).
+    never_old_kind: [5]u64 = @splat(0),
+};
+pub var cov: Coverage = .{};
+
+/// "Old enough for a helper to have raced ahead" — mirrors
+/// `prof_age.AGE_OLD_THRESHOLD` (2^21 cy, ~0.5ms at 3.6GHz); duplicated to
+/// keep this module import-light.
+const COV_OLD_THRESHOLD: u64 = 1 << 21;
+
+/// Classify one `claimed_by_main` force. `disp` = `Future.spec_disp`,
+/// `created_tsc` = the thunk's creation stamp (0 = unknown, skipped),
+/// `kind_idx` = its `TargetKind` int. Off-main callers must not call this
+/// (the discovery census already guards worker 0). Zero-cost when off.
+pub inline fn recordCoverage(disp: u8, created_tsc: u64, kind_idx: u8) void {
+    if (comptime !prof.enabled) return;
+    if (created_tsc == 0) return;
+    const age = prof.rdtsc() -| created_tsc;
+    const old = age >= COV_OLD_THRESHOLD;
+    switch (disp) {
+        1 => if (old) {
+            cov.admitted_old += 1;
+        } else {
+            cov.admitted_fresh += 1;
+        },
+        2 => if (old) {
+            cov.rejected_old += 1;
+        } else {
+            cov.rejected_fresh += 1;
+        },
+        else => if (old) {
+            cov.never_old += 1;
+            if (kind_idx < cov.never_old_kind.len) cov.never_old_kind[kind_idx] += 1;
+        } else {
+            cov.never_fresh += 1;
+        },
+    }
+}
+
+/// Coverage-miss breakdown of main's self-claimed forces (see `Coverage`).
+pub fn reportCoverage() void {
+    const total = cov.never_fresh + cov.never_old + cov.admitted_fresh +
+        cov.admitted_old + cov.rejected_fresh + cov.rejected_old;
+    if (total == 0) return;
+    const never = cov.never_fresh + cov.never_old;
+    const admitted = cov.admitted_fresh + cov.admitted_old;
+    const rejected = cov.rejected_fresh + cov.rejected_old;
+    std.debug.print(
+        "prof coverage-miss (main self-claimed forces, n={d} — speculation did NOT cover these):\n",
+        .{total},
+    );
+    std.debug.print(
+        "  never-submitted    = {d} ({d:.1}%) | old={d} ({d:.1}%)=TARGETING gap  fresh={d} ({d:.1}%)=serial spine\n",
+        .{ never, pct(never, total), cov.never_old, pct(cov.never_old, total), cov.never_fresh, pct(cov.never_fresh, total) },
+    );
+    std.debug.print(
+        "  submitted-admitted = {d} ({d:.1}%) | old={d} ({d:.1}%)=LATENCY gap   fresh={d} ({d:.1}%)\n",
+        .{ admitted, pct(admitted, total), cov.admitted_old, pct(cov.admitted_old, total), cov.admitted_fresh, pct(cov.admitted_fresh, total) },
+    );
+    std.debug.print(
+        "  submitted-rejected = {d} ({d:.1}%) | old={d} fresh={d}  =CAPACITY gap\n",
+        .{ rejected, pct(rejected, total), cov.rejected_old, cov.rejected_fresh },
+    );
+    std.debug.print(
+        "  TARGETING gap (never+old) by kind: closure={d} bytecode={d} pass_through={d} attr_access={d} deferred={d}\n",
+        .{ cov.never_old_kind[0], cov.never_old_kind[1], cov.never_old_kind[2], cov.never_old_kind[3], cov.never_old_kind[4] },
+    );
+}
+
 /// Strict-collection-walk size census (piggybacks on `-Dprof-main`): sizes
 /// the collections MAIN (worker 0, demand context) strictly walks via
 /// `forceListAccelerate` / `forceAttrsAccelerate`. `fan_out_min_items` (=4)

@@ -37,6 +37,22 @@ pub inline fn initCreatedDemand() CreatedDemand {
     return if (comptime created_tsc_enabled) false else {};
 }
 
+/// `-Dprof-main` speculation-disposition probe: did speculation ever
+/// submit a `force_thunk` task for this thunk, and was it admitted?
+///   0 = never submitted (the eligibility predicate said no, or the
+///       thunk kind never passes through `makeThunk`'s spec branch)
+///   1 = submitted AND admitted to a lane (spec aimed here; if main
+///       later claims it itself, speculation lost the race — a LATENCY
+///       gap, not a targeting one)
+///   2 = submitted but REJECTED at admission (backlog full → CAPACITY gap)
+/// Read at the `claimed_by_main` census site to split main's self-computed
+/// forces into targeting / latency / capacity misses. Zero bytes off.
+pub const SpecDisp = if (created_tsc_enabled) u8 else void;
+
+pub inline fn initSpecDisp() SpecDisp {
+    return if (comptime created_tsc_enabled) @as(u8, 0) else {};
+}
+
 inline fn nowCreatedTsc() CreatedTsc {
     if (comptime !created_tsc_enabled) return {};
     var low: u32 = undefined;
@@ -154,6 +170,21 @@ pub const Future = struct {
     /// of demand" from "demanded immediately, no headroom" in the exit
     /// census. Racy-benign (racing first-demanders write ~the same value).
     demanded_old: CreatedDemand = initCreatedDemand(),
+    /// Speculation disposition (see `SpecDisp`). Set once at the
+    /// `makeThunk` submit site; read at `claimed_by_main`. Zero bytes off.
+    spec_disp: SpecDisp = initSpecDisp(),
+
+    /// Record whether speculation submitted (and whether the scheduler
+    /// admitted) a force task for this thunk. `-Dprof-main` only — compiles
+    /// to nothing on normal builds.
+    pub inline fn noteSpecSubmitted(self: *Future, admitted: bool) void {
+        if (comptime created_tsc_enabled) self.spec_disp = if (admitted) 1 else 2;
+    }
+
+    /// Read the speculation disposition (0 on normal builds).
+    pub inline fn specDispValue(self: *const Future) u8 {
+        return if (comptime created_tsc_enabled) self.spec_disp else 0;
+    }
 
     pub fn init() Future {
         return .{
@@ -202,6 +233,23 @@ pub const Future = struct {
             .waiters_head = null,
             .waiters_mu = .{},
             .created_tsc = nowCreatedTsc(),
+        };
+    }
+
+    /// `initClaimed` with a comptime-known creation stamp (0) instead of the
+    /// runtime `rdtsc` in `nowCreatedTsc`. Needed where a claimed Future is a
+    /// struct-field DEFAULT (e.g. `RealizationClaim.future`): a default value
+    /// must be comptime-known, which the stamping constructor is not under
+    /// `-Dprof-main`. The zero stamp disables age accounting — correct here,
+    /// since the age census only reads thunk futures, never store claim cells.
+    pub fn initClaimedStatic(claimer: ClaimerId) Future {
+        return .{
+            .state = .init(@intFromEnum(FutureState.evaluating)),
+            .claimer = .init(claimer),
+            .demanded = .init(0),
+            .waiters_head = null,
+            .waiters_mu = .{},
+            .created_tsc = if (comptime created_tsc_enabled) @as(u64, 0) else {},
         };
     }
 

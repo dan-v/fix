@@ -342,6 +342,9 @@ pub fn report(registry: anytype, intern: anytype) void {
     prof_task.report();
     // Discovery-serialization breakdown of main's demand forces.
     prof_census.reportDiscovery();
+    // Coverage-miss breakdown: of the forces main computed itself, how many
+    // did speculation never aim at (targeting gap) vs aim-at-but-lose.
+    prof_census.reportCoverage();
     // Strict-collection-walk size census: are main's walks mostly small
     // (unfannable, sub-threshold) — aggregate parallelism fan-out can't reach?
     prof_census.reportStrictWalks(&prof_census.list_walks, "list");

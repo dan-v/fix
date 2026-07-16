@@ -170,6 +170,11 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
         if (self.scheduler.touch_log != null) force.logSpawn(self, id, ok);
+        // Coverage census (`-Dprof-main`): this bytecode-thunk submit path is
+        // ON (gated on body_is_substantial, not eager) — stamp it so the
+        // `claimed_by_main` disposition split isn't mis-attributed as
+        // never-submitted.
+        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
     }
     try stack.push(self, Value.thunk(id));
 }
@@ -364,7 +369,8 @@ pub fn makeBytecodeThunkFromCapturesEager(self: *VM, chunk_id: ChunkId, descript
     const id = try captureBytecodeThunk(self, chunk_id, descriptors, frame);
     recordBytecodeThunkCreate(self, id, frame, chunk_id);
     if (!self.solo and !self.in_speculation and eager_submit_enabled) {
-        _ = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
+        const ok = self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId());
+        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
     }
     try stack.push(self, Value.thunk(id));
 }

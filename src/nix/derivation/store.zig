@@ -481,7 +481,7 @@ pub const DerivationStore = struct {
         /// Woken (once) when the claim reaches a terminal state — waiters enroll
         /// on it and park (a compute fiber yields; a thread blocks on a
         /// semaphore-backed waiter). Starts `.evaluating` so `enrollWaiter` takes.
-        future: Future = Future.initClaimed(runtime.thunk.makeClaimer(0)),
+        future: Future = Future.initClaimedStatic(runtime.thunk.makeClaimer(0)),
         refs: std.atomic.Value(usize) = .init(1),
         state: State = .writing,
         err: ?anyerror = null,

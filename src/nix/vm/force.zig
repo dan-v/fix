@@ -865,6 +865,15 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 if (comptime prof.enabled) {
                     if (demand and self.workerId() == 0) {
                         prof_census.disc.claimed_by_main += 1;
+                        // Coverage-miss breakdown: main is computing this
+                        // itself, so speculation did NOT cover it. Split by
+                        // whether spec ever aimed here (disposition) crossed
+                        // with whether it had time to (age).
+                        prof_census.recordCoverage(
+                            thunk.future.specDispValue(),
+                            thunk.future.created_tsc,
+                            @intFromEnum(thunk.targetKind()),
+                        );
                         age_t = prof.ageForceBegin(
                             thunk.future.created_tsc,
                             @intFromEnum(thunk.targetKind()),
@@ -1277,6 +1286,10 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());
         if (self.scheduler.touch_log != null) logSpawn(self, id, ok);
+        // Coverage census (`-Dprof-main`): stamp whether this thunk was
+        // aimed at by speculation (and admitted), so the `claimed_by_main`
+        // site can tell a targeting miss from a lost race.
+        if (comptime prof.enabled) self.heap.getThunkAssumeValid(id).future.noteSpecSubmitted(ok);
     }
     return Value.thunk(id);
 }
