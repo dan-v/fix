@@ -6,12 +6,15 @@
 //! to switch back to whoever resumed it, suspending its state for later
 //! resumption.
 //!
-//! Stack switching is done via a small naked assembly routine
-//! (`fix_swap_context`, see src/base/fiber/swap_<arch>.S) that saves the
-//! callee-saved register set + stack pointer into a `Context` and loads a
-//! new one.
-//! Caller-saved registers are clobbered on swap — Zig's calling convention
-//! lets the compiler handle that around the swap call site.
+//! Stack switching is done by `contextSwitch`, an inline-asm routine
+//! vendored from Zig's `std.Io.fiber`. It saves only the stack pointer,
+//! frame pointer, and resume address into a `Context`; every other register
+//! — callee-saved GPRs, the vector file, and the FP/flags control state
+//! (`mxcsr`/`fpcr`/direction flag) — is listed as clobbered, so the compiler
+//! spills whatever is live around each swap site. Being `inline` is what makes
+//! that correct: the clobbers must land at the real call sites, not behind a
+//! call. This preserves FP rounding mode and the direction flag across a swap,
+//! which the old hand-rolled per-arch `.S` did not.
 //!
 //! Fibers can be resumed from any OS thread. `caller_ctx` points into
 //! the resumer's stack frame for the duration of one `resume_` call
@@ -76,74 +79,128 @@ pub inline fn censusNow() u64 {
     return (@as(u64, high) << 32) | @as(u64, low);
 }
 
-/// Callee-saved register set + saved stack pointer. The layout is
-/// arch-specific and MUST match the corresponding swap_<arch>.S exactly.
+/// Minimal saved state for an inactive fiber: stack pointer, frame pointer, and
+/// resume address. The offsets (0, 8, 16) are load-bearing — `contextSwitch`
+/// reads them directly. Everything else the swap needs to preserve rides the
+/// clobber list, not this struct. Vendored from Zig's `std.Io.fiber`.
 pub const Context = switch (builtin.cpu.arch) {
-    // SysV/Win64-agnostic x86_64 callee-saved set. See swap_x86_64.S.
-    .x86_64 => extern struct {
-        rbx: u64 = 0,
-        rbp: u64 = 0,
-        r12: u64 = 0,
-        r13: u64 = 0,
-        r14: u64 = 0,
-        r15: u64 = 0,
-        rsp: u64 = 0,
-    },
-    // AAPCS64 callee-saved set: x19-x28, fp (x29), lr (x30), sp, and the
-    // low 64 bits of the callee-saved SIMD registers v8-v15. See
-    // swap_aarch64.S. Field order/offsets are load-bearing.
-    .aarch64 => extern struct {
-        x19: u64 = 0,
-        x20: u64 = 0,
-        x21: u64 = 0,
-        x22: u64 = 0,
-        x23: u64 = 0,
-        x24: u64 = 0,
-        x25: u64 = 0,
-        x26: u64 = 0,
-        x27: u64 = 0,
-        x28: u64 = 0,
-        fp: u64 = 0,
-        lr: u64 = 0,
-        sp: u64 = 0,
-        d8: u64 = 0,
-        d9: u64 = 0,
-        d10: u64 = 0,
-        d11: u64 = 0,
-        d12: u64 = 0,
-        d13: u64 = 0,
-        d14: u64 = 0,
-        d15: u64 = 0,
-    },
+    .x86_64 => extern struct { rsp: u64 = 0, rbp: u64 = 0, rip: u64 = 0 },
+    .aarch64 => extern struct { sp: u64 = 0, fp: u64 = 0, pc: u64 = 0 },
     else => unreachable, // gated by the comptime block above
 };
 
-/// Implemented in src/base/fiber/swap_<arch>.S.
-extern fn fix_swap_context(from: *Context, to: *Context) callconv(.c) void;
+/// Save-into / restore-from pair for one context switch. Layout matches what
+/// `contextSwitch` reads: `old` at offset 0, `new` at offset 8.
+const Switch = extern struct { old: *Context, new: *Context };
 
-/// Bootstrap a fresh `Context` on `stack` so the first `fix_swap_context`
-/// into it lands in `trampoline` on the fiber's own stack. The mechanism
-/// is arch-specific: x86_64 `ret`s off the stack top (so we push the
-/// trampoline address there), while aarch64 `ret`s to the link register
-/// (so we seed `lr` directly and leave `sp` at the aligned top).
+/// Save the current CPU state into `s.old`, restore `s.new`, and continue at
+/// `s.new`'s resume address. Vendored verbatim from Zig 0.16 `std.Io.fiber`:
+/// only sp/fp/pc are stored; the full clobber list (callee-saved GPRs, the
+/// vector file, `mxcsr`/`fpcr`/`fpsr`, the direction flag) forces the compiler
+/// to preserve any live state around the emitted swap. MUST stay `inline` — the
+/// clobbers only bind at the real call site, never behind a call boundary. The
+/// returned `*const Switch` is the resumer's message (unused here).
+inline fn contextSwitch(s: *const Switch) *const Switch {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\ movq 0(%%rsi), %%rax
+            \\ movq 8(%%rsi), %%rcx
+            \\ leaq 0f(%%rip), %%rdx
+            \\ movq %%rsp, 0(%%rax)
+            \\ movq %%rbp, 8(%%rax)
+            \\ movq %%rdx, 16(%%rax)
+            \\ movq 0(%%rcx), %%rsp
+            \\ movq 8(%%rcx), %%rbp
+            \\ jmpq *16(%%rcx)
+            \\0:
+            : [received_message] "={rsi}" (-> *const Switch),
+            : [message_to_send] "{rsi}" (s),
+            : .{
+                .rax = true,   .rcx = true,   .rdx = true,   .rbx = true,
+                .rsi = true,   .rdi = true,   .r8 = true,    .r9 = true,
+                .r10 = true,   .r11 = true,   .r12 = true,   .r13 = true,
+                .r14 = true,   .r15 = true,
+                .mm0 = true,   .mm1 = true,   .mm2 = true,   .mm3 = true,
+                .mm4 = true,   .mm5 = true,   .mm6 = true,   .mm7 = true,
+                .zmm0 = true,  .zmm1 = true,  .zmm2 = true,  .zmm3 = true,
+                .zmm4 = true,  .zmm5 = true,  .zmm6 = true,  .zmm7 = true,
+                .zmm8 = true,  .zmm9 = true,  .zmm10 = true, .zmm11 = true,
+                .zmm12 = true, .zmm13 = true, .zmm14 = true, .zmm15 = true,
+                .zmm16 = true, .zmm17 = true, .zmm18 = true, .zmm19 = true,
+                .zmm20 = true, .zmm21 = true, .zmm22 = true, .zmm23 = true,
+                .zmm24 = true, .zmm25 = true, .zmm26 = true, .zmm27 = true,
+                .zmm28 = true, .zmm29 = true, .zmm30 = true, .zmm31 = true,
+                .fpsr = true,  .fpcr = true,  .mxcsr = true, .rflags = true,
+                .dirflag = true, .memory = true,
+            }),
+        .aarch64 => asm volatile (
+            \\ ldp x0, x2, [x1]
+            \\ ldr x3, [x2, #16]
+            \\ mov x4, sp
+            \\ stp x4, fp, [x0]
+            \\ adr x5, 0f
+            \\ ldp x4, fp, [x2]
+            \\ str x5, [x0, #16]
+            \\ mov sp, x4
+            \\ br x3
+            \\0:
+            : [received_message] "={x1}" (-> *const Switch),
+            : [message_to_send] "{x1}" (s),
+            : .{
+                .x0 = true,  .x1 = true,  .x2 = true,  .x3 = true,
+                .x4 = true,  .x5 = true,  .x6 = true,  .x7 = true,
+                .x8 = true,  .x9 = true,  .x10 = true, .x11 = true,
+                .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+                .x16 = true, .x17 = true, .x19 = true, .x20 = true,
+                .x21 = true, .x22 = true, .x23 = true, .x24 = true,
+                .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+                .x30 = true,
+                .z0 = true,  .z1 = true,  .z2 = true,  .z3 = true,
+                .z4 = true,  .z5 = true,  .z6 = true,  .z7 = true,
+                .z8 = true,  .z9 = true,  .z10 = true, .z11 = true,
+                .z12 = true, .z13 = true, .z14 = true, .z15 = true,
+                .z16 = true, .z17 = true, .z18 = true, .z19 = true,
+                .z20 = true, .z21 = true, .z22 = true, .z23 = true,
+                .z24 = true, .z25 = true, .z26 = true, .z27 = true,
+                .z28 = true, .z29 = true, .z30 = true, .z31 = true,
+                .p0 = true,  .p1 = true,  .p2 = true,  .p3 = true,
+                .p4 = true,  .p5 = true,  .p6 = true,  .p7 = true,
+                .p8 = true,  .p9 = true,  .p10 = true, .p11 = true,
+                .p12 = true, .p13 = true, .p14 = true, .p15 = true,
+                .fpcr = true, .fpsr = true, .ffr = true, .memory = true,
+            }),
+        else => unreachable,
+    };
+}
+
+/// Save the running context into `from` and switch to `to`. `inline` so the
+/// vendored `contextSwitch` clobbers bind at the caller (`resume_`/`yield`/
+/// `trampoline`), the way the old out-of-line swap call did.
+inline fn swap(from: *Context, to: *Context) void {
+    var s = Switch{ .old = from, .new = to };
+    _ = contextSwitch(&s);
+}
+
+/// Bootstrap a fresh `Context` on `stack` so the first switch into it lands in
+/// `trampoline` on the fiber's own stack. `contextSwitch` loads sp/fp and jumps
+/// straight to the saved address, so we seed the resume address directly (no
+/// pushed return slot).
 fn bootstrapContext(stack: []u8) Context {
     const top = @intFromPtr(stack.ptr) + stack.len;
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            // sp_start must satisfy sp_start % 16 == 0 so that AFTER `ret`
-            // pops the return address the trampoline sees rsp ≡ 8 (mod 16),
-            // which is what SysV expects at function entry. Round down.
-            const sp_start = (top - 8) & ~@as(usize, 15);
-            const slot: *usize = @ptrFromInt(sp_start);
-            slot.* = @intFromPtr(&trampoline);
-            return .{ .rsp = sp_start };
+            // The switch `jmp`s to `rip` — entering `trampoline` as if via a
+            // `call` (which pushes 8 bytes). SysV wants rsp ≡ 8 (mod 16) at
+            // entry, so seed the 16-aligned top minus 8.
+            const sp_start = (top & ~@as(usize, 15)) - 8;
+            return .{ .rsp = sp_start, .rbp = 0, .rip = @intFromPtr(&trampoline) };
         },
         .aarch64 => {
-            // AAPCS64 requires sp 16-byte aligned at all times. `top` is
-            // page-aligned (mmap), hence already 16-aligned. `ret` branches
-            // to lr, so no return address is pushed onto the stack.
+            // AAPCS64 requires sp 16-byte aligned at all times; `top` is
+            // page-aligned (mmap), hence already 16-aligned. The switch `br`s to
+            // `pc`, so no return address is pushed onto the stack.
             const sp_start = top & ~@as(usize, 15);
-            return .{ .sp = sp_start, .lr = @intFromPtr(&trampoline) };
+            return .{ .sp = sp_start, .fp = 0, .pc = @intFromPtr(&trampoline) };
         },
         else => unreachable,
     }
@@ -330,7 +387,7 @@ pub const Fiber = struct {
         current = self;
         self.caller_ctx = &here;
         self.state = .running;
-        fix_swap_context(&here, &self.ctx);
+        swap(&here, &self.ctx);
         // Back from the swap: the fiber either yielded (state == .suspended) or
         // completed (state == .finished).
         //
@@ -354,7 +411,7 @@ pub const Fiber = struct {
         const back = self.caller_ctx orelse @panic("running fiber has no caller_ctx");
         self.state = .suspended;
         if (comptime census_enabled) census_exit_swap = censusNow();
-        fix_swap_context(&self.ctx, back);
+        swap(&self.ctx, back);
         if (comptime census_enabled) {
             census_in_cy += censusNow() -| census_pre_swap;
             census_in_n += 1;
@@ -365,10 +422,11 @@ pub const Fiber = struct {
 };
 
 /// Entry point that the new fiber's stack is bootstrapped to. The first
-/// `fix_swap_context` "returns" into here on the fiber's own stack. We
-/// pull the fiber pointer from the threadlocal `current` (set by
-/// `resume_` before the swap), invoke the user entry, and then swap
-/// back permanently — `entry` returning means the fiber is done.
+/// switch into it jumps here on the fiber's own stack (its `Context.rip`/`pc`
+/// is seeded to this by `bootstrapContext`). We pull the fiber pointer from the
+/// threadlocal `current` (set by `resume_` before the swap), invoke the user
+/// entry, and then swap back permanently — `entry` returning means the fiber
+/// is done.
 fn trampoline() callconv(.c) void {
     if (comptime census_enabled) {
         census_in_cy += censusNow() -| census_pre_swap;
@@ -380,13 +438,13 @@ fn trampoline() callconv(.c) void {
     entry(arg);
     self.state = .finished;
     // Hold onto the back-ctx pointer before we (effectively) leave the
-    // fiber. After `fix_swap_context` we never resume — caller_ctx may be
+    // fiber. After the final swap we never resume — caller_ctx may be
     // gone by the time anyone else might read it.
     const back = self.caller_ctx orelse @panic("finished fiber has no caller_ctx");
     self.entry = null;
     self.entry_arg = null;
     if (comptime census_enabled) census_exit_swap = censusNow();
-    fix_swap_context(&self.ctx, back);
+    swap(&self.ctx, back);
     // Should never get here — resuming a `.finished` fiber would re-run
     // the swap, which would land on whatever junk is below this point.
     @panic("trampoline reached unreachable after finish swap");

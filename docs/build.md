@@ -10,7 +10,7 @@ Zig's `@import("<name>")` reaches a module only through its facade; the compiler
 
 | Module | Facade | Imports | Notes |
 |---|---|---|---|
-| `base` | `src/base/base.zig` | `build_options` | generic infra, no Nix coupling: deque + cache-line isolation, the stackful fiber (+ arch asm `src/base/fiber/swap_x86_64.S`), spin/blocking mutexes, segmented + flat stores, the `Vma(Tag)` RSS tracker, the block-cache allocator, a regex engine, a TOML parser |
+| `base` | `src/base/base.zig` | `build_options` | generic infra, no Nix coupling: deque + cache-line isolation, the stackful fiber (inline-asm context switch, vendored from std.Io.fiber), spin/blocking mutexes, segmented + flat stores, the `Vma(Tag)` RSS tracker, the block-cache allocator, a regex engine, a TOML parser |
 | `syntax` | `src/nix/syntax.zig` | `parser_tables` | lexer + LALR(1) parser + AST |
 | `runtime` | `src/nix/runtime.zig` | `build_options`, `base` | Nix value model, heap, interning, thunk/Future, GC tracer, the `MemTag` taxonomy |
 | `observ` | `src/nix/observ.zig` | `syntax` | progress sink + error-trace collector — the sinks the VM writes to |

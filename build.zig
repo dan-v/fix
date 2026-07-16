@@ -79,14 +79,8 @@ pub fn build(b: *std.Build) void {
     // src/base/arena.zig. `base` sits below `syntax` in the graph, so this
     // introduces no cycle.
     syntax_mod.addImport("base", base_mod);
-    // Fiber stack-switching primitive. The .S file is per-arch; pick one by the
-    // resolved target. Lives with the fiber code. Each .S is preprocessed and
-    // handles both ELF (Linux) and Mach-O (Darwin) via `__APPLE__` guards.
-    switch (target.result.cpu.arch) {
-        .x86_64 => base_mod.addAssemblyFile(b.path("src/base/fiber/swap_x86_64.S")),
-        .aarch64 => base_mod.addAssemblyFile(b.path("src/base/fiber/swap_aarch64.S")),
-        else => @panic("unsupported architecture: stack-switching asm is only implemented for x86_64 and aarch64"),
-    }
+    // The fiber stack-switch is now inline asm in src/base/fiber.zig (vendored
+    // from std.Io.fiber) — no per-arch .S file to compile in.
 
     const runtime_mod = b.addModule("runtime", .{
         .root_source_file = b.path("src/nix/runtime.zig"),
