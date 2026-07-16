@@ -432,7 +432,6 @@ pub fn forceDeepInner(self: *VM, value: Value, seen: *std.ArrayListUnmanaged(See
 /// concatLists, foldl', concatMap, filter, sort, etc.) get the same
 /// benefit as forceDeep — main is about to touch every item, so getting
 /// helpers started early is free.
-
 /// Below this threshold, the caller can force the items itself faster
 /// than the round-trip through the scheduler (submit + helper wake +
 /// fiber resume). Chosen empirically; most "small" lists in a NixOS
@@ -1374,7 +1373,11 @@ inline fn recordCreateForClosure(self: *VM, id: ObjectId, closure: Value) void {
             break :blk c.chunk_id;
         } else null;
         const creator = creatorFrame(self);
-        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid);
+        const substantial = if (ckid) |chunk_id|
+            if (self.registry.slot(chunk_id)) |slot| slot.body_is_substantial else false
+        else
+            false;
+        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, target_kind, ckid, substantial);
     }
 }
 
@@ -1382,7 +1385,7 @@ inline fn recordCreatePassThrough(self: *VM, id: ObjectId) void {
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
         const creator = creatorFrame(self);
-        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null);
+        tt.recordCreate(id, self.workerId(), claimerFiberId(self), creator.chunk_id, creator.ip, .pass_through, null, false);
     }
 }
 

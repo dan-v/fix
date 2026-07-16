@@ -394,7 +394,8 @@ inline fn recordBytecodeThunkCreate(self: *VM, id: types.ObjectId, frame: *const
     if (comptime !vm_mod.thunks_log_enabled) return;
     if (self.thunk_trace) |tt| {
         const fiber_id = self.ctx.claimer_id & 0x00FFFFFF;
-        tt.recordCreate(id, self.workerId(), fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id);
+        const substantial = if (self.registry.slot(chunk_id)) |slot| slot.body_is_substantial else false;
+        tt.recordCreate(id, self.workerId(), fiber_id, frame.chunk_id, @intCast(frame.ip), .bytecode, chunk_id, substantial);
     }
 }
 
