@@ -69,7 +69,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
     defer source.deinit(ev.allocator);
     // Let the debugger show a source snippet for a `-e` expression (files it
     // reads from the FileCache).
-    if (options.debugger) ev.debug_source = source.text;
+    if (options.debugger) ev.setDebugSource(source.text);
 
     var progress = cli.EvalProgress.init(init.io, term.show_progress);
     errdefer progress.deinit(false);

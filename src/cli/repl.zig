@@ -99,7 +99,7 @@ pub fn run_cmd(allocator: std.mem.Allocator, init: std.process.Init, args_iter: 
 
     // Normal repl output suppresses color in bare mode; the debugger console
     // colors by the resolved terminal decision (its banner/snippet do too).
-    ev.value_color = if (options.debugger) term.use_color else (term.use_color and interactive);
+    ev.setValueColor(if (options.debugger) term.use_color else (term.use_color and interactive));
     var repl = Repl.init(allocator, init, options, &ev, term.use_color and interactive, interactive);
     defer repl.deinit();
     if (options.debugger) repl.debug_console = &console;

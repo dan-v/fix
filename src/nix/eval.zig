@@ -45,6 +45,8 @@ const search_path_mod = @import("eval/search_path.zig");
 const imports_mod = @import("eval/imports.zig");
 const mem_report = @import("eval/mem_report.zig");
 const tuning = @import("eval/tuning.zig");
+const progress_controller = @import("eval/progress_controller.zig");
+const debugger_state = @import("eval/debugger_state.zig");
 
 const worker_mod = @import("vm.zig").worker;
 const io_offload = @import("vm.zig").io_offload;
@@ -72,6 +74,8 @@ pub const DebugUi = struct {
     ctx: *anyopaque,
     run: *const fn (*anyopaque, *DebugSession) anyerror!void,
 };
+
+const DebuggerState = debugger_state.State(DebugUi, bytecode.BreakpointTable);
 
 /// One rendered backtrace frame: the running chunk and its source anchor.
 /// `line`/`column` are 1-based; `file`/all fields are 0 when unavailable.
@@ -133,11 +137,11 @@ pub const DebugSession = struct {
     /// the pause.
     pub fn frameSourceText(self: *DebugSession, i: usize) ?[]const u8 {
         const f = &self.vm.frames[i];
-        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debug_source;
+        const span = bytecode.inspect.frameSpan(f.chunk_ptr, f.ip) orelse return self.ev.debugger.source;
         if (span.file) |fid| {
-            return self.ev.files.readFile(self.ev.intern.get(fid)) catch self.ev.debug_source;
+            return self.ev.files.readFile(self.ev.intern.get(fid)) catch self.ev.debugger.source;
         }
-        return self.ev.debug_source;
+        return self.ev.debugger.source;
     }
 
     /// Local slots of frame `i` (the values in `vm.stack[base..base+count]`).
@@ -212,19 +216,19 @@ pub const DebugSession = struct {
     /// line carrying code; returns null if nothing matches. Applies to already
     /// compiled chunks and any that compile later.
     pub fn setBreakpoint(self: *DebugSession, file: []const u8, line: u32) !?bytecode.BreakpointTable.SetResult {
-        if (self.ev.breakpoints) |*bp| return bp.set(&self.ev.registry, file, line);
+        if (self.ev.debugger.breakpoints) |*bp| return bp.set(&self.ev.registry, file, line);
         return null;
     }
 
     /// All active breakpoint requests (for a `:breakpoints` listing).
     pub fn listBreakpoints(self: *const DebugSession) []const bytecode.BreakpointTable.Request {
-        if (self.ev.breakpoints) |*bp| return bp.list();
+        if (self.ev.debugger.breakpoints) |*bp| return bp.list();
         return &.{};
     }
 
     /// Remove a breakpoint by id; true if it existed.
     pub fn deleteBreakpoint(self: *DebugSession, id: u32) bool {
-        if (self.ev.breakpoints) |*bp| return bp.remove(&self.ev.registry, id);
+        if (self.ev.debugger.breakpoints) |*bp| return bp.remove(&self.ev.registry, id);
         return false;
     }
 
@@ -240,7 +244,7 @@ pub const DebugSession = struct {
     /// Arm a single step. It takes effect once the console resumes; the next
     /// pause is the step's landing point. See `clearStep`.
     pub fn step(self: *DebugSession, kind: StepKind) !void {
-        if (self.ev.breakpoints == null) return;
+        if (self.ev.debugger.breakpoints == null) return;
         const depth = self.vm.frames_len;
         if (depth == 0) return;
         const cur = &self.vm.frames[depth - 1];
@@ -283,12 +287,12 @@ pub const DebugSession = struct {
             }
         }
 
-        if (self.ev.breakpoints) |*bp| try bp.armStep(&self.ev.registry, sites.items, max_depth);
+        if (self.ev.debugger.breakpoints) |*bp| try bp.armStep(&self.ev.registry, sites.items, max_depth);
     }
 
     /// Disarm any in-progress step (called at each pause before prompting).
     pub fn clearStep(self: *DebugSession) void {
-        if (self.ev.breakpoints) |*bp| bp.clearStep(&self.ev.registry);
+        if (self.ev.debugger.breakpoints) |*bp| bp.clearStep(&self.ev.registry);
     }
 
     /// Build a one-entry scope attrset binding `name` to `self.value` — handy
@@ -502,37 +506,14 @@ pub const Evaluator = struct {
     /// Feature gates and deprecated compatibility behavior shared unchanged by
     /// parsing, every nested compiler, and every VM.
     policy: LanguagePolicy = .{},
-    /// Interactive debugger UI, installed by the CLI (`--debugger`). Null (the
-    /// default) means no debugger: `builtins.break` is a plain identity and the
-    /// break sink is never installed on VMs. See `DebugSession`.
-    debug_ui: ?DebugUi = null,
-    /// Re-entrancy guard: true while the console is running. A `break`/throw in
-    /// a console expression must not open a nested debugger — the console's own
-    /// error handling deals with it.
-    debug_in_session: bool = false,
-    /// Source-line breakpoints (patched bytecode). Created by `setDebugUi`;
-    /// null with no debugger. Its address is stable (the Evaluator is used by
-    /// pointer), so the registry sink and each VM point at it directly.
-    breakpoints: ?bytecode.BreakpointTable = null,
+    debugger: DebuggerState = .{},
     /// Colorize `writeValue` output (strings/numbers/keywords/attr names). Set
     /// by the CLI from its terminal-color decision; default off (plain text for
     /// pipes, tests, JSON/XML paths). See `eval/print.zig`.
     value_color: bool = false,
-    /// The entry source text, for the debugger to show a snippet at a pause in
-    /// a `-e` expression (files come from the FileCache). Set by the CLI.
-    debug_source: ?[]const u8 = null,
     base_path: ?[:0]u8,
     env_map: ?*const std.process.Environ.Map,
-    progress: ?eval_progress.Sink,
-    /// Progress sampler state (active only while `progress != null`). A thread
-    /// pushes a counter snapshot to the sink every ~100ms — decoupled from
-    /// fiber quanta so `--workers=1` (which can run the whole eval in one
-    /// non-yielding quantum) still updates. `progress_wait` is the shared
-    /// demand-block subject the sampler surfaces. All three are inert (unset)
-    /// in non-interactive runs, so they add nothing to the hot path.
-    progress_wait: eval_progress.ProgressWait = .{},
-    progress_thread: ?std.Thread = null,
-    progress_stop: std.atomic.Value(bool) = .init(false),
+    progress_control: progress_controller.Controller = .{},
     vm_trace: ?*VmTrace,
     thunk_trace: if (vm_mod.thunks_log_enabled) ?*ThunkTrace else void,
     worker_count: u8,
@@ -656,7 +637,7 @@ pub const Evaluator = struct {
             .builtins_value = null,
             .base_path = null,
             .env_map = null,
-            .progress = null,
+            .progress_control = .{},
             .vm_trace = null,
             .thunk_trace = if (vm_mod.thunks_log_enabled) null else {},
             .worker_count = worker_count,
@@ -674,7 +655,7 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
-        if (self.breakpoints) |*bp| bp.deinit();
+        self.debugger.deinit();
         self.releaseEvalState();
         if (self.base_path) |path| self.allocator.free(path);
         // Language workers are joined by releaseEvalState, so no fiber remains
@@ -873,7 +854,7 @@ pub const Evaluator = struct {
     }
 
     pub fn setProgressSink(self: *Evaluator, progress: ?eval_progress.Sink) void {
-        self.progress = progress;
+        self.progress_control.setSink(progress);
         // The derivation store does its real store work (`.drv` writes, source
         // serializes) off the demand fiber, so it reports via the thread-safe span
         // sink. It must not import observ (same module layer), so hand it opaque
@@ -896,7 +877,7 @@ pub const Evaluator = struct {
     /// both no-op if the sink was cleared mid-run.
     fn drvSpanBegin(ctx: *anyopaque, group: realization.SpanGroup, label: []const u8) usize {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        const spans = (self.progress orelse return 0).spans;
+        const spans = (self.progress_control.sink orelse return 0).spans;
         const observ_group: eval_progress.SpanGroup = switch (group) {
             .store => .store,
             .source => .source,
@@ -906,7 +887,7 @@ pub const Evaluator = struct {
 
     fn drvSpanEnd(ctx: *anyopaque, token: usize) void {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
-        const spans = (self.progress orelse return).spans;
+        const spans = (self.progress_control.sink orelse return).spans;
         spans.endSpan(.{ .token = token });
     }
 
@@ -1178,12 +1159,20 @@ pub const Evaluator = struct {
     /// the UI implementation (terminal I/O lives in `cli`); the engine only
     /// upcalls through this seam, so the layering stays down-only.
     pub fn setDebugUi(self: *Evaluator, ctx: *anyopaque, run: *const fn (*anyopaque, *DebugSession) anyerror!void) void {
-        self.debug_ui = .{ .ctx = ctx, .run = run };
-        if (self.breakpoints == null) {
-            self.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
+        self.debugger.setUi(.{ .ctx = ctx, .run = run });
+        if (self.debugger.breakpoints == null) {
+            self.debugger.breakpoints = bytecode.BreakpointTable.init(self.allocator, &self.intern);
             // Newly (often lazily) compiled chunks get pending breakpoints too.
-            self.registry.breakpoint_sink = self.breakpoints.?.sink();
+            self.registry.breakpoint_sink = self.debugger.breakpoints.?.sink();
         }
+    }
+
+    pub fn setDebugSource(self: *Evaluator, source: ?[]const u8) void {
+        self.debugger.setSource(source);
+    }
+
+    pub fn setValueColor(self: *Evaluator, enabled: bool) void {
+        self.value_color = enabled;
     }
 
     /// `vm_mod.BreakSink.fire` trampoline: build a `DebugSession` over the
@@ -1193,10 +1182,8 @@ pub const Evaluator = struct {
         const self: *Evaluator = @ptrCast(@alignCast(ctx));
         // A break/throw raised while the console is evaluating an expression
         // must not recurse into a nested debugger.
-        if (self.debug_in_session) return;
-        const ui = self.debug_ui orelse return;
-        self.debug_in_session = true;
-        defer self.debug_in_session = false;
+        const ui = self.debugger.beginSession() orelse return;
+        defer self.debugger.endSession();
         var session: DebugSession = .{ .ev = self, .vm = vm, .value = value, .reason = reason };
         try ui.run(ui.ctx, &session);
     }
@@ -1432,7 +1419,7 @@ pub const Evaluator = struct {
             // the demand fiber's ExecutionContext (installed by
             // `Worker.runTopLevel`; nested VMs share the ctx pointer, see
             // below), so a helper has no way to touch `active[]`.
-            .progress_spans = if (self.progress) |p| p.spans else null,
+            .progress_spans = if (self.progress_control.sink) |p| p.spans else null,
             .vm_trace = if (worker_id == 0) self.vm_trace else null,
             // The thunk trace IS shared across workers — diagnosing
             // concurrency-shaped wrong-result bugs needs to see every
@@ -1443,8 +1430,8 @@ pub const Evaluator = struct {
             .builtins_value = try self.ensureBuiltins(),
             .deferred_table = &self.deferred_table,
             .regexes = &self.regexes,
-            .break_sink = if (self.debug_ui != null) .{ .ctx = self, .fire = fireBreak } else null,
-            .breakpoints = if (self.breakpoints != null) &self.breakpoints.? else null,
+            .break_sink = if (self.debugger.ui != null) .{ .ctx = self, .fire = fireBreak } else null,
+            .breakpoints = if (self.debugger.breakpoints != null) &self.debugger.breakpoints.? else null,
             .policy = self.policy,
             .lazy_shells_visible = self.lazy_shells_visible,
         });
@@ -1664,8 +1651,8 @@ pub const Evaluator = struct {
         // stay null when progress isn't drawn, so the demand fiber's
         // stage/wait writes remain structurally free in benchmark/piped runs.
         try worker.runTopLevel(Ctx.entry, @ptrCast(&ctx), .{
-            .progress_stage = if (self.progress) |p| p.stage else null,
-            .progress_wait = if (self.progress != null) &self.progress_wait else null,
+            .progress_stage = if (self.progress_control.sink) |p| p.stage else null,
+            .progress_wait = if (self.progress_control.sink != null) &self.progress_control.wait else null,
         });
         if (ctx.err) |e| return e;
         return ctx.result;
@@ -1909,7 +1896,7 @@ pub const Evaluator = struct {
     /// single-threaded setup on the main thread (parse/compile before the
     /// run enters a fiber) — allowed, the demand fiber doesn't exist yet.
     fn stageSink(self: *Evaluator) ?eval_progress.StageSink {
-        const progress = self.progress orelse return null;
+        const progress = self.progress_control.sink orelse return null;
         const inner = fiber_mod.currentFiber() orelse return progress.stage;
         const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
         return wf.ctx.progress_stage;
@@ -1951,58 +1938,25 @@ pub const Evaluator = struct {
             .gc_live_bytes = g.live_bytes,
             .gc_freed_objects = g.freed_objects,
         };
-        m.wait_len = @intCast(self.progress_wait.read(&m.wait_buf));
+        m.wait_len = @intCast(self.progress_control.wait.read(&m.wait_buf));
         return m;
     }
 
-    fn progressSample(self: *Evaluator) void {
-        if (self.progress) |p| p.stage.metrics(self.readMetrics());
-    }
-
-    /// Live-counter sample period. Paired with the render refresh in
-    /// `cli.EvalProgress.init` — sampling faster than the redraw is invisible,
-    /// so bump both together. 50ms (20 Hz) keeps the counters feeling live
-    /// while staying "reasonable sampling": the cost is a handful of atomic
-    /// loads + one /proc read on a background thread that only exists while
-    /// progress is drawn — never the eval path. (Deliberately a timer thread,
-    /// NOT a per-fiber-quantum hook: quantum emission was tried and starved
-    /// `--workers=1` — one long non-yielding quantum → ~2 samples per eval —
-    /// and cost a branch per quantum even with progress off.)
-    const sample_period_ms = 50;
-    /// Stop-flag poll granularity within a sample period (bounds
-    /// `stopProgressSampler`'s join latency).
-    const stop_check_ms = 10;
-
-    /// Sampler thread body: push a snapshot, then sleep out the sample period
-    /// (waking to observe the stop flag). Decoupled from fiber quanta so the
-    /// display advances even during a single long `--workers=1` quantum.
-    fn progressSampleLoop(self: *Evaluator) void {
-        while (!self.progress_stop.load(.acquire)) {
-            self.progressSample();
-            var slept: u32 = 0;
-            while (slept < sample_period_ms and !self.progress_stop.load(.acquire)) : (slept += stop_check_ms) {
-                @import("base").sync.sleepNs(stop_check_ms * std.time.ns_per_ms);
-            }
-        }
+    fn progressSample(context: *anyopaque) void {
+        const self: *Evaluator = @ptrCast(@alignCast(context));
+        if (self.progress_control.sink) |p| p.stage.metrics(self.readMetrics());
     }
 
     /// Start the background progress sampler. No-op unless progress is drawn,
     /// so it never spins up in benchmark / piped runs.
     pub fn startProgressSampler(self: *Evaluator) void {
-        if (self.progress == null) return;
-        self.progress_stop.store(false, .release);
-        self.progress_thread = std.Thread.spawn(.{}, progressSampleLoop, .{self}) catch null;
+        self.progress_control.start(self, progressSample);
     }
 
     /// Stop and join the sampler, then push one final snapshot so the last
     /// numbers (final heap / GC tally) land before the bar is torn down.
     pub fn stopProgressSampler(self: *Evaluator) void {
-        if (self.progress_thread) |t| {
-            self.progress_stop.store(true, .release);
-            t.join();
-            self.progress_thread = null;
-        }
-        self.progressSample();
+        self.progress_control.stop();
     }
 
     /// Writer-side `[i/N]` item count. `progressCountBegin` sets the render
@@ -2016,16 +1970,16 @@ pub const Evaluator = struct {
     }
 
     pub fn progressStep(self: *Evaluator, completed: usize, total: usize) void {
-        if (self.progress) |p| p.stage.count(completed, total);
+        if (self.progress_control.sink) |p| p.stage.count(completed, total);
     }
 
     pub fn progressSessionBegin(self: *Evaluator, label: []const u8) void {
-        if (self.progress) |p| p.stage.sessionBegin(label);
+        if (self.progress_control.sink) |p| p.stage.sessionBegin(label);
     }
 
     pub fn progressSessionEnd(self: *Evaluator) void {
-        self.progress_wait.clear();
-        if (self.progress) |p| p.stage.sessionEnd();
+        self.progress_control.wait.clear();
+        if (self.progress_control.sink) |p| p.stage.sessionEnd();
     }
 };
 

@@ -13,7 +13,7 @@ const renderXmlForTest = helpers.renderXmlForTest;
 test "writeValue colorizes strings, numbers, keywords, and attr names when value_color is set" {
     var ev = try Evaluator.init(std.testing.allocator, 0);
     defer ev.deinit();
-    ev.value_color = true;
+    ev.setValueColor(true);
     const result = try ev.evaluate("{ n = 1; s = \"x\"; b = true; }");
     try ev.forceDeep(result);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);

@@ -38,7 +38,7 @@ pub fn evaluateAndWrite(
     // sampler running across every phase. Defers are LIFO: the sampler stops
     // (and joins) before the session's nodes are torn down.
     // Values render in the same palette as diagnostics when writing to a tty.
-    ev.value_color = use_color;
+    ev.setValueColor(use_color);
     ev.progressSessionBegin(label);
     defer ev.progressSessionEnd();
     ev.startProgressSampler();
