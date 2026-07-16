@@ -16,6 +16,7 @@ const Compiler = compiler_mod.Compiler;
 const Node = compiler_mod.Node;
 const ChunkBuilder = chunk.ChunkBuilder;
 const strictness = @import("strictness.zig");
+const lambda = @import("lambda.zig");
 
 const ChunkId = @import("runtime").types.ChunkId;
 
@@ -139,7 +140,13 @@ pub fn compileThunkEager(self: *Compiler, expr: *const Node, eager: bool) !void 
     var child = self.initChild(&child_builder);
     defer child.deinit();
 
-    child.compileNode(expr) catch |err| {
+    // A thunk body's final expression is in tail position (the chunk computes
+    // it and returns), so compile it as a tail expression — matching lambda
+    // bodies. A trailing apply becomes `call_tail`, reusing the thunk's frame
+    // instead of pushing a callee frame that returns straight into a `ret`
+    // (the `ret->ret` forwarding pattern). Gives thunk bodies O(1) tail-stack
+    // like lambdas; perf-neutral, kept for consistency/robustness.
+    lambda.compileTailExpression(&child, expr) catch |err| {
         try diagnostics.absorbChildDiagnostics(self, &child);
         return err;
     };
