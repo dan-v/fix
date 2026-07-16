@@ -163,8 +163,12 @@ fn forwardingUpvalue(self: *Compiler, child: *Compiler, body: *const Node, param
 }
 
 /// True iff `func` is a `x: body` lambda whose body must-force its
-/// parameter (so a caller may pass its argument eagerly).
-fn directlyAppliedStrictLambda(self: *Compiler, func: *const Node) !bool {
+/// parameter (so a caller may pass its argument eagerly). Unwraps parens
+/// first — a directly-applied lambda is nearly always written parenthesized
+/// (`(x: body) arg`), so without this the check was dead (`func.tag == .parens`
+/// → false) and only beta-inlining eagerized such args.
+fn directlyAppliedStrictLambda(self: *Compiler, func_raw: *const Node) !bool {
+    const func = unwrapParens(func_raw);
     if (func.tag != .lambda) return false;
     const lambda = func.data.lambda;
     const param_name = self.source[lambda.param_offset .. lambda.param_offset + lambda.param_len];
