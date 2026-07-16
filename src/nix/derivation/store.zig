@@ -15,10 +15,17 @@ const runtime = @import("runtime");
 const rstore = runtime.store;
 const FileCache = runtime.file_cache.FileCache;
 const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
+const Future = runtime.thunk.Future;
+const Waiter = runtime.thunk.Waiter;
 
 /// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
 /// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
 const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void;
+
+/// Injected `vm.io_offload.fiberPark`: park the current compute fiber on `future`
+/// (a realization claim). Returns false if not on a fiber — the caller then waits
+/// on the thread itself (the main-thread realize / tests).
+const FiberParkFn = *const fn (future: *Future) bool;
 
 /// The daemon connection the current thread's in-flight op runs against. Set at
 /// each offload boundary (a pool worker running one op, or the inline dispatch)
@@ -123,6 +130,9 @@ pub const DerivationStore = struct {
     /// Null → no fiber machinery (tests): the pool's `submitBlocking` runs the op
     /// on a worker and blocks the caller. Either way every op goes to the pool.
     offload_run: ?OffloadFn = null,
+    /// Injected fiber-park for a realization-claim wait (null in tests → the
+    /// waiter blocks its thread on a semaphore instead).
+    fiber_park: ?FiberParkFn = null,
     /// The Evaluator- (or test-) owned runtime that owns the connection pool.
     daemon_runtime: ?*DaemonRuntime = null,
     /// The hot-connection pool, obtained from `daemon_runtime` — started eagerly
@@ -422,7 +432,10 @@ pub const DerivationStore = struct {
 
     const RealizationClaim = struct {
         mu: stable.BlockingMutex = .{},
-        seq: std.atomic.Value(u32) = .init(0),
+        /// Woken (once) when the claim reaches a terminal state — waiters enroll
+        /// on it and park (a compute fiber yields; a thread blocks on a
+        /// semaphore-backed waiter). Starts `.evaluating` so `enrollWaiter` takes.
+        future: Future = Future.initClaimed(runtime.thunk.makeClaimer(0)),
         refs: std.atomic.Value(usize) = .init(1),
         state: State = .writing,
         err: ?anyerror = null,
@@ -451,8 +464,8 @@ pub const DerivationStore = struct {
             self.state = state;
             self.err = err;
             self.mu.unlock();
-            _ = self.seq.fetchAdd(1, .release);
-            stable.Futex.wake(&self.seq, std.math.maxInt(u32));
+            // Release-publish the future so an enrolled waiter observes `state`.
+            self.future.publish();
         }
     };
 
@@ -572,13 +585,15 @@ pub const DerivationStore = struct {
     /// Install the pool-offload entry (from the vm layer). Must be set before any
     /// forcing begins, and cleared (`clearOffload`) before the runtime is torn
     /// down. `rt` owns the connection pool this store submits to.
-    pub fn setOffload(self: *DerivationStore, rt: *DaemonRuntime, run: OffloadFn) void {
+    pub fn setOffload(self: *DerivationStore, rt: *DaemonRuntime, run: OffloadFn, fiber_park: FiberParkFn) void {
         self.daemon_runtime = rt;
         self.offload_run = run;
+        self.fiber_park = fiber_park;
     }
 
     pub fn clearOffload(self: *DerivationStore) void {
         self.offload_run = null;
+        self.fiber_park = null;
         self.daemon_runtime = null;
         self.pool = null;
     }
@@ -683,6 +698,9 @@ pub const DerivationStore = struct {
     }
 
     fn queryPathValid(self: *DerivationStore, store_path: []const u8) !bool {
+        // Caller-side cache hit: skip the pool round-trip entirely (the closure
+        // walk hits this for every already-present path).
+        if (self.cacheContains(store_path)) return true;
         var cell: QueryCell = .{ .store = self, .store_path = store_path };
         try self.runOnDaemon(QueryCell.run, &cell);
         if (cell.err) |e| return e;
@@ -948,34 +966,21 @@ pub const DerivationStore = struct {
         parent: ?*const Visit,
     };
 
+    /// Materialize `store_path`'s closure. Runs on the DEMANDING caller — a
+    /// compute fiber for IFD (`demandPathArg`), the main thread for the terminal
+    /// realize/instantiate — so a wait on another realizer's claim is a normal
+    /// fiber park (or a thread block off a fiber). Only the individual daemon
+    /// round-trips (queries/writes/builds) are offloaded to the pool.
     pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
-        var cell: EnsureClosureCell = .{ .store = self, .store_path = store_path };
-        try self.runOnDaemon(EnsureClosureCell.run, &cell);
-        return cell.err;
+        return self.ensureClosureInner(store_path, null);
     }
-
-    const EnsureClosureCell = struct {
-        store: *DerivationStore,
-        store_path: []const u8,
-        err: anyerror!void = {},
-
-        fn run(conn: ?*anyopaque, pointer: *anyopaque) void {
-            const self: *EnsureClosureCell = @ptrCast(@alignCast(pointer));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
-            self.err = self.store.ensureClosureInner(self.store_path, null);
-        }
-    };
 
     fn ensureClosureInner(self: *DerivationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
         while (true) {
-            // The whole closure walk runs on one pool worker connection
-            // (`active_conn`): nested writes/queries reuse it directly and, being
-            // deps-first, land a path's references before the path itself. A
-            // concurrent walk on another worker deduplicates via realization
-            // claims, so there is no cross-connection ordering hazard.
-            if (try self.applyIsValid(store_path)) return;
+            // Deps-first: a path's references are realized (and land in the store)
+            // before the path itself. Each daemon round-trip goes to the pool; a
+            // concurrent realizer of the same path deduplicates via the claim.
+            if (try self.queryPathValid(store_path)) return;
             if (visitContains(parent, store_path)) return error.RecipeCycle;
 
             const claim_result = try self.claimMissingPath(store_path);
@@ -1028,28 +1033,11 @@ pub const DerivationStore = struct {
         }
     }
 
+    /// Realize `drv_path`'s outputs (IFD / terminal build). Runs on the demanding
+    /// caller (see `ensureClosure`): the closure is materialized deps-first, then
+    /// the build is offloaded to the pool. A concurrent realizer of the same
+    /// output deduplicates via the claim (a normal fiber park / thread block).
     pub fn realizeOutput(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
-        var cell: RealizeOutputCell = .{ .store = self, .drv_path = drv_path, .outputs = outputs };
-        try self.runOnDaemon(RealizeOutputCell.run, &cell);
-        return cell.err;
-    }
-
-    const RealizeOutputCell = struct {
-        store: *DerivationStore,
-        drv_path: []const u8,
-        outputs: []const []const u8,
-        err: anyerror!void = {},
-
-        fn run(conn: ?*anyopaque, pointer: *anyopaque) void {
-            const self: *RealizeOutputCell = @ptrCast(@alignCast(pointer));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
-            self.err = self.store.realizeOutputInline(self.drv_path, self.outputs);
-        }
-    };
-
-    fn realizeOutputInline(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
         try self.ensureClosureInner(drv_path, null);
         const derived = try self.derivedPathString(drv_path, outputs);
         defer self.allocator.free(derived);
@@ -1072,10 +1060,9 @@ pub const DerivationStore = struct {
                 }
             }
 
-            // Build on THIS walk's connection (`active_conn`), not a re-dispatch:
-            // re-entering the pool from a worker with no fiber would block the
-            // worker on itself.
-            self.buildOnConn(&.{derived}, null, .normal) catch |err| {
+            // The build itself is offloaded to the pool (the demanding caller
+            // parks / blocks); the `.drv` closure is already on disk above.
+            self.buildPaths(&.{derived}, null, .normal) catch |err| {
                 if (retryableRealizationError(err)) {
                     self.finishRetryableClaim(derived, claim, err);
                 } else {
@@ -1109,10 +1096,11 @@ pub const DerivationStore = struct {
         };
 
         for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
+        // References are on disk now; write this path (offloaded to the pool).
         switch (recipe.payload) {
-            .text => |text| try self.applyDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
-            .nar => |nar_bytes| try self.applyDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
-            .flat => |bytes| try self.applyDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
+            .text => |text| try self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text.bytes, .references = text.references } }),
+            .nar => |nar_bytes| try self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }),
+            .flat => |bytes| try self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes.bytes() } }),
         }
         self.releaseRecipeForPath(store_path);
     }
@@ -1176,19 +1164,35 @@ pub const DerivationStore = struct {
     }
 
     fn waitForClaim(self: *DerivationStore, claim: *RealizationClaim) RealizationClaim.State {
-        _ = self;
         while (true) {
             claim.mu.lock();
             const state = claim.state;
-            if (state != .writing) {
-                claim.mu.unlock();
-                return state;
-            }
-            const seq = claim.seq.load(.acquire);
             claim.mu.unlock();
-            stable.Futex.wait(&claim.seq, seq);
+            if (state != .writing) return state;
+            // Park until the claim's future is published, then re-read the state.
+            // A compute fiber yields (`fiber_park`); anything else (main-thread
+            // realize, tests) blocks on a semaphore woken by the same publish.
+            if (self.fiber_park) |park| {
+                if (park(&claim.future)) continue;
+            }
+            var w: SemaphoreWaiter = .{ .waiter = .{ .wake_fn = SemaphoreWaiter.wake } };
+            if (claim.future.enrollWaiter(&w.waiter)) w.sem.acquire();
         }
     }
+
+    /// A `Future` waiter that wakes a blocked thread (no fiber to park): its
+    /// `wake_fn` releases the semaphore the waiter is parked on. Lives on the
+    /// waiting thread's stack — safe because `wakeFiberWaiters` reads `next`
+    /// before calling `wake_fn`.
+    const SemaphoreWaiter = struct {
+        waiter: Waiter,
+        sem: stable.Semaphore = stable.Semaphore.init(0),
+
+        fn wake(waiter: *Waiter) void {
+            const self: *SemaphoreWaiter = @fieldParentPtr("waiter", waiter);
+            self.sem.release();
+        }
+    };
 
     fn finishSuccessfulClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
         self.removeClaim(store_path, claim);

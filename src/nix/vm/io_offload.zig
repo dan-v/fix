@@ -108,6 +108,22 @@ const PoolCell = struct {
     }
 };
 
+/// Park the current compute fiber on `future` until it is published (used for a
+/// realization-claim wait: a fiber demanding a path another is realizing yields
+/// instead of blocking). Returns false if not on a fiber — the caller then waits
+/// on the thread itself (the main-thread realize / tests). Enrolls the fiber's
+/// own waiter, exactly like forcing a `.busy` thunk; the publisher wakes it.
+pub fn fiberPark(future: *thunk_mod.Future) bool {
+    const inner = fiber_mod.currentFiber() orelse return false;
+    const wf: *worker_mod.WorkerFiber = @fieldParentPtr("inner", inner);
+    if (future.enrollWaiter(&wf.waiter)) {
+        wf.state = .suspended;
+        fiber_mod.Fiber.yield();
+        wf.state = .running;
+    }
+    return true;
+}
+
 /// Like `run`, but spawns a dedicated thread for this one fetch instead of
 /// queueing on the shared serial IO thread — fetches are independent and run in
 /// parallel, bounded by `sem` (from `http-connections`; null = unlimited). The
