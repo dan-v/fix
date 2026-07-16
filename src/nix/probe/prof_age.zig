@@ -92,6 +92,39 @@ fn oldAggAdd(key: u32, contrib: u64, incl: u64) void {
     old_agg_overflow += 1;
 }
 
+/// Per-body aggregation of YOUNG forces (age < AGE_OLD_THRESHOLD) — the
+/// just-in-time serial spine that speculation can't reach. Answers whether
+/// thunk-elision has a targetable HEAD: which chunks create the demanded-
+/// young thunks, and how much own-body (exclusive) cost they carry. `n` is
+/// the count of young thunks that body produced (each = one avoidable
+/// create+force pair); `excl` is their summed exclusive cycles. Same
+/// open-addressed engine as `oldAggAdd`.
+pub const YoungAgg = struct { key: u32 = SENTINEL_KEY, n: u64 = 0, excl: u64 = 0 };
+pub var young_agg: [old_agg_cap]YoungAgg = @splat(.{});
+pub var young_agg_overflow: u64 = 0;
+/// young-force counts by TargetKind (0 closure .. 4 deferred).
+pub var young_kind: [8]u64 = @splat(0);
+
+fn youngAggAdd(key: u32, excl: u64) void {
+    const h: u64 = @as(u64, key) *% 0x9E3779B97F4A7C15;
+    var i: usize = @intCast((h ^ (h >> 31)) & (old_agg_cap - 1));
+    var probes: usize = 0;
+    while (probes < 64) : (probes += 1) {
+        const s = &young_agg[i];
+        if (s.key == key) {
+            s.n += 1;
+            s.excl += excl;
+            return;
+        }
+        if (s.key == SENTINEL_KEY) {
+            s.* = .{ .key = key, .n = 1, .excl = excl };
+            return;
+        }
+        i = (i + 1) & (old_agg_cap - 1);
+    }
+    young_agg_overflow += 1;
+}
+
 /// Begin accounting a claimed demand-force on main. `created_tsc` = the
 /// thunk's creation stamp (0 disables). `kind_idx` = its TargetKind int;
 /// `key` identifies the body (`prof_path` key space). Returns a sentinel
@@ -111,6 +144,8 @@ pub inline fn ageForceBegin(created_tsc: u64, kind_idx: u8, key: u32) u64 {
     const is_old = age >= AGE_OLD_THRESHOLD;
     if (is_old) {
         if (kind_idx < age_old_kind.len) age_old_kind[kind_idx] += 1;
+    } else {
+        if (kind_idx < young_kind.len) young_kind[kind_idx] += 1;
     }
     const idx = age_stack_len;
     age_stack[idx] = .{
@@ -163,6 +198,10 @@ pub inline fn ageForceEnd(t: u64) void {
             oldAggAdd(frame.key, contrib, inclusive);
         }
         up_contrib += contrib;
+    } else {
+        // Young (just-in-time) force: attribute its own-body cost to the
+        // creating chunk so the spine's elision head is visible.
+        youngAggAdd(frame.key, exclusive);
     }
     age_stack_len -= 1;
     if (age_stack_len > 0) {
@@ -229,6 +268,47 @@ pub fn report(registry: anytype, intern: anytype) void {
             if (agg.key == SENTINEL_KEY or agg.sum_min == 0) continue;
             std.debug.print("  min_cy={d:>11} incl_cy={d:>11} n={d:>6} {s}\n", .{
                 agg.sum_min, agg.sum_incl, agg.n, prof_path_mod.locName(registry, intern, agg.key),
+            });
+        }
+
+        // YOUNG (just-in-time serial spine) creators: does thunk-elision
+        // have a targetable head? Top bodies by own-body (excl) cost of the
+        // young thunks they produce, plus the young-force count each carries.
+        var young_total_n: u64 = 0;
+        var young_total_excl: u64 = 0;
+        for (young_agg) |agg| {
+            young_total_n += agg.n;
+            young_total_excl += agg.excl;
+        }
+        std.debug.print(
+            "prof age-at-force YOUNG (age<2^21cy) creators: n={d} excl_cy={d} ({d:.1}% of main claimed excl) kinds closure={d} bytecode={d} pass_through={d} attr_access={d} deferred={d} (overflow={d})\n",
+            .{
+                young_total_n, young_total_excl, pct(young_total_excl, total_excl),
+                young_kind[0], young_kind[1], young_kind[2], young_kind[3], young_kind[4],
+                young_agg_overflow,
+            },
+        );
+        var ytop: [TOP]YoungAgg = @splat(.{});
+        for (young_agg) |agg| {
+            if (agg.key == SENTINEL_KEY) continue;
+            var slot: usize = TOP;
+            for (ytop, 0..) |t2, i| {
+                if (agg.excl > t2.excl) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < TOP) {
+                var j: usize = TOP - 1;
+                while (j > slot) : (j -= 1) ytop[j] = ytop[j - 1];
+                ytop[slot] = agg;
+            }
+        }
+        std.debug.print("prof age-at-force top young-thunk creators (elision targets):\n", .{});
+        for (ytop) |agg| {
+            if (agg.key == SENTINEL_KEY or agg.excl == 0) continue;
+            std.debug.print("  excl_cy={d:>11} n={d:>7} ({d:.1}% of young) {s}\n", .{
+                agg.excl, agg.n, pct(agg.n, young_total_n), prof_path_mod.locName(registry, intern, agg.key),
             });
         }
     }
