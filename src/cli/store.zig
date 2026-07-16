@@ -1,13 +1,13 @@
 //! `fix store` — talk to the nix-daemon over the worker protocol. A thin
-//! window onto the `runtime.store` client, used to exercise/verify it and to
+//! window onto the host store client, used to exercise/verify it and to
 //! answer store-validity questions without shelling out to `nix`.
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const runtime = @import("runtime");
-const store = runtime.store;
-const nar = runtime.nar;
-const FileCache = runtime.file_cache.FileCache;
+const host = @import("host");
+const store = host.store;
+const nar = host.nar;
+const FileCache = host.FileCache;
 
 const usage =
     \\usage: fix store <subcommand> [args]

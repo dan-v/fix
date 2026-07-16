@@ -9,7 +9,7 @@ const fix = @import("fix");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
-const rstore = @import("runtime").store;
+const rstore = @import("host").store;
 const hugetlb = @import("base").hugetlb;
 
 const Evaluator = fix.Evaluator;

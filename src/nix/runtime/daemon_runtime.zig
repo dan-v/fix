@@ -10,16 +10,11 @@
 //! These threads are IO-bound (parked on the socket), separate from and not
 //! counted against the `--workers` compute pool.
 //!
-//! The pool starts lazily (`ensurePool`) on the first store op — a pure `eval`
-//! that never touches the daemon never forks a connection. Ordering is not the
-//! pool's concern: it belongs to `DerivationStore`'s demand-driven closure walk
-//! (see `store/pool.zig`).
-//!
-//! The **fast lane** (a single serial `IoRuntime`) remains for the legacy offload
-//! seam during the pool cutover; it is retired once every op routes to the pool.
+//! Store-writing commands start the pool eagerly after configuration so the
+//! daemon handshake overlaps evaluation. Plain evaluation starts it on first
+//! store demand. Ordering belongs to the realization layer's closure walk.
 
 const std = @import("std");
-const io_runtime = @import("io_runtime.zig");
 const rstore = @import("store.zig");
 const sync = @import("base").sync;
 
@@ -32,8 +27,6 @@ const DaemonPool = rstore.DaemonPool;
 const default_pool_workers: usize = 8;
 
 pub const DaemonRuntime = struct {
-    fast: io_runtime.IoRuntime = .{},
-
     pool: DaemonPool = undefined,
     pool_started: bool = false,
     pool_mu: sync.BlockingMutex = .{},
@@ -57,14 +50,6 @@ pub const DaemonRuntime = struct {
 
     pub fn init() DaemonRuntime {
         return .{};
-    }
-
-    pub fn start(self: *DaemonRuntime) !void {
-        try self.fast.start();
-    }
-
-    pub fn fastRuntime(self: *DaemonRuntime) *io_runtime.IoRuntime {
-        return &self.fast;
     }
 
     /// Lazily create + start the connection pool with the given connection config.
@@ -106,6 +91,5 @@ pub const DaemonRuntime = struct {
 
     pub fn deinit(self: *DaemonRuntime) void {
         if (self.pool_started) self.pool.deinit();
-        self.fast.deinit();
     }
 };

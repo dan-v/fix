@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const stable = @import("base").sync;
-const vma = @import("mem_tag.zig").vma;
+const vma = @import("runtime").mem_tag.vma;
 
 pub const FileCache = struct {
     allocator: std.mem.Allocator,

@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const Value = @import("runtime").value.Value;
-const file_cache = @import("runtime").file_cache;
+const file_cache = @import("host").file_cache;
 const derivation = @import("derivation");
-const nar = @import("runtime").nar;
+const nar = @import("host").nar;
 const source_paths = @import("derivation").source_path;
 const path_ops = @import("runtime").paths;
 const nix_hash = @import("runtime").hash;

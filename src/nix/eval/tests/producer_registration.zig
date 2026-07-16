@@ -4,7 +4,7 @@ const Evaluator = eval_mod.Evaluator;
 const DerivationStore = @import("derivation").DerivationStore;
 const Value = @import("runtime").value.Value;
 const ObjectId = @import("runtime").types.ObjectId;
-const nar = @import("runtime").nar;
+const nar = @import("host").nar;
 const FakeDaemon = @import("../../test_daemon.zig").FakeDaemon;
 
 fn recipeInspectionAvailable() bool {

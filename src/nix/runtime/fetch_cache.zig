@@ -5,7 +5,7 @@
 //! module owns host effects, caching, and subprocess boundaries.
 
 const std = @import("std");
-const nix_hash = @import("hash.zig");
+const nix_hash = @import("runtime").hash;
 const nar = @import("nar.zig");
 const FileCache = @import("file_cache.zig").FileCache;
 const sync = @import("base").sync;

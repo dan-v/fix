@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const runtime = @import("runtime");
+const host = @import("host");
 const types = @import("runtime").types;
 const bytecode = @import("bytecode");
 const opcode = bytecode.opcode;
@@ -20,8 +21,8 @@ const vm_force = @import("vm").force;
 const vm_builtins = @import("vm").builtins;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_gc = @import("runtime").heap.heap_gc;
-const FileCache = @import("runtime").file_cache.FileCache;
-const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const FileCache = host.FileCache;
+const FetchCache = host.FetchCache;
 const regex_mod = @import("base").regex;
 const block_cache_mod = @import("base").block_cache;
 const vma_mod = @import("runtime").mem_tag.vma;
@@ -47,7 +48,7 @@ const eval_diagnostics = @import("eval/diagnostics.zig");
 
 const worker_mod = @import("vm").worker;
 const io_offload = @import("vm").io_offload;
-const daemon_runtime_mod = @import("runtime").daemon_runtime;
+const daemon_runtime_mod = host.daemon_runtime;
 const eval_gc = @import("eval/gc.zig");
 const fiber_mod = @import("base").fiber;
 const prof = @import("probe").prof;
@@ -423,7 +424,7 @@ pub const Evaluator = struct {
     fetchers: FetchCache,
     derivations: DerivationStore,
     /// Owns the fast IO lane — the background thread that runs blocking daemon
-    /// store ops off the compute fibers (see `runtime.daemon_runtime`).
+    /// store ops off the compute fibers (see `host.daemon_runtime`).
     /// Heap-allocated so its address is stable — the thread captures it, and the
     /// Evaluator itself is returned by value.
     daemon_runtime: *daemon_runtime_mod.DaemonRuntime,
@@ -634,7 +635,6 @@ pub const Evaluator = struct {
         const daemon_rt = try allocator.create(daemon_runtime_mod.DaemonRuntime);
         errdefer allocator.destroy(daemon_rt);
         daemon_rt.* = daemon_runtime_mod.DaemonRuntime.init();
-        try daemon_rt.start();
         errdefer daemon_rt.deinit();
 
         var ev: Evaluator = .{
@@ -1593,7 +1593,7 @@ pub const Evaluator = struct {
 
     /// Realize `derived_paths` (`<drvpath>^<outputs>`) via the daemon store,
     /// forwarding the build activity/log stream to `sink` if given.
-    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
+    pub fn buildDerivations(self: *Evaluator, derived_paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
         return self.derivations.buildPaths(derived_paths, sink, mode);
     }
 
@@ -1618,7 +1618,7 @@ pub const Evaluator = struct {
     /// the base allocator is already thread-safe (the IO thread allocates
     /// against it during builds). The single build-phase entry point for the
     /// realizing subcommands — no caller should sequence release-then-build.
-    pub fn buildDerivationsReleasing(self: *Evaluator, derived_paths: []const []const u8, sink: ?runtime.store.BuildSink, mode: runtime.store.BuildMode) !void {
+    pub fn buildDerivationsReleasing(self: *Evaluator, derived_paths: []const []const u8, sink: ?host.store.BuildSink, mode: host.store.BuildMode) !void {
         // Writes are demand-driven: materialize each target's `.drv` closure now,
         // BEFORE releasing eval state — `ensureClosure` walks the recipe graph,
         // which `releaseEvalState` frees. (Cheap, and inherently sequential: the
@@ -1640,7 +1640,7 @@ pub const Evaluator = struct {
 
     /// Set the per-connection daemon settings (`--cores`/`--max-jobs`/… via
     /// `set_options`) applied when the store connects. See `setup.configure`.
-    pub fn setDaemonBuildSettings(self: *Evaluator, settings: runtime.store.BuildSettings) !void {
+    pub fn setDaemonBuildSettings(self: *Evaluator, settings: host.store.BuildSettings) !void {
         return self.derivations.setBuildSettings(settings);
     }
 

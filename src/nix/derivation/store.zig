@@ -12,9 +12,10 @@ const types = @import("types.zig");
 const clone = @import("clone.zig");
 const stable = @import("base").sync;
 const runtime = @import("runtime");
-const rstore = runtime.store;
-const FileCache = runtime.file_cache.FileCache;
-const DaemonRuntime = runtime.daemon_runtime.DaemonRuntime;
+const host = @import("host");
+const rstore = host.store;
+const FileCache = host.FileCache;
+const DaemonRuntime = host.DaemonRuntime;
 const Future = runtime.thunk.Future;
 const Waiter = runtime.thunk.Waiter;
 

@@ -205,7 +205,7 @@ pub const DaemonStore = struct {
     /// Add a NAR-serialized tree to the store under `name`, content-addressed
     /// recursively (`nar:sha256`) — the addressing `builtins.path`/`filterSource`
     /// and fetched sources use. `nar_bytes` is a `nix-archive-1` stream (see
-    /// `runtime.nar.serialize`). Returns the resulting store path (owned by
+    /// `host.nar.serialize`). Returns the resulting store path (owned by
     /// `allocator`). Idempotent.
     pub fn addPath(self: *DaemonStore, allocator: std.mem.Allocator, name: []const u8, nar_bytes: []const u8, references: []const []const u8) ![]u8 {
         try self.beginOp(.add_to_store);

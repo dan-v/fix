@@ -4,7 +4,7 @@
 //! `EvalProgress`, so eval and build render as one tree.
 
 const std = @import("std");
-const store = @import("runtime").store;
+const store = @import("host").store;
 const EvalProgress = @import("cli.zig").EvalProgress;
 
 pub const BuildProgress = struct {

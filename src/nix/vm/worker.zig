@@ -60,8 +60,8 @@ const bytecode = @import("bytecode");
 const InternTable = @import("runtime").intern.InternTable;
 const ObjectHeap = @import("runtime").heap.ObjectHeap;
 const heap_ring_size = @import("runtime").heap.SCAV_RING_SIZE;
-const FileCache = @import("runtime").file_cache.FileCache;
-const FetchCache = @import("runtime").fetch_cache.FetchCache;
+const FileCache = @import("host").FileCache;
+const FetchCache = @import("host").FetchCache;
 const DerivationStore = @import("derivation").DerivationStore;
 
 /// VM constructor injected by the embedder (eval.zig). Returns a VM

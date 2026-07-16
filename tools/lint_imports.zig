@@ -23,7 +23,7 @@ const std = @import("std");
 /// Every build module's name. A file outside a module may not reach into its
 /// files by relative path; see `owningModule` for how physical paths (the
 /// `base/`, `nix/`, `cli/` tiers) map onto these names.
-const module_dirs = [_][]const u8{ "syntax", "runtime", "base", "scheduler", "derivation", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
+const module_dirs = [_][]const u8{ "syntax", "runtime", "host", "base", "scheduler", "derivation", "cli", "observ", "bytecode", "probe", "compiler", "vm" };
 
 /// Longest-path topological level of each module in the `build.zig` dependency
 /// graph. Imports must point strictly DOWN: a file in module M may only
@@ -38,9 +38,10 @@ const module_levels = [_]ModuleLevel{
     // syntax sits one above base; observ → syntax pushes observ to 2.
     .{ .name = "syntax", .level = 1 },
     .{ .name = "runtime", .level = 1 },
+    .{ .name = "host", .level = 2 },
     .{ .name = "observ", .level = 2 },
     .{ .name = "scheduler", .level = 2 },
-    .{ .name = "derivation", .level = 2 },
+    .{ .name = "derivation", .level = 3 },
     .{ .name = "bytecode", .level = 2 },
     .{ .name = "probe", .level = 3 },
     .{ .name = "compiler", .level = 4 },
@@ -127,6 +128,12 @@ pub fn main(init: std.process.Init) !void {
 fn owningModule(rel: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, rel, "base/")) return "base";
     if (std.mem.startsWith(u8, rel, "cli/")) return "cli";
+    if (std.mem.eql(u8, rel, "nix/runtime/file_cache.zig") or
+        std.mem.eql(u8, rel, "nix/runtime/fetch_cache.zig") or
+        std.mem.eql(u8, rel, "nix/runtime/nar.zig") or
+        std.mem.eql(u8, rel, "nix/runtime/store.zig") or
+        std.mem.startsWith(u8, rel, "nix/runtime/store/") or
+        std.mem.eql(u8, rel, "nix/runtime/daemon_runtime.zig")) return "host";
     // Strip the `nix/` tier segment (if present) before matching subsystem dirs.
     const inner = if (std.mem.startsWith(u8, rel, "nix/")) rel["nix/".len..] else rel;
     // Dedicated test root for the derivation module. It lives one level up so

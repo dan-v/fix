@@ -3,6 +3,7 @@ const derivation = @import("../derivation.zig");
 const sort = @import("sort.zig");
 const hash_codec = @import("hash_codec.zig");
 const runtime = @import("runtime");
+const host = @import("host");
 const debug_record_mod = @import("debug_record.zig");
 const types_mod = @import("types.zig");
 const clone_mod = @import("clone.zig");
@@ -41,7 +42,7 @@ test "setDaemonSocket overrides the default path and re-set frees the prior owne
     var store = DerivationStore.init(std.testing.allocator);
     defer store.deinit();
 
-    try std.testing.expectEqualStrings(runtime.store.default_socket_path, store.daemon_socket);
+    try std.testing.expectEqualStrings(host.store.default_socket_path, store.daemon_socket);
     try store.setDaemonSocket("/tmp/one.sock");
     try std.testing.expectEqualStrings("/tmp/one.sock", store.daemon_socket);
     // Re-setting must free the prior owned copy (no leak — the testing allocator

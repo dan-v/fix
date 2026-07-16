@@ -92,6 +92,18 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("build_options", build_options_mod);
     runtime_mod.addImport("base", base_mod);
 
+    // Concrete host effects live above the language value runtime and below
+    // the VM/evaluator that consume them.
+    const host_mod = b.addModule("host", .{
+        .root_source_file = b.path("src/nix/host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .omit_frame_pointer = omit_frame_pointer,
+    });
+    host_mod.addImport("runtime", runtime_mod);
+    host_mod.addImport("base", base_mod);
+
     const scheduler_mod = b.addModule("scheduler", .{
         .root_source_file = b.path("src/nix/scheduler.zig"),
         .target = target,
@@ -111,6 +123,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     derivation_mod.addImport("runtime", runtime_mod);
+    derivation_mod.addImport("host", host_mod);
     derivation_mod.addImport("base", base_mod);
 
     // Test-only imports live behind a dedicated root, not on the production
@@ -123,6 +136,7 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = omit_frame_pointer,
     });
     derivation_tests_mod.addImport("runtime", runtime_mod);
+    derivation_tests_mod.addImport("host", host_mod);
     derivation_tests_mod.addImport("base", base_mod);
 
     // Evaluation observability sinks (progress protocol + error-trace collector).
@@ -191,6 +205,7 @@ pub fn build(b: *std.Build) void {
     });
     vm_mod.addImport("build_options", build_options_mod);
     vm_mod.addImport("runtime", runtime_mod);
+    vm_mod.addImport("host", host_mod);
     vm_mod.addImport("base", base_mod);
     vm_mod.addImport("syntax", syntax_mod);
     vm_mod.addImport("scheduler", scheduler_mod);
@@ -211,6 +226,7 @@ pub fn build(b: *std.Build) void {
         .build_options = build_options_mod,
         .syntax = syntax_mod,
         .runtime = runtime_mod,
+        .host = host_mod,
         .base = base_mod,
         .scheduler = scheduler_mod,
         .derivation = derivation_mod,
@@ -296,6 +312,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
 
+    const host_tests = b.addTest(.{
+        .root_module = host_mod,
+        .use_llvm = true,
+    });
+    const run_host_tests = b.addRunArtifact(host_tests);
+
     const syntax_tests = b.addTest(.{
         .root_module = syntax_mod,
         .use_llvm = true,
@@ -358,6 +380,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_host_tests.step);
     test_step.dependOn(&run_syntax_tests.step);
     test_step.dependOn(&run_scheduler_tests.step);
     test_step.dependOn(&run_derivation_tests.step);
@@ -415,6 +438,7 @@ const SharedImports = struct {
     build_options: *std.Build.Module,
     syntax: *std.Build.Module,
     runtime: *std.Build.Module,
+    host: *std.Build.Module,
     base: *std.Build.Module,
     scheduler: *std.Build.Module,
     derivation: *std.Build.Module,
@@ -425,6 +449,7 @@ fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
     module.addImport("build_options", imports.build_options);
     module.addImport("syntax", imports.syntax);
     module.addImport("runtime", imports.runtime);
+    module.addImport("host", imports.host);
     module.addImport("base", imports.base);
     module.addImport("scheduler", imports.scheduler);
     module.addImport("derivation", imports.derivation);

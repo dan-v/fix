@@ -8,7 +8,7 @@ const derivation_debug = @import("derivation_debug.zig");
 const eval = @import("fix").eval;
 const Evaluator = eval.Evaluator;
 const Value = @import("runtime").value.Value;
-const rstore = @import("runtime").store;
+const rstore = @import("host").store;
 const EvaluationMode = args.EvaluationMode;
 const SourceArg = args.SourceArg;
 

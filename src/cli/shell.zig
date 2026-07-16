@@ -15,7 +15,7 @@ const run = @import("run.zig");
 
 const Evaluator = fix.Evaluator;
 const EnvMap = std.process.Environ.Map;
-const BuildSink = @import("runtime").store.BuildSink;
+const BuildSink = @import("host").store.BuildSink;
 
 pub const synopsis =
     \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]
