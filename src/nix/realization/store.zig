@@ -17,8 +17,8 @@ const FileCache = host.FileCache;
 const DaemonRuntime = host.DaemonRuntime;
 const Future = runtime.thunk.Future;
 const Waiter = runtime.thunk.Waiter;
-const owned_strings = @import("base").owned_strings;
 const eval_memo = @import("eval_memo.zig");
+const recipe_graph = @import("recipe_graph.zig");
 
 /// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
 /// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
@@ -32,7 +32,7 @@ const FiberParkFn = *const fn (future: *Future) bool;
 /// The progress-span groups the derivation store reports into. Mirrors the
 /// observ `SpanGroup`, but named locally: the derivation module must not import
 /// observ (same layer), so the eval layer maps these onto the real groups.
-pub const SpanGroup = enum { store, source };
+pub const SpanGroup = recipe_graph.SpanGroup;
 
 /// Injected concurrent progress-span hooks for the store's real writes: a
 /// `.store` span around a `.drv` transfer and a `.source` span around a source
@@ -81,6 +81,7 @@ pub const DerivationStore = struct {
     store_dir: []const u8 = "/nix/store",
     registry: derivation.Registry,
     memo: eval_memo.EvalMemo,
+    graph: recipe_graph.Graph,
 
     /// Guards the small shared state every pool worker touches: the `instantiated`
     /// cache and `last_error_msg`. Held only for brief in-memory updates, never
@@ -142,38 +143,11 @@ pub const DerivationStore = struct {
     /// don't manage its lifetime separately). Deinitialized + freed in `deinit`.
     test_owned_runtime: if (builtin.is_test) ?*DaemonRuntime else void = if (builtin.is_test) null else {},
 
-    /// Store-owned IFD recipes, keyed by full store path. Separate from the
-    /// derivation/debug registry so unrelated eval hot paths add no recipe
-    /// locking or payload refcount traffic.
-    recipes: std.StringHashMapUnmanaged(*Recipe) = .empty,
-    realization_claims: std.StringHashMapUnmanaged(*RealizationClaim) = .empty,
-    realized_outputs: std.StringHashMapUnmanaged(void) = .empty,
-    /// Deferred fetch specs, keyed by the fixed-output store path a
-    /// `builtins.fetchurl`/`fetchTarball` with a known hash resolves to. In
-    /// plain eval the path is fully determined by (name, sha256), so it is
-    /// returned without touching the network; the download runs lazily only if
-    /// the path's *content* is later demanded (readFile/import/realization),
-    /// keeping path-only use offline while preserving import-from-derivation.
-    /// Guarded by `recipe_mu`.
-    pending_fetches: std.StringHashMapUnmanaged(PendingFetch) = .empty,
-    recipe_mu: stable.BlockingMutex = .{},
-    /// Test-only deterministic scheduling hook. This field is zero-bit `void`
-    /// and all access is compiled out of production builds.
-    test_root_claim_hook: if (builtin.is_test) ?RootClaimHook else void = if (builtin.is_test) null else {},
-    /// Original payload allocations observed at producer allocation boundaries.
-    /// A path can be produced more than once, so tests retain every observation
-    /// until recipe identity is compared and then consume the whole entry. The
-    /// field is zero-bit and all calls compile away outside tests.
-    test_producer_payload_pointers: if (builtin.is_test) std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) else void = if (builtin.is_test) .empty else {},
-
-    pub const RootClaimHook = struct {
-        ctx: *anyopaque,
-        observe: *const fn (ctx: *anyopaque, store_path: []const u8) void,
-    };
+    pub const RootClaimHook = recipe_graph.RootClaimHook;
 
     pub fn setRootClaimHookForTest(self: *DerivationStore, hook: ?RootClaimHook) void {
         if (comptime builtin.is_test) {
-            self.test_root_claim_hook = hook;
+            self.graph.test_root_claim_hook = hook;
         } else unreachable;
     }
 
@@ -181,10 +155,10 @@ pub const DerivationStore = struct {
     /// allocation is created, independently of whether registration succeeds.
     pub fn noteProducerPayloadForTest(self: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
             const owned_path = try self.allocator.dupe(u8, store_path);
-            const result = self.test_producer_payload_pointers.getOrPut(self.allocator, owned_path) catch |err| {
+            const result = self.graph.test_producer_payload_pointers.getOrPut(self.allocator, owned_path) catch |err| {
                 self.allocator.free(owned_path);
                 return err;
             };
@@ -197,7 +171,7 @@ pub const DerivationStore = struct {
             for (result.value_ptr.items) |observed| if (observed == pointer) return;
             result.value_ptr.append(self.allocator, pointer) catch |err| {
                 if (!result.found_existing) {
-                    const removed = self.test_producer_payload_pointers.fetchRemove(store_path).?;
+                    const removed = self.graph.test_producer_payload_pointers.fetchRemove(store_path).?;
                     self.allocator.free(removed.key);
                 }
                 return err;
@@ -210,12 +184,12 @@ pub const DerivationStore = struct {
     /// identity failures visible. Consumption prevents stale-map false passes.
     pub fn producerPayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            var removed = self.test_producer_payload_pointers.fetchRemove(store_path) orelse return null;
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            var removed = self.graph.test_producer_payload_pointers.fetchRemove(store_path) orelse return null;
             defer self.allocator.free(removed.key);
             defer removed.value.deinit(self.allocator);
-            const retained = if (self.recipes.get(store_path)) |recipe| recipePayloadPointer(recipe) else null;
+            const retained = if (self.graph.recipes.get(store_path)) |recipe| recipe.payloadPointer() else null;
             if (retained) |pointer| {
                 for (removed.value.items) |observed| if (observed == pointer) return observed;
             }
@@ -223,21 +197,21 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub const RecipeVariantForTest = enum { text, nar, flat };
+    pub const RecipeVariantForTest = recipe_graph.RecipeVariantForTest;
 
     pub fn recipeCountForTest(self: *DerivationStore) usize {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            return self.recipes.count();
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            return self.graph.recipes.count();
         } else return 0;
     }
 
     pub fn recipeVariantForTest(self: *DerivationStore, store_path: []const u8) ?RecipeVariantForTest {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            const recipe = self.recipes.get(store_path) orelse return null;
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            const recipe = self.graph.recipes.get(store_path) orelse return null;
             return switch (recipe.payload) {
                 .text => .text,
                 .nar => .nar,
@@ -248,17 +222,17 @@ pub const DerivationStore = struct {
 
     pub fn recipePayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            return recipePayloadPointer(self.recipes.get(store_path) orelse return null);
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            return (self.graph.recipes.get(store_path) orelse return null).payloadPointer();
         } else return null;
     }
 
     pub fn recipePayloadBytesForTest(self: *DerivationStore, store_path: []const u8) ?[]const u8 {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            const recipe = self.recipes.get(store_path) orelse return null;
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            const recipe = self.graph.recipes.get(store_path) orelse return null;
             return switch (recipe.payload) {
                 .text => |text| text.bytes,
                 .nar => |bytes| bytes,
@@ -269,9 +243,9 @@ pub const DerivationStore = struct {
 
     pub fn recipeReferencesForTest(self: *DerivationStore, store_path: []const u8) ?[]const []const u8 {
         if (comptime builtin.is_test) {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            return (self.recipes.get(store_path) orelse return null).references();
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            return (self.graph.recipes.get(store_path) orelse return null).references();
         } else return null;
     }
 
@@ -279,45 +253,11 @@ pub const DerivationStore = struct {
     /// so it can be dropped into an `Ingested` (which is caller-owned).
     pub const SourceMemoHit = eval_memo.SourceMemoHit;
 
-    /// A deferred `fetchurl`/`fetchTarball`: the download spec plus the expected
-    /// content hash, materialized on demand. `recursive` distinguishes a flat
-    /// file (fetchurl) from an unpacked tree (fetchTarball).
-    pub const PendingFetch = struct {
-        url: []u8,
-        name: []u8,
-        recursive: bool,
-        hash_hex: []u8,
-
-        pub fn deinit(self: PendingFetch, allocator: std.mem.Allocator) void {
-            allocator.free(self.url);
-            allocator.free(self.name);
-            allocator.free(self.hash_hex);
-        }
-
-        fn clone(self: PendingFetch, allocator: std.mem.Allocator) !PendingFetch {
-            const url = try allocator.dupe(u8, self.url);
-            errdefer allocator.free(url);
-            const name = try allocator.dupe(u8, self.name);
-            errdefer allocator.free(name);
-            const hash_hex = try allocator.dupe(u8, self.hash_hex);
-            return .{ .url = url, .name = name, .recursive = self.recursive, .hash_hex = hash_hex };
-        }
-    };
+    pub const PendingFetch = recipe_graph.PendingFetch;
 
     /// Register a deferred fetch for `store_path` (no-op if one already exists).
     pub fn recordPendingFetch(self: *DerivationStore, store_path: []const u8, url: []const u8, name: []const u8, recursive: bool, hash_hex: []const u8) !void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        if (self.pending_fetches.contains(store_path)) return;
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        const url_copy = try self.allocator.dupe(u8, url);
-        errdefer self.allocator.free(url_copy);
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
-        const hash_copy = try self.allocator.dupe(u8, hash_hex);
-        errdefer self.allocator.free(hash_copy);
-        try self.pending_fetches.put(self.allocator, key, .{ .url = url_copy, .name = name_copy, .recursive = recursive, .hash_hex = hash_copy });
+        return self.graph.recordPendingFetch(store_path, url, name, recursive, hash_hex);
     }
 
     /// Return an owned copy of the deferred fetch for exactly `store_path`, or
@@ -325,137 +265,22 @@ pub const DerivationStore = struct {
     /// against the (memoized) fetch cache; `removePendingFetch` drops it once a
     /// flat file is seeded. Caller owns the copy and must `deinit` it.
     pub fn peekPendingFetch(self: *DerivationStore, store_path: []const u8) !?PendingFetch {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        const entry = self.pending_fetches.get(store_path) orelse return null;
-        return try entry.clone(self.allocator);
+        return self.graph.peekPendingFetch(store_path);
     }
 
     pub fn removePendingFetch(self: *DerivationStore, store_path: []const u8) void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        const removed = self.pending_fetches.fetchRemove(store_path) orelse return;
-        self.allocator.free(removed.key);
-        removed.value.deinit(self.allocator);
+        self.graph.removePendingFetch(store_path);
     }
 
-    const Recipe = struct {
-        payload: Payload,
-        /// Which progress group the actual write reports under (`.store` for a
-        /// `.drv`, `.source` for a local source copy), or null for writes shown
-        /// elsewhere (fetches report under `.fetch` at download). See `applyDaemonOp`.
-        span_group: ?SpanGroup = null,
-
-        const TextPayload = struct {
-            bytes: []u8,
-            references: [][]u8,
-        };
-
-        const Payload = union(enum) {
-            text: TextPayload,
-            nar: []u8,
-            flat: FileCache.ImmutableBytes,
-        };
-
-        fn deinit(self: *Recipe, allocator: std.mem.Allocator) void {
-            switch (self.payload) {
-                .text => |text| {
-                    allocator.free(text.bytes);
-                    for (text.references) |reference| allocator.free(reference);
-                    allocator.free(text.references);
-                },
-                .nar => |nar_bytes| allocator.free(nar_bytes),
-                .flat => |*bytes| bytes.release(),
-            }
-            allocator.destroy(self);
-        }
-
-        fn textMatches(self: *const Recipe, text: []const u8, refs: []const []const u8) bool {
-            const existing = switch (self.payload) {
-                .text => |payload| payload,
-                else => return false,
-            };
-            if (!std.mem.eql(u8, existing.bytes, text) or existing.references.len != refs.len) return false;
-            for (existing.references, refs) |left, right| {
-                if (!std.mem.eql(u8, left, right)) return false;
-            }
-            return true;
-        }
-
-        fn narMatches(self: *const Recipe, nar_bytes: []const u8) bool {
-            return switch (self.payload) {
-                .nar => |existing| std.mem.eql(u8, existing, nar_bytes),
-                else => false,
-            };
-        }
-
-        fn flatMatches(self: *const Recipe, handle: FileCache.ImmutableBytes) bool {
-            return switch (self.payload) {
-                .flat => |existing| std.mem.eql(u8, existing.bytes(), handle.bytes()),
-                else => false,
-            };
-        }
-
-        fn references(self: *const Recipe) []const []const u8 {
-            return switch (self.payload) {
-                .text => |text| text.references,
-                else => &.{},
-            };
-        }
-    };
-
-    fn recipePayloadPointer(recipe: *const Recipe) usize {
-        return switch (recipe.payload) {
-            .text => |text| @intFromPtr(text.bytes.ptr),
-            .nar => |bytes| @intFromPtr(bytes.ptr),
-            .flat => |bytes| @intFromPtr(bytes.bytes().ptr),
-        };
-    }
-
-    const RealizationClaim = struct {
-        mu: stable.BlockingMutex = .{},
-        /// Woken (once) when the claim reaches a terminal state — waiters enroll
-        /// on it and park (a compute fiber yields; a thread blocks on a
-        /// semaphore-backed waiter). Starts `.evaluating` so `enrollWaiter` takes.
-        future: Future = Future.initClaimedStatic(runtime.thunk.makeClaimer(0)),
-        refs: std.atomic.Value(usize) = .init(1),
-        state: State = .writing,
-        err: ?anyerror = null,
-        /// Cold-path wait-for edge, guarded by `recipe_mu`. A retained target
-        /// keeps graph traversal safe while concurrent claims complete.
-        waiting_on: ?*RealizationClaim = null,
-
-        const State = enum {
-            writing,
-            success,
-            retry,
-            permanent_failure,
-        };
-
-        fn retain(self: *RealizationClaim) void {
-            _ = self.refs.fetchAdd(1, .monotonic);
-        }
-
-        fn release(self: *RealizationClaim, allocator: std.mem.Allocator) void {
-            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
-            allocator.destroy(self);
-        }
-
-        fn publish(self: *RealizationClaim, state: State, err: ?anyerror) void {
-            self.mu.lock();
-            self.state = state;
-            self.err = err;
-            self.mu.unlock();
-            // Release-publish the future so an enrolled waiter observes `state`.
-            self.future.publish();
-        }
-    };
+    const Recipe = recipe_graph.Recipe;
+    const RealizationClaim = recipe_graph.Claim;
 
     pub fn init(allocator: std.mem.Allocator) DerivationStore {
         return .{
             .allocator = allocator,
             .registry = derivation.Registry.init(allocator),
             .memo = eval_memo.EvalMemo.init(allocator),
+            .graph = recipe_graph.Graph.init(allocator),
         };
     }
 
@@ -469,33 +294,7 @@ pub const DerivationStore = struct {
                 self.test_owned_runtime = null;
             }
         }
-        self.releaseRecipePayloads();
-        self.recipes.deinit(self.allocator);
-        self.recipe_mu.lock();
-        var claims = self.realization_claims.iterator();
-        while (claims.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.*.release(self.allocator);
-        }
-        self.realization_claims.deinit(self.allocator);
-        var realized = self.realized_outputs.keyIterator();
-        while (realized.next()) |key| self.allocator.free(key.*);
-        self.realized_outputs.deinit(self.allocator);
-        var pending = self.pending_fetches.iterator();
-        while (pending.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.pending_fetches.deinit(self.allocator);
-        if (comptime builtin.is_test) {
-            var producer_pointers = self.test_producer_payload_pointers.iterator();
-            while (producer_pointers.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit(self.allocator);
-            }
-            self.test_producer_payload_pointers.deinit(self.allocator);
-        }
-        self.recipe_mu.unlock();
+        self.graph.deinit();
         self.registry.deinit();
         self.memo.deinit();
         var inst = self.instantiated.keyIterator();
@@ -884,88 +683,22 @@ pub const DerivationStore = struct {
     }
 
     pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
-        // Always record a recipe — never write eagerly, even in store-write mode.
-        // A derivation forced during eval (including speculatively) is not
-        // necessarily demanded; its `.drv` is materialized only when something
-        // asks for it (`ensureClosure`/IFD/the terminal realize), deps-first via
-        // `references`. That makes write ordering explicit (the recipe graph),
-        // not a reverse-topological force-order coincidence.
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-
-        if (self.recipes.get(store_path)) |recipe| {
-            defer self.allocator.free(text);
-            if (recipe.textMatches(text, references)) return;
-            return error.RecipeConflict;
-        }
-
-        errdefer self.allocator.free(text);
-        const recipe = try self.allocator.create(Recipe);
-        errdefer self.allocator.destroy(recipe);
-        const owned_refs = try owned_strings.clone(self.allocator, references);
-        errdefer owned_strings.free(self.allocator, owned_refs);
-        recipe.* = .{ .payload = .{ .text = .{ .bytes = text, .references = owned_refs } }, .span_group = .store };
-
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        try self.recipes.put(self.allocator, key, recipe);
+        return self.graph.recordOwnedText(store_path, text, references);
     }
 
     pub fn recordOwnedNarRecipe(self: *DerivationStore, store_path: []const u8, nar_bytes: []u8) !void {
-        // Deferred like `recordOwnedTextRecipe`: materialized on demand, deps-first.
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-
-        if (self.recipes.get(store_path)) |recipe| {
-            defer self.allocator.free(nar_bytes);
-            if (recipe.narMatches(nar_bytes)) return;
-            return error.RecipeConflict;
-        }
-
-        errdefer self.allocator.free(nar_bytes);
-        const recipe = try self.allocator.create(Recipe);
-        errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .nar = nar_bytes }, .span_group = .source };
-
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        try self.recipes.put(self.allocator, key, recipe);
+        return self.graph.recordOwnedNar(store_path, nar_bytes);
     }
 
     /// `span_group` names the progress group the eventual write reports under —
     /// `.source` for a flat local source (`builtins.path { recursive = false; }`),
     /// null for a fetched flat file (shown under `.fetch` at download time).
     pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
-        // Deferred like `recordOwnedTextRecipe`: materialized on demand, deps-first.
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-
-        var retained = handle.retain();
-        if (self.recipes.get(store_path)) |recipe| {
-            defer retained.release();
-            if (recipe.flatMatches(handle)) return;
-            return error.RecipeConflict;
-        }
-        errdefer retained.release();
-
-        const recipe = try self.allocator.create(Recipe);
-        errdefer self.allocator.destroy(recipe);
-        recipe.* = .{ .payload = .{ .flat = retained }, .span_group = span_group };
-
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        try self.recipes.put(self.allocator, key, recipe);
+        return self.graph.recordFlat(store_path, handle, span_group);
     }
 
     pub fn releaseRecipePayloads(self: *DerivationStore) void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        var it = self.recipes.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.*.deinit(self.allocator);
-        }
-        self.recipes.clearRetainingCapacity();
+        self.graph.releaseRecipePayloads();
     }
 
     const Visit = struct {
@@ -997,7 +730,7 @@ pub const DerivationStore = struct {
 
             if (comptime builtin.is_test) {
                 if (claim_result.writer and parent == null) {
-                    if (self.test_root_claim_hook) |hook| hook.observe(hook.ctx, store_path);
+                    if (self.graph.test_root_claim_hook) |hook| hook.observe(hook.ctx, store_path);
                 }
             }
 
@@ -1051,9 +784,9 @@ pub const DerivationStore = struct {
         defer self.allocator.free(derived);
 
         while (true) {
-            self.recipe_mu.lock();
-            const already_realized = self.realized_outputs.contains(derived);
-            self.recipe_mu.unlock();
+            self.graph.mu.lock();
+            const already_realized = self.graph.realized_outputs.contains(derived);
+            self.graph.mu.unlock();
             if (already_realized) return;
 
             const claim_result = try self.claimMissingPath(derived);
@@ -1090,17 +823,17 @@ pub const DerivationStore = struct {
     fn markOutputRealized(self: *DerivationStore, derived: []const u8) !void {
         const key = try self.allocator.dupe(u8, derived);
         errdefer self.allocator.free(key);
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        const result = try self.realized_outputs.getOrPut(self.allocator, key);
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
+        const result = try self.graph.realized_outputs.getOrPut(self.allocator, key);
         if (result.found_existing) self.allocator.free(key);
     }
 
     fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8, visit: *const Visit) anyerror!void {
         const recipe = blk: {
-            self.recipe_mu.lock();
-            defer self.recipe_mu.unlock();
-            break :blk self.recipes.get(store_path) orelse return error.MissingStoreRecipe;
+            self.graph.mu.lock();
+            defer self.graph.mu.unlock();
+            break :blk self.graph.recipes.get(store_path) orelse return error.MissingStoreRecipe;
         };
 
         for (recipe.references()) |reference| try self.ensureClosureInner(reference, visit);
@@ -1116,10 +849,10 @@ pub const DerivationStore = struct {
     }
 
     fn claimMissingPath(self: *DerivationStore, store_path: []const u8) !struct { claim: *RealizationClaim, writer: bool } {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
 
-        if (self.realization_claims.get(store_path)) |claim| {
+        if (self.graph.claims.get(store_path)) |claim| {
             claim.retain();
             return .{ .claim = claim, .writer = false };
         }
@@ -1132,7 +865,7 @@ pub const DerivationStore = struct {
 
         const key = try self.allocator.dupe(u8, store_path);
         errdefer self.allocator.free(key);
-        try self.realization_claims.put(self.allocator, key, claim);
+        try self.graph.claims.put(self.allocator, key, claim);
         return .{ .claim = claim, .writer = true };
     }
 
@@ -1147,8 +880,8 @@ pub const DerivationStore = struct {
     /// Add one cold-path wait-for edge and report whether it closes a cycle.
     /// The edge retains its target and is visible only under `recipe_mu`.
     fn beginClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) bool {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
         std.debug.assert(source.waiting_on == null);
         target.retain();
         source.waiting_on = target;
@@ -1165,8 +898,8 @@ pub const DerivationStore = struct {
     }
 
     fn endClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
         if (source.waiting_on == target) {
             source.waiting_on = null;
             target.release(self.allocator);
@@ -1215,18 +948,18 @@ pub const DerivationStore = struct {
     }
 
     fn removeClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        const removed = self.realization_claims.fetchRemove(store_path) orelse return;
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
+        const removed = self.graph.claims.fetchRemove(store_path) orelse return;
         std.debug.assert(removed.value == claim);
         self.allocator.free(removed.key);
         claim.release(self.allocator);
     }
 
     fn releaseRecipeForPath(self: *DerivationStore, store_path: []const u8) void {
-        self.recipe_mu.lock();
-        defer self.recipe_mu.unlock();
-        const removed = self.recipes.fetchRemove(store_path) orelse return;
+        self.graph.mu.lock();
+        defer self.graph.mu.unlock();
+        const removed = self.graph.recipes.fetchRemove(store_path) orelse return;
         self.allocator.free(removed.key);
         removed.value.deinit(self.allocator);
     }
