@@ -956,7 +956,7 @@ pub fn forceThunkImpl(self: *VM, thunk_val: Value, demand: bool) anyerror!Value 
                 // (spread across the idle workers) instead of competing with
                 // junk in the spec lane. Transitive: a rescued fiber that
                 // blocks here promotes the next link down the critical chain.
-                if (self.scheduler.spec_rescue and
+                if (self.scheduler.config.spec_rescue and
                     (self.ctx.is_demand or self.demand_rescue.load(.monotonic) != 0) and
                     !thunk.isDemanded())
                 {
@@ -1118,7 +1118,7 @@ pub fn makeThunk(self: *VM, closure: Value) !Value {
         // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
         // instance of a chunk goes to the high-priority novel lane.
         // builtin_closure thunks carry no chunk of their own — bulk lane.
-        const ok = if (self.scheduler.spec_novel and speculate.novelClosureChunk(self, closure))
+        const ok = if (self.scheduler.config.spec_novel and speculate.novelClosureChunk(self, closure))
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());

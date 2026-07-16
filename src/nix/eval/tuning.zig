@@ -10,17 +10,16 @@
 const std = @import("std");
 const scheduler_mod = @import("../scheduler.zig");
 
-/// Resolve and apply the scheduler/speculation tuning knobs. Takes exactly the
-/// lower-layer state it touches — the scheduler, environment, and worker
-/// count — never the whole Evaluator.
-pub fn apply(
-    sched: *scheduler_mod.Scheduler,
+/// Resolve scheduler/speculation tuning into one immutable policy value.
+pub fn resolve(
+    base: scheduler_mod.Config,
     env: ?*const std.process.Environ.Map,
     worker_count: u8,
-) void {
+) scheduler_mod.Config {
+    var config = base;
     // FIX_SPEC_BACKLOG: sweep the speculation backlog cap (peak-RSS↔wall knob).
     if (env) |em| if (em.get("FIX_SPEC_BACKLOG")) |s| {
-        if (std.fmt.parseInt(u32, s, 10)) |n| scheduler_mod.setSpecBacklog(n) else |_| {}
+        if (std.fmt.parseInt(u32, s, 10)) |n| config.spec_backlog_per_helper = n else |_| {}
     };
     // Novel-chunk priority lane: first-ever speculation of each chunk
     // goes to the high-priority novel lane (see scheduler.spec_novel).
@@ -33,9 +32,9 @@ pub fn apply(
     // bulk-spec drain cap below: novel is now neutral-to-winning at w=32
     // (-2..-5% median across 6 interleaved rounds, footprint flat), so
     // the gate is gone. FIX_SPEC_NOVEL=0/1 overrides.
-    sched.spec_novel = worker_count > 1;
+    config.spec_novel = worker_count > 1;
     if (env) |em| if (em.get("FIX_SPEC_NOVEL")) |s| {
-        sched.spec_novel = !std.mem.eql(u8, s, "0");
+        config.spec_novel = !std.mem.eql(u8, s, "0");
     };
     // FIX_SPEC_HELPERS: highest worker id allowed to take bulk-spec tasks.
     // Default 16 — inert through w=17 (worker ids run 0..w-1, so every
@@ -50,16 +49,16 @@ pub fn apply(
     // where the backlog knob alone measured dead flat; with the cap in
     // place the novel/prefetch/sibling gates could be re-tuned on their
     // own merits. FIX_SPEC_HELPERS=255 restores uncapped.
-    sched.spec_helper_cap = 16;
+    config.spec_helper_cap = 16;
     if (env) |em| if (em.get("FIX_SPEC_HELPERS")) |s| {
-        if (std.fmt.parseInt(u8, s, 10)) |n| sched.spec_helper_cap = n else |_| {}
+        if (std.fmt.parseInt(u8, s, 10)) |n| config.spec_helper_cap = n else |_| {}
     };
     // FIX_RESCUE: demand priority inheritance (see scheduler.spec_rescue) —
     // when a demand fiber blocks on a spec-owned thunk, promote the fiber
     // computing it (urgent sub-forces + no bail). Needs helpers; default off
     // pending A/B.
     if (env) |em| if (em.get("FIX_RESCUE")) |s| {
-        sched.spec_rescue = worker_count > 1 and !std.mem.eql(u8, s, "0");
+        config.spec_rescue = worker_count > 1 and !std.mem.eql(u8, s, "0");
     };
     // FIX_SPEC_BAND_BUDGET: hard creation budget for spec tasks rooted
     // at untrusted-band (sub-256 effective size) chunks; default ON
@@ -67,7 +66,7 @@ pub fn apply(
     // Scheduler.spec_band_budget). 0 disables.
     if (env) |em| if (em.get("FIX_SPEC_BAND_BUDGET")) |s| {
         if (std.fmt.parseInt(u64, s, 10)) |v| {
-            sched.spec_band_budget = v;
+            config.spec_band_budget = v;
         } else |_| {}
     };
     // Demand-sibling prefetch is ON by default at 2-16 workers
@@ -99,18 +98,21 @@ pub fn apply(
             }
             if (em.get("FIX_SIBLING_BUDGET")) |s| {
                 if (std.fmt.parseInt(u64, s, 10)) |n| {
-                    sched.sibling_budget = n;
-                    sched.sibling_claim_budget = n;
+                    config.sibling_budget = n;
+                    config.sibling_claim_budget = n;
                 } else |_| {}
             }
             if (em.get("FIX_SIBLING_CLAIMS")) |s| {
-                if (std.fmt.parseInt(u64, s, 10)) |n| sched.sibling_claim_budget = n else |_| {}
+                if (std.fmt.parseInt(u64, s, 10)) |n| config.sibling_claim_budget = n else |_| {}
             }
             if (em.get("FIX_SIBLING_URGENT")) |s| {
-                sched.sibling_urgent = !std.mem.eql(u8, s, "0");
+                config.sibling_urgent = !std.mem.eql(u8, s, "0");
             }
-            sched.sibling_log = em.get("FIX_SIBLING_LOG") != null;
+            config.sibling_log = em.get("FIX_SIBLING_LOG") != null;
         }
-        sched.setSiblingPrefetch(sib_on, sib_min, sib_max);
+        config.sibling_prefetch = sib_on;
+        config.sibling_min = sib_min;
+        config.sibling_max = sib_max;
     }
+    return config;
 }

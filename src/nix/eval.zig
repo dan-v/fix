@@ -1235,8 +1235,10 @@ pub const Evaluator = struct {
     }
 
     pub fn setParallelismToggles(self: *Evaluator, disable_speculation: bool, disable_fanout: bool) void {
-        self.scheduler.disable_speculation = disable_speculation;
-        self.scheduler.disable_fanout = disable_fanout;
+        var config = self.scheduler.configuration();
+        config.disable_speculation = disable_speculation;
+        config.disable_fanout = disable_fanout;
+        self.scheduler.configure(config);
     }
 
     /// Compile source text into bytecode and evaluate it.
@@ -1267,7 +1269,9 @@ pub const Evaluator = struct {
         // the self-reference `builtins.builtins`; that prediction is only
         // safe when no other thread is allocating objects.
         _ = try self.ensureBuiltins();
-        tuning.apply(&self.scheduler, self.env_map, self.worker_count);
+        if (!self.scheduler.isStarted()) {
+            self.scheduler.configure(tuning.resolve(self.scheduler.configuration(), self.env_map, self.worker_count));
+        }
         // Speculative import prefetch: `.nix` path constants of freshly
         // compiled chunks are parse+compile+evaluated ahead of demand on
         // the spec lane (the braid-window perf decomposition measured

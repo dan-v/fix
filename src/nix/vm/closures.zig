@@ -165,7 +165,7 @@ pub fn makeBytecodeThunkFromCaptures(self: *VM, chunk_id: ChunkId, descriptors: 
             self.scheduler.submitUrgent(.{ .force_thunk = id }, self.workerId())
             // Novelty routing (`FIX_SPEC_NOVEL`): the first-ever speculative
             // instance of this chunk goes to the high-priority novel lane.
-        else if (self.scheduler.spec_novel and self.registry.markSpecSubmitted(chunk_id))
+        else if (self.scheduler.config.spec_novel and self.registry.markSpecSubmitted(chunk_id))
             self.scheduler.submitNovel(.{ .force_thunk = id }, self.workerId())
         else
             self.scheduler.submit(.{ .force_thunk = id }, self.workerId());

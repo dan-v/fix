@@ -211,7 +211,7 @@ fn maybePrefetchChildDirs(
     dir_path: []const u8,
     dir_entries: []const FileCache.DirEntry,
 ) void {
-    const min = self.scheduler.readdir_prefetch_min;
+    const min = self.scheduler.config.readdir_prefetch_min;
     if (min == 0) return; // off (w=1 / FIX_READDIR_PREFETCH=0)
     var ndirs: u32 = 0;
     for (dir_entries) |e| {

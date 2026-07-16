@@ -227,7 +227,7 @@ pub const SchedulingHints = struct {
     /// bodies whose one execution can recursively force multi-million-
     /// thunk never-demanded subgraphs). Speculative `force_thunk` tasks
     /// whose ROOT chunk carries this bit run under a hard creation
-    /// budget (`Scheduler.spec_band_budget`); trusted (≥256) roots run
+    /// budget (`Scheduler.Config.spec_band_budget`); trusted (≥256) roots run
     /// unbudgeted as always. With the admission gate at its default
     /// (== trusted threshold) no such chunk is ever submitted, so the
     /// bit is dormant; it exists so lowering the admission gate — or a

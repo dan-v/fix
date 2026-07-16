@@ -124,7 +124,7 @@ inline fn cachedAttrLookup(self: *VM, obj_id: types.ObjectId, name_id: InternId)
     // the trigger point for sweeping the member's siblings. One dead
     // branch here when the flag is off; everything else lives in the
     // cold helper.
-    if (self.scheduler.sibling_prefetch) maybeSiblingSweep(self, obj_id, raw);
+    if (self.scheduler.config.sibling_prefetch) maybeSiblingSweep(self, obj_id, raw);
     return raw;
 }
 
@@ -144,9 +144,9 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
     const th = self.heap.getThunkAssumeValid(member.asObjectId());
     if (th.future.state.load(.monotonic) != @intFromEnum(thunk_mod.FutureState.unresolved)) return;
     const sched = self.scheduler;
-    if (!self.heap.trySiblingSweep(obj_id, sched.sibling_min, sched.sibling_max)) return;
+    if (!self.heap.trySiblingSweep(obj_id, sched.config.sibling_min, sched.config.sibling_max)) return;
     const task: sched_mod.Task = .{ .force_attrs_sweep = obj_id };
-    const ok = if (sched.sibling_urgent)
+    const ok = if (sched.config.sibling_urgent)
         sched.submitUrgent(task, self.workerId())
     else
         sched.submit(task, self.workerId());
@@ -157,7 +157,7 @@ fn maybeSiblingSweep(self: *VM, obj_id: types.ObjectId, member: Value) void {
         // retry — a set must not become permanently unsweepable because
         // one submit lost a race to a full queue.
         self.heap.clearSiblingSwept(obj_id);
-    if (sched.sibling_log) {
+    if (sched.config.sibling_log) {
         // Diagnostics only: submit timestamp + submitter, so a run log
         // shows per-sweep submit->run latency and lost submits.
         std.debug.print("sweep-submit attrs={d} t_us={d} worker={d} ok={}\n", .{

@@ -1039,7 +1039,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             //    useful deep speculation discards its claim spine, and the
             //    demand-side redo measured +12% w=8 wall.
             if (f.current_lane != .urgent) {
-                const band = f.vm.scheduler.spec_band_budget;
+                const band = f.vm.scheduler.config.spec_band_budget;
                 if (band != 0 and specRootBandSmall(f, thunk_id))
                     vm_force.specCreateArm(&f.vm, band);
             }
@@ -1088,7 +1088,7 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             defer vm_force.rootsEnd(&f.vm, gc_roots);
             vm_force.rootKeep(&f.vm, Value.attrs(attrs_id));
             const entries = f.vm.heap.getAttrs(attrs_id) catch return;
-            const log = f.vm.scheduler.sibling_log;
+            const log = f.vm.scheduler.config.sibling_log;
             const objs_before: u32 = if (log) f.vm.heap.objects.count() else 0;
             var lbuf: [160]u8 = undefined;
             var rbuf: [224]u8 = undefined;
@@ -1123,8 +1123,8 @@ fn runTask(f: *WorkerFiber, task: Task) void {
             for (entries) |entry| {
                 if (!entry.value.isThunk()) continue;
                 if (!vm_force.sweepMemberAdmissible(&f.vm, entry.value.asObjectId())) continue;
-                f.vm.spec_budget = f.vm.scheduler.sibling_claim_budget;
-                vm_force.specCreateArm(&f.vm, f.vm.scheduler.sibling_budget);
+                f.vm.spec_budget = f.vm.scheduler.config.sibling_claim_budget;
+                vm_force.specCreateArm(&f.vm, f.vm.scheduler.config.sibling_budget);
                 if (log) {
                     // Per-member cascade attribution: this worker's own
                     // thunk-creation counter around the force. Best-effort —
