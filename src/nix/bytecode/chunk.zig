@@ -747,6 +747,10 @@ pub const ChunkRegistry = struct {
     /// Debugger source-line-breakpoint patcher (see `BreakpointSink`). Null
     /// unless a debugger is attached.
     breakpoint_sink: ?BreakpointSink = null,
+    /// Import-prefetch discovery hook for this registry. Keeping the hook on
+    /// the registry prevents concurrently-live Evaluators from redirecting
+    /// each other's newly compiled path constants.
+    path_const_sink: ?PathConstSink = null,
     /// The thread that first recorded into the sidecar, captured lazily. The
     /// maps are not synchronized, so every `recordName`/`recordFile` must come
     /// from one thread; a debug assertion enforces it (see `checkSingleThread`).
@@ -950,17 +954,14 @@ pub const ChunkRegistry = struct {
     /// set (by the Evaluator, before workers start), `register` reports each
     /// freshly compiled chunk's `.path` constants so `.nix` file references
     /// can be speculatively parsed+compiled+evaluated on idle helpers ahead
-    /// of the demand fiber. A module-level hook (not a registry field) so
-    /// the deferred force-time compiles — which build Compilers from bare
-    /// registry/intern/heap refs — feed it without extra plumbing. Read-only
-    /// after start; called concurrently from every compiling worker (the
-    /// callee handles its own synchronization/dedup).
+    /// of the demand fiber. Deferred force-time compiles already register
+    /// through this registry, so they feed the same per-Evaluator hook without
+    /// additional compiler plumbing. Read-only after start; called concurrently
+    /// from every compiling worker (the callee synchronizes and deduplicates).
     pub const PathConstSink = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque, path_id: types.InternId) void,
     };
-    pub var path_const_sink: ?PathConstSink = null;
-
     /// Debugger hook: called for every chunk as it registers, so pending
     /// source-line breakpoints get patched into freshly (often lazily) compiled
     /// bodies — imports and deferred attrs register mid-evaluation. Null in
@@ -1146,7 +1147,7 @@ pub const ChunkRegistry = struct {
             self.allocator.destroy(stored);
         }
         stored.* = chunk;
-        if (path_const_sink) |sink| {
+        if (self.path_const_sink) |sink| {
             for (stored.constants) |c| {
                 if (c.isPath()) sink.call(sink.ctx, c.asInternId());
             }
@@ -1284,6 +1285,36 @@ test "chunk builder emits opcodes and operands into the code stream" {
     try std.testing.expectEqual(@as(u8, 3), chunk.code[1]);
     try std.testing.expectEqual(@intFromEnum(OpCode.jump), chunk.code[2]);
     try std.testing.expectEqual(@as(u32, 10), readU32Inline(chunk.code, 3));
+}
+
+test "chunk path hooks are isolated per registry" {
+    const allocator = std.testing.allocator;
+    var left = try ChunkRegistry.init(allocator);
+    defer left.deinit();
+    var right = try ChunkRegistry.init(allocator);
+    defer right.deinit();
+
+    const Counter = struct {
+        value: u32 = 0,
+
+        fn note(ctx: *anyopaque, _: types.InternId) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.value += 1;
+        }
+    };
+    var left_count: Counter = .{};
+    var right_count: Counter = .{};
+    left.path_const_sink = .{ .ctx = &left_count, .call = Counter.note };
+    right.path_const_sink = .{ .ctx = &right_count, .call = Counter.note };
+
+    var builder = try ChunkBuilder.init(allocator);
+    defer builder.deinit(allocator);
+    _ = try builder.addConstant(allocator, Value.path(17));
+    const chunk = try builder.finish(allocator, 0);
+    _ = try left.register(chunk);
+
+    try std.testing.expectEqual(@as(u32, 1), left_count.value);
+    try std.testing.expectEqual(@as(u32, 0), right_count.value);
 }
 
 test "chunk builder patches a forward jump offset after emission" {

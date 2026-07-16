@@ -704,11 +704,9 @@ pub const Evaluator = struct {
         // build phase already, but be structural about it.
         self.stopProgressSampler();
         mem_report.report(&self.heap, &self.intern, &self.registry, self.retained_arenas.items, self.mem_report_mode);
-        // Detach the import-prefetch sink before teardown (module-level
-        // global; only clear it if it still points at THIS evaluator).
-        if (ChunkRegistry.path_const_sink) |sink| {
-            if (sink.ctx == @as(*anyopaque, @ptrCast(self))) ChunkRegistry.path_const_sink = null;
-        }
+        // No compilation may notify this Evaluator once registry teardown
+        // begins. The hook is instance-owned, so other evaluators are untouched.
+        self.registry.path_const_sink = null;
         self.prefetch.seen.deinit(self.allocator);
         gc.recordFinalTotal(self.heap.totalReservedBytes());
         if (self.gc_report_on) gc.report();
@@ -1294,10 +1292,10 @@ pub const Evaluator = struct {
             }
             if (on and self.worker_count > 1) {
                 self.prefetch.budget = max;
-                ChunkRegistry.path_const_sink = .{ .ctx = self, .call = prefetchPathConst };
+                self.registry.path_const_sink = .{ .ctx = self, .call = prefetchPathConst };
             } else {
                 self.prefetch.budget = 0;
-                ChunkRegistry.path_const_sink = null;
+                self.registry.path_const_sink = null;
             }
         }
         // Speculative readDir-children prefetch: a cold builtins.readDir
@@ -1385,23 +1383,9 @@ pub const Evaluator = struct {
         // stays gated at the enclosing builtin's depth. native_depth lives on
         // the VM (fiber-local), so no threadlocal dance is needed.
         vm.native_depth = parent_depth -| 1;
-        // This VM isn't in any worker's `fibers`, so the collector can't find
-        // its roots on its own — register it for the duration of the import.
-        // Concurrent imports at --workers>1 interleave, so guard the list and
-        // remove by value (not LIFO pop).
-        self.gc_import_vms_mu.lock();
-        self.gc_import_vms.append(self.allocator, &vm) catch {};
-        self.gc_import_vms_mu.unlock();
-        defer {
-            self.gc_import_vms_mu.lock();
-            for (self.gc_import_vms.items, 0..) |ivm, i| {
-                if (ivm == &vm) {
-                    _ = self.gc_import_vms.swapRemove(i);
-                    break;
-                }
-            }
-            self.gc_import_vms_mu.unlock();
-        }
+        // This VM isn't in a Worker's fiber list; make its roots visible to GC.
+        eval_gc.registerVm(self, &vm);
+        defer eval_gc.unregisterVm(self, &vm);
         return vm.eval(chunk_id);
     }
 
@@ -1834,7 +1818,8 @@ pub const Evaluator = struct {
         return imports_mod.importPath(self, path, parent_depth);
     }
 
-    /// `ChunkRegistry.path_const_sink` target (`FIX_IMPORT_PREFETCH`):
+    /// This Evaluator's `ChunkRegistry.path_const_sink` target
+    /// (`FIX_IMPORT_PREFETCH`):
     /// called for every `.path` constant of every freshly compiled chunk,
     /// from whichever worker ran the compile. Filters to `.nix` files
     /// (directory references — the bulk of e.g. all-packages.nix's ~1.7K
