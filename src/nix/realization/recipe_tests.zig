@@ -29,7 +29,7 @@ fn realizationApiAvailable() bool {
 /// `fake.deinit()` (declared first, so it runs last).
 fn attachFake(store: *DerivationStore, fake: *FakeDaemon) void {
     store.setIo(std.testing.io);
-    store.daemon_socket = fake.socketPath();
+    store.setDaemonSocketBorrowedForTest(fake.socketPath());
     const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
     rt.* = DaemonRuntime.init();
     rt.pool_workers = 2;
@@ -569,7 +569,7 @@ test "transient connection failure resets claim state and permits retry" {
         var store = DerivationStore.init(std.testing.allocator);
         defer store.deinit();
         store.setIo(std.testing.io);
-        store.daemon_socket = socket_path;
+        store.setDaemonSocketBorrowedForTest(socket_path);
         const rt = std.testing.allocator.create(DaemonRuntime) catch @panic("OOM");
         rt.* = DaemonRuntime.init();
         rt.pool_workers = 2;

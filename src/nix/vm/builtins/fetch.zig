@@ -72,7 +72,7 @@ pub const FetchedOut = struct {
 
 pub fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8, rev: []const u8, filter: ?nar.Filter) !FetchedOut {
     _ = rev;
-    if (self.derivations.store_writes_enabled) {
+    if (self.derivations.storeWritesEnabled()) {
         // Fetched trees carry no user-lambda filter identity, so they are never
         // filter-memoized (pass null); a null `filter` is unfiltered-memoized.
         const ingested = try source_paths.ingest(self.allocator, self.derivations, self.files, cache_path, name, filter, null);
@@ -93,7 +93,7 @@ pub fn ingestFetchedTree(self: anytype, cache_path: []const u8, name: []const u8
 /// eval) it is a bare string of the download-cache path.
 fn fetchedPathValue(self: anytype, path: []const u8) !Value {
     const id = try self.intern.intern(path);
-    return if (self.derivations.store_writes_enabled)
+    return if (self.derivations.storeWritesEnabled())
         contextStringWithPath(self, id)
     else
         Value.string(id);
@@ -340,7 +340,7 @@ pub fn builtinFetchurl(self: anytype, arg: Value) !Value {
     // content is later demanded — offline for path-only use, still correct for
     // import-from-derivation. Store writes keep the eager fetch+materialize path.
     if (expected_hash) |expected| {
-        if (!self.derivations.store_writes_enabled) {
+        if (!self.derivations.storeWritesEnabled()) {
             const store_path = try derivation.fixedOutputPath(self.allocator, self.derivations.store_dir, spec.name, "out", "sha256", expected);
             defer self.allocator.free(store_path);
             try self.derivations.recordPendingFetch(store_path, spec.url, spec.name, false, expected);
@@ -399,7 +399,7 @@ pub fn flatFetchOutPath(self: anytype, cache_path: []const u8, hash_hex: []const
     errdefer self.allocator.free(store_path);
     var contents = try self.files.retainFile(cache_path);
     defer contents.release();
-    if (!self.derivations.store_writes_enabled) {
+    if (!self.derivations.storeWritesEnabled()) {
         // Plain eval has no store to materialize the file; seed the cache so
         // `readFile`/`import` on the returned store path stays zero-copy.
         try self.files.provideRegular(store_path, contents);
@@ -468,7 +468,7 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
     // fetchurl above). Content demand (readFile into the tree, import) triggers
     // the fetch+unpack lazily. Store writes keep the eager ingest path.
     if (expected_hash) |expected| {
-        if (!self.derivations.store_writes_enabled) {
+        if (!self.derivations.storeWritesEnabled()) {
             const store_path = try derivation.sourcePath(self.allocator, self.derivations.store_dir, tree_name, expected);
             defer self.allocator.free(store_path);
             try self.derivations.recordPendingFetch(store_path, spec.url, tree_name, true, expected);
@@ -489,7 +489,7 @@ pub fn builtinFetchTarball(self: anytype, arg: Value) !Value {
         const payload = result.nar_payload orelse unreachable;
         const actual_hash = std.fmt.bytesToHex(payload.digest, .lower);
         try validateFetchedSha256(self, "tarball", spec.url, expected, &actual_hash);
-        if (self.derivations.store_writes_enabled) {
+        if (self.derivations.storeWritesEnabled()) {
             const ingested = try source_paths.ingestSerializedNar(
                 self.allocator,
                 self.derivations,

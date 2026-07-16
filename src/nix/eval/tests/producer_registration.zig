@@ -42,7 +42,7 @@ const Fixture = struct {
         errdefer ev.deinit();
         ev.setFileIo(std.testing.io);
         ev.store.derivations.store_dir = store_dir;
-        ev.store.derivations.daemon_socket = fake.socketPath();
+        ev.store.derivations.setDaemonSocketBorrowedForTest(fake.socketPath());
         if (enable_store_writes) ev.enableStoreWrites();
 
         return .{

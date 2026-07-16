@@ -43,16 +43,16 @@ test "setDaemonSocket overrides the default path and re-set frees the prior owne
     var store = DerivationStore.init(std.testing.allocator);
     defer store.deinit();
 
-    try std.testing.expectEqualStrings(host.store.default_socket_path, store.daemon_socket);
+    try std.testing.expectEqualStrings(host.store.default_socket_path, store.daemonSocket());
     try store.setDaemonSocket("/tmp/one.sock");
-    try std.testing.expectEqualStrings("/tmp/one.sock", store.daemon_socket);
+    try std.testing.expectEqualStrings("/tmp/one.sock", store.daemonSocket());
     // Re-setting must free the prior owned copy (no leak — the testing allocator
     // would flag it) and point at the new one.
     try store.setDaemonSocket("/tmp/two.sock");
-    try std.testing.expectEqualStrings("/tmp/two.sock", store.daemon_socket);
+    try std.testing.expectEqualStrings("/tmp/two.sock", store.daemonSocket());
     // Empty is a no-op (keeps the current value).
     try store.setDaemonSocket("");
-    try std.testing.expectEqualStrings("/tmp/two.sock", store.daemon_socket);
+    try std.testing.expectEqualStrings("/tmp/two.sock", store.daemonSocket());
 }
 
 test "derivation IR computes minimal Nix paths" {

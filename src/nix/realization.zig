@@ -7,7 +7,8 @@
 pub const store = @import("realization/store.zig");
 pub const source_path = @import("realization/source_path.zig");
 
-pub const DerivationStore = store.DerivationStore;
+pub const RealizationStore = store.RealizationStore;
+pub const DerivationStore = RealizationStore;
 pub const SpanGroup = store.SpanGroup;
 
 test {

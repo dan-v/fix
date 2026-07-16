@@ -1,8 +1,5 @@
-//! DerivationStore: the evaluation-wide registry mapping each .drv path to its
-//! hash-modulo and output names (the resolver for input-addressed hashing),
-//! plus the lazy-derivation Value cache and optional debug-record capture.
-//! Read-mostly but written from any worker thread: `mu` guards the record maps
-//! and a separate `lazy_drv_mu` spinlock guards the lazy value cache.
+//! Realization facade coordinating the derivation registry, evaluation memo,
+//! recipe/claim graph, and daemon client.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,19 +12,19 @@ const host = @import("../host.zig");
 const rstore = host.store;
 const FileCache = host.FileCache;
 const DaemonRuntime = host.DaemonRuntime;
-const Future = runtime.thunk.Future;
 const Waiter = runtime.thunk.Waiter;
 const eval_memo = @import("eval_memo.zig");
 const recipe_graph = @import("recipe_graph.zig");
+const daemon_client = @import("daemon_client.zig");
 
 /// Injected `vm.io_offload.runOnPool`: submit `work(conn)` to the pool and park
 /// the caller. `ctx` is the `*DaemonPool`; `conn` is the worker's connection.
-const OffloadFn = *const fn (ctx: *anyopaque, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) void;
+const OffloadFn = daemon_client.OffloadFn;
 
 /// Injected `vm.io_offload.fiberPark`: park the current compute fiber on `future`
 /// (a realization claim). Returns false if not on a fiber — the caller then waits
 /// on the thread itself (the main-thread realize / tests).
-const FiberParkFn = *const fn (future: *Future) bool;
+const FiberParkFn = daemon_client.FiberParkFn;
 
 /// The progress-span groups the derivation store reports into. Mirrors the
 /// observ `SpanGroup`, but named locally: the derivation module must not import
@@ -41,21 +38,8 @@ pub const SpanGroup = recipe_graph.SpanGroup;
 /// layer adapts its observ `SpanSink` into these opaque fn pointers. `begin`
 /// opens a span labeled with `label` and returns its token; `end` closes it.
 /// A span may open on a pool worker / compute fiber and close after the write.
-const SpanBeginFn = *const fn (ctx: *anyopaque, group: SpanGroup, label: []const u8) usize;
-const SpanEndFn = *const fn (ctx: *anyopaque, token: usize) void;
-const SpanHooks = struct {
-    ctx: *anyopaque,
-    begin: SpanBeginFn,
-    end: SpanEndFn,
-};
-
-/// The daemon connection the current thread's in-flight op runs against. Set at
-/// each offload boundary (a pool worker running one op, or the inline dispatch)
-/// so the whole nested closure walk — `ensureClosure` → writes/queries — reaches
-/// its connection without threading a `conn` parameter through every function.
-/// Per-thread: each pool worker has its own, concurrent walks never collide, and
-/// the parked submitting fiber never runs the closure itself.
-threadlocal var active_conn: ?*rstore.DaemonStore = null;
+const SpanBeginFn = daemon_client.SpanBeginFn;
+const SpanEndFn = daemon_client.SpanEndFn;
 
 const DebugRecord = types.DebugRecord;
 const ComputedPaths = types.ComputedPaths;
@@ -76,76 +60,17 @@ fn storePathName(path: []const u8) []const u8 {
     return base;
 }
 
-pub const DerivationStore = struct {
+pub const RealizationStore = struct {
     allocator: std.mem.Allocator,
     store_dir: []const u8 = "/nix/store",
     registry: derivation.Registry,
     memo: eval_memo.EvalMemo,
     graph: recipe_graph.Graph,
-
-    /// Guards the small shared state every pool worker touches: the `instantiated`
-    /// cache and `last_error_msg`. Held only for brief in-memory updates, never
-    /// across a daemon round-trip (those run on the worker's own connection).
-    daemon_mu: stable.BlockingMutex = .{},
-    /// First failing daemon op's message, copied out of its (transient) pool
-    /// connection so `lastStoreError` can surface it after the op is gone.
-    last_error_msg: ?[]u8 = null,
-    /// Store paths we've already ensured are present this run — either because
-    /// we wrote them, or because a pre-write `isValidPath` confirmed the daemon
-    /// already has them. Both cases mean a re-force can skip re-sending the
-    /// bytes. Empty at process start, so the first force of an already-present
-    /// path pays one cheap `isValidPath` round-trip instead of streaming the
-    /// whole text/NAR the daemon would just hash and discard.
-    instantiated: std.StringHashMapUnmanaged(void) = .empty,
-    io: ?std.Io = null,
-    /// Path to the nix-daemon socket. Defaults to Nix's well-known location;
-    /// `setDaemonSocket` (from `$NIX_DAEMON_SOCKET_PATH`) overrides it, pointing
-    /// at `daemon_socket_owned`.
-    daemon_socket: []const u8 = rstore.default_socket_path,
-    daemon_socket_owned: ?[]u8 = null,
-    /// Per-connection daemon settings (`--cores`/`--max-jobs`/`--fallback`/…),
-    /// sent via `set_options` right after the handshake. Null = send nothing
-    /// (the daemon uses its own config). Its `overrides` slice is owned via
-    /// `daemon_overrides` below.
-    daemon_options: ?rstore.BuildSettings = null,
-    daemon_overrides: std.ArrayListUnmanaged(rstore.Setting) = .empty,
-    /// Whether forced derivations, their sources, and fetched trees are
-    /// materialized to the store (`fix instantiate`/`build` enable it). Off for
-    /// plain `eval` so the hot eval path never does store I/O per derivation
-    /// and fetches stay local/offline (returning their download-cache path).
-    store_writes_enabled: bool = false,
-
-    /// Concurrent progress-span hooks for real store writes (see `SpanHooks`):
-    /// a `.store` span per actual `.drv` transfer, a `.source` span per actual
-    /// source copy — both reported in `applyDaemonOp`, past the validity guard.
-    /// Set by the evaluator alongside the demand-fiber stage sink. They count
-    /// actual writes — not per instantiated derivation / per coercion, which only
-    /// record an in-memory recipe or hit the memo. Null when progress isn't drawn.
-    span_hooks: ?SpanHooks = null,
-
-    /// The pool-offload entry (`vm.io_offload.runOnPool`), injected by the eval
-    /// layer: submits one daemon op to `pool` and parks the caller (fiber yields).
-    /// Null → no fiber machinery (tests): the pool's `submitBlocking` runs the op
-    /// on a worker and blocks the caller. Either way every op goes to the pool.
-    offload_run: ?OffloadFn = null,
-    /// Injected fiber-park for a realization-claim wait (null in tests → the
-    /// waiter blocks its thread on a semaphore instead).
-    fiber_park: ?FiberParkFn = null,
-    /// The Evaluator- (or test-) owned runtime that owns the connection pool.
-    daemon_runtime: ?*DaemonRuntime = null,
-    /// The hot-connection pool, obtained from `daemon_runtime` — started eagerly
-    /// by `enableStoreWrites` (store-writing commands) so connections warm while
-    /// eval runs, or lazily on the first daemon op for plain-eval IFD. Guarded by
-    /// `pool_mu`.
-    pool: ?*rstore.DaemonPool = null,
-    pool_mu: stable.BlockingMutex = .{},
-    /// Test-only: a `DaemonRuntime` the test harness had this store own (so tests
-    /// don't manage its lifetime separately). Deinitialized + freed in `deinit`.
-    test_owned_runtime: if (builtin.is_test) ?*DaemonRuntime else void = if (builtin.is_test) null else {},
+    daemon: daemon_client.Client,
 
     pub const RootClaimHook = recipe_graph.RootClaimHook;
 
-    pub fn setRootClaimHookForTest(self: *DerivationStore, hook: ?RootClaimHook) void {
+    pub fn setRootClaimHookForTest(self: *RealizationStore, hook: ?RootClaimHook) void {
         if (comptime builtin.is_test) {
             self.graph.test_root_claim_hook = hook;
         } else unreachable;
@@ -153,7 +78,7 @@ pub const DerivationStore = struct {
 
     /// Test-only producer-boundary seam. Producers call this after the owned
     /// allocation is created, independently of whether registration succeeds.
-    pub fn noteProducerPayloadForTest(self: *DerivationStore, store_path: []const u8, payload: []const u8) !void {
+    pub fn noteProducerPayloadForTest(self: *RealizationStore, store_path: []const u8, payload: []const u8) !void {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -182,7 +107,7 @@ pub const DerivationStore = struct {
     /// Consume the allocation observations for `store_path`, returning the one
     /// actually retained by the recipe. A non-matching first observation keeps
     /// identity failures visible. Consumption prevents stale-map false passes.
-    pub fn producerPayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
+    pub fn producerPayloadPointerForTest(self: *RealizationStore, store_path: []const u8) ?usize {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -199,7 +124,7 @@ pub const DerivationStore = struct {
 
     pub const RecipeVariantForTest = recipe_graph.RecipeVariantForTest;
 
-    pub fn recipeCountForTest(self: *DerivationStore) usize {
+    pub fn recipeCountForTest(self: *RealizationStore) usize {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -207,7 +132,7 @@ pub const DerivationStore = struct {
         } else return 0;
     }
 
-    pub fn recipeVariantForTest(self: *DerivationStore, store_path: []const u8) ?RecipeVariantForTest {
+    pub fn recipeVariantForTest(self: *RealizationStore, store_path: []const u8) ?RecipeVariantForTest {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -220,7 +145,7 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub fn recipePayloadPointerForTest(self: *DerivationStore, store_path: []const u8) ?usize {
+    pub fn recipePayloadPointerForTest(self: *RealizationStore, store_path: []const u8) ?usize {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -228,7 +153,7 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub fn recipePayloadBytesForTest(self: *DerivationStore, store_path: []const u8) ?[]const u8 {
+    pub fn recipePayloadBytesForTest(self: *RealizationStore, store_path: []const u8) ?[]const u8 {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -241,7 +166,7 @@ pub const DerivationStore = struct {
         } else return null;
     }
 
-    pub fn recipeReferencesForTest(self: *DerivationStore, store_path: []const u8) ?[]const []const u8 {
+    pub fn recipeReferencesForTest(self: *RealizationStore, store_path: []const u8) ?[]const []const u8 {
         if (comptime builtin.is_test) {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -256,7 +181,7 @@ pub const DerivationStore = struct {
     pub const PendingFetch = recipe_graph.PendingFetch;
 
     /// Register a deferred fetch for `store_path` (no-op if one already exists).
-    pub fn recordPendingFetch(self: *DerivationStore, store_path: []const u8, url: []const u8, name: []const u8, recursive: bool, hash_hex: []const u8) !void {
+    pub fn recordPendingFetch(self: *RealizationStore, store_path: []const u8, url: []const u8, name: []const u8, recursive: bool, hash_hex: []const u8) !void {
         return self.graph.recordPendingFetch(store_path, url, name, recursive, hash_hex);
     }
 
@@ -264,83 +189,61 @@ pub const DerivationStore = struct {
     /// null. The entry is left in place — concurrent demands each materialize
     /// against the (memoized) fetch cache; `removePendingFetch` drops it once a
     /// flat file is seeded. Caller owns the copy and must `deinit` it.
-    pub fn peekPendingFetch(self: *DerivationStore, store_path: []const u8) !?PendingFetch {
+    pub fn peekPendingFetch(self: *RealizationStore, store_path: []const u8) !?PendingFetch {
         return self.graph.peekPendingFetch(store_path);
     }
 
-    pub fn removePendingFetch(self: *DerivationStore, store_path: []const u8) void {
+    pub fn removePendingFetch(self: *RealizationStore, store_path: []const u8) void {
         self.graph.removePendingFetch(store_path);
     }
 
     const Recipe = recipe_graph.Recipe;
     const RealizationClaim = recipe_graph.Claim;
 
-    pub fn init(allocator: std.mem.Allocator) DerivationStore {
+    pub fn init(allocator: std.mem.Allocator) RealizationStore {
         return .{
             .allocator = allocator,
             .registry = derivation.Registry.init(allocator),
             .memo = eval_memo.EvalMemo.init(allocator),
             .graph = recipe_graph.Graph.init(allocator),
+            .daemon = daemon_client.Client.init(allocator),
         };
     }
 
-    pub fn deinit(self: *DerivationStore) void {
-        // Tear down a test-owned runtime first (joins pool workers → closes their
-        // connections), before the fake daemon it talks to is stopped.
-        if (comptime builtin.is_test) {
-            if (self.test_owned_runtime) |rt| {
-                rt.deinit();
-                self.allocator.destroy(rt);
-                self.test_owned_runtime = null;
-            }
-        }
+    pub fn deinit(self: *RealizationStore) void {
+        self.daemon.deinit();
         self.graph.deinit();
         self.registry.deinit();
         self.memo.deinit();
-        var inst = self.instantiated.keyIterator();
-        while (inst.next()) |key| self.allocator.free(key.*);
-        self.instantiated.deinit(self.allocator);
-        for (self.daemon_overrides.items) |o| {
-            self.allocator.free(o.name);
-            self.allocator.free(o.value);
-        }
-        self.daemon_overrides.deinit(self.allocator);
-        if (self.daemon_socket_owned) |owned| self.allocator.free(owned);
-        if (self.last_error_msg) |msg| self.allocator.free(msg);
     }
 
     /// Set the per-connection daemon settings to apply on connect. Dupes the
     /// overrides into owned storage (freed in `deinit`).
-    pub fn setBuildSettings(self: *DerivationStore, settings: rstore.BuildSettings) !void {
-        for (self.daemon_overrides.items) |o| {
-            self.allocator.free(o.name);
-            self.allocator.free(o.value);
-        }
-        self.daemon_overrides.clearRetainingCapacity();
-        for (settings.overrides) |o| {
-            try self.daemon_overrides.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, o.name),
-                .value = try self.allocator.dupe(u8, o.value),
-            });
-        }
-        var owned = settings;
-        owned.overrides = self.daemon_overrides.items;
-        self.daemon_options = owned;
+    pub fn setBuildSettings(self: *RealizationStore, settings: rstore.BuildSettings) !void {
+        return self.daemon.setBuildSettings(settings);
     }
 
     /// Override the nix-daemon socket path (from `$NIX_DAEMON_SOCKET_PATH`).
     /// Dupes `path` into owned storage (freed in `deinit`); a no-op if empty.
-    pub fn setDaemonSocket(self: *DerivationStore, path: []const u8) !void {
-        if (path.len == 0) return;
-        const owned = try self.allocator.dupe(u8, path);
-        if (self.daemon_socket_owned) |old| self.allocator.free(old);
-        self.daemon_socket_owned = owned;
-        self.daemon_socket = owned;
+    pub fn setDaemonSocket(self: *RealizationStore, path: []const u8) !void {
+        return self.daemon.setSocket(path);
+    }
+
+    pub fn setDaemonSocketBorrowedForTest(self: *RealizationStore, path: []const u8) void {
+        self.daemon.setBorrowedSocketForTest(path);
+    }
+
+    pub fn daemonSocket(self: *const RealizationStore) []const u8 {
+        return self.daemon.socketPath();
+    }
+
+    pub fn storeWritesEnabled(self: *const RealizationStore) bool {
+        return self.daemon.writesEnabled();
     }
 
     /// Provide the IO handle used to connect to the daemon on demand.
-    pub fn setIo(self: *DerivationStore, io: std.Io) void {
-        self.io = io;
+    pub fn setIo(self: *RealizationStore, io: std.Io) void {
+        self.daemon.setIo(io);
     }
 
     /// Enable writing forced derivations + their sources to the store
@@ -348,136 +251,101 @@ pub const DerivationStore = struct {
     /// Eagerly starts the connection pool (io + socket + options are configured
     /// by now) so its connections warm concurrently with eval instead of on a
     /// compute fiber's critical path at the first store op.
-    pub fn enableStoreWrites(self: *DerivationStore) void {
-        self.store_writes_enabled = true;
-        _ = self.ensurePool() catch {};
+    pub fn enableStoreWrites(self: *RealizationStore) void {
+        self.daemon.enableWrites();
     }
 
     /// Install (or clear) the concurrent progress-span hooks. A null `ctx` clears
     /// them (progress not drawn). Set by the evaluator when a progress sink is
     /// (re)installed; safe to change between top-level runs.
-    pub fn setSpanHooks(self: *DerivationStore, ctx: ?*anyopaque, begin: SpanBeginFn, end: SpanEndFn) void {
-        self.span_hooks = if (ctx) |c| .{ .ctx = c, .begin = begin, .end = end } else null;
+    pub fn setSpanHooks(self: *RealizationStore, ctx: ?*anyopaque, begin: SpanBeginFn, end: SpanEndFn) void {
+        self.daemon.setSpanHooks(ctx, begin, end);
     }
 
     /// Open a concurrent progress span for real store work, or null when progress
     /// isn't drawn. Pair with `endSpan` (defer). The label is borrowed for the
     /// call only. See `SpanHooks`.
-    pub fn beginSpan(self: *DerivationStore, group: SpanGroup, label: []const u8) ?usize {
-        const hooks = self.span_hooks orelse return null;
-        return hooks.begin(hooks.ctx, group, label);
+    pub fn beginSpan(self: *RealizationStore, group: SpanGroup, label: []const u8) ?usize {
+        return self.daemon.beginSpan(group, label);
     }
 
     /// Close a span opened by `beginSpan` (no-op on null / no hooks).
-    pub fn endSpan(self: *DerivationStore, token: ?usize) void {
-        const t = token orelse return;
-        const hooks = self.span_hooks orelse return;
-        hooks.end(hooks.ctx, t);
+    pub fn endSpan(self: *RealizationStore, token: ?usize) void {
+        self.daemon.endSpan(token);
     }
 
     /// Install the pool-offload entry (from the vm layer). Must be set before any
     /// forcing begins, and cleared (`clearOffload`) before the runtime is torn
     /// down. `rt` owns the connection pool this store submits to.
-    pub fn setOffload(self: *DerivationStore, rt: *DaemonRuntime, run: OffloadFn, fiber_park: FiberParkFn) void {
-        self.daemon_runtime = rt;
-        self.offload_run = run;
-        self.fiber_park = fiber_park;
+    pub fn setOffload(self: *RealizationStore, rt: *DaemonRuntime, run: OffloadFn, fiber_park: FiberParkFn) void {
+        self.daemon.setOffload(rt, run, fiber_park);
     }
 
-    pub fn clearOffload(self: *DerivationStore) void {
-        self.offload_run = null;
-        self.fiber_park = null;
-        self.daemon_runtime = null;
-        self.pool = null;
+    pub fn clearOffload(self: *RealizationStore) void {
+        self.daemon.clearOffload();
     }
 
     /// Test-only: hand this store a `DaemonRuntime` to use (as its pool source)
     /// and own (torn down in `deinit`). No `offload_run`, so ops go through the
     /// pool's blocking submit. See `recipe_tests`.
-    pub fn setTestRuntime(self: *DerivationStore, rt: *DaemonRuntime) void {
-        if (comptime !builtin.is_test) unreachable;
-        self.daemon_runtime = rt;
-        self.test_owned_runtime = rt;
-    }
-
-    /// The connection pool, starting it on first need (idempotent). Errors if no
-    /// runtime/io was installed (tests / `fix store`, which use the inline path).
-    fn ensurePool(self: *DerivationStore) !*rstore.DaemonPool {
-        self.pool_mu.lock();
-        defer self.pool_mu.unlock();
-        if (self.pool) |p| return p;
-        const rt = self.daemon_runtime orelse return error.StoreUnavailable;
-        const io = self.io orelse return error.StoreUnavailable;
-        const p = try rt.ensurePool(self.allocator, io, self.daemon_socket, self.daemon_options, self.store_writes_enabled);
-        self.pool = p;
-        return p;
+    pub fn setTestRuntime(self: *RealizationStore, rt: *DaemonRuntime) void {
+        self.daemon.setTestRuntime(rt);
     }
 
     /// The connection the current op runs against (see `active_conn`). A null
     /// means the pool worker could not open a connection — surface it as the
     /// store being unavailable rather than dereferencing null.
-    fn currentConn(_: *DerivationStore) !*rstore.DaemonStore {
-        return active_conn orelse error.StoreUnavailable;
+    fn currentConn(self: *RealizationStore) !*rstore.DaemonStore {
+        return self.daemon.currentConnection();
     }
 
     /// Run one daemon op: submit it to the pool and park the caller (a compute
     /// fiber yields; the main thread / tests block). `work(conn)` reads its
     /// connection through `active_conn`, set by whichever pool worker runs it.
-    fn runOnDaemon(self: *DerivationStore, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
-        const p = try self.ensurePool();
-        if (self.offload_run) |offload| {
-            offload(p, work, work_ctx);
-        } else {
-            p.submitBlocking(work, work_ctx);
-        }
+    fn runOnDaemon(self: *RealizationStore, work: *const fn (conn: ?*anyopaque, work_ctx: *anyopaque) void, work_ctx: *anyopaque) !void {
+        return self.daemon.run(work, work_ctx);
     }
 
     /// Copy a failing op's daemon message out of its (transient) pool connection
     /// so `lastStoreError` can surface it after the connection is reused. First
     /// writer wins.
-    fn captureDaemonError(self: *DerivationStore, conn: *rstore.DaemonStore) void {
-        const msg = conn.last_error orelse return;
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        if (self.last_error_msg != null) return;
-        self.last_error_msg = self.allocator.dupe(u8, msg) catch null;
+    fn captureDaemonError(self: *RealizationStore, conn: *rstore.DaemonStore) void {
+        self.daemon.captureError(conn);
     }
 
     /// Read the last daemon error message (for surfacing `error.DaemonError`),
     /// captured from the pool connection whose op failed.
-    pub fn lastStoreError(self: *DerivationStore) ?[]const u8 {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        return self.last_error_msg;
+    pub fn lastStoreError(self: *RealizationStore) ?[]const u8 {
+        return self.daemon.lastError();
     }
 
     /// Write `drv_path`'s `.drv` to the store (text-addressed), gated on
     /// `store_writes_enabled`. Inputs are forced before dependents, so a
     /// `.drv`'s referenced input `.drv`s are already written when we get here.
-    pub fn instantiateDrv(self: *DerivationStore, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
+    pub fn instantiateDrv(self: *RealizationStore, drv_path: []const u8, aterm: []const u8, references: []const []const u8) !void {
         return self.instantiateText(drv_path, aterm, references);
     }
 
     /// Write a text-addressed object (a `.drv` or `builtins.toFile` result),
     /// gated on `store_writes_enabled` (off during plain eval).
-    pub fn instantiateText(self: *DerivationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
-        if (!self.store_writes_enabled) return;
+    pub fn instantiateText(self: *RealizationStore, store_path: []const u8, text: []const u8, references: []const []const u8) !void {
+        if (!self.daemon.writes_enabled) return;
         return self.runDaemonOp(.{ .text = .{ .store_path = store_path, .text = text, .references = references } }, .store);
     }
 
     /// Write a NAR-serialized source tree, gated on `store_writes_enabled`.
     /// Sources ingest during derivation normalization — before the `.drv` that
     /// references them — so `input_srcs` are valid in time.
-    pub fn instantiatePath(self: *DerivationStore, store_path: []const u8, nar_bytes: []const u8) !void {
-        if (!self.store_writes_enabled) return;
+    pub fn instantiatePath(self: *RealizationStore, store_path: []const u8, nar_bytes: []const u8) !void {
+        if (!self.daemon.writes_enabled) return;
         // Used by `ingestSerializedNar` (fetchTarball) — a fetch, shown under `.fetch`.
         return self.runDaemonOp(.{ .path = .{ .store_path = store_path, .nar_bytes = nar_bytes } }, null);
     }
 
     /// Add a flat file's raw bytes to the store (fetchurl), gated on
     /// `store_writes_enabled`.
-    pub fn instantiateFlat(self: *DerivationStore, store_path: []const u8, bytes: []const u8) !void {
-        if (!self.store_writes_enabled) return;
+    pub fn instantiateFlat(self: *RealizationStore, store_path: []const u8, bytes: []const u8) !void {
+        if (!self.daemon.writes_enabled) return;
         return self.runDaemonOp(.{ .flat = .{ .store_path = store_path, .bytes = bytes } }, null);
     }
 
@@ -486,12 +354,12 @@ pub const DerivationStore = struct {
     /// hash IS the right content). Only meaningful with store writes enabled
     /// (else there is no daemon); returns false otherwise. Offloaded like the
     /// writes so the calling fiber parks rather than blocking on the socket.
-    pub fn pathIsValid(self: *DerivationStore, store_path: []const u8) !bool {
-        if (!self.store_writes_enabled) return false;
+    pub fn pathIsValid(self: *RealizationStore, store_path: []const u8) !bool {
+        if (!self.daemon.writes_enabled) return false;
         return self.queryPathValid(store_path);
     }
 
-    fn queryPathValid(self: *DerivationStore, store_path: []const u8) !bool {
+    fn queryPathValid(self: *RealizationStore, store_path: []const u8) !bool {
         // Caller-side cache hit: skip the pool round-trip entirely (the closure
         // walk hits this for every already-present path).
         if (self.cacheContains(store_path)) return true;
@@ -502,16 +370,15 @@ pub const DerivationStore = struct {
     }
 
     const QueryCell = struct {
-        store: *DerivationStore,
+        store: *RealizationStore,
         store_path: []const u8,
         valid: bool = false,
         err: ?anyerror = null,
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const c: *QueryCell = @ptrCast(@alignCast(p));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
+            const previous = daemon_client.installActiveConnection(conn);
+            defer daemon_client.restoreActiveConnection(previous);
             c.valid = c.store.applyIsValid(c.store_path) catch |e| {
                 c.err = e;
                 return;
@@ -523,7 +390,7 @@ pub const DerivationStore = struct {
     /// populating the `instantiated` cache. The daemon round-trip runs without
     /// `daemon_mu` held (it guards only the brief cache touches), so concurrent
     /// pool workers don't serialize on it.
-    fn applyIsValid(self: *DerivationStore, store_path: []const u8) !bool {
+    fn applyIsValid(self: *RealizationStore, store_path: []const u8) !bool {
         if (self.cacheContains(store_path)) return true;
         const conn = try self.currentConn();
         const valid = try conn.isValidPath(store_path);
@@ -537,7 +404,7 @@ pub const DerivationStore = struct {
     /// daemon, forwarding the build activity/log stream to `sink` if given.
     /// Dispatched to the pool (fiber parks / main thread blocks) so the whole
     /// build runs on a warm worker connection, not a compute worker.
-    pub fn buildPaths(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+    pub fn buildPaths(self: *RealizationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         var cell: BuildCell = .{ .store = self, .paths = derived_paths, .sink = sink, .mode = mode };
         try self.runOnDaemon(BuildCell.run, &cell);
         return cell.err;
@@ -545,13 +412,13 @@ pub const DerivationStore = struct {
 
     /// Realize `derived_paths` for import-from-derivation. Same as `buildPaths`;
     /// kept as a distinct entry for the `run`/`shell` realize call sites.
-    pub fn realizePaths(self: *DerivationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
+    pub fn realizePaths(self: *RealizationStore, derived_paths: []const []const u8, mode: rstore.BuildMode) !void {
         return self.buildPaths(derived_paths, null, mode);
     }
 
     /// Build against the current connection (used both by `BuildCell` and, inside
     /// an already-active op, by `realizeOutputInline`'s build step).
-    fn buildOnConn(self: *DerivationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
+    fn buildOnConn(self: *RealizationStore, derived_paths: []const []const u8, sink: ?rstore.BuildSink, mode: rstore.BuildMode) !void {
         const conn = try self.currentConn();
         conn.buildPaths(derived_paths, sink, mode) catch |err| {
             self.captureDaemonError(conn);
@@ -560,7 +427,7 @@ pub const DerivationStore = struct {
     }
 
     const BuildCell = struct {
-        store: *DerivationStore,
+        store: *RealizationStore,
         paths: []const []const u8,
         sink: ?rstore.BuildSink = null,
         mode: rstore.BuildMode,
@@ -568,31 +435,29 @@ pub const DerivationStore = struct {
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *BuildCell = @ptrCast(@alignCast(p));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
+            const previous = daemon_client.installActiveConnection(conn);
+            defer daemon_client.restoreActiveConnection(previous);
             self.err = self.store.buildOnConn(self.paths, self.sink, self.mode);
         }
     };
 
     /// Register `link_path` (an existing absolute symlink into the store) as an
     /// indirect GC root via the daemon.
-    pub fn addIndirectRoot(self: *DerivationStore, link_path: []const u8) !void {
+    pub fn addIndirectRoot(self: *RealizationStore, link_path: []const u8) !void {
         var cell: RootCell = .{ .store = self, .link_path = link_path };
         try self.runOnDaemon(RootCell.run, &cell);
         return cell.err;
     }
 
     const RootCell = struct {
-        store: *DerivationStore,
+        store: *RealizationStore,
         link_path: []const u8,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *RootCell = @ptrCast(@alignCast(p));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
+            const previous = daemon_client.installActiveConnection(conn);
+            defer daemon_client.restoreActiveConnection(previous);
             self.err = blk: {
                 const c = self.store.currentConn() catch |e| break :blk e;
                 break :blk c.addIndirectRoot(self.link_path);
@@ -611,23 +476,22 @@ pub const DerivationStore = struct {
     /// fiber parks (its stack — holding the NAR/text buffers — is preserved).
     /// `span_group` is the progress group the actual transfer reports under (null
     /// for writes shown elsewhere, e.g. fetches under `.fetch`).
-    fn runDaemonOp(self: *DerivationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
+    fn runDaemonOp(self: *RealizationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
         var cell: OpCell = .{ .store = self, .op = op, .span_group = span_group };
         try self.runOnDaemon(OpCell.run, &cell);
         return cell.err;
     }
 
     const OpCell = struct {
-        store: *DerivationStore,
+        store: *RealizationStore,
         op: DaemonOp,
         span_group: ?SpanGroup = null,
         err: anyerror!void = {},
 
         fn run(conn: ?*anyopaque, p: *anyopaque) void {
             const self: *OpCell = @ptrCast(@alignCast(p));
-            const prev = active_conn;
-            active_conn = if (conn) |x| @ptrCast(@alignCast(x)) else null;
-            defer active_conn = prev;
+            const previous = daemon_client.installActiveConnection(conn);
+            defer daemon_client.restoreActiveConnection(previous);
             self.err = self.store.applyDaemonOp(self.op, self.span_group);
         }
     };
@@ -635,7 +499,7 @@ pub const DerivationStore = struct {
     /// Perform a store write against the current connection. Skips the transfer
     /// when the path is already valid (cache or a daemon check). Cache touches are
     /// briefly guarded; the daemon round-trips run without `daemon_mu`.
-    fn applyDaemonOp(self: *DerivationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
+    fn applyDaemonOp(self: *RealizationStore, op: DaemonOp, span_group: ?SpanGroup) !void {
         const store_path = switch (op) {
             inline else => |o| o.store_path,
         };
@@ -662,42 +526,32 @@ pub const DerivationStore = struct {
     }
 
     /// Is `store_path` known present this run? Guarded read of `instantiated`.
-    fn cacheContains(self: *DerivationStore, store_path: []const u8) bool {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        return self.instantiated.contains(store_path);
+    fn cacheContains(self: *RealizationStore, store_path: []const u8) bool {
+        return self.daemon.cacheContains(store_path);
     }
 
     /// Record `store_path` as present (a write landed, or a query confirmed it).
     /// Best-effort: a cache-insert OOM just means a later redundant round-trip.
-    fn cacheMark(self: *DerivationStore, store_path: []const u8) void {
-        self.daemon_mu.lock();
-        defer self.daemon_mu.unlock();
-        self.markInstantiated(store_path) catch {};
+    fn cacheMark(self: *RealizationStore, store_path: []const u8) void {
+        self.daemon.cacheMark(store_path);
     }
 
-    fn markInstantiated(self: *DerivationStore, store_path: []const u8) !void {
-        const key = try self.allocator.dupe(u8, store_path);
-        errdefer self.allocator.free(key);
-        try self.instantiated.put(self.allocator, key, {});
-    }
-
-    pub fn recordOwnedTextRecipe(self: *DerivationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
+    pub fn recordOwnedTextRecipe(self: *RealizationStore, store_path: []const u8, text: []u8, references: []const []const u8) !void {
         return self.graph.recordOwnedText(store_path, text, references);
     }
 
-    pub fn recordOwnedNarRecipe(self: *DerivationStore, store_path: []const u8, nar_bytes: []u8) !void {
+    pub fn recordOwnedNarRecipe(self: *RealizationStore, store_path: []const u8, nar_bytes: []u8) !void {
         return self.graph.recordOwnedNar(store_path, nar_bytes);
     }
 
     /// `span_group` names the progress group the eventual write reports under —
     /// `.source` for a flat local source (`builtins.path { recursive = false; }`),
     /// null for a fetched flat file (shown under `.fetch` at download time).
-    pub fn recordFlatRecipe(self: *DerivationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
+    pub fn recordFlatRecipe(self: *RealizationStore, store_path: []const u8, handle: FileCache.ImmutableBytes, span_group: ?SpanGroup) !void {
         return self.graph.recordFlat(store_path, handle, span_group);
     }
 
-    pub fn releaseRecipePayloads(self: *DerivationStore) void {
+    pub fn releaseRecipePayloads(self: *RealizationStore) void {
         self.graph.releaseRecipePayloads();
     }
 
@@ -712,11 +566,11 @@ pub const DerivationStore = struct {
     /// realize/instantiate — so a wait on another realizer's claim is a normal
     /// fiber park (or a thread block off a fiber). Only the individual daemon
     /// round-trips (queries/writes/builds) are offloaded to the pool.
-    pub fn ensureClosure(self: *DerivationStore, store_path: []const u8) anyerror!void {
+    pub fn ensureClosure(self: *RealizationStore, store_path: []const u8) anyerror!void {
         return self.ensureClosureInner(store_path, null);
     }
 
-    fn ensureClosureInner(self: *DerivationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
+    fn ensureClosureInner(self: *RealizationStore, store_path: []const u8, parent: ?*const Visit) anyerror!void {
         while (true) {
             // Deps-first: a path's references are realized (and land in the store)
             // before the path itself. Each daemon round-trip goes to the pool; a
@@ -778,7 +632,7 @@ pub const DerivationStore = struct {
     /// caller (see `ensureClosure`): the closure is materialized deps-first, then
     /// the build is offloaded to the pool. A concurrent realizer of the same
     /// output deduplicates via the claim (a normal fiber park / thread block).
-    pub fn realizeOutput(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) !void {
+    pub fn realizeOutput(self: *RealizationStore, drv_path: []const u8, outputs: []const []const u8) !void {
         try self.ensureClosureInner(drv_path, null);
         const derived = try self.derivedPathString(drv_path, outputs);
         defer self.allocator.free(derived);
@@ -820,7 +674,7 @@ pub const DerivationStore = struct {
         }
     }
 
-    fn markOutputRealized(self: *DerivationStore, derived: []const u8) !void {
+    fn markOutputRealized(self: *RealizationStore, derived: []const u8) !void {
         const key = try self.allocator.dupe(u8, derived);
         errdefer self.allocator.free(key);
         self.graph.mu.lock();
@@ -829,7 +683,7 @@ pub const DerivationStore = struct {
         if (result.found_existing) self.allocator.free(key);
     }
 
-    fn ensureClosureWriter(self: *DerivationStore, store_path: []const u8, visit: *const Visit) anyerror!void {
+    fn ensureClosureWriter(self: *RealizationStore, store_path: []const u8, visit: *const Visit) anyerror!void {
         const recipe = blk: {
             self.graph.mu.lock();
             defer self.graph.mu.unlock();
@@ -848,7 +702,7 @@ pub const DerivationStore = struct {
         self.releaseRecipeForPath(store_path);
     }
 
-    fn claimMissingPath(self: *DerivationStore, store_path: []const u8) !struct { claim: *RealizationClaim, writer: bool } {
+    fn claimMissingPath(self: *RealizationStore, store_path: []const u8) !struct { claim: *RealizationClaim, writer: bool } {
         self.graph.mu.lock();
         defer self.graph.mu.unlock();
 
@@ -879,7 +733,7 @@ pub const DerivationStore = struct {
 
     /// Add one cold-path wait-for edge and report whether it closes a cycle.
     /// The edge retains its target and is visible only under `recipe_mu`.
-    fn beginClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) bool {
+    fn beginClaimWait(self: *RealizationStore, source: *RealizationClaim, target: *RealizationClaim) bool {
         self.graph.mu.lock();
         defer self.graph.mu.unlock();
         std.debug.assert(source.waiting_on == null);
@@ -897,7 +751,7 @@ pub const DerivationStore = struct {
         return false;
     }
 
-    fn endClaimWait(self: *DerivationStore, source: *RealizationClaim, target: *RealizationClaim) void {
+    fn endClaimWait(self: *RealizationStore, source: *RealizationClaim, target: *RealizationClaim) void {
         self.graph.mu.lock();
         defer self.graph.mu.unlock();
         if (source.waiting_on == target) {
@@ -906,7 +760,7 @@ pub const DerivationStore = struct {
         }
     }
 
-    fn waitForClaim(self: *DerivationStore, claim: *RealizationClaim) RealizationClaim.State {
+    fn waitForClaim(self: *RealizationStore, claim: *RealizationClaim) RealizationClaim.State {
         while (true) {
             claim.mu.lock();
             const state = claim.state;
@@ -915,9 +769,7 @@ pub const DerivationStore = struct {
             // Park until the claim's future is published, then re-read the state.
             // A compute fiber yields (`fiber_park`); anything else (main-thread
             // realize, tests) blocks on a semaphore woken by the same publish.
-            if (self.fiber_park) |park| {
-                if (park(&claim.future)) continue;
-            }
+            if (self.daemon.parkClaim(&claim.future)) continue;
             var w: SemaphoreWaiter = .{ .waiter = .{ .wake_fn = SemaphoreWaiter.wake } };
             if (claim.future.enrollWaiter(&w.waiter)) w.sem.acquire();
         }
@@ -937,17 +789,17 @@ pub const DerivationStore = struct {
         }
     };
 
-    fn finishSuccessfulClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
+    fn finishSuccessfulClaim(self: *RealizationStore, store_path: []const u8, claim: *RealizationClaim) void {
         self.removeClaim(store_path, claim);
         claim.publish(.success, null);
     }
 
-    fn finishRetryableClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim, err: anyerror) void {
+    fn finishRetryableClaim(self: *RealizationStore, store_path: []const u8, claim: *RealizationClaim, err: anyerror) void {
         self.removeClaim(store_path, claim);
         claim.publish(.retry, err);
     }
 
-    fn removeClaim(self: *DerivationStore, store_path: []const u8, claim: *RealizationClaim) void {
+    fn removeClaim(self: *RealizationStore, store_path: []const u8, claim: *RealizationClaim) void {
         self.graph.mu.lock();
         defer self.graph.mu.unlock();
         const removed = self.graph.claims.fetchRemove(store_path) orelse return;
@@ -956,7 +808,7 @@ pub const DerivationStore = struct {
         claim.release(self.allocator);
     }
 
-    fn releaseRecipeForPath(self: *DerivationStore, store_path: []const u8) void {
+    fn releaseRecipeForPath(self: *RealizationStore, store_path: []const u8) void {
         self.graph.mu.lock();
         defer self.graph.mu.unlock();
         const removed = self.graph.recipes.fetchRemove(store_path) orelse return;
@@ -964,7 +816,7 @@ pub const DerivationStore = struct {
         removed.value.deinit(self.allocator);
     }
 
-    fn derivedPathString(self: *DerivationStore, drv_path: []const u8, outputs: []const []const u8) ![]u8 {
+    fn derivedPathString(self: *RealizationStore, drv_path: []const u8, outputs: []const []const u8) ![]u8 {
         var rendered: std.ArrayListUnmanaged(u8) = .empty;
         errdefer rendered.deinit(self.allocator);
         try rendered.appendSlice(self.allocator, drv_path);
@@ -1031,12 +883,12 @@ pub const DerivationStore = struct {
     /// Callers lock it, re-check the memo, serialize on a miss, and unlock — so
     /// concurrent coercers of the same source don't each re-serialize. See
     /// `source_ingest_locks`.
-    pub fn sourceIngestLock(self: *DerivationStore, path: []const u8, name: []const u8) *stable.BlockingMutex {
+    pub fn sourceIngestLock(self: *RealizationStore, path: []const u8, name: []const u8) *stable.BlockingMutex {
         return self.memo.sourceIngestLock(path, name);
     }
 
     pub fn lookupSourceMemo(
-        self: *DerivationStore,
+        self: *RealizationStore,
         out_allocator: std.mem.Allocator,
         path: []const u8,
         name: []const u8,
@@ -1053,7 +905,7 @@ pub const DerivationStore = struct {
     /// new copy; a filtered entry whose token differs is stale (the filter's
     /// ObjectId was reused after a GC) — replace it.
     pub fn storeSourceMemo(
-        self: *DerivationStore,
+        self: *RealizationStore,
         path: []const u8,
         name: []const u8,
         recursive: bool,
@@ -1067,51 +919,54 @@ pub const DerivationStore = struct {
 
     /// Look up a cached `buildForcedDerivationValue(.lazy)` result.
     /// Returns the cached `Value.bits` if present, `null` otherwise.
-    pub fn lookupLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64) ?u64 {
+    pub fn lookupLazyDerivation(self: *RealizationStore, attrs_id: u32, token: u64) ?u64 {
         return self.memo.lookupLazyDerivation(attrs_id, token);
     }
 
     /// Cache the result of `buildForcedDerivationValue(.lazy)` for
     /// future per-attr lookups against the same input attrs.
-    pub fn cacheLazyDerivation(self: *DerivationStore, attrs_id: u32, token: u64, value_bits: u64) !void {
+    pub fn cacheLazyDerivation(self: *RealizationStore, attrs_id: u32, token: u64, value_bits: u64) !void {
         return self.memo.cacheLazyDerivation(attrs_id, token, value_bits);
     }
 
-    pub fn visitLiveLazyDerivations(self: *DerivationStore, token: u64, context: anytype, comptime visit: anytype) void {
+    pub fn visitLiveLazyDerivations(self: *RealizationStore, token: u64, context: anytype, comptime visit: anytype) void {
         self.memo.visitLiveLazyValues(token, context, visit);
     }
 
-    pub fn setDebugEnabled(self: *DerivationStore, enabled: bool) void {
+    pub fn setDebugEnabled(self: *RealizationStore, enabled: bool) void {
         self.registry.setDebugEnabled(enabled);
     }
 
-    pub fn debugEnabled(self: *DerivationStore) bool {
+    pub fn debugEnabled(self: *RealizationStore) bool {
         return self.registry.debugEnabled();
     }
 
-    pub fn clearDebugRecords(self: *DerivationStore) void {
+    pub fn clearDebugRecords(self: *RealizationStore) void {
         self.registry.clearDebugRecords();
     }
 
     /// Returns a borrowed slice. Caller must not invoke `record*` concurrently.
     /// Used at end-of-evaluation from the main thread after helpers have quiesced.
-    pub fn debugRecords(self: *const DerivationStore) []const DebugRecord {
+    pub fn debugRecords(self: *const RealizationStore) []const DebugRecord {
         return self.registry.debugRecords();
     }
 
-    pub fn resolver(self: *DerivationStore) HashModuloResolver {
+    pub fn resolver(self: *RealizationStore) HashModuloResolver {
         return self.registry.resolver(self.store_dir);
     }
 
-    pub fn record(self: *DerivationStore, drv_path: []const u8, hash_modulo: HashModuloView, outputs: []const DrvOutput) !void {
+    pub fn record(self: *RealizationStore, drv_path: []const u8, hash_modulo: HashModuloView, outputs: []const DrvOutput) !void {
         return self.registry.record(drv_path, hash_modulo, outputs);
     }
 
-    pub fn recordDebug(self: *DerivationStore, drv: *const Drv, computed: ComputedPaths) !void {
+    pub fn recordDebug(self: *RealizationStore, drv: *const Drv, computed: ComputedPaths) !void {
         return self.registry.recordDebug(self.store_dir, drv, computed);
     }
 
-    pub fn outputNames(self: *DerivationStore, drv_path: []const u8) ?[]const []const u8 {
+    pub fn outputNames(self: *RealizationStore, drv_path: []const u8) ?[]const []const u8 {
         return self.registry.outputNames(drv_path);
     }
 };
+
+/// Compatibility name retained for callers that model this as derivation state.
+pub const DerivationStore = RealizationStore;
