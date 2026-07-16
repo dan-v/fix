@@ -23,10 +23,10 @@ const args = @import("args.zig");
 const setup = @import("setup.zig");
 const debugger = @import("debugger.zig");
 const render_err = @import("render.zig");
-const fix = @import("fix");
-const runtime_value = @import("runtime").value;
-const thunk_mod = @import("runtime").thunk;
-const types = @import("runtime").types;
+const engine = @import("engine");
+const runtime_value = engine.value;
+const thunk_mod = engine.thunk;
+const types = engine.types;
 
 const commands = @import("repl/commands.zig");
 const check = @import("repl/check.zig");
@@ -39,8 +39,8 @@ const complete_mod = @import("repl/complete.zig");
 const pager_mod = @import("repl/pager.zig");
 
 const Options = args.Options;
-const Evaluator = fix.Evaluator;
-const Value = fix.Value;
+const Evaluator = engine.Evaluator;
+const Value = engine.Value;
 
 pub const synopsis =
     \\usage: fix repl [options]
@@ -628,7 +628,7 @@ const Repl = struct {
     /// external roots (every bound value + the attrset itself, so nothing
     /// is ever reachable only through a swept object).
     fn rebuildScope(self: *Repl) !void {
-        var entries: std.ArrayListUnmanaged(@import("runtime").heap.AttrEntry) = .empty;
+        var entries: std.ArrayListUnmanaged(engine.heap.AttrEntry) = .empty;
         defer entries.deinit(self.allocator);
         var roots: std.ArrayListUnmanaged(Value) = .empty;
         defer roots.deinit(self.allocator);

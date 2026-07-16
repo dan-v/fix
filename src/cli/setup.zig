@@ -5,14 +5,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const nix_conf = @import("nix_conf.zig");
-const rstore = @import("host").store;
-const hugetlb = @import("base").hugetlb;
+const rstore = engine.host.store;
+const hugetlb = engine.process_support.memory_backing;
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 
 /// Resolve the worker-thread count: an explicit `--workers`, else
 /// `min(12, cpu_count)` (1 when single-threaded).

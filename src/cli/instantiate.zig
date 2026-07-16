@@ -3,14 +3,14 @@
 //! print the top-level `.drv` path. The nix-instantiate analogue.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
 const build = @import("build.zig");
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 
 pub const synopsis =
     \\usage: fix instantiate [options] [path | -e <expr>]

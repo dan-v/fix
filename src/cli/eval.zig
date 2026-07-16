@@ -2,7 +2,7 @@
 //! value. This is the former default (no-subcommand) path, now a real command.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
@@ -10,9 +10,9 @@ const run = @import("run.zig");
 const debugger = @import("debugger.zig");
 const trace_setup = @import("trace_setup.zig");
 const stats = @import("stats.zig");
-const timeline = fix.probe.timeline;
+const timeline = engine.probe.timeline;
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 
 pub const synopsis =
     \\usage: fix eval [options] [path | -e <expression>]

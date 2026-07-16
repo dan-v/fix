@@ -5,13 +5,13 @@
 //! caller `deinit`s; `finish` flushes before teardown.
 
 const std = @import("std");
-const fix = @import("fix");
-const eval = fix.eval;
+const engine = @import("engine");
+const eval = engine.eval;
 const Evaluator = eval.Evaluator;
 const Options = @import("args.zig").Options;
-const vm_trace_mod = fix.vm.trace_log;
-const thunk_trace_mod = fix.probe.thunk_trace;
-const thunks_log_enabled = fix.vm.thunks_log_enabled;
+const vm_trace_mod = engine.vm.trace_log;
+const thunk_trace_mod = engine.probe.thunk_trace;
+const thunks_log_enabled = engine.vm.thunks_log_enabled;
 
 pub const ThunkTraceSetup = struct {
     trace: ?*thunk_trace_mod.ThunkTrace = null,

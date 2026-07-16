@@ -7,15 +7,15 @@
 //! piped to `$PAGER`.
 
 const std = @import("std");
-const fix = @import("fix");
-const bytecode = fix.bytecode;
+const engine = @import("engine");
+const bytecode = engine.bytecode;
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const runner = @import("run.zig");
 
-const Evaluator = fix.Evaluator;
-const ChunkId = @import("runtime").types.ChunkId;
+const Evaluator = engine.Evaluator;
+const ChunkId = engine.types.ChunkId;
 
 pub const synopsis =
     \\usage: fix disasm [options] [path | -e <expression>]

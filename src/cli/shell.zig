@@ -7,15 +7,15 @@
 //!   fix shell -p ripgrep -- rg --version
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 const EnvMap = std.process.Environ.Map;
-const BuildSink = @import("host").store.BuildSink;
+const BuildSink = engine.host.store.BuildSink;
 
 pub const synopsis =
     \\usage: fix shell [options] (-p <pkgs...> | path | -e <expr> | --flake) [-- cmd args...]

@@ -8,10 +8,10 @@
 //! by `--vm-trace --vm-trace-format=binary`.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
-const bytecode = fix.bytecode;
-const trace_log = fix.vm.trace_log;
+const bytecode = engine.bytecode;
+const trace_log = engine.vm.trace_log;
 
 const OpCode = bytecode.OpCode;
 const EventKind = trace_log.EventKind;

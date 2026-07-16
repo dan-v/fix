@@ -229,29 +229,26 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("compiler", compiler_mod);
     vm_mod.addImport("probe", probe_mod);
 
-    const mod = b.addModule("fix", .{
+    const engine_mod = b.addModule("engine", .{
         .root_source_file = b.path("src/nix/root.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    const shared_imports: SharedImports = .{
-        .build_options = build_options_mod,
-        .syntax = syntax_mod,
-        .runtime = runtime_mod,
-        .host = host_mod,
-        .realization = realization_mod,
-        .base = base_mod,
-        .scheduler = scheduler_mod,
-        .derivation = derivation_mod,
-        .observ = observ_mod,
-    };
-    addSharedImports(mod, shared_imports);
-    mod.addImport("bytecode", bytecode_mod);
-    mod.addImport("probe", probe_mod);
-    mod.addImport("compiler", compiler_mod);
-    mod.addImport("vm", vm_mod);
+    engine_mod.addImport("build_options", build_options_mod);
+    engine_mod.addImport("syntax", syntax_mod);
+    engine_mod.addImport("runtime", runtime_mod);
+    engine_mod.addImport("host", host_mod);
+    engine_mod.addImport("realization", realization_mod);
+    engine_mod.addImport("base", base_mod);
+    engine_mod.addImport("scheduler", scheduler_mod);
+    engine_mod.addImport("derivation", derivation_mod);
+    engine_mod.addImport("observ", observ_mod);
+    engine_mod.addImport("bytecode", bytecode_mod);
+    engine_mod.addImport("probe", probe_mod);
+    engine_mod.addImport("compiler", compiler_mod);
+    engine_mod.addImport("vm", vm_mod);
 
     const cli_mod = b.addModule("cli", .{
         .root_source_file = b.path("src/cli/cli.zig"),
@@ -260,8 +257,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
     });
-    cli_mod.addImport("fix", mod);
-    addSharedImports(cli_mod, shared_imports);
+    cli_mod.addImport("engine", engine_mod);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -270,11 +266,10 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .omit_frame_pointer = omit_frame_pointer,
         .imports = &.{
-            .{ .name = "fix", .module = mod },
+            .{ .name = "engine", .module = engine_mod },
             .{ .name = "cli", .module = cli_mod },
         },
     });
-    addSharedImports(exe_mod, shared_imports);
 
     const exe = b.addExecutable(.{
         .name = "fix",
@@ -297,7 +292,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = engine_mod,
         // Match the exe: threaded dispatcher needs LLVM tail calls.
         .use_llvm = true,
     });
@@ -454,28 +449,4 @@ pub fn build(b: *std.Build) void {
     _ = run_lang.captureStdErr(.{});
     if (b.args) |args| run_lang.addArgs(args);
     lang_step.dependOn(&run_lang.step);
-}
-
-const SharedImports = struct {
-    build_options: *std.Build.Module,
-    syntax: *std.Build.Module,
-    runtime: *std.Build.Module,
-    host: *std.Build.Module,
-    realization: *std.Build.Module,
-    base: *std.Build.Module,
-    scheduler: *std.Build.Module,
-    derivation: *std.Build.Module,
-    observ: *std.Build.Module,
-};
-
-fn addSharedImports(module: *std.Build.Module, imports: SharedImports) void {
-    module.addImport("build_options", imports.build_options);
-    module.addImport("syntax", imports.syntax);
-    module.addImport("runtime", imports.runtime);
-    module.addImport("host", imports.host);
-    module.addImport("realization", imports.realization);
-    module.addImport("base", imports.base);
-    module.addImport("scheduler", imports.scheduler);
-    module.addImport("derivation", imports.derivation);
-    module.addImport("observ", imports.observ);
 }

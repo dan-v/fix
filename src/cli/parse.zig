@@ -11,12 +11,12 @@
 //! the pinned parse corpus checks.
 
 const std = @import("std");
-const fix = @import("fix");
-const syntax = @import("syntax");
+const engine = @import("engine");
+const syntax = engine.syntax;
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 const Parser = syntax.parser.Parser;
 const AstArena = syntax.ast.AstArena;
 const Diagnostic = syntax.diagnostic.Diagnostic;

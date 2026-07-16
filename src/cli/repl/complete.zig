@@ -13,14 +13,14 @@
 //! All results are allocated in the arena the editor hands us.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const editor_mod = @import("editor.zig");
 const commands = @import("commands.zig");
 
-const Evaluator = fix.Evaluator;
-const Value = fix.Value;
-const builtins_mod = fix.builtins;
-const thunk_mod = fix.thunk;
+const Evaluator = engine.Evaluator;
+const Value = engine.Value;
+const builtins_mod = engine.builtins;
+const thunk_mod = engine.thunk;
 
 pub const Ctx = struct {
     ev: *Evaluator,
@@ -131,7 +131,7 @@ fn sortItems(items: [][]const u8) void {
 /// The builtins attrset's entries (always fully built, never thunked).
 /// `builtinsValue` constructs it on first use, so completion works before
 /// the session's first evaluation.
-fn builtinsAttrs(ctx: *Ctx) ?[]const fix.heap.AttrEntry {
+fn builtinsAttrs(ctx: *Ctx) ?[]const engine.heap.AttrEntry {
     const b = ctx.ev.builtinsValue() catch return null;
     if (!b.isAttrs()) return null;
     return ctx.ev.heap.getAttrs(b.asObjectId()) catch null;

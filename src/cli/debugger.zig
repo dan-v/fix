@@ -2,22 +2,22 @@
 //!
 //! When a debugger is attached, evaluation pauses at `builtins.break x` (and,
 //! with `--debugger`, at an evaluation error) and hands control here. The
-//! console is a small line-oriented REPL over a `fix.DebugSession`: it can show
+//! console is a small line-oriented REPL over a `engine.DebugSession`: it can show
 //! a backtrace with source locations, list the paused frame's locals, evaluate
 //! expressions in place (with the break value bound as `it`), and continue or
 //! abort. All I/O goes to the terminal via stdin/stderr so a redirected stdout
 //! still receives only the final value.
 //!
-//! The engine upcalls through `fix.Evaluator.setDebugUi`; this file is the
+//! The engine upcalls through `engine.Evaluator.setDebugUi`; this file is the
 //! `cli`-side implementation, so no VM internals leak below the facade.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
-const syntax = @import("syntax");
+const syntax = engine.syntax;
 
-const DebugSession = fix.DebugSession;
-const Value = fix.Value;
+const DebugSession = engine.DebugSession;
+const Value = engine.Value;
 const TokenType = syntax.token.TokenType;
 
 // Syntax-highlight palette (matches the value-render palette in eval/print.zig).
@@ -44,7 +44,7 @@ pub const Console = struct {
     hits: usize = 0,
 
     /// Attach this console to `ev`; `builtins.break`/errors now route here.
-    pub fn install(self: *Console, ev: *fix.Evaluator) void {
+    pub fn install(self: *Console, ev: *engine.Evaluator) void {
         ev.setDebugUi(self, runCallback);
     }
 
@@ -209,7 +209,7 @@ pub const Console = struct {
     /// Print the source line at the current frame's span, syntax-highlighted,
     /// with a caret underlining the span. One line of context each side. A
     /// no-op when the source or span is unavailable (e.g. a spanless thunk).
-    fn sourceSnippet(self: *Console, w: *std.Io.Writer, s: *DebugSession, f: fix.DebugFrame) !void {
+    fn sourceSnippet(self: *Console, w: *std.Io.Writer, s: *DebugSession, f: engine.DebugFrame) !void {
         const span = f.span orelse return;
         const text = s.frameSourceText(s.frameCount() - 1) orelse return;
         if (span.offset >= text.len) return;

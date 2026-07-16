@@ -9,13 +9,13 @@
 //! same text non-interactively.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const term_mod = @import("term.zig");
 const keys_mod = @import("keys.zig");
 
-const Evaluator = fix.Evaluator;
-const ChunkId = fix.types.ChunkId;
-const disasm = fix.bytecode.disasm;
+const Evaluator = engine.Evaluator;
+const ChunkId = engine.types.ChunkId;
+const disasm = engine.bytecode.disasm;
 
 const disasm_options: disasm.Options = .{
     .show_constants = true,

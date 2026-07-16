@@ -7,8 +7,8 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const derivation_debug = @import("derivation_debug.zig");
-const eval_gc = @import("fix").eval_gc;
-const hugetlb = @import("base").hugetlb;
+const eval_gc = @import("engine").eval_gc;
+const hugetlb = @import("engine").process_support.memory_backing;
 
 pub const OutputFormat = enum {
     nix,

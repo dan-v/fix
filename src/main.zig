@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
+const engine = @import("engine");
 const repl = cli.repl;
 const disasm_cmd = cli.disasm;
 const inspect_cmd = cli.inspect;
@@ -16,8 +17,6 @@ const build_cmd = cli.build;
 const run_cmd = cli.runcmd;
 const shell_cmd = cli.shell;
 const switch_cmd = cli.@"switch";
-const block_cache = @import("base").block_cache;
-const mem_tag = @import("runtime").mem_tag;
 
 const ArgsIterator = std.process.Args.Iterator;
 const SubcommandRun = *const fn (std.mem.Allocator, std.process.Init, *ArgsIterator) anyerror!u8;
@@ -73,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
     // maps/unmaps every >=64KB allocation, and the eval's ~9K large
     // temporaries otherwise re-minor-fault ~2GB of pages per run (>20% of
     // w=1 wall in fault handling). See runtime/block_cache.zig.
-    var big_blocks = block_cache.BlockCacheAllocator(mem_tag.vma).init(init.gpa);
+    var big_blocks = engine.process_support.LargeBlockAllocator.init(init.gpa);
     defer big_blocks.deinit();
     // Let the evaluator's build-phase release flush the parked blocks
     // (block_cache.trimGlobal) — it only holds a plain Allocator. Debug

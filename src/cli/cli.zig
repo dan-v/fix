@@ -4,10 +4,21 @@
 //! formatting primitives. Evaluation progress itself is backed by `std.Progress`.
 
 const std = @import("std");
-const Evaluator = @import("fix").Evaluator;
-const eval_progress = @import("fix").eval_progress;
-const gc = @import("runtime").gc;
-const sync = @import("base").sync;
+const Evaluator = @import("engine").Evaluator;
+const eval_progress = @import("engine").eval_progress;
+const gc = @import("engine").gc;
+
+const SpinMutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *SpinMutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SpinMutex) void {
+        self.inner.unlock();
+    }
+};
 
 // Command modules, re-exported so `main.zig` reaches them through the `cli`
 // module by name instead of importing `src/cli/*.zig` by relative path.
@@ -208,7 +219,7 @@ pub const EvalProgress = struct {
     /// the session (ended in `endSessionNodes`).
     span_groups: [std.enums.values(eval_progress.SpanGroup).len]?std.Progress.Node =
         [_]?std.Progress.Node{null} ** std.enums.values(eval_progress.SpanGroup).len,
-    span_mu: sync.SpinMutex = .{},
+    span_mu: SpinMutex = .{},
 
     const Active = struct {
         stage: eval_progress.Stage,

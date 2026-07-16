@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const cli = @import("cli.zig");
-const diagnostic = @import("syntax").diagnostic;
-const eval = @import("fix").eval;
+const diagnostic = @import("engine").diagnostic;
+const eval = @import("engine").eval;
 const Evaluator = eval.Evaluator;
 const EvalTrace = eval.EvalTrace;
 

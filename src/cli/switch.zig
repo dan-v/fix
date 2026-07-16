@@ -24,14 +24,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
 const args = @import("args.zig");
 const setup = @import("setup.zig");
 const run = @import("run.zig");
 const build = @import("build.zig");
 
-const Evaluator = fix.Evaluator;
+const Evaluator = engine.Evaluator;
 const Target = args.SwitchTarget;
 
 /// What to do with the built configuration. The first positional (default

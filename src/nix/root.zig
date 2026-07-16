@@ -4,6 +4,7 @@
 
 pub const types = @import("runtime").types;
 pub const value = @import("runtime").value;
+pub const syntax = @import("syntax");
 pub const stable_segments = @import("base").segments;
 pub const token = @import("syntax").token;
 pub const scanner = @import("syntax").scanner;
@@ -14,6 +15,7 @@ pub const bytecode = @import("bytecode");
 pub const opcode = bytecode.opcode;
 pub const chunk = bytecode.chunk;
 pub const heap = @import("runtime").heap;
+pub const gc = @import("runtime").gc;
 pub const compiler = @import("compiler");
 pub const intern = @import("runtime").intern;
 pub const thunk = @import("runtime").thunk;
@@ -31,12 +33,17 @@ pub const builtins = @import("runtime").builtins;
 pub const derivation = @import("derivation");
 pub const realization = @import("realization");
 pub const diagnostic = @import("syntax").diagnostic;
+pub const process_support = @import("process_support.zig");
 
 pub const Evaluator = eval.Evaluator;
 pub const Value = value.Value;
 pub const DebugSession = eval.DebugSession;
 pub const DebugFrame = eval.DebugFrame;
 pub const BreakReason = eval.BreakReason;
+
+pub fn reportSchedulerScanCensus() void {
+    scheduler.reportScanCensus();
+}
 
 test {
     _ = @import("root/tests.zig");

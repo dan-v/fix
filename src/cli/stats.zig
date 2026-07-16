@@ -6,11 +6,10 @@
 //! are imported here at the top of the file rather than inline at each use.
 
 const std = @import("std");
-const fix = @import("fix");
-const Evaluator = fix.Evaluator;
-const prof = fix.probe.prof;
-const prof_path = fix.probe.prof_path;
-const scheduler = @import("scheduler");
+const engine = @import("engine");
+const Evaluator = engine.Evaluator;
+const prof = engine.probe.prof;
+const prof_path = engine.probe.prof_path;
 
 pub fn report(ev: *Evaluator) void {
     const s = ev.schedulerStats();
@@ -22,7 +21,7 @@ pub fn report(ev: *Evaluator) void {
     {
         const d = ev.deferred_table.stats();
         std.debug.print("deferred: registered={d} compiled={d} ({d:.1}% forced)\n", .{
-            d.registered, d.compiled,
+            d.registered,                                                                                                                d.compiled,
             if (d.registered == 0) @as(f64, 0) else 100.0 * @as(f64, @floatFromInt(d.compiled)) / @as(f64, @floatFromInt(d.registered)),
         });
     }
@@ -56,7 +55,7 @@ pub fn report(ev: *Evaluator) void {
     }
     if (comptime prof.enabled) {
         prof.report(ev.chunkRegistry(), ev.internTable());
-        scheduler.reportScanCensus();
+        engine.reportSchedulerScanCensus();
         // Demand-prediction de-risk censuses (see heap.zig): junk ratios
         // for demand-descendant scavenging and sibling prefetch.
         ev.heap.profCreationCensus();

@@ -5,11 +5,11 @@
 //! Use `--no-eval` to inspect what compilation alone produces.
 
 const std = @import("std");
-const fix = @import("fix");
+const engine = @import("engine");
 const cli = @import("cli.zig");
-const eval = fix.eval;
-const bytecode = fix.bytecode;
-const intern_mod = @import("runtime").intern;
+const eval = engine.eval;
+const bytecode = engine.bytecode;
+const intern_mod = engine.intern;
 const builtin = @import("builtin");
 
 const Evaluator = eval.Evaluator;
